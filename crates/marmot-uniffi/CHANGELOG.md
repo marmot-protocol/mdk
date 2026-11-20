@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `TimelineMessageRecordFfi` and `TimelineReplyPreviewFfi` gain `thread: TimelineThreadRefFfi?` (root and parent of
+  a NIP-22 thread). Regenerate Swift or Kotlin bindings with the matching native library.
+
+### Added
+
+- `sendThreadMessage` sends a NIP-22 thread message from a thread view. Clients without one keep answering with
+  `replyToMessage`; see [replies and thread messages](README.md#replies-and-thread-messages).
+
 ## 0.18.0 - 2026-11-20
 
 ### Breaking changes

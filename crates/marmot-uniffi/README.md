@@ -29,7 +29,8 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [prepared conversation windows](#prepared-conversation-windows),
   [advanced timeline search](#advanced-timeline-search), [live timeline updates](#live-timeline-updates),
   [durable avatar access](#durable-avatar-access)
-- Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
+- Messages and moderation: [replies and thread messages](#replies-and-thread-messages),
+  [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
   [a group change still being sent](#a-group-change-still-being-sent),
@@ -1172,6 +1173,17 @@ completes. `clearAvatarCache` clears durable bytes and demand; later visible req
 Keep host persistent caches until migration and device validation are complete. See
 [the avatar contract](../../docs/marmot-architecture/further-context/avatar-cache-storage.md)
 for source/account fencing, result states and lifecycle rules.
+
+## Replies and thread messages
+
+An inline reply is kind 9, sent with `replyToMessage`. A thread message is a NIP-22 kind 1111, sent with
+`sendThreadMessage`, which builds every thread tag from the parent's row. Timeline records, conversation-window
+messages and reply previews carry `replyToMessageIdHex` (what a client without a thread view quotes: the reply target,
+or a thread message's parent) and `thread` (`rootMessageIdHex`, `parentMessageIdHex`; null outside threads). A
+client without a thread view shows thread messages inline with a one-level quote of their parent and answers
+everything with `replyToMessage`. Thread messages count as chat activity and notify like kind 9. The wire format, the
+older Linux forms MDK still reads and shared fixtures are in
+[replies and thread messages](../../docs/marmot-architecture/overview/thread-messages.md).
 
 ## Deletion provenance and custom events
 

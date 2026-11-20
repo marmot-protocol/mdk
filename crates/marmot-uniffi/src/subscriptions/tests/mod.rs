@@ -34,6 +34,7 @@ fn record(id: &str, plaintext: &str) -> TimelineMessageRecord {
         received_at: 1,
         reply_to_message_id_hex: None,
         reply_preview: None,
+        thread: None,
         media: None,
         agent_text_stream: None,
         reactions: marmot_app::TimelineReactionSummary::default(),

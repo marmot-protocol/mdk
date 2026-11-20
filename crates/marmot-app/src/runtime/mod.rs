@@ -4572,6 +4572,44 @@ impl MarmotAppRuntime {
         Ok(summary)
     }
 
+    /// Send a NIP-22 thread message (kind 1111) answering `parent_message_id`:
+    /// text, already-uploaded attachments, or both, plus application tags
+    /// such as NIP-30 `emoji`. MDK finds the parent's thread in this device's
+    /// timeline and builds the `E`/`K`/`P` root and `e`/`k` parent tags;
+    /// callers cannot pass those. An inline reply stays
+    /// [`Self::reply_to_message`] (kind 9), also when it answers a thread
+    /// message.
+    pub async fn send_thread_message(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        parent_message_id: &str,
+        content: String,
+        attachments: Vec<MediaAttachmentReference>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::ThreadMessage {
+                    parent_message_id: parent_message_id.to_owned(),
+                    content,
+                    attachments,
+                    message_tags,
+                    placement: None,
+                },
+            )
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
+    }
+
     /// Build an authenticated `imeta` tag for an optimistic host-side record
     /// without publishing it. The account worker derives the target group's
     /// media profile and rejects a reference from the other media version.

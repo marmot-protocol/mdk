@@ -4,8 +4,8 @@
 use marmot_app::{
     AppGroupSystemEvent, AppProjectionUpdate, RuntimeProjectionUpdate,
     RuntimeTimelineMessageUpdate, TimelineMessageChange, TimelineMessageRecord, TimelinePage,
-    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
-    TimelineUserReaction,
+    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineThreadRef,
+    TimelineUpdateTrigger, TimelineUserReaction,
 };
 
 use super::chat_list::{ChatListRowFfi, ChatListUpdateTriggerFfi};
@@ -237,6 +237,28 @@ pub struct TimelineReplyPreviewFfi {
     /// Convergence invalidation reason for the previewed message. The content
     /// fields are intentionally preserved so the application controls display.
     pub invalidation_status: Option<String>,
+    /// Where the previewed message sits in a NIP-22 thread.
+    pub thread: Option<TimelineThreadRefFfi>,
+}
+
+/// A row's place in a NIP-22 thread: set for every thread message (kind
+/// 1111), and for a chat, sticker or poll that joined a thread. A client
+/// without a thread view ignores it and quotes `reply_to_message_id_hex`.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct TimelineThreadRefFfi {
+    /// The message the thread hangs from.
+    pub root_message_id_hex: String,
+    /// The message this one answers; the root for a top-level thread message.
+    pub parent_message_id_hex: String,
+}
+
+impl From<TimelineThreadRef> for TimelineThreadRefFfi {
+    fn from(value: TimelineThreadRef) -> Self {
+        Self {
+            root_message_id_hex: value.root_message_id_hex,
+            parent_message_id_hex: value.parent_message_id_hex,
+        }
+    }
 }
 
 impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
@@ -257,6 +279,7 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
             deleted: value.deleted,
             deletion_source: value.deletion_source.into(),
             invalidation_status: value.invalidation_status,
+            thread: value.thread.map(Into::into),
         }
     }
 }
@@ -365,8 +388,12 @@ pub struct TimelineMessageRecordFfi {
     pub timeline_at: u64,
     /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
+    /// What a client without a thread view quotes: the inline-reply target,
+    /// or a thread message's parent.
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreviewFfi>,
+    /// Where this row sits in a NIP-22 thread; `None` outside threads.
+    pub thread: Option<TimelineThreadRefFfi>,
     pub media_json: Option<String>,
     /// Ordered per-attachment outcomes for this message, built from its `imeta`
     /// tags + its own `source_epoch` with the same parser and error mapping as
@@ -445,6 +472,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             received_at: value.received_at,
             reply_to_message_id_hex: value.reply_to_message_id_hex,
             reply_preview: value.reply_preview.map(Into::into),
+            thread: value.thread.map(Into::into),
             media_json: value.media.map(|media| media.to_string()),
             media,
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
@@ -970,6 +998,7 @@ mod tests {
             received_at: 11,
             reply_to_message_id_hex: reply_preview.as_ref().map(|p| p.message_id_hex.clone()),
             reply_preview,
+            thread: None,
             media,
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
@@ -1169,6 +1198,7 @@ mod tests {
             deleted: false,
             deletion_source: Default::default(),
             invalidation_status: Some("LosingBranch".to_owned()),
+            thread: None,
         };
         let record: TimelineMessageRecordFfi =
             record_with_media(Some(7), None, Some(preview)).into();
@@ -1204,6 +1234,7 @@ mod tests {
             deleted,
             deletion_source: Default::default(),
             invalidation_status: None,
+            thread: None,
         }
     }
 

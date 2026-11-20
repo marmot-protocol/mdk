@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- `MarmotAppRuntime::send_thread_message` sends a NIP-22 thread message (kind 1111) with text, attachments or both,
+  building the `E`/`K`/`P` root and `e`/`k` parent tags from the parent's row. `TimelineThreadRef` is re-exported.
+
+### Changed
+
+- Thread messages notify like kind 9 (live, background wake and push to other members) and count as mentions when
+  they mention the account. See `docs/marmot-architecture/overview/thread-messages.md`.
+
 ## 0.18.0 - 2026-11-20
 
 ### Breaking changes

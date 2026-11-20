@@ -75,6 +75,7 @@ fn message(group: &str, sender: &str) -> TimelineMessageRecord {
         received_at: 1,
         reply_to_message_id_hex: None,
         reply_preview: None,
+        thread: None,
         media: None,
         agent_text_stream: None,
         reactions: TimelineReactionSummary::default(),
@@ -277,6 +278,7 @@ fn conversation_dictionary_includes_former_members_replies_mentions_and_peer() {
         deleted: false,
         deletion_source: Default::default(),
         invalidation_status: None,
+        thread: None,
     });
     let result = project(&app, &input, &page(vec![row]));
     assert_eq!(result.identities.len(), 4);
@@ -643,6 +645,7 @@ fn conversation_reply_mentions_have_independent_limits_and_complete_identities()
         deleted: false,
         deletion_source: Default::default(),
         invalidation_status: None,
+        thread: None,
     });
     let result = project(&app, &input, &page(vec![row.clone()]));
     assert_eq!(result.messages[0].mentions, vec![main]);

@@ -255,6 +255,7 @@ mod tests {
             received_at: 43,
             reply_to_message_id_hex: Some("55".repeat(32)),
             reply_preview: None,
+            thread: None,
             media: None,
             agent_text_stream: None,
             reactions: TimelineReactionSummary {

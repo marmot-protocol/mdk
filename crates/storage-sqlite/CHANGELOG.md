@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `TimelineMessageRecord` and `TimelineReplyPreview` gain `thread: Option<TimelineThreadRef>`, the row's NIP-22
+  thread root and parent. It is computed on read; a legacy thread message without `E` finds its root by walking
+  stored parents. Struct literals need the field.
+- Account migration 0217 projects stored kind-1111 events that carry a lowercase `e` but no numeric `k` as comments
+  (parent, media, author edits, media-key references). Older binaries refuse schema 217; downgrade is unsupported.
+
+### Changed
+
+- Thread messages (kind 1111 with a parent) count as chat activity: chat-list preview, order, unread and mention
+  counts, and the message-text filter. The chat-list projection version moves to 5, so every row is rebuilt once.
+
 ## 0.18.0 - 2026-11-20
 
 ### Breaking changes

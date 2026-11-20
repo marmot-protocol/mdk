@@ -192,15 +192,7 @@ fn append_mention_tags(tags: &mut Vec<Vec<String>>, content: &str) {
     }
 }
 
-const NIP22_COMMENT_KIND: u64 = 1111;
-
-pub(crate) fn is_nip22_comment(kind: u64, tags: &[Vec<String>]) -> bool {
-    kind == NIP22_COMMENT_KIND
-        && tags.iter().any(|tag| {
-            tag.first().is_some_and(|name| name == "k")
-                && tag.get(1).is_some_and(|kind| kind.parse::<u64>().is_ok())
-        })
-}
+pub(crate) use cgka_traits::is_nip22_comment;
 
 /// Value of the `stream-type` tag on an agent text stream start event.
 const STREAM_TYPE_TEXT: &str = "text";
@@ -279,6 +271,16 @@ pub(crate) enum AppMessageIntent {
         caption: Option<String>,
         message_tags: Vec<Vec<String>>,
     },
+    /// A NIP-22 thread message (kind 1111) answering `parent_message_id`.
+    /// The account worker fills `placement` from local rows before the event
+    /// is built.
+    ThreadMessage {
+        parent_message_id: String,
+        content: String,
+        attachments: Vec<MediaAttachmentReference>,
+        message_tags: Vec<Vec<String>>,
+        placement: Option<ThreadPlacement>,
+    },
     StreamStart {
         stream_id: Vec<u8>,
         parent_message_id: Option<String>,
@@ -324,13 +326,27 @@ pub(crate) enum AppMessageIntent {
     },
     /// An event with an arbitrary non-reserved kind. Tags and content pass
     /// through unchanged, except NIP-22 comments (1111 with a numeric lowercase
-    /// `k` tag) gain missing mention `p` tags.
+    /// `k` tag or a lowercase `e` tag) gain missing mention `p` tags.
     Custom {
         kind: u64,
         tags: Vec<Vec<String>>,
         content: String,
     },
 }
+
+/// Where a new thread message goes: its root and parent, with the kinds and
+/// authors the NIP-22 tags name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadPlacement {
+    pub(crate) root_message_id: String,
+    pub(crate) root_kind: u64,
+    pub(crate) root_author: String,
+    pub(crate) parent_kind: u64,
+    pub(crate) parent_author: String,
+}
+
+/// Tag names a thread message's own placement owns; callers cannot pass them.
+const THREAD_PLACEMENT_TAGS: [&str; 5] = ["E", "K", "P", "e", "k"];
 
 /// Build the inner Marmot app event for `intent`, authored by `sender_pubkey_hex`
 /// at `created_at`. `Unreact` must be resolved to `DeleteReactions` before this
@@ -574,19 +590,12 @@ pub(crate) fn build_inner_event_with_media_reply(
                     "media message requires at least one attachment".into(),
                 ));
             }
-            let source_epoch = attachments[0].source_epoch;
-            for attachment in attachments {
-                // Structural + group-policy validation of outbound attachments
-                // happens in `Client::send_media_attachments`, which holds the
-                // group's `allowed_locator_kinds`. Here we only enforce the
-                // cross-attachment invariant that one message shares a single
-                // source epoch.
-                if attachment.source_epoch != source_epoch {
-                    return Err(AppError::InvalidAppMessagePayload(
-                        "media attachments in one message must share a source epoch".into(),
-                    ));
-                }
-            }
+            // Structural + group-policy validation of outbound attachments
+            // happens in `Client::send_media_attachments`, which holds the
+            // group's `allowed_locator_kinds`. Here we only enforce the
+            // cross-attachment invariant that one message shares a single
+            // source epoch.
+            validate_shared_source_epoch(attachments)?;
             let mut tags: Vec<Vec<String>> = attachments
                 .iter()
                 .map(MediaAttachmentReference::imeta_tag)
@@ -604,6 +613,63 @@ pub(crate) fn build_inner_event_with_media_reply(
                 MARMOT_APP_EVENT_KIND_CHAT,
                 tags,
                 caption.clone().unwrap_or_default(),
+            ))
+        }
+        AppMessageIntent::ThreadMessage {
+            parent_message_id,
+            content,
+            attachments,
+            message_tags,
+            placement,
+        } => {
+            let placement = placement.as_ref().ok_or_else(|| {
+                AppError::InvalidAppMessagePayload(
+                    "thread message must be placed before event construction".into(),
+                )
+            })?;
+            validate_message_ref(parent_message_id)?;
+            validate_message_ref(&placement.root_message_id)?;
+            validate_message_tags(message_tags)?;
+            if message_tags
+                .iter()
+                .any(|tag| THREAD_PLACEMENT_TAGS.contains(&tag[0].as_str()))
+            {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "thread message tags E, K, P, e and k are built by MDK".into(),
+                ));
+            }
+            if attachments.is_empty() && content.trim().is_empty() {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "thread message requires text or an attachment".into(),
+                ));
+            }
+            validate_shared_source_epoch(attachments)?;
+            // NIP-22: E/K/P name the root, e/k the parent. The parent's author
+            // gets no `p`: in Marmot a `p` tag on a message is a mention.
+            let mut tags = vec![
+                vec![
+                    "E".to_owned(),
+                    placement.root_message_id.clone(),
+                    String::new(),
+                    placement.root_author.clone(),
+                ],
+                vec!["K".to_owned(), placement.root_kind.to_string()],
+                vec!["P".to_owned(), placement.root_author.clone()],
+                vec![
+                    EVENT_REF_TAG.to_owned(),
+                    parent_message_id.clone(),
+                    String::new(),
+                    placement.parent_author.clone(),
+                ],
+                vec!["k".to_owned(), placement.parent_kind.to_string()],
+            ];
+            tags.extend(attachments.iter().map(MediaAttachmentReference::imeta_tag));
+            tags.extend(message_tags.iter().cloned());
+            append_mention_tags(&mut tags, content);
+            Ok(event(
+                cgka_traits::NIP22_COMMENT_KIND,
+                tags,
+                content.clone(),
             ))
         }
         AppMessageIntent::StreamStart {
@@ -905,6 +971,21 @@ pub(crate) fn validate_reaction_content(emoji: &str) -> Result<(), AppError> {
 
 fn event_ref_tag(target_message_id: &str) -> Vec<String> {
     vec![EVENT_REF_TAG.to_owned(), target_message_id.to_owned()]
+}
+
+fn validate_shared_source_epoch(attachments: &[MediaAttachmentReference]) -> Result<(), AppError> {
+    let Some(first) = attachments.first() else {
+        return Ok(());
+    };
+    if attachments
+        .iter()
+        .any(|attachment| attachment.source_epoch != first.source_epoch)
+    {
+        return Err(AppError::InvalidAppMessagePayload(
+            "media attachments in one message must share a source epoch".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_message_ref(target_message_id: &str) -> Result<(), AppError> {

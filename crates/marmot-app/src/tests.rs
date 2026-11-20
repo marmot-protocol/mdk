@@ -3153,6 +3153,171 @@ async fn media_send_branch_pin_body(before_send: bool, upload_and_send: bool, re
 }
 
 #[test]
+fn thread_messages_send_nip22_tags_from_local_rows() {
+    run_composed_app_runtime_test("thread-message-send", thread_message_send_body);
+}
+
+async fn thread_message_send_body() {
+    // MDK builds every NIP-22 tag from the parent's row; the first lowercase
+    // `e` stays the parent, which is what White Noise Linux reads today.
+    let dir = tempfile::tempdir().unwrap();
+    let alice = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap()
+        .account_id_hex;
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("threads", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_hex = hex::encode(group_id.as_slice());
+    let thread_message =
+        |parent: &str, content: &str, tags: Vec<Vec<String>>| AppMessageIntent::ThreadMessage {
+            parent_message_id: parent.to_owned(),
+            content: content.to_owned(),
+            attachments: Vec::new(),
+            message_tags: tags,
+            placement: None,
+        };
+    let row = |id: &str| {
+        app.timeline_message("alice", &group_hex, id)
+            .unwrap()
+            .unwrap()
+    };
+    let tags = |rows: &[&[&str]]| -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| row.iter().map(|value| (*value).to_owned()).collect())
+            .collect()
+    };
+
+    let root = client.send(&group_id, b"lunch?").await.unwrap().message_ids[0].clone();
+    let (_, first) = client
+        .send_app_event(&group_id, thread_message(&root, "friday", Vec::new()))
+        .await
+        .unwrap();
+    let first = first.message_ids[0].clone();
+    let first_row = row(&first);
+    assert_eq!(first_row.kind, cgka_traits::NIP22_COMMENT_KIND);
+    assert_eq!(
+        first_row.tags,
+        tags(&[
+            &["E", &root, "", &alice],
+            &["K", "9"],
+            &["P", &alice],
+            &["e", &root, "", &alice],
+            &["k", "9"],
+        ])
+    );
+    assert_eq!(
+        first_row.reply_to_message_id_hex.as_deref(),
+        Some(root.as_str())
+    );
+    assert_eq!(
+        first_row.thread,
+        Some(storage_sqlite::TimelineThreadRef {
+            root_message_id_hex: root.clone(),
+            parent_message_id_hex: root.clone(),
+        })
+    );
+
+    let emoji = vec![
+        "emoji".to_owned(),
+        "wave".to_owned(),
+        "https://example.com/w.png".to_owned(),
+    ];
+    let (_, nested) = client
+        .send_app_event(
+            &group_id,
+            thread_message(&first, "noon", vec![emoji.clone()]),
+        )
+        .await
+        .unwrap();
+    let nested_row = row(&nested.message_ids[0]);
+    assert_eq!(
+        nested_row.tags,
+        tags(&[
+            &["E", &root, "", &alice],
+            &["K", "9"],
+            &["P", &alice],
+            &["e", &first, "", &alice],
+            &["k", "1111"],
+            &["emoji", "wave", "https://example.com/w.png"],
+        ])
+    );
+    assert_eq!(
+        crate::messages::tag_value(&nested_row.tags, "e"),
+        Some(first.as_str()),
+        "Linux reads the first lowercase e as the thread it belongs to"
+    );
+    assert_eq!(
+        nested_row.thread,
+        Some(storage_sqlite::TimelineThreadRef {
+            root_message_id_hex: root.clone(),
+            parent_message_id_hex: first.clone(),
+        })
+    );
+
+    // An inline reply to a thread message stays kind 9 with e + q.
+    let (_, inline) = client
+        .send_app_event(
+            &group_id,
+            AppMessageIntent::Reply {
+                target_message_id: first.clone(),
+                text: "inline".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let inline_row = row(&inline.message_ids[0]);
+    assert_eq!(
+        inline_row.kind,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+    );
+    assert_eq!(inline_row.tags, tags(&[&["e", &first], &["q", &first]]));
+    assert_eq!(inline_row.thread, None);
+    assert_eq!(
+        inline_row.reply_preview.and_then(|preview| preview.thread),
+        first_row.thread
+    );
+
+    let published_before = relay.published_event_ids().len();
+    for (intent, case) in [
+        (
+            thread_message("c0c0", "lost", Vec::new()),
+            "an unknown parent",
+        ),
+        (
+            thread_message(&root, "  ", Vec::new()),
+            "no text and no attachment",
+        ),
+        (
+            thread_message(&root, "forged", tags(&[&["E", "elsewhere"]])),
+            "a caller-built root tag",
+        ),
+        (
+            thread_message(&root, "forged", tags(&[&["e", "elsewhere"]])),
+            "a caller-built parent tag",
+        ),
+    ] {
+        let error = client.send_app_event(&group_id, intent).await.unwrap_err();
+        assert!(
+            matches!(error, AppError::InvalidAppMessagePayload(_)),
+            "{case} must be refused, got {error:?}"
+        );
+    }
+    assert_eq!(
+        relay.published_event_ids().len(),
+        published_before,
+        "a refused thread message must reach the relay with nothing"
+    );
+}
+
+#[test]
 fn edits_require_an_available_own_chat_target() {
     run_composed_app_runtime_test("edit-target-preflight", edit_target_preflight_body);
 }

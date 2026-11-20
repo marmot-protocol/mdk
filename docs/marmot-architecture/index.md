@@ -65,6 +65,11 @@ Written to be readable in 5 minutes each, shareable as a package.
   - **What it covers:** The implemented first slice of the multi-account `marmot-app` runtime, its shared Nostr relay
     plane, and the daemon, CLI, TUI boundary.
 
+- **Doc:** [`overview/thread-messages.md`](./overview/thread-messages.md)
+  - **What it covers:** The client contract for inline replies (kind 9) and NIP-22 thread messages (kind 1111): wire
+    format, older forms MDK still reads, typed row fields, chat activity and display rules with and without a thread
+    view.
+
 - **Doc:** [`hermes-openclaw-agent-integration-plan.md`](./hermes-openclaw-agent-integration-plan.md)
   - **What it covers:** Working plan for hosting Hermes Agent and OpenClaw as server-side Marmot members with a
     `wn-agent` connector, local gateway shims, invite allowlists, and QUIC previews.

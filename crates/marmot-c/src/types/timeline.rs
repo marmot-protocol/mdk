@@ -10,7 +10,7 @@ use marmot_uniffi::conversions::{
     TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineReplyPreviewFfi, TimelineSubscriptionUpdateFfi,
-    TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
+    TimelineThreadRefFfi, TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
 };
 
 use super::chat_list::{MarmotChatListRow, MarmotChatListUpdateTrigger};
@@ -157,6 +157,20 @@ c_mirror! {
 }
 
 c_mirror! {
+    /// A row's place in a NIP-22 thread: set for every thread message
+    /// (kind 1111) and for a chat, sticker or poll that joined a thread.
+    /// A client without a thread view ignores it and quotes
+    /// `reply_to_message_id_hex`.
+    MarmotTimelineThreadRef from TimelineThreadRefFfi {
+        /// The message the thread hangs from.
+        str root_message_id_hex,
+        /// The message this one answers; the root for a top-level thread
+        /// message.
+        str parent_message_id_hex,
+    }
+}
+
+c_mirror! {
     /// Preview of the message a timeline row replies to.
     MarmotTimelineReplyPreview from TimelineReplyPreviewFfi {
         str message_id_hex,
@@ -175,6 +189,8 @@ c_mirror! {
         /// Convergence invalidation reason for the previewed message.
         /// Nullable.
         opt_str invalidation_status,
+        /// Where the previewed message sits in a NIP-22 thread. Nullable.
+        opt_rec thread: MarmotTimelineThreadRef,
     }
 }
 
@@ -301,6 +317,10 @@ c_mirror! {
         opt_rec imported_from: MarmotHistoryImportSource,
         /// Complete typed provenance; legacy imported_from remains sibling-only.
         opt_rec history_import_provenance: MarmotHistoryImportProvenance,
+        /// Where this row sits in a NIP-22 thread; NULL outside threads.
+        /// `reply_to_message_id_hex` stays what a client without a thread
+        /// view quotes: a thread message's parent.
+        opt_rec thread: MarmotTimelineThreadRef,
     }
 }
 

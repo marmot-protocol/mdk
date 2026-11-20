@@ -1660,6 +1660,7 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         history_import_provenance: None,
         reply_to_message_id_hex: None,
         reply_preview: None,
+        thread: None,
         media: None,
         agent_text_stream: None,
         reactions: Default::default(),

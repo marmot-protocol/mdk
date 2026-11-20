@@ -1241,6 +1241,7 @@ pub(crate) fn notification_trigger_for_intent(
         | AppMessageIntent::Sticker { .. }
         | AppMessageIntent::Reply { .. }
         | AppMessageIntent::Media { .. }
+        | AppMessageIntent::ThreadMessage { .. }
         | AppMessageIntent::Poll { .. }
         | AppMessageIntent::StreamFinal { .. } => {
             Some(notifications::NotificationTrigger::NewMessage)

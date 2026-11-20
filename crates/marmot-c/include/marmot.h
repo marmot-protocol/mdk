@@ -5705,6 +5705,24 @@ typedef struct MarmotPollProjection {
 } MarmotPollProjection;
 
 /**
+ * A row's place in a NIP-22 thread: set for every thread message
+ * (kind 1111) and for a chat, sticker or poll that joined a thread.
+ * A client without a thread view ignores it and quotes
+ * `reply_to_message_id_hex`.
+ */
+typedef struct MarmotTimelineThreadRef {
+  /**
+   * The message the thread hangs from.
+   */
+  char *root_message_id_hex;
+  /**
+   * The message this one answers; the root for a top-level thread
+   * message.
+   */
+  char *parent_message_id_hex;
+} MarmotTimelineThreadRef;
+
+/**
  * Preview of the message a timeline row replies to.
  */
 typedef struct MarmotTimelineReplyPreview {
@@ -5729,6 +5747,10 @@ typedef struct MarmotTimelineReplyPreview {
    * Nullable.
    */
   char *invalidation_status;
+  /**
+   * Where the previewed message sits in a NIP-22 thread. Nullable.
+   */
+  struct MarmotTimelineThreadRef *thread;
 } MarmotTimelineReplyPreview;
 
 /**
@@ -5897,6 +5919,12 @@ typedef struct MarmotTimelineMessageRecord {
    * Complete typed provenance; legacy imported_from remains sibling-only.
    */
   struct MarmotHistoryImportProvenance *history_import_provenance;
+  /**
+   * Where this row sits in a NIP-22 thread; NULL outside threads.
+   * `reply_to_message_id_hex` stays what a client without a thread
+   * view quotes: a thread message's parent.
+   */
+  struct MarmotTimelineThreadRef *thread;
 } MarmotTimelineMessageRecord;
 
 /**
@@ -12259,6 +12287,31 @@ MarmotStatus marmot_send_tagged_media(const struct MarmotClient *client,
                                       uintptr_t tags_len,
                                       const char *caption,
                                       struct MarmotSendSummary **out);
+
+/**
+ * Send a NIP-22 thread message (kind 1111) answering `parent_message_id`:
+ * `text`, previously uploaded `attachments`, or both, plus application
+ * `tags` (for example NIP-30 `emoji`), each row a `(char **, len)` pair.
+ * MDK builds the thread's `E`/`K`/`P` and `e`/`k` tags from the parent's
+ * row and rejects them, and imeta, in `tags`. A client without a thread
+ * view answers with `marmot_reply_to_message` instead, also when the
+ * target is a thread message. Free with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; strings valid; `attachments` must
+ * point to `attachments_len` valid caller-owned structs and `tags` to
+ * `tags_len` valid rows (each NULL with length 0 allowed); `out` valid.
+ */
+MarmotStatus marmot_send_thread_message(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *group_id_hex,
+                                        const char *parent_message_id,
+                                        const char *text,
+                                        const struct MarmotMediaAttachmentReference *attachments,
+                                        uintptr_t attachments_len,
+                                        const struct MarmotStringArray *tags,
+                                        uintptr_t tags_len,
+                                        struct MarmotSendSummary **out);
 
 /**
  * React with a custom emoji image. `attachments` (already uploaded)

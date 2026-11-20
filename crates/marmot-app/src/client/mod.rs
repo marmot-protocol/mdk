@@ -112,6 +112,7 @@ pub(crate) mod sign_ins;
 pub(crate) mod sign_out;
 mod small_state;
 mod sync;
+mod thread_placement;
 #[cfg(test)]
 pub(crate) mod upload_cleanup_tests;
 pub(crate) mod welcome_waves;
@@ -4892,6 +4893,10 @@ impl AppClient {
                 (Family::MessageAction, "delete")
             }
             AppMessageIntent::Media { .. } => (Family::MessageAction, "media"),
+            AppMessageIntent::ThreadMessage { attachments, .. } if !attachments.is_empty() => {
+                (Family::MessageAction, "media")
+            }
+            AppMessageIntent::ThreadMessage { .. } => (Family::MessageAction, "reply"),
             AppMessageIntent::PushTokenUpdate { .. } | AppMessageIntent::PushTokenList { .. } => {
                 (Family::Notification, "update")
             }
@@ -4998,6 +5003,27 @@ impl AppClient {
                         .ok_or(AppError::InvalidEditTarget)?;
                     intent
                 }
+                AppMessageIntent::ThreadMessage {
+                    parent_message_id,
+                    content,
+                    attachments,
+                    message_tags,
+                    placement: None,
+                } => {
+                    let storage = self.app.account_storage(&self.state.label)?.app_storage();
+                    let placement = thread_placement::thread_placement(
+                        &storage,
+                        &hex::encode(group_id.as_slice()),
+                        &parent_message_id,
+                    )?;
+                    AppMessageIntent::ThreadMessage {
+                        parent_message_id,
+                        content,
+                        attachments,
+                        message_tags,
+                        placement: Some(placement),
+                    }
+                }
                 AppMessageIntent::Delete { target_message_id } => {
                     let storage = self.app.account_storage(&self.state.label)?.app_storage();
                     let target = storage
@@ -5048,6 +5074,7 @@ impl AppClient {
             // own convergence/preflight, and refuses to retain pinned work.
             let expected_epoch = match &intent {
                 AppMessageIntent::Media { attachments, .. }
+                | AppMessageIntent::ThreadMessage { attachments, .. }
                 | AppMessageIntent::Reaction { attachments, .. } => {
                     self.media_send_epoch_pin(group_id, attachments)?
                 }

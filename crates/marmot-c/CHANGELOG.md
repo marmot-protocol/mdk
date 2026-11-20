@@ -7,6 +7,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `MarmotTimelineMessageRecord` and `MarmotTimelineReplyPreview` gain a trailing nullable
+  `thread: MarmotTimelineThreadRef *`. Rebuild clients with the matching header and library.
+
+### Added
+
+- `marmot_send_thread_message` sends a NIP-22 thread message from a thread view.
+
 ## [0.18.0] - 2026-11-20
 
 ### Breaking changes

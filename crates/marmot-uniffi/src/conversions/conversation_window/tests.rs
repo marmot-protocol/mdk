@@ -202,6 +202,7 @@ fn prepared_conversion_reuses_rows_and_text_but_keeps_all_visible_changes() {
                 deleted: false,
                 deletion_source: Default::default(),
                 invalidation_status: None,
+                thread: None,
             })
         },
         |row| {

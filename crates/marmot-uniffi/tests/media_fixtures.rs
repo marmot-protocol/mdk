@@ -86,6 +86,7 @@ fn projected_outcome(tag: &[String], source_epoch: u64) -> MediaAttachmentOutcom
         deleted: false,
         deletion_source: Default::default(),
         invalidation_status: None,
+        thread: None,
     }
     .into();
     let mut media = preview.media;
