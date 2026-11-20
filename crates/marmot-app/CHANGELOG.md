@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.18.0 - 2026-11-20
+
 ### Breaking changes
 
 - DeviceLinkSnapshot gains `chat_progress`. It reports remaining eligible Adds on the approver and remaining local joins on the new device (#3532). Update Rust struct literals.
@@ -68,6 +70,24 @@
 
 ### Changed
 
+- The prepared group image status and list (an upload in flight reads `Uploading`), the fresh-start flag and chat
+  history imports answer from the published read state, as the 0.17.0 account and group reads do (mdk#3273, #3468).
+  History notices and account recovery status follow (#3428), and reads that could answer before the worker would
+  (`group_commit_delivery` and `maintenance_status` for an unhydrated group, `quarantined_groups` after a reconnect,
+  history notices for an unrecoverable group, the backup-restore watch) now wait for the state the worker would
+  give (#3533).
+- WN Agent and every other host that opens with `MarmotAppConfig::white_noise()` or `default()` runs with device
+  groups on (mdk#2628).
+- Runtime shutdown gives Welcome waves still publishing one bound, 2 s after shutdown begins, shared by the runtime and
+  every account worker, before it cancels them (#3488). A wave a create or invite started counts from before the host
+  hears of it. `shutdown_and_close` still closes storage first, so a wave that settles after the close leaves its
+  Welcome owed and the next start sends it once more. Sign-out, unlink and client replacement still cancel at once.
+- Destructive sign-out reports a member Leave it could only queue in `group_leave_failures` instead of counting the
+  group as left (#3539).
+- Background history drains without a standing live tail owe history only through where the drain first saw the
+  route, so a drain over slow relays ends instead of polling them continuously; epoch-gap visits are bounded in time
+  and passive polling per gap unit is limited (#3541, #3548). `RecoveryStatusChanged` is published when a route's
+  catching-up state changes, not a relay's.
 - Commit-preparing group commands fail with `AppError::GroupCommitPending` while the group's own commit is pending,
   before the catching-up and undelivered checks and without spending their acknowledgements (mdk#2332). So do a
   member's `leave_group` and `decline_group_invite`. They failed with the engine's untyped refusal before.
@@ -116,8 +136,9 @@
   obligation's phase deadline, a KeyPackage refresh, expiry or relay backoff, a transport fanout's backoff or bound, a
   private KeyPackage expiry, a reinvite retry, or the 10-minute component recheck. A self-update held by an epoch gap is
   due when its 24 h hold ends, and one held by an undelivered commit an hour after that commit's first acknowledgement.
-  Work with no stored time (a send failure, an in-memory retry, a rejoin offer, an unrecoverable group, device-group
-  passes, an overdue component recheck) retries 15 s after the last run while it lasts, as before. KeyPackage
+  Work with no stored time (a send failure, an in-memory retry, a rejoin offer, an unrecoverable group, an overdue
+  component recheck) retries 15 s after the last run while it lasts, as before; device-group passes have their own
+  times (below). KeyPackage
   publication retries now follow their stored backoff (30 s doubling to 1 h) instead of every tick. The due time is
   re-read at most once a second, after a command, a receive, a convergence pass, a recovery turn or a maintenance run,
   and timed as `worker_maintenance_next_due`. The watchdog's own read on each tick is timed apart, as
@@ -132,13 +153,23 @@
   broadcast, private KeyPackage request pacing, a leaving sibling's decision, gap filling and inventory pages. They
   retry 15 s after the last run only while they owe work with no time: something left unsent, held invitation work, a
   device-group event, a small-state edit or a pass that failed. Device pairing runs only while linking is under way,
-  not for every settled device group.
+  not for every settled device group. Deadlines a week or more out (history expiry, inactivity, takeover) ride the
+  run the hourly heartbeat brings, so they can be up to an hour late, and a sibling's decline this device cannot
+  apply as the chat's last admin waits for the next maintenance run, up to an hour.
 
 ### Fixed
 
+- A newly linked device no longer reads traffic stamped up to five minutes after its Welcome as stall evidence
+  (#3552). Such pre-join history armed a false epoch gap, which offered a needless Reset Device List (mdk#3536) and held
+  device-group work, so the approver added the device to no chats until an unrelated commit (mdk#3535).
+- A fresh account no longer fails KeyPackage rotation with "legacy key package replacement is pending" or reports
+  `RecoveryRequired` because an early read created its database (#3483, #3509). The account database records that it
+  was created empty, and the cutover and the legacy recovery check read that record instead of the file's existence.
+  The device-group removal look no longer opens a database that does not exist.
+- A linked and then removed device's slot no longer shows as "Rejected on another of your devices" (#3482).
 - An invitation answered on one linked device shows as answered on the other within seconds (mdk#3566). The answer is
-  sent on the worker's next turn, a sibling's winning answer is applied when it arrives, and the chat then reports its
-  new state as a host accept does. Before, each device waited for a maintenance pass, and the receiving device's chat
+  sent on the worker's next turn, a sibling's winning answer is applied when it arrives, and the chat then reports
+  `GroupStateUpdated`, as a host accept does. Before, each device waited for a maintenance pass, and the receiving device's chat
   list changed only with the chat's next event.
 
 - A sibling Add forwards how this device holds the chat, and the new device's copy shows it the same way (mdk#3546).
@@ -326,8 +357,6 @@
   are members, member-id pages, MLS state and its diagnostic form, roster and conversation snapshot, and app
   components. A group read that names a group still awaiting startup hydration asks the worker to hydrate it and
   answers once it has. A forget sent during startup hydration now runs at its place in the worker's command order.
-  The prepared group image status and list (an upload in flight reads `Uploading`), the fresh-start flag and chat
-  history imports answer the same way.
 
 ### Fixed
 

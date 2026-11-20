@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.18.0 - 2026-11-20
+
 ### Breaking changes
 
 - `SqliteAppStorage::merge_invitation_decisions` returns whether any decision won (mdk#3566).
@@ -78,7 +80,7 @@
 - New reads for the account worker's job deadlines (mdk#2923): `device_pairing_state_exists`,
   `push_gossip_timing_pending` and `history_dispatch_next_at`, which counts the backup pass and condemned blob
   deadlines only when its `backups` argument says backups are configured. The history delivery due columns have no
-  index; one may be needed once device groups ship.
+  index; one may be needed now that device groups are on by default.
 - New reads for the account worker's pass deadlines (mdk#2923): `SqliteAppStorage::attachment_work_schedule`
   (`AttachmentWorkSchedule`: the earliest timed candidate, acquisition or partial, whether polled work exists, and
   whether an admission demand waits), `avatar_work_schedule` and `chat_presentation_work_pending`.
@@ -88,6 +90,10 @@
 
 ### Fixed
 
+- A new account database records, in a one-row `cgka_database_origin` table the migration runner writes before the
+  first migration commits, that it was created empty (#3509). The KeyPackage cutover and the legacy recovery check
+  read it instead of the file's existence, so an early read that created the file no longer makes a fresh account
+  look upgraded. A database migrated by an older build never gains the row and still fails closed.
 - `expire_history_deliveries`, `record_recovery_coverage_since` with no slices, `start_small_state` once started
   and a `sync_small_state` pass that receives nothing and would change nothing take no writer transaction
   (mdk#3479). A small-state pass with nothing received first runs its reads on a read snapshot; it returns the same

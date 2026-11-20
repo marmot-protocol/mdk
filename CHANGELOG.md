@@ -2,8 +2,33 @@
 
 ## Unreleased
 
+## 0.18.0 - 2026-11-20
+
 ### Breaking changes
 
+- Multi-device ships. Every build includes device groups and every MarmotKit,
+  Marmot C and WN Agent runtime opens with them on: device linking, the
+  linked-device list, sign-in review, history transfer, backups and admin
+  step-down on Leave work without a special build or constructor, and every
+  build advertises the device-roster component. The `dev-device-groups` and
+  `unreleased-device-pairing` Cargo features and the `--dev-device-groups`
+  build flags are gone. `MarmotAppConfig::dev_device_groups` is renamed
+  `device_groups` and defaults to true; `wn` and `wnd` honor
+  `WN_DEVICE_GROUPS=0`. Ship the new library in every process that opens a
+  root, extensions included (#3476, #3519).
+- A sibling Welcome that forwards how the adding device holds a chat is
+  version 3, which devices older than this release refuse (#3564).
+- MarmotKit adds `MarmotKitError.GroupCommitPending`, `NoUsableRelay` and
+  `ReactionNotFound`, `GroupEventKindFfi.GroupChangeNotDelivered` and
+  `OnboardingActionFfi.RemoveUnusableRelays`; exhaustive switches must add
+  them. `AppMessageRecordFfi.invalidated`, `OnboardingDevicePackageFfi.client`
+  and `OnboardingRelayTagChangeFfi.removal_reason` are new fields without
+  defaults. C adds statuses 131 to 133 and changes the layout of seven
+  records. See the crate changelogs.
+- Account databases migrate from schema 207 to 216 (0208 to 0216), the shared
+  database from 4 to 5 (0005) and the per-account directory cache from 2 to 3,
+  on first open. Older binaries refuse the upgraded databases; downgrade is
+  unsupported.
 - C hosts: `MarmotSelectedMessageDraftAttachment` and
   `MarmotAttachmentStorageUsage` gain fields for file-backed draft attachments
   (#3431), so their layouts changed: rebuild with the matching header and
@@ -13,6 +38,22 @@
 
 ### Added
 
+- Device-link status reports how many chats remain on each device
+  (`chat_progress`) (#3543).
+- `attachment_removals` (Rust, UniFFI, C) exposes durable, bounded removal
+  identities for host derivative caches (#3495).
+- Raw message records carry `invalidated` for rows kept only as invalidated
+  tombstones (#3463).
+- `start_direct_conversation_with_options` founds a direct chat with a
+  disappearing-message duration in its founding state (#3432).
+- NIP-22 comments (kind 1111) project as editable replies with their parent,
+  media and author edits; account migration 0208 repairs retained ones
+  (#3435).
+- Onboarding lets users fix a relay or inbox list whose check was
+  inconclusive (#3445), suggests removing declared relays that cannot serve
+  their role (#3453), names the app another installation's package reports
+  (#3447), and keeps a single-device acknowledgment across a long pause
+  (#3444).
 - The v5 audit records every invite on the sender, not only a new group's
   founding Welcomes. An invite into an existing group records
   `welcome_prepared` naming the exact KeyPackage its Welcome answers, every
@@ -98,6 +139,19 @@
 
 ### Changed
 
+- Idle accounts no longer wake every 15 seconds (#3258, #3361, #3568). Session
+  maintenance, device pairing, the device-group passes, recovery, post-join
+  work, attachments, avatars and the other maintenance jobs run when an event
+  wakes them and at the deadline their data gives, and an idle maintenance
+  tick takes no writer transaction (#3487). Deadlines a week or more out ride
+  the hourly heartbeat's run, so they can be up to an hour late.
+- WN Agent accounts run with device groups on, through the runtime's new
+  default; the connector has no switch for them.
+- Runtime shutdown gives Welcome waves still publishing up to 2 s before it
+  cancels them, so a Welcome a create or invite just started is not left owed
+  until the next start (#3488).
+- Destructive sign-out reports queued member leaves in its leave failures
+  instead of counting them as left (#3539).
 - A group change made while the group's own commit is pending fails with the
   new `GroupCommitPending` (Rust `AppError`, UniFFI `MarmotKitError`, C
   `MARMOT_STATUS_GROUP_COMMIT_PENDING`, CLI `group_commit_pending`) instead of
@@ -113,6 +167,26 @@
 
 ### Fixed
 
+- An invitation answered on one linked device shows as answered on the other
+  within seconds instead of about a minute (#3568).
+- When a device is linked to an account with two or more devices, the
+  approver adds it to its chats while active and the other devices wait, so
+  they no longer both add it and fork chats (#3562).
+- A newly linked device no longer reads pre-join history as an epoch gap,
+  which offered a needless Reset Device List and held its chats back (#3552).
+- A device the user linked and then removed no longer comes back as a new
+  sign-in, nor as "Rejected on another of your devices" (#3508, #3482).
+- A fresh account no longer fails KeyPackage rotation or reports
+  `RecoveryRequired` because an early read created its database (#3483,
+  #3509).
+- A refused Welcome delivery no longer drops a later delivery of the same
+  Welcome as a duplicate (#3520).
+- Background history fetches without a live tail, and epoch-gap visits, end
+  instead of polling relays continuously, and recovery status is announced
+  per route (#3541, #3548).
+- The OpenClaw plugin declares its tools and ships a Doctor contract, so it
+  installs and updates on OpenClaw 2026.10.10 and later (#3518).
+- Emoji discovery applies its 60-set limit after deduplicating (#3494).
 - A newly linked device gets each chat as the device that adds it holds it
   (#3546). A chat confirmed there from before invitation generations arrives
   confirmed instead of as an invitation from the account itself; one with an

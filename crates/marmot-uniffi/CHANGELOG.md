@@ -2,9 +2,15 @@
 
 ## Unreleased
 
+## 0.18.0 - 2026-11-20
+
 ### Breaking changes
 
-- `DeviceLinkSnapshotFfi.chatProgress` reports per-link remaining chats. Regenerate Swift or Kotlin bindings with the matching native library (#3532).
+- `MarmotKitError` gains `NoUsableRelay`, `GroupCommitPending { groupIdHex }` and `ReactionNotFound` (see Added), so
+  exhaustive Swift `switch` and Kotlin `when` must handle them. `OnboardingRelayTagChangeFfi.removalReason` has no
+  default: code that constructs the record must pass it.
+- `DeviceLinkSnapshotFfi.chatProgress` reports per-link remaining chats, defaulting to empty. Regenerate Swift or
+  Kotlin bindings with the matching native library (#3532).
 
 - `AppMessageRecordFfi` gains `invalidated: Bool`, true when a raw row is retained only as an invalidated tombstone
   (#3411). `messages` and message-subscription snapshots expose the stored flag. Code that constructs the record
@@ -18,6 +24,11 @@
   `newWithExperimentalDeviceGroups` is now the same open, kept so existing hosts keep compiling. There is no binding
   switch to turn device groups off.
 
+### Changed
+
+- Destructive sign-out reports a member Leave it could only queue in its leave failures instead of counting the group
+  as left (#3539).
+
 ### Added
 
 - `MarmotKitError.NoUsableRelay` reports a group send none of whose relays MDK may send to, such as relays at
@@ -29,7 +40,7 @@
   for a local no-match; refresh authoritative state before treating it as
   convergence (#1963).
 
-- `attachment_removals(account_ref, cursor, limit)` exposes durable bounded
+- `attachmentRemovals(accountRef, cursor, limit)` exposes durable bounded
   source-slot removal identities for host derivative caches (mdk#3491), with
   `AttachmentBodyRemovalFfi`, `AttachmentBodyRemovalStateFfi`, and
   `AttachmentBodyRemovalPageFfi`. Persist the returned cursor after eviction;

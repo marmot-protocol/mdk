@@ -9,6 +9,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-20
+
 ### Changed
 
 - Device-link status shows remaining chats on each device and includes per-link counts in the JSON `chat_progress` field (#3532).
@@ -16,7 +18,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Every `wn`/`wnd` build includes multi-device (mdk#2628), on by default; `--features dev-device-groups` is gone.
   `wn devices` linking, the device roster and admin step-down on Leave work in the CLI and TUI without setup, so
   `groups management` reports `requires_self_demote_before_leave` false for a nonlast admin. Export
-  `WN_DEVICE_GROUPS=0` for both `wn` and `wnd` to turn device groups off.
+  `WN_DEVICE_GROUPS=0` for both `wn` and `wnd` to turn device groups off. `wn daemon status` JSON adds
+  `device_groups`, so clients such as the TUI follow the daemon's setting.
+- WN Agent runs its accounts with device groups on, through the runtime's default; it has no switch for them.
 
 ### Added
 
@@ -27,6 +31,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   pending, ahead of `group_catching_up` and `group_commit_undelivered`.
 - `wn groups changes-not-delivered <group-hex>` lists your group changes given up after their call returned, and
   `wn groups acknowledge-change-not-delivered <group-hex> <commit-hex>` clears one (mdk#2332).
+
+### Fixed
+
+- The OpenClaw plugin declares its `marmot_history` and `marmot_group_profile` tools and ships an empty Doctor
+  contract, so it installs, and updates with a pending Doctor-inspection record, on OpenClaw 2026.10.10 and later
+  (#3518).
 
 ## [0.17.0] - 2026-11-15
 
@@ -3389,7 +3399,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/marmot-protocol/mdk/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/marmot-protocol/mdk/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/marmot-protocol/mdk/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/marmot-protocol/mdk/compare/v0.14.0...v0.15.0

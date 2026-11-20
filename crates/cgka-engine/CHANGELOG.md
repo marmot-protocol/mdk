@@ -2,8 +2,12 @@
 
 ## Unreleased
 
+## 0.18.0 - 2026-11-20
+
 ### Breaking changes
 
+- The `dev-device-groups` feature is gone (mdk#2628): every build may advertise the device-roster component
+  (`marmot.account.device-roster.v1`), so other clients see it in this build's capabilities.
 - `SiblingWelcome` gains `forwarded`, encoded as version 3 when anything is forwarded: the original inviter, and for
   a copy with no invitation generation whether it is confirmed (mdk#3546). A sibling join reports it on
   `GroupJoined.forwarded`. Receivers older than this refuse a version-3 Welcome. An Add that forwards anything
@@ -20,6 +24,8 @@
 
 ### Added
 
+- `Engine::stored_rejoin_welcomes` and `Engine::rejoin_offers` read the stored rejoin offers whose group's MLS state
+  loads, for the host's published read state (#3428).
 - `Engine::outbound_welcome_audit_facts` reads one retained outbound Welcome's group, id, transport source,
   recipient, origin commit, KeyPackage event id and state, in any state and without its bytes, for the sender's audit. Invite and founding Welcomes record the
   transport event id of the KeyPackage they answer.
@@ -61,6 +67,10 @@
 
 ### Fixed
 
+- A refused Welcome delivery no longer marks the Welcome's content as seen (#3520). Only a completed join, or a
+  declined rejoin offer, writes the content marker; a refusal marks only its delivery's wrapper, so a later delivery
+  of the same Welcome can still join.
+- Stored convergence leaves out this device's own commits that have not confirmed (#3531).
 - `Engine::deferred_stall_evidence` propagates storage read failures instead of omitting unread rows from its sample.
   Only `StorageError::NotFound` is skipped when a row disappears after listing, so an incomplete read cannot retire
   recovery demand as though too few failures remained.
