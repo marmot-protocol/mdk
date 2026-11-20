@@ -80,9 +80,14 @@ keys in storage and in the engine, and the `wn-agent` feed (incoming messages wi
 edits and deletes, live and on replay; a message deleted before the agent sees it reaches the agent only as its
 deletion).
 
-A kind 1111 with a numeric `k` but no lowercase `e` is a comment without a parent: like every comment it keeps its
-author's edits and its attachments, and timeline search matches it as it matches every row, but it stays a custom row
-and none of the rest of the list applies. A kind 1111 with neither is a plain custom event.
+A kind 1111 with a numeric `k` but no lowercase `e` is a comment without a parent. Like every comment it keeps its
+author's edits and deletes and its attachments, and timeline search matches it as it matches every row. It stays a
+custom row, though: it is not chat activity, so the rest of the list does not apply. A kind 1111 with neither is a plain
+custom event.
+
+A deletion can reach the `wn-agent` feed after the message it deletes: a message deleted before the connector writes
+it is dropped, but one deleted after it was written arrives as the message followed by its deletion, live or on
+replay.
 
 Admin removal is the exception: a group admin removing another member's message applies to kind 9 only, on the sending
 and the receiving side. Extending it changes what receivers accept, so it needs its own change.

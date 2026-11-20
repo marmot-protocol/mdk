@@ -5908,6 +5908,21 @@ fn delivered_inbound_cursor_dedups_and_evicts_oldest() {
     assert!(cursor.contains("d"));
 }
 
+/// Drain a lag replay the way the inbound stream does, one projection per row.
+fn replay_missed(
+    connector: &AgentConnector,
+    account_filter: Option<&str>,
+    group_filter: Option<&str>,
+    delivered: &mut DeliveredInboundCursor,
+) -> Result<Vec<AgentControlEvent>, crate::error::ConnectorError> {
+    let mut missed = connector.missed_inbound(account_filter, group_filter, delivered)?;
+    let mut events = Vec::new();
+    while let Some(event) = missed.next_event(connector, delivered)? {
+        events.push(event);
+    }
+    Ok(events)
+}
+
 #[tokio::test]
 async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     storage_sqlite::relax_storage_for_test_process();
@@ -5999,13 +6014,13 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
 
     // First replay surfaces the missed inbound message as an InboundMessage event.
     let mut delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
-    let replayed = connector
-        .replay_missed_inbound(
-            Some(&agent.account.account_id_hex),
-            Some(&group_id_hex),
-            &mut delivered,
-        )
-        .unwrap();
+    let replayed = replay_missed(
+        &connector,
+        Some(&agent.account.account_id_hex),
+        Some(&group_id_hex),
+        &mut delivered,
+    )
+    .unwrap();
     // Replay emits exactly the InboundMessage the live path emits.
     let stored_target = connector
         .runtime
@@ -6146,13 +6161,13 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    let mutation_replay = connector
-        .replay_missed_inbound(
-            Some(&agent.account.account_id_hex),
-            Some(&group_id_hex),
-            &mut delivered,
-        )
-        .unwrap();
+    let mutation_replay = replay_missed(
+        &connector,
+        Some(&agent.account.account_id_hex),
+        Some(&group_id_hex),
+        &mut delivered,
+    )
+    .unwrap();
     assert!(
         mutation_replay.iter().any(|event| matches!(
             event,
@@ -6230,16 +6245,119 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     );
 
     // A subsequent replay must not re-deliver either the message or mutations.
-    let replayed_again = connector
-        .replay_missed_inbound(
-            Some(&agent.account.account_id_hex),
-            Some(&group_id_hex),
-            &mut delivered,
-        )
-        .unwrap();
+    let replayed_again = replay_missed(
+        &connector,
+        Some(&agent.account.account_id_hex),
+        Some(&group_id_hex),
+        &mut delivered,
+    )
+    .unwrap();
     assert!(
         replayed_again.is_empty(),
         "subsequent replay must not duplicate delivered durable events: {replayed_again:?}"
+    );
+
+    // Replay projects each row only when it is about to be written, so a
+    // message deleted after replay began (while earlier frames were still
+    // going out to a slow reader) reaches the agent only as its deletion.
+    let thread_reply = |text: &str| {
+        let text = text.to_owned();
+        let runtime = &connector.runtime;
+        let human = &human.account.account_id_hex;
+        let group_id = &group_id;
+        let parent = &target_message_id_hex;
+        async move {
+            runtime
+                .send_thread_message(human, group_id, parent, text, Vec::new(), Vec::new())
+                .await
+                .unwrap()
+                .message_ids[0]
+                .clone()
+        }
+    };
+    let kept_id_hex = thread_reply("kept").await;
+    let late_deleted_id_hex = thread_reply("deleted mid-replay").await;
+    let agent_stored = |connector: &AgentConnector| {
+        connector
+            .runtime
+            .messages_with_query(
+                &agent.account.account_id_hex,
+                crate::AppMessageQuery {
+                    group_id_hex: Some(group_id_hex.clone()),
+                    kinds: None,
+                    limit: None,
+                },
+            )
+            .unwrap()
+    };
+    for _ in 0..40 {
+        connector.runtime.catch_up_accounts().await.unwrap();
+        if agent_stored(&connector)
+            .iter()
+            .any(|message| message.message_id_hex == late_deleted_id_hex)
+        {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let mut missed = connector
+        .missed_inbound(
+            Some(&agent.account.account_id_hex),
+            Some(&group_id_hex),
+            &delivered,
+        )
+        .unwrap();
+    connector
+        .runtime
+        .delete_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &late_deleted_id_hex,
+        )
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        connector.runtime.catch_up_accounts().await.unwrap();
+        if agent_stored(&connector).iter().any(|message| {
+            message.kind == MARMOT_APP_EVENT_KIND_DELETE
+                && message
+                    .tags
+                    .iter()
+                    .any(|tag| tag.get(1) == Some(&late_deleted_id_hex))
+        }) {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let mut in_flight = Vec::new();
+    while let Some(event) = missed.next_event(&connector, &mut delivered).unwrap() {
+        in_flight.push(event);
+    }
+    let inbound_ids: Vec<_> = in_flight
+        .iter()
+        .filter_map(|event| match event {
+            AgentControlEvent::InboundMessage { message, .. } => Some(&message.message_id_hex),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        inbound_ids.contains(&&kept_id_hex) && !inbound_ids.contains(&&late_deleted_id_hex),
+        "a message deleted mid-replay must not reach the agent: {in_flight:?}"
+    );
+    let after = replay_missed(
+        &connector,
+        Some(&agent.account.account_id_hex),
+        Some(&group_id_hex),
+        &mut delivered,
+    )
+    .unwrap();
+    assert!(
+        after.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::MessageDeleted { target_message_id_hex: target, .. }
+                if target == &late_deleted_id_hex
+        )),
+        "the next replay delivers the deletion: {after:?}"
     );
 
     // Raw modifiers that the materialized timeline rejects must also stay out
@@ -6316,13 +6434,13 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     }
 
     let mut human_delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
-    let rejected = connector
-        .replay_missed_inbound(
-            Some(&human.account.account_id_hex),
-            Some(&group_id_hex),
-            &mut human_delivered,
-        )
-        .unwrap();
+    let rejected = replay_missed(
+        &connector,
+        Some(&human.account.account_id_hex),
+        Some(&group_id_hex),
+        &mut human_delivered,
+    )
+    .unwrap();
     assert!(
         !rejected.iter().any(|event| matches!(
             event,

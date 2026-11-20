@@ -180,26 +180,48 @@ impl AgentConnector {
                             // reconnect backlog never silently loses user messages. The
                             // delivered-id cursor guarantees we re-deliver only messages this
                             // subscription has not already emitted.
-                            match self.replay_missed_inbound(
+                            // Project each missed row just before writing it: a slow reader
+                            // can hold an earlier frame while an author deletes a later
+                            // message, and that message must then go out only as its deletion.
+                            let observation = self.runtime.begin_product_operation(
+                                marmot_app::ProductFamily::Agent,
+                                "replay",
+                                marmot_app::ProductUnit::Attempt,
+                            );
+                            let mut replayed_events = 0_usize;
+                            let outcome = match self.missed_inbound(
                                 account_id_hex.as_deref(),
                                 group_id_hex.as_deref(),
-                                &mut delivered,
+                                &delivered,
                             ) {
-                                Ok(missed) => {
+                                Ok(mut missed) => loop {
+                                    match missed.next_event(self, &mut delivered) {
+                                        Ok(Some(replayed)) => {
+                                            let envelope = AgentControlEnvelope::new(
+                                                request_id.clone(),
+                                                replayed,
+                                            );
+                                            write_control_frame(writer, &envelope).await?;
+                                            replayed_events += 1;
+                                        }
+                                        Ok(None) => break Ok(()),
+                                        Err(err) => break Err(err),
+                                    }
+                                },
+                                Err(err) => Err(err),
+                            };
+                            if let Some(observation) = observation {
+                                observation.finish(if outcome.is_ok() { "success" } else { "failure" });
+                            }
+                            match outcome {
+                                Ok(()) => {
                                     tracing::warn!(
                                         target: "agent_connector",
                                         method = "stream_inbound_events",
                                         dropped_events = dropped,
-                                        replayed_events = missed.len(),
+                                        replayed_events,
                                         "inbound broadcast lagged; replayed missed events from storage"
                                     );
-                                    for replayed in missed {
-                                        let envelope = AgentControlEnvelope::new(
-                                            request_id.clone(),
-                                            replayed,
-                                        );
-                                        write_control_frame(writer, &envelope).await?;
-                                    }
                                     continue;
                                 }
                                 Err(err) => {
@@ -280,42 +302,24 @@ impl AgentConnector {
     }
 
     /// Recover control events that were dropped from the broadcast channel by re-reading durable
-    /// per-account storage. Returns missed chat/delete/group-state events scoped to this
-    /// subscription's filters, skipping any storage row id already recorded in `delivered` and
-    /// recording the ones it returns. This is how a lagged subscription recovers ambient inbound
-    /// facts instead of silently losing them: the connector re-queries its own state, exactly the
-    /// resync the agent could not perform on its own.
-    pub(crate) fn replay_missed_inbound(
+    /// per-account storage. Returns the rows this subscription's filters cover and `delivered`
+    /// has not recorded; [`MissedInbound::next_event`] projects them one at a time. This is how a
+    /// lagged subscription recovers ambient inbound facts instead of silently losing them: the
+    /// connector re-queries its own state, exactly the resync the agent could not perform on its
+    /// own.
+    pub(crate) fn missed_inbound(
         &self,
         account_filter: Option<&str>,
         group_filter: Option<&str>,
-        delivered: &mut DeliveredInboundCursor,
-    ) -> Result<Vec<AgentControlEvent>, ConnectorError> {
-        let observation = self.runtime.begin_product_operation(
-            marmot_app::ProductFamily::Agent,
-            "replay",
-            marmot_app::ProductUnit::Attempt,
-        );
-        let result = self.replay_missed_inbound_unobserved(account_filter, group_filter, delivered);
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    fn replay_missed_inbound_unobserved(
-        &self,
-        account_filter: Option<&str>,
-        group_filter: Option<&str>,
-        delivered: &mut DeliveredInboundCursor,
-    ) -> Result<Vec<AgentControlEvent>, ConnectorError> {
+        delivered: &DeliveredInboundCursor,
+    ) -> Result<MissedInbound, ConnectorError> {
         // Replay for the filtered account, or for every local account on an unscoped
         // subscription (mirroring the live path, which emits for all local accounts).
         let accounts = match account_filter {
             Some(account_id_hex) => vec![self.local_account_for_account_id(account_id_hex)?],
             None => self.account_home.accounts()?,
         };
-        let mut events = Vec::new();
+        let mut rows = Vec::new();
         for account in accounts {
             // #609/#747: bound the replay to the newest `DELIVERED_INBOUND_CURSOR_CAPACITY`
             // rows instead of `limit: None` (the entire per-account history). Lag
@@ -333,26 +337,63 @@ impl AgentConnector {
                 limit: Some(crate::DELIVERED_INBOUND_CURSOR_CAPACITY),
             };
             let records = self.runtime.messages_with_query(&account.label, query)?;
-            for record in records {
-                let replay_id = record.message_id_hex.clone();
-                if delivered.contains(&replay_id) {
-                    continue;
-                }
-                let Some(event) = inbound_message_event_from_record_with_runtime(
-                    &self.runtime,
-                    &account.label,
-                    &account.account_id_hex,
-                    record,
-                    account_filter,
-                    group_filter,
-                )?
-                else {
-                    continue;
-                };
-                delivered.record(replay_id);
-                events.push(event);
-            }
+            rows.extend(
+                records
+                    .into_iter()
+                    .filter(|record| !delivered.contains(&record.message_id_hex))
+                    .map(|record| {
+                        (
+                            account.label.clone(),
+                            account.account_id_hex.clone(),
+                            record,
+                        )
+                    }),
+            );
         }
-        Ok(events)
+        Ok(MissedInbound {
+            account_filter: account_filter.map(str::to_owned),
+            group_filter: group_filter.map(str::to_owned),
+            rows: rows.into_iter(),
+        })
+    }
+}
+
+/// Stored rows a lagged subscription missed, still unprojected. Each row is projected only when
+/// the caller is ready to write it, so the projection sees the row's state at that moment (a
+/// message deleted meanwhile yields nothing; its deletion is a row of its own).
+pub(crate) struct MissedInbound {
+    account_filter: Option<String>,
+    group_filter: Option<String>,
+    rows: std::vec::IntoIter<(String, String, marmot_app::AppMessageRecord)>,
+}
+
+impl MissedInbound {
+    /// Project the next missed row this subscription should receive, recording it in
+    /// `delivered`, or `None` once every row is done.
+    pub(crate) fn next_event(
+        &mut self,
+        connector: &AgentConnector,
+        delivered: &mut DeliveredInboundCursor,
+    ) -> Result<Option<AgentControlEvent>, ConnectorError> {
+        for (account_label, account_id_hex, record) in self.rows.by_ref() {
+            let replay_id = record.message_id_hex.clone();
+            if delivered.contains(&replay_id) {
+                continue;
+            }
+            let Some(event) = inbound_message_event_from_record_with_runtime(
+                &connector.runtime,
+                &account_label,
+                &account_id_hex,
+                record,
+                self.account_filter.as_deref(),
+                self.group_filter.as_deref(),
+            )?
+            else {
+                continue;
+            };
+            delivered.record(replay_id);
+            return Ok(Some(event));
+        }
+        Ok(None)
     }
 }

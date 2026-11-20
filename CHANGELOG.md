@@ -10,7 +10,8 @@
 ### Fixed
 
 - `wn-agent` no longer passes a message's original text and attachments to the agent when it was deleted before the
-  agent caught up after a lag; the agent receives only the deletion.
+  agent caught up after a lag, including while earlier catch-up messages were still being written; the agent receives
+  only the deletion.
 
 ## 0.18.0 - 2026-11-20
 
