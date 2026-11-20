@@ -3793,12 +3793,32 @@ async fn setup_rollback_reaps_worker() {
         Some(&imported),
         AppError::MissingDefaultRelays,
     ));
-    let first = futures::poll!(rollback.as_mut());
+    let early = timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        loop {
+            if let std::task::Poll::Ready(result) = futures::poll!(rollback.as_mut()) {
+                break Some(result);
+            }
+            let reaping = manager
+                .worker_reapers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|reaper| reaper.account_id == account.account_id_hex);
+            if reaping {
+                break None;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rollback reaches its tracked worker reaper");
+    let reached_reaper = early.is_none();
     let live_while_open = app.account_home().account(&account.label).is_ok();
+    let worker_held = !old_commands.is_closed();
     proceed.send(()).unwrap();
-    let result = match first {
-        std::task::Poll::Ready(result) => result,
-        std::task::Poll::Pending => rollback.await,
+    let result = match early {
+        Some(result) => result,
+        None => rollback.await,
     };
     let worker_stopped = old_commands.is_closed();
     let removed = matches!(
@@ -3807,6 +3827,11 @@ async fn setup_rollback_reaps_worker() {
     );
     runtime.shutdown().await;
 
+    assert!(
+        reached_reaper,
+        "rollback completed before reaping its worker"
+    );
+    assert!(worker_held, "the session gate still holds the old worker");
     assert!(
         live_while_open,
         "rollback must not tombstone an open session"

@@ -15,6 +15,12 @@ struct Network {
     public_indexer_events: FixtureMutex<Vec<NostrTransportEvent>>,
     attempts: FixtureMutex<Vec<NostrTransportEvent>>,
     published_endpoints: FixtureMutex<Vec<Vec<String>>>,
+    held_fetch: FixtureMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     fail_reads: AtomicBool,
     return_off_filter_events: AtomicBool,
     fail_index_only: AtomicBool,
@@ -43,6 +49,11 @@ impl DirectoryRelayFetcher for Network {
                 .iter()
                 .all(|e| e.policy == RelayEndpointPolicy::Allowed)
         );
+        let held = self.held_fetch.lock().take();
+        if let Some((entered, proceed)) = held {
+            entered.send(()).unwrap();
+            proceed.await.expect("release held directory fetch");
+        }
         if self.fail_reads.load(Ordering::SeqCst)
             || request
                 .endpoints
@@ -5906,6 +5917,119 @@ impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for Blockin
             .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
         request.signature_from_signed_event(event)
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promoted_rollback_reaps() {
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    let directory = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let (fetch_entered, fetch_seen) = tokio::sync::oneshot::channel();
+    let (fetch_release, fetch_proceed) = tokio::sync::oneshot::channel();
+    *network.held_fetch.lock() = Some((fetch_entered, fetch_proceed));
+    let runtime = runtime(directory.path(), network);
+    let manager = runtime.accounts();
+    let app = &manager.app;
+    let home = app.account_home();
+    let keys = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
+    let id = keys.public_key().to_hex();
+    let public = home.add_public_account(&id).unwrap();
+    let payload = home.account_dir(&id).join("retained-public-payload");
+    fs_private::write_private(&payload, b"existing public payload").unwrap();
+    let mut login = Box::pin(manager.login_external_signer(
+        id.clone(),
+        BlockingSigner {
+            keys,
+            block: Arc::new(AtomicBool::new(false)),
+            started: Arc::new(Notify::new()),
+        },
+        AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://default.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://default.example".into())],
+            discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
+            publish_missing_relay_lists: false,
+            publish_initial_key_package: false,
+            ..Default::default()
+        },
+    ));
+    tokio::time::timeout(DEADLINE, async {
+        tokio::select! {
+            result = &mut login => panic!("setup completed before held discovery: {result:?}"),
+            result = fetch_seen => result.unwrap(),
+        }
+    })
+    .await
+    .unwrap();
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    app.install_local_open_gate(
+        &id,
+        crate::AccountStartupStage::SessionOpen,
+        opened_tx,
+        proceed_rx,
+    )
+    .unwrap();
+    let starting = manager.clone();
+    let reconcile = tokio::spawn(async move { starting.reconcile().await });
+    tokio::task::spawn_blocking(move || opened_rx.recv_timeout(DEADLINE).unwrap())
+        .await
+        .unwrap();
+    reconcile.abort();
+    assert!(reconcile.await.unwrap_err().is_cancelled());
+    let old_commands = manager.workers.lock().await[&id].commands.clone();
+    fetch_release.send(()).unwrap();
+
+    let early = tokio::time::timeout(DEADLINE, async {
+        loop {
+            if let std::task::Poll::Ready(result) = futures::poll!(login.as_mut()) {
+                break Some(result);
+            }
+            let reaping = manager
+                .worker_reapers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|reaper| reaper.account_id == id);
+            if reaping {
+                break None;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("promotion rollback reaches its tracked worker reaper");
+    let reached_reaper = early.is_none();
+    let external_while_open = home
+        .account(&id)
+        .is_ok_and(|account| account.external_signing);
+    let worker_held = !old_commands.is_closed();
+    proceed_tx.send(()).unwrap();
+    let result = match early {
+        Some(result) => result,
+        None => login.await,
+    };
+    let worker_stopped = old_commands.is_closed();
+    let restored = home.account(&id).unwrap();
+    let retained = std::fs::read(&payload).unwrap();
+    runtime.shutdown_and_close().await.unwrap();
+
+    assert!(
+        reached_reaper,
+        "promotion completed before reaping its worker"
+    );
+    assert!(worker_held, "the session gate still holds the old worker");
+    assert!(
+        external_while_open,
+        "the public role must not be restored before reaping"
+    );
+    assert!(worker_stopped, "the old external worker must be stopped");
+    assert!(
+        matches!(&result, Err(AppError::DirectoryLookupIncomplete(account)) if account == &id),
+        "retain the incomplete-directory error after compensation: {result:?}"
+    );
+    assert_eq!(restored, public);
+    assert_eq!(retained, b"existing public payload");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
