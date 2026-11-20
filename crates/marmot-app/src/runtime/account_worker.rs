@@ -1869,8 +1869,11 @@ async fn run_app_runtime_account_worker(
         // pass (mdk#3566). What it leaves owed retries with maintenance. Not
         // once shutdown is requested, as no scheduled job runs then: the
         // answer is saved, and the next start sends and applies it.
+        // Nor once this worker alone is told to stop: the select below
+        // takes that signal, which checking it here leaves in place.
         if client.invitation_decisions_changed
             && !lifecycle.is_stopping()
+            && shutdown.is_empty()
             && Box::pin(client.drive_changed_invitation_decisions()).await
         {
             publish_settled_invitations(&mut client, &events, &account_id_hex, &account_label);
