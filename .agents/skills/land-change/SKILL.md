@@ -175,8 +175,8 @@ gh pr view <pr> --json headRefOid,mergeable,mergeStateStatus,reviewDecision
 | --- | --- | --- |
 | `CLEAN`, `HAS_HOOKS` | Checks pass, nothing blocks | Ready: step 6 |
 | `UNSTABLE` | A non-required check failed | Classify it with the table below; ready once it is not yours |
-| `BEHIND` | Master moved and the branch must be up to date | Rebase on `origin/master`, redo step 2, redo step 3 (a rebase needs a new round), push, check again |
-| `DIRTY` | Conflicts | Rebase and resolve, redo steps 2 and 3, push, check again |
+| `BEHIND` | Master moved and the branch must be up to date | `git fetch origin master`, rebase on `origin/master`, redo step 2, redo step 3 (a rebase needs a new round), push, check again |
+| `DIRTY` | Conflicts | `git fetch origin master`, rebase and resolve, redo steps 2 and 3, push, check again |
 | `BLOCKED` | Required checks pending or failing, or a required human review | Wait for checks (below). If only a human approval is missing (`reviewDecision: REVIEW_REQUIRED`), it is ready: step 6 |
 | `UNKNOWN` | GitHub is still computing | Check again shortly |
 
@@ -201,8 +201,8 @@ which case it is:
 | --- | --- | --- |
 | Your bug | Fails on your branch, passes on `origin/master` | Fix it, redo steps 2 and 3, push |
 | Conflict with a change that landed ahead of you | Passes on your branch alone, fails once rebased onto `origin/master` | Rebase, fix the interaction, redo steps 2–3, push |
-| Flake | Intermittent, also fails on `origin/master`, or in code your change cannot reach | Leave the test alone. Open or update an issue for it (search the test name first), then rerun the job once |
-| Master is broken | The same failure in master's own CI | Find the open PR fixing it and rebase once it lands. Do not fix it again in your PR |
+| Flake | Intermittent, or in code your change cannot reach | Leave the test alone. Open or update an issue for it (search the test name first), then rerun the job once |
+| Master is broken | The same failure in master's own CI, or it fails every time on a fresh `origin/master` | Find the open PR fixing it and rebase once it lands. Do not fix it again in your PR |
 
 A flake already on the `just flake-report` leaderboard, or with an open
 `Flaky:` issue, is already tracked: do only what the flake row asks (update
