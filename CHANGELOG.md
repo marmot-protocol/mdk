@@ -2,8 +2,33 @@
 
 ## Unreleased
 
+## 0.18.0 - 2026-11-20
+
 ### Breaking changes
 
+- Multi-device ships. Every build includes device groups and every MarmotKit,
+  Marmot C and WN Agent runtime opens with them on: device linking, the
+  linked-device list, sign-in review, history transfer, backups and admin
+  step-down on Leave work without a special build or constructor, and a
+  runtime with them on advertises the device-roster component. The `dev-device-groups` and
+  `unreleased-device-pairing` Cargo features and the `--dev-device-groups`
+  build flags are gone. `MarmotAppConfig::dev_device_groups` is renamed
+  `device_groups` and defaults to true; `wn` and `wnd` honor
+  `WN_DEVICE_GROUPS=0`. Ship the new library in every process that opens a
+  root, extensions included (#3476, #3519).
+- A sibling Welcome that forwards how the adding device holds a chat is
+  version 3, which devices older than this release refuse (#3564).
+- MarmotKit adds `MarmotKitError.GroupCommitPending`, `NoUsableRelay` and
+  `ReactionNotFound`, `GroupEventKindFfi.GroupChangeNotDelivered` and
+  `OnboardingActionFfi.RemoveUnusableRelays`; exhaustive switches must add
+  them. `AppMessageRecordFfi.invalidated`, `OnboardingDevicePackageFfi.client`
+  and `OnboardingRelayTagChangeFfi.removal_reason` are new fields without
+  defaults. C adds statuses 131 to 133 and changes the layout of seven
+  records. See the crate changelogs.
+- Account databases migrate from schema 207 to 216 (0208 to 0216), the shared
+  database from 4 to 5 (0005) and the per-account directory cache from 2 to 3,
+  on first open. Older binaries refuse the upgraded databases; downgrade is
+  unsupported.
 - C hosts: `MarmotSelectedMessageDraftAttachment` and
   `MarmotAttachmentStorageUsage` gain fields for file-backed draft attachments
   (#3431), so their layouts changed: rebuild with the matching header and
@@ -13,6 +38,22 @@
 
 ### Added
 
+- Device-link status reports how many chats remain on each device
+  (`chat_progress`) (#3543).
+- `attachment_removals` (Rust, UniFFI, C) exposes durable, bounded removal
+  identities for host derivative caches (#3495).
+- Raw message records carry `invalidated` for rows kept only as invalidated
+  tombstones (#3463).
+- `start_direct_conversation_with_options` founds a direct chat with a
+  disappearing-message duration in its founding state (#3432).
+- NIP-22 comments (kind 1111) project as editable replies with their parent,
+  media and author edits; account migration 0208 repairs retained ones
+  (#3435).
+- Onboarding lets users fix a relay or inbox list whose check was
+  inconclusive (#3445), suggests removing declared relays that cannot serve
+  their role (#3453), names the app another installation's package reports
+  (#3447), and keeps a single-device acknowledgment across a long pause
+  (#3444).
 - The v5 audit records every invite on the sender, not only a new group's
   founding Welcomes. An invite into an existing group records
   `welcome_prepared` naming the exact KeyPackage its Welcome answers, every
@@ -93,18 +134,35 @@
   `upload_message_draft_attachments`, whose references carry the staged
   bodies' descriptors and digests, before `send_message_draft`. No full-size
   buffer crosses the binding after staging. Storage usage reports the staged
-  bytes as `draft_bytes`. `message_draft_attachment_if_revision` and the
-  legacy whole-draft read refuse a draft with a file-backed attachment.
+  bytes as `draft_bytes`. `message_draft_attachment_if_revision` refuses a
+  file-backed attachment (it still reads inline ones), and the legacy
+  whole-draft read refuses a draft that holds one.
 
 ### Changed
 
+- Idle accounts no longer wake every 15 seconds (#3258, #3361, #3568). Session
+  maintenance, device pairing, the device-group passes, recovery, post-join
+  work, attachments, avatars and the other maintenance jobs run when an event
+  wakes them and at the deadline their data gives, and an idle maintenance
+  tick takes no writer transaction (#3487). Deadlines a week or more out ride
+  the hourly heartbeat's run, so they can be up to an hour late.
+- WN Agent accounts run with device groups on, through the runtime's new
+  default; the connector has no switch for them.
+- Runtime shutdown gives Welcome waves still publishing up to 2 s before it
+  cancels them, so a Welcome a create or invite just started is usually sent
+  before exit (#3488). `shutdown_and_close` still closes storage first: a wave
+  that settles after the close leaves its Welcome owed, and the next start
+  sends it again.
+- Destructive sign-out reports queued member leaves in its leave failures
+  instead of counting them as left (#3539).
 - A group change made while the group's own commit is pending fails with the
   new `GroupCommitPending` (Rust `AppError`, UniFFI `MarmotKitError`, C
   `MARMOT_STATUS_GROUP_COMMIT_PENDING`, CLI `group_commit_pending`) instead of
   the engine's untyped refusal (#2332). It is checked before `GroupCatchingUp`
   and `GroupCommitUndelivered`, and no acknowledgement releases it: retry once
   the commit confirms. A member's leave and invite decline fail the same way.
-  Disbanding and an admin's leave are still accepted, and messages still send.
+  Disbanding and an admin's leave are still accepted, and messages are accepted
+  but wait in the queue until the commit resolves.
 - `send_message_draft` (Rust, UniFFI, C) and captured-media admission match
   prepared media to the draft's attachments after the normalization an upload
   applies (#3431): a V1 upload's trimmed file name and either version's
@@ -113,6 +171,26 @@
 
 ### Fixed
 
+- An invitation answered on one linked device shows as answered on the other
+  within seconds instead of about a minute (#3568).
+- When a device is linked to an account with two or more devices, the
+  approver adds it to its chats while active and the other devices wait, so
+  they no longer both add it and fork chats (#3562).
+- A newly linked device no longer reads pre-join history as an epoch gap,
+  which offered a needless Reset Device List and held its chats back (#3552).
+- A device the user linked and then removed no longer comes back as a new
+  sign-in, nor as "Rejected on another of your devices" (#3508, #3482).
+- A fresh account no longer fails KeyPackage rotation or reports
+  `RecoveryRequired` because an early read created its database (#3483,
+  #3509).
+- A refused Welcome delivery no longer drops a later delivery of the same
+  Welcome as a duplicate (#3520).
+- Background history fetches without a live tail, and epoch-gap visits, end
+  instead of polling relays continuously, and recovery status is announced
+  per route (#3541, #3548).
+- The OpenClaw plugin declares its tools and ships a Doctor contract, so it
+  installs and updates on OpenClaw 2026.10.10 and later (#3518).
+- Emoji discovery applies its 60-set limit after deduplicating (#3494).
 - A newly linked device gets each chat as the device that adds it holds it
   (#3546). A chat confirmed there from before invitation generations arrives
   confirmed instead of as an invitation from the account itself; one with an
@@ -172,7 +250,7 @@
   send by asking its relays for it (#2332). From then on, each retry of a
   relay that may hold the change first reads that exact change back from it,
   and a relay that returns it confirms the change. The read never signs in as
-  the account, sends one request per relay, at most eight an hour, and feeds
+  the account, sends one request per relay, at most eight per account per relay an hour, and feeds
   nothing into message handling. Any other answer changes nothing: the relay
   is resent to as before, and nothing rolls back because a read found nothing.
 - Give up a group change that reached no relay (#2332). Ten minutes after its
@@ -190,13 +268,15 @@
   instead of leaving it queued to be prepared and sent again. A change whose
   commit was stored by an earlier release is prepared once more after such a
   rollback, and its new commit carries the link.
-- Send a queued message once (#2332). A message sent while a group change was
-  pending waits in the queue, and it was prepared and sent a second time when
-  its first send reached no relay and a retry later did, or when the app
-  restarted before its send resolved. Its stored send now names the queued
-  message, which retires when the send resolves, so a retry or a restart no
-  longer duplicates it. A message whose send was stored by an earlier release
-  can still be sent once more after a restart.
+- Prepare a queued message once across retries and restarts (#2332). A
+  message sent while a group change was pending waits in the queue, and it
+  was prepared and sent a second time, as a new message, when its first send
+  reached no relay and a retry later did, or when the app restarted before
+  its send resolved. Its stored send now names the queued message, which
+  retires when the send resolves, so a retry or a restart no longer prepares
+  it again; relays can still receive the same event more than once while the
+  send resolves. A message whose send was stored by an earlier release can
+  still be prepared once more after a restart.
 
 ## 0.17.0 - 2026-11-15
 

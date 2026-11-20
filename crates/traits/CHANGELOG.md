@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.18.0 - 2026-11-20
+
 ### Breaking changes
 
 - `SendIntent::AddOwnAccountDevices` and `GroupEvent::GroupJoined` gain `forwarded: ForwardedInvitation`, what the

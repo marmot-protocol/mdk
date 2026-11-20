@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-20
+
 ### Breaking changes
 
 - `MarmotDeviceLinkSnapshot` gains trailing `chat_progress` and `chat_progress_len` fields. Rebuild clients with the matching header and library (#3532).
@@ -41,6 +43,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   linked devices, runs backups and steps a nonlast admin down on Leave.
   `marmot_client_new_with_experimental_device_groups` is now the same open, kept so existing hosts keep linking. There
   is no C switch to turn device groups off.
+
+### Changed
+
+- Destructive sign-out reports a member Leave it could only queue in its leave failures instead of counting the group
+  as left (#3539).
 
 ### Added
 
@@ -1318,7 +1325,8 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.17.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.18.0...HEAD
+[0.18.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.17.0...marmotc-v0.18.0
 [0.17.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.16.0...marmotc-v0.17.0
 [0.16.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.15.0...marmotc-v0.16.0
 [0.15.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.14.0...marmotc-v0.15.0
