@@ -3,19 +3,26 @@
 # seat, a read-only input directory holding the diff, the context, the
 # guidelines and the prompt, and an output directory no reviewer is given.
 #
-# usage: prepare-round.sh <seat-a> [<seat-b>] [--context file] [--notes file] [--base ref]
+# usage: prepare-round.sh <seat-a> [<seat-b>] --round n [--user-approved]
+#                         [--context file] [--notes file] [--base ref]
 #   seat       codex | claude | cursor | opencode; one seat only to replace a
 #              seat that could not run (see SKILL.md)
+#   --round    this round's number (SKILL.md says how to count). Rounds after
+#              the first need --notes. Rounds past the limit need
+#              --user-approved: the user read the stop report and chose to go on
 #   --context  what the change is for: the issue text or the user's request
 #   --notes    later rounds only: previous findings and the author's answers
 #   --base     defaults to the remote's default branch (origin/HEAD)
 #
 # Run from inside the repository. Prints shell assignments for REVIEW_DIR,
-# OUT_DIR, BASE and HEAD_SHA.
+# OUT_DIR, BASE, HEAD_SHA and ROUND.
 set -euo pipefail
 
+# Rounds without two merge verdicts before the author must stop and report.
+round_limit=3
+
 usage() {
-  echo "usage: prepare-round.sh <seat-a> [<seat-b>] [--context file] [--notes file] [--base ref]" >&2
+  echo "usage: prepare-round.sh <seat-a> [<seat-b>] --round n [--user-approved] [--context file] [--notes file] [--base ref]" >&2
   exit 2
 }
 
@@ -28,9 +35,17 @@ done
 context_file=""
 notes_file=""
 base_ref=""
+round=""
+user_approved=0
 while [[ $# -gt 0 ]]; do
+  if [[ $1 == --user-approved ]]; then
+    user_approved=1
+    shift
+    continue
+  fi
   [[ $# -ge 2 ]] || usage
   case "$1" in
+    --round) round=$2 ;;
     --context) context_file=$2 ;;
     --notes) notes_file=$2 ;;
     --base) base_ref=$2 ;;
@@ -38,6 +53,21 @@ while [[ $# -gt 0 ]]; do
   esac
   shift 2
 done
+
+if [[ ! $round =~ ^[1-9][0-9]*$ ]]; then
+  echo "--round <n> is required: 1 for a change's first round (see SKILL.md)" >&2
+  exit 2
+fi
+if [[ $round -gt 1 && -z $notes_file ]]; then
+  echo "round $round needs --notes: the previous findings and your answer to each" >&2
+  exit 2
+fi
+if [[ $round -gt $round_limit && $user_approved -eq 0 ]]; then
+  echo "round $round is past the limit of $round_limit. Stop: write the report in" >&2
+  echo "SKILL.md's 'When review does not converge', end your turn and wait for the" >&2
+  echo "user. Pass --user-approved only once they have chosen to go on." >&2
+  exit 3
+fi
 
 for seat in "${seats[@]}"; do
   case "$seat" in
@@ -98,8 +128,8 @@ fi
 
 tmp_root="${TMPDIR:-/tmp}"
 tmp_root="${tmp_root%/}"
-# Physical paths: OpenCode resolves /var to /private/var on macOS, and its
-# allow rule for the input directory must match the path the prompt names.
+# Resolve symlinks (macOS: /var -> /private/var) so every path in the prompt
+# matches what the reviewers resolve, including OpenCode's allow rule.
 review_dir="$(cd "$(mktemp -d "$tmp_root/review-local.XXXXXX")" && pwd -P)"
 out_dir="$(cd "$(mktemp -d "$tmp_root/review-out.XXXXXX")" && pwd -P)"
 # A failure past this point would leave worktrees registered in the repository
@@ -150,8 +180,22 @@ surrounding code you need. Do not edit files, commit, push or post anything.
    speculative flexibility, and drive-by changes outside the change's scope.
 
 Skip pure style preferences. Every finding must be actionable and worth the
-author's time. For each give severity (blocker, should-fix, minor),
-file:line, a concrete failure scenario or cost, and a suggested fix.
+author's time. For each give severity, file:line, a concrete failure scenario
+or cost, and a suggested fix. Severities:
+
+- blocker: the change should not land as built. It is wrong, unsafe, breaks
+  a documented invariant, or should not exist.
+- should-fix: a real defect that normal use or a normal caller will hit, or
+  a rare one whose damage is severe or cannot be undone: data loss or
+  corruption, a security or privacy hole, state that cannot recover.
+- minor: everything else worth saying, such as a small cleanup, a weak test
+  name, or a rare edge case whose effect is recoverable (a retry, a reload or
+  a restart fixes it).
+
+The verdict follows from severity. Say VERDICT: merge when no blocker or
+should-fix remains, even if you list minor findings; minor findings never
+block a merge. Say VERDICT: changes-needed only for a blocker or a
+should-fix.
 EOF
     if [[ -n "$notes_file" ]]; then
       printf '\nThis is a later round. The previous findings and the author'"'"'s answers\n'
@@ -164,5 +208,5 @@ EOF
   chmod -R a-w "$input"
 done
 
-printf 'REVIEW_DIR=%q\nOUT_DIR=%q\nBASE=%q\nHEAD_SHA=%q\n' \
-  "$review_dir" "$out_dir" "$base" "$head_sha"
+printf 'REVIEW_DIR=%q\nOUT_DIR=%q\nBASE=%q\nHEAD_SHA=%q\nROUND=%s\n' \
+  "$review_dir" "$out_dir" "$base" "$head_sha" "$round"

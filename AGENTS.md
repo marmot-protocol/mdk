@@ -44,7 +44,7 @@ before adding behavior or bindings.
 | Shared terminal-harness runtime | `integrations/terminal-harness/AGENTS.md` |
 | Claude Code / Codex / OpenCode / Pi / Goose harnesses | `integrations/{claude,codex,opencode,pi,goose}/marmot/AGENTS.md` |
 | Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
-| Production audit pipeline (White Noise audit receiver and reader in `internet-privacy/whitenoise-data`), investigating a group from audit records | `docs/marmot-architecture/audit-logging.md#downstream-whitenoise-data`; query with the `whitenoise-reader` skill |
+| Production audit pipeline (White Noise audit receiver and reader in `internet-privacy/whitenoise-data`), investigating a group from audit records | `docs/marmot-architecture/audit-logging.md#downstream-whitenoise-data`; query with `.agents/skills/whitenoise-reader/SKILL.md` |
 | App runtime UniFFI bindings | `crates/marmot-uniffi/AGENTS.md` |
 | UniFFI async-export runtime macro | `crates/marmot-uniffi-macros/AGENTS.md` |
 | App runtime C ABI bindings | `crates/marmot-c/AGENTS.md` |
@@ -60,14 +60,16 @@ before adding behavior or bindings.
 | Releases | `release.md` |
 | Writing, reviewing, or pruning tests | `.agents/skills/test-audit/SKILL.md` |
 | Landing a change (verify, review, PR, merge queue) | `.agents/skills/land-change/SKILL.md` |
+| Writing a PR description | `.agents/skills/gh-create-pr/SKILL.md` |
 
 ## Landing changes
 
 Every change reaches master through the merge queue; nobody pushes to master or bypasses the queue. Verification and
 review happen locally, the PR carries the change, and the queue runs the full CI matrix on the exact commit that
 lands. Follow `.agents/skills/land-change`: targeted tests plus the end-to-end smoke, two independent cross-model
-reviews of the local diff (`.agents/skills/review-local`) until both recommend merge, a short PR, enqueue as soon as
-the pre-check passes, and own the queue result until the change merges.
+reviews of the local diff (`.agents/skills/review-local`) until both recommend merge, a short PR
+(`.agents/skills/gh-create-pr`) brought to a green pre-check with no conflicts, then a report. Enqueue only when the
+user asks, and then own the queue result until the change merges.
 
 ## Documentation
 

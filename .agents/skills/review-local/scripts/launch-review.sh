@@ -18,7 +18,7 @@
 #   refuses MCP tools that write.
 # - Codex without --ignore-user-config loaded MCP servers from
 #   ~/.codex/config.toml, which run outside its read-only sandbox.
-# - OpenCode (checked 2026-11-17, 2.2.1 under numes): ~/.config/opencode holds
+# - OpenCode (checked 2026-11-17, under numes): ~/.config/opencode holds
 #   the user's MCP servers, custom tools and plugins, so OPENCODE_CONFIG_DIR
 #   replaces it with a round-local one whose only agent denies every tool but
 #   read, grep and glob. --standalone keeps the run off the background
@@ -46,11 +46,9 @@ done
 rc=0
 case "$seat" in
   codex)
-    # --ignore-user-config also drops ~/.codex's reasoning effort, which
-    # leaves the seat at none (seen 2026-11-17); set it here.
     model=gpt-6.2-sol
-    codex exec --ignore-user-config -c model_reasoning_effort='"xhigh"' \
-      -s read-only -m "$model" \
+    # --ignore-user-config also drops model_reasoning_effort, leaving effort none.
+    codex exec --ignore-user-config -c model_reasoning_effort='"medium"' -s read-only -m "$model" \
       -C "$checkout" -o "$out_dir/codex.md" - \
       < "$input/prompt.md" > "$out_dir/codex.log" 2>&1 || rc=$?
     ;;
@@ -60,23 +58,23 @@ case "$seat" in
     # Use -p (print and exit), never --bg, which leaves a session running.
     model=claude-opus-5-5
     (cd "$checkout" && claude -p --restricted --tools Read Grep Glob --strict-mcp-config \
-      --add-dir "$input" --model "$model" --effort high \
+      --add-dir "$input" --model "$model" --effort medium \
       < "$input/prompt.md") > "$out_dir/claude.md" 2> "$out_dir/claude.log" || rc=$?
     ;;
 
   cursor)
-    # Newest grok-*-high-fast (older builds: cursor-grok-*-high-fast);
-    # skips xhigh-fast and non-fast high.
+    # Cursor names the reasoning level in the model id, not a flag. Newest
+    # grok-*-medium-fast (older builds: cursor-grok-*-medium-fast).
     model="$(agent --list-models | awk '
-      $1 ~ /^(cursor-)?grok-[0-9.]+-high-fast$/ {
+      $1 ~ /^(cursor-)?grok-[0-9.]+-medium-fast$/ {
         ver = $1
         sub(/^(cursor-)?grok-/, "", ver)
-        sub(/-high-fast$/, "", ver)
+        sub(/-medium-fast$/, "", ver)
         print ver "\t" $1
       }
     ' | sort -V | tail -1 | cut -f2)"
     if [[ -z "$model" ]]; then
-      echo "no grok-*-high-fast model from agent --list-models" >&2
+      echo "no grok-*-medium-fast model from agent --list-models" >&2
       exit 1
     fi
     agent -p --mode ask --sandbox enabled --trust --workspace "$checkout" \
@@ -107,13 +105,16 @@ case "$seat" in
 }
 EOF
     : > "$out_dir/opencode.log"
-    for model in moonshotai/kimi-k3.1-pro:free z-ai/glm-5.3-flash:free \
-      deepseek/deepseek-v4.1-flash:free nvidia/nemotron-3-ultra-550b-a55b:free; do
+    # The reasoning level is the #variant (checked 2026-11-20): GLM 5.3 Flash
+    # has only low and high, and DeepSeek V4.1 Flash hung on medium while high
+    # answered.
+    for model in moonshotai/kimi-k3.1-pro:free#medium z-ai/glm-5.3-flash:free#high \
+      deepseek/deepseek-v4.1-flash:free#high nvidia/nemotron-3-ultra-550b-a55b:free#high; do
       echo "=== $model" >> "$out_dir/opencode.log"
       rc=0
       (cd "$checkout" && OPENCODE_CONFIG_DIR="$config_dir" OPENCODE_DISABLE_PROJECT_CONFIG=1 \
         OPENCODE_DISABLE_CLAUDE_CODE=1 numes run opencode run --standalone --agent review \
-        -m "numes/$model#high" "$(cat "$input/prompt.md")") \
+        -m "numes/$model" "$(cat "$input/prompt.md")") \
         < /dev/null > "$out_dir/opencode.md" 2>> "$out_dir/opencode.log" || rc=$?
       if [[ $rc -eq 0 ]] && grep -v '^[[:space:]]*$' "$out_dir/opencode.md" | tail -1 |
         grep -qE '^[[:space:]]*VERDICT: (merge|changes-needed)[[:space:]]*$'; then
@@ -121,7 +122,6 @@ EOF
       fi
       echo "=== $model failed (exit $rc or no VERDICT line)" >> "$out_dir/opencode.log"
     done
-    model="$model#high"
     ;;
 
   *)
