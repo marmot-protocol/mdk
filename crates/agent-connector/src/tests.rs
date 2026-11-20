@@ -5486,47 +5486,6 @@ fn received_chat_record(
 }
 
 #[tokio::test]
-async fn inbound_message_event_from_record_projects_received_chat() {
-    let dir = tempfile::tempdir().unwrap();
-    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
-    // Regression for mdk#210: a missed inbound chat recovered from storage must
-    // project into exactly the same InboundMessage event the live path emits, so the
-    // consumer's existing handler delivers it to the agent.
-    let record = received_chat_record("aa", "bb", "cc", "hello agent");
-    let event = inbound_message_event_from_record_with_runtime(
-        &runtime,
-        "acct",
-        "acct",
-        record,
-        Some("acct"),
-        Some("bb"),
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(
-        event,
-        AgentControlEvent::InboundMessage {
-            account_id_hex: "acct".to_owned(),
-            group_id_hex: "bb".to_owned(),
-            message: agent_control::AgentControlMessage {
-                message_id_hex: "aa".to_owned(),
-                sender: agent_control::AgentControlActor {
-                    account_id_hex: "cc".to_owned(),
-                    display_name: None,
-                    is_self: false,
-                },
-                text: "hello agent".to_owned(),
-                recorded_at: 100,
-                media: Vec::new(),
-            },
-            mentions_self: false,
-            reply_to: None,
-        }
-    );
-    runtime.shutdown().await;
-}
-
-#[tokio::test]
 async fn inbound_message_event_from_record_projects_group_system_row() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
@@ -6047,21 +6006,36 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             &mut delivered,
         )
         .unwrap();
-    let recovered: Vec<_> = replayed
-        .iter()
-        .filter_map(|event| match event {
-            AgentControlEvent::InboundMessage { message, .. } => {
-                Some((message.text.clone(), message.sender.account_id_hex.clone()))
-            }
-            _ => None,
-        })
-        .collect();
+    // Replay emits exactly the InboundMessage the live path emits.
+    let stored_target = connector
+        .runtime
+        .message_by_id(
+            &agent.account.account_id_hex,
+            &group_id_hex,
+            &target_message_id_hex,
+        )
+        .unwrap()
+        .expect("the agent stored the missed message");
+    let expected = AgentControlEvent::InboundMessage {
+        account_id_hex: agent.account.account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        message: agent_control::AgentControlMessage {
+            message_id_hex: target_message_id_hex.clone(),
+            sender: agent_control::AgentControlActor {
+                account_id_hex: human.account.account_id_hex.clone(),
+                display_name: None,
+                is_self: false,
+            },
+            text: "missed while lagging".to_owned(),
+            recorded_at: stored_target.recorded_at,
+            media: Vec::new(),
+        },
+        mentions_self: false,
+        reply_to: None,
+    };
     assert!(
-        recovered
-            .iter()
-            .any(|(text, sender)| text == "missed while lagging"
-                && sender == &human.account.account_id_hex),
-        "replay should recover the missed inbound message, got {recovered:?}"
+        replayed.contains(&expected),
+        "replay should recover the missed inbound message, got {replayed:?}"
     );
 
     // Exercise every durable mutation through the same production projection
@@ -6101,6 +6075,31 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         )
         .await
         .unwrap();
+    // A thread message deleted before the agent sees it must never reach the
+    // agent; only its deletion does.
+    let deleted_thread_message_id_hex = connector
+        .runtime
+        .send_thread_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+            "deleted in a thread".to_owned(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap()
+        .message_ids[0]
+        .clone();
+    connector
+        .runtime
+        .delete_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &deleted_thread_message_id_hex,
+        )
+        .await
+        .unwrap();
     let reaction = connector
         .runtime
         .react_to_message(
@@ -6135,13 +6134,13 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
                 },
             )
             .unwrap();
-        if stored.iter().any(|message| {
-            message.kind == MARMOT_APP_EVENT_KIND_DELETE
-                && message
-                    .tags
-                    .iter()
-                    .any(|tag| tag.get(1) == Some(&expected_reaction_event_id_hex))
-        }) {
+        let deletes = |target: &String| {
+            stored.iter().any(|message| {
+                message.kind == MARMOT_APP_EVENT_KIND_DELETE
+                    && message.tags.iter().any(|tag| tag.get(1) == Some(target))
+            })
+        };
+        if deletes(&expected_reaction_event_id_hex) && deletes(&deleted_thread_message_id_hex) {
             break;
         }
         sleep(Duration::from_millis(50)).await;
@@ -6187,6 +6186,22 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             } if target == &thread_message_id_hex && replacement_text == "edited in a thread"
         )),
         "a thread message's edit reaches the agent: {mutation_replay:?}"
+    );
+    assert!(
+        !mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::InboundMessage { message, .. }
+                if message.message_id_hex == deleted_thread_message_id_hex
+        )),
+        "a message deleted before delivery must not reach the agent: {mutation_replay:?}"
+    );
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::MessageDeleted { target_message_id_hex: target, .. }
+                if target == &deleted_thread_message_id_hex
+        )),
+        "the deletion itself still reaches the agent: {mutation_replay:?}"
     );
     assert!(
         mutation_replay.iter().any(|event| matches!(

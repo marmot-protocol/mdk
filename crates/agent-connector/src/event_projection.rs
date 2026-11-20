@@ -464,6 +464,15 @@ fn project_durable_record(
     match record.kind {
         // Chat, including a thread message: its first `e` names the parent.
         kind if is_chat_message(kind, &record.tags) => {
+            // Replay reads raw rows, which keep a deleted message's text and
+            // attachments. A message deleted before delivery must not reach the
+            // agent; its deletion still does.
+            if runtime
+                .message_target(account_ref, &group_id_hex, &record.message_id_hex)?
+                .is_some_and(|target| target.deleted)
+            {
+                return Ok(None);
+            }
             let mentions_self =
                 message_mentions_account(&record.tags, &record.plaintext, account_id_hex);
             let reply_to = match reply_target_from_tags(&record.tags) {

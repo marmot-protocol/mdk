@@ -41,6 +41,15 @@ pub(super) fn thread_ref(
     row: &ReadRow<'_>,
     legacy_roots: &mut ThreadRootCache,
 ) -> StorageResult<Option<TimelineThreadRef>> {
+    // Rule out rows that cannot be in a thread before reading stored tags.
+    let may_join = match row.kind {
+        NIP22_COMMENT_KIND => row.reply_to_message_id_hex.is_some(),
+        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL => true,
+        _ => false,
+    };
+    if !may_join {
+        return Ok(None);
+    }
     let stored_tags;
     let tags = if row.deleted {
         stored_tags = stored_row(conn, row.group_id_hex, row.message_id_hex)?

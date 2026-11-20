@@ -77,11 +77,12 @@ edits of the chat-list preview, the sender's own read position, chat-list text s
 notifications, push to the other members (also when Linux sends it through `send_custom_event`, or the queue publishes
 it later), bringing back a locally deleted chat, author edits and deletes, history import, retention of its media
 keys in storage and in the engine, and the `wn-agent` feed (incoming messages with their parent as the reply target,
-edits and deletes, live and on replay).
+edits and deletes, live and on replay; a message deleted before the agent sees it reaches the agent only as its
+deletion).
 
 A kind 1111 with a numeric `k` but no lowercase `e` is a comment without a parent: like every comment it keeps its
-author's edits and its attachments, but it stays a custom row and none of the above applies. A kind 1111 with neither
-is a plain custom event.
+author's edits and its attachments, and timeline search matches it as it matches every row, but it stays a custom row
+and none of the rest of the list applies. A kind 1111 with neither is a plain custom event.
 
 Admin removal is the exception: a group admin removing another member's message applies to kind 9 only, on the sending
 and the receiving side. Extending it changes what receivers accept, so it needs its own change.
