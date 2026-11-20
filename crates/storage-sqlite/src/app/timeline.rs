@@ -11,6 +11,7 @@ mod presentation;
 mod removal_validation;
 #[cfg(test)]
 mod removal_validation_tests;
+mod threads;
 pub use chat_history::{
     AppEventImport, BackupHistorySource, HistoryExportEvent, HistoryExportRow,
     HistoryImportProvenance, HistoryImportSource, ImportedAppEvent, ImportedFileKey,
@@ -51,6 +52,7 @@ use cgka_traits::app_event::{
 };
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageResult};
+use cgka_traits::threads::{NIP22_COMMENT_KIND, is_nip22_comment};
 use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, MarmotAppEvent,
     PollDefinition, PollOptionResult, PollProjection, PollVote, PollVotePage, parse_poll,
@@ -295,8 +297,13 @@ pub struct TimelineMessageRecord {
     pub timeline_at: u64,
     /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
+    /// What a client without a thread view quotes: the inline-reply target of
+    /// a chat, poll or sticker, or the parent of a thread message.
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreview>,
+    /// Where this row sits in a NIP-22 thread; `None` outside threads.
+    #[serde(default)]
+    pub thread: Option<TimelineThreadRef>,
     pub media: Option<Value>,
     pub agent_text_stream: Option<Value>,
     pub reactions: TimelineReactionSummary,
@@ -376,6 +383,24 @@ pub struct TimelineReplyPreview {
     /// Set when convergence invalidated the previewed message. Content remains
     /// available so the application can choose whether to show or hide it.
     pub invalidation_status: Option<String>,
+    /// Where the previewed message sits in a NIP-22 thread.
+    #[serde(default)]
+    pub thread: Option<TimelineThreadRef>,
+}
+
+/// A row's place in a NIP-22 thread. A thread message (kind 1111) always has
+/// one; a chat, sticker or poll has one when it joins a thread with an `E`
+/// tag. Both ids are message ids in the same group.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimelineThreadRef {
+    /// The message the thread hangs from. A thread message names it with `E`;
+    /// for one without `E` (White Noise Linux before this contract) it is
+    /// found by walking parents up to the first message outside the thread,
+    /// or to the last one stored locally.
+    pub root_message_id_hex: String,
+    /// The message this one answers: a thread message's first `e`, or a
+    /// joining chat or poll's reply target, else the root.
+    pub parent_message_id_hex: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -4702,12 +4727,6 @@ fn keep_receipts_of_pruned_reactions_tx(
     Ok(())
 }
 
-const NIP22_COMMENT_KIND: u64 = 1111;
-
-pub(super) fn is_nip22_comment(kind: u64, tags: &[Vec<String>]) -> bool {
-    kind == NIP22_COMMENT_KIND && tag_values(tags, "k").any(|kind| kind.parse::<u64>().is_ok())
-}
-
 fn is_editable_message(kind: u64, tags: &[Vec<String>]) -> bool {
     kind == MARMOT_APP_EVENT_KIND_CHAT || is_nip22_comment(kind, tags)
 }
@@ -4989,6 +5008,7 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         received_at: row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
         reply_to_message_id_hex: row.get(13)?,
         reply_preview: None,
+        thread: None,
         media: media_value_from_json(row.get::<_, Option<String>>(14)?),
         agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(15)?).map_err(
             |err| {
@@ -5276,6 +5296,17 @@ fn hydrate_timeline_presentation(
     reports::hydrate(conn, messages)?;
     filter_blocked_reactions(conn, messages)?;
     hydrate_polls(conn, messages)?;
+    let mut legacy_roots = HashMap::new();
+    for message in messages.iter_mut() {
+        message.thread = threads::thread_ref(
+            conn,
+            &message.group_id_hex,
+            message.kind,
+            &message.tags,
+            message.reply_to_message_id_hex.as_deref(),
+            &mut legacy_roots,
+        )?;
+    }
     let targets = messages
         .iter()
         .filter_map(|message| {
@@ -5289,7 +5320,7 @@ fn hydrate_timeline_presentation(
         return Ok(());
     }
 
-    let previews = load_reply_previews(conn, targets)?;
+    let previews = load_reply_previews(conn, targets, &mut legacy_roots)?;
 
     for message in messages {
         let Some(target) = message.reply_to_message_id_hex.as_ref() else {
@@ -5340,6 +5371,7 @@ fn filter_blocked_reactions(
 fn load_reply_previews(
     conn: &Connection,
     targets: HashSet<(String, String)>,
+    legacy_roots: &mut threads::ThreadRootCache,
 ) -> StorageResult<HashMap<String, HashMap<String, TimelineReplyPreview>>> {
     let mut targets_by_group = BTreeMap::<String, Vec<String>>::new();
     for (group_id_hex, message_id_hex) in targets {
@@ -5360,7 +5392,7 @@ fn load_reply_previews(
                 .join(", ");
             let sql = format!(
                 "SELECT message_id_hex, sender, plaintext, kind, tags_json, media_json, agent_stream_json, deleted, source_epoch,
-                        invalidation_status, deletion_source
+                        invalidation_status, deletion_source, reply_to_message_id_hex
                  FROM visible_message_timeline
                  WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
             );
@@ -5373,7 +5405,15 @@ fn load_reply_previews(
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
                 .storage()?;
-            for preview in rows {
+            for (mut preview, reply_to_message_id_hex) in rows {
+                preview.thread = threads::thread_ref(
+                    conn,
+                    &group_id_hex,
+                    preview.kind,
+                    &preview.tags,
+                    reply_to_message_id_hex.as_deref(),
+                    legacy_roots,
+                )?;
                 group_previews.insert(preview.message_id_hex.clone(), preview);
             }
         }
@@ -5381,8 +5421,11 @@ fn load_reply_previews(
     Ok(previews)
 }
 
-fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineReplyPreview> {
-    Ok(TimelineReplyPreview {
+/// A preview plus its projected reply target, which places it in a thread.
+fn reply_preview_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(TimelineReplyPreview, Option<String>)> {
+    let preview = TimelineReplyPreview {
         message_id_hex: row.get(0)?,
         sender: row.get(1)?,
         plaintext: row.get(2)?,
@@ -5414,7 +5457,9 @@ fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineR
             .and_then(|value| value.try_into().ok()),
         invalidation_status: row.get(9)?,
         deletion_source: DeletionSource::from_storage(&row.get::<_, String>(10)?),
-    })
+        thread: None,
+    };
+    Ok((preview, row.get(11)?))
 }
 
 fn tags_json(tags: &[Vec<String>]) -> StorageResult<String> {

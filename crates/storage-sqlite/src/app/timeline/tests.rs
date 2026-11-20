@@ -907,6 +907,7 @@ fn oversized_timeline_id_sets_are_chunked() {
     let previews = load_reply_previews(
         &conn,
         ids.iter().map(|id| ("11".repeat(32), id.clone())).collect(),
+        &mut HashMap::new(),
     )
     .unwrap();
     assert_eq!(
@@ -2799,6 +2800,83 @@ fn nip22_comment_in_timeline() {
     );
 }
 
+/// The thread-message contract fixtures every White Noise client shares:
+/// each wire form projects one reply target and one thread placement, in
+/// live projection and after a rebuild.
+#[test]
+fn thread_message_fixtures_project_reply_target_and_thread() {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        events: Vec<FixtureEvent>,
+    }
+    #[derive(serde::Deserialize)]
+    struct FixtureEvent {
+        name: String,
+        id: String,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        expect: Expect,
+    }
+    #[derive(serde::Deserialize)]
+    struct Expect {
+        reply_to: Option<String>,
+        thread: Option<ExpectThread>,
+        reply_preview_thread: Option<ExpectThread>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ExpectThread {
+        root: String,
+        parent: String,
+    }
+    fn thread(expect: Option<&ExpectThread>) -> Option<TimelineThreadRef> {
+        expect.map(|thread| TimelineThreadRef {
+            root_message_id_hex: thread.root.clone(),
+            parent_message_id_hex: thread.parent.clone(),
+        })
+    }
+
+    let fixture: Fixture =
+        serde_json::from_str(include_str!("../../../fixtures/thread-messages.json")).unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    for (at, event) in (1..).zip(&fixture.events) {
+        let mut stored = chat(&event.id, "alice", at, &event.name);
+        stored.kind = event.kind;
+        stored.tags = event.tags.clone();
+        store.record_app_event(&stored).unwrap();
+    }
+    let group = "11".repeat(32);
+    for rebuild in [false, true] {
+        if rebuild {
+            store.rebuild_message_timeline_for_group(&group).unwrap();
+        }
+        for event in &fixture.events {
+            let row = store.timeline_message(&group, &event.id).unwrap().unwrap();
+            let context = format!("{} (rebuild: {rebuild})", event.name);
+            assert_eq!(
+                row.reply_to_message_id_hex, event.expect.reply_to,
+                "{context}"
+            );
+            assert_eq!(
+                row.thread,
+                thread(event.expect.thread.as_ref()),
+                "{context}"
+            );
+            if let Some(expected) = &event.expect.reply_preview_thread {
+                assert_eq!(
+                    row.reply_preview.and_then(|preview| preview.thread),
+                    thread(Some(expected)),
+                    "{context}"
+                );
+            }
+        }
+    }
+    let media = store
+        .timeline_message(&group, "linux-media")
+        .unwrap()
+        .unwrap();
+    assert!(media.media.is_some(), "a thread message keeps its media");
+}
+
 #[test]
 fn unmarked_comments_stay_custom() {
     for kind_tag in [None, Some("invalid")] {
@@ -2806,7 +2884,7 @@ fn unmarked_comments_stay_custom() {
         let mut comment = chat("custom", "alice", 1, "original");
         comment.kind = NIP22_COMMENT_KIND;
         comment.tags = vec![
-            vec!["e".into(), "parent".into()],
+            vec!["E".into(), "parent".into()],
             vec!["imeta".into(), "url https://example.com/image.png".into()],
         ];
         if let Some(kind) = kind_tag {

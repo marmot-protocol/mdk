@@ -7,6 +7,21 @@ use serde_json::json;
 
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     upgrade_attachment_sources(tx)?;
+    repair_comments(tx, |tags| {
+        tags.iter().any(|tag| {
+            tag.first().is_some_and(|name| name == "k")
+                && tag.get(1).is_some_and(|kind| kind.parse::<u64>().is_ok())
+        })
+    })
+}
+
+/// Project every stored kind-1111 event whose tags pass `recognized` as a
+/// comment: parent, media, accepted edit and retained media-key references.
+/// Migration 0217 reuses it for comments recognized by `e` alone.
+pub(super) fn repair_comments(
+    tx: &Transaction<'_>,
+    recognized: impl Fn(&[Vec<String>]) -> bool,
+) -> StorageResult<()> {
     let mut sources = tx
         .prepare(
             "SELECT e.group_id_hex, e.message_id_hex, e.tags_json, e.source_epoch,
@@ -25,10 +40,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         let Some(tags) = tags(row, 2) else {
             continue;
         };
-        if !tags.iter().any(|tag| {
-            tag.first().is_some_and(|name| name == "k")
-                && tag.get(1).is_some_and(|kind| kind.parse::<u64>().is_ok())
-        }) {
+        if !recognized(&tags) {
             continue;
         }
         let group: String = row.get(0).storage()?;

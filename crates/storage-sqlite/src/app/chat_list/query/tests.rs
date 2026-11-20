@@ -1326,7 +1326,7 @@ fn message_text_leaf_matches_only_text_the_timeline_shows() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();
     for id in [
-        "01", "02", "03", "04", "05", "06", "07", "08", "09", "0a", "0b",
+        "01", "02", "03", "04", "05", "06", "07", "08", "09", "0a", "0b", "0c", "0d",
     ] {
         seed(&store, id, &[]);
     }
@@ -1450,6 +1450,12 @@ fn message_text_leaf_matches_only_text_the_timeline_shows() {
         crate::app::timeline::LOCAL_PUBLISH_FAILED_REASON,
     )
     .unwrap();
+    // A thread message is message text; a kind-1111 event without a parent
+    // is a custom event.
+    let thread = cgka_traits::NIP22_COMMENT_KIND;
+    event(&app, "0c", "m0c", "bb", thread, "thread answer", e("m01"));
+    let scope_only = vec![vec!["E".to_owned(), "m01".to_owned()]];
+    event(&app, "0d", "m0d", "bb", thread, "custom answer", scope_only);
     // 0a has no messages.
     ready(&store);
     for (query, expected) in [
@@ -1466,6 +1472,8 @@ fn message_text_leaf_matches_only_text_the_timeline_shows() {
         ("lunch vote", &["05"]),
         ("tea", &[]),
         ("fleeting", &["08"]),
+        ("thread answer", &["0c"]),
+        ("custom answer", &[]),
         ("", &[]),
         ("   ", &[]),
     ] {
@@ -1486,7 +1494,9 @@ fn message_text_leaf_matches_only_text_the_timeline_shows() {
     negated.sort();
     assert_eq!(
         negated,
-        ["01", "02", "03", "04", "06", "07", "08", "09", "0a", "0b"]
+        [
+            "01", "02", "03", "04", "06", "07", "08", "09", "0a", "0b", "0c", "0d"
+        ]
     );
     assert_eq!(
         selected_at(

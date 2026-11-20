@@ -22,6 +22,7 @@ pub mod message;
 pub mod peeler;
 pub mod polls;
 pub mod storage;
+pub mod threads;
 pub mod transport;
 pub mod transport_adapter;
 pub mod types;
@@ -122,6 +123,7 @@ pub use storage::{
     QueuedOutboundIntent, RosterRevision, StorageError, StorageProvider, StorageResult,
     WelcomeStorage,
 };
+pub use threads::{NIP22_COMMENT_KIND, is_nip22_comment, thread_message_parent, thread_root_tag};
 pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };

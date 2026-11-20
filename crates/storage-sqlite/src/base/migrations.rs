@@ -411,6 +411,8 @@ mod migration_0214_link_chat_progress;
 mod migration_0215_released_receipt_stall_evidence;
 #[path = "migrations/0216_welcome_key_package_event_id.rs"]
 mod migration_0216_welcome_key_package_event_id;
+#[path = "migrations/0217_untyped_thread_messages.rs"]
+mod migration_0217_untyped_thread_messages;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1561,6 +1563,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0216_welcome_key_package_event_id",
         suspend_foreign_keys: &[],
         apply: migration_0216_welcome_key_package_event_id::apply,
+    },
+    Migration {
+        version: 217,
+        name: "0217_untyped_thread_messages",
+        suspend_foreign_keys: &[],
+        apply: migration_0217_untyped_thread_messages::apply,
     },
 ];
 

@@ -243,7 +243,7 @@ pub(crate) fn replace_encrypted_media_secret_references_for_parts_tx(
     .storage()?;
 
     // Comments carry attachments; reactions carry NIP-30 custom emoji images.
-    let comment = super::timeline::is_nip22_comment(kind, tags);
+    let comment = cgka_traits::is_nip22_comment(kind, tags);
     if (kind == MARMOT_APP_EVENT_KIND_CHAT || kind == MARMOT_APP_EVENT_KIND_REACTION || comment)
         && let Some(source_epoch) = source_epoch
     {

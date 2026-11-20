@@ -536,8 +536,9 @@ impl FilterWriter<'_> {
                         index
                     }
                 };
-                // What the timeline shows as message text: chat messages and
-                // poll questions, from accounts not blocked, not deleted (whose
+                // What the timeline shows as message text: chat messages,
+                // thread messages (kind-1111 rows the projection gave a
+                // parent) and poll questions, from accounts not blocked, not deleted (whose
                 // text is cleared anyway), not invalidated except an own send
                 // that reached no one (shown as failed, as the row's preview
                 // does), and not past the expiry the retention sweep prunes at
@@ -545,7 +546,9 @@ impl FilterWriter<'_> {
                 self.sql.push_str(&format!(
                     "EXISTS(SELECT 1 FROM visible_message_timeline AS message
                         WHERE message.group_id_hex = chat_list_rows.group_id_hex
-                          AND message.kind IN ({chat}, {poll})
+                          AND message.kind IN ({chat}, {poll}, {thread})
+                          AND (message.kind != {thread}
+                               OR message.reply_to_message_id_hex IS NOT NULL)
                           AND message.deleted = 0
                           AND (message.invalidation_status IS NULL
                                OR (message.direction = 'sent'
@@ -557,6 +560,7 @@ impl FilterWriter<'_> {
                                 AND source.retention_expires_at <= ?{now_seconds}))",
                     chat = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
                     poll = cgka_traits::MARMOT_APP_EVENT_KIND_POLL,
+                    thread = cgka_traits::NIP22_COMMENT_KIND,
                     contains = crate::base::text_search::SQL_CONTAINS_FUNCTION,
                     failed = crate::app::timeline::LOCAL_PUBLISH_FAILED_REASON,
                 ));
