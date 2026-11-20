@@ -264,13 +264,15 @@
   instead of leaving it queued to be prepared and sent again. A change whose
   commit was stored by an earlier release is prepared once more after such a
   rollback, and its new commit carries the link.
-- Send a queued message once (#2332). A message sent while a group change was
-  pending waits in the queue, and it was prepared and sent a second time when
-  its first send reached no relay and a retry later did, or when the app
-  restarted before its send resolved. Its stored send now names the queued
-  message, which retires when the send resolves, so a retry or a restart no
-  longer duplicates it. A message whose send was stored by an earlier release
-  can still be sent once more after a restart.
+- Prepare a queued message once across retries and restarts (#2332). A
+  message sent while a group change was pending waits in the queue, and it
+  was prepared and sent a second time, as a new message, when its first send
+  reached no relay and a retry later did, or when the app restarted before
+  its send resolved. Its stored send now names the queued message, which
+  retires when the send resolves, so a retry or a restart no longer prepares
+  it again; relays can still receive the same event more than once while the
+  send resolves. A message whose send was stored by an earlier release can
+  still be prepared once more after a restart.
 
 ## 0.17.0 - 2026-11-15
 
