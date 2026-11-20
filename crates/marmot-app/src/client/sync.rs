@@ -3469,10 +3469,12 @@ impl AppClient {
                 category: cgka_traits::InputRejectionCategory::NotAddressedToThisDevice,
             }
         ) {
+            let account_id_hex = hex::encode(client.runtime.self_id().as_slice());
+            client.app.sign_in_nudges.nudge(&account_id_hex);
             client
                 .app
-                .sign_in_nudges
-                .nudge(&hex::encode(client.runtime.self_id().as_slice()));
+                .device_group_wakes
+                .sign_in_nudged(&account_id_hex);
         }
         let queued = client.pending_applied_effects.len();
         client.retain_effect_projection(

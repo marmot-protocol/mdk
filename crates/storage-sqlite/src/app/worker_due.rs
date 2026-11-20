@@ -6,19 +6,67 @@ use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::StorageResult;
 
 impl SqliteAppStorage {
-    /// Whether any device-pairing state is stored: a device group, a join,
-    /// a move or a link. While one is, the worker drives pairing every 15 s.
+    /// Whether stored device-pairing state still has work for pairing's
+    /// timers: a device group being created or waiting for its Welcome, a
+    /// join or a move not yet finished, or a link not yet decided or whose failed
+    /// Welcome is not yet withdrawn. A settled device group and its decided
+    /// links have none (mdk#3265), so a linked account no longer drives
+    /// pairing every 15 s. A failed link still listed in the roster is the
+    /// app's to find, from the roster.
     pub fn device_pairing_state_exists(&self) -> StorageResult<bool> {
         self.lock()?
             .query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM device_groups)
+                "SELECT EXISTS(SELECT 1 FROM device_groups
+                                WHERE trust IN ('creating', 'awaiting_welcome'))
                      OR EXISTS(SELECT 1 FROM device_group_joins)
-                     OR EXISTS(SELECT 1 FROM device_group_moves)
-                     OR EXISTS(SELECT 1 FROM device_links)",
+                     OR EXISTS(SELECT 1 FROM device_group_moves WHERE phase != 3)
+                     OR EXISTS(SELECT 1 FROM device_links
+                                WHERE outcome = 'pending'
+                                   OR (outcome = 'failed' AND welcome_withdrawn = 0))",
                 [],
                 |row| row.get(0),
             )
             .storage()
+    }
+
+    /// Whether device-group work is stored that maintenance must retry with
+    /// no time of its own (mdk#3265): small state, an invitation decision or
+    /// a broadcast request a send left unsent, a history to send inline,
+    /// a sibling Welcome to join that no chat holds back, or a private
+    /// KeyPackage need not yet asked for. A removal's slot withdrawal is
+    /// not counted: one no relay took fails its pass, which retries, and the
+    /// rest wait for the device group to settle or never apply (`not_me`).
+    pub fn device_group_work_owed(&self) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM small_state_items WHERE unsent = 1)
+                     OR EXISTS(SELECT 1 FROM invitation_decisions WHERE unsent = 1)
+                     OR EXISTS(SELECT 1 FROM small_state_sync WHERE request_owed = 1)
+                     OR EXISTS(SELECT 1 FROM history_deliveries_owed
+                                WHERE sent_at IS NULL AND blossom_due_at IS NULL)
+                     OR EXISTS(SELECT 1 FROM sibling_welcomes_received
+                                WHERE held_group_id_hex IS NULL)
+                     OR EXISTS(SELECT 1 FROM private_key_package_requests
+                                WHERE requested_at IS NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
+    /// The earliest second an unmet private KeyPackage need was last asked
+    /// for, which paces when it may be asked for again (mdk#3265).
+    pub fn private_key_package_earliest_request(&self) -> StorageResult<Option<u64>> {
+        let next: Option<i64> = self
+            .lock()?
+            .query_row_cached(
+                "SELECT MIN(requested_at) FROM private_key_package_requests
+                 WHERE requested_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .storage()?;
+        Ok(next.map(|at| u64::try_from(at).unwrap_or(0)))
     }
 
     /// Whether a push join window is open or an announce is owed. Both wait

@@ -1027,6 +1027,7 @@ impl AppClient {
     /// names, for the quiet-writer check a pass makes.
     pub(crate) async fn drive_backup_takeover(&mut self) {
         if let Err(error) = self.take_over_from_a_gone_writer().await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "drive_backup_takeover",

@@ -107,6 +107,7 @@ impl AppClient {
             return 0;
         }
         if let Err(error) = self.prune_link_chat_progress(unix_now_seconds()) {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "prune_link_chat_progress",
@@ -119,6 +120,7 @@ impl AppClient {
             .try_add_linked_devices_to_chats(held, &mut budget, selection)
             .await
         {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "add_linked_devices_to_chats",

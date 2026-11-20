@@ -115,7 +115,7 @@ mod sync;
 #[cfg(test)]
 pub(crate) mod upload_cleanup_tests;
 pub(crate) mod welcome_waves;
-mod worker_due;
+pub(crate) mod worker_due;
 
 pub(crate) use history_recovery::recovery_coverage::LiveCoverage;
 pub(crate) use push::PushFetchClock;
@@ -813,9 +813,35 @@ pub struct AppClient {
     /// a refused sibling Add hands its KeyPackage back. Pass-local selectors
     /// observe native projection retries through it.
     pub(crate) received_private_key_package_generation: u64,
-    /// A sibling-Add scan recorded an acceptance it has not sent yet
+    /// A sibling-Add scan recorded an acceptance, or this device's user
+    /// answered an invitation, and it has not been sent yet
     /// ([`Self::send_recorded_acceptances`]).
     pub(crate) acceptances_recorded: bool,
+    /// An invitation decision was recorded here, or a sibling's won here,
+    /// since the worker last sent and applied them: it does so on its next
+    /// turn, not at the next maintenance pass (mdk#3566).
+    pub(crate) invitation_decisions_changed: bool,
+    /// The last invitation pass left work it retries once the reason passes
+    /// on its own: a chat's projection still saving, a chat not quiet or a
+    /// failure. Work that waits for an event, such as a blocked inviter, is
+    /// not counted.
+    pub(crate) invitation_work_held: bool,
+    /// Chats whose invitation a decision settled here outside a host
+    /// command, which the worker announces as a host accept is (mdk#3566).
+    pub(crate) invitations_settled: Vec<GroupId>,
+    /// Device-group work may be owed with no time of its own: set at open,
+    /// by every device-group event, and by a device-group pass that left
+    /// work for a retry. Each maintenance run takes it before its passes
+    /// (mdk#3265).
+    pub(crate) device_group_work_changed: bool,
+    /// This device's user changed small state (a read position, pin, mute
+    /// or archive) since the last maintenance run, which records and sends
+    /// it once the account is linked.
+    pub(crate) small_state_edited: bool,
+    /// The earliest second a device-group pass asked to look again at work
+    /// it left, such as a chat held by an epoch gap until its hold ends.
+    /// Each maintenance run takes it before its passes (mdk#3265).
+    pub(crate) device_group_retry_at: Option<u64>,
     // Struct fields drop in declaration order. Keep the engine-owning runtime
     // and the engine connection before this guard so ownership is released
     // only after engine teardown.
@@ -1550,6 +1576,13 @@ impl AppClient {
             "sweep",
             crate::ProductUnit::Attempt,
         );
+        // This run's passes find again what device-group work is owed with
+        // no time of its own; events and failures during them set it again
+        // (mdk#3265).
+        self.device_group_work_changed = false;
+        self.device_group_retry_at = None;
+        self.small_state_edited = false;
+        self.invitation_decisions_changed = false;
         let app_passes =
             self.maintenance_step(crate::RuntimePerformanceOperation::WorkerMaintenanceAppPasses);
         boxed(|| self.drive_sign_ins()).await;
@@ -1569,6 +1602,9 @@ impl AppClient {
         let held = match prepared {
             Ok(held) => held,
             Err(error) => {
+                // The device-group passes after this did not run: what they
+                // owe is retried 15 s on.
+                self.device_group_work_changed = true;
                 finish_maintenance_step(app_passes, marmot_observability::Outcome::Failure);
                 if let Some(sweep) = sweep {
                     sweep.finish("failure");
@@ -6920,6 +6956,8 @@ impl AppClient {
         group_id: &GroupId,
         archived: bool,
     ) -> Result<AppGroupRecord, AppError> {
+        // A linked device's next run records and sends the edit (mdk#3265).
+        self.small_state_edited = true;
         let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             if archived { "archive" } else { "unarchive" },

@@ -27,6 +27,7 @@ mod devices;
 mod heartbeats;
 mod history;
 pub(super) mod history_delivery;
+mod idle_maintenance;
 mod inactivity;
 mod private_key_packages;
 mod removal;

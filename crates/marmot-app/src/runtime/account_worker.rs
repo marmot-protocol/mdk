@@ -1213,6 +1213,7 @@ async fn run_app_runtime_account_worker(
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut relay_config_updates = app.presentation_signals.profile_updates.subscribe();
+    let mut device_group_wakes = app.device_group_wakes.subscribe();
     let mut open_client = std::pin::pin!(app.runtime_local_client(
         &account_label,
         &relay_plane,
@@ -1863,6 +1864,18 @@ async fn run_app_runtime_account_worker(
                 &account_label,
             );
         }
+        // An invitation answered here, or one a sibling's decision settled,
+        // goes out and applies on this turn, not at the next maintenance
+        // pass (mdk#3566). What it leaves owed retries with maintenance. Not
+        // once shutdown is requested, as no scheduled job runs then: the
+        // answer is saved, and the next start sends and applies it.
+        if client.invitation_decisions_changed
+            && !lifecycle.is_stopping()
+            && Box::pin(client.drive_changed_invitation_decisions()).await
+        {
+            publish_settled_invitations(&mut client, &events, &account_id_hex, &account_label);
+            maintenance_due_dirty = true;
+        }
         // Re-arm the schedule from whichever path ran the recovery seam or
         // the post-join advance since the last turn. Pausing or resuming
         // maintenance wakes post-join and history dispatch: neither has a
@@ -1872,6 +1885,12 @@ async fn run_app_runtime_account_worker(
             maintenance_paused = !maintenance_paused;
             schedule.wake(schedule::Job::PostJoin);
             schedule.wake(schedule::Job::HistoryDispatch);
+            // Device-group passes owe nothing while paused, and on resume
+            // the next run finds what they owe (mdk#3265).
+            if !maintenance_paused {
+                client.device_group_work_changed = true;
+            }
+            maintenance_due_dirty = true;
         }
         if let Some(owed) = client.recovery_seam_owed.take() {
             schedule.ran(schedule::Job::Recovery, owed, now);
@@ -2119,6 +2138,44 @@ async fn run_app_runtime_account_worker(
                         schedule::Job::RelayConfig,
                         Some(TokioInstant::now() + schedule::RETRY_WHILE_OWED),
                     );
+                }
+            }
+            wake = device_group_wakes.recv() => {
+                // A change made outside this worker that can make its
+                // device-group maintenance owed (mdk#3265). A lagged
+                // receiver may have missed one of this account's.
+                let mut wakes = vec![wake];
+                loop {
+                    match device_group_wakes.try_recv() {
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        next => wakes.push(next.map_err(|error| match error {
+                            broadcast::error::TryRecvError::Lagged(missed) => {
+                                broadcast::error::RecvError::Lagged(missed)
+                            }
+                            _ => broadcast::error::RecvError::Closed,
+                        })),
+                    }
+                }
+                for wake in wakes {
+                    match wake {
+                        Ok(crate::client::worker_due::DeviceGroupWake::SignInNudged(account))
+                            if account == account_id_hex =>
+                        {
+                            maintenance_due_dirty = true;
+                        }
+                        Ok(crate::client::worker_due::DeviceGroupWake::SmallStateEdited(label))
+                            if label == account_label =>
+                        {
+                            client.small_state_edited = true;
+                            maintenance_due_dirty = true;
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            client.small_state_edited = true;
+                            maintenance_due_dirty = true;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break 'worker,
+                    }
                 }
             }
             result = relay_config_updates.recv() => {
@@ -4026,6 +4083,7 @@ async fn finish_periodic_maintenance(
     let step = telemetry.observe(RuntimeOp::WorkerMaintenanceDue);
     let due = client.run_due_maintenance().await;
     step.finish_app(&due);
+    publish_settled_invitations(client, events, account_id_hex, account_label);
     match due {
         Ok(summary) => {
             if let Some(permit) = &backlog_permit {
@@ -8016,6 +8074,7 @@ fn account_worker_command_future<'a>(
         }),
         AccountWorkerCommand::RunDueMaintenance { respond } => Box::pin(async move {
             let result = client.run_due_maintenance().await;
+            publish_settled_invitations(client, events, account_id_hex, account_label);
             if result.is_ok() {
                 publish_client_pending_projection_updates(
                     client,
@@ -9453,6 +9512,26 @@ fn publish_created_group(
                     chat_list_trigger: ChatListUpdateTrigger::NewGroup,
                 },
             }),
+        );
+    }
+}
+
+/// Announce each chat whose invitation a decision settled outside a host
+/// command, as a host accept is announced: hosts drop the invitation once
+/// its chat reports its new state (mdk#3566).
+fn publish_settled_invitations(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    for group_id in std::mem::take(&mut client.invitations_settled) {
+        publish_app_runtime_group_state_updated(
+            Emit::Quiescent(client),
+            events,
+            account_id_hex,
+            account_label,
+            &group_id,
         );
     }
 }

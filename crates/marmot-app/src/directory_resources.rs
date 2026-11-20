@@ -122,6 +122,7 @@ impl DirectoryResources for MarmotApp {
 
     fn account_key_package_published(&self, account_id_hex: &str) {
         self.sign_in_nudges.nudge(account_id_hex);
+        self.device_group_wakes.sign_in_nudged(account_id_hex);
     }
 }
 

@@ -3,6 +3,48 @@
 //! (mdk#2923 step B). Memory and at most a few indexed reads; a failed read
 //! counts as owed, so the job still runs.
 use super::AppClient;
+use cgka_traits::storage::SiblingAddStorage as _;
+use tokio::sync::broadcast;
+
+/// A change [`DeviceGroupWakes`] carries to the account workers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeviceGroupWake {
+    /// A live KeyPackage of this account id arrived: its sign-in check comes
+    /// due within a minute.
+    SignInNudged(String),
+    /// This account label's user changed small state outside its worker.
+    SmallStateEdited(String),
+}
+
+/// Changes made outside an account worker that can make its device-group
+/// maintenance owed (mdk#3265). Each worker hears every account's and keeps
+/// its own.
+#[derive(Debug)]
+pub(crate) struct DeviceGroupWakes(broadcast::Sender<DeviceGroupWake>);
+
+impl Default for DeviceGroupWakes {
+    fn default() -> Self {
+        Self(broadcast::channel(64).0)
+    }
+}
+
+impl DeviceGroupWakes {
+    pub(crate) fn sign_in_nudged(&self, account_id_hex: &str) {
+        let _ = self
+            .0
+            .send(DeviceGroupWake::SignInNudged(account_id_hex.to_owned()));
+    }
+
+    pub(crate) fn small_state_edited(&self, label: &str) {
+        let _ = self
+            .0
+            .send(DeviceGroupWake::SmallStateEdited(label.to_owned()));
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<DeviceGroupWake> {
+        self.0.subscribe()
+    }
+}
 
 /// What [`AppClient::epoch_gap_hold_ends`] found across the live groups.
 pub(crate) struct EpochGapHolds {
@@ -27,7 +69,9 @@ impl AppClient {
     }
 
     /// Whether linking has anything its timers still run: state in memory,
-    /// or a device group, join, move or link stored. Never with device
+    /// a pairing message to read, a roster change to check failed links
+    /// against, or stored linking still under way (mdk#3265). A settled
+    /// device group and its decided links owe nothing. Never with device
     /// pairing compiled out or device groups off.
     pub(crate) fn device_pairing_owed(&self) -> bool {
         if self.app.device_groups_enabled() && !self.signing_out() {
@@ -214,15 +258,123 @@ impl AppClient {
                 None => reinvite_owed = true,
             }
         }
-        // While device groups are on, their passes keep the 15 s check.
+        // Device-group passes run at their own times and retry only what
+        // they still owe with no time (mdk#3265).
+        let device_groups = self.device_group_due(&held)?;
+        if let Some(next) = device_groups.at {
+            at(next);
+        }
         if unrecoverable
             || group_unread
             || reinvite_owed
+            || device_groups.owed
             || self.runtime.has_rejoin_offers()?
-            || self.app.device_groups_enabled()
         {
             due.retry_while_owed = true;
         }
         Ok(due)
     }
+
+    /// When the device-group passes of `run_due_maintenance` next have work
+    /// (mdk#3265), with device groups on and maintenance running.
+    ///
+    /// By time: the sign-in check, for every account. With a trusted device
+    /// group also its heartbeat, small-state broadcast, private KeyPackage
+    /// request pacing, a leaving sibling's decision, gap filling and a
+    /// recently linked device's inventory pages. Times a week or more out
+    /// (history expiry, inactivity, takeover) ride the run the hourly
+    /// heartbeat brings, at most an hour late.
+    ///
+    /// Owed with no time: an invitation decision changed or held, and with a
+    /// trusted device group device-group work stored unsent or undone, a
+    /// sibling added to a chat, a device-group event, a small-state edit or
+    /// a pass's failure since the last run. Each retries 15 s after the last
+    /// run.
+    ///
+    /// `held` is each live group whose self-update an epoch gap holds, with
+    /// the second that hold ends: a held device group sends no heartbeat
+    /// until then.
+    fn device_group_due(
+        &self,
+        held: &[(cgka_traits::GroupId, cgka_traits::Timestamp)],
+    ) -> Result<DeviceGroupDue, super::AppError> {
+        let mut due = DeviceGroupDue::default();
+        if !self.app.device_groups_enabled()
+            || self.runtime.maintenance_is_paused()
+            || self.device_unlinked
+            || self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+        {
+            return Ok(due);
+        }
+        let mut at = |next: u64| due.at = Some(due.at.map_or(next, |at| at.min(next)));
+        let account_id_hex = hex::encode(self.runtime.self_id().as_slice());
+        if let Some(next) = self.sign_in_schedule.next_due_unix(
+            self.app.sign_in_nudges.peek(&account_id_hex),
+            std::time::Instant::now(),
+            crate::unix_now_seconds(),
+        ) {
+            at(next);
+        }
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        // An invitation answered here applies here, linked or not.
+        let mut owed = self.invitation_decisions_changed || self.invitation_work_held;
+        // The rest only a linked device sends or applies: an unlinked one
+        // keeps its decisions and edits unsent until it links. A sibling this
+        // device added to a chat is owed that chat's history.
+        if let Some(group_id) = self.trusted_device_group()? {
+            owed |= self.device_group_work_changed
+                || self.small_state_edited
+                || storage.device_group_work_owed()?
+                || !self
+                    .app
+                    .account_storage(&self.state.label)?
+                    .sibling_adds()?
+                    .is_empty();
+            let group_id_hex = hex::encode(group_id.as_slice());
+            let heartbeat = match storage.device_heartbeat_sent()? {
+                Some(sent) if sent.group_id_hex == group_id_hex => Some(
+                    sent.sent_at
+                        .saturating_add(super::device_heartbeats::HEARTBEAT_INTERVAL_SECS),
+                ),
+                // None sent from this group yet: owed once the device tags
+                // from it, which settling its join or its tag commit sets.
+                _ if self.runtime.device_tag_group() == Some(&group_id) => Some(0),
+                _ => None,
+            };
+            if let Some(next) = heartbeat {
+                // A held device group sends none until its hold ends.
+                let hold_end = held
+                    .iter()
+                    .find(|(held, _)| *held == group_id)
+                    .map_or(0, |(_, until)| until.0);
+                at(next.max(hold_end));
+            }
+            if let Some(schedule) = storage.small_state_schedule()? {
+                at(crate::small_state::broadcast_next_at(&schedule));
+            }
+            if let Some(requested) = storage.private_key_package_earliest_request()? {
+                at(requested.saturating_add(super::private_key_packages::REQUEST_INTERVAL_SECS));
+            }
+            for next in self
+                .leaving_siblings
+                .values()
+                .copied()
+                .chain(self.sibling_chat_gaps.next_due())
+                .chain(self.device_group_retry_at)
+                .chain(self.link_chat_progress.next_due())
+            {
+                at(next);
+            }
+        }
+        due.owed = owed;
+        Ok(due)
+    }
+}
+
+/// What [`AppClient::device_group_due`] found: the earliest time a device-
+/// group pass has work, and whether one owes work with no time.
+#[derive(Default)]
+struct DeviceGroupDue {
+    at: Option<u64>,
+    owed: bool,
 }

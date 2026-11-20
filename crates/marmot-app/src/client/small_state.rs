@@ -46,6 +46,7 @@ impl AppClient {
             Err(error) => Err(error),
         };
         if let Err(error) = result {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "drive_small_state",
@@ -298,7 +299,10 @@ impl AppClient {
         self.ensure_small_state_group(group_id)?;
         let items = decode_small_state_update(content)?;
         let invitations = decode_invitation_decisions(content)?;
-        self.app
+        // A sibling's winning decision is applied on the worker's next turn,
+        // not at the next maintenance pass (mdk#3566).
+        self.invitation_decisions_changed |= self
+            .app
             .account_storage(&self.state.label)?
             .app_storage()
             .merge_invitation_decisions(&invitations)?;

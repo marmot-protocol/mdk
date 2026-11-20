@@ -110,19 +110,22 @@ impl SqliteAppStorage {
     }
 
     /// A remote winner is durable before presentation or Leave effects. It is not a local action.
+    /// Returns whether any value won, and so owes application work.
     pub fn merge_invitation_decisions(
         &self,
         decisions: &[InvitationDecision],
-    ) -> StorageResult<()> {
+    ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            let mut won = false;
             for decision in decisions.iter().filter(|item| item.is_valid()) {
                 let prior = held(&conn, &decision.group_id_hex, &decision.generation)?;
                 if prior.as_ref().is_none_or(|prior| decision.wins_over(prior)) {
                     put(&conn, decision, false)?;
+                    won = true;
                 }
             }
-            Ok(())
+            Ok(won)
         })
     }
 

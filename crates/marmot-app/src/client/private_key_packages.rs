@@ -100,7 +100,7 @@ type SiblingWelcomeCarrierIds = (Vec<u8>, Vec<u8>);
 
 /// While a need lasts, a device asks the same sibling again at most this
 /// often.
-const REQUEST_INTERVAL_SECS: u64 = 60 * 60;
+pub(super) const REQUEST_INTERVAL_SECS: u64 = 60 * 60;
 
 /// Advisory selection data for one maintenance/creation pass. Entries refresh
 /// when a hand-off adds stock or the trusted device-group pin changes; each
@@ -419,6 +419,7 @@ impl AppClient {
             return;
         }
         if let Err(error) = self.try_join_stashed_sibling_welcomes().await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "join_stashed_sibling_welcomes",
@@ -605,6 +606,7 @@ impl AppClient {
             return;
         }
         if let Err(error) = self.try_sibling_key_package_upkeep(held).await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "sibling_key_package_upkeep",
@@ -1058,6 +1060,7 @@ impl AppClient {
             return;
         }
         if let Err(error) = self.try_send_owed_sibling_welcomes(held).await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "send_owed_sibling_welcomes",

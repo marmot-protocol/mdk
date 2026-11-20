@@ -4,6 +4,7 @@
 
 ### Breaking changes
 
+- `SqliteAppStorage::merge_invitation_decisions` returns whether any decision won (mdk#3566).
 - Account migration 0216 gates stored Welcome payload tags 14 and 15, which name the transport event of the
   KeyPackage a Welcome answers. It changes no table; older binaries refuse schema 216, and downgrade is unsupported.
 - Account migration 0215 adds `stall_evidence` to `cgka_released_transport_receipts` (mdk#3536). Consuming the
@@ -67,6 +68,10 @@
 
 - `SqliteAppStorage::received_private_key_packages_next_expiry` returns when the earliest handed-over private
   KeyPackage expires (mdk#3265).
+
+- `SqliteAppStorage::device_group_work_owed` reports device-group work stored with no time of its own, and
+  `private_key_package_earliest_request` the earliest unmet private KeyPackage request. `device_pairing_state_exists`
+  now counts only linking still under way: a settled device group and its decided links no longer count (mdk#3265).
 
 ### Changed
 
