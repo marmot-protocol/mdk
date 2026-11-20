@@ -1,477 +1,477 @@
 {
-  "date": "2026-11-19",
+  "date": "2026-11-20",
   "schema": 1,
-  "source_sha": "e4421e86a6c73f336b0154ee09c13826d8fafff5",
+  "source_sha": "0e22bcd5d8919331100230281d0e0eafa5db07fc",
   "tracks": {
     "marmotc": {
       "assets": [
         {
-          "name": "marmot-c-linux-x86_64-0.18.0-nightly.20261119.zip",
-          "sha256": "c457dddd4a631b93bd06bbdcedc1d7f420bf3de4d2fd638e1c07a7a2f2bbf763",
-          "size": 229407559,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotc-v0.18.0-nightly.20261119/marmot-c-linux-x86_64-0.18.0-nightly.20261119.zip"
+          "name": "marmot-c-linux-x86_64-0.18.0-nightly.20261120.zip",
+          "sha256": "64ca597aea63ad9f2eddad90c7e48338d1954e5c333eb8b502d1e3e0adee7285",
+          "size": 230856340,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotc-v0.18.0-nightly.20261120/marmot-c-linux-x86_64-0.18.0-nightly.20261120.zip"
         },
         {
-          "name": "marmot-c-linux-x86_64-0.18.0-nightly.20261119.zip.sha256",
-          "sha256": "d77ac1315e49f469e7e42c32179b4c60fd2928d801f26e6f8e42e78cbeffcaaa",
+          "name": "marmot-c-linux-x86_64-0.18.0-nightly.20261120.zip.sha256",
+          "sha256": "661b3c01c5caaf3c6a0cd341ff500c78806e2ffeae03497f1793f82d0d022e1b",
           "size": 116,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotc-v0.18.0-nightly.20261119/marmot-c-linux-x86_64-0.18.0-nightly.20261119.zip.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotc-v0.18.0-nightly.20261120/marmot-c-linux-x86_64-0.18.0-nightly.20261120.zip.sha256"
         }
       ],
-      "release_url": "https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.18.0-nightly.20261119",
-      "tag": "marmotc-v0.18.0-nightly.20261119"
+      "release_url": "https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.18.0-nightly.20261120",
+      "tag": "marmotc-v0.18.0-nightly.20261120"
     },
     "marmotkit": {
       "assets": [
         {
-          "name": "MarmotKit-0.18.0-nightly.20261119.swift",
-          "sha256": "7e84818a28db674d45992b6481fd0a6c82626dde13e2c7486a9d8630610e4309",
-          "size": 2483286,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/MarmotKit-0.18.0-nightly.20261119.swift"
+          "name": "MarmotKit-0.18.0-nightly.20261120.swift",
+          "sha256": "21b0e2b28c0cabc9d85e3473b4f5fc22c2915962e57deec78247b7c8d0458954",
+          "size": 2505316,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/MarmotKit-0.18.0-nightly.20261120.swift"
         },
         {
-          "name": "MarmotKitFFI-0.18.0-nightly.20261119.xcframework.zip",
-          "sha256": "d41ff6f768ce7c9d8734e7464d99295f19326f6e37e1536613d4ad38633cf013",
-          "size": 80101158,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/MarmotKitFFI-0.18.0-nightly.20261119.xcframework.zip"
+          "name": "MarmotKitFFI-0.18.0-nightly.20261120.xcframework.zip",
+          "sha256": "fef6880861caf95649eb2a0bd2a9bbd9a829cb44f5c43abf9e3c17d8ca0f682a",
+          "size": 80463803,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/MarmotKitFFI-0.18.0-nightly.20261120.xcframework.zip"
         },
         {
-          "name": "MarmotKitFFI-0.18.0-nightly.20261119.xcframework.zip.sha256",
-          "sha256": "4c706c9bb66e836812018352eca24695cbf7d99fc800bcbee57640e92ccc6f52",
+          "name": "MarmotKitFFI-0.18.0-nightly.20261120.xcframework.zip.sha256",
+          "sha256": "fcf349a7d4a1a1595b5cd3aaf1e979989f0ad9ec75e62e3a28192a59444234d4",
           "size": 119,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/MarmotKitFFI-0.18.0-nightly.20261119.xcframework.zip.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/MarmotKitFFI-0.18.0-nightly.20261120.xcframework.zip.sha256"
         },
         {
-          "name": "MarmotKitFFI-0.18.0-nightly.20261119.xcframework.zip.swiftpm-checksum",
-          "sha256": "15620e095c74017f14bfd045aadc0f740a466d84c7795179550d1efd3908e4d6",
+          "name": "MarmotKitFFI-0.18.0-nightly.20261120.xcframework.zip.swiftpm-checksum",
+          "sha256": "d6e077408a96f82aaa3efd1c84b5bf0e759714dd1ef4b511d517c184ac0bf0d2",
           "size": 65,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/MarmotKitFFI-0.18.0-nightly.20261119.xcframework.zip.swiftpm-checksum"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/MarmotKitFFI-0.18.0-nightly.20261120.xcframework.zip.swiftpm-checksum"
         },
         {
-          "name": "MarmotKitFFI-macos-0.18.0-nightly.20261119.xcframework.zip",
-          "sha256": "42fd938c90678591c2782a47c043777521bd988b76b74f03e9e89ba2ff550912",
-          "size": 40412974,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/MarmotKitFFI-macos-0.18.0-nightly.20261119.xcframework.zip"
+          "name": "MarmotKitFFI-macos-0.18.0-nightly.20261120.xcframework.zip",
+          "sha256": "07ec5a7e8aeeb06c085139d3605c90d5f003bc410bd077babf3d645637c23ab1",
+          "size": 40590670,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/MarmotKitFFI-macos-0.18.0-nightly.20261120.xcframework.zip"
         },
         {
-          "name": "MarmotKitFFI-macos-0.18.0-nightly.20261119.xcframework.zip.sha256",
-          "sha256": "be7bd7cebbea06f32ea123857504c6879996814ca9dba9600836d03e50d93c6b",
+          "name": "MarmotKitFFI-macos-0.18.0-nightly.20261120.xcframework.zip.sha256",
+          "sha256": "02c7e2abae05269231a6ec13067fc6878e4722b32ec551597c3d4af45d5d3a92",
           "size": 125,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/MarmotKitFFI-macos-0.18.0-nightly.20261119.xcframework.zip.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/MarmotKitFFI-macos-0.18.0-nightly.20261120.xcframework.zip.sha256"
         },
         {
-          "name": "MarmotKitFFI-macos-0.18.0-nightly.20261119.xcframework.zip.swiftpm-checksum",
-          "sha256": "13665a45abe1b09db0c394f004733162d6d17359bc9dec09fe23212b6730d4ec",
+          "name": "MarmotKitFFI-macos-0.18.0-nightly.20261120.xcframework.zip.swiftpm-checksum",
+          "sha256": "59649aa95cd152da8daa71e1bf1bfc6153bd80ddda3f4740308f27b43a62be69",
           "size": 65,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/MarmotKitFFI-macos-0.18.0-nightly.20261119.xcframework.zip.swiftpm-checksum"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/MarmotKitFFI-macos-0.18.0-nightly.20261120.xcframework.zip.swiftpm-checksum"
         },
         {
-          "name": "PrivacyInfo-ios-0.18.0-nightly.20261119.xcprivacy",
+          "name": "PrivacyInfo-ios-0.18.0-nightly.20261120.xcprivacy",
           "sha256": "3759ff2493741386342599b39673989a461f491ad1fb207a7133a2b0035140f7",
           "size": 5447,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/PrivacyInfo-ios-0.18.0-nightly.20261119.xcprivacy"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/PrivacyInfo-ios-0.18.0-nightly.20261120.xcprivacy"
         },
         {
-          "name": "PrivacyInfo-ios-0.18.0-nightly.20261119.xcprivacy.sha256",
-          "sha256": "09dd994d47fd26d8a6bb831781a3cf09b5af8c51a32af941c8434eb0fd9c7f9d",
+          "name": "PrivacyInfo-ios-0.18.0-nightly.20261120.xcprivacy.sha256",
+          "sha256": "04291b8e94bbdd1d1f2aa62bbf3195265713f223481a0cedd20982ca4df57777",
           "size": 116,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/PrivacyInfo-ios-0.18.0-nightly.20261119.xcprivacy.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/PrivacyInfo-ios-0.18.0-nightly.20261120.xcprivacy.sha256"
         },
         {
-          "name": "PrivacyInfo-macos-0.18.0-nightly.20261119.xcprivacy",
+          "name": "PrivacyInfo-macos-0.18.0-nightly.20261120.xcprivacy",
           "sha256": "3759ff2493741386342599b39673989a461f491ad1fb207a7133a2b0035140f7",
           "size": 5447,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/PrivacyInfo-macos-0.18.0-nightly.20261119.xcprivacy"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/PrivacyInfo-macos-0.18.0-nightly.20261120.xcprivacy"
         },
         {
-          "name": "PrivacyInfo-macos-0.18.0-nightly.20261119.xcprivacy.sha256",
-          "sha256": "1e25a3719140b79077b0adffab0e17798489d35171cce607293eed9139dd80ea",
+          "name": "PrivacyInfo-macos-0.18.0-nightly.20261120.xcprivacy.sha256",
+          "sha256": "e997c26845dec700650b257ce91ba354e75273ad62b2072d5403c375c3874688",
           "size": 118,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/PrivacyInfo-macos-0.18.0-nightly.20261119.xcprivacy.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/PrivacyInfo-macos-0.18.0-nightly.20261120.xcprivacy.sha256"
         },
         {
-          "name": "marmotkit-android-0.18.0-nightly.20261119.zip",
-          "sha256": "bc824f2bebdd6e43b563ef10ff49ef16fe2c242828cf8266d76680f25f72cc3c",
-          "size": 110814945,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/marmotkit-android-0.18.0-nightly.20261119.zip"
+          "name": "marmotkit-android-0.18.0-nightly.20261120.zip",
+          "sha256": "08024345861ebb65f7889704d56bcaa097f19f7ac522ee4f599b49f40483d255",
+          "size": 111472810,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/marmotkit-android-0.18.0-nightly.20261120.zip"
         },
         {
-          "name": "marmotkit-android-0.18.0-nightly.20261119.zip.sha256",
-          "sha256": "7c3bc477e68d4400718ba2b029cc3d6553b0bbe828019e28e9ac2b281535c1f8",
+          "name": "marmotkit-android-0.18.0-nightly.20261120.zip.sha256",
+          "sha256": "3510dc7daf2cf704549ec30d412be20af2a3cead7640a154d53ccf17b05786e7",
           "size": 112,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/marmotkit-android-0.18.0-nightly.20261119.zip.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/marmotkit-android-0.18.0-nightly.20261120.zip.sha256"
         },
         {
-          "name": "marmotkit-ios-0.18.0-nightly.20261119.checksums.txt",
-          "sha256": "18e4d90a208046c1f032ffff742b3157df8c716ee71cc38c529ac309bf5c00a6",
+          "name": "marmotkit-ios-0.18.0-nightly.20261120.checksums.txt",
+          "sha256": "5fb2f3d72cc5cb1df133a51937de7d359e87e48ce254005deefd3cb6029404a7",
           "size": 734,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/marmotkit-ios-0.18.0-nightly.20261119.checksums.txt"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/marmotkit-ios-0.18.0-nightly.20261120.checksums.txt"
         },
         {
-          "name": "marmotkit-ios-0.18.0-nightly.20261119.manifest.json",
-          "sha256": "cd92b7d1b5007af5ca2a06ea48c4786ca5bca4ae76ef98983a6736f5f5eb95d0",
+          "name": "marmotkit-ios-0.18.0-nightly.20261120.manifest.json",
+          "sha256": "76c66e4055ac936f19f6fe5ca23dd7c028922d6439a973c6be9dfc3c29f4ec0e",
           "size": 1916,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/marmotkit-ios-0.18.0-nightly.20261119.manifest.json"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/marmotkit-ios-0.18.0-nightly.20261120.manifest.json"
         },
         {
-          "name": "marmotkit-ios-0.18.0-nightly.20261119.zip",
-          "sha256": "f55cb912c1d241bd401849bffe5cbd172da4ab47c01c22a31c363ed0fe919b1e",
-          "size": 80408503,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/marmotkit-ios-0.18.0-nightly.20261119.zip"
+          "name": "marmotkit-ios-0.18.0-nightly.20261120.zip",
+          "sha256": "f2b579ecdc2564c26cc40ba5856a6b6d00be2dda89f967f820df589fc35f7cd0",
+          "size": 80773546,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/marmotkit-ios-0.18.0-nightly.20261120.zip"
         },
         {
-          "name": "marmotkit-ios-0.18.0-nightly.20261119.zip.sha256",
-          "sha256": "32148c381fd45bf7f6362f246b8783748a0b1592070c7bf1a474e080294aa77e",
+          "name": "marmotkit-ios-0.18.0-nightly.20261120.zip.sha256",
+          "sha256": "d5e6930f8b7af33119deb5dc7331af0ef7c060f33006e270fc09ce7780e9750d",
           "size": 108,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/marmotkit-ios-0.18.0-nightly.20261119.zip.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/marmotkit-ios-0.18.0-nightly.20261120.zip.sha256"
         },
         {
-          "name": "marmotkit-macos-0.18.0-nightly.20261119.checksums.txt",
-          "sha256": "1a2d74b18a5e735267a93122ee6fc8adeb8e6cccc282aafc2a86b358330724f7",
+          "name": "marmotkit-macos-0.18.0-nightly.20261120.checksums.txt",
+          "sha256": "d9e3dda51ed5766ff129bd657ebba52752a3e58558cac5fbf8efffbae3eff8b0",
           "size": 752,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/marmotkit-macos-0.18.0-nightly.20261119.checksums.txt"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/marmotkit-macos-0.18.0-nightly.20261120.checksums.txt"
         },
         {
-          "name": "marmotkit-macos-0.18.0-nightly.20261119.manifest.json",
-          "sha256": "d399b46631b39382e89101d71d4a18e9992ef810f3ad58927191932f27aaeb64",
+          "name": "marmotkit-macos-0.18.0-nightly.20261120.manifest.json",
+          "sha256": "3f65726407fc33060c7eaa219cf67e10117ac125f86122c07c5a11680b83fe9e",
           "size": 1719,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/marmotkit-macos-0.18.0-nightly.20261119.manifest.json"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/marmotkit-macos-0.18.0-nightly.20261120.manifest.json"
         },
         {
-          "name": "marmotkit-macos-0.18.0-nightly.20261119.zip",
-          "sha256": "cb6ec347cf0702d7161f51d1aaada22889d99bab8c008910fa034270f764fa29",
-          "size": 40719931,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/marmotkit-macos-0.18.0-nightly.20261119.zip"
+          "name": "marmotkit-macos-0.18.0-nightly.20261120.zip",
+          "sha256": "c86fa597c12fd727f371923ad3b3ad1a183c246d457ecc903d7c554fa6ef0705",
+          "size": 40900023,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/marmotkit-macos-0.18.0-nightly.20261120.zip"
         },
         {
-          "name": "marmotkit-macos-0.18.0-nightly.20261119.zip.sha256",
-          "sha256": "17bf2a4403d96f38acb4b7603e70a6cf0775b35fd8a9fee66313b5d5ed1ee739",
+          "name": "marmotkit-macos-0.18.0-nightly.20261120.zip.sha256",
+          "sha256": "f5810131b1c40f110b8c18ea5f8acf4da5b7c95bdb5c828656fc3c543f63f884",
           "size": 110,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261119/marmotkit-macos-0.18.0-nightly.20261119.zip.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v0.18.0-nightly.20261120/marmotkit-macos-0.18.0-nightly.20261120.zip.sha256"
         }
       ],
-      "release_url": "https://github.com/marmot-protocol/mdk/releases/tag/marmotkit-v0.18.0-nightly.20261119",
-      "tag": "marmotkit-v0.18.0-nightly.20261119"
+      "release_url": "https://github.com/marmot-protocol/mdk/releases/tag/marmotkit-v0.18.0-nightly.20261120",
+      "tag": "marmotkit-v0.18.0-nightly.20261120"
     },
     "wn-agent": {
       "assets": [
         {
-          "name": "hermes-marmot-plugin-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "25f229b94efbcbc4bccea25b807e39bed88fb6108390011cae344048684b03cf",
-          "size": 117949,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/hermes-marmot-plugin-0.18.0-nightly.20261119.tar.gz"
+          "name": "hermes-marmot-plugin-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "881b3c2c48a90fc70bba715843623601487f1dfae498b0359787147c569d4afd",
+          "size": 117940,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/hermes-marmot-plugin-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "hermes-marmot-plugin-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "a439beb0af2e9d67f3566f881302d60232dd735be009bf6ca221a97ea1fcc845",
+          "name": "hermes-marmot-plugin-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "b56ad5881c74ba07a05f0876d630cbe49723bfbc25fd8191e55fdd6c0fa7ebc0",
           "size": 118,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/hermes-marmot-plugin-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/hermes-marmot-plugin-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "openclaw-marmot-plugin-0.18.0-nightly.20261119.tgz",
-          "sha256": "a798e976d88e6892a948927bc4fa2d59010623f57e49e9e6ccaef7f1f02d73dc",
+          "name": "openclaw-marmot-plugin-0.18.0-nightly.20261120.tgz",
+          "sha256": "a1813e435037ec101c56cf62b733efde13ad46bc55a8c543e43a20100bf8a5eb",
           "size": 181156,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/openclaw-marmot-plugin-0.18.0-nightly.20261119.tgz"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/openclaw-marmot-plugin-0.18.0-nightly.20261120.tgz"
         },
         {
-          "name": "openclaw-marmot-plugin-0.18.0-nightly.20261119.tgz.sha256",
-          "sha256": "1848425b5a1fe469e635537c8935ea15bab28cc18473a09a307052654ee5deaf",
+          "name": "openclaw-marmot-plugin-0.18.0-nightly.20261120.tgz.sha256",
+          "sha256": "edb6d2041f1bf678c2fbb6d07c49f4377763fcd7e4bbd1b6ded798102b67af34",
           "size": 117,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/openclaw-marmot-plugin-0.18.0-nightly.20261119.tgz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/openclaw-marmot-plugin-0.18.0-nightly.20261120.tgz.sha256"
         },
         {
-          "name": "wn-agent-darwin-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "0d3522788ee5816c654587bb0fdd0c8c2c7cfa3e040ef61637dcf374f782e6fd",
-          "size": 24389129,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-agent-darwin-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-agent-darwin-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "7a731bce8321d03faeb28bb8c90056bdbbb8a9e01c3059b439cf18ae4f61f959",
+          "size": 24492594,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-agent-darwin-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-agent-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "bc1c2ae486cbe71e5c1cb302feb7c0e23911e7d4178911578293c4fd54bd0e59",
+          "name": "wn-agent-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "277ac71eae8d2fe08e8eab169d1e28e87efe3ac05ff4b449ebc1937b5b7b2d22",
           "size": 121,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-agent-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-agent-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-agent-darwin-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "f3bf611bdb98e51ab43d2fac9755a887deecc96f2126bdc73009ecebd4722271",
-          "size": 25802140,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-agent-darwin-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-agent-darwin-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "ad5c9e93a84dd7ebe6f574ebb0ec5a1bc538627be64339ea0fa606c5f7641c81",
+          "size": 25913759,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-agent-darwin-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-agent-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "caa56a2a19d62591bf2d6c15200ac0d27383332c3ea9fa880a5f0f4609639e89",
+          "name": "wn-agent-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "c4db7f94da374c7511f12c184720b639385421a48cb62ecc227fb5437fd55541",
           "size": 120,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-agent-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-agent-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-agent-linux-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "ad3f4ff80eae1eebffed7ce4845d619eacf0d71e0f4da2567784ec93baeceefb",
-          "size": 26819376,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-agent-linux-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-agent-linux-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "bca05e2005d039f2e2212affcd277f16ad42ab3d59c3d1165cb9abf9c6bff214",
+          "size": 26929080,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-agent-linux-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-agent-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "da25144890b6ccfd153fd88d5f235452864afd90e991fc2b037e6dec4ebec70c",
+          "name": "wn-agent-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "55bbd11dbca131a33bbe2f3cfbed7c273c6b9918af73b0ee20a211aa82b41d8d",
           "size": 120,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-agent-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-agent-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-agent-linux-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "282fbe6589e9680871078d2c6e96e439bfd89ef92732e7a2073f8f32aa7fb301",
-          "size": 28014546,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-agent-linux-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-agent-linux-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "52768cc8642eb61b5c5c8d5fb81630b76c2a730c44f655060f9bd9fe66ed8b72",
+          "size": 28136593,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-agent-linux-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-agent-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "93ccf23b38b366b184e6f563987069f2c0248cd926dbef784ff569e7c4b45208",
+          "name": "wn-agent-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "c745601f19718608c1f3c410da237165f485350f5237ec7039a2eb0fdcb857ec",
           "size": 119,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-agent-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-agent-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-claude-darwin-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "dffe5abb061cb27e6277b2185a6f6fac01f2da8bd182892be0fc97b02483e81d",
-          "size": 1466805,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-claude-darwin-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-claude-darwin-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "3bc3bb84c4019abbcbfecd771fc738f93ac17049a987f6070c6a3406c5be2166",
+          "size": 1466803,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-claude-darwin-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-claude-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "47834939c83ea5852d8b6e1d7c4ff7b36b6247052cbf7f4bb9fa1f96632cbc14",
+          "name": "wn-claude-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "3f436fc53717295caf8350a3a5a2d3f75f08f70f52a5ef26eb2837154a7d9369",
           "size": 122,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-claude-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-claude-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-claude-darwin-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "2ab55968491cb7cc1506ff7fbb8f702993b3583fa309c56b64ce5b85a4baaee4",
-          "size": 1560225,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-claude-darwin-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-claude-darwin-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "cbdab079c5d3edea68874437a8f1e5d9660bef0f5b67bacb2aa6c19f6e74615a",
+          "size": 1560222,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-claude-darwin-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-claude-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "b88794c92def11b24f0f91bee3407ffce5df00061ac65fc1ac2eb7c052a79e8c",
+          "name": "wn-claude-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "b976b20c5772539ca66def1bff19c355235b2ffb7687c01ef392623cb05456d3",
           "size": 121,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-claude-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-claude-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-claude-linux-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "5a9db5f1f1f2c64bfdea3c8d1969fc2d1d671300007fdd83794fc698869936fd",
-          "size": 2120743,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-claude-linux-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-claude-linux-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "f530d8b632d0304721a150600d1705587311d8b6df2c97724dbbd6677ec2a953",
+          "size": 2120747,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-claude-linux-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-claude-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "9c8b39d0f8b6023d035aeb191a1fb95ccbff0d197b5ee631cbd02a19b13ca53d",
+          "name": "wn-claude-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "62d77e5378aadc8f919693f839a3632b395e1c76a5d7adf47ff2991babff9e5e",
           "size": 121,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-claude-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-claude-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-claude-linux-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "ae464b258ee2fdfadf0ced514afed1ddd031a8828174e44f3bd4044daf5ecb78",
-          "size": 2296370,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-claude-linux-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-claude-linux-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "824893797acbc5cc4d6d37c3c42ee34d1ab9d23cdc0040f5d14783b1bf22c738",
+          "size": 2296354,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-claude-linux-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-claude-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "d259c069b5b66efe8a4641a05714c0da68ebcddfd0b3514a8be4ecefa7448e1a",
+          "name": "wn-claude-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "ff52924f4cbba377888182eed11ca91f7c9c19ef020bbee26166c3551c676e38",
           "size": 120,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-claude-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-claude-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-codex-darwin-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "ac9ff2551948864eb842daf60613fe0c712df936d6f41d55fff596e59d1e97d0",
+          "name": "wn-codex-darwin-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "ed9321fb142b9b0f69f845963651646604aecf5e89c79b64b752c65c634f305a",
           "size": 1486908,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-codex-darwin-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-codex-darwin-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-codex-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "87b72cda8ead0239b96767ac69867cd9744724a4a2a2ccd3601fc3aeea9be619",
+          "name": "wn-codex-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "1473a6f716b32129d9f72122f969d5853496463f2358025da8399cba4deec9d3",
           "size": 121,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-codex-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-codex-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-codex-darwin-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "d3e3a4b536005994c8bb9600d5967609b3f0be95fee0946b3efe91a04cef8d35",
-          "size": 1579422,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-codex-darwin-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-codex-darwin-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "613d8d3ec2a6619842d29a1820b24149013c8a7434377fe999a32327e039f9b6",
+          "size": 1579413,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-codex-darwin-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-codex-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "1118ace6fd5f363df5aa6863cb70067202d4e68a1c4d39f733eaf9447ecd6fc6",
+          "name": "wn-codex-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "0811fd49b473f496df2ef4fc61d0a64449b8813d7a5860a0e55f21a4dac9cee1",
           "size": 120,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-codex-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-codex-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-codex-linux-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "f8fc24af20058330b41f67906842f75faa9a9f072441df9b6567d2e79a4ef66e",
-          "size": 2140137,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-codex-linux-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-codex-linux-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "6bb3b97a5c60111220b94754e66fc72cd1464cff948070597aa1cc7d92c3ddd5",
+          "size": 2140135,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-codex-linux-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-codex-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "1c9a9814e16690c8d249a5b7c087d4b74df763b21d1ff6b947de2aa3575d1203",
+          "name": "wn-codex-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "415a72095d33887ad46fabb3e6647abf17cb68ad86cb157c6ab50a4a01cb0ab4",
           "size": 120,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-codex-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-codex-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-codex-linux-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "c8ce313941503746f9da2ec2922aa398846b7b1cacad37bb546dc68aec7ff0b2",
-          "size": 2317321,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-codex-linux-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-codex-linux-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "bd9f1d0056b79f35e097615f010830dfdbbe8f3896761c073bdbd7977ea55220",
+          "size": 2317312,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-codex-linux-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-codex-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "7f88af060ff6cad67ecf3e45c3f5785346793620abf93d63bb569318fb18d8f6",
+          "name": "wn-codex-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "fb4f8ff94be90a8ca457ba39cd3bb4b39eee840ab0f7ac6558a2bdf0054afbd2",
           "size": 119,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-codex-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-codex-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-goose-darwin-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "828170db963279de960106f4e8ee7580c8b8bb2c35a2cef2ccb9649f2805ca1c",
-          "size": 1468301,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-goose-darwin-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-goose-darwin-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "2b9b60b20604791d1c62ef1f09c0aff21e9c3d0728cc338a3e5a0d5ecdbb7e0d",
+          "size": 1468297,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-goose-darwin-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-goose-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "20d8840dd64d5b1ea50b6b1a5a824e9a32cdbac1dbf116c97d413d3bf82c3e15",
+          "name": "wn-goose-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "ae7af4d008d7ffb2444037ef1101f6cd39fb373ae4241641a5ffc0bad9a8735d",
           "size": 121,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-goose-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-goose-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-goose-darwin-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "a1fdab662aab1b27d11d69b4444ea66c71e3ec37fef52d9b444113b344ab417e",
-          "size": 1561256,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-goose-darwin-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-goose-darwin-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "9fd3971ebd2dc1c33afb65f005450f01a97a57077bf5200968f647164a7fea8b",
+          "size": 1561248,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-goose-darwin-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-goose-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "8cebd767379cacf4c36b56fca2257955e0a07649e3a172ad8406914c802a6eb3",
+          "name": "wn-goose-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "7811b98a6f60d404462a27c6e19cc55b9ea76afd1f394862f1533d0badab244c",
           "size": 120,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-goose-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-goose-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-goose-linux-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "6948d061ef316f14ed3d12e330446dabd1745ac1d2c6ace32caa37aa033d265f",
-          "size": 2122442,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-goose-linux-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-goose-linux-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "dd9a7d5badb7775995069fbdbce66d14a1fc5c2bbd5765c33d90d02ce4be65ec",
+          "size": 2122424,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-goose-linux-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-goose-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "5634c436ded4bddd79c8a0ae7397c883cfebcc102181db7f9499a17f3a6e21ac",
+          "name": "wn-goose-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "87508a6acf6c8fcc1e6751cec73a38f8d5be7e191b2c8cb434d079535698923d",
           "size": 120,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-goose-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-goose-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-goose-linux-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "c5c3a0253bd5cb901d4293fc839828bb538156cc9b7a5791755b8be9deecad17",
-          "size": 2297427,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-goose-linux-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-goose-linux-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "187f0aacb84d926af8daacd0c62f3887aa40b3dd898b2c74bfbf7bf670ad35ce",
+          "size": 2297413,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-goose-linux-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-goose-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "d035bdcab669ab3958c582475a557556bf57ced7fc9e8bbc40eb32b9b35fec78",
+          "name": "wn-goose-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "484cae81fc12a38cc03e536fe453df507990cc9f0bbe435869753025b09762f1",
           "size": 119,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-goose-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-goose-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-opencode-darwin-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "844e0a1942486e9831c8703c24ee910073fb0e8909ee66d06a31fc97b9f97204",
-          "size": 1476578,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-opencode-darwin-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-opencode-darwin-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "7f9a62d1bfc456a6ca282a84a9b41ca4c947375d2ce55762df3172a2a7edbed9",
+          "size": 1476575,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-opencode-darwin-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-opencode-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "0d3d481eb3be39b3406608d1a3328ee68307aacf9e95acb3cd4089337253fb19",
+          "name": "wn-opencode-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "90ccf1672c1754bafee0b811cd6d7268d7c06531757e6c9c808de8bc2c739f0f",
           "size": 124,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-opencode-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-opencode-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-opencode-darwin-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "8f4df84d1d3c9f44d284fc80dca27c8a02831f0c87899d471728caaa535b8467",
-          "size": 1568136,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-opencode-darwin-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-opencode-darwin-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "78b9cca2f6d185aa2cf684c339a32362d75d16cc55dd3316b59ee2f8cf7aa873",
+          "size": 1568128,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-opencode-darwin-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-opencode-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "080470aa1e525efe71ce542a9a45a46694966462722ceb26886406efb7751717",
+          "name": "wn-opencode-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "c69872fa75a01d01588c67ccd1ea8dd77dab9f52d0c82755b2262c3bb7dbede9",
           "size": 123,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-opencode-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-opencode-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-opencode-linux-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "e1491ac6c963287fe61c822233ba1044160de0d5c65bf514dd532f0e0b18cd98",
-          "size": 2129667,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-opencode-linux-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-opencode-linux-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "ffbf9ae433619be930ca1114573656310edb8d3e06eb0d00ceee044040d20258",
+          "size": 2129672,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-opencode-linux-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-opencode-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "5aef6e2f19652f85c3344201906f2183476bbb0b2a403a92a23c1f8cc91e3d2a",
+          "name": "wn-opencode-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "25b2cf0a20be7c41113a9ad57befcba72e19ba14cb0b31cd07ee0d8a94142b48",
           "size": 123,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-opencode-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-opencode-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-opencode-linux-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "2c5d3b676ee18cdfa0ebe452365c3a895f4a635e3f9895559689068cdb851f04",
-          "size": 2304067,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-opencode-linux-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-opencode-linux-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "08d65f7db6d15511f42cd5f6bf5b80b0df5bfd499e23590f8330b5c1741e2dfb",
+          "size": 2304071,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-opencode-linux-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-opencode-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "13823720ef384ca9e29882246d07ab053e7e5fc849394bf92ca375316cd58b69",
+          "name": "wn-opencode-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "dad7ddd317eb3ad04f7c6667df31f96eafa78886274607c065b77ec354fe25d1",
           "size": 122,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-opencode-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-opencode-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-pi-darwin-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "486763b1e634335883b776df413b9840dc9f781b897ed67369dd160218b34cf3",
-          "size": 1464590,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-pi-darwin-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-pi-darwin-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "8828efe055537eb91e642faf2d1a946db5e4f97835816e40c450485cd16b3a71",
+          "size": 1464592,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-pi-darwin-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-pi-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "6238b2001765eb3a7dfd0bb4df41283ab966c5bd36fdc42047e3c114833151da",
+          "name": "wn-pi-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "4c3b5c06ca348a7f7c96ad84157180b6a97c2b3539d3238088ccdc2c2f6cae97",
           "size": 118,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-pi-darwin-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-pi-darwin-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-pi-darwin-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "c224dd6e89894863aea775fd584a0459a91f96b23e2b2468b3d78aeba585c972",
-          "size": 1554233,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-pi-darwin-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-pi-darwin-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "4a8b6a4170a6386116cb5ba4cf33248e061332eb4d41692e088043a66ebc361b",
+          "size": 1554226,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-pi-darwin-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-pi-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "e0a0e5e43e3a75970b8c19b7b32325e91a9a8f2773d5e6575375a7e860ee9811",
+          "name": "wn-pi-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "e22335294b1603f5a595964b14267e6aa35399d6ac9261e06489f8e2a67b1166",
           "size": 117,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-pi-darwin-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-pi-darwin-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-pi-linux-aarch64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "beafcf53d3a6f19cdc3547cfca7b62a83ca871254999803f9bdac8031acadd63",
-          "size": 2117255,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-pi-linux-aarch64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-pi-linux-aarch64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "8eb96f8dc78552bcf7c5cd51506392fb586a4730a2ca08e3b0b72bc61b5e4641",
+          "size": 2117246,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-pi-linux-aarch64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-pi-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "c1d3a2e5e2855fad85c2e0fc0adf418a65af93a2726be002963df20928336bec",
+          "name": "wn-pi-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "08a2654d17a0c7e6dc3beaeaa53175afdd94c369ac97a46cadef146f771a3d9b",
           "size": 117,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-pi-linux-aarch64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-pi-linux-aarch64-0.18.0-nightly.20261120.tar.gz.sha256"
         },
         {
-          "name": "wn-pi-linux-x86_64-0.18.0-nightly.20261119.tar.gz",
-          "sha256": "2305b78c55269c8e228a5596690ad988332c4a01fba86b9b0a843e4d38b74c4b",
-          "size": 2291506,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-pi-linux-x86_64-0.18.0-nightly.20261119.tar.gz"
+          "name": "wn-pi-linux-x86_64-0.18.0-nightly.20261120.tar.gz",
+          "sha256": "dc09b55323cb7a5724a103bbe6f4c8a7a5036143bd35bca70709b2f2d5a3df95",
+          "size": 2291502,
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-pi-linux-x86_64-0.18.0-nightly.20261120.tar.gz"
         },
         {
-          "name": "wn-pi-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256",
-          "sha256": "eabe432112bb65ea8fdc8fa1436bf0960ed2de91eb76b1982730de89ff87258a",
+          "name": "wn-pi-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256",
+          "sha256": "e535b45aad985157ed2e72c96dbfe16dd9f2d6ea958ec1fde40dc4401482ff0b",
           "size": 116,
-          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261119/wn-pi-linux-x86_64-0.18.0-nightly.20261119.tar.gz.sha256"
+          "url": "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0-nightly.20261120/wn-pi-linux-x86_64-0.18.0-nightly.20261120.tar.gz.sha256"
         }
       ],
-      "release_url": "https://github.com/marmot-protocol/mdk/releases/tag/wn-agent-v0.18.0-nightly.20261119",
-      "tag": "wn-agent-v0.18.0-nightly.20261119"
+      "release_url": "https://github.com/marmot-protocol/mdk/releases/tag/wn-agent-v0.18.0-nightly.20261120",
+      "tag": "wn-agent-v0.18.0-nightly.20261120"
     }
   },
-  "version": "0.18.0-nightly.20261119",
-  "workflow_run": "https://github.com/marmot-protocol/mdk/actions/runs/44479771984"
+  "version": "0.18.0-nightly.20261120",
+  "workflow_run": "https://github.com/marmot-protocol/mdk/actions/runs/44693878943"
 }
