@@ -1,0 +1,25 @@
+# Changes to CI, release automation and the toolchain inputs that release
+# builds trust need approval from one of these owners (the "Safe Master"
+# ruleset requires code-owner review). These files decide what CI runs, what
+# counts as passing, and what gets published, so a PR must not be able to
+# change them and judge itself.
+#
+# The root Cargo.toml is owned because it sets dependency sources and the
+# release profile. Ordinary source changes, including Cargo.lock, need no
+# owner review.
+
+/.github/                    @erskingardner @Datawav @dannym-arx @mubarakcoded
+/scripts/                    @erskingardner @Datawav @dannym-arx @mubarakcoded
+/Cargo.toml                  @erskingardner @Datawav @dannym-arx @mubarakcoded
+/Justfile                    @erskingardner @Datawav @dannym-arx @mubarakcoded
+/rust-toolchain.toml         @erskingardner @Datawav @dannym-arx @mubarakcoded
+/.cargo/                     @erskingardner @Datawav @dannym-arx @mubarakcoded
+/.config/                    @erskingardner @Datawav @dannym-arx @mubarakcoded
+/Dockerfile.*                @erskingardner @Datawav @dannym-arx @mubarakcoded
+/.dockerignore               @erskingardner @Datawav @dannym-arx @mubarakcoded
+/release.md                  @erskingardner @Datawav @dannym-arx @mubarakcoded
+
+# Crate-local scripts that build, package and validate published bindings.
+/crates/marmot-c/*.sh        @erskingardner @Datawav @dannym-arx @mubarakcoded
+/crates/marmot-uniffi/*.sh   @erskingardner @Datawav @dannym-arx @mubarakcoded
+/crates/marmot-uniffi/*.py   @erskingardner @Datawav @dannym-arx @mubarakcoded

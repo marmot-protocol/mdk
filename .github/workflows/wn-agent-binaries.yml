@@ -197,9 +197,11 @@ jobs:
 
       # Only the darwin targets keep a Cargo cache: they wait for the shared
       # macOS runners, and only they fit in the cache budget described in
-      # ci.yml. The Linux targets build cold.
+      # ci.yml. The Linux targets build cold. Release tags and nightlies
+      # publish these binaries, so they build cold too rather than from a
+      # restorable (poisonable) cache.
       - name: Cache Cargo artifacts
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && !startsWith(github.ref, 'refs/tags/') && !inputs.nightly_version
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}

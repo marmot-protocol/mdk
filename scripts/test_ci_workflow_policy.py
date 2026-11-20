@@ -202,7 +202,8 @@ class SignaturePolicyTests(unittest.TestCase):
                     return bool(needs) and any(gated(parent, visited | {job}) for parent in
                         re.findall(r"[a-z0-9][a-z0-9-]*", needs[1]))
                 for job, body in jobs.items():
-                    if job not in {"required-ci", "candidate-validation", "merge-group-fail-fast"}:
+                    if job not in {"required-ci", "candidate-validation", "merge-group-fail-fast",
+                                   "report-master-failure"}:
                         self.assertTrue(gated(job), f"{path.name}:{job} can run before signatures")
                         self.assertNotRegex(body, r"(?m)^    if:.*(?:always|failure|cancelled)\(")
 
@@ -515,7 +516,10 @@ class CacheBudgetPolicyTests(unittest.TestCase):
                     # Pull requests and merge groups only restore.
                     self.assertEqual(save_if, "${{ github.ref == 'refs/heads/master' }}")
                     if workflow.name == "wn-agent-binaries.yml":
-                        self.assertRegex(step, r"(?m)^        if: runner\.os == 'macOS'$")
+                        # Release tags and nightlies publish these binaries, so
+                        # they never restore a cache (binding packages below).
+                        self.assertRegex(step, r"(?m)^        if: runner\.os == 'macOS' && "
+                                               r"!startsWith\(github\.ref, 'refs/tags/'\) && !inputs\.nightly_version$")
         self.assertEqual(saving, {"ci.yml", "wn-agent-binaries.yml"})
 
     def test_only_setup_odin_saves_an_actions_cache_and_only_from_master(self):
