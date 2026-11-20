@@ -207,7 +207,7 @@ class SignaturePolicyTests(unittest.TestCase):
                         self.assertTrue(gated(job))
                         self.assertIn("    if: always() && github.event_name != 'pull_request' && "
                                       "github.ref == 'refs/heads/master' && "
-                                      "needs.candidate-validation.result == 'failure'\n", body)
+                                      "needs.candidate-validation.result == 'failure'", body.splitlines())
                     elif job not in {"required-ci", "candidate-validation", "merge-group-fail-fast"}:
                         self.assertTrue(gated(job), f"{path.name}:{job} can run before signatures")
                         self.assertNotRegex(body, r"(?m)^    if:.*(?:always|failure|cancelled)\(")
