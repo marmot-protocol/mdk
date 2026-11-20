@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-11-13
+updated: 2026-11-20
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -87,9 +87,10 @@ team-internal repository. It builds two separate Odin programs that share only s
 These replace Goggles, the earlier Django audit service, which is retired along with MDK's v4
 whole-file upload to it. Do not describe either program, or any current audit consumer, by the old name.
 
-**Investigating a group.** Agents query the reader through the `whitenoise-reader` skill, which
-whitenoise-data ships in `docs/reader/skill/`. Install it into your agent's skills directory as
-`whitenoise-reader`, and ask the repository's maintainer for a reader token. The reader's
+**Investigating a group.** Agents query the reader through
+[`.agents/skills/whitenoise-reader`](../../.agents/skills/whitenoise-reader/SKILL.md), a copy of the skill
+whitenoise-data ships in `docs/reader/skill/`, pinned to a reader release. Ask the repository's maintainer
+for a reader token. The reader's
 `GET /v1/contract` endpoint lists what each record kind can and cannot prove; the repository's `CONTRACT.md` explains how
 the reader interprets each kind. Reader output is sensitive: never put group ids, refs, source refs,
 record ids, record bodies or tokens into MDK issues, PRs, commits, fixtures or logs.
