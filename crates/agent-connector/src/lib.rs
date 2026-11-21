@@ -22,9 +22,8 @@ mod media_temp;
 mod messaging;
 mod reconcile_telemetry;
 mod relays;
+mod send_idempotency;
 mod socket;
-mod stream;
-mod stream_session;
 #[cfg(test)]
 mod test_support;
 mod timeline;
@@ -34,10 +33,9 @@ mod validation;
 mod tests;
 
 pub use bootstrap::{
-    BootstrapError, BootstrapOptions, BootstrapResult, DEFAULT_BOOTSTRAP_LABEL,
-    DEFAULT_QUIC_CANDIDATE, DEFAULT_RELAYS, RelaySource, ResolvedRelays, default_bootstrap_home,
-    read_bootstrap_auth_token, resolve_bootstrap_home, resolve_bootstrap_quic_candidates,
-    resolve_bootstrap_socket, resolve_relays, run_bootstrap,
+    BootstrapError, BootstrapOptions, BootstrapResult, DEFAULT_BOOTSTRAP_LABEL, DEFAULT_RELAYS,
+    RelaySource, ResolvedRelays, default_bootstrap_home, read_bootstrap_auth_token,
+    resolve_bootstrap_home, resolve_bootstrap_socket, resolve_relays, run_bootstrap,
 };
 pub use doctor::{
     DoctorCheck, DoctorCounts, DoctorOptions, DoctorReport, DoctorScope, DoctorStatus, run_doctor,
@@ -72,8 +70,9 @@ pub(crate) use marmot_app::AppMessageQuery;
 
 use crate::allowlist::AllowlistStore;
 use crate::event_projection::InboundCatchUpDriver;
+use crate::messaging::DebugFinalSendStore;
+use crate::send_idempotency::SendIdempotencyStore;
 use crate::socket::{bind_connector_socket_with_owned_home, verify_control_socket_link};
-use crate::stream_session::{DebugFinalSendStore, SendIdempotencyStore, StreamSessionStore};
 use crate::validation::{endpoint, validate_control_plane_config, validate_relay_url};
 
 pub(crate) const AGENT_SOCKET_DIR_MODE: u32 = 0o700;
@@ -88,7 +87,6 @@ pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub(crate) const STREAM_COMPOSE_CHUNK_BYTES: usize = 1024;
 /// Whole-operation deadline for control-socket I/O and request-scoped name
 /// resolution. A peer cannot reset it by trickling bytes or partial progress.
 pub(crate) const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -108,12 +106,6 @@ pub(crate) const INVITE_POLICY_RECONCILE_INTERVAL: Duration = Duration::from_sec
 pub(crate) const INVITE_POLICY_RECONCILE_MAX_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const INVITE_POLICY_RETRY_BASE: Duration = Duration::from_secs(5);
 pub(crate) const INVITE_POLICY_RETRY_MAX: Duration = Duration::from_secs(300);
-/// Maximum time a stream compose session may sit without an append/status/progress
-/// command before the sweeper aborts it. Bounds the lifetime of sessions abandoned by
-/// a crashed or restarted gateway (fresh ids on restart leave no cleanup path).
-pub(crate) const STREAM_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-/// How often the background sweeper scans for idle stream compose sessions.
-pub(crate) const STREAM_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// Maximum age of a decrypted inbound media temp directory before the sweeper
 /// removes the whole per-blob dir under `$TMPDIR/marmot-media/`.
 pub(crate) const MEDIA_TEMP_MAX_AGE: Duration = Duration::from_secs(3600);
@@ -144,8 +136,8 @@ pub(crate) const MAX_RELAY_URL_CHARS: usize = 512;
 /// plus, for `SubscribeInbound`, runtime/debug subscriptions and a delivered
 /// cursor, so beyond the cap new connections receive `server_busy` and close.
 pub const MAX_CONTROL_CONNECTIONS: usize = 64;
-/// Long-lived inbound subscriptions are capped separately so one-shot sends,
-/// stream finalization, and policy operations retain connection capacity.
+/// Long-lived inbound subscriptions are capped separately so one-shot sends
+/// and policy operations retain connection capacity.
 pub(crate) const MAX_CONTROL_SUBSCRIPTIONS: usize = 16;
 /// Poll interval while `AgentConnector::start` runs so a removed or replaced
 /// control-socket path is detected before the accept loop begins.
@@ -193,15 +185,6 @@ pub struct AgentConnectorConfig {
     /// Cap on concurrently served control connections; connections beyond it
     /// are closed at accept time. Must be nonzero.
     pub max_connections: usize,
-    /// Dev/test gate for insecure loopback brokers. When set, a stream-begin
-    /// `quic://` candidate whose host is a LITERAL loopback (`localhost` or a
-    /// loopback IP literal) may resolve to loopback and connect with
-    /// certificate verification disabled (`BrokerServerTrust::InsecureLocal`).
-    /// Off by default: agent-supplied candidates must resolve to public
-    /// addresses and always verify certificates, so a prompt-injected gateway
-    /// cannot steer the connector at local services (SSRF) or downgrade TLS
-    /// trust through DNS. See `docs/marmot-architecture/overview/dial-safety.md`.
-    pub allow_insecure_local_broker: bool,
     /// Dev/test gate for loopback relay endpoints (e.g. an in-process
     /// `MockRelay` or a local `nostr-rs-relay`). Admits loopback only;
     /// private/link-local/CGNAT relay hosts stay rejected. Off by default:
@@ -226,7 +209,6 @@ impl AgentConnectorConfig {
             auth_token: None,
             media_allowed_roots: Vec::new(),
             max_connections: MAX_CONTROL_CONNECTIONS,
-            allow_insecure_local_broker: false,
             allow_loopback_relays: false,
         }
     }
@@ -241,12 +223,9 @@ pub struct AgentConnector {
     pub(crate) debug_controls: bool,
     pub(crate) auth_token: Option<String>,
     pub(crate) media_allowed_roots: media_roots::MediaAllowedRoots,
-    pub(crate) allow_insecure_local_broker: bool,
     pub(crate) debug_events: broadcast::Sender<AgentControlEvent>,
     pub(crate) debug_final_sends: DebugFinalSendStore,
     pub(crate) idempotency: SendIdempotencyStore,
-    pub(crate) preview_idempotency: SendIdempotencyStore,
-    pub(crate) streams: StreamSessionStore,
     pub(crate) app: MarmotApp,
     pub(crate) runtime: MarmotAppRuntime,
     pub(crate) inbound_catch_up: InboundCatchUpDriver,
@@ -306,12 +285,9 @@ impl AgentConnector {
             debug_controls: config.debug_controls,
             auth_token: config.auth_token,
             media_allowed_roots,
-            allow_insecure_local_broker: config.allow_insecure_local_broker,
             debug_events,
             debug_final_sends: DebugFinalSendStore::default(),
             idempotency: SendIdempotencyStore::new(&config.home),
-            preview_idempotency: SendIdempotencyStore::process_local_preview(),
-            streams: StreamSessionStore::default(),
             app,
             runtime,
             inbound_catch_up,
@@ -335,7 +311,6 @@ impl AgentConnector {
     pub async fn start(&self) -> Result<(), ConnectorError> {
         self.runtime.start().await?;
         self.spawn_invite_policy_worker();
-        self.spawn_stream_session_sweeper();
         self.spawn_media_temp_sweeper();
         let observation = self.runtime.begin_product_operation(
             marmot_app::ProductFamily::Agent,
@@ -499,8 +474,8 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
             }
         };
         // Bound concurrent per-connection tasks (and the subscriptions and
-        // cursors they hold), mirroring the broker's connection limiter:
-        // beyond the cap the connection is closed instead of served.
+        // cursors they hold): beyond the cap the connection is closed instead
+        // of served.
         let Ok(permit) = Arc::clone(&connection_limiter).try_acquire_owned() else {
             let connections_refused = connector
                 .connections_refused

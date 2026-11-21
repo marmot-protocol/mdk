@@ -133,13 +133,6 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::EditMessage { .. } => "edit_message",
         AgentControlRequest::SendReaction { .. } => "send_reaction",
         AgentControlRequest::RemoveReaction { .. } => "remove_reaction",
-        AgentControlRequest::StreamBegin { .. } => "stream_begin",
-        AgentControlRequest::StreamAppend { .. } => "stream_append",
-        AgentControlRequest::StreamStatus { .. } => "stream_status",
-        AgentControlRequest::StreamProgress { .. } => "stream_progress",
-        AgentControlRequest::StreamFinish { .. } => "stream_finish",
-        AgentControlRequest::StreamFinalize { .. } => "stream_finalize",
-        AgentControlRequest::StreamCancel { .. } => "stream_cancel",
         AgentControlRequest::AccountList => "account_list",
         AgentControlRequest::AccountCreate { .. } => "account_create",
         AgentControlRequest::AccountPublishKeyPackage { .. } => "account_publish_key_package",
@@ -328,14 +321,6 @@ pub(crate) fn validate_relay_url(
         return Err(ConnectorError::InvalidRelayUrl("unsupported_scheme"));
     }
     Ok(value.to_owned())
-}
-
-pub(crate) fn transcript_hash_from_hex(value: &str) -> Result<[u8; 32], ConnectorError> {
-    let bytes = hex::decode(normalize_hex(value)?)?;
-    let actual = bytes.len();
-    bytes
-        .try_into()
-        .map_err(|_| ConnectorError::Stream(format!("invalid transcript hash length: {actual}")))
 }
 
 pub(crate) fn normalize_hex(value: &str) -> Result<String, ConnectorError> {

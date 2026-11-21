@@ -22,7 +22,6 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.eu.whitenoise.chat",
     "wss://relay.us.whitenoise.chat",
 ];
-pub const DEFAULT_QUIC_CANDIDATE: &str = "quic://quic-broker.ipf.dev:4450";
 
 #[derive(Clone, Debug)]
 pub struct BootstrapOptions {
@@ -32,7 +31,6 @@ pub struct BootstrapOptions {
     pub account_id_hex: Option<String>,
     pub auth_token: Option<String>,
     pub relays: Vec<String>,
-    pub quic_candidates: Vec<String>,
     pub allow_welcomers: Vec<String>,
     pub invite_policy: Option<AgentControlInvitePolicy>,
     pub create_if_missing: bool,
@@ -52,7 +50,6 @@ pub struct BootstrapResult {
     pub key_package_bytes: Option<usize>,
     pub socket: String,
     pub relays: Vec<String>,
-    pub quic_candidates: Vec<String>,
     pub welcomer_account_ids_hex: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invite_policy: Option<AgentControlInvitePolicy>,
@@ -148,7 +145,6 @@ pub async fn run_bootstrap(options: BootstrapOptions) -> Result<BootstrapResult,
         key_package_bytes: account_state.key_package_bytes,
         socket: options.socket.display().to_string(),
         relays: options.relays.clone(),
-        quic_candidates: options.quic_candidates.clone(),
         welcomer_account_ids_hex,
         invite_policy,
         npub,
@@ -531,8 +527,6 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::MaintenanceScheduled { .. } => "maintenance_scheduled",
         AgentControlResponse::MaintenancePolicy { .. } => "maintenance_policy",
         AgentControlResponse::MaintenanceRun { .. } => "maintenance_run",
-        AgentControlResponse::StreamBegun { .. } => "stream_begun",
-        AgentControlResponse::StreamFinalized { .. } => "stream_finalized",
         AgentControlResponse::DebugRecordedFinals { .. } => "debug_recorded_finals",
         AgentControlResponse::MediaDownloaded { .. } => "media_downloaded",
         AgentControlResponse::Attachment { .. } => "attachment",
@@ -687,31 +681,6 @@ fn resolve_relays_from(
     }
 }
 
-pub fn resolve_bootstrap_quic_candidates(
-    cli_candidates: Vec<String>,
-    cli_csv: Option<String>,
-    no_quic: bool,
-) -> Vec<String> {
-    if no_quic {
-        return Vec::new();
-    }
-    let mut candidates = cli_candidates;
-    if let Some(csv) = cli_csv {
-        candidates.extend(csv_values(&csv));
-    }
-    let cleaned = clean_values(candidates);
-    if !cleaned.is_empty() {
-        return cleaned;
-    }
-    if let Ok(value) = std::env::var("MARMOT_QUIC_CANDIDATES") {
-        let parsed = csv_values(&value);
-        if !parsed.is_empty() {
-            return parsed;
-        }
-    }
-    vec![DEFAULT_QUIC_CANDIDATE.to_owned()]
-}
-
 fn csv_values(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -840,7 +809,6 @@ mod tests {
             "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy"
         );
         assert!(result.nprofile.starts_with("nprofile1"));
-        assert!(!result.qr_payload.contains("quic://"));
         let recorded = requests.lock().await;
         assert_eq!(recorded.len(), 3);
         assert!(matches!(recorded[0], AgentControlRequest::AccountList));
@@ -976,62 +944,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_honors_repeated_and_csv_quic_candidates() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("wn-agent.sock");
-        let server = spawn_mock_server(
-            socket_path.clone(),
-            Arc::new(Mutex::new(Vec::new())),
-            |request| match request {
-                AgentControlRequest::AccountList => AgentControlResponse::AccountList {
-                    accounts: vec![AgentControlAccount {
-                        account_id_hex: ACCOUNT_ID.to_owned(),
-                        label: DEFAULT_BOOTSTRAP_LABEL.to_owned(),
-                        local_signing: true,
-                    }],
-                },
-                AgentControlRequest::AccountPublishKeyPackage { .. } => {
-                    AgentControlResponse::KeyPackagePublished {
-                        account_id_hex: ACCOUNT_ID.to_owned(),
-                        key_package_bytes: 12,
-                    }
-                }
-                AgentControlRequest::AllowlistList { account_id_hex } => {
-                    assert_eq!(account_id_hex, ACCOUNT_ID);
-                    AgentControlResponse::Allowlist {
-                        account_id_hex: ACCOUNT_ID.to_owned(),
-                        welcomer_account_ids_hex: Vec::new(),
-                    }
-                }
-                other => panic!("unexpected request: {other:?}"),
-            },
-        )
-        .await;
-
-        let mut options = test_options(socket_path);
-        options.relays = vec!["wss://relay.one".to_owned()];
-        options.quic_candidates = resolve_bootstrap_quic_candidates(
-            vec!["quic://one".to_owned()],
-            Some("quic://two,quic://three".to_owned()),
-            false,
-        );
-        let result = run_bootstrap(options).await.unwrap();
-        server.abort();
-
-        assert_eq!(result.relays, vec!["wss://relay.one".to_owned()]);
-        assert_eq!(
-            result.quic_candidates,
-            vec![
-                "quic://one".to_owned(),
-                "quic://two".to_owned(),
-                "quic://three".to_owned(),
-            ]
-        );
-        assert!(result.qr_payload.starts_with("nprofile1"));
-        assert!(!result.qr_payload.contains("quic://one"));
-    }
-
-    #[tokio::test]
     async fn bootstrap_adds_allowlisted_welcomers_from_hex_and_npub() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("wn-agent.sock");
@@ -1157,7 +1069,6 @@ mod tests {
                 .iter()
                 .map(|relay| (*relay).to_owned())
                 .collect(),
-            quic_candidates: vec![DEFAULT_QUIC_CANDIDATE.to_owned()],
             allow_welcomers: Vec::new(),
             invite_policy: None,
             create_if_missing: true,

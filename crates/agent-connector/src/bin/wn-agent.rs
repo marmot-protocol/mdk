@@ -9,8 +9,8 @@ use agent_connector::{
     DEFAULT_BOOTSTRAP_LABEL, DoctorOptions, GroupProfileToolConfig, MAX_CONTROL_CONNECTIONS,
     MAX_IDENTITY_BYTES, default_socket_path, import_existing_identity_file,
     import_existing_identity_secret, read_bootstrap_auth_token, resolve_bootstrap_home,
-    resolve_bootstrap_quic_candidates, resolve_bootstrap_socket, resolve_relays, run_bootstrap,
-    run_doctor, run_group_profile_tool, serve_socket,
+    resolve_bootstrap_socket, resolve_relays, run_bootstrap, run_doctor, run_group_profile_tool,
+    serve_socket,
 };
 use agent_control::AgentControlInvitePolicy;
 use clap::{Args, Parser, Subcommand};
@@ -116,12 +116,6 @@ struct ServeArgs {
     max_connections: usize,
     #[arg(
         long,
-        help = "Dev/test only: allow literal-loopback quic:// broker candidates \
-                without certificate verification"
-    )]
-    insecure_local_broker: bool,
-    #[arg(
-        long,
         help = "Dev/test only: allow relay connections to loopback endpoints (loopback only; private/link-local/CGNAT stay rejected)"
     )]
     allow_loopback_relays: bool,
@@ -165,20 +159,11 @@ struct BootstrapArgs {
         help = "Public Nostr relay used for invite output; may be repeated"
     )]
     relay: Vec<String>,
-    #[arg(
-        long,
-        value_name = "URI",
-        help = "QUIC preview candidate included in bootstrap output; may be repeated"
-    )]
-    quic_candidate: Vec<String>,
-    #[arg(
-        long,
-        value_name = "CSV",
-        help = "Comma-separated QUIC preview candidates"
-    )]
-    quic_candidates: Option<String>,
-    #[arg(long, help = "Omit default QUIC preview candidate from output")]
-    no_quic: bool,
+    // Accepted and ignored. Live previews over QUIC were removed, but installers
+    // released before that pass `--no-quic` on every bootstrap; keep accepting
+    // it so a stale installer does not fail. Hidden from `--help`.
+    #[arg(long = "no-quic", hide = true)]
+    _no_quic: bool,
     #[arg(
         long,
         help = "Fail instead of creating an account when none exists locally"
@@ -647,7 +632,6 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
         auth_token,
         media_allowed_roots: args.media_allowed_roots,
         max_connections: args.max_connections,
-        allow_insecure_local_broker: args.insecure_local_broker,
         allow_loopback_relays: args.allow_loopback_relays,
     };
     if config.dev_allow_any_invites && config.debug_controls {
@@ -711,8 +695,6 @@ async fn run_bootstrap_command(args: BootstrapArgs) -> ExitCode {
         }
     };
     let relays = resolve_relays(args.relay, true).relays;
-    let quic_candidates =
-        resolve_bootstrap_quic_candidates(args.quic_candidate, args.quic_candidates, args.no_quic);
     let options = BootstrapOptions {
         home,
         socket,
@@ -720,7 +702,6 @@ async fn run_bootstrap_command(args: BootstrapArgs) -> ExitCode {
         account_id_hex: args.account_id_hex,
         auth_token,
         relays,
-        quic_candidates,
         allow_welcomers: args.allow_welcomer,
         invite_policy: args.invite_policy,
         create_if_missing: !args.no_create,
@@ -764,11 +745,6 @@ fn write_bootstrap_output(
     println!("Agent npub: {}", result.npub);
     println!("Agent nprofile: {}", result.nprofile);
     println!("Relay(s): {}", result.relays.join(", "));
-    if result.quic_candidates.is_empty() {
-        println!("QUIC candidate(s): none");
-    } else {
-        println!("QUIC candidate(s): {}", result.quic_candidates.join(", "));
-    }
     println!(
         "Welcomer allowlist: {} entr{}",
         result.welcomer_account_ids_hex.len(),
@@ -860,4 +836,26 @@ enum UsageCommand {
     Show,
     Enable,
     Disable,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn bootstrap_accepts_the_retired_no_quic_flag_without_advertising_it() {
+        let cli = Cli::try_parse_from(["wn-agent", "bootstrap", "--no-quic"])
+            .expect("installers released before the QUIC removal pass --no-quic");
+        assert!(matches!(cli.command, Some(Commands::Bootstrap(_))));
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("bootstrap")
+            .expect("bootstrap subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("quic"), "retired flag must stay hidden");
+    }
 }

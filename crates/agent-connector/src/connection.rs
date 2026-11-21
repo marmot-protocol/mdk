@@ -201,10 +201,6 @@ impl AgentConnector {
             | AgentControlRequest::MaintenanceGetPolicy { .. }
             | AgentControlRequest::AllowlistList { .. }
             | AgentControlRequest::InvitePolicyGet { .. } => Some("control_read"),
-            AgentControlRequest::StreamBegin { .. }
-            | AgentControlRequest::StreamFinalize { .. }
-            | AgentControlRequest::StreamFinish { .. }
-            | AgentControlRequest::StreamCancel { .. } => Some("control_preview"),
             AgentControlRequest::SendFinal { .. }
             | AgentControlRequest::DeleteMessage { .. }
             | AgentControlRequest::EditMessage { .. }
@@ -504,108 +500,6 @@ impl AgentConnector {
                     emoji.as_deref(),
                 )
                 .await
-            }
-            AgentControlRequest::StreamBegin {
-                account_id_hex,
-                group_id_hex,
-                stream_id_hex,
-                parent_message_id_hex,
-                quic_candidates,
-            } => {
-                self.stream_begin_response(
-                    request_id,
-                    &account_id_hex,
-                    &group_id_hex,
-                    stream_id_hex,
-                    parent_message_id_hex,
-                    quic_candidates,
-                )
-                .await
-            }
-            AgentControlRequest::StreamAppend {
-                stream_id_hex,
-                stream_capability,
-                append_text,
-                idempotency_key,
-            } => {
-                self.stream_record_response(
-                    marmot_app::AgentPublisherRecord::Text,
-                    &stream_id_hex,
-                    &stream_capability,
-                    append_text,
-                    idempotency_key,
-                )
-                .await
-            }
-            AgentControlRequest::StreamStatus {
-                stream_id_hex,
-                stream_capability,
-                status,
-                idempotency_key,
-            } => {
-                self.stream_record_response(
-                    marmot_app::AgentPublisherRecord::Status,
-                    &stream_id_hex,
-                    &stream_capability,
-                    status,
-                    idempotency_key,
-                )
-                .await
-            }
-            AgentControlRequest::StreamProgress {
-                stream_id_hex,
-                stream_capability,
-                text,
-                idempotency_key,
-            } => {
-                self.stream_record_response(
-                    marmot_app::AgentPublisherRecord::Progress,
-                    &stream_id_hex,
-                    &stream_capability,
-                    text,
-                    idempotency_key,
-                )
-                .await
-            }
-            AgentControlRequest::StreamFinish {
-                stream_id_hex,
-                stream_capability,
-                final_text,
-                idempotency_key,
-            } => {
-                self.stream_finish_response(
-                    &stream_id_hex,
-                    &stream_capability,
-                    final_text,
-                    idempotency_key,
-                )
-                .await
-            }
-            AgentControlRequest::StreamFinalize {
-                stream_id_hex,
-                stream_capability,
-                final_text,
-                transcript_hash_hex,
-                chunk_count,
-                idempotency_key,
-            } => {
-                self.stream_finalize_response(
-                    &stream_id_hex,
-                    &stream_capability,
-                    final_text,
-                    &transcript_hash_hex,
-                    chunk_count,
-                    idempotency_key,
-                )
-                .await
-            }
-            AgentControlRequest::StreamCancel {
-                stream_id_hex,
-                stream_capability,
-                ..
-            } => {
-                self.stream_cancel_response(&stream_id_hex, &stream_capability)
-                    .await
             }
             AgentControlRequest::AccountCreate {
                 label,
