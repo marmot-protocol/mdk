@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::{
     ArtifactExportConfig, ArtifactExportGrant, Config, DEFAULT_MAX_ATTACHMENT_BYTES,
     DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_REPLY_BYTES, HarnessError, MARMOT_MESSAGE_BYTES_CEILING,
-    Result,
+    Result, RoutingConfig,
 };
 
 const DEFAULT_BACKEND_TIMEOUT_SECS: u64 = 3600;
@@ -282,6 +282,8 @@ pub fn load_config_with(
     )
     .with_max_count(artifact_max_count);
 
+    let routing = load_routing(lookup, &spec)?;
+
     Ok(LoadedConfig {
         harness: Config {
             socket,
@@ -301,11 +303,62 @@ pub fn load_config_with(
             backend_idle_timeout,
             execution_profile,
             artifact_exports,
+            routing,
             spec,
         },
         home,
         bin,
     })
+}
+
+/// Shared routing-file variable read by every co-resident harness.
+pub(crate) const ROUTING_FILE_ENV: &str = "MARMOT_HARNESS_ROUTING_FILE";
+/// Optional operator text that replaces the built-in handoff preamble.
+pub(crate) const HANDOFF_PROMPT_FILE_ENV: &str = "MARMOT_HARNESS_HANDOFF_PROMPT_FILE";
+
+fn load_routing(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    spec: &ConfigSpec,
+) -> Result<Option<RoutingConfig>> {
+    let Some(file) = lookup(ROUTING_FILE_ENV).filter(|raw| !raw.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let file = PathBuf::from(file.trim());
+    if !file.is_absolute() {
+        return Err(config_error(format!(
+            "{ROUTING_FILE_ENV} must be an absolute path"
+        )));
+    }
+    let name_env = format!("{}_ROUTE_NAME", spec.env_prefix);
+    let name = lookup(&name_env)
+        .map(|raw| raw.trim().to_owned())
+        .unwrap_or_else(|| {
+            spec.reply_prefix
+                .strip_prefix("wn-")
+                .unwrap_or(spec.reply_prefix)
+                .to_owned()
+        });
+    if !crate::routing::is_valid_agent_name(&name) {
+        return Err(config_error(format!(
+            "{name_env} must be 1-32 lowercase letters, digits, or hyphens"
+        )));
+    }
+    let handoff_prompt_file = lookup(HANDOFF_PROMPT_FILE_ENV)
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| PathBuf::from(raw.trim()));
+    if handoff_prompt_file
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(config_error(format!(
+            "{HANDOFF_PROMPT_FILE_ENV} must be an absolute path"
+        )));
+    }
+    Ok(Some(RoutingConfig {
+        file,
+        name,
+        handoff_prompt_file,
+    }))
 }
 
 fn parse_positive_duration(
@@ -635,6 +688,75 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(loaded.harness.spec.env_prefix, "WN_TEST");
+    }
+
+    #[test]
+    fn routing_is_disabled_unless_a_file_is_configured() {
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+        ])
+        .unwrap();
+        assert!(loaded.harness.routing.is_none());
+    }
+
+    #[test]
+    fn routing_defaults_the_route_name_from_the_reply_prefix() {
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("MARMOT_HARNESS_ROUTING_FILE", "/tmp/routing.json"),
+        ])
+        .unwrap();
+        let routing = loaded.harness.routing.unwrap();
+        assert_eq!(routing.name, "test");
+        assert_eq!(routing.file, PathBuf::from("/tmp/routing.json"));
+        assert!(routing.handoff_prompt_file.is_none());
+
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("MARMOT_HARNESS_ROUTING_FILE", "/tmp/routing.json"),
+            ("WN_TEST_ROUTE_NAME", "kimi"),
+            ("MARMOT_HARNESS_HANDOFF_PROMPT_FILE", "/tmp/handoff.md"),
+        ])
+        .unwrap();
+        let routing = loaded.harness.routing.unwrap();
+        assert_eq!(routing.name, "kimi");
+        assert_eq!(
+            routing.handoff_prompt_file,
+            Some(PathBuf::from("/tmp/handoff.md"))
+        );
+    }
+
+    #[test]
+    fn routing_rejects_relative_files_and_invalid_names() {
+        assert!(
+            load(&[
+                ("HOME", "/home/test"),
+                ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+                ("MARMOT_HARNESS_ROUTING_FILE", "routing.json"),
+            ])
+            .is_err()
+        );
+        assert!(
+            load(&[
+                ("HOME", "/home/test"),
+                ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+                ("MARMOT_HARNESS_ROUTING_FILE", "/tmp/routing.json"),
+                ("WN_TEST_ROUTE_NAME", "Not Valid"),
+            ])
+            .is_err()
+        );
+        assert!(
+            load(&[
+                ("HOME", "/home/test"),
+                ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+                ("MARMOT_HARNESS_ROUTING_FILE", "/tmp/routing.json"),
+                ("MARMOT_HARNESS_HANDOFF_PROMPT_FILE", "handoff.md"),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use agent_control::{
     AgentControlAccount, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
+    AgentControlTimelineCursor,
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::AbortHandle;
@@ -23,6 +24,10 @@ use crate::commands::{self, ChatCommand, Routed};
 use crate::control::{ControlClient, DownloadedMedia};
 use crate::error::{HarnessError, Result};
 use crate::repo_picker::{RepoPicker, parse_repo_picker, resolve_repo, validate_session_cwd};
+use crate::routing::{
+    AgentCommandAction, AgentCommandPlan, CommandRef, Gate, Router, Takeover, TranscriptLine,
+    handoff_preamble, speaker_label,
+};
 use crate::store::{
     FinalDeliveryRecord, FinalDeliveryStore, RecoveryKind, RecoveryRecord, RecoveryStatus,
     RecoveryStore, SessionRecord, SessionStore,
@@ -117,6 +122,10 @@ pub async fn run<B: Backend>(mut config: Config, backend: B) -> Result<()> {
     )?);
     reconcile_pending_deliveries(&client, &deliveries).await;
     let queues = Arc::new(GroupQueues::new(config.max_pending_per_group));
+    let router = config
+        .routing
+        .clone()
+        .map(|routing| Arc::new(Router::new(routing)));
     let ctx = Arc::new(BridgeContext {
         cfg: Arc::new(config),
         client,
@@ -130,6 +139,7 @@ pub async fn run<B: Backend>(mut config: Config, backend: B) -> Result<()> {
         backend: Arc::new(backend),
         outbox,
         home,
+        router,
     });
 
     if ctx.cfg.artifact_exports.enabled() {
@@ -175,6 +185,7 @@ struct BridgeContext {
     backend: Arc<dyn Backend>,
     outbox: Arc<Mutex<ArtifactOutbox>>,
     home: PathBuf,
+    router: Option<Arc<Router>>,
 }
 
 struct ReconciliationSlot {
@@ -358,6 +369,32 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 );
                 return DispatchOutcome::Continue;
             }
+            let mut agent_action = None;
+            if let Some(router) = &ctx.router {
+                let group_key = group_id_hex.to_ascii_lowercase();
+                let position = CommandRef {
+                    at: message.recorded_at,
+                    message: message.message_id_hex.to_ascii_lowercase(),
+                };
+                if let Routed::Command(ChatCommand::Agent { name }) = commands::route(&message.text)
+                {
+                    match router
+                        .apply_agent_command(&group_key, name.as_deref(), position)
+                        .await
+                    {
+                        AgentCommandPlan::Silent => return DispatchOutcome::Continue,
+                        AgentCommandPlan::Handle(action) => agent_action = Some(action),
+                    }
+                } else if router.gate(&group_key, &position).await == Gate::Ignore {
+                    debug!(
+                        target: TRACE_TARGET,
+                        method = "dispatch_event",
+                        event = "routed_elsewhere",
+                        "ignoring inbound event routed to another agent"
+                    );
+                    return DispatchOutcome::Continue;
+                }
+            }
             let disposition = classify_prompt(&message.text);
             let permit = acquire_dispatch_permit(&ctx.queues, &group_id_hex, &disposition).await;
             let Some(permit) = permit else {
@@ -405,6 +442,8 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 message_ref: message.message_id_hex,
                 text: message.text,
                 media: message.media,
+                recorded_at: message.recorded_at,
+                agent_action,
             };
             tokio::spawn(handle_message(ctx, inbound, permit));
             DispatchOutcome::Continue
@@ -446,6 +485,10 @@ struct InboundPrompt {
     message_ref: String,
     text: String,
     media: Vec<AgentControlMediaRef>,
+    /// Sender-authenticated message time, used to bound a handoff transcript.
+    recorded_at: u64,
+    /// Routing decision for an `/agent` command, planned at dispatch time.
+    agent_action: Option<AgentCommandAction>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -494,9 +537,13 @@ async fn acquire_dispatch_permit(
     group_ref: &str,
     disposition: &PromptDisposition,
 ) -> Option<GroupPermit> {
+    // `/agent` must not be refused for a full queue: the switch is already
+    // saved, and the target has to reset and announce it.
     if matches!(
         disposition,
-        PromptDisposition::RetryLast | PromptDisposition::DiscardLast
+        PromptDisposition::RetryLast
+            | PromptDisposition::DiscardLast
+            | PromptDisposition::HarnessCommand(ChatCommand::Agent { .. })
     ) || is_inspect_disposition(disposition)
     {
         queues.enter_without_waiter_quota(group_ref).await
@@ -598,6 +645,38 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             drop(pending);
         }
     };
+
+    if let Some(router) = &ctx.router
+        && !matches!(
+            disposition,
+            PromptDisposition::HarnessCommand(ChatCommand::Agent { .. })
+        )
+    {
+        let group_key = inbound.group_ref.to_ascii_lowercase();
+        // A routing file that became readable or was edited while this prompt
+        // waited may assign it elsewhere; the message's own time decides.
+        let position = CommandRef {
+            at: inbound.recorded_at,
+            message: inbound.message_ref.to_ascii_lowercase(),
+        };
+        if router.gate(&group_key, &position).await == Gate::Ignore {
+            debug!(
+                target: TRACE_TARGET,
+                method = "handle_message",
+                event = "routed_elsewhere",
+                "dropping queued prompt routed to another agent"
+            );
+            return;
+        }
+        // A switch to this harness whose `/agent` command was not handled
+        // yet, because this harness was offline, the command was not
+        // replayed, or the command task is still queued behind this prompt,
+        // needs a fresh session before this prompt runs.
+        if let Ok(Takeover::Pending { command, previous }) = router.takeover_state(&group_key).await
+        {
+            start_takeover(&ctx, router, &inbound.group_ref, &command, previous).await;
+        }
+    }
 
     let mut retrying = false;
     let forced_run = match disposition {
@@ -751,6 +830,11 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         .as_ref()
         .and_then(|record| record.goal.as_deref());
     let (recovery_prompt, prompt) = prepare_prompt(goal, prompt);
+    let prompt = if retrying {
+        prompt
+    } else {
+        with_pending_handoff(&ctx, &inbound, prompt).await
+    };
     let recovery_prompt = RecoveryPrompt {
         text: recovery_prompt,
         omit_control_instructions: !add_control_instructions,
@@ -1755,6 +1839,12 @@ fn attachment_failure_reply(config: &Config, error: &HarnessError) -> String {
 }
 
 async fn handle_command(ctx: &BridgeContext, inbound: &InboundPrompt, command: ChatCommand) {
+    if let ChatCommand::Agent { .. } = command {
+        if let Some(body) = agent_command_body(ctx, inbound).await {
+            send_command_reply(ctx, inbound, &body).await;
+        }
+        return;
+    }
     let record = ctx.sessions.get(&inbound.group_ref).await;
     let body =
         match command {
@@ -1787,6 +1877,7 @@ async fn handle_command(ctx: &BridgeContext, inbound: &InboundPrompt, command: C
                     Err(()) => "Failed to set the standing goal.".to_owned(),
                 }
             }
+            ChatCommand::Agent { .. } => unreachable!("agent commands are handled above"),
             ChatCommand::RetryLast | ChatCommand::DiscardLast => {
                 unreachable!("recovery commands are handled before generic command dispatch")
             }
@@ -1830,6 +1921,209 @@ async fn new_session_body(ctx: &BridgeContext, inbound: &InboundPrompt) -> Strin
             format!("Failed to reset the {} session.", ctx.cfg.spec.display_name)
         }
     }
+}
+
+/// Replies to an `/agent` command, or returns `None` when this harness must
+/// stay silent because a newer switch replaced the planned takeover.
+async fn agent_command_body(ctx: &BridgeContext, inbound: &InboundPrompt) -> Option<String> {
+    let Some(router) = &ctx.router else {
+        return Some("Agent routing is not configured for this harness.".to_owned());
+    };
+    let group_key = inbound.group_ref.to_ascii_lowercase();
+    let display = ctx.cfg.spec.display_name;
+    let body = match &inbound.agent_action {
+        None | Some(AgentCommandAction::Status) => router.status_text(&group_key).await,
+        Some(AgentCommandAction::Unknown { requested }) => format!(
+            "There is no agent named `{requested}`.\n{}",
+            router.status_text(&group_key).await
+        ),
+        Some(AgentCommandAction::Pinned) => format!(
+            "This chat is pinned in the routing file and cannot be switched from chat.\n{}",
+            router.status_text(&group_key).await
+        ),
+        Some(AgentCommandAction::Unavailable) => {
+            "Agent routing is configured, but the routing file is missing or invalid.".to_owned()
+        }
+        Some(AgentCommandAction::FutureTimestamp) => format!(
+            "This switch was ignored because its timestamp is ahead of this machine's clock.\n{}",
+            router.status_text(&group_key).await
+        ),
+        Some(AgentCommandAction::SaveFailed) => format!(
+            "{display} could not save the switch to the routing file, so the previous routing stays in effect."
+        ),
+        Some(AgentCommandAction::TakeOver { command, previous }) => {
+            let from = previous
+                .as_ref()
+                .map(|previous| format!(" from {previous}"))
+                .unwrap_or_default();
+            // Re-check under the serial lock: a newer switch may have replaced
+            // this one, or an earlier prompt may already have adopted it.
+            let state = router
+                .takeover_state(&group_key)
+                .await
+                .unwrap_or_else(|err| {
+                    // The switch is saved; take over even though a replay may
+                    // announce it again.
+                    warn!(
+                        target: TRACE_TARGET,
+                        method = "routing_takeover",
+                        error_kind = err.privacy_safe_kind(),
+                        "failed to read the agent switch state"
+                    );
+                    Takeover::Pending {
+                        command: command.clone(),
+                        previous: previous.clone(),
+                    }
+                });
+            let already_active = previous.as_deref() == Some(router.name());
+            match state {
+                Takeover::Pending { command: saved, .. } if saved == *command => {
+                    if already_active {
+                        confirm_takeover(router, &group_key, command).await;
+                        format!("{display} already answers in this chat.")
+                    } else {
+                        let reset = new_session_body(ctx, inbound).await;
+                        router.mark_handoff(&group_key, previous.clone()).await;
+                        confirm_takeover(router, &group_key, command).await;
+                        format!(
+                            "{display} took over this chat{from}. {reset} The first prompt includes a short handoff with recent messages."
+                        )
+                    }
+                }
+                Takeover::Done { command: saved } if saved == *command => {
+                    if already_active {
+                        format!("{display} already answers in this chat.")
+                    } else {
+                        format!("{display} took over this chat{from} and started a new session.")
+                    }
+                }
+                _ => return None,
+            }
+        }
+    };
+    Some(body)
+}
+
+/// Starts the fresh session for a pending takeover, then marks it handled.
+/// Resetting first means a crash in between repeats the reset rather than
+/// skipping it.
+async fn start_takeover(
+    ctx: &BridgeContext,
+    router: &Router,
+    group_ref: &str,
+    command: &str,
+    previous: Option<String>,
+) {
+    let group_key = group_ref.to_ascii_lowercase();
+    if previous.as_deref() != Some(router.name()) {
+        if let Err(err) = ctx.sessions.reset_session(group_ref, command).await {
+            warn!(
+                target: TRACE_TARGET,
+                method = "routing_adopt",
+                error_kind = err.privacy_safe_kind(),
+                "failed to reset backend session for an adopted switch"
+            );
+        }
+        router.mark_handoff(&group_key, previous).await;
+    }
+    confirm_takeover(router, &group_key, command).await;
+}
+
+async fn confirm_takeover(router: &Router, group_key: &str, command: &str) {
+    if let Err(err) = router.confirm_takeover(group_key, command).await {
+        warn!(
+            target: TRACE_TARGET,
+            method = "routing_confirm",
+            error_kind = err.privacy_safe_kind(),
+            "failed to confirm agent switch"
+        );
+    }
+}
+
+/// Number of recent messages included in a takeover handoff.
+const HANDOFF_TRANSCRIPT_MESSAGES: u32 = 20;
+
+async fn with_pending_handoff(
+    ctx: &BridgeContext,
+    inbound: &InboundPrompt,
+    prompt: String,
+) -> String {
+    let Some(router) = &ctx.router else {
+        return prompt;
+    };
+    let Some(previous) = router
+        .take_handoff(&inbound.group_ref.to_ascii_lowercase())
+        .await
+    else {
+        return prompt;
+    };
+    let transcript = match ctx
+        .client
+        .recent_timeline(
+            &inbound.account_ref,
+            &inbound.group_ref,
+            AgentControlTimelineCursor {
+                recorded_at: inbound.recorded_at,
+                message_id_hex: inbound.message_ref.clone(),
+            },
+            HANDOFF_TRANSCRIPT_MESSAGES,
+        )
+        .await
+    {
+        Ok(messages) => handoff_transcript(messages, &ctx.cfg.allowed_senders, router.name()),
+        Err(err) => {
+            warn!(
+                target: TRACE_TARGET,
+                method = "handoff_timeline",
+                error_kind = err.privacy_safe_kind(),
+                "failed to read recent messages for handoff"
+            );
+            Vec::new()
+        }
+    };
+    let template = router.handoff_template().await;
+    let preamble = handoff_preamble(
+        template.as_deref(),
+        router.name(),
+        previous.as_deref(),
+        &transcript,
+    );
+    format!("{preamble}{prompt}")
+}
+
+fn handoff_transcript(
+    mut messages: Vec<agent_control::AgentControlTimelineMessage>,
+    allowed_senders: &HashSet<String>,
+    own_name: &str,
+) -> Vec<TranscriptLine> {
+    messages.sort_by(|a, b| {
+        (a.recorded_at, &a.message_id_hex).cmp(&(b.recorded_at, &b.message_id_hex))
+    });
+    messages
+        .into_iter()
+        .filter_map(|message| {
+            let text = message.text?;
+            let sender = &message.sender;
+            let id = sender.account_id_hex.to_ascii_lowercase();
+            let short = &id[..id.len().min(8)];
+            let name = sender.display_name.as_deref().map(speaker_label);
+            let speaker = if sender.is_self {
+                own_name.to_owned()
+            } else if allowed_senders.contains(&id) {
+                format!(
+                    "{} (allowed sender)",
+                    name.unwrap_or_else(|| short.to_owned())
+                )
+            } else {
+                // Other members, including other agents, are context only.
+                format!(
+                    "{} (member {short})",
+                    name.unwrap_or_else(|| "member".to_owned())
+                )
+            };
+            Some(TranscriptLine { speaker, text })
+        })
+        .collect()
 }
 
 async fn change_workdir_body(
@@ -3014,6 +3308,7 @@ mod tests {
             backend_idle_timeout: Duration::from_secs(45),
             execution_profile: crate::ExecutionProfile::Inherit,
             artifact_exports: crate::ArtifactExportConfig::default(),
+            routing: None,
             spec: crate::ConfigSpec {
                 env_prefix: "WN_OPENCODE",
                 default_home_name: "harnesses",
@@ -3431,6 +3726,7 @@ mod tests {
                 ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
             )),
             home: root.path().to_path_buf(),
+            router: None,
         });
         let permit = ctx.queues.try_enter_waiter("group").await.unwrap();
         handle_message(
@@ -3441,6 +3737,8 @@ mod tests {
                 message_ref: "message".to_owned(),
                 text: "create artifacts".to_owned(),
                 media: Vec::new(),
+                recorded_at: 0,
+                agent_action: None,
             },
             permit,
         )
@@ -3571,6 +3869,7 @@ mod tests {
                 ArtifactOutbox::load(root.join("outbox.json")).unwrap(),
             )),
             home: home.to_path_buf(),
+            router: None,
         })
     }
 
@@ -3596,6 +3895,8 @@ mod tests {
                 message_ref: message_ref.to_owned(),
                 text: text.to_owned(),
                 media,
+                recorded_at: 0,
+                agent_action: None,
             },
             permit,
         )
@@ -4053,6 +4354,7 @@ mod tests {
                 ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
             )),
             home: home.clone(),
+            router: None,
         });
         let media = AgentControlMediaRef {
             media_type: "image/png".to_owned(),
@@ -4404,6 +4706,7 @@ mod tests {
                 ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
             )),
             home: root.path().to_path_buf(),
+            router: None,
         });
         let permit = ctx.queues.try_enter_waiter("group").await.unwrap();
         handle_message(
@@ -4414,6 +4717,8 @@ mod tests {
                 message_ref: "message".to_owned(),
                 text: "complete then fail".to_owned(),
                 media: Vec::new(),
+                recorded_at: 0,
+                agent_action: None,
             },
             permit,
         )
@@ -4858,6 +5163,7 @@ mod tests {
                 ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
             )),
             home: root.path().to_path_buf(),
+            router: None,
         });
         let permit = ctx.queues.try_enter_waiter("group").await.unwrap();
         handle_message(
@@ -4868,6 +5174,8 @@ mod tests {
                 message_ref: "message".to_owned(),
                 text: "create artifact".to_owned(),
                 media: Vec::new(),
+                recorded_at: 0,
+                agent_action: None,
             },
             permit,
         )
@@ -5010,6 +5318,7 @@ mod tests {
             }),
             outbox: Arc::new(Mutex::new(ArtifactOutbox::load(outbox_path).unwrap())),
             home: root.path().to_path_buf(),
+            router: None,
         });
         let permit = ctx.queues.try_enter_waiter("group").await.unwrap();
         handle_message(
@@ -5020,6 +5329,8 @@ mod tests {
                 message_ref: "message".to_owned(),
                 text: "create artifact".to_owned(),
                 media: Vec::new(),
+                recorded_at: 0,
+                agent_action: None,
             },
             permit,
         )
@@ -5127,6 +5438,7 @@ mod tests {
                 ArtifactOutbox::load(outbox_path.clone()).unwrap(),
             )),
             home: root.path().to_path_buf(),
+            router: None,
         });
 
         tokio::time::timeout(Duration::from_secs(3), retry_pending_artifacts(&ctx))
@@ -5657,7 +5969,122 @@ mod tests {
                 root.join("outbox.json"),
             ))),
             home: root.to_path_buf(),
+            router: None,
         }
+    }
+
+    fn routed_inbound(group: &str, id: &str, text: &str) -> AgentControlEvent {
+        AgentControlEvent::InboundMessage {
+            account_id_hex: "account".to_owned(),
+            group_id_hex: group.to_owned(),
+            message: agent_control::AgentControlMessage {
+                message_id_hex: id.to_owned(),
+                sender: agent_control::AgentControlActor {
+                    account_id_hex: "owner".to_owned(),
+                    display_name: None,
+                    is_self: false,
+                },
+                text: text.to_owned(),
+                recorded_at: 1,
+                media: Vec::new(),
+            },
+            mentions_self: false,
+            reply_to: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_drops_messages_routed_to_another_agent_before_dedupe() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("routing.json");
+        fs::write(
+            &file,
+            r#"{"schema":1,"agents":["claude","opencode"],"groups":{"g1":"claude"}}"#,
+        )
+        .unwrap();
+        let mut ctx = test_bridge_context(root.path());
+        let mut cfg = (*ctx.cfg).clone();
+        cfg.allowed_senders.insert("owner".to_owned());
+        ctx.cfg = Arc::new(cfg);
+        ctx.router = Some(Arc::new(Router::new(crate::RoutingConfig {
+            file,
+            name: "opencode".to_owned(),
+            handoff_prompt_file: None,
+        })));
+        let ctx = Arc::new(ctx);
+
+        let outcome = dispatch_event(ctx.clone(), routed_inbound("g1", "m1", "hello")).await;
+        assert!(matches!(outcome, DispatchOutcome::Continue));
+        assert!(ctx.dedupe.insert("m1".to_owned()).await);
+
+        let outcome =
+            dispatch_event(ctx.clone(), routed_inbound("g1", "m2", "/agent claude")).await;
+        assert!(matches!(outcome, DispatchOutcome::Continue));
+        assert!(ctx.dedupe.insert("m2".to_owned()).await);
+        // The non-target still saved the switch for the offline target.
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.path().join("routing.json")).unwrap()).unwrap();
+        assert_eq!(saved["groups"]["g1"], "claude");
+        assert_eq!(saved["switches"]["g1"]["message"], "m2");
+        assert_eq!(saved["switches"]["g1"]["confirmed"], false);
+    }
+
+    #[tokio::test]
+    async fn takeover_reply_follows_the_saved_switch_state() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("routing.json");
+        fs::write(
+            &file,
+            r#"{"schema":1,"agents":["claude","opencode"],"groups":{"g1":"claude"}}"#,
+        )
+        .unwrap();
+        let mut ctx = test_bridge_context(root.path());
+        let router = Arc::new(Router::new(crate::RoutingConfig {
+            file: file.clone(),
+            name: "opencode".to_owned(),
+            handoff_prompt_file: None,
+        }));
+        ctx.router = Some(router.clone());
+        let plan = router
+            .apply_agent_command(
+                "g1",
+                Some("opencode"),
+                CommandRef {
+                    at: 10,
+                    message: "m1".to_owned(),
+                },
+            )
+            .await;
+        let AgentCommandPlan::Handle(action) = plan else {
+            panic!("target must handle its takeover");
+        };
+        let inbound = InboundPrompt {
+            account_ref: "account".to_owned(),
+            group_ref: "g1".to_owned(),
+            message_ref: "m1".to_owned(),
+            text: "/agent opencode".to_owned(),
+            media: Vec::new(),
+            recorded_at: 10,
+            agent_action: Some(action),
+        };
+        // A prompt that ran first adopted the switch; the reply still
+        // announces it without resetting the new session again.
+        assert!(router.confirm_takeover("g1", "m1").await.unwrap());
+        let body = agent_command_body(&ctx, &inbound).await.unwrap();
+        assert!(body.contains("took over this chat from claude and started a new session"));
+        assert_eq!(router.take_handoff("g1").await, None);
+        // A newer switch away replaces the takeover; the reply is dropped.
+        router
+            .apply_agent_command(
+                "g1",
+                Some("claude"),
+                CommandRef {
+                    at: 20,
+                    message: "m2".to_owned(),
+                },
+            )
+            .await;
+        assert_eq!(agent_command_body(&ctx, &inbound).await, None);
     }
 
     #[tokio::test]
