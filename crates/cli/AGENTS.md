@@ -63,7 +63,7 @@ behavior and JSON fields are documented in the README; the rules below are the o
 - `sync` is a diagnostic/repair path, not part of normal flows.
 - Reaction, delete, retry, encrypted media, and admin/member management JSON shapes: keep them aligned with the
   `Unreleased` changelog entries when changing them.
-- Other namespaces: `chats`, `follows`, `profile`, `relays`, `settings`, `users`, `notifications`, `stream`, `debug`,
+- Other namespaces: `chats`, `follows`, `profile`, `relays`, `settings`, `users`, `notifications`, `debug`,
   `usage-diagnostics`, `tui`.
 - `devices` (list and start/status/confirm-match/approve/cancel) uses the existing daemon-owned runtime and refuses
   local execution. Device groups are on unless `WN_DEVICE_GROUPS=0` reaches `wnd` (and the TUI, for Leave). Do not add a CLI pairing store. Other account commands
@@ -89,9 +89,7 @@ behavior and JSON fields are documented in the README; the rules below are the o
   (`resolve_relative_paths`) before forwarding: the daemon's working directory is unrelated to the caller's.
 - Runtime subscriptions should keep local signing accounts current; explicit catch-up remains a diagnostic/repair path.
 - Keep daemon status JSON useful for the TUI: running state, pid, socket, log path, last runtime activity summary,
-  relay health, and background stream watch summaries.
-- Keep QUIC preview subscription output under `messages subscribe` as typed `stream_preview` updates. Do not introduce
-  user-facing `streams subscribe` or `stream subscribe` commands for the same app-level feed.
+  and relay health.
 - Keep daemon streaming output newline-delimited and typed. Current user-facing subscription feeds are
   `messages subscribe`, `messages timeline subscribe`, `chats subscribe`, `chats subscribe-archived`, and
   `groups subscribe-state`.
@@ -103,8 +101,6 @@ behavior and JSON fields are documented in the README; the rules below are the o
 - Keep account onboarding on top of `wn create-identity` and `wn login`; redact `nsec` import input before rendering it in the composer.
 - Keep daemon controls on top of `wn daemon start|stop|status`; live refresh should observe daemon state and avoid
   interrupting active composer input.
-- Keep TUI stream controls on top of the real `wn stream` commands. Broker watches should use runtime-tracked daemon
-  watches instead of blocking the TUI event loop.
 - Keep chat and group management on top of real CLI commands. `/chat new` is the TUI spelling for chat creation; do not
   reintroduce `/new` as a hidden compatibility alias.
 - Keep member commands direct: `/members add`, `/members remove`, and `/members list` operate on the selected chat.
@@ -123,28 +119,25 @@ a wrong reload.
   dispatch (which calls `commands::<namespace>::<handler>`), the daemon-socket routing/fallback glue, `CliOutput` /
   `CommandOutput` / `CliRuntimeInfo` types, and the broadly-shared `pub(crate)` helpers (`resolve_account`,
   `npub_for_account_id`, `ensure_local_signing`, `normalize_group_id_hex`, `relay_endpoints`, `validate_relay_url`,
-  `group_json`/`group_show_output`, `agent_text_stream_payload_value`, `unsupported_command`, home/secret-store
-  resolution, etc.).
+  `group_json`/`group_show_output`, `unsupported_command`, home/secret-store resolution, etc.).
 - `src/commands/`: per-namespace command handlers, each module mirroring a `*Command` enum in `args.rs`. The
   `foo_command` / `foo_command_with_runtime` pairs plus the output/format helpers used only by that namespace live
   here. Modules: `account` (create-identity/login/whoami/account(s) + account-setup output), `key_package` (keys),
   `chats`, `media`, `groups` (group + groups), `messages` (incl. the `timeline` subgroup), `follows`, `profile`,
-  `relays`, `settings`, `users`, `notifications`, `stream` (QUIC agent text stream previews + quic-candidate/trust
-  helpers), `debug`, `sync`, and `relay_stats`. Handlers and helpers reached from the lib dispatch, from the `daemon`
-  module, or across namespaces are `pub(crate)`.
+  `relays`, `settings`, `users`, `notifications`, `debug`, `sync`, and `relay_stats`. Handlers and helpers reached
+  from the lib dispatch, from the `daemon` module, or across namespaces are `pub(crate)`.
 - `src/main.rs` / `src/bin/wnd.rs`: thin `wn` and `wnd` binary entrypoints.
 - `src/secret.rs`: zeroizing stdin nsec import with redacted diagnostics.
 - `src/terminal.rs`: terminal-safe rendering of untrusted human-facing text (TUI and non-JSON output).
 - `src/args.rs`: clap argument/command enums (`Cli`, `Command`, and the per-namespace `*Command` types).
 - `src/error.rs`: `WnError` and the `--json` error rendering.
 - `src/daemon/`: `wnd` runtime, socket-backed execution, subscription workers; calls
-  `commands::<namespace>::*_with_runtime` handlers and shared `commands::stream` / `commands::account` helpers.
+  `commands::<namespace>::*_with_runtime` handlers and shared `commands::account` helpers.
   `mod.rs` keeps the accept loop / request dispatch (`run_server`, `handle_connection`) and re-exports the
   submodules: `protocol` (request/response wire types, framing, `DaemonClient`), `responses` (stream-response
   construction + subscription matching), `subscriptions` (the streaming `handle_*_subscription` handlers),
-  `stream_workers` (background stream-watch and stream-compose workers), `runtime_host` (app-runtime reconciliation,
-  event bridge, hosted command dispatch), and `lifecycle` (start/stop/status, pid/log/socket files). `tests.rs`
-  holds the daemon unit tests.
+  `runtime_host` (app-runtime reconciliation, event bridge, hosted command dispatch), and `lifecycle`
+  (start/stop/status, pid/log/socket files). `tests.rs` holds the daemon unit tests.
 - `src/tui/`: Ratatui shell over the `wn --json` surface. `mod.rs` keeps the `run_tui` entry plus shared constants
   and re-exports the submodules: `model` (row/view/state types, JSON parsers, pure helpers), `view` (`TuiApp` draw
   methods + Ratatui line/style helpers), `slash` (slash-command parsing), `client` (`WnClient` subprocess wrapper,
