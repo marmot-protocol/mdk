@@ -232,13 +232,17 @@ pub(crate) enum AppMessageIntent {
     DeleteReactions {
         reaction_message_ids: Vec<String>,
     },
+    /// `tags` are extra application tags; the reply owns `e` and `q`.
     Reply {
         target_message_id: String,
         text: String,
+        tags: Vec<Vec<String>>,
     },
+    /// `tags` are extra application tags; the edit owns `e`.
     Edit {
         target_message_id: String,
         content: String,
+        tags: Vec<Vec<String>>,
     },
     Delete {
         target_message_id: String,
@@ -408,6 +412,7 @@ pub(crate) fn build_inner_event_with_media_reply(
         AppMessageIntent::Reply {
             target_message_id,
             text,
+            tags: extra,
         } => {
             validate_message_ref(target_message_id)?;
             if text.trim().is_empty() {
@@ -419,12 +424,14 @@ pub(crate) fn build_inner_event_with_media_reply(
                 event_ref_tag(target_message_id),
                 vec![QUOTE_REF_TAG.to_owned(), target_message_id.clone()],
             ];
-            tags.extend(mention_p_tags(text));
+            append_application_tags(&mut tags, extra, &["e", "q"])?;
+            append_distinct(&mut tags, mention_p_tags(text));
             Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, text.clone()))
         }
         AppMessageIntent::Edit {
             target_message_id,
             content,
+            tags: extra,
         } => {
             validate_message_ref(target_message_id)?;
             if content.trim().is_empty() {
@@ -433,7 +440,8 @@ pub(crate) fn build_inner_event_with_media_reply(
                 ));
             }
             let mut tags = vec![event_ref_tag(target_message_id)];
-            tags.extend(mention_p_tags(content));
+            append_application_tags(&mut tags, extra, &["e"])?;
+            append_distinct(&mut tags, mention_p_tags(content));
             Ok(event(MARMOT_APP_EVENT_KIND_EDIT, tags, content.clone()))
         }
         AppMessageIntent::Report {
@@ -818,6 +826,32 @@ pub fn is_reserved_app_event_kind(kind: u64) -> bool {
         || crate::client::device_group::is_device_group_kind(kind)
 }
 
+/// Append caller tags after the tags an event structure owns. `owned` names
+/// the tags the structure already places (a reply's `e`/`q`, an edit's `e`);
+/// a caller copy could name another target, so it is refused.
+fn append_application_tags(
+    tags: &mut Vec<Vec<String>>,
+    extra: &[Vec<String>],
+    owned: &[&str],
+) -> Result<(), AppError> {
+    validate_message_tags(extra)?;
+    if extra.iter().any(|tag| owned.contains(&tag[0].as_str())) {
+        return Err(AppError::InvalidAppMessagePayload(
+            "additional tags cannot replace the event's own reference tags".into(),
+        ));
+    }
+    tags.extend_from_slice(extra);
+    Ok(())
+}
+
+fn append_distinct(tags: &mut Vec<Vec<String>>, more: Vec<Vec<String>>) {
+    for tag in more {
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+}
+
 // Application tags may decorate chat, but encrypted media references remain typed.
 pub(crate) fn validate_message_tags(tags: &[Vec<String>]) -> Result<(), AppError> {
     if tags.len() > 64 || tags.iter().flatten().map(String::len).sum::<usize>() > 16 * 1024 {
@@ -1136,6 +1170,7 @@ mod mention_tests {
             AppMessageIntent::Reply {
                 target_message_id: "aa".repeat(32),
                 text: "same text".into(),
+                tags: Vec::new(),
             },
             AppMessageIntent::Media {
                 message_tags: Vec::new(),
@@ -1180,6 +1215,7 @@ mod mention_tests {
         let intent = AppMessageIntent::Reply {
             target_message_id: target.clone(),
             text: format!("re nostr:{npub}"),
+            tags: Vec::new(),
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
         assert!(
@@ -1351,6 +1387,58 @@ mod application_tag_tests {
         let event = build_inner_event(&intent, &sender(), 1).unwrap();
         assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
         assert_eq!(event.tags, tags());
+    }
+
+    #[test]
+    fn reply_and_edit_place_application_tags_after_their_own_references() {
+        let target = "abc123".to_owned();
+        let words = vec![
+            vec!["turn".to_owned(), "turn-1".to_owned()],
+            vec!["phase".to_owned(), "commentary".to_owned()],
+        ];
+        let reply = AppMessageIntent::Reply {
+            target_message_id: target.clone(),
+            text: "hello".into(),
+            tags: words.clone(),
+        };
+        let event = build_inner_event(&reply, &sender(), 1).unwrap();
+        assert_eq!(event.tags[0], vec!["e".to_owned(), target.clone()]);
+        assert_eq!(event.tags[1], vec!["q".to_owned(), target.clone()]);
+        assert_eq!(&event.tags[2..], words);
+        let edit = AppMessageIntent::Edit {
+            target_message_id: target.clone(),
+            content: "hello".into(),
+            tags: words.clone(),
+        };
+        let event = build_inner_event(&edit, &sender(), 1).unwrap();
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_EDIT);
+        assert_eq!(event.tags[0], vec!["e".to_owned(), target.clone()]);
+        assert_eq!(&event.tags[1..], words);
+
+        // A caller copy of an owned reference could name another target.
+        let other = vec![vec!["e".to_owned(), "def456".to_owned()]];
+        for intent in [
+            AppMessageIntent::Reply {
+                target_message_id: target.clone(),
+                text: "hello".into(),
+                tags: vec![vec!["q".to_owned(), "def456".to_owned()]],
+            },
+            AppMessageIntent::Edit {
+                target_message_id: target.clone(),
+                content: "hello".into(),
+                tags: other,
+            },
+            AppMessageIntent::Edit {
+                target_message_id: target.clone(),
+                content: "hello".into(),
+                tags: vec![vec!["imeta".to_owned(), "url x".to_owned()]],
+            },
+        ] {
+            assert!(matches!(
+                build_inner_event(&intent, &sender(), 1),
+                Err(AppError::InvalidAppMessagePayload(_))
+            ));
+        }
     }
 
     #[test]

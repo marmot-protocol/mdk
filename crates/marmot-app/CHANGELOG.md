@@ -29,6 +29,13 @@
 
 - `MarmotAppRuntime::send_thread_message` sends a NIP-22 thread message (kind 1111) with text, attachments or both,
   building the `E`/`K`/`P` root and `e`/`k` parent tags from the parent's row. `TimelineThreadRef` is re-exported.
+- Crash-safe tagged sends: `MarmotAppRuntime::submit_tagged_text`, `submit_tagged_reply` and
+  `submit_tagged_edit_for_local_send` admit kind-9 text, replies and pending edits that carry application tags inside
+  the encrypted event, under `send_tagged_text`'s tag rules (`imeta` refused; a reply's `e`/`q` and an edit's `e` are
+  its own). `submit_custom_event` does the same for `send_custom_event`. Each takes a client token like `submit_text`:
+  the same token and request return the same message id after a restart, `local_send_status` reports its progress,
+  and the tags (and a custom event's kind) are part of the request, so a token reused with other tags is refused.
+  Untagged submissions keep their existing request hashes.
 
 ### Changed
 

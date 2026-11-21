@@ -254,6 +254,7 @@ impl MarmotAppRuntime {
                 content: caption.unwrap_or_default(),
                 reply_to: reply_to_message_id,
                 attachments,
+                ..Default::default()
             },
             None,
             None,
@@ -282,6 +283,7 @@ impl MarmotAppRuntime {
                 content: caption.unwrap_or_default(),
                 reply_to: None,
                 attachments,
+                ..Default::default()
             },
             consuming_draft.map(LocalDraftAdmission::ConsumeIfCurrent),
             None,
@@ -300,14 +302,30 @@ impl MarmotAppRuntime {
         text: String,
         client_token: String,
     ) -> Result<crate::LocalSendAcceptance, AppError> {
+        self.submit_tagged_text(account, group, text, Vec::new(), client_token)
+            .await
+    }
+
+    /// [`Self::submit_text`] for kind-9 text that carries application tags,
+    /// under [`Self::send_tagged_text`]'s tag rules (`imeta` is refused). The
+    /// tags travel inside the encrypted event and are part of the request: a
+    /// token reused with other tags is a changed request and is refused.
+    pub async fn submit_tagged_text(
+        &self,
+        account: &str,
+        group: &GroupId,
+        text: String,
+        tags: Vec<Vec<String>>,
+        client_token: String,
+    ) -> Result<crate::LocalSendAcceptance, AppError> {
         self.submit_local_message(
             account,
             group,
             client_token,
             LocalMessageRequest {
                 content: text,
-                reply_to: None,
-                attachments: vec![],
+                tags,
+                ..Default::default()
             },
             None,
             None,
@@ -323,6 +341,22 @@ impl MarmotAppRuntime {
         text: String,
         client_token: String,
     ) -> Result<crate::LocalSendAcceptance, AppError> {
+        self.submit_tagged_reply(account, group, target, text, Vec::new(), client_token)
+            .await
+    }
+
+    /// [`Self::submit_reply`] with application tags, as
+    /// [`Self::submit_tagged_text`]. The reply owns its `e` and `q` tags, so
+    /// caller tags with those names are refused.
+    pub async fn submit_tagged_reply(
+        &self,
+        account: &str,
+        group: &GroupId,
+        target: String,
+        text: String,
+        tags: Vec<Vec<String>>,
+        client_token: String,
+    ) -> Result<crate::LocalSendAcceptance, AppError> {
         self.submit_local_message(
             account,
             group,
@@ -330,7 +364,39 @@ impl MarmotAppRuntime {
             LocalMessageRequest {
                 content: text,
                 reply_to: Some(target),
-                attachments: vec![],
+                tags,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Durably admit an app-defined event under [`Self::send_custom_event`]'s
+    /// rules (MDK-owned kinds are refused), with the same token correlation,
+    /// retry identity and [`Self::local_send_status`] reporting as
+    /// [`Self::submit_text`]. Kind, tags and content are all part of the
+    /// request. Like every token submit, an event identical to an existing one
+    /// (same kind, tags, content and second) is refused as a collision.
+    pub async fn submit_custom_event(
+        &self,
+        account: &str,
+        group: &GroupId,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: String,
+        client_token: String,
+    ) -> Result<crate::LocalSendAcceptance, AppError> {
+        self.submit_local_message(
+            account,
+            group,
+            client_token,
+            LocalMessageRequest {
+                content,
+                tags,
+                custom_kind: Some(kind),
+                ..Default::default()
             },
             None,
             None,
@@ -354,6 +420,7 @@ impl MarmotAppRuntime {
                 content: String::new(),
                 reply_to: None,
                 attachments,
+                ..Default::default()
             },
             Some(LocalDraftAdmission::Source(revision)),
             None,
@@ -371,14 +438,38 @@ impl MarmotAppRuntime {
         content: String,
         edit_client_token: String,
     ) -> Result<crate::LocalSendAcceptance, AppError> {
+        self.submit_tagged_edit_for_local_send(
+            account,
+            group,
+            original_client_token,
+            content,
+            Vec::new(),
+            edit_client_token,
+        )
+        .await
+    }
+
+    /// [`Self::submit_edit_for_local_send`] with application tags on the edit
+    /// event, as [`Self::submit_tagged_text`]. An edit does not inherit the
+    /// original's tags; pass the ones the edit should carry. The edit owns its
+    /// `e` tag, so a caller `e` tag is refused.
+    pub async fn submit_tagged_edit_for_local_send(
+        &self,
+        account: &str,
+        group: &GroupId,
+        original_client_token: String,
+        content: String,
+        tags: Vec<Vec<String>>,
+        edit_client_token: String,
+    ) -> Result<crate::LocalSendAcceptance, AppError> {
         self.submit_local_message(
             account,
             group,
             edit_client_token,
             LocalMessageRequest {
                 content,
-                reply_to: None,
-                attachments: vec![],
+                tags,
+                ..Default::default()
             },
             None,
             Some(original_client_token),

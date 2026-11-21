@@ -4822,10 +4822,7 @@ impl AppClient {
                     "original local send was not accepted by the engine".into(),
                 ));
             }
-            crate::messages::AppMessageIntent::Edit {
-                target_message_id: original.message_id_hex,
-                content: request.content.clone(),
-            }
+            request.edit_intent(original.message_id_hex)
         } else {
             request.intent()
         };
@@ -5770,6 +5767,7 @@ impl AppClient {
                     AppMessageIntent::Reply {
                         target_message_id,
                         text: draft.content,
+                        tags: Vec::new(),
                     },
                     None,
                 ),

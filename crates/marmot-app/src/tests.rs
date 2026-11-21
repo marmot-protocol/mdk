@@ -3299,6 +3299,7 @@ async fn thread_message_send_body() {
             AppMessageIntent::Reply {
                 target_message_id: first.clone(),
                 text: "inline".into(),
+                tags: Vec::new(),
             },
         )
         .await
@@ -3468,6 +3469,7 @@ async fn edit_target_preflight_body() {
     let edit = |target: &str, content: &str| AppMessageIntent::Edit {
         target_message_id: target.to_owned(),
         content: content.to_owned(),
+        tags: Vec::new(),
     };
 
     let original = client.send(&group_id, b"status: starting").await.unwrap();
@@ -15215,6 +15217,7 @@ fn reply_intent_builds_kind_nine_with_e_and_q_tags() {
     let event = build(AppMessageIntent::Reply {
         target_message_id: "parent".to_owned(),
         text: "sure".to_owned(),
+        tags: Vec::new(),
     });
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
     assert_eq!(event.content, "sure");
