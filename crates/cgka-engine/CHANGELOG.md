@@ -10,7 +10,8 @@
 - In a current-profile group, a received Commit whose resulting state has a member leaf lacking a role capability that
   `0x8006` requires is now rejected, as `agent-text-stream-quic-v1.md` ("Validation") requires on every Commit.
   Before, only the admission paths (create, invite, join, own-device add, device link and recovery) checked roles;
-  other Commits did not. Legacy-profile groups keep their deployed rules.
+  other Commits did not. Stored and joined state is not re-judged, so no group is quarantined on upgrade, and
+  legacy-profile groups keep their deployed rules.
 - Sending a kind-1200 agent stream start is refused with `InvalidAppMessagePayload`; one queued before an upgrade is
   retired at drain and announced as `GroupEvent::QueuedIntentRefused`. Received starts are still accepted.
 

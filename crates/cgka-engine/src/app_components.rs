@@ -1119,6 +1119,7 @@ pub(crate) fn validate_current_profile_invariants_for_staged_commit(
         validate_current_profile_group_context(extensions, "resulting group state")?;
     let leaves = conceptual_resulting_leaves(group, staged, committer_index)?;
     validate_resulting_leaf_capabilities(leaves.iter(), extensions, &required_components)?;
+    validate_resulting_leaf_roles(&leaves, extensions)?;
     validate_account_devices_transition(group, staged, &required_components)?;
     validate_account_devices_state(extensions, &required_components, &leaves)?;
     validate_device_roster_transition(group, &required_components)?;
@@ -1804,10 +1805,6 @@ fn validate_resulting_leaf_capabilities<'a>(
             "invalid current-profile group state: missing required_capabilities".into(),
         )
     })?;
-    // The retired agent text stream component still requires its member
-    // roles of every leaf, on every Commit (agent-text-stream-quic-v1.md,
-    // "Validation").
-    let required_roles = crate::capability_manager::required_role_capabilities_of(extensions);
     for leaf in leaves {
         let capabilities = leaf.capabilities();
         let supports_required = required.extension_types().iter().all(|required| {
@@ -1833,11 +1830,25 @@ fn validate_resulting_leaf_capabilities<'a>(
                     .into(),
             ));
         }
+    }
+    Ok(())
+}
+
+/// The retired agent text stream component (`0x8006`) requires its
+/// `required_member_roles` of every leaf, on every Commit
+/// (agent-text-stream-quic-v1.md, "Validation"). Checked only for a Commit
+/// being applied, so state a group already holds still loads.
+fn validate_resulting_leaf_roles(
+    leaves: &[LeafNode],
+    extensions: &Extensions<GroupContext>,
+) -> Result<(), EngineError> {
+    let required_roles = crate::capability_manager::required_role_capabilities_of(extensions);
+    for leaf in leaves {
+        let advertised = leaf.capabilities().extensions();
         if !required_roles.extensions.iter().all(|role| {
-            capabilities
-                .extensions()
+            advertised
                 .iter()
-                .any(|advertised| u16::from(*advertised) == *role)
+                .any(|extension| u16::from(*extension) == *role)
         }) {
             return Err(EngineError::Other(
                 "invalid current-profile resulting state: member lacks a required role capability"

@@ -310,7 +310,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     it. The stored history-key suite refusal is also here: both public reads reject the actual mismatched stored key
     without replacing it. Valid encrypted history-key continuity remains in `sqlite_storage.rs`. It also owns, for its
     raw-commit harness, the replay rejection of a Commit whose resulting state requires an agent text stream
-    (`0x8006`) role no member advertises.
+    (`0x8006`) role no member advertises, and that state a group already holds with such a gap still joins and loads.
 
 - **File:** `account_devices/creation.rs`
   - **Owns:** Creating a group (mdk#2628 item 2.3): the founding state requires 0x800d exactly when the creator's leaf
