@@ -978,14 +978,14 @@ fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, WnError> {
         });
     }
     #[cfg(unix)]
-    let root_exists = fs_private::inspect_directory_path(home)?.is_some();
+    let reset = reset_tree::reset_home(home);
     #[cfg(not(unix))]
-    let root_exists = home.try_exists()?;
-    if root_exists {
-        let _root_owner = marmot_app::MarmotRootRuntimeLease::try_acquire(home)?;
-        #[cfg(any(unix, windows))]
-        reset_data(home)?;
-    }
+    let reset: Result<(), WnError> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "local reset requires Unix directory descriptors",
+    )
+    .into());
+    reset?;
     Ok(CommandOutput {
         plain: format!("deleted local data in {}", home.display()),
         json: json!({
@@ -995,86 +995,465 @@ fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, WnError> {
     })
 }
 
-#[cfg(any(unix, windows))]
-fn reset_data(home: &Path) -> std::io::Result<()> {
+#[cfg(unix)]
+mod reset_tree {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+    use std::ptr::NonNull;
+
+    use fs_private::{PrivateExclusiveFileLease, try_acquire_lease_at};
     use marmot_account::{CREDENTIAL_STORE_LOCK_FILE, ROOT_MUTATION_LOCK_FILE};
+    use marmot_app::{AppError, MARMOT_ROOT_RUNTIME_LOCK_FILE};
 
-    let _mutation = acquire_reset_lease(
-        &home.join(ROOT_MUTATION_LOCK_FILE),
-        "account mutation is already in progress",
-    )?;
-    let _root_vault = acquire_reset_lease(
-        &home.join(CREDENTIAL_STORE_LOCK_FILE),
-        "credential store is already in use",
-    )?;
-    let mut leases = Vec::new();
-    let mut removals = Vec::new();
-    plan_reset(home, home, &mut leases, &mut removals)?;
+    use super::WnError;
 
-    // Delete only planned entries. A directory may have gained a new lease
-    // file since the scan; remove_dir must not unlink it.
-    for (path, file_type) in removals {
-        if file_type.is_dir() {
-            std::fs::remove_dir(path)?;
-        } else {
-            std::fs::remove_file(path)?;
+    const RUNTIME_BUSY: &str = "marmot runtime root is already in use";
+    const MUTATION_BUSY: &str = "account mutation is already in progress";
+    const CREDENTIAL_BUSY: &str = "credential store is already in use";
+
+    pub(super) fn reset_home(home: &Path) -> Result<(), WnError> {
+        if let Some(root) = fs_private::inspect_directory_path(home)? {
+            ResetPlan::new(root.as_fd(), home)?.delete()?;
         }
+        Ok(())
     }
-    Ok(())
-}
 
-#[cfg(any(unix, windows))]
-fn plan_reset(
-    directory: &Path,
-    home: &Path,
-    leases: &mut Vec<fs_private::PrivateExclusiveFileLease>,
-    removals: &mut Vec<(PathBuf, std::fs::FileType)>,
-) -> std::io::Result<bool> {
-    use marmot_account::{CREDENTIAL_STORE_LOCK_FILE, ROOT_MUTATION_LOCK_FILE};
-    use marmot_app::MARMOT_ROOT_RUNTIME_LOCK_FILE;
+    struct ResetPlan<'a> {
+        root: BorrowedFd<'a>,
+        _runtime: PrivateExclusiveFileLease,
+        _mutation: PrivateExclusiveFileLease,
+        _credential: PrivateExclusiveFileLease,
+        leases: Vec<PrivateExclusiveFileLease>,
+        entries: Vec<ResetEntry>,
+        survivors: usize,
+    }
 
-    // Keep every lease and its ancestors. Acquire all leases before deleting
-    // anything so contention in a nested vault cannot leave a partial reset.
-    let mut keep_directory = false;
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let path = entry.path();
-        let busy = match name.to_str() {
-            Some(MARMOT_ROOT_RUNTIME_LOCK_FILE) => Some("marmot runtime root is already in use"),
-            Some(ROOT_MUTATION_LOCK_FILE) => Some("account mutation is already in progress"),
-            Some(CREDENTIAL_STORE_LOCK_FILE) => Some("credential store is already in use"),
-            _ => None,
-        };
-        if let Some(busy) = busy {
-            if directory != home {
-                leases.push(acquire_reset_lease(&path, busy)?);
+    struct ResetEntry {
+        name: CString,
+        identity: (u64, u64),
+        children: Option<ResetChildren>,
+    }
+
+    struct ResetChildren {
+        len: usize,
+        survivors: usize,
+    }
+
+    impl<'a> ResetPlan<'a> {
+        fn new(root: BorrowedFd<'a>, home: &Path) -> Result<Self, WnError> {
+            let runtime =
+                match try_acquire_lease_at(root, OsStr::new(MARMOT_ROOT_RUNTIME_LOCK_FILE)) {
+                    Ok(lease) => lease,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        return Err(AppError::RuntimeBusy.into());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+            let mut plan = Self {
+                root,
+                _runtime: runtime,
+                _mutation: acquire_lease(
+                    root,
+                    home,
+                    OsStr::new(ROOT_MUTATION_LOCK_FILE),
+                    MUTATION_BUSY,
+                )?,
+                _credential: acquire_lease(
+                    root,
+                    home,
+                    OsStr::new(CREDENTIAL_STORE_LOCK_FILE),
+                    CREDENTIAL_BUSY,
+                )?,
+                leases: Vec::new(),
+                entries: Vec::new(),
+                survivors: 0,
+            };
+            plan.survivors = plan.scan(root, &mut home.to_path_buf())?;
+            Ok(plan)
+        }
+
+        fn scan(&mut self, parent: BorrowedFd<'_>, path: &mut PathBuf) -> io::Result<usize> {
+            let mut stream = DirStream::open(parent)?;
+            let mut survivors = 0;
+            while let Some(name) = stream.next_name()? {
+                let file_name = OsStr::from_bytes(name.to_bytes());
+                let busy = match file_name.to_str() {
+                    Some(MARMOT_ROOT_RUNTIME_LOCK_FILE) => Some(RUNTIME_BUSY),
+                    Some(ROOT_MUTATION_LOCK_FILE) => Some(MUTATION_BUSY),
+                    Some(CREDENTIAL_STORE_LOCK_FILE) => Some(CREDENTIAL_BUSY),
+                    _ => None,
+                };
+                if let Some(busy) = busy {
+                    if parent.as_raw_fd() != self.root.as_raw_fd() {
+                        self.leases
+                            .push(acquire_lease(parent, path, file_name, busy)?);
+                    }
+                    survivors += 1;
+                    continue;
+                }
+
+                let stat = stat_at(parent, name)?;
+                let index = self.entries.len();
+                self.entries.push(ResetEntry {
+                    name: name.to_owned(),
+                    identity: stat.identity,
+                    children: None,
+                });
+                if stat.directory {
+                    let child = self.entries[index].open_dir(parent)?;
+                    path.push(file_name);
+                    let child_survivors = self.scan(child.as_fd(), path)?;
+                    path.pop();
+                    self.entries[index].children = Some(ResetChildren {
+                        len: self.entries.len() - index - 1,
+                        survivors: child_survivors,
+                    });
+                    survivors += usize::from(child_survivors != 0);
+                }
             }
-            keep_directory = true;
-            continue;
+            Ok(survivors)
         }
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() && plan_reset(&path, home, leases, removals)? {
-            keep_directory = true;
-        } else {
-            removals.push((path, file_type));
+
+        fn delete(self) -> io::Result<()> {
+            remove_entries(self.root, &self.entries)?;
+            check_remaining(self.root, self.survivors)
         }
     }
-    Ok(keep_directory)
-}
 
-#[cfg(any(unix, windows))]
-fn acquire_reset_lease(
-    path: &Path,
-    busy: &str,
-) -> std::io::Result<fs_private::PrivateExclusiveFileLease> {
-    fs_private::try_acquire_private_exclusive_file_lease(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            std::io::Error::new(error.kind(), format!("{busy}: {}", path.display()))
-        } else {
-            error
+    impl ResetEntry {
+        fn open_dir(&self, parent: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+            let directory = open_dir_at(parent, &self.name)?;
+            self.check_identity(stat_at(directory.as_fd(), c".")?.identity)?;
+            Ok(directory)
         }
-    })
+
+        fn check_identity(&self, identity: (u64, u64)) -> io::Result<()> {
+            if self.identity == identity {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "reset entry changed: {:?}",
+                    self.name
+                )))
+            }
+        }
+    }
+
+    // Preorder entries encode each directory's descendants in a contiguous span.
+    // Reopen only those directories, and never recursively unlink new arrivals.
+    fn remove_entries(parent: BorrowedFd<'_>, mut entries: &[ResetEntry]) -> io::Result<()> {
+        while let Some((entry, rest)) = entries.split_first() {
+            let flags = if let Some(children) = &entry.children {
+                let child = entry.open_dir(parent)?;
+                let (descendants, siblings) = rest.split_at(children.len);
+                remove_entries(child.as_fd(), descendants)?;
+                entries = siblings;
+                if children.survivors != 0 {
+                    check_remaining(child.as_fd(), children.survivors)?;
+                    entry.check_identity(stat_at(parent, &entry.name)?.identity)?;
+                    continue;
+                }
+                libc::AT_REMOVEDIR
+            } else {
+                entries = rest;
+                0
+            };
+            entry.check_identity(stat_at(parent, &entry.name)?.identity)?;
+            // The parent remains pinned and the name is one directory entry.
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), entry.name.as_ptr(), flags) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    // Retained directories do not get the emptiness check from unlinkat.
+    fn check_remaining(parent: BorrowedFd<'_>, survivors: usize) -> io::Result<()> {
+        let mut stream = DirStream::open(parent)?;
+        for _ in 0..survivors {
+            if stream.next_name()?.is_none() {
+                return Err(io::Error::other("reset directory lost a retained entry"));
+            }
+        }
+        if stream.next_name()?.is_some() {
+            return Err(io::Error::other(
+                "reset directory gained an unplanned entry",
+            ));
+        }
+        Ok(())
+    }
+
+    fn acquire_lease(
+        parent: BorrowedFd<'_>,
+        path: &Path,
+        name: &OsStr,
+        busy: &str,
+    ) -> io::Result<PrivateExclusiveFileLease> {
+        try_acquire_lease_at(parent, name).map_err(|error| {
+            let path = path.join(name);
+            let message = if error.kind() == io::ErrorKind::WouldBlock {
+                format!("{busy}: {}", path.display())
+            } else {
+                format!("acquire reset lease at {}: {error}", path.display())
+            };
+            io::Error::new(error.kind(), message)
+        })
+    }
+
+    fn open_dir_at(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<OwnedFd> {
+        // name is either one directory entry or `.`.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // openat returned a new descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    struct EntryStat {
+        identity: (u64, u64),
+        directory: bool,
+    }
+
+    #[allow(clippy::unnecessary_cast)] // libc stat field widths vary across Unix targets.
+    fn stat_at(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<EntryStat> {
+        let mut stat = MaybeUninit::uninit();
+        // fstatat initializes stat on success without following a leaf symlink.
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let stat = unsafe { stat.assume_init() };
+        Ok(EntryStat {
+            identity: (stat.st_dev as u64, stat.st_ino as u64),
+            directory: stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+        })
+    }
+
+    struct DirStream(NonNull<libc::DIR>);
+
+    impl DirStream {
+        fn open(directory: BorrowedFd<'_>) -> io::Result<Self> {
+            let fd = open_dir_at(directory, c".")?;
+            // On success fdopendir owns the descriptor; on error fd still owns it.
+            let stream = NonNull::new(unsafe { libc::fdopendir(fd.as_raw_fd()) })
+                .ok_or_else(io::Error::last_os_error)?;
+            let _ = fd.into_raw_fd();
+            Ok(Self(stream))
+        }
+
+        fn next_name(&mut self) -> io::Result<Option<&CStr>> {
+            loop {
+                // readdir returns null both at EOF and on error. Clear this
+                // thread's errno so the two cases are distinguishable.
+                let entry = unsafe {
+                    *errno_location() = 0;
+                    libc::readdir(self.0.as_ptr())
+                };
+                if entry.is_null() {
+                    let error = unsafe { *errno_location() };
+                    return if error == 0 {
+                        Ok(None)
+                    } else {
+                        Err(io::Error::from_raw_os_error(error))
+                    };
+                }
+                // The stream owns this NUL-terminated name until the next read.
+                let name = unsafe { CStr::from_ptr((&raw const (*entry).d_name).cast()) };
+                if !matches!(name.to_bytes(), b"." | b"..") {
+                    return Ok(Some(name));
+                }
+            }
+        }
+    }
+
+    impl Drop for DirStream {
+        fn drop(&mut self) {
+            // closedir releases both the stream and its descriptor.
+            unsafe { libc::closedir(self.0.as_ptr()) };
+        }
+    }
+
+    unsafe extern "C" {
+        #[cfg_attr(
+            any(target_vendor = "apple", target_os = "freebsd"),
+            link_name = "__error"
+        )]
+        #[cfg_attr(
+            any(
+                target_os = "android",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "cygwin",
+                target_env = "newlib"
+            ),
+            link_name = "__errno"
+        )]
+        #[cfg_attr(
+            any(target_os = "illumos", target_os = "solaris"),
+            link_name = "___errno"
+        )]
+        #[cfg_attr(target_os = "haiku", link_name = "_errnop")]
+        #[cfg_attr(
+            any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "hurd",
+                target_os = "emscripten",
+                target_os = "redox"
+            ),
+            link_name = "__errno_location"
+        )]
+        #[cfg_attr(target_os = "aix", link_name = "_Errno")]
+        #[cfg_attr(target_os = "nto", link_name = "__get_errno_ptr")]
+        fn errno_location() -> *mut libc::c_int;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        use super::*;
+
+        const OUTSIDE_FILES: [&str; 4] = [
+            "payload",
+            MARMOT_ROOT_RUNTIME_LOCK_FILE,
+            ROOT_MUTATION_LOCK_FILE,
+            CREDENTIAL_STORE_LOCK_FILE,
+        ];
+
+        fn outside_fixture(path: &Path) -> [fs::File; 4] {
+            fs::create_dir(path).unwrap();
+            OUTSIDE_FILES.map(|name| {
+                let file = path.join(name);
+                fs::write(&file, b"outside reset").unwrap();
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+                fs::File::open(file).unwrap()
+            })
+        }
+
+        fn assert_outside_unchanged(path: &Path, originals: &[fs::File; 4]) {
+            for (name, original) in OUTSIDE_FILES.into_iter().zip(originals) {
+                let file = path.join(name);
+                assert_eq!(fs::read(&file).unwrap(), b"outside reset");
+                let before = original.metadata().unwrap();
+                let after = file.metadata().unwrap();
+                assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+                assert_eq!(after.mode() & 0o777, 0o644);
+            }
+            assert_eq!(fs::read_dir(path).unwrap().count(), OUTSIDE_FILES.len());
+        }
+
+        #[test]
+        fn reset_stays_on_verified_root() {
+            let base = tempfile::tempdir().unwrap();
+            let home = base.path().join("home");
+            let original = base.path().join("original");
+            let outside = base.path().join("outside");
+            let outside_files = outside_fixture(&outside);
+            fs::create_dir(&home).unwrap();
+            let data = OsStr::from_bytes(b"payload-\xff");
+            fs::write(home.join(data), b"inside reset").unwrap();
+            let root = fs_private::inspect_directory_path(&home).unwrap().unwrap();
+
+            fs::rename(&home, &original).unwrap();
+            symlink(&outside, &home).unwrap();
+
+            ResetPlan::new(root.as_fd(), &home)
+                .unwrap()
+                .delete()
+                .unwrap();
+            assert!(!original.join(data).try_exists().unwrap());
+            for name in &OUTSIDE_FILES[1..] {
+                assert!(original.join(name).is_file());
+            }
+            assert_eq!(fs::read_link(&home).unwrap(), outside);
+            assert_outside_unchanged(&outside, &outside_files);
+        }
+
+        #[test]
+        fn reset_refuses_nested_symlink() {
+            let base = tempfile::tempdir().unwrap();
+            let home = base.path().join("home");
+            let accounts = home.join("accounts");
+            let original = base.path().join("original");
+            let outside = base.path().join("outside");
+            let outside_files = outside_fixture(&outside);
+            fs::create_dir_all(&accounts).unwrap();
+            fs::write(accounts.join("payload"), b"inside reset").unwrap();
+            let root = fs_private::inspect_directory_path(&home).unwrap().unwrap();
+            let plan = ResetPlan::new(root.as_fd(), &home).unwrap();
+
+            fs::rename(&accounts, &original).unwrap();
+            symlink(&outside, &accounts).unwrap();
+
+            let error = plan.delete().unwrap_err();
+            assert!(
+                matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
+                "{error}"
+            );
+            assert_eq!(fs::read_link(&accounts).unwrap(), outside);
+            assert_eq!(fs::read(original.join("payload")).unwrap(), b"inside reset");
+            assert_outside_unchanged(&outside, &outside_files);
+        }
+
+        #[test]
+        fn reset_refuses_replaced_dir() {
+            let base = tempfile::tempdir().unwrap();
+            let home = base.path().join("home");
+            let accounts = home.join("accounts");
+            let original = base.path().join("original");
+            fs::create_dir_all(&accounts).unwrap();
+            fs::write(accounts.join("payload"), b"inside reset").unwrap();
+            let root = fs_private::inspect_directory_path(&home).unwrap().unwrap();
+            let plan = ResetPlan::new(root.as_fd(), &home).unwrap();
+
+            fs::rename(&accounts, &original).unwrap();
+            let replacement_files = outside_fixture(&accounts);
+
+            let error = plan.delete().unwrap_err();
+            assert_eq!(error.to_string(), "reset entry changed: \"accounts\"");
+            assert_eq!(fs::read(original.join("payload")).unwrap(), b"inside reset");
+            assert_outside_unchanged(&accounts, &replacement_files);
+        }
+
+        #[test]
+        fn reset_reports_new_entries() {
+            let base = tempfile::tempdir().unwrap();
+            let home = base.path().join("home");
+            fs::create_dir(&home).unwrap();
+            let root = fs_private::inspect_directory_path(&home).unwrap().unwrap();
+            let plan = ResetPlan::new(root.as_fd(), &home).unwrap();
+            let new = home.join("new");
+            fs::create_dir(&new).unwrap();
+            fs::write(new.join("payload"), b"not in snapshot").unwrap();
+
+            let error = plan.delete().unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "reset directory gained an unplanned entry"
+            );
+            assert_eq!(fs::read(new.join("payload")).unwrap(), b"not in snapshot");
+        }
+    }
 }
 
 pub(crate) fn unix_now_seconds() -> u64 {

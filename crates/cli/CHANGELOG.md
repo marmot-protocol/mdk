@@ -16,7 +16,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Local logout does not open an application runtime. Foreground stream watches remain client-hosted and defer
   pending wipe cleanup when the daemon owns the root (#819).
 - `wn reset --confirm` refuses to delete data while a daemon (even on a custom socket), an account mutation,
-  or a credential update holds a lock. Reset keeps the lock files and their containing directories.
+  or a credential update holds a lock. Reset keeps the lock files and their containing directories and does not
+  follow symlinks during deletion.
 - Local commands, including logout, reject `WN_DEV_SETTLEMENT_QUIESCENCE_MS` without `test-policy-overrides`.
 
 ### Changed
