@@ -4663,8 +4663,10 @@ def _metadata_dict_value(metadata: Optional[Dict[str, Any]], key: str) -> Any:
 
 
 def _is_token_stream_preview(metadata: Optional[Dict[str, Any]]) -> bool:
-    # Hermes's stream consumer marks a send it will edit later with
-    # `expect_edits`, and adds `notify` only to one that is the whole reply.
+    # Hermes's stream consumer marks a send it may edit later with
+    # `expect_edits`. It adds `notify` to finished text: the whole reply, or
+    # the text it flushes before a tool call. Only the partial preview is
+    # refused; refusing a flush would drop that finished text.
     return bool(metadata) and metadata.get("expect_edits") is True and not metadata.get("notify")
 
 
