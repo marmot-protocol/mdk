@@ -2333,6 +2333,9 @@ async fn a_lower_sibling_claim_holds_only_its_chat() {
         .observe_drained_session_events(&effects)
         .await
         .unwrap();
+    // The forks above withdrew commits, which owe the small state again
+    // (mdk#3594). Send it first, so the count below sees only gap filling.
+    low.client.drive_changed_invitation_decisions().await;
     let before = relay.published_events.lock().unwrap().len();
     let stock = held_from(&low, &target);
     assert!(stock > 0);

@@ -44,6 +44,10 @@
 - An invitation answer whose device-group update lost a fork between linked devices is sent again on the worker's
   next turn, not at the next maintenance pass, so the other device shows it within seconds instead of after up to
   15 s (mdk#3573).
+- An invitation answer sent in a device-group update on a commit that then lost a fork reaches the other linked
+  device again. Branch selection parks such an update with its branch instead of withdrawing it, so it was never sent
+  again and the other device kept showing the invitation as pending. A withdrawn device-group commit now owes the
+  small state again, and its answers go out on the worker's next turn (mdk#3594).
 
 ## 0.18.0 - 2026-11-20
 
