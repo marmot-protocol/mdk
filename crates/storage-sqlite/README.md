@@ -31,8 +31,8 @@ The crate is split by which side owns each table:
   and conversation opening, message drafts, attachments, avatar cache, encrypted-media secrets, account recovery, and
   `media_catalog.rs`, the metadata for the encrypted per-file media store in the
   [`media-store`](../media-store/README.md) crate (the bodies are files that crate owns). `app/transport/` holds the
-  transport-specific app storage: delivery spill, NIP-77 reconciliation, user blocks, the moderation outbox, agent
-  stream sequences and prepared group-image uploads.
+  transport-specific app storage: delivery spill, NIP-77 reconciliation, user blocks, the moderation outbox and
+  prepared group-image uploads.
 - `SqliteAppStorage` (`app/handle.rs`) — the app side's handle, over the same connection; get it with
   `storage.app_storage()`. Every app and transport method is on it, except the two that also change engine state:
   `delete_local_group_data` and `set_message_draft_commit_observer` stay on `SqliteAccountStorage`, in `cross/`.

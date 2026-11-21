@@ -413,6 +413,8 @@ mod migration_0215_released_receipt_stall_evidence;
 mod migration_0216_welcome_key_package_event_id;
 #[path = "migrations/0217_untyped_thread_messages.rs"]
 mod migration_0217_untyped_thread_messages;
+#[path = "migrations/0218_retired_agent_text_streams.rs"]
+mod migration_0218_retired_agent_text_streams;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1569,6 +1571,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0217_untyped_thread_messages",
         suspend_foreign_keys: &[],
         apply: migration_0217_untyped_thread_messages::apply,
+    },
+    Migration {
+        version: 218,
+        name: "0218_retired_agent_text_streams",
+        suspend_foreign_keys: &[],
+        apply: migration_0218_retired_agent_text_streams::apply,
     },
 ];
 

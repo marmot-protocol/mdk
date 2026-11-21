@@ -3,9 +3,8 @@ use super::*;
 use crate::SqliteAccountStorage;
 use crate::{SqlCipherKey, SqliteStorageOptions, StoredAppEvent};
 use cgka_traits::app_event::{
-    AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
-    QUOTE_REF_TAG, STREAM_TAG,
+    AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG,
 };
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::MessageStorage;
@@ -407,29 +406,6 @@ fn app_event(id: &str, group_id_hex: &str, at: u64) -> StoredAppEvent {
         plaintext: id.to_owned(),
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
-        recorded_at: at,
-        received_at: at,
-        origin_commit_id: None,
-        moderation_grant: false,
-    }
-}
-
-fn agent_stream_start_event(
-    id: &str,
-    group_id_hex: &str,
-    stream_id_hex: &str,
-    at: u64,
-) -> StoredAppEvent {
-    StoredAppEvent {
-        group_id_hex: group_id_hex.to_owned(),
-        message_id_hex: id.to_owned(),
-        source_message_id_hex: Some(format!("source-{id}")),
-        source_epoch: None,
-        direction: "received".to_owned(),
-        sender: "agent".to_owned(),
-        plaintext: id.to_owned(),
-        kind: MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-        tags: vec![vec![STREAM_TAG.to_owned(), stream_id_hex.to_owned()]],
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
@@ -1991,54 +1967,6 @@ fn prune_app_events_before_does_not_delete_surviving_timeline_rows() {
 }
 
 #[test]
-fn prune_app_events_before_deletes_only_pruned_agent_stream_start_rows() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let app = store.app_storage();
-    app.record_app_event(&agent_stream_start_event(
-        "old-stream",
-        "aa",
-        "stream-old",
-        10,
-    ))
-    .unwrap();
-    app.record_app_event(&agent_stream_start_event(
-        "new-stream",
-        "aa",
-        "stream-new",
-        20,
-    ))
-    .unwrap();
-    {
-        let conn = store.lock().unwrap();
-        conn.execute_batch(
-            "CREATE TRIGGER fail_survivor_stream_start_delete
-             BEFORE DELETE ON agent_stream_starts
-             WHEN OLD.message_id_hex = 'new-stream'
-             BEGIN
-                SELECT RAISE(FAIL, 'unexpected survivor stream start delete');
-             END;",
-        )
-        .unwrap();
-    }
-
-    assert_eq!(
-        app.prune_app_events_before("aa", 15, "local", &no_mentions)
-            .unwrap(),
-        1
-    );
-
-    let conn = store.lock().unwrap();
-    let stream_start_ids = conn
-        .prepare("SELECT message_id_hex FROM agent_stream_starts ORDER BY message_id_hex")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(stream_start_ids, vec!["new-stream"]);
-}
-
-#[test]
 fn prune_app_events_before_chunks_projection_deletes_under_sqlite_variable_limit() {
     const EVENT_COUNT: usize = 1_005;
 
@@ -3556,15 +3484,6 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .unwrap();
     store
         .app_storage()
-        .record_app_event(&agent_stream_start_event(
-            "stream-aa",
-            "aa",
-            &"11".repeat(32),
-            11,
-        ))
-        .unwrap();
-    store
-        .app_storage()
         .record_app_event(&app_event("msg-bb", "bb", 12))
         .unwrap();
     store
@@ -3718,7 +3637,6 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "account_group_app_components",
         "app_events",
         "message_timeline",
-        "agent_stream_starts",
         "conversation_read_state",
         "chat_list_rows",
         "group_push_tokens",

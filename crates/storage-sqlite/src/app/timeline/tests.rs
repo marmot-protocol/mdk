@@ -317,9 +317,9 @@ fn poll_reply_survives_rebuild() {
         .unwrap();
     let mut event = poll(&poll_id, "creator", 100);
     event.tags.push(vec!["e".to_owned(), parent_id.clone()]);
-    event.tags.extend([
-        vec!["imeta".into(), "url https://example.com/poll.png".into()],
-        vec![STREAM_TAG.into(), "aa".repeat(32)],
+    event.tags.push(vec![
+        "imeta".into(),
+        "url https://example.com/poll.png".into(),
     ]);
 
     let update = store.record_app_event(&event).unwrap();
@@ -354,7 +354,6 @@ fn poll_reply_survives_rebuild() {
         let projected = store.timeline_message(&group, &poll_id).unwrap().unwrap();
         assert_eq!(projected.kind, MARMOT_APP_EVENT_KIND_POLL);
         assert!(projected.media.is_none());
-        assert!(projected.agent_text_stream.is_none());
         assert_eq!(
             projected.reply_to_message_id_hex.as_deref(),
             Some(parent_id.as_str())
@@ -3369,7 +3368,7 @@ fn delete_requires_target_author_and_keeps_tombstone() {
 }
 
 #[test]
-fn stream_start_and_final_are_materialized_as_linked_timeline_records() {
+fn retired_stream_start_has_no_row_and_stream_final_is_plain_chat() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let start = StoredAppEvent {
         group_id_hex: "11".repeat(32),
@@ -3380,115 +3379,59 @@ fn stream_start_and_final_are_materialized_as_linked_timeline_records() {
         sender: "agent".to_owned(),
         plaintext: String::new(),
         kind: MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-        tags: vec![vec![STREAM_TAG.to_owned(), "aa".repeat(32)]],
+        tags: vec![vec!["stream".to_owned(), "aa".repeat(32)]],
         recorded_at: 1,
         received_at: 1,
         origin_commit_id: None,
         moderation_grant: false,
     };
     let final_event = StoredAppEvent {
-        group_id_hex: "11".repeat(32),
         message_id_hex: "final".to_owned(),
         source_message_id_hex: Some("source-final".to_owned()),
-        source_epoch: None,
-        direction: "received".to_owned(),
-        sender: "agent".to_owned(),
         plaintext: "done".to_owned(),
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         tags: vec![
-            vec![STREAM_TAG.to_owned(), "aa".repeat(32)],
-            vec![STREAM_START_TAG.to_owned(), "start".to_owned()],
+            vec!["stream".to_owned(), "aa".repeat(32)],
+            vec!["stream-start".to_owned(), "start".to_owned()],
         ],
         recorded_at: 2,
         received_at: 2,
-        origin_commit_id: None,
-        moderation_grant: false,
-    };
-
-    let tagless = StoredAppEvent {
-        message_id_hex: "tagless".to_owned(),
-        source_message_id_hex: Some("source-tagless".to_owned()),
-        tags: Vec::new(),
-        recorded_at: 3,
-        received_at: 3,
         ..start.clone()
     };
 
-    store.record_app_event(&start).unwrap();
-    store.record_app_event(&final_event).unwrap();
+    let update = store.record_app_event(&start).unwrap();
+    assert!(update.messages.is_empty());
+    assert!(update.changes.is_empty());
+    let update = store.record_app_event(&final_event).unwrap();
+    assert!(matches!(
+        update.changes.as_slice(),
+        [TimelineMessageChange::Upsert { trigger: TimelineUpdateTrigger::NewMessage, message }]
+            if message.message_id_hex == "final"
+    ));
 
     let messages = list(&store);
-    assert_eq!(messages.len(), 2);
-
-    let start = &messages[0];
-    assert_eq!(start.message_id_hex, "start");
-    assert_eq!(start.kind, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START);
     assert_eq!(
-        start
-            .agent_text_stream
-            .as_ref()
-            .and_then(|value| value.get("stream_id_hex"))
-            .and_then(Value::as_str),
-        Some("aa".repeat(32).as_str())
-    );
-    assert_eq!(
-        start
-            .agent_text_stream
-            .as_ref()
-            .and_then(|value| value.get("status"))
-            .and_then(Value::as_str),
-        Some("started")
-    );
-
-    let final_message = &messages[1];
-    assert_eq!(final_message.message_id_hex, "final");
-    assert_eq!(
-        final_message
-            .agent_text_stream
-            .as_ref()
-            .and_then(|value| value.get("start_event_id"))
-            .and_then(Value::as_str),
-        Some("start")
-    );
-    assert_eq!(
-        final_message
-            .agent_text_stream
-            .as_ref()
-            .and_then(|value| value.get("status"))
-            .and_then(Value::as_str),
-        Some("finalized")
+        messages
+            .iter()
+            .map(|message| (
+                message.message_id_hex.as_str(),
+                message.kind,
+                message.plaintext.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [("final", MARMOT_APP_EVENT_KIND_CHAT, "done")]
     );
 
     // Every invalidation, revival and prune rebuilds the whole group, which
-    // must reproject the stream exactly as recording did.
+    // must project exactly as recording did.
     store
         .rebuild_message_timeline_for_group(&"11".repeat(32))
         .unwrap();
     assert_eq!(list(&store), messages);
-
-    // An invalidated start stays a tombstone, not a live stream.
     store
         .invalidate_app_event_by_source("source-start", "LosingBranch")
-        .unwrap()
-        .expect("projection update");
-    let start = list(&store)
-        .into_iter()
-        .find(|message| message.message_id_hex == "start")
-        .expect("invalidated start kept as a tombstone");
-    assert_eq!(start.invalidation_status.as_deref(), Some("LosingBranch"));
-
-    // A start without a stream tag has no row on either path.
-    store.record_app_event(&tagless).unwrap();
-    let has_tagless = |store: &SqliteAppStorage| {
-        list(store)
-            .iter()
-            .any(|message| message.message_id_hex == "tagless")
-    };
-    assert!(!has_tagless(&store));
-    store
-        .rebuild_message_timeline_for_group(&"11".repeat(32))
         .unwrap();
-    assert!(!has_tagless(&store));
+    assert_eq!(list(&store), messages);
 }
 
 #[test]

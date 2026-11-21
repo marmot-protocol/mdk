@@ -48,7 +48,6 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_OPERATION, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
     MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG,
-    STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_START_TAG, STREAM_TAG,
 };
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -305,7 +304,6 @@ pub struct TimelineMessageRecord {
     #[serde(default)]
     pub thread: Option<TimelineThreadRef>,
     pub media: Option<Value>,
-    pub agent_text_stream: Option<Value>,
     pub reactions: TimelineReactionSummary,
     #[serde(default)]
     pub edit: Option<TimelineEditSummary>,
@@ -379,7 +377,6 @@ pub struct TimelineReplyPreview {
     /// `None` for local sends not yet committed to an epoch.
     pub source_epoch: Option<u64>,
     pub media: Option<Value>,
-    pub agent_text_stream: Option<Value>,
     pub deleted: bool,
     #[serde(default)]
     pub deletion_source: DeletionSource,
@@ -489,8 +486,6 @@ pub enum TimelineUpdateTrigger {
     ReactionRemoved,
     MessageDeleted,
     ReplyPreviewChanged,
-    AgentStreamStarted,
-    AgentStreamFinished,
     AgentActivity,
     AgentOperation,
     GroupSystem,
@@ -565,7 +560,6 @@ struct TimelineRow {
     received_at: u64,
     reply_to_message_id_hex: Option<String>,
     media: Option<Value>,
-    agent_text_stream: Option<Value>,
     reactions: TimelineReactionSummary,
     edit: Option<TimelineEditSummary>,
     deleted: bool,
@@ -576,18 +570,6 @@ struct TimelineRow {
     /// A deletion cleared another account's reaction from the row. The
     /// reaction still proves that account received the row.
     deleted_peer_reaction: bool,
-}
-
-#[derive(Clone, Debug)]
-struct StreamStartRow {
-    group_id_hex: String,
-    message_id_hex: String,
-    source_message_id_hex: Option<String>,
-    sender: String,
-    stream_id_hex: String,
-    tags: Vec<Vec<String>>,
-    started_at: u64,
-    received_at: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1862,7 +1844,7 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
         .map(|event| event.message_id_hex.clone())
         .collect();
     let removal_targets = removal_validation::targets(tx, group_id_hex, None)?;
-    let (mut rows, stream_starts) = project_group_events(events, &removal_targets);
+    let mut rows = project_group_events(events, &removal_targets);
     let kept_receipts = kept_recipient_receipts_tx(tx, group_id_hex)?;
     for row in &mut rows {
         let receipt_kept = kept_receipts.contains(&row.message_id_hex);
@@ -1874,19 +1856,11 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
         params![group_id_hex],
     )
     .storage()?;
-    tx.execute_cached(
-        "DELETE FROM agent_stream_starts WHERE group_id_hex = ?1",
-        params![group_id_hex],
-    )
-    .storage()?;
     for row in rows {
         upsert_message_timeline_row_tx(tx, &row)?;
     }
     for message_id in chat_ids {
         reports::refresh(tx, group_id_hex, &message_id)?;
-    }
-    for start in stream_starts {
-        upsert_agent_stream_start_tx(tx, &start)?;
     }
     crate::app::attachment_history::refresh_reaction_attachment_sources_tx(tx, group_id_hex, None)?;
     crate::app::attachment_acquisition::reconcile_attachment_acquisition_tx(
@@ -2380,16 +2354,7 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<()> {
-    tx.execute_cached(
-        "DELETE FROM agent_stream_starts
-         WHERE group_id_hex = ?1 AND message_id_hex = ?2",
-        params![group_id_hex, message_id_hex],
-    )
-    .storage()?;
-
-    let Some((row, stream_start)) =
-        project_single_message_timeline_tx(tx, group_id_hex, message_id_hex)?
-    else {
+    let Some(row) = project_single_message_timeline_tx(tx, group_id_hex, message_id_hex)? else {
         tx.execute_cached(
             "DELETE FROM message_timeline
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
@@ -2424,9 +2389,6 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
             group_id_hex,
             Some(message_id_hex),
         )?;
-    }
-    if let Some(stream_start) = stream_start {
-        upsert_agent_stream_start_tx(tx, &stream_start)?;
     }
     Ok(())
 }
@@ -2473,39 +2435,22 @@ fn project_single_message_timeline_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
-) -> StorageResult<Option<(TimelineRow, Option<StreamStartRow>)>> {
+) -> StorageResult<Option<TimelineRow>> {
     let Some(event) = raw_app_event_tx(tx, group_id_hex, message_id_hex)? else {
         return Ok(None);
     };
 
-    let mut stream_start = None;
     let mut row = match event.kind {
         MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL => timeline_row_from_chat(&event),
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
         | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
         | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => timeline_row_from_app_event(&event),
-        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => {
-            let Some(stream_id_hex) = tag_value(&event.tags, STREAM_TAG) else {
-                return Ok(None);
-            };
-            if !event.invalidated {
-                stream_start = Some(StreamStartRow {
-                    group_id_hex: event.group_id_hex.clone(),
-                    message_id_hex: event.message_id_hex.clone(),
-                    source_message_id_hex: event.source_message_id_hex.clone(),
-                    sender: event.sender.clone(),
-                    stream_id_hex: stream_id_hex.to_owned(),
-                    tags: event.tags.clone(),
-                    started_at: event.recorded_at,
-                    received_at: event.received_at,
-                });
-            }
-            timeline_row_from_stream_start(&event)
-        }
         // Modifier kinds never get a row of their own: reactions aggregate onto
-        // their target and deletes tombstone it. Every other kind — including
-        // app-defined custom kinds — projects a generic row.
-        MARMOT_APP_EVENT_KIND_REACTION
+        // their target and deletes tombstone it. The retired agent stream
+        // start has no row either. Every other kind — including app-defined
+        // custom kinds — projects a generic row.
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
+        | MARMOT_APP_EVENT_KIND_REACTION
         | MARMOT_APP_EVENT_KIND_POLL_RESPONSE
         | MARMOT_APP_EVENT_KIND_DELETE
         | MARMOT_APP_EVENT_KIND_EDIT
@@ -2524,7 +2469,7 @@ fn project_single_message_timeline_tx(
     if is_deleted_failed_send(&row) {
         return Ok(None);
     }
-    Ok(Some((row, stream_start)))
+    Ok(Some(row))
 }
 
 /// An own send that reached no one and that the user then deleted. It has no
@@ -2684,7 +2629,6 @@ fn apply_message_removals_tx(tx: &Connection, row: &mut TimelineRow) -> StorageR
         row.plaintext.clear();
         row.edit = None;
         row.media = None;
-        row.agent_text_stream = None;
         row.deleted_peer_reaction |= peer_reacted(row);
         row.reactions = TimelineReactionSummary::default();
     }
@@ -2808,11 +2752,11 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
         "INSERT INTO message_timeline (
             group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
             plaintext, kind, tags_json, timeline_at, received_at,
-            reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
+            reply_to_message_id_hex, media_json, reactions_json,
             deleted, deleted_by_message_id_hex, invalidation_status, edit_json, deletion_source,
             recipient_confirmed
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
          ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
             source_message_id_hex = excluded.source_message_id_hex,
             source_epoch = excluded.source_epoch,
@@ -2825,7 +2769,6 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             received_at = excluded.received_at,
             reply_to_message_id_hex = excluded.reply_to_message_id_hex,
             media_json = excluded.media_json,
-            agent_stream_json = excluded.agent_stream_json,
             reactions_json = excluded.reactions_json,
             deleted = excluded.deleted,
             deleted_by_message_id_hex = excluded.deleted_by_message_id_hex,
@@ -2847,7 +2790,6 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             u64_to_i64(row.received_at)?,
             &row.reply_to_message_id_hex,
             optional_value_json(&row.media)?,
-            optional_value_json(&row.agent_text_stream)?,
             reaction_summary_json(&row.reactions)?,
             if row.deleted { 1_i64 } else { 0_i64 },
             &row.deleted_by_message_id_hex,
@@ -2888,35 +2830,6 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             i64::from(order_phase),
             u64_to_i64(order_at)?,
             u64_to_i64(unix_now_seconds())?
-        ],
-    )
-    .storage()?;
-    Ok(())
-}
-
-fn upsert_agent_stream_start_tx(tx: &Connection, start: &StreamStartRow) -> StorageResult<()> {
-    tx.execute_cached(
-        "INSERT INTO agent_stream_starts (
-            group_id_hex, message_id_hex, source_message_id_hex, sender, stream_id_hex,
-            tags_json, started_at, received_at
-         )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
-            source_message_id_hex = excluded.source_message_id_hex,
-            sender = excluded.sender,
-            stream_id_hex = excluded.stream_id_hex,
-            tags_json = excluded.tags_json,
-            started_at = excluded.started_at,
-            received_at = excluded.received_at",
-        params![
-            &start.group_id_hex,
-            &start.message_id_hex,
-            &start.source_message_id_hex,
-            &start.sender,
-            &start.stream_id_hex,
-            tags_json(&start.tags)?,
-            u64_to_i64(start.started_at)?,
-            u64_to_i64(start.received_at)?,
         ],
     )
     .storage()?;
@@ -3224,30 +3137,12 @@ fn scrub_timeline_projection_rows_by_ids_tx(
                          WHEN media_json IS NULL THEN NULL
                          ELSE zeroblob(length(media_json))
                      END,
-                     agent_stream_json = CASE
-                         WHEN agent_stream_json IS NULL THEN NULL
-                         ELSE zeroblob(length(agent_stream_json))
-                     END,
                      reactions_json = zeroblob(length(reactions_json)),
                      edit_json = NULL,
                      deleted_by_message_id_hex = NULL,
                      deletion_source = 'unknown',
                      invalidation_status = NULL,
                      recipient_confirmed = 0
-                 WHERE group_id_hex = ?
-                   AND message_id_hex IN ({placeholders})"
-            ),
-            params_from_iter(values.iter()),
-        )
-        .storage()?;
-        let values = group_and_message_id_values(group_id_hex, chunk);
-        tx.execute_cached(
-            &format!(
-                "UPDATE agent_stream_starts
-                 SET source_message_id_hex = NULL,
-                     sender = zeroblob(length(sender)),
-                     stream_id_hex = zeroblob(length(stream_id_hex)),
-                     tags_json = zeroblob(length(tags_json))
                  WHERE group_id_hex = ?
                    AND message_id_hex IN ({placeholders})"
             ),
@@ -3309,22 +3204,20 @@ fn delete_timeline_projection_rows_by_ids_tx(
         return Ok(());
     }
     let message_ids = message_ids.iter().collect::<Vec<_>>();
-    for table in ["message_timeline", "agent_stream_starts"] {
-        for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let values = group_and_message_id_values(group_id_hex, chunk);
-            tx.execute_cached(
-                &format!(
-                    "DELETE FROM {table}
-                     WHERE group_id_hex = ?
-                       AND message_id_hex IN ({placeholders})"
-                ),
-                params_from_iter(values.iter()),
-            )
-            .storage()?;
-        }
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = group_and_message_id_values(group_id_hex, chunk);
+        tx.execute_cached(
+            &format!(
+                "DELETE FROM message_timeline
+                 WHERE group_id_hex = ?
+                   AND message_id_hex IN ({placeholders})"
+            ),
+            params_from_iter(values.iter()),
+        )
+        .storage()?;
     }
     Ok(())
 }
@@ -3393,7 +3286,6 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
     let mut reply_preview_targets = BTreeSet::new();
     match kind {
         MARMOT_APP_EVENT_KIND_CHAT
-        | MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
         | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
         | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
         | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => {
@@ -3423,6 +3315,8 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
         MARMOT_APP_EVENT_KIND_POLL_RESPONSE => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
+        // The retired agent stream start projects no row.
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => {}
         MARMOT_APP_EVENT_KIND_REPORT => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
@@ -3727,8 +3621,7 @@ fn timeline_trigger_for_invalidation_row(
         && (cgka_traits::is_chat_message(kind, tags)
             || matches!(
                 kind,
-                MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
-                    | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
+                MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
                     | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
                     | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
                     | MARMOT_APP_EVENT_KIND_DELETE
@@ -3804,8 +3697,7 @@ fn timeline_trigger_for_event_row(
         && (cgka_traits::is_chat_message(kind, tags)
             || matches!(
                 kind,
-                MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
-                    | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
+                MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
                     | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
                     | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
                     | MARMOT_APP_EVENT_KIND_DELETE
@@ -3817,15 +3709,7 @@ fn timeline_trigger_for_event_row(
     }
     match kind {
         MARMOT_APP_EVENT_KIND_REMOVE if row.deleted => TimelineUpdateTrigger::MessageDeleted,
-        MARMOT_APP_EVENT_KIND_CHAT => {
-            if tag_value(tags, STREAM_TAG).is_some() && tag_value(tags, STREAM_START_TAG).is_some()
-            {
-                TimelineUpdateTrigger::AgentStreamFinished
-            } else {
-                TimelineUpdateTrigger::NewMessage
-            }
-        }
-        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => TimelineUpdateTrigger::AgentStreamStarted,
+        MARMOT_APP_EVENT_KIND_CHAT => TimelineUpdateTrigger::NewMessage,
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY => TimelineUpdateTrigger::AgentActivity,
         MARMOT_APP_EVENT_KIND_AGENT_OPERATION => TimelineUpdateTrigger::AgentOperation,
         MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => TimelineUpdateTrigger::GroupSystem,
@@ -3951,7 +3835,7 @@ fn timeline_records_by_ids_tx(
                     timeline.direction, timeline.group_id_hex, timeline.sender,
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
-                    timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
+                    timeline.reactions_json, timeline.deleted,
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
@@ -4290,7 +4174,7 @@ fn timeline_query_sql(
                     timeline.direction, timeline.group_id_hex, timeline.sender,
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
-                    timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
+                    timeline.reactions_json, timeline.deleted,
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
@@ -4342,9 +4226,8 @@ pub(crate) fn canonical_timeline_order_key<'a>(
 fn project_group_events(
     events: Vec<RawAppEvent>,
     removal_targets: &BTreeMap<String, BTreeSet<String>>,
-) -> (Vec<TimelineRow>, Vec<StreamStartRow>) {
+) -> Vec<TimelineRow> {
     let mut timeline = BTreeMap::<String, TimelineRow>::new();
-    let mut stream_starts = Vec::new();
     let mut reactions = Vec::new();
     let mut deletes = Vec::new();
 
@@ -4366,37 +4249,16 @@ fn project_group_events(
                 }
                 timeline.insert(event.message_id_hex.clone(), row);
             }
-            MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => {
-                if let Some(stream_id_hex) = tag_value(&event.tags, STREAM_TAG) {
-                    let mut row = timeline_row_from_stream_start(event);
-                    if event.invalidated {
-                        row.invalidation_status = Some(invalidation_status(event));
-                    }
-                    timeline.insert(event.message_id_hex.clone(), row);
-                    // An invalidated stream start is a tombstone, not a live stream,
-                    // so it does not register an active stream-start row.
-                    if !event.invalidated {
-                        stream_starts.push(StreamStartRow {
-                            group_id_hex: event.group_id_hex.clone(),
-                            message_id_hex: event.message_id_hex.clone(),
-                            source_message_id_hex: event.source_message_id_hex.clone(),
-                            sender: event.sender.clone(),
-                            stream_id_hex: stream_id_hex.to_owned(),
-                            tags: event.tags.clone(),
-                            started_at: event.recorded_at,
-                            received_at: event.received_at,
-                        });
-                    }
-                }
-            }
             // Invalidated modifier events landed on a losing branch and MUST NOT
             // mutate canonical content, so they are skipped entirely.
             MARMOT_APP_EVENT_KIND_REACTION if !event.invalidated => reactions.push(event.clone()),
             MARMOT_APP_EVENT_KIND_DELETE if !event.invalidated => deletes.push(event.clone()),
             MARMOT_APP_EVENT_KIND_REMOVE if !event.invalidated => deletes.push(event.clone()),
-            // Modifier kinds never get a row of their own. Every other kind —
-            // including app-defined custom kinds — projects a generic row.
-            MARMOT_APP_EVENT_KIND_REACTION
+            // Modifier kinds and the retired agent stream start never get a
+            // row of their own. Every other kind — including app-defined
+            // custom kinds — projects a generic row.
+            MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
+            | MARMOT_APP_EVENT_KIND_REACTION
             | MARMOT_APP_EVENT_KIND_POLL_RESPONSE
             | MARMOT_APP_EVENT_KIND_DELETE
             | MARMOT_APP_EVENT_KIND_EDIT
@@ -4504,7 +4366,6 @@ fn project_group_events(
             row.plaintext.clear();
             row.edit = None;
             row.media = None;
-            row.agent_text_stream = None;
             row.deleted_peer_reaction |= peer_reacted(row);
             row.reactions = TimelineReactionSummary::default();
         }
@@ -4516,12 +4377,7 @@ fn project_group_events(
             .cmp(&b.timeline_at)
             .then_with(|| a.message_id_hex.cmp(&b.message_id_hex))
     });
-    stream_starts.sort_by(|a, b| {
-        a.started_at
-            .cmp(&b.started_at)
-            .then_with(|| a.message_id_hex.cmp(&b.message_id_hex))
-    });
-    (rows, stream_starts)
+    rows
 }
 
 /// Whether `message_id_hex` is an own send that failed and no relay accepted,
@@ -4765,13 +4621,10 @@ fn is_editable_message(kind: u64, tags: &[Vec<String>]) -> bool {
 }
 
 fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
-    let (media, agent_text_stream) = if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
-        (
-            media_metadata(&event.tags),
-            agent_stream_final_metadata(&event.tags),
-        )
+    let media = if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
+        media_metadata(&event.tags)
     } else {
-        (None, None)
+        None
     };
     TimelineRow {
         message_id_hex: event.message_id_hex.clone(),
@@ -4789,7 +4642,6 @@ fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
             .or_else(|| tag_value(&event.tags, EVENT_REF_TAG))
             .map(ToOwned::to_owned),
         media,
-        agent_text_stream,
         reactions: TimelineReactionSummary::default(),
         edit: None,
         deleted: false,
@@ -4816,7 +4668,6 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
         received_at: event.received_at,
         reply_to_message_id_hex: tag_value(&event.tags, EVENT_REF_TAG).map(ToOwned::to_owned),
         media: None,
-        agent_text_stream: None,
         reactions: TimelineReactionSummary::default(),
         edit: None,
         deleted: false,
@@ -4845,33 +4696,6 @@ fn timeline_row_from_custom_event(event: &RawAppEvent) -> TimelineRow {
     }
 }
 
-fn timeline_row_from_stream_start(event: &RawAppEvent) -> TimelineRow {
-    TimelineRow {
-        message_id_hex: event.message_id_hex.clone(),
-        source_message_id_hex: event.source_message_id_hex.clone(),
-        source_epoch: event.source_epoch,
-        direction: event.direction.clone(),
-        group_id_hex: event.group_id_hex.clone(),
-        sender: event.sender.clone(),
-        plaintext: event.plaintext.clone(),
-        kind: event.kind,
-        tags: event.tags.clone(),
-        timeline_at: event.recorded_at,
-        received_at: event.received_at,
-        reply_to_message_id_hex: None,
-        media: None,
-        agent_text_stream: agent_stream_start_metadata(event),
-        reactions: TimelineReactionSummary::default(),
-        edit: None,
-        deleted: false,
-        deletion_source: Default::default(),
-        deleted_by_message_id_hex: None,
-        invalidation_status: None,
-        recipient_confirmed: false,
-        deleted_peer_reaction: false,
-    }
-}
-
 /// The projected invalidation status for an invalidated event: the engine
 /// invalidation reason (e.g. `LosingBranch`) when present, falling back to a
 /// generic marker so the tombstone is always distinguishable from a delivered row.
@@ -4890,30 +4714,6 @@ fn media_metadata(tags: &[Vec<String>]) -> Option<Value> {
         .cloned()
         .collect::<Vec<_>>();
     (!imeta.is_empty()).then(|| json!({ "imeta": imeta }))
-}
-
-fn agent_stream_start_metadata(event: &RawAppEvent) -> Option<Value> {
-    let stream_id_hex = tag_value(&event.tags, STREAM_TAG)?;
-    Some(json!({
-        "stream_id_hex": stream_id_hex,
-        "start_event_id": event.message_id_hex,
-        "status": "started"
-    }))
-}
-
-fn agent_stream_final_metadata(tags: &[Vec<String>]) -> Option<Value> {
-    let stream_id_hex = tag_value(tags, STREAM_TAG)?;
-    let mut value = json!({ "stream_id_hex": stream_id_hex, "status": "finalized" });
-    if let Some(start) = tag_value(tags, STREAM_START_TAG) {
-        value["start_event_id"] = Value::String(start.to_owned());
-    }
-    if let Some(hash) = tag_value(tags, STREAM_HASH_TAG) {
-        value["transcript_hash"] = Value::String(hash.to_owned());
-    }
-    if let Some(chunks) = tag_value(tags, STREAM_CHUNKS_TAG) {
-        value["chunk_count"] = Value::String(chunks.to_owned());
-    }
-    Some(value)
 }
 
 fn tag_value<'a>(tags: &'a [Vec<String>], name: &str) -> Option<&'a str> {
@@ -4974,7 +4774,7 @@ fn visible_timeline_record(
                     timeline.direction, timeline.group_id_hex, timeline.sender,
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
-                    timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
+                    timeline.reactions_json, timeline.deleted,
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed,
                 {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                 (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
@@ -4998,7 +4798,7 @@ fn visible_timeline_record(
 }
 
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
-    let deleted = row.get::<_, bool>(17)?;
+    let deleted = row.get::<_, bool>(16)?;
     Ok(TimelineMessageRecord {
         client_token: row.get("client_token")?,
         has_reports: false,
@@ -5006,7 +4806,7 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
             row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
             &row.get::<_, String>(8)?,
             row.get("authenticated_group_system")?,
-            row.get::<_, bool>(17)?,
+            row.get::<_, bool>(16)?,
         ),
         poll: None,
         message_id_hex: row.get(0)?,
@@ -5043,34 +4843,25 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         reply_preview: None,
         thread: None,
         media: media_value_from_json(row.get::<_, Option<String>>(14)?),
-        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(15)?).map_err(
-            |err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    15,
-                    rusqlite::types::Type::Text,
-                    Box::new(err),
-                )
-            },
-        )?,
-        reactions: reaction_summary_from_json(row.get::<_, String>(16)?).map_err(|err| {
+        reactions: reaction_summary_from_json(row.get::<_, String>(15)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                16,
+                15,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
         deleted,
-        deleted_by_message_id_hex: row.get(18)?,
+        deleted_by_message_id_hex: row.get(17)?,
         deletion_source: DeletionSource::from_storage(&row.get::<_, String>("deletion_source")?),
-        invalidation_status: row.get(19)?,
+        invalidation_status: row.get(18)?,
         recipient_confirmed: row.get("recipient_confirmed")?,
         edit: row
-            .get::<_, Option<String>>(20)?
+            .get::<_, Option<String>>(19)?
             .map(|json| serde_json::from_str(&json))
             .transpose()
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    20,
+                    19,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -5428,7 +5219,7 @@ fn load_reply_previews(
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT message_id_hex, sender, plaintext, kind, tags_json, media_json, agent_stream_json, deleted, source_epoch,
+                "SELECT message_id_hex, sender, plaintext, kind, tags_json, media_json, deleted, source_epoch,
                         invalidation_status, deletion_source, reply_to_message_id_hex
                  FROM visible_message_timeline
                  WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
@@ -5465,11 +5256,11 @@ fn load_reply_previews(
 fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineReplyPreview> {
     Ok(TimelineReplyPreview {
         message_id_hex: row.get(0)?,
-        reply_to_message_id_hex: row.get(11)?,
+        reply_to_message_id_hex: row.get(10)?,
         sender: row.get(1)?,
         plaintext: row.get(2)?,
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
-        tags: if row.get::<_, i64>(7)? != 0 {
+        tags: if row.get::<_, i64>(6)? != 0 {
             Vec::new()
         } else {
             serde_json::from_str(&row.get::<_, String>(4)?).map_err(|err| {
@@ -5481,21 +5272,12 @@ fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineR
             })?
         },
         media: media_value_from_json(row.get::<_, Option<String>>(5)?),
-        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(6)?).map_err(
-            |err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    6,
-                    rusqlite::types::Type::Text,
-                    Box::new(err),
-                )
-            },
-        )?,
-        deleted: row.get::<_, i64>(7)? != 0,
+        deleted: row.get::<_, i64>(6)? != 0,
         source_epoch: row
-            .get::<_, Option<i64>>(8)?
+            .get::<_, Option<i64>>(7)?
             .and_then(|value| value.try_into().ok()),
-        invalidation_status: row.get(9)?,
-        deletion_source: DeletionSource::from_storage(&row.get::<_, String>(10)?),
+        invalidation_status: row.get(8)?,
+        deletion_source: DeletionSource::from_storage(&row.get::<_, String>(9)?),
         thread: None,
     })
 }
@@ -5535,10 +5317,6 @@ fn optional_value_json(value: &Option<Value>) -> StorageResult<Option<String>> {
         .map(serde_json::to_string)
         .transpose()
         .map_err(|err| StorageError::Serialization(err.to_string()))
-}
-
-fn optional_value_from_json(value: Option<String>) -> Result<Option<Value>, serde_json::Error> {
-    value.map(|value| serde_json::from_str(&value)).transpose()
 }
 
 /// Decode a stored media container leniently. The projection only ever writes
