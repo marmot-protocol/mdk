@@ -13,9 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
     AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
-    AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
 };
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID,
@@ -8482,6 +8480,8 @@ impl MarmotApp {
         components.insert(GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
         components.insert(NOSTR_ROUTING_COMPONENT_ID);
         components.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+        // Retired, but groups created before its retirement still require
+        // it, so support stays advertised for them; new groups omit it.
         components.insert(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID);
         components.insert(GROUP_AVATAR_URL_COMPONENT_ID);
         // Existing legacy groups continue to require V1, while fresh
@@ -8608,39 +8608,19 @@ fn app_feature_registry() -> FeatureRegistry {
             description: "MIP-03 SelfRemove group departure",
         },
     );
-    // Each agent-text-stream-QUIC role maps to its own distinct backing
-    // capability (a private-use MLS extension type), so a member advertises
-    // `receive`/`send`/`fanout` independently and a group's
-    // `required_member_roles` mask is enforceable per role (#177,
-    // agent-text-stream-quic-v1.md). The capability/feature/bit mapping is the
-    // shared `AGENT_TEXT_STREAM_QUIC_ROLES` table so the engine enforcement and
-    // this registration cannot drift.
-    for (feature, capability, description) in [
-        (
-            AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE.clone(),
-            AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY,
-            "receive QUIC-backed agent text stream previews",
-        ),
-        (
-            AGENT_TEXT_STREAM_QUIC_SEND_FEATURE.clone(),
-            AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY,
-            "send QUIC-backed agent text stream frames",
-        ),
-        (
-            AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE.clone(),
-            AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY,
-            "fan out QUIC-backed agent text stream frames",
-        ),
-    ] {
-        registry.register(
-            feature,
-            CapabilityRequirement {
-                requires: capability,
-                level: RequirementLevel::Optional,
-                description,
-            },
-        );
-    }
+    // The retired agent text stream component (0x8006) still requires the
+    // `receive` role in every group created before its retirement, so every
+    // leaf keeps advertising it; it needs no QUIC code. The retired `send` and
+    // `fanout` roles are no longer advertised (agent-text-stream-quic-v1.md,
+    // "Retirement").
+    registry.register(
+        AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
+        CapabilityRequirement {
+            requires: AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY,
+            level: RequirementLevel::Optional,
+            description: "retired agent text stream receive role",
+        },
+    );
     registry
 }
 

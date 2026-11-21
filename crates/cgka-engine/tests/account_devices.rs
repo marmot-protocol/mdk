@@ -36,6 +36,9 @@ use cgka_engine::{
     ConvergenceClock, DEFAULT_CIPHERSUITE, Engine, EngineBuilder, ManualConvergenceClock,
 };
 use cgka_traits::EngineError;
+use cgka_traits::agent_text_stream::{
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AgentTextStreamQuicPolicyV1,
+};
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID,
     AppComponentData, AppComponentSet, GROUP_PROFILE_COMPONENT_ID, GroupProfileV1,
@@ -1279,6 +1282,29 @@ async fn upgrade_never_requires_account_devices() {
             .contains(ACCOUNT_DEVICES_COMPONENT_ID),
         "every member advertises 0x800d, yet an upgrade must not require it"
     );
+}
+
+/// The retired agent text stream component (`0x8006`) still requires its
+/// `required_member_roles` of every leaf the resulting state holds, on every
+/// Commit (agent-text-stream-quic-v1.md, "Validation"). No engine send path
+/// commits such state, so a receiver must reject a raw OpenMLS commit that
+/// sets a policy requiring `receive` while no member advertises it. It lives
+/// here for this file's raw-commit harness.
+#[tokio::test]
+async fn a_commit_requiring_a_role_no_member_advertises_is_rejected() {
+    let mut alice = device(b"alice", false);
+    let mut carol = device(b"carol", false);
+    let carol_kp = carol.engine.fresh_key_package().await.unwrap();
+    let gid = found_group(&mut alice, vec![carol_kp], false, &mut [&mut carol]).await;
+    let policy = AppDataUpdateProposal::update(
+        AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+        AgentTextStreamQuicPolicyV1::user_to_agent_default()
+            .encode_component_state()
+            .unwrap(),
+    );
+
+    let crafted = crafted_commit(&alice, &gid, vec![], vec![policy], None);
+    assert_rejected_on_replay(&mut carol, &crafted, &gid).await;
 }
 
 #[tokio::test]

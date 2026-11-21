@@ -81,15 +81,7 @@ async fn keyed_group_matches_list() {
     assert!(initial.archived && initial.pending_confirmation);
     assert_eq!(initial.self_membership, SelfMembership::Removed);
     assert_eq!(initial.member_count, Some(2));
-    // The fixture's opaque component, beside the retired agent text stream
-    // component every new group still carries.
-    let mut opaque = initial
-        .unknown_components
-        .iter()
-        .map(|component| component.component_id)
-        .collect::<Vec<_>>();
-    opaque.sort_unstable();
-    assert_eq!(opaque, [0x8006, 0x9000]);
+    assert_eq!(initial.unknown_components.len(), 1);
     storage
         .put_leave_request(&LeaveRequest {
             group_id: group_id.clone(),

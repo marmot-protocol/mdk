@@ -1542,9 +1542,6 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::InvalidGroupProfile(_) => "read_marker_failed:invalid_group_profile",
         AppError::InvalidNostrRouting(_) => "read_marker_failed:invalid_nostr_routing",
         AppError::InvalidGroupAvatarUrl(_) => "read_marker_failed:invalid_group_avatar_url",
-        AppError::InvalidAgentTextStreamPolicy(_) => {
-            "read_marker_failed:invalid_agent_text_stream_policy"
-        }
         AppError::InvalidEncryptedMedia(_) => "read_marker_failed:invalid_encrypted_media",
         AppError::MediaReferenceStaleEpoch { .. } => {
             "read_marker_failed:media_reference_stale_epoch"

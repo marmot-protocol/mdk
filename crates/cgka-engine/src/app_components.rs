@@ -1804,6 +1804,10 @@ fn validate_resulting_leaf_capabilities<'a>(
             "invalid current-profile group state: missing required_capabilities".into(),
         )
     })?;
+    // The retired agent text stream component still requires its member
+    // roles of every leaf, on every Commit (agent-text-stream-quic-v1.md,
+    // "Validation").
+    let required_roles = crate::capability_manager::required_role_capabilities_of(extensions);
     for leaf in leaves {
         let capabilities = leaf.capabilities();
         let supports_required = required.extension_types().iter().all(|required| {
@@ -1826,6 +1830,15 @@ fn validate_resulting_leaf_capabilities<'a>(
         if !required_components.missing_from(&advertised).is_empty() {
             return Err(EngineError::Other(
                 "invalid current-profile resulting state: member lacks a required app component"
+                    .into(),
+            ));
+        }
+        if !required_roles
+            .missing_from(&crate::capabilities::capabilities_of_leaf(leaf))
+            .is_empty()
+        {
+            return Err(EngineError::Other(
+                "invalid current-profile resulting state: member lacks a required role capability"
                     .into(),
             ));
         }

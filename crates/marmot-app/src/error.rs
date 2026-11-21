@@ -318,8 +318,6 @@ pub enum AppError {
     InvalidNostrRouting(String),
     #[error("invalid group avatar URL: {0}")]
     InvalidGroupAvatarUrl(String),
-    #[error("invalid agent text stream policy: {0}")]
-    InvalidAgentTextStreamPolicy(String),
     #[error("invalid encrypted media: {0}")]
     InvalidEncryptedMedia(String),
     /// A media reference was encrypted under `source_epoch`, but the message
@@ -775,7 +773,6 @@ impl AppError {
             Self::InvalidAppComponent(_) => "invalid_app_component",
             Self::InvalidNostrRouting(_) => "invalid_nostr_routing",
             Self::InvalidGroupAvatarUrl(_) => "invalid_group_avatar_url",
-            Self::InvalidAgentTextStreamPolicy(_) => "invalid_agent_text_stream_policy",
             Self::InvalidEncryptedMedia(_) => "invalid_encrypted_media",
             Self::MediaReferenceStaleEpoch { .. } => "media_reference_stale_epoch",
             Self::MediaReferenceEpochUnsettled { .. } => "media_reference_epoch_unsettled",

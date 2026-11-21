@@ -9839,11 +9839,11 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
     assert!(bad_media.to_string().contains("media plaintext_sha256"));
 }
 
-/// New groups still require the retired agent text stream component
-/// (`0x8006`), and a metadata update keeps it in every member's MLS state and
-/// account record, carried as an opaque component.
+/// New groups no longer carry the retired agent text stream component
+/// (`0x8006`), so neither member's record holds it
+/// (agent-text-stream-quic-v1.md, "Retirement").
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retired_agent_text_stream_component_survives_group_metadata_updates() {
+async fn new_groups_omit_the_retired_agent_text_stream_component() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -9861,39 +9861,15 @@ async fn retired_agent_text_stream_component_survives_group_metadata_updates() {
         .operation
         .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
-    let retired = |label: &str| {
-        let group = app.group(label, &group_id_hex).unwrap().unwrap();
-        let component = group
-            .unknown_components
-            .iter()
-            .find(|component| component.component_id == 0x8006)
-            .map(|component| (component.component.clone(), component.data_hex.clone()));
-        (group.profile.name, component)
-    };
-    let user_to_agent_default = Some((
-        "marmot.group.agent-text-stream.quic.v1".to_owned(),
-        "010300001000000000000000".to_owned(),
-    ));
-
     bob.sync().await.unwrap();
-    for label in ["alice", "bob"] {
-        assert_eq!(
-            retired(label),
-            ("agent".to_owned(), user_to_agent_default.clone()),
-            "{label}"
-        );
-    }
 
-    alice
-        .update_group_profile(&group_id, Some("renamed"), None)
-        .await
-        .unwrap();
-    let renamed_epoch = alice.group_mls_state(&group_id).unwrap().epoch;
-    sync_to_epoch(&mut bob, &group_id, renamed_epoch).await;
     for label in ["alice", "bob"] {
-        assert_eq!(
-            retired(label),
-            ("renamed".to_owned(), user_to_agent_default.clone()),
+        let group = app.group(label, &group_id_hex).unwrap().unwrap();
+        assert!(
+            group
+                .unknown_components
+                .iter()
+                .all(|component| component.component_id != 0x8006),
             "{label}"
         );
     }

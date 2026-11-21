@@ -1486,6 +1486,15 @@ impl<S: StorageProvider> Engine<S> {
 
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
+        // The agent text stream is retired: a client sends no stream start,
+        // including one queued before an upgrade (agent-text-stream-quic-v1.md,
+        // "Retirement"). Receivers still accept one from an older client.
+        if app_event.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
+            self.return_unmodified_mls_group(&group_id, mls_group);
+            return Err(EngineError::InvalidAppMessagePayload(
+                "retired agent stream start".into(),
+            ));
+        }
         let authority = if cgka_traits::reporting::requires_source_authority(app_event.kind) {
             Some(crate::app_payload::source_authority(
                 &mls_group,

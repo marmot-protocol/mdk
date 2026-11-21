@@ -8,6 +8,7 @@
 //! self-update never went out.
 
 use super::*;
+use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 
 /// Alice's confirmed Commit that leaves only alice an admin, routed for
 /// delivery to carol.
@@ -288,4 +289,70 @@ async fn an_invite_with_a_bad_key_package_signature_is_refused_before_it_is_queu
             .len(),
         1
     );
+}
+
+/// A retired agent stream start (kind 1200) queued before an upgrade is
+/// retired at drain, never published (agent-text-stream-quic-v1.md,
+/// "Retirement"), and the chat queued behind it still goes out.
+#[tokio::test]
+async fn a_queued_retired_stream_start_is_retired_not_published() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut carol = build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock);
+    let group_id = create_reservation_test_group(&mut alice, &mut carol, "stream-start").await;
+    let rename = alice_rename_commit(&mut alice, &group_id, "unsettled").await;
+    assert!(matches!(
+        carol.ingest(rename).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+
+    let carol_hex = hex::encode(carol.self_id().as_slice());
+    let mut intent_ids = Vec::new();
+    for (kind, created_at) in [
+        (MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, 1_700_000_000),
+        (MARMOT_APP_EVENT_KIND_CHAT, 1_700_000_001),
+    ] {
+        let payload =
+            MarmotAppEvent::new(carol_hex.clone(), created_at, kind, vec![], "x".to_owned())
+                .encode()
+                .unwrap();
+        match carol
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+                expected_epoch: None,
+            })
+            .await
+        {
+            Ok(SendResult::Queued { intent_id, .. }) => intent_ids.push(intent_id),
+            other => panic!("the send waits for the rename to settle: {other:?}"),
+        }
+    }
+    carol.drain_events();
+
+    let drained = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    let events = carol.drain_events();
+
+    assert!(
+        matches!(drained.as_slice(), [SendResult::ApplicationMessage { .. }]),
+        "only the chat is published: {drained:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::QueuedIntentRefused { intent_id, .. } if intent_id == &intent_ids[0]
+        )),
+        "{events:?}"
+    );
+    let queued_ids = carol_storage
+        .list_queued_outbound_intents(&group_id)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.id)
+        .collect::<Vec<_>>();
+    assert!(!queued_ids.contains(&intent_ids[0]), "{queued_ids:?}");
 }
