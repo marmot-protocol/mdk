@@ -172,3 +172,51 @@ async fn keyed_read_ignores_other_rows() {
     assert!(app.groups("alice").is_err());
     assert!(app.group("alice", &id_hex).unwrap() == keyed);
 }
+
+/// A group created before the agent text stream retirement holds `0x8006`
+/// (an older build's commit put it there); a metadata update keeps it in the
+/// group record as an opaque component.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_holding_the_retired_stream_component_keeps_it_through_a_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    app.account_home().create_account("alice").unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("agent", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let policy =
+        cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1::user_to_agent_default()
+            .to_app_component_data()
+            .unwrap();
+    client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![policy.clone()],
+        })
+        .await
+        .unwrap();
+    client.refresh_group(&group_id);
+
+    client
+        .update_group_profile(&group_id, Some("renamed"), None)
+        .await
+        .unwrap();
+
+    let group = app
+        .group("alice", &hex::encode(group_id.as_slice()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(group.profile.name, "renamed");
+    let retired = group
+        .unknown_components
+        .iter()
+        .find(|component| component.component_id == policy.component_id)
+        .map(|component| component.data_hex.clone());
+    assert_eq!(retired, Some(hex::encode(&policy.data)));
+}
