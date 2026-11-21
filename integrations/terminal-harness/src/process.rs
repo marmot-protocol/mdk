@@ -205,6 +205,80 @@ impl ProcessGroupGuard {
     fn disarm(&mut self) {}
 }
 
+/// Long-lived backend helper in its own process group. Dropping it kills the
+/// whole group and reaps the direct child, like an abandoned JSONL run.
+pub struct OwnedProcess {
+    // Dropped first: the group is killed before the leader can be reaped.
+    process_group: ProcessGroupGuard,
+    child: Child,
+}
+
+impl OwnedProcess {
+    /// Spawns with the current turn's routing environment, null stdin and
+    /// stderr, and piped stdout for the caller to read.
+    pub fn spawn(
+        executable: &str,
+        args: &[&str],
+        cwd: &std::path::Path,
+        environment: Vec<EnvironmentChange>,
+    ) -> std::io::Result<Self> {
+        let mut command = Command::new(executable);
+        crate::group_profile::configure_command(&mut command);
+        command
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        apply_environment(&mut command, environment);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.as_std_mut().process_group(0);
+        }
+        let child = command.spawn()?;
+        let process_group = ProcessGroupGuard::new(&child);
+        Ok(Self {
+            child,
+            process_group,
+        })
+    }
+
+    /// Takes the piped stdout once.
+    pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    /// Whether the direct child has exited. It is not reaped, so its PID cannot
+    /// be reused while this value is alive.
+    pub fn has_exited(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.process_group.has_exited().unwrap_or(true)
+        }
+        // Without a waitable group the caller's own request errors report a
+        // dead server instead.
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+fn apply_environment(command: &mut Command, environment: Vec<EnvironmentChange>) {
+    for change in environment {
+        match change {
+            EnvironmentChange::Remove(name) => {
+                command.env_remove(name);
+            }
+            EnvironmentChange::Set { name, value } => {
+                command.env(name, value);
+            }
+        }
+    }
+}
+
 async fn wait_for_child_and_cleanup(
     child: &mut Child,
     process_group: &mut ProcessGroupGuard,
@@ -391,16 +465,7 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    for change in environment {
-        match change {
-            EnvironmentChange::Remove(name) => {
-                command.env_remove(name);
-            }
-            EnvironmentChange::Set { name, value } => {
-                command.env(name, value);
-            }
-        }
-    }
+    apply_environment(&mut command, environment);
     match &prompt {
         PromptTransport::Stdin(_) => {
             command.stdin(Stdio::piped());

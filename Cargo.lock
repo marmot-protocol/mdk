@@ -7708,6 +7708,7 @@ dependencies = [
  "async-trait",
  "clap",
  "marmot-terminal-harness",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

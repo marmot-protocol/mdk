@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use marmot_terminal_harness::{
     ApprovalSupport, Attachment, Backend, ExecutionProfile, ExecutionSupport, HarnessError,
     Invocation, IsolationSupport, Outcome, ParsedEvent, PromptTransport, Result, RunFailure,
-    RunnerEvent,
+    RunnerEvent, SteerOutcome,
     attachment_preflight::{is_utf8_text, revalidate},
     process::{EnvironmentChange, ProcessSpec, run_jsonl_process},
 };
@@ -14,11 +14,35 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 pub(crate) struct OpencodeBackend {
     pub(crate) bin: String,
+    pub(crate) native_enabled: bool,
     pub(crate) execution_profile: ExecutionProfile,
+    pub(crate) native: std::sync::Arc<crate::native::Native>,
 }
 
 #[async_trait]
 impl Backend for OpencodeBackend {
+    fn supports_steering(&self) -> bool {
+        self.native_enabled
+    }
+    fn has_active_turn(&self, group: &str) -> bool {
+        self.native_enabled && self.native.active(group)
+    }
+    async fn steer(&self, group: &str, text: &str) -> SteerOutcome {
+        self.native.steer(group, text, vec![], None).await
+    }
+    async fn steer_with_attachments(
+        &self,
+        group: &str,
+        text: &str,
+        attachments: Vec<Attachment>,
+        lease: Box<dyn Send + Sync>,
+    ) -> SteerOutcome {
+        let Ok(files) = prepare_attachments(&attachments) else {
+            return SteerOutcome::Unavailable;
+        };
+        self.native.steer(group, text, files, Some(lease)).await
+    }
+
     fn execution_support(&self) -> ExecutionSupport {
         ExecutionSupport {
             approvals: match self.execution_profile {
@@ -35,6 +59,19 @@ impl Backend for OpencodeBackend {
         invocation: Invocation,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure> {
+        if self.native_enabled {
+            return self
+                .native
+                .run(
+                    &self.bin,
+                    invocation,
+                    &[],
+                    native_environment(self.execution_profile),
+                    self.execution_profile != ExecutionProfile::Inherit,
+                    tx,
+                )
+                .await;
+        }
         run_with_bin(&self.bin, self.execution_profile, invocation, &[], tx).await
     }
 
@@ -44,6 +81,19 @@ impl Backend for OpencodeBackend {
         attachments: Vec<Attachment>,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure> {
+        if self.native_enabled {
+            return self
+                .native
+                .run(
+                    &self.bin,
+                    invocation,
+                    &attachments,
+                    native_environment(self.execution_profile),
+                    self.execution_profile != ExecutionProfile::Inherit,
+                    tx,
+                )
+                .await;
+        }
         run_with_bin(
             &self.bin,
             self.execution_profile,
@@ -172,7 +222,7 @@ fn build_run_args(
 
 /// Revalidates every staged copy immediately before spawn and returns their absolute paths in
 /// source order. Any file OpenCode would not deliver as its own content fails the whole batch.
-fn prepare_attachments(attachments: &[Attachment]) -> Result<Vec<String>> {
+pub(crate) fn prepare_attachments(attachments: &[Attachment]) -> Result<Vec<String>> {
     attachments
         .iter()
         .map(|attachment| {
@@ -294,6 +344,21 @@ impl OpencodeError {
         }
         summary
     }
+}
+
+/// The CLI's permission overlay. Approval replies are passed separately.
+fn native_environment(profile: ExecutionProfile) -> Vec<EnvironmentChange> {
+    config_overlay(profile)
+        .map(|(remove, name, value)| {
+            vec![
+                EnvironmentChange::Remove(remove),
+                EnvironmentChange::Set {
+                    name,
+                    value: value.to_owned(),
+                },
+            ]
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

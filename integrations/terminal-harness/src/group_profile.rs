@@ -28,6 +28,11 @@ pub async fn with_group_profile_context<F: Future>(
     CONTEXT.scope(context, future).await
 }
 
+/// Group bound to the current authorized backend invocation.
+pub fn current_group_id() -> Option<String> {
+    CONTEXT.try_with(|ctx| ctx.group_id_hex.clone()).ok()
+}
+
 pub(crate) fn configure_command(command: &mut Command) {
     let _ = CONTEXT.try_with(|ctx| {
         command
