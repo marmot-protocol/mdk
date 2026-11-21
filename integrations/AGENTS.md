@@ -28,13 +28,13 @@ client, no harness. `custom-client.md` is the guide for those clients.
 
 The shared boundary is the `marmot.agent-control.v2` NDJSON protocol over a
 local Unix socket. `wn-agent` owns Marmot account state, MLS state, Nostr
-transport, relay interaction, QUIC preview records, durable encrypted sends,
+transport, relay interaction, durable encrypted sends,
 deletes, invite policy, and local storage.
 
 ## Shared Invariants
 
 - Keep integrations control-plane only. Do not add MLS, Nostr relay, encryption,
-  storage-engine, or QUIC broker logic under `integrations/`; put that in
+  or storage-engine logic under `integrations/`; put that in
   `wn-agent`, `marmot-app`, transport crates, or shared crates as appropriate.
 - Treat `MARMOT_HOME`, `MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_AUTH_TOKEN_FILE`,
   `MARMOT_AGENT_AUTH_TOKEN`, and `MARMOT_ACCOUNT_ID_HEX` as the common connector
@@ -46,10 +46,7 @@ deletes, invite policy, and local storage.
 - Keep logging privacy-safe: no account ids, group ids, message ids, relay URLs,
   pubkeys, payloads, prompts, model output, ciphertext, plaintext, key material,
   or local sensitive paths.
-- Live-preview clients retain the v2 `stream_capability` returned by
-  `stream_begin` only for the life of that preview and present it on every later
-  stream operation. Reuse one stable envelope request id when retrying a
-  timed-out `stream_begin`. Never log capabilities or control bearer tokens.
+- Never log control bearer tokens.
 - Preserve host-runtime configuration outside the Marmot section. Installers and
   setup scripts should patch only the Marmot plugin/channel entries they own.
 - Default Hermes, OpenClaw, and terminal-harness release installs use
@@ -60,8 +57,8 @@ deletes, invite policy, and local storage.
 ## Gateway Versus Harness
 
 Hermes and OpenClaw are gateway/channel integrations. They adapt a full agent
-runtime to Marmot and may own activation policy, message-tool routing, live
-preview adaptation, media staging policy, profile onboarding, and gateway
+runtime to Marmot and may own activation policy, message-tool routing, media
+staging policy, profile onboarding, and gateway
 session behavior.
 
 `wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose` are pure terminal harnesses. They subscribe to allowed
