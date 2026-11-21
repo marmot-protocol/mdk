@@ -168,9 +168,9 @@ impl SqliteAppStorage {
     }
 
     /// [`Self::save_message_draft_if_revision`], except that an attachment
-    /// the draft holds stays unless the save names it
-    /// [`StoredMessageDraftAttachmentInput::Removed`]: a save never drops one
-    /// its caller did not know about. The named attachments come first, in
+    /// the draft holds and the save does not name stays: a save never drops
+    /// one its caller did not know about. Name one
+    /// [`StoredMessageDraftAttachmentInput::Removed`] to delete it. The named attachments come first, in
     /// order, then the kept ones in their stored order. Removing an id the
     /// draft does not hold changes nothing.
     pub fn update_message_draft_if_revision(

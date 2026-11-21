@@ -109,7 +109,8 @@ prim_vec waveform_samples/waveform_samples_len: f64,
 /// marmot_read_message_draft_attachment or a handoff.
 /// marmot_save_message_draft_inputs_if_revision keeps it unless the save
 /// names it by `removed_id` or saves new inline bytes under its id;
-/// marmot_save_message_draft_if_revision drops it unless listed.
+/// marmot_save_message_draft_if_revision replaces the whole list and drops
+/// it.
 copy file_backed: bool,
 } }
 c_mirror! { MarmotSelectedMessageDraftContent from SelectedMessageDraftContentFfi {

@@ -625,7 +625,7 @@ fn cancelling_older_event_preserves_a_replacement_for_the_same_draft_revision() 
 }
 
 /// mdk#3586: an update keeps every attachment it does not name, inline ones
-/// included, after the ones it names; only `Removed` deletes one, and
+/// included, after the ones it names; `Removed` deletes one, and
 /// removing an id the draft no longer holds changes nothing.
 #[test]
 fn an_update_keeps_attachments_it_does_not_name_and_removes_only_named_ones() {
