@@ -3,7 +3,7 @@
 `wn-claude` is a terminal-harness connector that sends authorized Marmot group
 messages to [Claude Code](https://code.claude.com/docs/en/overview) through the
 local `wn-agent` control socket. It is intentionally a thin harness: no mention
-activation, profile onboarding, live previews, MLS, relay, or storage logic.
+activation, profile onboarding, MLS, relay, or storage logic.
 
 The adapter uses Claude Code's documented non-interactive contract. It sends
 prompts over stdin with `claude -p --output-format stream-json --verbose`,
@@ -54,8 +54,7 @@ commands share the [terminal-harness command guide](../../terminal-harness/READM
 
 Tool access, credentials and model choices come from the backend's native
 configuration and the [execution profile](../../terminal-harness/README.md#execution-profiles).
-The harness does not implement mention activation, reaction tools
-or live previews. An interactive backend's slash commands are not automatically
+The harness does not implement mention activation or reaction tools. An interactive backend's slash commands are not automatically
 available through this chat; shared harness commands are handled locally.
 
 ## First-install checklist
