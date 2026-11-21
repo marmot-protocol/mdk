@@ -3,8 +3,9 @@ use super::*;
 use crate::SqliteAccountStorage;
 use crate::{SqlCipherKey, SqliteStorageOptions, StoredAppEvent};
 use cgka_traits::app_event::{
-    AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG,
+    AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
+    QUOTE_REF_TAG,
 };
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::MessageStorage;
@@ -1329,6 +1330,37 @@ fn account_projection_delta_writes_only_observations_and_changed_groups() {
     assert_eq!(write_count("component_insert"), 0);
     assert_eq!(write_count("component_update"), 0);
     assert_eq!(write_count("component_delete"), 0);
+}
+
+#[test]
+fn visible_messages_skip_retired_stream_starts_before_the_limit() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .record_app_event(&app_event("chat", "aa", 10))
+        .unwrap();
+    store
+        .record_app_event(&StoredAppEvent {
+            kind: MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+            ..app_event("start", "aa", 20)
+        })
+        .unwrap();
+    let newest = |records: Vec<StoredAppMessageRecord>| {
+        records
+            .into_iter()
+            .map(|record| record.message_id_hex)
+            .collect::<Vec<_>>()
+    };
+    let query = StoredAppMessageQuery {
+        group_id_hex: Some("aa".to_owned()),
+        kinds: None,
+        limit: Some(1),
+    };
+
+    assert_eq!(
+        newest(store.visible_app_messages(query.clone()).unwrap()),
+        ["chat"]
+    );
+    assert_eq!(newest(store.app_messages(query).unwrap()), ["start"]);
 }
 
 #[test]

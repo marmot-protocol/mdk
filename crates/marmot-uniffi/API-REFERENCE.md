@@ -4400,7 +4400,7 @@ repeat its cursor row. Each request starts from the cursor-free `query`, so the
 After request does not accidentally retain a Before pair. Equal timestamps and
 different canonical epochs use the same boundary-row selection.
 
-[Source](src/commands/timeline.rs#L193)
+[Source](src/commands/timeline.rs#L192)
 
 </details>
 

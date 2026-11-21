@@ -215,7 +215,10 @@ hermes plugins enable marmot
 Hermes clones the detached exact-commit checkout and copies only this plugin
 subdirectory into `~/.hermes/plugins/marmot`; it does not install an MDK
 workspace. Removing `MDK_PLUGIN_CHECKOUT` after installation does not remove the
-installed plugin. Newer Hermes versions may require a separate security-scan
+installed plugin. Unlike the release installer, this path does not rewrite the
+gateway config: if an older install turned Marmot streaming on, set
+`display.platforms.marmot.streaming: false` yourself, or Hermes splits each
+streamed reply into two messages. Newer Hermes versions may require a separate security-scan
 confirmation for source plugins. Review that report for the exact checked-out
 revision; an unattended process cannot assume the confirmation was granted.
 If admission is blocked, report the findings and obtain the runtime's required

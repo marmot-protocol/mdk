@@ -1855,7 +1855,7 @@ impl SqliteAppStorage {
     fn app_messages_with_visibility(
         &self,
         query: StoredAppMessageQuery,
-        hide_blocked: bool,
+        visible_only: bool,
     ) -> StorageResult<Vec<StoredAppMessageRecord>> {
         // Single-source the column list + replay ordering so the query order and
         // the runtime recovery watermark/suppression (via `AppEventReplayCursor`)
@@ -1865,11 +1865,17 @@ impl SqliteAppStorage {
         let asc = APP_EVENT_REPLAY_ORDER_ASC;
         let desc = APP_EVENT_REPLAY_ORDER_DESC;
         let mut conditions: Vec<String> = Vec::new();
-        if hide_blocked {
+        if visible_only {
             conditions.push("sender NOT IN (SELECT public_key FROM user_blocks)".into());
             conditions.push(
                 "group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites)".into(),
             );
+            // Retired agent stream starts are never shown, so they must not
+            // take a slot in a limited page either. Raw access keeps them.
+            conditions.push(format!(
+                "kind <> {}",
+                cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
+            ));
         }
         let mut values: Vec<Value> = Vec::new();
         if let Some(group_id_hex) = &query.group_id_hex {
