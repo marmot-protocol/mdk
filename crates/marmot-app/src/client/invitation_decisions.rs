@@ -156,15 +156,16 @@ impl AppClient {
             return Ok(None);
         }
         let decision = store.record_invitation_decision(&chat, admission.generation, true)?;
-        self.note_local_invitation_decision();
+        self.send_invitation_decisions_next_turn();
         Ok(Some(decision))
     }
 
-    /// This device's user answered an invitation: its siblings get the
-    /// decision on the worker's next turn, through the same send a sibling
+    /// This device owes its siblings invitation decisions: its user answered
+    /// one, or branch selection withdrew the update that carried them. They
+    /// get them on the worker's next turn, through the same send a sibling
     /// Add's acceptance takes ([`Self::send_recorded_acceptances`]), not at
     /// the next maintenance pass (mdk#3566).
-    fn note_local_invitation_decision(&mut self) {
+    pub(super) fn send_invitation_decisions_next_turn(&mut self) {
         self.acceptances_recorded = true;
         self.invitation_decisions_changed = true;
     }
@@ -214,7 +215,7 @@ impl AppClient {
             admission.generation,
             declined,
         )?;
-        self.note_local_invitation_decision();
+        self.send_invitation_decisions_next_turn();
         Ok(Some(decision))
     }
 

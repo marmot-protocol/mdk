@@ -589,6 +589,15 @@ async fn siblings_exchange_small_state_through_the_device_group() {
         laptop_storage().unsent_invitation_decisions().unwrap(),
         [decision]
     );
+    // The answer it carried goes out again on the worker's next turn, as the
+    // answer first did, not at the next maintenance pass (mdk#3566).
+    assert!(devices.phone.drive_changed_invitation_decisions().await);
+    assert!(
+        phone_storage()
+            .unsent_invitation_decisions()
+            .unwrap()
+            .is_empty()
+    );
 
     // A withdrawn request owes a new one, on both.
     devices

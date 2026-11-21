@@ -338,6 +338,12 @@ impl AppClient {
         match kind {
             KIND_SMALL_STATE_UPDATE => {
                 storage.owe_all_small_state_items()?;
+                // An answered invitation it carried goes out again on the
+                // worker's next turn, as the answer first did: a sibling
+                // still waits for it (mdk#3566).
+                if !storage.unsent_invitation_decisions()?.is_empty() {
+                    self.send_invitation_decisions_next_turn();
+                }
             }
             KIND_SMALL_STATE_BROADCAST_REQUEST => storage.owe_small_state_broadcast_request()?,
             _ => {}

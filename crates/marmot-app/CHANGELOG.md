@@ -41,6 +41,9 @@
 
 - An account whose sign-out a device removal holds no longer retries maintenance every 15 s until the hold lifts.
   Maintenance, the invitation step and device-group due times share one check of whether passes run.
+- An invitation answer whose device-group update lost a fork between linked devices is sent again on the worker's
+  next turn, not at the next maintenance pass, so the other device shows it within seconds instead of after up to
+  15 s (mdk#3573).
 
 ## 0.18.0 - 2026-11-20
 
