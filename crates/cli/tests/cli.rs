@@ -7220,6 +7220,17 @@ fn daemon_socket_path_is_private() {
     assert_eq!(pid_mode, 0o600);
 }
 
+fn run_reset(home: &std::path::Path) -> Output {
+    cli_binary(env!("CARGO_BIN_EXE_wn"))
+        .env_remove("WN_SOCKET")
+        .env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
+        .arg("--home")
+        .arg(home)
+        .args(["--json", "reset", "--confirm"])
+        .output()
+        .expect("local wn reset should start")
+}
+
 #[test]
 fn daemon_refuses_reset_over_socket() {
     let home = tempfile::tempdir().expect("tempdir");
@@ -7264,15 +7275,7 @@ fn daemon_refuses_reset_over_socket() {
         std::fs::File::open(home.path().join(lock_name)).expect("open daemon coordination file"),
         std::fs::File::open(home.path()).expect("open daemon home"),
     );
-    let local_reset = || {
-        wn_without_relay(home.path())
-            .env_remove("WN_SOCKET")
-            .env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
-            .args(["reset", "--confirm"])
-            .output()
-            .expect("local wn reset should start")
-    };
-    let output = local_reset();
+    let output = run_reset(home.path());
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -7289,7 +7292,7 @@ fn daemon_refuses_reset_over_socket() {
 
     stop_owned_test_daemon(daemon);
 
-    let output = local_reset();
+    let output = run_reset(home.path());
     assert!(
         output.status.success(),
         "{}",
@@ -7297,11 +7300,21 @@ fn daemon_refuses_reset_over_socket() {
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("local reset success JSON");
     assert_eq!(value["result"]["deleted"], true);
-    let remaining: Vec<_> = std::fs::read_dir(home.path())
+    let remaining: BTreeSet<_> = std::fs::read_dir(home.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect();
-    assert_eq!(remaining, [std::ffi::OsString::from(lock_name)]);
+    assert_eq!(
+        remaining,
+        BTreeSet::from(
+            [
+                lock_name,
+                marmot_account::ROOT_MUTATION_LOCK_FILE,
+                marmot_account::CREDENTIAL_STORE_LOCK_FILE,
+            ]
+            .map(std::ffi::OsString::from)
+        )
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -7323,6 +7336,87 @@ fn daemon_refuses_reset_over_socket() {
             (root_before.dev(), root_before.ino())
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_preserves_writer_leases() {
+    use std::os::unix::fs::MetadataExt;
+
+    use marmot_account::{CREDENTIAL_STORE_LOCK_FILE, ROOT_MUTATION_LOCK_FILE};
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let vault = home.path().join("vaults").join("secondary");
+    let receipts = vault.join("receipts");
+    std::fs::create_dir_all(&receipts).unwrap();
+    let data = [home.path().join("unrelated-data"), receipts.join("receipt")];
+    for path in &data {
+        std::fs::write(path, b"local data").unwrap();
+    }
+
+    let locks = [
+        (
+            home.path().join(ROOT_MUTATION_LOCK_FILE),
+            "account mutation is already in progress",
+        ),
+        (
+            home.path().join(CREDENTIAL_STORE_LOCK_FILE),
+            "credential store is already in use",
+        ),
+        (
+            vault.join(CREDENTIAL_STORE_LOCK_FILE),
+            "credential store is already in use",
+        ),
+    ];
+    let original_files = locks.each_ref().map(|(path, _)| {
+        let lease = fs_private::try_acquire_private_exclusive_file_lease(path).unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        drop(lease);
+        file
+    });
+    let assert_same_inodes = || {
+        for ((path, _), original) in locks.iter().zip(&original_files) {
+            let before = original.metadata().unwrap();
+            let after = path.metadata().unwrap();
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        }
+    };
+
+    for (path, message) in &locks {
+        let lease = fs_private::try_acquire_private_exclusive_file_lease(path).unwrap();
+        let output = run_reset(home.path());
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            command_output_summary(&output)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["error"]["code"], "io_error");
+        assert_eq!(
+            value["error"]["message"],
+            format!("{message}: {}", path.display())
+        );
+        for path in &data {
+            assert_eq!(std::fs::read(path).unwrap(), b"local data");
+        }
+        assert_same_inodes();
+        drop(lease);
+    }
+
+    let output = run_reset(home.path());
+    assert!(
+        output.status.success(),
+        "{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["result"]["deleted"], true);
+    for path in &data {
+        assert!(!path.try_exists().unwrap());
+    }
+    assert!(!receipts.try_exists().unwrap());
+    assert_same_inodes();
 }
 
 #[test]

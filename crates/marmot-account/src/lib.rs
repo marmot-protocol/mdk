@@ -25,11 +25,13 @@ pub use error::{AccountHomeError, AccountHomeResult};
 pub use home::{
     AccountHome, AccountSetupKind, AccountSetupPhase, AccountSetupState, AccountSummary,
     EXTERNAL_SQLCIPHER_SECRET_FILE, ExternalSecretMode, Nip46Removal, Nip46SessionRecord,
-    Nip46SessionWrite, NostrAccountImport,
+    Nip46SessionWrite, NostrAccountImport, ROOT_MUTATION_LOCK_FILE,
 };
 pub use location::IosOptions;
 pub use ownership::{
     AcquiredSecret, SecretClaimMode, SecretCredential, SecretCredentialKind, SecretOrigin,
     SecretReleaseMode, SecretReleaseOutcome,
 };
-pub use secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
+pub use secret_store::{
+    AccountSecretStore, CREDENTIAL_STORE_LOCK_FILE, KeychainSecretStore, LocalFileSecretStore,
+};

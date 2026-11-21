@@ -50,8 +50,8 @@ const WIPE_CLEANUP_FILE: &str = ".wipe-cleanup.json";
 const CREDENTIAL_OWNERS_FILE: &str = ".credential-ownership.json";
 const HOME_IDENTITY_FILE: &str = ".account-home-id.json";
 const MAX_WIPE_CLEANUP_BYTES: u64 = 16 * 1024;
-#[cfg(any(unix, windows))]
-const ROOT_MUTATION_LOCK_FILE: &str = ".account-mutation.lock";
+/// Stable root lease filename for account mutations. Never unlink while the root is in use.
+pub const ROOT_MUTATION_LOCK_FILE: &str = ".account-mutation.lock";
 
 enum SigningKeyRemoval {
     Delete,

@@ -22,6 +22,9 @@ use crate::ownership::{
     SecretReleaseOutcome,
 };
 
+/// Stable vault lease filename. Never unlink while the vault is in use.
+pub const CREDENTIAL_STORE_LOCK_FILE: &str = ".credential-store.lock";
+
 #[derive(Serialize, Deserialize)]
 struct StoredAccountSecret {
     #[serde(default = "stored_secret_version")]
@@ -234,7 +237,7 @@ impl LocalFileSecretStore {
         {
             let guard = FileVaultGuard {
                 _lease: fs_private::try_acquire_private_exclusive_file_lease(
-                    &root.join(".credential-store.lock"),
+                    &root.join(CREDENTIAL_STORE_LOCK_FILE),
                 )?,
             };
             self.storage_root()?;

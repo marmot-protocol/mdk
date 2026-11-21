@@ -566,6 +566,9 @@ async fn execute_inner(
 ) -> Result<CommandOutput, WnError> {
     let settlement_quiescence_ms = wn_dev_settlement_quiescence_ms()?;
     let home = resolve_home(cli.home.clone());
+    if let Command::Reset { confirm } = cli.command {
+        return reset_command(&home, confirm);
+    }
     let account_flag = cli.account.clone();
     let command = cli.command.clone();
     if let Command::Stream { command } = &command
@@ -785,7 +788,7 @@ async fn execute_inner(
             commands::sync::sync_command(&app()?, account).await
         }
         Command::RelayStats => commands::relay_stats::relay_stats_command(&app()?).await,
-        Command::Reset { confirm } => reset_command(&home, confirm),
+        Command::Reset { .. } => unreachable!("reset runs without opening the account home"),
     }
 }
 
@@ -980,18 +983,8 @@ fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, WnError> {
     let root_exists = home.try_exists()?;
     if root_exists {
         let _root_owner = marmot_app::MarmotRootRuntimeLease::try_acquire(home)?;
-        for entry in std::fs::read_dir(home)? {
-            let entry = entry?;
-            // Unlinking the lock file would let another runtime lock a new inode.
-            if entry.file_name() == marmot_app::MARMOT_ROOT_RUNTIME_LOCK_FILE {
-                continue;
-            }
-            if entry.file_type()?.is_dir() {
-                std::fs::remove_dir_all(entry.path())?;
-            } else {
-                std::fs::remove_file(entry.path())?;
-            }
-        }
+        #[cfg(any(unix, windows))]
+        reset_data(home)?;
     }
     Ok(CommandOutput {
         plain: format!("deleted local data in {}", home.display()),
@@ -999,6 +992,88 @@ fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, WnError> {
             "deleted": true,
             "home": home,
         }),
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn reset_data(home: &Path) -> std::io::Result<()> {
+    use marmot_account::{CREDENTIAL_STORE_LOCK_FILE, ROOT_MUTATION_LOCK_FILE};
+
+    let _mutation = acquire_reset_lease(
+        &home.join(ROOT_MUTATION_LOCK_FILE),
+        "account mutation is already in progress",
+    )?;
+    let _root_vault = acquire_reset_lease(
+        &home.join(CREDENTIAL_STORE_LOCK_FILE),
+        "credential store is already in use",
+    )?;
+    let mut leases = Vec::new();
+    let mut removals = Vec::new();
+    plan_reset(home, home, &mut leases, &mut removals)?;
+
+    // Delete only planned entries. A directory may have gained a new lease
+    // file since the scan; remove_dir must not unlink it.
+    for (path, file_type) in removals {
+        if file_type.is_dir() {
+            std::fs::remove_dir(path)?;
+        } else {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn plan_reset(
+    directory: &Path,
+    home: &Path,
+    leases: &mut Vec<fs_private::PrivateExclusiveFileLease>,
+    removals: &mut Vec<(PathBuf, std::fs::FileType)>,
+) -> std::io::Result<bool> {
+    use marmot_account::{CREDENTIAL_STORE_LOCK_FILE, ROOT_MUTATION_LOCK_FILE};
+    use marmot_app::MARMOT_ROOT_RUNTIME_LOCK_FILE;
+
+    // Keep every lease and its ancestors. Acquire all leases before deleting
+    // anything so contention in a nested vault cannot leave a partial reset.
+    let mut keep_directory = false;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let path = entry.path();
+        let busy = match name.to_str() {
+            Some(MARMOT_ROOT_RUNTIME_LOCK_FILE) => Some("marmot runtime root is already in use"),
+            Some(ROOT_MUTATION_LOCK_FILE) => Some("account mutation is already in progress"),
+            Some(CREDENTIAL_STORE_LOCK_FILE) => Some("credential store is already in use"),
+            _ => None,
+        };
+        if let Some(busy) = busy {
+            if directory != home {
+                leases.push(acquire_reset_lease(&path, busy)?);
+            }
+            keep_directory = true;
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && plan_reset(&path, home, leases, removals)? {
+            keep_directory = true;
+        } else {
+            removals.push((path, file_type));
+        }
+    }
+    Ok(keep_directory)
+}
+
+#[cfg(any(unix, windows))]
+fn acquire_reset_lease(
+    path: &Path,
+    busy: &str,
+) -> std::io::Result<fs_private::PrivateExclusiveFileLease> {
+    fs_private::try_acquire_private_exclusive_file_lease(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            std::io::Error::new(error.kind(), format!("{busy}: {}", path.display()))
+        } else {
+            error
+        }
     })
 }
 
