@@ -284,8 +284,8 @@ link-local endpoints. Local insecure trust is intended only for tests.
 
 ### Host secret-store identity
 
-`MarmotSecretStore` requires `cleanup_namespace`, `acquire_secret`, `load_secret`, and
-`reconcile_cleanup`. See the [shared secret-store contract](../marmot-uniffi/README.md#host-secret-store-identity)
+`MarmotSecretStore` requires every callback except `destroy`.
+See the [shared secret-store contract](../marmot-uniffi/README.md#host-secret-store-identity)
 for namespace identity, receipt ownership, and cleanup policy. Older vtables with unowned write and delete
 callbacks do not match this layout.
 
