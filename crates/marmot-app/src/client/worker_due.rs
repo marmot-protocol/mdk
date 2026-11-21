@@ -294,15 +294,16 @@ impl AppClient {
     /// `held` is each live group whose self-update an epoch gap holds, with
     /// the second that hold ends: a held device group sends no heartbeat
     /// until then.
-    fn device_group_due(
+    pub(crate) fn device_group_due(
         &self,
         held: &[(cgka_traits::GroupId, cgka_traits::Timestamp)],
     ) -> Result<DeviceGroupDue, super::AppError> {
         let mut due = DeviceGroupDue::default();
+        // Where maintenance runs no pass, nothing it owes can be done, so
+        // none of it holds the 15 s retry.
         if !self.app.device_groups_enabled()
             || self.runtime.maintenance_is_paused()
-            || self.device_unlinked
-            || self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+            || self.maintenance_passes()? != super::MaintenancePasses::Run
         {
             return Ok(due);
         }
@@ -373,8 +374,8 @@ impl AppClient {
 
 /// What [`AppClient::device_group_due`] found: the earliest time a device-
 /// group pass has work, and whether one owes work with no time.
-#[derive(Default)]
-struct DeviceGroupDue {
-    at: Option<u64>,
-    owed: bool,
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeviceGroupDue {
+    pub(crate) at: Option<u64>,
+    pub(crate) owed: bool,
 }

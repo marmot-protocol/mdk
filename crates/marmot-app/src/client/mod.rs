@@ -1343,6 +1343,20 @@ impl LaneStep {
     }
 }
 
+/// Whether maintenance runs its passes ([`AppClient::maintenance_passes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenancePasses {
+    Run,
+    /// The device group removed this device: it does no more work.
+    Unlinked,
+    /// A removal holds this device's sign-out: it sends only what the
+    /// sign-out has left.
+    SignOutHeld,
+    /// A wake-collection runtime (`CursorPersistence::Frozen`) leaves the
+    /// passes to an advancing one.
+    Frozen,
+}
+
 impl AppClient {
     pub(crate) fn lane_step(&self, operation: crate::RuntimePerformanceOperation) -> LaneStep {
         LaneStep(
@@ -1517,28 +1531,46 @@ impl AppClient {
         self.runtime.resume_maintenance();
     }
 
+    /// Whether maintenance runs its passes here, or why not. The one place
+    /// that decides it: `run_due_maintenance`, the worker's invitation step
+    /// and `maintenance_due`'s device-group times all read it (mdk#3265).
+    pub(crate) fn maintenance_passes(&self) -> Result<MaintenancePasses, AppError> {
+        Ok(if self.device_unlinked {
+            MaintenancePasses::Unlinked
+        } else if self.hold_removed_sign_out_publishing()? {
+            MaintenancePasses::SignOutHeld
+        } else if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
+            MaintenancePasses::Frozen
+        } else {
+            MaintenancePasses::Run
+        })
+    }
+
     pub async fn run_due_maintenance(&mut self) -> Result<crate::MaintenanceRunSummary, AppError> {
-        // An unlinked account does no more work here (mdk#2628 D67).
-        if self.device_unlinked {
-            return Err(AppError::AccountHome(
-                marmot_account::AccountHomeError::AccountUnlinked(self.state.label.clone()),
-            ));
-        }
-        // A device its device group removed while it signs out sends only
-        // what its sign-out has left (mdk#2628 D67).
-        if self.hold_removed_sign_out_publishing()? {
-            let summary = self
-                .runtime
-                .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
-            return Ok(maintenance_run_summary_from_account(summary));
-        }
-        if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
-            self.runtime.sweep_expired_key_package_private_material()?;
-            self.discard_expired_sibling_key_packages();
-            let summary = self
-                .runtime
-                .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
-            return Ok(maintenance_run_summary_from_account(summary));
+        match self.maintenance_passes()? {
+            MaintenancePasses::Run => {}
+            // An unlinked account does no more work here (mdk#2628 D67).
+            MaintenancePasses::Unlinked => {
+                return Err(AppError::AccountHome(
+                    marmot_account::AccountHomeError::AccountUnlinked(self.state.label.clone()),
+                ));
+            }
+            // A device its device group removed while it signs out sends
+            // only what its sign-out has left (mdk#2628 D67).
+            MaintenancePasses::SignOutHeld => {
+                let summary = self
+                    .runtime
+                    .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
+                return Ok(maintenance_run_summary_from_account(summary));
+            }
+            MaintenancePasses::Frozen => {
+                self.runtime.sweep_expired_key_package_private_material()?;
+                self.discard_expired_sibling_key_packages();
+                let summary = self
+                    .runtime
+                    .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
+                return Ok(maintenance_run_summary_from_account(summary));
+            }
         }
         let key_package_before = self.key_package_catch_up_state();
         // Drain edges between ticks too. A new consent generation establishes a

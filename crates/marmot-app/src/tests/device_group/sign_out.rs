@@ -392,6 +392,41 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
     assert!(laptop.device_unlinked());
 }
 
+/// A device a removal holds while it signs out runs no maintenance pass, so
+/// its device-group work holds no 15 s retry, even owed invitation work
+/// (mdk#3265). The device-group times kept their own copy of maintenance's
+/// early returns, without this one, and retried every 15 s until the hold
+/// lifted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_sign_out_owes_no_device_group_maintenance() {
+    let (devices, _group, _chats) = tagging_devices_with_chats::<1>().await;
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        laptop_app,
+        mut laptop,
+        ..
+    } = devices;
+    let mut laptop_cursor = published_count(&relay);
+    let account_id_hex = account_id_hex(&laptop_app);
+    let _laptop_signing_out = laptop_app.begin_signing_out(&account_id_hex);
+    phone
+        .remove_linked_device(&hex::encode(slot_of(&laptop)))
+        .await
+        .unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    assert!(laptop.hold_removed_sign_out_publishing().unwrap());
+    laptop.invitation_decisions_changed = true;
+    laptop.device_group_work_changed = true;
+    assert_eq!(
+        laptop.device_group_due(&[]).unwrap(),
+        Default::default(),
+        "a held sign-out owes no device-group maintenance"
+    );
+}
+
 /// A sibling's `leaving` entry without its tag signature key is never
 /// decided: no device may remove an entry that has none. The phone sets the
 /// laptop's entry, whose first commit has not landed, to `leaving`, as a

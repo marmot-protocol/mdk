@@ -4898,34 +4898,11 @@ async fn a_linked_device_shows_an_answered_invitation_within_seconds() {
 
     // The relay between the devices: what either publishes from here on
     // reaches both, as it would live.
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let forwarder = tokio::spawn({
-        let relay = relay.clone();
-        let apps = [phone_app.clone(), laptop_app.clone()];
-        let stop = stop.clone();
-        async move {
-            // A short pause per look leaves the CPU to the workers measured.
-            let mut look = tokio::time::interval(Duration::from_millis(10));
-            let mut cursor = relayed_from;
-            while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                let events = relay.published_events.lock().unwrap()[cursor..].to_vec();
-                cursor += events.len();
-                for event in events {
-                    for app in &apps {
-                        let _ = app
-                            .relay_plane
-                            .handle_relay_event_for_test(NostrRelayEvent {
-                                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
-                                subscription_id: Some("linked-devices".to_owned()),
-                                event: event.clone(),
-                            })
-                            .await;
-                    }
-                }
-                look.tick().await;
-            }
-        }
-    });
+    let (stop, forwarder) = spawn_relay_forwarder(
+        &relay,
+        vec![phone_app.clone(), laptop_app.clone()],
+        relayed_from,
+    );
 
     // What the laptop's user sees: its chat list.
     let mut laptop_chats = laptop_runtime
@@ -5019,35 +4996,12 @@ async fn a_frozen_runtime_leaves_a_siblings_decline_owed() {
     for runtime in [&phone_runtime, &frozen_runtime] {
         runtime.reconcile_accounts().await.unwrap();
     }
-    // The relay between the devices, as in
-    // `a_linked_device_shows_an_answered_invitation_within_seconds`.
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let forwarder = tokio::spawn({
-        let relay = relay.clone();
-        let apps = [phone_app.clone(), frozen.clone()];
-        let stop = stop.clone();
-        async move {
-            let mut look = tokio::time::interval(Duration::from_millis(10));
-            let mut cursor = relayed_from;
-            while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                let events = relay.published_events.lock().unwrap()[cursor..].to_vec();
-                cursor += events.len();
-                for event in events {
-                    for app in &apps {
-                        let _ = app
-                            .relay_plane
-                            .handle_relay_event_for_test(NostrRelayEvent {
-                                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
-                                subscription_id: Some("linked-devices".to_owned()),
-                                event: event.clone(),
-                            })
-                            .await;
-                    }
-                }
-                look.tick().await;
-            }
-        }
-    });
+    // The relay between the devices.
+    let (stop, forwarder) = spawn_relay_forwarder(
+        &relay,
+        vec![phone_app.clone(), frozen.clone()],
+        relayed_from,
+    );
 
     phone_runtime
         .decline_group_invite("alice", &chat)
@@ -5061,12 +5015,13 @@ async fn a_frozen_runtime_leaves_a_siblings_decline_owed() {
         .generation;
     let storage = account.app_storage();
     let merged = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut look = tokio::time::interval(Duration::from_millis(10));
         while storage
             .invitation_decision(&chat_hex, &generation)
             .unwrap()
             .is_none_or(|held| !held.declined)
         {
-            tokio::task::yield_now().await;
+            look.tick().await;
         }
     })
     .await;
@@ -5091,4 +5046,44 @@ async fn a_frozen_runtime_leaves_a_siblings_decline_owed() {
             .any(|work| work.decision.group_id_hex == chat_hex && work.decline_owed),
         "the decline stays owed for an advancing runtime"
     );
+}
+
+/// Relays what `relay` holds from index `from` on to each of `apps`, as a
+/// live relay would, their own events included, until the returned flag is
+/// set. Each look waits 10 ms, leaving the CPU to the workers under test.
+fn spawn_relay_forwarder(
+    relay: &Arc<ScriptedPushRelayClient>,
+    apps: Vec<MarmotApp>,
+    from: usize,
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let forwarder = tokio::spawn({
+        let relay = relay.clone();
+        let stop = stop.clone();
+        async move {
+            let mut look = tokio::time::interval(Duration::from_millis(10));
+            let mut cursor = from;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let events = relay.published_events.lock().unwrap()[cursor..].to_vec();
+                cursor += events.len();
+                for event in events {
+                    for app in &apps {
+                        let _ = app
+                            .relay_plane
+                            .handle_relay_event_for_test(NostrRelayEvent {
+                                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                                subscription_id: Some("linked-devices".to_owned()),
+                                event: event.clone(),
+                            })
+                            .await;
+                    }
+                }
+                look.tick().await;
+            }
+        }
+    });
+    (stop, forwarder)
 }

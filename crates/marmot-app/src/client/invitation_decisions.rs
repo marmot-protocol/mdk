@@ -437,16 +437,12 @@ impl AppClient {
     /// at the next maintenance pass (mdk#3566). What is left owed retries
     /// with maintenance. Returns whether it ran.
     ///
-    /// Not where `run_due_maintenance` runs no pass either: with maintenance
-    /// paused, in a wake-collection runtime (`CursorPersistence::Frozen`),
-    /// on an unlinked device, or while a removal holds a sign-out's
-    /// publishing. The flag stays set and the work stays stored, for the
-    /// next advancing runtime's maintenance.
+    /// Not while maintenance is paused or runs no pass
+    /// ([`Self::maintenance_passes`]): the flag stays set and the work
+    /// stays stored, for the next run that does.
     pub(crate) async fn drive_changed_invitation_decisions(&mut self) -> bool {
         if self.runtime.maintenance_is_paused()
-            || self.app.cursor_persistence() == crate::CursorPersistence::Frozen
-            || self.device_unlinked
-            || self.hold_removed_sign_out_publishing().unwrap_or(true)
+            || !matches!(self.maintenance_passes(), Ok(super::MaintenancePasses::Run))
             || !std::mem::take(&mut self.invitation_decisions_changed)
         {
             return false;

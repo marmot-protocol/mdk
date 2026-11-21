@@ -29,6 +29,11 @@
   a locally deleted chat like kind 9, advance the sender's read position like a chat send, and carry mention
   identities in conversation presentation. See `docs/marmot-architecture/overview/thread-messages.md`.
 
+### Fixed
+
+- An account whose sign-out a device removal holds no longer retries maintenance every 15 s until the hold lifts.
+  Maintenance, the invitation step and device-group due times share one check of whether passes run.
+
 ## 0.18.0 - 2026-11-20
 
 ### Breaking changes
