@@ -9,7 +9,6 @@ use std::time::Duration;
 use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED, GROUP_SYSTEM_TYPE_MEMBER_ADDED,
     GROUP_SYSTEM_TYPE_MEMBER_LEFT, GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG,
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
 };
 use cgka_traits::{GroupId, storage::StorageError};
 use serde::{Deserialize, Serialize};
@@ -1963,17 +1962,13 @@ fn messages_recovery_updates(
 }
 
 /// Rebuild a `RuntimeMessageUpdate` from a stored projection row. Returns
-/// `None` when the row carries an undecodable group id (it cannot be routed)
-/// or is a retired agent stream start, which the live path drops too.
+/// `None` when the row carries an undecodable group id (it cannot be routed).
 pub(crate) fn received_message_update_from_record(
     account_id_hex: &str,
     account_label: &str,
     record: AppMessageRecord,
     display_names: &HashMap<String, String>,
 ) -> Option<RuntimeMessageUpdate> {
-    if record.kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
-        return None;
-    }
     let group_id = GroupId::new(hex::decode(&record.group_id_hex).ok()?);
     let sender_display_name = display_names.get(&record.sender).cloned();
     let message = ReceivedMessage {

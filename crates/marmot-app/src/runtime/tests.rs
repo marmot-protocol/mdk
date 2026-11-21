@@ -2932,22 +2932,6 @@ fn recovery_record_maps_chat_message_to_message_update() {
 }
 
 #[test]
-fn recovery_record_drops_retired_agent_stream_start() {
-    let record = message_record(
-        &"22".repeat(32),
-        &"cd".repeat(32),
-        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-    );
-    let update = received_message_update_from_record(
-        "ac".repeat(32).as_str(),
-        "alice",
-        record,
-        &HashMap::new(),
-    );
-    assert!(update.is_none());
-}
-
-#[test]
 fn recovery_record_drops_undecodable_group_id() {
     let record = message_record(&"33".repeat(32), "not-hex", 9);
     let update = received_message_update_from_record(
