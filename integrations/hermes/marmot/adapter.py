@@ -1,8 +1,7 @@
 """Hermes platform plugin for the local Marmot agent connector.
 
 The adapter is intentionally thin: Hermes owns agent execution and tools, while
-``wn-agent`` owns Marmot account state, MLS group state, durable sends, and QUIC
-preview streams.
+``wn-agent`` owns Marmot account state, MLS group state, and durable sends.
 """
 
 from __future__ import annotations
@@ -37,7 +36,6 @@ from .agent_control import (
     _DEFAULT_READ_TIMEOUT,
     _normalize_hex,
     _normalize_media_reply,
-    _normalize_stream_capability,
     bounded_wait,
 )
 from .ambient_context import AmbientContextStore
@@ -102,7 +100,6 @@ def _home_channel_platform_name(home_channel: Any) -> Optional[str]:
 
 
 DEFAULT_SOCKET_HOME = "~/.marmot"
-STREAM_MESSAGE_PREFIX = "marmot-stream:"
 TOOL_PROGRESS_MESSAGE_PREFIX = "marmot-tool-progress:"
 _PRESENCE_OWNER: ContextVar[Optional[object]] = ContextVar("marmot_presence_owner", default=None)
 
@@ -127,9 +124,6 @@ SEND_MEDIA_RETRY_BACKOFF_S = (0.1, 0.3)
 # Best-effort current-name lookup for Hermes chat/session display. Covers account
 # resolution plus one group_info control request; fallback is deterministic.
 CHAT_INFO_TIMEOUT_S = 2.0
-STREAM_BEGIN_RETRY_BACKOFF_S = (0.1, 0.3)
-STREAM_FINALIZE_RETRY_BACKOFF_S = (0.1, 0.3)
-STREAM_PREVIEW_RETRY_BACKOFF_S = (0.1, 0.3)
 # Hermes albums and the native Telegram/Discord/Slack batch APIs share a
 # ten-item ceiling. Keeping one Marmot album within that bound also limits the
 # encrypted blobs an all-or-error upload can orphan before publication fails.
@@ -140,7 +134,6 @@ MAX_OUTBOUND_MEDIA_ATTACHMENTS = 10
 # beginning the upload.
 MAX_OUTBOUND_MEDIA_FILE_BYTES = 512 * 1024 * 1024 - 16
 MAX_OUTBOUND_MEDIA_BATCH_BYTES = 512 * 1024 * 1024 - 16
-DEFAULT_STREAMING_CURSOR = "\u2589"
 MAX_TOOL_PROGRESS_MESSAGES = 512
 DEFAULT_RECONNECT_DELAY_MS = 1000
 DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000
@@ -252,10 +245,6 @@ LEGACY_TOOL_PROGRESS_RE = re.compile(
     re.DOTALL,
 )
 
-
-
-class NonAppendOnlyUpdate(RuntimeError):
-    """Raised when a gateway replacement cannot be represented as an append."""
 
 
 class _ResyncRequired(RuntimeError):
@@ -1029,32 +1018,6 @@ def build_profile_prompt(suggested_name: Optional[str]) -> str:
     return PROFILE_PROMPT_NO_NAME
 
 
-class AppendOnlyTextState:
-    """Tracks the latest visible stream text and returns safe suffix deltas."""
-
-    def __init__(self):
-        self.text = ""
-
-    def pending_suffix_for(self, next_text: str) -> str:
-        """Validate that ``next_text`` extends the current text and return the
-        append-only suffix WITHOUT advancing ``self.text``. The caller commits
-        the advance with :meth:`commit` only after the remote append succeeds, so
-        a failed append can be retried with the same text without diverging from
-        the connector's transcript (mirrors live.ts ``update()``)."""
-        next_text = str(next_text or "")
-        if not next_text.startswith(self.text):
-            raise NonAppendOnlyUpdate("Marmot stream update is not append-only")
-        return next_text[len(self.text):]
-
-    def commit(self, next_text: str) -> None:
-        self.text = str(next_text or "")
-
-    def suffix_for(self, next_text: str) -> str:
-        suffix = self.pending_suffix_for(next_text)
-        self.commit(next_text)
-        return suffix
-
-
 class ProfileNameOnboardingStore:
     """Tiny local state file for the one-time public profile-name consent flow."""
 
@@ -1224,198 +1187,6 @@ class ProfileLookupGate:
         self._failures[key] = (attempts, self._now() + delay)
         return "indeterminate"
 
-
-
-class MarmotLiveStream:
-    """Client-side state for one append-only Marmot live-preview stream."""
-
-    def __init__(
-        self,
-        *,
-        client: MarmotAgentControlClient,
-        account_id_hex: str,
-        group_id_hex: str,
-        stream_id_hex: str,
-        stream_capability: str,
-        start_message_id_hex: str,
-        parent_message_id_hex: Optional[str],
-    ):
-        self.client = client
-        self.account_id_hex = account_id_hex
-        self.group_id_hex = group_id_hex
-        self.stream_id_hex = stream_id_hex
-        self.stream_capability = stream_capability
-        self.start_message_id_hex = start_message_id_hex
-        self.parent_message_id_hex = _optional_hex(
-            parent_message_id_hex,
-            "parent_message_id_hex",
-        )
-        self.text = AppendOnlyTextState()
-        self.finalize_idempotency_key = uuid.uuid4().hex
-        self.finalized = False
-        self._mutation_lock = asyncio.Lock()
-        self._pending_preview_mutation: Optional[Tuple[str, str, str]] = None
-
-    async def _retry_preview_mutation(
-        self,
-        operation: str,
-        payload: str,
-        mutation: Callable[[str], Awaitable[Dict[str, Any]]],
-    ) -> None:
-        pending = self._pending_preview_mutation
-        if pending is not None and pending[:2] != (operation, payload):
-            raise AgentControlError(
-                "an ambiguous preview mutation must be reconciled first",
-                code="preview_mutation_pending",
-                retryable=True,
-            )
-        key = pending[2] if pending is not None else uuid.uuid4().hex
-        self._pending_preview_mutation = (operation, payload, key)
-        for attempt in range(len(STREAM_PREVIEW_RETRY_BACKOFF_S) + 1):
-            try:
-                await mutation(key)
-                self._pending_preview_mutation = None
-                return
-            except Exception as exc:
-                if not is_retryable(exc):
-                    self._pending_preview_mutation = None
-                    raise
-                if attempt >= len(STREAM_PREVIEW_RETRY_BACKOFF_S):
-                    raise
-                await asyncio.sleep(STREAM_PREVIEW_RETRY_BACKOFF_S[attempt])
-
-    @classmethod
-    async def begin(
-        cls,
-        *,
-        client: MarmotAgentControlClient,
-        account_id_hex: str,
-        group_id_hex: str,
-        quic_candidates: Iterable[str],
-        stream_id_hex: Optional[str] = None,
-        parent_message_id_hex: Optional[str] = None,
-    ) -> "MarmotLiveStream":
-        begin_options: Dict[str, Any] = {
-            "stream_id_hex": stream_id_hex,
-            "quic_candidates": quic_candidates,
-        }
-        if parent_message_id_hex is not None:
-            begin_options["parent_message_id_hex"] = parent_message_id_hex
-        begin_request_id = uuid.uuid4().hex
-        response: Optional[Dict[str, Any]] = None
-        for attempt in range(len(STREAM_BEGIN_RETRY_BACKOFF_S) + 1):
-            try:
-                response = await client.stream_begin(
-                    account_id_hex,
-                    group_id_hex,
-                    request_id=begin_request_id,
-                    **begin_options,
-                )
-                break
-            except Exception as exc:
-                if attempt < len(STREAM_BEGIN_RETRY_BACKOFF_S) and is_retryable(exc):
-                    await asyncio.sleep(STREAM_BEGIN_RETRY_BACKOFF_S[attempt])
-                    continue
-                raise
-        if response is None:
-            raise AgentControlError(
-                "Marmot stream begin failed without a response",
-                code="unexpected_stream_begin_response",
-                retryable=True,
-            )
-        return cls(
-            client=client,
-            account_id_hex=account_id_hex,
-            group_id_hex=group_id_hex,
-            stream_id_hex=response["stream_id_hex"],
-            stream_capability=_normalize_stream_capability(response["stream_capability"]),
-            start_message_id_hex=response["start_message_id_hex"],
-            parent_message_id_hex=parent_message_id_hex,
-        )
-
-    async def append_replacement(self, next_text: str) -> None:
-        async with self._mutation_lock:
-            await self._append_replacement_locked(next_text)
-
-    async def _append_replacement_locked(self, next_text: str) -> None:
-        next_text = str(next_text or "")
-        suffix = self.text.pending_suffix_for(next_text)
-        if not suffix:
-            return
-        # Commit local append-only state only AFTER the remote append
-        # succeeds, so a failed append leaves the stream consistent and the same
-        # text re-appendable like the OpenClaw preview adapter.
-        await self._retry_preview_mutation(
-            "append",
-            suffix,
-            lambda key: self.client.stream_append(
-                self.stream_id_hex, self.stream_capability, suffix, idempotency_key=key
-            )
-        )
-        self.text.commit(next_text)
-
-    async def status(self, status: str) -> None:
-        async with self._mutation_lock:
-            await self._retry_preview_mutation(
-                "status",
-                status,
-                lambda key: self.client.stream_status(
-                    self.stream_id_hex, self.stream_capability, status, idempotency_key=key
-                )
-            )
-
-    async def progress(self, text: str) -> None:
-        async with self._mutation_lock:
-            await self._retry_preview_mutation(
-                "progress",
-                text,
-                lambda key: self.client.stream_progress(
-                    self.stream_id_hex, self.stream_capability, text, idempotency_key=key
-                ),
-            )
-
-    async def finalize(self, final_text: str) -> Dict[str, Any]:
-        async with self._mutation_lock:
-            return await self._finalize_locked(final_text)
-
-    async def _finalize_locked(self, final_text: str) -> Dict[str, Any]:
-        await self._append_replacement_locked(final_text)
-        response: Optional[Dict[str, Any]] = None
-        for attempt in range(len(STREAM_FINALIZE_RETRY_BACKOFF_S) + 1):
-            try:
-                response = await self.client.stream_finish(
-                    self.stream_id_hex,
-                    self.stream_capability,
-                    final_text,
-                    idempotency_key=self.finalize_idempotency_key,
-                )
-                break
-            except Exception as exc:
-                if attempt < len(STREAM_FINALIZE_RETRY_BACKOFF_S) and is_retryable(exc):
-                    logger.debug(
-                        "Marmot stream_finalize failed; retrying (attempt %d): %s",
-                        attempt + 1,
-                        exc,
-                    )
-                    await asyncio.sleep(STREAM_FINALIZE_RETRY_BACKOFF_S[attempt])
-                    continue
-                raise
-        if response is None:
-            raise AgentControlError(
-                "Marmot stream finalize failed without a response",
-                code="unexpected_stream_finalize_response",
-                retryable=True,
-            )
-        self.finalized = True
-        return response
-
-    async def cancel(self, reason: Optional[str] = None) -> None:
-        if not self.finalized:
-            await self.client.stream_cancel(
-                self.stream_id_hex,
-                self.stream_capability,
-                reason,
-            )
 
 
 PRESENCE_REACTIONS = {
@@ -1659,10 +1430,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             _first_config_value(extra, "group_id_hex", "group", env="MARMOT_GROUP_ID_HEX"),
             "MARMOT_GROUP_ID_HEX",
         )
-        self.quic_candidates = resolve_quic_candidates(extra)
-        if extra.get("stream_chunk_bytes") or os.getenv("MARMOT_STREAM_CHUNK_BYTES"):
-            logger.warning("Marmot stream_chunk_bytes is ignored; wn-agent chunks live previews")
-        self.streaming_cursor = str(extra.get("streaming_cursor") or os.getenv("MARMOT_STREAMING_CURSOR") or DEFAULT_STREAMING_CURSOR)
         self.debounce_ms = resolve_debounce_ms(extra)
         self.group_activation = resolve_group_activation(extra)
         # This consent feature requires an explicit boolean opt-in.
@@ -1737,9 +1504,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._inbound_queue = KeyedAsyncQueue(
             int(extra.get("inbound_queue_max_depth") or DEFAULT_INBOUND_QUEUE_MAX_DEPTH)
         )
-        self._active_streams: Dict[str, MarmotLiveStream] = {}
-        self._draft_streams: Dict[tuple[str, int], MarmotLiveStream] = {}
-        self._last_chat_stream: Dict[str, MarmotLiveStream] = {}
         self._tool_progress_events: OrderedDict[str, set[str]] = OrderedDict()
         self._tool_progress_replies: Dict[str, Optional[str]] = {}
         self._presence = PresenceReactions(self, extra)
@@ -2099,7 +1863,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         await self._inbound_queue.cancel_all()
         await self._retry_inbound_dispatch_dispositions()
         await self._retry_ambient_outcomes()
-        await self._cancel_all_streams("adapter disconnect")
         self._last_inbound_message_ids.clear()
         self._activation_cache.clear()
         self._tool_progress_events.clear()
@@ -2148,9 +1911,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 # unthreaded; invalid destination/account ids remain errors.
                 logger.debug("Marmot approval confirmation dropping invalid reply anchor")
                 reply_to = None
-        visible_content, is_preview = self._split_stream_preview(content)
-
-        tool_events = _tool_events_from_progress_text(visible_content)
+        tool_events = _tool_events_from_progress_text(content)
         if tool_events:
             return await self._send_tool_progress_events(
                 chat_id,
@@ -2158,68 +1919,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 reply_to_message_id_hex=_optional_hex(reply_to),
             )
 
-        if _delivery_routes_to_commentary_activity(metadata) and not is_preview:
+        if _delivery_routes_to_commentary_activity(metadata):
             return await self._send_commentary_activity(
                 chat_id,
-                visible_content,
+                content,
                 reply_to=reply_to,
                 metadata=metadata,
             )
 
-        if is_preview:
-            if not self.quic_candidates:
-                return SendResult(success=False, error="Marmot live preview requires MARMOT_QUIC_CANDIDATES")
-            try:
-                await self._cancel_other_chat_streams(chat_id, reason="superseded by newer preview")
-                stream = await self._begin_live_stream(
-                    chat_id,
-                    parent_message_id_hex=_optional_hex(reply_to),
-                )
-                await stream.append_replacement(visible_content)
-                message_id = _stream_message_id(stream.stream_id_hex)
-                self._active_streams[message_id] = stream
-                self._last_chat_stream[chat_id] = stream
-                return SendResult(success=True, message_id=message_id)
-            except Exception as exc:
-                logger.debug("Marmot live-preview first send failed: %s", exc)
-                return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
-
-        stream = self._last_chat_stream.get(chat_id)
-        if stream is not None and not stream.finalized:
-            message_id = _stream_message_id(stream.stream_id_hex)
-            try:
-                # The final text is authoritative. Finalize the live preview only
-                # when the final is an exact append-only extension of the streamed
-                # text; otherwise drop the preview and send the final verbatim.
-                return await self._finalize_active_stream(
-                    chat_id,
-                    stream,
-                    visible_content,
-                    message_id=message_id,
-                )
-            except NonAppendOnlyUpdate:
-                return await self._abandon_preview_and_send_final(
-                    chat_id,
-                    stream,
-                    visible_content,
-                    message_id=message_id,
-                    reason="final text was not append-only",
-                    reply_to_message_id_hex=_optional_hex(reply_to),
-                )
-            except Exception as exc:
-                logger.debug("Marmot live-preview finalize failed: %s", exc)
-                return await self._abandon_preview_and_send_final(
-                    chat_id,
-                    stream,
-                    visible_content,
-                    message_id=message_id,
-                    reason="finalize_error",
-                    reply_to_message_id_hex=_optional_hex(reply_to),
-                )
-
         return await self._send_final_direct(
             chat_id,
-            visible_content,
+            content,
             reply_to_message_id_hex=_optional_hex(reply_to),
         )
 
@@ -2233,68 +1943,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         self._capture_loop()
-        if message_id.startswith(TOOL_PROGRESS_MESSAGE_PREFIX):
-            chat_id = _normalize_hex(chat_id, "chat_id")
-            visible_content = self._strip_streaming_cursor(content)
-            tool_events = _tool_events_from_progress_text(visible_content)
-            if not tool_events:
-                return SendResult(success=True, message_id=message_id)
-            return await self._send_tool_progress_events(
-                chat_id,
-                tool_events,
-                message_id=message_id,
-            )
-
-        stream = self._active_streams.get(message_id)
-        if stream is None:
+        if not message_id.startswith(TOOL_PROGRESS_MESSAGE_PREFIX):
             return SendResult(success=False, error="Marmot cannot edit durable messages")
-
         chat_id = _normalize_hex(chat_id, "chat_id")
-        visible_content = self._strip_streaming_cursor(content)
-        if finalize and _delivery_routes_to_commentary_activity(metadata):
-            result = await self._send_commentary_activity(
-                chat_id,
-                visible_content,
-                reply_to=stream.parent_message_id_hex,
-                metadata=metadata,
-                preserve_stream=stream,
-            )
-            if result.success:
-                await self._cancel_stream(chat_id, message_id, stream, "non-final commentary")
-            return result
-        try:
-            await stream.append_replacement(visible_content)
-            if not finalize:
-                return SendResult(success=True, message_id=message_id)
-
-            return await self._finalize_active_stream(
-                chat_id,
-                stream,
-                visible_content,
-                message_id=message_id,
-            )
-        except NonAppendOnlyUpdate as exc:
-            if finalize:
-                return await self._abandon_preview_and_send_final(
-                    chat_id,
-                    stream,
-                    visible_content,
-                    message_id=message_id,
-                    reason=str(exc),
-                )
-            await self._cancel_stream(chat_id, message_id, stream, str(exc))
-            return SendResult(success=False, error=str(exc), retryable=False)
-        except Exception as exc:
-            logger.debug("Marmot live-preview edit failed: %s", exc)
-            if finalize:
-                return await self._abandon_preview_and_send_final(
-                    chat_id,
-                    stream,
-                    visible_content,
-                    message_id=message_id,
-                    reason="finalize_error",
-                )
-            return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+        tool_events = _tool_events_from_progress_text(content)
+        if not tool_events:
+            return SendResult(success=True, message_id=message_id)
+        return await self._send_tool_progress_events(
+            chat_id,
+            tool_events,
+            message_id=message_id,
+        )
 
     @property
     def supports_status_text(self) -> bool:
@@ -2330,13 +1989,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
         self._presence.finish(event.source.chat_id, event, getattr(outcome, "value", outcome))
-
-    def supports_draft_streaming(
-        self,
-        chat_type: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        return bool(self.quic_candidates)
 
     def _start_session_processing(
         self,
@@ -2408,123 +2060,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             "sequence": getattr(event, "index", None),
         }
         return _encoded_tool_event({key: value for key, value in payload.items() if value is not None})
-
-    async def send_draft(
-        self,
-        chat_id: str,
-        draft_id: int,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        self._capture_loop()
-        if not self.quic_candidates:
-            return SendResult(success=False, error="Marmot live preview requires MARMOT_QUIC_CANDIDATES")
-
-        chat_id = _normalize_hex(chat_id, "chat_id")
-        key = (chat_id, int(draft_id))
-        visible_content = self._strip_streaming_cursor(content)
-        if not visible_content.strip():
-            stream = self._draft_streams.pop(key, None)
-            if stream is not None:
-                await self._cancel_stream(chat_id, None, stream, "draft cleared")
-            return SendResult(success=True)
-
-        try:
-            stream = self._draft_streams.get(key)
-            if stream is None:
-                await self._cancel_other_draft_streams(
-                    chat_id,
-                    keep_key=key,
-                    reason="superseded by newer draft",
-                )
-                await self._cancel_other_chat_streams(chat_id, reason="superseded by newer draft")
-                metadata = metadata or {}
-                stream = await self._begin_live_stream(
-                    chat_id,
-                    parent_message_id_hex=_optional_hex(
-                        metadata.get("parent_message_id_hex")
-                        or metadata.get("reply_to_message_id_hex")
-                        or _TURN_PARENT_MESSAGE_ID_HEX.get()
-                    ),
-                )
-                self._draft_streams[key] = stream
-                self._last_chat_stream[chat_id] = stream
-            await stream.append_replacement(visible_content)
-            return SendResult(success=True)
-        except NonAppendOnlyUpdate as exc:
-            stream = self._draft_streams.pop(key, None)
-            if stream is not None:
-                await self._cancel_stream(chat_id, None, stream, str(exc))
-            return SendResult(success=False, error=str(exc), retryable=False)
-        except Exception as exc:
-            logger.debug("Marmot live-preview draft failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
-
-    async def _finalize_active_stream(
-        self,
-        chat_id: str,
-        stream: MarmotLiveStream,
-        final_text: str,
-        *,
-        message_id: Optional[str] = None,
-    ) -> SendResult:
-        try:
-            response = await stream.finalize(final_text)
-        except Exception as exc:
-            if is_retryable(exc):
-                # Keep the same stream and key: the durable send may have committed.
-                return SendResult(success=False, error=str(exc), retryable=True)
-            raise
-        if message_id:
-            self._active_streams.pop(message_id, None)
-        self._forget_stream(chat_id, stream)
-        try:
-            result = self._result_from_stream_finalize(response)
-        except Exception as exc:
-            logger.debug("Marmot stream finalize response rejected: %s", exc)
-            await self._cancel_stream(chat_id, message_id, stream, "finalize rejected")
-            return await self._send_final_direct(chat_id, final_text)
-        account_id = await self._ensure_account_id()
-        self._sent_targets.record_all(
-            tuple(response.get("message_ids_hex") or ()),
-            account_id_hex=account_id,
-            group_id_hex=chat_id,
-        )
-        return result
-
-    @staticmethod
-    def _result_from_stream_finalize(response: Dict[str, Any]) -> SendResult:
-        message_ids = tuple(response.get("message_ids_hex") or ())
-        message_id = message_ids[-1] if message_ids else None
-        if response.get("type") != "stream_finalized" or not message_ids:
-            raise AgentControlError(
-                "Marmot stream finalize returned no message ids",
-                code="unexpected_stream_finalize_response",
-                retryable=True,
-            )
-        return SendResult(
-            success=True,
-            message_id=message_id,
-            raw_response=response,
-            continuation_message_ids=message_ids[:-1],
-        )
-
-    async def _abandon_preview_and_send_final(
-        self,
-        chat_id: str,
-        stream: MarmotLiveStream,
-        final_text: str,
-        *,
-        message_id: Optional[str] = None,
-        reason: str,
-        reply_to_message_id_hex: Optional[str] = None,
-    ) -> SendResult:
-        await self._cancel_stream(chat_id, message_id, stream, reason)
-        return await self._send_final_direct(
-            chat_id,
-            final_text,
-            reply_to_message_id_hex=reply_to_message_id_hex,
-        )
 
     async def _send_final_direct(
         self,
@@ -3082,53 +2617,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             self._tool_progress_replies.pop(dropped_message_id, None)
         return seen
 
-    async def _begin_live_stream(
-        self,
-        chat_id: str,
-        *,
-        parent_message_id_hex: Optional[str] = None,
-    ) -> MarmotLiveStream:
-        account_id = await self._ensure_account_id()
-        return await MarmotLiveStream.begin(
-            client=self.client,
-            account_id_hex=account_id,
-            group_id_hex=chat_id,
-            parent_message_id_hex=parent_message_id_hex,
-            quic_candidates=self.quic_candidates,
-        )
-
-    async def _cancel_other_chat_streams(
-        self,
-        chat_id: str,
-        *,
-        keep: Optional[MarmotLiveStream] = None,
-        reason: str = "superseded by newer stream",
-    ) -> None:
-        chat_id = _normalize_hex(chat_id, "chat_id")
-        pending: list[tuple[Optional[str], MarmotLiveStream]] = []
-
-        last = self._last_chat_stream.get(chat_id)
-        if last is not None and last is not keep:
-            pending.append((None, last))
-
-        for message_id, stream in list(self._active_streams.items()):
-            if stream is keep or stream.group_id_hex != chat_id:
-                continue
-            pending.append((message_id, stream))
-
-        for (draft_chat_id, _draft_id), stream in list(self._draft_streams.items()):
-            if stream is keep or draft_chat_id != chat_id:
-                continue
-            pending.append((None, stream))
-
-        seen: set[int] = set()
-        for message_id, stream in pending:
-            token = id(stream)
-            if token in seen:
-                continue
-            seen.add(token)
-            await self._cancel_stream(chat_id, message_id, stream, reason)
-
     def _capture_loop(self) -> None:
         try:
             self._loop = asyncio.get_running_loop()
@@ -3188,19 +2676,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         *,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
-        preserve_stream: Optional[MarmotLiveStream] = None,
     ) -> SendResult:
         if not str(text or "").strip():
             return SendResult(success=True)
         reply_to_message_id_hex = _reply_to_from_send_context(metadata, reply_to)
-        stream = self._last_chat_stream.get(chat_id)
-        if reply_to_message_id_hex is None and stream is not None:
-            reply_to_message_id_hex = stream.parent_message_id_hex
-        await self._cancel_other_chat_streams(
-            chat_id,
-            reason="non-final commentary",
-            keep=preserve_stream,
-        )
         try:
             response = await self._send_agent_activity_event(
                 chat_id,
@@ -3231,62 +2710,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("Marmot send_agent_activity failed: %s", exc)
             return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
-
-    async def _cancel_other_draft_streams(
-        self,
-        chat_id: str,
-        *,
-        keep_key: tuple[str, int],
-        reason: str,
-    ) -> None:
-        stale_keys = [
-            key
-            for key in self._draft_streams
-            if key[0] == chat_id and key != keep_key
-        ]
-        for key in stale_keys:
-            stream = self._draft_streams.get(key)
-            if stream is not None:
-                await self._cancel_stream(chat_id, None, stream, reason)
-
-    async def _cancel_stream(
-        self,
-        chat_id: str,
-        message_id: Optional[str],
-        stream: MarmotLiveStream,
-        reason: str,
-    ) -> None:
-        try:
-            await stream.cancel(reason)
-        except Exception:
-            logger.debug("Marmot live-preview cancel failed", exc_info=True)
-        if message_id:
-            self._active_streams.pop(message_id, None)
-        self._forget_stream(chat_id, stream)
-
-    async def _cancel_all_streams(self, reason: str) -> None:
-        streams = set(self._active_streams.values()) | set(self._draft_streams.values())
-        for stream in streams:
-            try:
-                await stream.cancel(reason)
-            except Exception:
-                logger.debug("Marmot live-preview cancel failed", exc_info=True)
-        self._active_streams.clear()
-        self._draft_streams.clear()
-        self._last_chat_stream.clear()
-
-    def _forget_stream(self, chat_id: str, stream: MarmotLiveStream) -> None:
-        if self._last_chat_stream.get(chat_id) is stream:
-            self._last_chat_stream.pop(chat_id, None)
-        self._remove_stream_refs(stream)
-
-    def _remove_stream_refs(self, stream: MarmotLiveStream) -> None:
-        for key, value in list(self._active_streams.items()):
-            if value is stream:
-                self._active_streams.pop(key, None)
-        for key, value in list(self._draft_streams.items()):
-            if value is stream:
-                self._draft_streams.pop(key, None)
 
     async def _ensure_account_id(self) -> str:
         if self.account_id_hex:
@@ -4093,8 +3516,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         response = result.raw_response
         if not result.success or not result.message_id or not isinstance(response, dict):
             return
-        if response.get("type") not in {"final_sent", "stream_finalized"}:
-            return  # Activity and live-preview ids cannot be reaction targets.
+        if response.get("type") != "final_sent":
+            return  # Activity ids cannot be reaction targets.
         ids = response.get("message_ids_hex")
         if not isinstance(ids, (list, tuple)):
             return
@@ -4403,41 +3826,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 reply_to_message_id_hex=message_id_hex,
             )
         return True
-
-    def _split_stream_preview(self, content: str) -> tuple[str, bool]:
-        text = str(content or "")
-        cursor = self.streaming_cursor
-        if not cursor:
-            return text, False
-
-        trimmed = text.rstrip()
-        # Hermes balances Markdown after appending its streaming cursor. An
-        # unclosed inline span therefore ends with the cursor followed by one
-        # backtick, while an unclosed fenced block adds a newline plus three
-        # backticks. If both need balancing, the two closers form four trailing
-        # backticks. These display-only closers are not part of the append-only
-        # stream transcript.
-        cursor_suffixes = (
-            cursor,
-            cursor + "`",
-            cursor + "\n```",
-            cursor + "\n````",
-        )
-        for suffix in cursor_suffixes:
-            if not trimmed.endswith(suffix):
-                continue
-            visible = trimmed[: -len(suffix)]
-            return visible + text[len(trimmed) :], True
-        return text, False
-
-    def _looks_like_stream_preview(self, content: str) -> bool:
-        _, is_preview = self._split_stream_preview(content)
-        return is_preview
-
-    def _strip_streaming_cursor(self, content: str) -> str:
-        visible, _ = self._split_stream_preview(content)
-        return visible
-
 
 def check_requirements() -> bool:
     # Install-time only: runtime readiness is validated with the effective
@@ -5134,13 +4522,6 @@ def resolve_auth_token(extra: Dict[str, Any]) -> Optional[str]:
     return token
 
 
-def resolve_quic_candidates(extra: Dict[str, Any]) -> list[str]:
-    configured = extra.get("quic_candidates")
-    if configured is None:
-        configured = os.getenv("MARMOT_QUIC_CANDIDATES") or os.getenv("MARMOT_QUIC_CANDIDATE")
-    return [candidate for candidate in _split_config_list(configured) if candidate.startswith("quic://")]
-
-
 def resolve_group_activation(extra: Dict[str, Any]) -> Literal["mention", "always"]:
     configured = _first_config_value(
         extra,
@@ -5350,10 +4731,6 @@ def _config_bool(value: Any, *, default: bool) -> bool:
     if not text:
         return default
     return text not in {"0", "false", "no", "off", "disabled"}
-
-
-def _stream_message_id(stream_id_hex: str) -> str:
-    return f"{STREAM_MESSAGE_PREFIX}{stream_id_hex}"
 
 
 def _tool_progress_message_id() -> str:

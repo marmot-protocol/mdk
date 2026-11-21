@@ -52,7 +52,6 @@ CONFIGURE_HERMES=1
 DOCTOR=0
 DOCTOR_JSON=0
 DRY_RUN=0
-ENABLE_STREAMING=0
 FORCE=0
 INSTALL_SERVICE=1
 INTERACTIVE=0
@@ -73,7 +72,6 @@ WN_AGENT_TEMP_PID=""
 RELAYS=()
 ALLOW_WELCOMERS=()
 ALLOW_USERS=()
-QUIC_CANDIDATES=()
 EXPLICIT_ALLOW_ALL=0
 
 usage() {
@@ -100,8 +98,6 @@ Options:
                            may repeat or contain comma-separated values
   --allow-all-users        Allow Marmot messages from any sender (explicit opt-in)
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
-  --enable-streaming       Configure Marmot live preview streaming
-  --quic-candidate URI     QUIC preview candidate used with --enable-streaming
   --no-service             Do not install/start a LaunchAgent or systemd user unit
   --no-start-wn-agent      Do not start wn-agent before bootstrap
   --no-configure-hermes    Install assets but do not patch Hermes config.yaml
@@ -897,18 +893,6 @@ relay_args() {
     done
 }
 
-quic_args() {
-    local candidate
-    if [ "$ENABLE_STREAMING" -ne 1 ]; then
-        printf '%s\n' "--no-quic"
-        return 0
-    fi
-    for candidate in "${QUIC_CANDIDATES[@]}"; do
-        printf '%s\n' "--quic-candidate"
-        printf '%s\n' "$candidate"
-    done
-}
-
 allow_welcomer_args() {
     local welcomer
     if [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ]; then
@@ -1177,14 +1161,6 @@ bootstrap_agent() {
     for relay in "${RELAYS[@]}"; do
         args+=(--relay "$relay")
     done
-    if [ "$ENABLE_STREAMING" -eq 1 ]; then
-        local candidate
-        for candidate in "${QUIC_CANDIDATES[@]}"; do
-            args+=(--quic-candidate "$candidate")
-        done
-    else
-        args+=(--no-quic)
-    fi
     local welcomer
     if [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ]; then
         for welcomer in "${ALLOW_WELCOMERS[@]}"; do
@@ -1261,11 +1237,6 @@ configure_hermes_gateway() {
         --busy-ack-detail 0
         --configure-env
     )
-    if [ "$ENABLE_STREAMING" -eq 1 ]; then
-        args+=(--streaming 1 --transport auto --configure-global-streaming)
-    else
-        args+=(--streaming 0 --transport off)
-    fi
     local welcomer
     if [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ]; then
         for welcomer in "${ALLOW_WELCOMERS[@]}"; do
@@ -1466,14 +1437,6 @@ while [ "$#" -gt 0 ]; do
             RELAYS+=("${2:?missing value for --relay}")
             shift 2
             ;;
-        --enable-streaming)
-            ENABLE_STREAMING=1
-            shift
-            ;;
-        --quic-candidate)
-            QUIC_CANDIDATES+=("${2:?missing value for --quic-candidate}")
-            shift 2
-            ;;
         --no-service)
             INSTALL_SERVICE=0
             shift
@@ -1534,13 +1497,12 @@ if [ "$DOCTOR_JSON" -eq 1 ] && [ "$DOCTOR" -ne 1 ]; then
 fi
 if [ "$DOCTOR" -eq 1 ]; then
     if [ "$ASSUME_YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ] || [ "$FORCE" -eq 1 ] \
-        || [ "$SYSTEM_INSTALL" -eq 1 ] || [ "$ENABLE_STREAMING" -eq 1 ] \
+        || [ "$SYSTEM_INSTALL" -eq 1 ] \
         || [ "$NO_START_WN_AGENT" -eq 1 ] || [ "$CONFIGURE_HERMES" -eq 0 ] \
         || [ "$CLI_RELAYS" -eq 1 ] \
         || [ "$EXPLICIT_ALLOW_ALL" -eq 1 ] || [ "$GENERATE_IDENTITY_EXPLICIT" -eq 1 ] \
         || [ -n "$EXISTING_IDENTITY_FILE" ] || [ -n "$EXPECTED_IDENTITY" ] \
-        || [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ] || [ "${#ALLOW_USERS[@]}" -gt 0 ] \
-        || [ "${#QUIC_CANDIDATES[@]}" -gt 0 ]; then
+        || [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ] || [ "${#ALLOW_USERS[@]}" -gt 0 ]; then
         echo "error: --doctor cannot be combined with mutating installer options" >&2
         exit 1
     fi
@@ -1560,9 +1522,6 @@ if [ -n "${MARMOT_WELCOMER_ALLOWLIST:-}" ]; then
     while IFS= read -r welcomer; do
         ALLOW_WELCOMERS+=("$welcomer")
     done < <(append_csv "$MARMOT_WELCOMER_ALLOWLIST")
-fi
-if [ "${#QUIC_CANDIDATES[@]}" -eq 0 ]; then
-    QUIC_CANDIDATES+=("quic://quic-broker.ipf.dev:4450")
 fi
 
 if [ "$INTERACTIVE" -eq 1 ]; then

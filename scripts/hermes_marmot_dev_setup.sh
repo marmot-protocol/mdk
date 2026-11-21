@@ -21,8 +21,6 @@ Options:
   --socket-dir-mode OCTAL  wn-agent control socket directory mode (default: 0700)
   --socket-mode OCTAL      wn-agent control socket mode (default: 0600)
   --relay URL              Add a wn-agent --relay argument; may be repeated
-  --quic-candidate URI     Add a MARMOT_QUIC_CANDIDATES entry; may be repeated
-  --quic-candidates CSV    Comma-separated MARMOT_QUIC_CANDIDATES value
   --skip-hermes-install    Create dirs, env, plugin symlink, and helpers only
   --no-enable-plugin       Do not run "hermes plugins enable marmot"
   --install-uv             Install uv with Astral's installer if uv is missing
@@ -67,7 +65,6 @@ install_pinned_wheel=0
 force=0
 print_env=0
 relays=()
-quic_candidates=()
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -118,19 +115,6 @@ while [ "$#" -gt 0 ]; do
             ;;
         --relay)
             relays+=("$2")
-            shift 2
-            ;;
-        --quic-candidate)
-            quic_candidates+=("$2")
-            shift 2
-            ;;
-        --quic-candidates)
-            IFS=',' read -r -a parsed_candidates <<<"$2"
-            for candidate in "${parsed_candidates[@]}"; do
-                candidate="${candidate#"${candidate%%[![:space:]]*}"}"
-                candidate="${candidate%"${candidate##*[![:space:]]}"}"
-                [ -z "$candidate" ] || quic_candidates+=("$candidate")
-            done
             shift 2
             ;;
         --skip-hermes-install)
@@ -344,18 +328,7 @@ ERROR
 }
 
 write_env_file() {
-    local quic_csv=""
     local relay_csv=""
-    local candidate
-    if [ "${#quic_candidates[@]}" -gt 0 ]; then
-        for candidate in "${quic_candidates[@]}"; do
-            if [ -z "$quic_csv" ]; then
-                quic_csv="$candidate"
-            else
-                quic_csv="$quic_csv,$candidate"
-            fi
-        done
-    fi
     local relay
     if [ "${#relays[@]}" -gt 0 ]; then
         for relay in "${relays[@]}"; do
@@ -383,21 +356,12 @@ write_env_file() {
         printf 'export MARMOT_ACCOUNT_ID_HEX=%q\n' "$account_id"
         printf 'export MARMOT_GROUP_ID_HEX=%q\n' "$group_id"
         printf 'export MARMOT_RELAYS=%q\n' "$relay_csv"
-        printf 'export MARMOT_QUIC_CANDIDATES=%q\n' "$quic_csv"
         printf 'export PATH=%q:"$PATH"\n' "$hermes_repo/.venv/bin"
         echo 'wn_agent_relay_args=('
         if [ "${#relays[@]}" -gt 0 ]; then
             for relay in "${relays[@]}"; do
                 printf '  %q\n' "--relay"
                 printf '  %q\n' "$relay"
-            done
-        fi
-        echo ')'
-        echo 'wn_agent_quic_args=('
-        if [ "${#quic_candidates[@]}" -gt 0 ]; then
-            for candidate in "${quic_candidates[@]}"; do
-                printf '  %q\n' "--quic-candidate"
-                printf '  %q\n' "$candidate"
             done
         fi
         echo ')'
@@ -510,7 +474,7 @@ fi
 if [ -n "${MARMOT_ACCOUNT_ID_HEX:-}" ]; then
     bootstrap_args+=(--account-id-hex "$MARMOT_ACCOUNT_ID_HEX")
 fi
-exec cargo run -p agent-connector --bin wn-agent -- "${bootstrap_args[@]}" "${wn_agent_relay_args[@]}" "${wn_agent_quic_args[@]}" --qr "$@"
+exec cargo run -p agent-connector --bin wn-agent -- "${bootstrap_args[@]}" "${wn_agent_relay_args[@]}" --qr "$@"
 SCRIPT
 
     cat >"$dev_root/start-wn-agent.sh" <<'SCRIPT'
