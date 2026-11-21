@@ -3,8 +3,8 @@
 This crate ships the `wn-agent` binary: the local White Noise agent connector.
 
 `wn-agent` is the headless Marmot process that lets an agent runtime appear as a normal Marmot member. It owns the
-Marmot account home, MLS state, Nostr relay IO, invite allowlists, durable encrypted sends, and live QUIC preview
-composition. Agent runtimes stay thin: they run models and tools, then talk to `wn-agent` through the local
+Marmot account home, MLS state, Nostr relay IO, invite allowlists, and durable encrypted sends. Agent runtimes stay
+thin: they run models and tools, then talk to `wn-agent` through the local
 agent-control socket.
 
 Supported integrations, all speaking the same [`agent-control`](../agent-control) protocol to this connector:
@@ -56,10 +56,9 @@ This crate is process glue. It owns:
 - `wn-agent bootstrap`, `wn-agent import-identity`, and `wn-agent usage-diagnostics`;
 - local socket binding, peer checks, file modes, and optional bearer-token auth;
 - allowlist-backed welcome confirmation for local agent accounts;
-- final Marmot sends and QUIC live-preview composition through the app runtime.
+- final Marmot sends through the app runtime.
 
-Agent-facing wire types live in [`agent-control`](../agent-control) and stream composition behavior in
-[`agent-stream-compose`](../agent-stream-compose).
+Agent-facing wire types live in [`agent-control`](../agent-control).
 
 ## First installation from a White Noise prompt
 
@@ -220,19 +219,18 @@ cargo run -p agent-connector --bin wn-agent -- bootstrap \
   --qr
 ```
 
-`bootstrap` prints the agent account id, `npub`, `nprofile`, relay hints, QUIC preview candidates, and optional
-terminal QR. Invite that account from the phone app. When flags are omitted, `bootstrap` reads `MARMOT_HOME` (default
-`~/.marmot-agent`), `MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_AUTH_TOKEN` / `MARMOT_AGENT_AUTH_TOKEN_FILE` (default
-`<home>/control.token` when present), `MARMOT_RELAYS`, and `MARMOT_QUIC_CANDIDATES` (default
-`quic://quic-broker.ipf.dev:4450`; `--no-quic` omits it).
+`bootstrap` prints the agent account id, `npub`, `nprofile`, relay hints, and optional terminal QR. Invite that
+account from the phone app. When flags are omitted, `bootstrap` reads `MARMOT_HOME` (default `~/.marmot-agent`),
+`MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_AUTH_TOKEN` / `MARMOT_AGENT_AUTH_TOKEN_FILE` (default `<home>/control.token` when
+present), and `MARMOT_RELAYS`. `bootstrap` still accepts and ignores the retired `--no-quic` flag so installers
+released before live previews were removed keep working.
 
 To keep an existing Nostr identity instead of generating one, import it before bootstrapping with
 `wn-agent import-identity --identity-file <path>` (an owner-only regular file) or `--prompt` (masked `/dev/tty`
 entry), optionally pinned with `--expected-identity <npub-or-hex>`.
 
 Other daemon flags: `--socket`, `--socket-dir-mode` (default `0700`), `--socket-mode` (default `0600`),
-`--auth-token-file`, `--max-connections` (default 64), and `--no-default-relays`. Development-only flags
-`--insecure-local-broker` (literal loopback `quic://` candidates without certificate verification) and
+`--auth-token-file`, `--max-connections` (default 64), and `--no-default-relays`. The development-only flag
 `--allow-loopback-relays` (loopback relays only; private, link-local, and CGNAT stay rejected) must not be used in
 production.
 
@@ -344,12 +342,6 @@ The v2 control plane is local-only:
 - default socket mode `0600`;
 - same effective UID required when no token is configured;
 - no TCP listener.
-
-Live-preview sessions have a second, narrower bearer boundary. `StreamBegin` requires a nonempty envelope request id
-and returns a fresh 256-bit capability. Every later stream operation must present that capability, which is compared
-without data-dependent early exit and is never logged or persisted. A begin retry must reuse its original request id;
-an exact retry returns the original capability, while a different request or a colliding stream id is rejected without
-replacing the active session.
 
 When the gateway and `wn-agent` run as different local service users, use a bearer token file plus group-readable socket
 modes:

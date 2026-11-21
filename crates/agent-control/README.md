@@ -9,12 +9,12 @@ protocol; `agent-connector` is the server.
 ## What this crate does
 
 - Owns `AgentControlEnvelope` and the typed control DTOs (bootstrap, send, subscribe, timeline history, invite policy,
-  stream compose, allowlists, identifier-free `diagnostic_status`, etc.).
+  allowlists, identifier-free `diagnostic_status`, etc.).
 - Provides newline-delimited JSON framing with a 1 MiB per-frame cap (`MAX_AGENT_CONTROL_FRAME_BYTES`).
 - Stays dependency-light: `serde` and Tokio IO only.
 
-It does not contain engine, storage, account, or transport logic, the socket daemon or process lifecycle (see
-`agent-connector`), or QUIC preview composition (see `agent-stream-compose`).
+It does not contain engine, storage, account, or transport logic, or the socket daemon and process lifecycle (see
+`agent-connector`).
 
 To write a client of this protocol, start with [Build your own client](../../integrations/custom-client.md): framing,
 group creation, sends and `subscribe_inbound`, with wire examples.
@@ -25,6 +25,14 @@ Version 2 is intentionally incompatible with version 1. The structured inbound-m
 mutation-event schema was the final intentionally breaking update shipped under the `v2` label, while every consumer
 was still released atomically from this repository. The `v2` schema is now stable: any later breaking wire change must
 introduce a new protocol label or explicit negotiation rather than silently changing `v2`.
+
+The one exception is the live preview stream. The `stream_begin`, `stream_append`, `stream_status`, `stream_progress`,
+`stream_finish`, `stream_finalize`, and `stream_cancel` requests, their `stream_begun` and `stream_finalized` responses,
+and the `stream_update` event carried agent text previews over QUIC. That feature is retired: no client used it, and
+the successor protocol (agent-control v3, built in `marmot-protocol/marmot-agents`) has no live preview stream. The
+operations were removed from `v2` outright rather than kept as dead surface. A connector cannot decode them, so it
+closes the connection without a response, as it does for any unknown request type. Send every reply as a durable
+message with `send_final`.
 
 `group_state_changed` includes an optional `event_id_hex`: the opaque durable occurrence id shared by live events and
 storage replay. Older connectors omit it. A change kind or timestamp alone is not a safe deduplication key.
@@ -97,31 +105,6 @@ frame, and existing timeline reads remain network-free and unchanged.
 Older connectors do not support these new request types. Do not fall back to a saved
 raw `download_media` reference for historical recovery: that does not provide these
 source checks or native acquisition controls.
-
-## Stream sessions
-
-A successful `StreamBegin` returns a random 32-byte `stream_capability` encoded as 64 lowercase hex characters. Every
-later append, status, progress, finalize, or cancel request for that stream must present the capability. Treat it as an
-in-memory bearer secret: never persist or log it.
-
-The envelope `id` is also the idempotency key for `StreamBegin`. Retrying the same begin request with the same `id`
-returns the original stream id, start event, candidates, policy limit, and capability. Reusing that `id` with different
-begin inputs is an error, and trying to begin another active stream with an occupied explicit stream id returns
-`stream_id_in_use`; neither case replaces the existing session.
-
-### Stream finalization
-
-`stream_finish` accepts `stream_id_hex`, `stream_capability`, `final_text`, and an optional `idempotency_key`. The
-shared publisher derives the hash and chunk count from acknowledged text, status, and progress records. A text mismatch
-leaves the stream active and returns the non-retryable `stream_finalize_mismatch` code; a failed durable send retains
-the sealed transcript and returns the retryable `stream_send_failed` code, so clients retry the same finish request.
-Successful retries with the same inputs and key return the original message ids, including after the connector
-restarts. Both paths return `stream_finalized`.
-
-The older `stream_finalize` remains supported and additionally validates the client's `transcript_hash_hex` and
-`chunk_count`. New clients use `stream_finish`, an additive v2 operation. The Hermes and OpenClaw plugins call
-`stream_finish` without a `stream_finalize` fallback, so they are cohort-locked to the `wn-agent` release they ship
-with; an older connector answers `control_error` and the plugins degrade to a plain durable send without a live preview.
 
 ## Reactions
 

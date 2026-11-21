@@ -25,9 +25,6 @@ optional_env:
   - name: MARMOT_GROUP_ID_HEX
     description: "Optional Marmot group id filter for inbound messages"
     password: false
-  - name: MARMOT_QUIC_CANDIDATES
-    description: "Comma-separated quic:// preview broker candidates for live Marmot previews"
-    password: false
   - name: MARMOT_HOME_CHANNEL
     description: "Default Marmot group id for Hermes cron/home delivery"
     password: false

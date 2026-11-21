@@ -33,8 +33,6 @@ pub enum ConnectorError {
     Unauthorized,
     #[error("unsafe agent control plane configuration: {0}")]
     UnsafeControlPlaneConfig(&'static str),
-    #[error("agent stream error: {0}")]
-    Stream(String),
     #[error("invalid group create request: {0}")]
     InvalidGroupCreate(&'static str),
     #[error("no requested group member is available")]
@@ -59,16 +57,6 @@ pub enum ConnectorError {
     MediaLimitsExceeded(&'static str),
     #[error("media idempotency key was reused with different inputs")]
     MediaIdempotencyConflict,
-    #[error("stream id is already reserved")]
-    StreamIdInUse,
-    #[error("stream capability denied")]
-    StreamCapabilityDenied,
-    #[error("stream begin request id is invalid")]
-    InvalidStreamBeginRequestId,
-    #[error("stream begin request id was reused with different inputs")]
-    StreamBeginRequestConflict,
-    #[error("stream preview idempotency key was reused with different inputs")]
-    StreamPreviewIdempotencyConflict,
 }
 
 /// Directory failures take the `AppError` codes they convert to.
@@ -87,9 +75,6 @@ impl ConnectorError {
             Self::AccountHome(_) => "account_home_error",
             Self::App(AppError::ReactionNotFound) => "reaction_not_found",
             Self::App(AppError::MediaUploadTimedOut) => "media_upload_timeout",
-            Self::App(AppError::AgentStreamPublisher(_)) => "stream_error",
-            Self::App(AppError::AgentStreamFinishMismatch) => "stream_finalize_mismatch",
-            Self::App(AppError::AgentStreamSendFailed(_)) => "stream_send_failed",
             Self::App(AppError::InvalidGroupProfile(_)) => "invalid_group_profile",
             Self::App(AppError::GroupCreateAdminNotMember) => "invalid_group_create",
             Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
@@ -113,7 +98,6 @@ impl ConnectorError {
             Self::DebugControlsDisabled => "debug_controls_disabled",
             Self::Unauthorized => "unauthorized",
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
-            Self::Stream(_) => "stream_error",
             Self::InvalidGroupCreate(_) => "invalid_group_create",
             Self::MemberResolutionFailed => "member_resolution_failed",
             Self::InvalidProfileName(_) => "invalid_profile_name",
@@ -126,11 +110,6 @@ impl ConnectorError {
             Self::MediaPathDenied(_) => "media_path_denied",
             Self::MediaLimitsExceeded(_) => "media_limits_exceeded",
             Self::MediaIdempotencyConflict => "media_idempotency_conflict",
-            Self::StreamIdInUse => "stream_id_in_use",
-            Self::StreamCapabilityDenied => "stream_capability_denied",
-            Self::InvalidStreamBeginRequestId => "invalid_stream_begin_request_id",
-            Self::StreamBeginRequestConflict => "stream_begin_request_conflict",
-            Self::StreamPreviewIdempotencyConflict => "stream_preview_idempotency_conflict",
         }
     }
 
@@ -153,15 +132,6 @@ impl ConnectorError {
             Self::UnsafeControlPlaneConfig(_) => "unsafe agent control plane configuration",
             Self::Hex(_) => "invalid hex value",
             Self::Json(_) | Self::Control(_) => "invalid control request",
-            Self::Stream(_) | Self::App(AppError::AgentStreamPublisher(_)) => {
-                "agent stream request failed"
-            }
-            Self::App(AppError::AgentStreamFinishMismatch) => {
-                "stream finalize does not match the sealed transcript"
-            }
-            Self::App(AppError::AgentStreamSendFailed(_)) => {
-                "stream durable send failed; retry the same finish request"
-            }
             Self::App(AppError::InvalidGroupProfile(_)) => "invalid group profile",
             Self::App(AppError::GroupCreateAdminNotMember) => "invalid group create request",
             Self::App(AppError::InvalidEditTarget) => {
@@ -199,15 +169,6 @@ impl ConnectorError {
             Self::MediaIdempotencyConflict => {
                 "media idempotency key was reused with different inputs"
             }
-            Self::StreamIdInUse => "stream id is already in use",
-            Self::StreamCapabilityDenied => "stream capability is not authorized",
-            Self::InvalidStreamBeginRequestId => "stream begin request id is invalid",
-            Self::StreamBeginRequestConflict => {
-                "stream begin request id was reused with different inputs"
-            }
-            Self::StreamPreviewIdempotencyConflict => {
-                "stream preview idempotency key was reused with different inputs"
-            }
             Self::Io(error) => {
                 crate::socket::socket_rejection(error).unwrap_or("connector I/O failed")
             }
@@ -223,7 +184,7 @@ impl ConnectorError {
             Self::SendInProgress
                 | Self::AttachmentReleaseFailed
                 | Self::RelayListInconclusive(_)
-                | Self::App(AppError::MediaUploadTimedOut | AppError::AgentStreamSendFailed(_))
+                | Self::App(AppError::MediaUploadTimedOut)
         )
     }
 

@@ -14,12 +14,35 @@ use marmot_app::{
 use crate::error::ConnectorError;
 use crate::maintenance::agent_maintenance_disposition;
 use crate::media_roots::MediaAllowedRoots;
-use crate::stream_session::{SendIdempotencyAcquisition, StrictIdempotencyAcquisition};
+use crate::send_idempotency::{SendIdempotencyAcquisition, StrictIdempotencyAcquisition};
 use crate::validation::normalize_hex;
 use crate::{
     AgentConnector, MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES, MAX_MEDIA_UPLOAD_ATTACHMENTS,
     MAX_MEDIA_UPLOAD_BATCH_BYTES,
 };
+
+/// Debug-controls recorder for final sends that were captured instead of published.
+#[derive(Clone, Default)]
+pub(crate) struct DebugFinalSendStore {
+    sends: std::sync::Arc<std::sync::Mutex<Vec<AgentControlDebugFinalSend>>>,
+}
+
+impl DebugFinalSendStore {
+    pub(crate) fn record(
+        &self,
+        mut send: AgentControlDebugFinalSend,
+    ) -> AgentControlDebugFinalSend {
+        let mut sends = crate::lock_recover(&self.sends);
+        let next_id = sends.len() + 1;
+        send.message_ids_hex = vec![format!("{next_id:064x}")];
+        sends.push(send.clone());
+        send
+    }
+
+    pub(crate) fn list(&self) -> Vec<AgentControlDebugFinalSend> {
+        crate::lock_recover(&self.sends).clone()
+    }
+}
 
 /// Map an account-scoped chat-list projection onto the optional `group_info`
 /// display subject. Missing rows, blank names, and projection errors yield

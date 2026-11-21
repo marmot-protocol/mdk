@@ -10,7 +10,7 @@ socket. Read `README.md`, `../../AGENTS.md`, and
   Nostr transport, durable sends, and invite handling; this crate invokes
   Claude Code and parses its `stream-json` event stream.
 - Every message from an allowed sender is a prompt. Do not add gateway,
-  mention-activation, profile, QUIC-preview, or protocol behavior here.
+  mention-activation, profile, or protocol behavior here.
 - Send prompts over stdin and emit completed text blocks from main-conversation
   assistant messages, including assistant messages between tool calls. Never
   expose reasoning, tool calls/output, user echoes, subagent messages, partial

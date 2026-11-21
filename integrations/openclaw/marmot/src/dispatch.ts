@@ -642,9 +642,8 @@ export function createMarmotInboundDispatcher(
               },
               replyOptions: {
                 sourceReplyDeliveryMode: "automatic",
-                // Keep the initial contract final-only. QUIC previews can be
-                // reintroduced later through the standard message-adapter live
-                // lifecycle without creating a second durable send path.
+                // Marmot replies are final-only: each answer is one durable
+                // message sent through the registered message adapter.
                 disableBlockStreaming: true,
               },
             }) as never,

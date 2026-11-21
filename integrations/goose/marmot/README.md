@@ -3,7 +3,7 @@
 `wn-goose` is a terminal-harness connector that sends authorized Marmot group
 messages to [Goose](https://github.com/aaif-goose/goose) through the local
 `wn-agent` control socket. It is intentionally a thin harness: no mention
-activation, profile onboarding, live previews, MLS, relay, or storage logic.
+activation, profile onboarding, MLS, relay, or storage logic.
 
 The adapter uses Goose's headless `run` contract. It sends prompts over stdin
 with `goose run --instructions - --output-format stream-json --quiet`. It

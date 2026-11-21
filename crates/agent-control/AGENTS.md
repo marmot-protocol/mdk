@@ -1,7 +1,7 @@
 # AGENTS.md - agent-control
 
-Local control-protocol DTOs and newline-delimited JSON framing for Marmot agents. Protocol semantics (stream
-capabilities, finalization codes, reactions, timeline reads): [`README.md`](README.md).
+Local control-protocol DTOs and newline-delimited JSON framing for Marmot agents. Protocol semantics (reactions, edits,
+timeline reads, attachment recovery): [`README.md`](README.md).
 
 ## Scope
 
@@ -18,16 +18,15 @@ capabilities, finalization codes, reactions, timeline reads): [`README.md`](READ
 | `src/diagnostics.rs` | Identifier-free `diagnostic_status` DTOs, re-exported from `lib.rs`. |
 | `../../fixtures/agent-control-v2-rich-context.json` | Shared rich-context golden, also read by the Hermes, OpenClaw, and terminal-harness tests. |
 
-Server-side handling and wire error codes (`stream_id_in_use`, `stream_finalize_mismatch`, `stream_send_failed`) live
-in `crates/agent-connector`.
+Server-side handling and wire error codes live in `crates/agent-connector`.
 
 ## Invariants
 
 - `v2` is stable. Do not make breaking wire changes under `v2`; add fields additively (optional, defaulted) or
-  introduce a new protocol label or explicit negotiation.
-- `stream_capability` is a bearer secret: never persist or log it.
-- Keep additive operations (for example `stream_finish`) alongside the older ones they extend (`stream_finalize`);
-  plugin clients are cohort-locked to the `wn-agent` release they ship with.
+  introduce a new protocol label or explicit negotiation. The retired live-preview stream operations are the one
+  documented removal (see `README.md` "Compatibility"); do not reintroduce them.
+- Keep additive operations alongside the older ones they extend; plugin clients are cohort-locked to the `wn-agent`
+  release they ship with.
 - A protocol change usually touches the connector and the plugin clients in `integrations/` too; keep them in step.
 
 ## Verification

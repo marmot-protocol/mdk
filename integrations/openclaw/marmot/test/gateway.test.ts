@@ -124,9 +124,6 @@ function account(overrides: Partial<ResolvedMarmotAccount> = {}): ResolvedMarmot
   return {
     accountId: "default",
     socketPath: "/tmp/marmot.sock",
-    streamMode: "off",
-    blockStreaming: false,
-    quicCandidates: [],
     groupActivation: "always",
     mentionPatterns: [],
     allowFrom: [],

@@ -1009,7 +1009,6 @@ run_wn_agent_bootstrap() {
         --home "$MARMOT_HOME"
         --socket "$MARMOT_AGENT_SOCKET"
         --label "$MARMOT_AGENT_LABEL"
-        --no-quic
     )
     if [ -n "$IMPORTED_ACCOUNT_ID_HEX" ]; then
         args+=(--no-create --account-id-hex "$IMPORTED_ACCOUNT_ID_HEX")

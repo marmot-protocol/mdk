@@ -2,7 +2,7 @@
 
 This directory is a Hermes platform plugin for the local `wn-agent` connector.
 Hermes runs the agent and tools. `wn-agent` owns the Marmot account, MLS state,
-Nostr transport, final encrypted sends, and QUIC live-preview stream records.
+Nostr transport, and final encrypted sends.
 
 For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
 [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
@@ -46,9 +46,9 @@ chat policy in the actual Hermes profile and verify it on the phone.
   reactions; `delete_marmot_message` retracts a prior own message.
   `marmot_group_profile` changes a group's name/description only as a current
   admin. Tool arguments, history cursors and limits are in [Behavior](#behavior).
-- **Show progress when configured.** Live previews are transient; the completed
-  answer is durable. Explicit host delivery context can route commentary to
-  agent activity. Preview configuration and final-delivery rules are in
+- **Show progress when configured.** Every reply is delivered as one durable
+  message once it is complete. Explicit host delivery context can route
+  commentary to agent activity. Final-delivery rules are in
   [Behavior](#behavior), and [presence reactions](#optional-presence-reactions)
   and [approval reactions](#approval-reactions-opt-in) are opt-in features.
 - **Check installation health.** `marmot_status` and the
@@ -238,9 +238,7 @@ pre-releases.
 Prerequisites:
 
 - The plugin and `wn-agent` are released as one cohort. Install both from the
-  same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
-  for older connectors. `stream_chunk_bytes` / `MARMOT_STREAM_CHUNK_BYTES` is
-  ignored; the connector chunks live previews itself.
+  same `wn-agent-v*` release.
 - Hermes Agent **0.19.0 or newer** installed and working locally. The installer
   validates the existing host and never installs or upgrades Hermes.
 - White Noise phone app pointed at the same public relay set
@@ -466,11 +464,10 @@ just hermes-dev-setup --skip-hermes-install --print-env
 # Pin Hermes to a branch, tag, or commit.
 just hermes-dev-setup --hermes-ref main --print-env
 
-# Include relay and QUIC preview settings for generated helpers.
+# Include relay settings for generated helpers.
 just hermes-dev-setup \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat \
-  --quic-candidate quic://quic-broker.ipf.dev:4450 \
   --print-env
 
 # Use a token-gated local control socket for a group-shared Hermes/wn-agent setup.
@@ -557,7 +554,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/te
 
 The repo has a Compose profile for the dedicated-computer phone test. It builds a container with `wn-agent`, Hermes,
 the Marmot plugin, and `qrencode` for terminal QR output. Run these commands on the host from the MDK repo root.
-They start or exec into the container for you. The container uses the pilot public relays and broker:
+They start or exec into the container for you. The container uses the pilot public relays:
 
 ```sh
 export OPENAI_API_KEY=...
@@ -568,23 +565,15 @@ just hermes-phone-test-bootstrap
 Use the provider secret and optional `HERMES_MODEL` or `HERMES_PROVIDER` settings that match your Hermes setup. The
 Compose service passes through common provider variables when they are set in your shell.
 
-The phone-test container patches `$HERMES_HOME/config.yaml` before starting the gateway. By default it enables Hermes
-gateway streaming for the Marmot platform and keeps tool/status chatter out of durable chat history:
+The phone-test container patches `$HERMES_HOME/config.yaml` before starting the gateway. By default it keeps
+tool/status chatter out of durable chat history:
 
 ```sh
-HERMES_MARMOT_STREAMING=1 \
-HERMES_MARMOT_STREAMING_TRANSPORT=auto \
 HERMES_MARMOT_TOOL_PROGRESS=off \
 HERMES_MARMOT_INTERIM_MESSAGES=0 \
 HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS=0 \
 HERMES_MARMOT_BUSY_ACK_DETAIL=0 \
 just hermes-phone-test-up
-```
-
-To compare the final-message-only path, turn streaming off:
-
-```sh
-HERMES_MARMOT_STREAMING=0 just hermes-phone-test-up
 ```
 
 To deliberately test Hermes tool-progress and interim-message behavior in the phone app, opt back in:
@@ -596,9 +585,15 @@ HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS=1 \
 just hermes-phone-test-up
 ```
 
-Install and reconfigure always write an explicit Marmot platform override
-`display.platforms.marmot.cleanup_progress: false`. Hermes otherwise inherits a
-global `cleanup_progress: true` when the platform key is missing, and would then
+Install and reconfigure always write explicit Marmot platform overrides
+`display.platforms.marmot.streaming: false` and
+`display.platforms.marmot.cleanup_progress: false`. Marmot cannot edit a sent
+message, so Hermes's edit-based token streaming would leave a durable partial
+reply beside the final one; the streaming override keeps a global
+`streaming.enabled: true` from applying to Marmot and repairs a stale Marmot
+`true` left by an older live-preview install. Without the cleanup override,
+Hermes inherits a global `cleanup_progress: true` when the platform key is
+missing, and would then
 treat tool-progress `SendResult` handles as temporary bubbles. Marmot tool
 progress is durable kind-1202 agent-operation history, so automatic cleanup is
 not a supported opt-in. A stale Marmot `true` (or a string/null leftover) is
@@ -608,9 +603,8 @@ retained progress (`tool_progress=all` / `new` / `verbose`) does not enable
 cleanup. Explicit `delete_marmot_message` against an exact durable event id is
 unchanged.
 
-The bootstrap command prints the agent account hex, `npub`, `nprofile`, relay hints, QUIC preview candidate, and QR
-code. The QR payload is the `nprofile`; QUIC preview candidates are printed for diagnostics and are still announced by
-Hermes in the first agent-stream start message. Run logs in another terminal while testing from the phone:
+The bootstrap command prints the agent account hex, `npub`, `nprofile`, relay hints, and QR code. The QR payload is
+the `nprofile`. Run logs in another terminal while testing from the phone:
 
 ```sh
 just hermes-phone-test-logs
@@ -664,7 +658,6 @@ Then configure Hermes with environment variables:
 ```sh
 export MARMOT_HOME="$HOME/.marmot-agents/hermes"
 export MARMOT_ACCOUNT_ID_HEX="<agent-account-pubkey-hex>"
-export MARMOT_QUIC_CANDIDATES="quic://quic-broker.ipf.dev:4450"
 ```
 
 `MARMOT_AGENT_SOCKET` can override the socket path. If it is not set, the plugin
@@ -878,32 +871,19 @@ successfully reaches `wn-agent`; `marmot_status` is the authoritative staged
 health readback. A configured plugin with no companion service is therefore not
 reported as operationally connected.
 
-For live previews, the plugin retries `stream_begin` with one stable v2 request
-id and retains the returned stream capability in memory for subsequent append,
-status, finalize, and cancel calls. The capability is a bearer secret and must
-not be logged or persisted.
-
 - Inbound Marmot messages become Hermes `MessageEvent`s with `chat_id` set to
   the Marmot group id and `user_id` set to the sender account id.
-- Hermes progressive edits open at most one live preview per chat at a time. A
-  newer preview cancels the previous stream for that chat.
+- Marmot has no live previews and cannot edit a sent message. Hermes token
+  streaming stays off for the Marmot platform, and `edit_message` refuses any
+  durable message, so Hermes sends each completed reply as a new message.
 - Explicit Hermes delivery context routes non-final commentary to durable agent
-  activity (`kind: 1201`, `status: commentary`). Preview and draft frames remain
-  transient; sealing the segment cancels its preview and emits one activity.
+  activity (`kind: 1201`, `status: commentary`).
 - Final answers and approvals remain durable `kind: 9` messages. Missing delivery
   context keeps this legacy final behavior for compatibility with older Hermes
   versions.
 - Durable message text is exactly what Hermes hands the adapter. The adapter
   never merges, splices, or reconstructs text across sends; fragmented or
   duplicated finals must be fixed in Hermes message segmentation.
-- A final or legacy plain send while a preview is open finalizes that stream as
-  one tagged stream-final `kind: 9` when the final text is an append-only
-  extension of the streamed text. There is no duplicate plain `send_final` for
-  the same text.
-- Otherwise the preview is cancelled and the final goes out verbatim as one
-  plain `send_final`.
-- `stream_finish` sends the acknowledged final text. The shared Rust publisher
-  owns chunking and transcript hashing, including status and progress records.
 
 ## Approval reactions (opt in)
 
@@ -1074,7 +1054,7 @@ loop. A storage failure never reclassifies an accepted real inbound turn.
 Durable rows contain SHA-256 routing/dedupe keys, allowlisted fact kinds,
 ordering/expiry metadata, and local claim ownership tokens. They contain no
 message or rename text, raw account/group/message identifiers, pubkeys, relay
-URLs, authentication tokens, or stream capabilities. Database, lock, and WAL
+URLs, or authentication tokens. Database, lock, and WAL
 files are private; symlink paths are refused. Acknowledged hashes remain as
 bounded replay tombstones. Dedupe only lasts while the hash is retained: after
 age expiry or capacity eviction, replay can surface an accepted fact again.

@@ -41,7 +41,6 @@ pub const MAX_AGENT_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_MEDIA_UPLOAD_ATTACHMENTS: usize = 10;
 pub const MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES: u64 = 512 * 1024 * 1024 - 16;
 pub const MAX_MEDIA_UPLOAD_BATCH_BYTES: u64 = MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES;
-pub const AGENT_CONTROL_STREAM_STATUS_STARTED: &str = "started";
 pub const AGENT_CONTROL_REFERENCED_TEXT_MAX_CHARS: usize = 2_000;
 pub const AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX: usize = 16;
 pub const AGENT_CONTROL_TIMELINE_DEFAULT_LIMIT: u32 = 20;
@@ -293,79 +292,6 @@ pub enum AgentControlRequest {
         target_message_id_hex: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         emoji: Option<String>,
-    },
-    StreamBegin {
-        account_id_hex: String,
-        group_id_hex: String,
-        stream_id_hex: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_message_id_hex: Option<String>,
-        quic_candidates: Vec<String>,
-    },
-    StreamAppend {
-        stream_id_hex: String,
-        stream_capability: String,
-        append_text: String,
-        /// Optional client-supplied preview dedup key. A matching retry is
-        /// acknowledged without re-applying the mutation. Reuse with different
-        /// inputs fails with `stream_preview_idempotency_conflict`. Preview
-        /// receipts are process-local and do not survive a restart.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        idempotency_key: Option<String>,
-    },
-    StreamStatus {
-        stream_id_hex: String,
-        stream_capability: String,
-        status: String,
-        /// Optional client-supplied preview dedup key. A matching retry is
-        /// acknowledged without re-applying the mutation. Reuse with different
-        /// inputs fails with `stream_preview_idempotency_conflict`. Preview
-        /// receipts are process-local and do not survive a restart.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        idempotency_key: Option<String>,
-    },
-    StreamProgress {
-        stream_id_hex: String,
-        stream_capability: String,
-        text: String,
-        /// Optional client-supplied preview dedup key. A matching retry is
-        /// acknowledged without re-applying the mutation. Reuse with different
-        /// inputs fails with `stream_preview_idempotency_conflict`. Preview
-        /// receipts are process-local and do not survive a restart.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        idempotency_key: Option<String>,
-    },
-    /// Finalize the server-owned transcript, checking only the acknowledged text.
-    StreamFinish {
-        stream_id_hex: String,
-        stream_capability: String,
-        final_text: String,
-        /// Stable retry key, bound to this stream, capability, and final text.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        idempotency_key: Option<String>,
-    },
-    /// Finalize an active preview stream into the durable final message.
-    ///
-    /// If `final_text`, `transcript_hash_hex`, or `chunk_count` do not match
-    /// the transcript composed from the preceding appends, the request fails
-    /// WITHOUT tearing down the stream session: the agent may append again
-    /// and/or re-issue `StreamFinalize`, or cancel the stream.
-    StreamFinalize {
-        stream_id_hex: String,
-        stream_capability: String,
-        final_text: String,
-        transcript_hash_hex: String,
-        chunk_count: u64,
-        /// Optional client-supplied dedup key. When present, the connector
-        /// returns the original stream-final message ids for a retry whose
-        /// finalized transcript matches the first successful finalize.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        idempotency_key: Option<String>,
-    },
-    StreamCancel {
-        stream_id_hex: String,
-        stream_capability: String,
-        reason: Option<String>,
     },
     AccountList,
     AccountCreate {
@@ -814,20 +740,6 @@ pub enum AgentControlResponse {
         ambiguous_exposure: u32,
         failures: u32,
     },
-    StreamBegun {
-        stream_id_hex: String,
-        /// Random 256-bit bearer capability required for every subsequent
-        /// operation on this stream. Never log or persist this value.
-        stream_capability: String,
-        start_message_id_hex: String,
-        quic_candidates: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        policy_max_plaintext_frame_len: Option<u32>,
-    },
-    StreamFinalized {
-        stream_id_hex: String,
-        message_ids_hex: Vec<String>,
-    },
     DebugRecordedFinals {
         sends: Vec<AgentControlDebugFinalSend>,
     },
@@ -1193,12 +1105,6 @@ pub enum AgentControlEvent {
         group_id_hex: String,
         via_welcome_message_id_hex: String,
         welcomer_account_id_hex: Option<String>,
-    },
-    StreamUpdate {
-        account_id_hex: String,
-        group_id_hex: String,
-        stream_id_hex: String,
-        status: String,
     },
     /// The connector's inbound broadcast lagged and dropped events before they could be
     /// delivered on this subscription. Dropped inbound messages are gone from the channel and
@@ -1697,49 +1603,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_append_frame_round_trips_as_append_only_text() {
-        let frame = AgentControlEnvelope::request(
-            Some("req-1".to_owned()),
-            AgentControlRequest::StreamAppend {
-                stream_id_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    .to_owned(),
-                stream_capability: "11".repeat(32),
-                append_text: "lo".to_owned(),
-                idempotency_key: None,
-            },
-        );
-
-        let encoded = encode_frame(&frame).unwrap();
-        assert!(encoded.ends_with(b"\n"));
-        let json: Value = serde_json::from_slice(&encoded[..encoded.len() - 1]).unwrap();
-        assert_eq!(json["marmot_agent_control"], "marmot.agent-control.v2");
-        assert_eq!(json["id"], "req-1");
-        assert_eq!(json["type"], "stream_append");
-        assert_eq!(json["append_text"], "lo");
-        assert_eq!(json["stream_capability"], "11".repeat(32));
-        assert!(json.get("text").is_none());
-        assert!(json.get("replace_text").is_none());
-        assert!(json.get("idempotency_key").is_none());
-
-        let decoded: AgentControlEnvelope<AgentControlRequest> = decode_envelope(&encoded).unwrap();
-        assert_eq!(decoded, frame);
-    }
-
-    #[test]
-    fn stream_preview_idempotency_key_is_optional_and_round_trips() {
-        let request: AgentControlRequest = serde_json::from_value(serde_json::json!({
-            "type": "stream_progress",
-            "stream_id_hex": "aa",
-            "stream_capability": "bb",
-            "text": "working",
-            "idempotency_key": "operation-1"
-        }))
-        .unwrap();
-        let value = serde_json::to_value(&request).unwrap();
-        assert_eq!(value["idempotency_key"], "operation-1");
-    }
-
-    #[test]
     fn envelope_auth_token_round_trips_when_present() {
         let frame = AgentControlEnvelope::request(
             Some("req-auth".to_owned()),
@@ -1753,36 +1616,6 @@ mod tests {
 
         let decoded: AgentControlEnvelope<AgentControlRequest> = decode_envelope(&encoded).unwrap();
         assert_eq!(decoded, frame);
-    }
-
-    #[test]
-    fn stream_begin_parent_message_id_is_optional_and_round_trips_when_present() {
-        let without = AgentControlRequest::StreamBegin {
-            account_id_hex: "aa".repeat(32),
-            group_id_hex: "cc".repeat(32),
-            stream_id_hex: None,
-            parent_message_id_hex: None,
-            quic_candidates: vec!["quic://broker.example:4450".to_owned()],
-        };
-        let value = serde_json::to_value(&without).unwrap();
-        assert!(
-            value.get("parent_message_id_hex").is_none(),
-            "absent parent must not be serialized"
-        );
-        let decoded: AgentControlRequest = serde_json::from_value(value).unwrap();
-        assert_eq!(decoded, without);
-
-        let with = AgentControlRequest::StreamBegin {
-            account_id_hex: "aa".repeat(32),
-            group_id_hex: "cc".repeat(32),
-            stream_id_hex: Some("55".repeat(32)),
-            parent_message_id_hex: Some("dd".repeat(32)),
-            quic_candidates: vec!["quic://broker.example:4450".to_owned()],
-        };
-        let value = serde_json::to_value(&with).unwrap();
-        assert_eq!(value["parent_message_id_hex"], "dd".repeat(32));
-        let decoded: AgentControlRequest = serde_json::from_value(value).unwrap();
-        assert_eq!(decoded, with);
     }
 
     #[test]
@@ -1915,56 +1748,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_finalize_idempotency_key_is_omitted_when_absent_and_present_when_set() {
-        // Same additive contract as send_final: old peers see the same frame
-        // when the key is absent, while newer clients can opt into dedup.
-        let without = AgentControlRequest::StreamFinalize {
-            stream_id_hex: "55".repeat(32),
-            stream_capability: "66".repeat(32),
-            final_text: "done".to_owned(),
-            transcript_hash_hex: "ab".repeat(32),
-            chunk_count: 1,
-            idempotency_key: None,
-        };
-        let value = serde_json::to_value(&without).unwrap();
-        assert!(
-            value.get("idempotency_key").is_none(),
-            "absent key must not be serialized"
-        );
-
-        let with = AgentControlRequest::StreamFinalize {
-            stream_id_hex: "55".repeat(32),
-            stream_capability: "66".repeat(32),
-            final_text: "done".to_owned(),
-            transcript_hash_hex: "ab".repeat(32),
-            chunk_count: 1,
-            idempotency_key: Some("stream-key-1".to_owned()),
-        };
-        let value = serde_json::to_value(&with).unwrap();
-        assert_eq!(value["idempotency_key"], "stream-key-1");
-        let round_tripped: AgentControlRequest = serde_json::from_value(value).unwrap();
-        assert_eq!(round_tripped, with);
-    }
-
-    #[test]
-    fn stream_begun_response_carries_policy_plaintext_cap_when_present() {
-        let begun = AgentControlResponse::StreamBegun {
-            stream_id_hex: "aa".repeat(32),
-            stream_capability: "cc".repeat(32),
-            start_message_id_hex: "bb".repeat(32),
-            quic_candidates: vec!["quic://127.0.0.1:4433".to_owned()],
-            policy_max_plaintext_frame_len: Some(4),
-        };
-
-        let value = serde_json::to_value(&begun).unwrap();
-        assert_eq!(value["type"], "stream_begun");
-        assert_eq!(value["policy_max_plaintext_frame_len"], 4);
-
-        let round_tripped: AgentControlResponse = serde_json::from_value(value).unwrap();
-        assert_eq!(round_tripped, begun);
-    }
-
-    #[test]
     fn group_state_changed_event_round_trips_with_optional_detail() {
         let renamed = AgentControlEvent::GroupStateChanged {
             account_id_hex: "aa".repeat(32),
@@ -2070,17 +1853,16 @@ mod tests {
         // A frame whose encoded line is exactly MAX_AGENT_CONTROL_FRAME_BYTES
         // (including its trailing newline) must still round-trip; the read-side
         // limit allows one byte past the cap precisely so a legal max-size frame
-        // is not truncated. We pad `append_text` with ASCII bytes (which serde
+        // is not truncated. We pad `text` with ASCII bytes (which serde
         // serializes 1:1 with no escaping) so we can hit the cap to the byte.
-        let make = |append_text: String| {
+        let make = |text: String| {
             AgentControlEnvelope::request(
                 Some("req-boundary".to_owned()),
-                AgentControlRequest::StreamAppend {
-                    stream_id_hex:
-                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                            .to_owned(),
-                    stream_capability: capability(),
-                    append_text,
+                AgentControlRequest::SendFinal {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    text,
+                    reply_to_message_id_hex: None,
                     idempotency_key: None,
                 },
             )
@@ -2193,71 +1975,6 @@ mod tests {
                     emoji: None,
                 },
                 "remove_reaction",
-            ),
-            (
-                AgentControlRequest::StreamBegin {
-                    account_id_hex: account(),
-                    group_id_hex: group(),
-                    stream_id_hex: None,
-                    parent_message_id_hex: None,
-                    quic_candidates: vec!["quic://127.0.0.1:4450".to_owned()],
-                },
-                "stream_begin",
-            ),
-            (
-                AgentControlRequest::StreamAppend {
-                    stream_id_hex: stream(),
-                    stream_capability: capability(),
-                    append_text: "hel".to_owned(),
-                    idempotency_key: None,
-                },
-                "stream_append",
-            ),
-            (
-                AgentControlRequest::StreamStatus {
-                    stream_id_hex: stream(),
-                    stream_capability: capability(),
-                    status: "thinking".to_owned(),
-                    idempotency_key: None,
-                },
-                "stream_status",
-            ),
-            (
-                AgentControlRequest::StreamProgress {
-                    stream_id_hex: stream(),
-                    stream_capability: capability(),
-                    text: "{\"v\":1,\"status\":\"started\"}".to_owned(),
-                    idempotency_key: None,
-                },
-                "stream_progress",
-            ),
-            (
-                AgentControlRequest::StreamFinish {
-                    stream_id_hex: stream(),
-                    stream_capability: capability(),
-                    final_text: "hello".to_owned(),
-                    idempotency_key: Some("stream-finish-1".to_owned()),
-                },
-                "stream_finish",
-            ),
-            (
-                AgentControlRequest::StreamFinalize {
-                    stream_id_hex: stream(),
-                    stream_capability: capability(),
-                    final_text: "hello".to_owned(),
-                    transcript_hash_hex: hash(),
-                    chunk_count: 1,
-                    idempotency_key: Some("stream-final-1".to_owned()),
-                },
-                "stream_finalize",
-            ),
-            (
-                AgentControlRequest::StreamCancel {
-                    stream_id_hex: stream(),
-                    stream_capability: capability(),
-                    reason: Some("gateway_replaced_text".to_owned()),
-                },
-                "stream_cancel",
             ),
             (AgentControlRequest::AccountList, "account_list"),
             (
@@ -2574,14 +2291,6 @@ mod tests {
 
     fn group() -> String {
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned()
-    }
-
-    fn stream() -> String {
-        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned()
-    }
-
-    fn capability() -> String {
-        "6666666666666666666666666666666666666666666666666666666666666666".to_owned()
     }
 
     fn message() -> String {

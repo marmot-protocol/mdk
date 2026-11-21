@@ -1,50 +1,22 @@
-//! Active agent text-stream compose sessions, the debug final-send recorder, and idle sweeping.
+//! Persisted, bounded idempotency receipts for durable sends.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_control::{AgentControlDebugFinalSend, AgentControlSendMaintenanceDisposition};
-use marmot_app::AgentPublisher;
+use agent_control::AgentControlSendMaintenanceDisposition;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedMutexGuard, watch};
+use tokio::sync::OwnedMutexGuard;
 
 use crate::error::ConnectorError;
-use crate::validation::normalize_hex;
-
-#[derive(Clone, Default)]
-pub(crate) struct DebugFinalSendStore {
-    sends: Arc<Mutex<Vec<AgentControlDebugFinalSend>>>,
-}
-
-impl DebugFinalSendStore {
-    pub(crate) fn record(
-        &self,
-        mut send: AgentControlDebugFinalSend,
-    ) -> AgentControlDebugFinalSend {
-        let mut sends = crate::lock_recover(&self.sends);
-        let next_id = sends.len() + 1;
-        send.message_ids_hex = vec![format!("{next_id:064x}")];
-        sends.push(send.clone());
-        send
-    }
-
-    pub(crate) fn list(&self) -> Vec<AgentControlDebugFinalSend> {
-        crate::lock_recover(&self.sends).clone()
-    }
-}
 
 /// Maximum number of recent idempotency keys retained for durable-send dedup.
 /// Oldest keys are evicted FIFO once the cap is reached; this bounds memory while
 /// comfortably covering any plausible in-flight retry window.
 pub(crate) const SEND_IDEMPOTENCY_CAPACITY: usize = 1024;
-/// Preview mutations are process-local and high-frequency. Keep their receipts
-/// in a separate, larger FIFO so they cannot evict durable send/finalize
-/// receipts or cause pointless disk snapshots.
-const PREVIEW_IDEMPOTENCY_CAPACITY: usize = 4096;
 
 /// Relative path under the connector home for persisted `send_final` idempotency
 /// records (`$MARMOT_HOME/dev/send-idempotency.json`).
@@ -80,8 +52,6 @@ struct SendIdempotencyGate {
 #[derive(Clone)]
 pub(crate) struct SendIdempotencyStore {
     path: PathBuf,
-    persist: bool,
-    capacity: usize,
     lock: Arc<Mutex<()>>,
     inner: Arc<Mutex<SendIdempotencyInner>>,
     in_flight: SendIdempotencyGates,
@@ -144,8 +114,6 @@ impl SendIdempotencyStore {
     pub(crate) fn new(home: &Path) -> Self {
         let store = Self {
             path: home.join(SEND_IDEMPOTENCY_FILE),
-            persist: true,
-            capacity: SEND_IDEMPOTENCY_CAPACITY,
             lock: Arc::new(Mutex::new(())),
             inner: Arc::new(Mutex::new(SendIdempotencyInner::default())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
@@ -154,28 +122,10 @@ impl SendIdempotencyStore {
         store
     }
 
-    /// A separate process-local store for strict live-preview mutation
-    /// idempotency. Active streams cannot survive restart, so persisting these
-    /// receipts is both useless and harmful to durable receipt retention.
-    pub(crate) fn process_local_preview() -> Self {
-        Self {
-            path: PathBuf::new(),
-            persist: false,
-            capacity: PREVIEW_IDEMPOTENCY_CAPACITY,
-            lock: Arc::new(Mutex::new(())),
-            inner: Arc::new(Mutex::new(SendIdempotencyInner::default())),
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    /// The message ids recorded for `key` by an earlier successful send, but only
-    /// when the recorded request `fingerprint` matches. A key hit with a different
-    /// fingerprint returns `None` (treated as a cache miss).
-    pub(crate) fn get(&self, key: &str, fingerprint: &str) -> Option<Vec<String>> {
-        self.get_with_disposition(key, fingerprint)
-            .map(|(ids, _)| ids)
-    }
-
+    /// The message ids and maintenance disposition recorded for `key` by an
+    /// earlier successful send, but only when the recorded request `fingerprint`
+    /// matches. A key hit with a different fingerprint returns `None` (treated as
+    /// a cache miss).
     pub(crate) fn get_with_disposition(
         &self,
         key: &str,
@@ -253,9 +203,8 @@ impl SendIdempotencyStore {
     }
 
     /// Acquire an idempotency reservation whose key is permanently bound to
-    /// its first fingerprint. Used by media sends and preview mutations; legacy
-    /// send/finalize callers retain the historical cache-miss semantics of
-    /// [`Self::acquire`].
+    /// its first fingerprint. Used by media sends; plain `send_final` callers
+    /// retain the historical cache-miss semantics of [`Self::acquire`].
     pub(crate) async fn acquire_strict(
         &self,
         key: &str,
@@ -301,7 +250,7 @@ impl SendIdempotencyStore {
             }
         };
         let guard = crate::with_control_operation_timeout(
-            "stream_preview_idempotency_wait",
+            "strict_send_idempotency_wait",
             Arc::clone(&gate.lock).lock_owned(),
         )
         .await
@@ -331,19 +280,10 @@ impl SendIdempotencyStore {
         ))
     }
 
-    /// Record the request `fingerprint` and durable message ids produced for
-    /// `key`. A repeat record for an existing key keeps the original entry (the
-    /// first successful send wins); otherwise the key is appended and the oldest
-    /// is evicted once at capacity.
-    pub(crate) fn record(&self, key: String, fingerprint: String, message_ids: Vec<String>) {
-        self.record_with_disposition(
-            key,
-            fingerprint,
-            message_ids,
-            AgentControlSendMaintenanceDisposition::Ready,
-        );
-    }
-
+    /// Record the request `fingerprint`, durable message ids, and maintenance
+    /// disposition produced for `key`. A repeat record for an existing key keeps
+    /// the original entry (the first successful send wins); otherwise the key is
+    /// appended and the oldest is evicted once at capacity.
     pub(crate) fn record_with_disposition(
         &self,
         key: String,
@@ -356,7 +296,7 @@ impl SendIdempotencyStore {
             if inner.seen.contains_key(&key) {
                 return;
             }
-            if inner.order.len() >= self.capacity
+            if inner.order.len() >= SEND_IDEMPOTENCY_CAPACITY
                 && let Some(evicted) = inner.order.pop_front()
             {
                 inner.seen.remove(&evicted);
@@ -371,9 +311,6 @@ impl SendIdempotencyStore {
             true
         };
         if !should_persist {
-            return;
-        }
-        if !self.persist {
             return;
         }
         // #691: persist OFF the async send hot path. The in-memory entry recorded
@@ -555,327 +492,4 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         difference |= left_byte ^ right_byte;
     }
     difference == 0
-}
-
-const STREAM_BEGIN_RECEIPT_CAPACITY: usize = 1024;
-
-#[derive(Clone, Default)]
-pub(crate) struct StreamSessionStore {
-    sessions: Arc<Mutex<HashMap<String, ActiveStreamSession>>>,
-    begin_receipts: Arc<Mutex<StreamBeginReceiptStore>>,
-}
-
-#[derive(Default)]
-struct StreamBeginReceiptStore {
-    order: VecDeque<String>,
-    by_request_id: HashMap<String, StreamBeginReceipt>,
-    in_flight_by_request_id: HashMap<String, InFlightStreamBegin>,
-    reserved_stream_ids: HashSet<String>,
-}
-
-struct InFlightStreamBegin {
-    fingerprint: String,
-    stream_id_hex: String,
-    completion: watch::Sender<bool>,
-}
-
-#[derive(Clone)]
-pub(crate) struct StreamBeginReceipt {
-    pub(crate) fingerprint: String,
-    pub(crate) stream_id_hex: String,
-    pub(crate) stream_capability: String,
-    pub(crate) start_message_id_hex: String,
-    pub(crate) quic_candidates: Vec<String>,
-    pub(crate) policy_max_plaintext_frame_len: Option<u32>,
-}
-
-pub(crate) enum StreamBeginReservation {
-    Completed(StreamBeginReceipt),
-    Wait(watch::Receiver<bool>),
-    Leader {
-        stream_id: Vec<u8>,
-        stream_id_hex: String,
-        guard: StreamBeginReservationGuard,
-    },
-}
-
-pub(crate) struct StreamBeginReservationGuard {
-    store: StreamSessionStore,
-    request_id: String,
-    stream_id_hex: String,
-    active: bool,
-}
-
-impl StreamBeginReservationGuard {
-    pub(crate) fn complete(mut self, receipt: StreamBeginReceipt) {
-        let completed =
-            self.store
-                .complete_stream_begin(&self.request_id, &self.stream_id_hex, receipt);
-        debug_assert!(completed, "active StreamBegin reservation must still exist");
-        self.active = !completed;
-    }
-}
-
-impl Drop for StreamBeginReservationGuard {
-    fn drop(&mut self) {
-        if self.active {
-            self.store
-                .release_stream_begin(&self.request_id, &self.stream_id_hex);
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ActiveStreamSession {
-    pub(crate) publisher: Arc<AgentPublisher>,
-    pub(crate) stream_capability: [u8; 32],
-    pub(crate) last_activity: Instant,
-}
-
-impl StreamSessionStore {
-    pub(crate) fn insert_new(
-        &self,
-        stream_id_hex: String,
-        session: ActiveStreamSession,
-    ) -> Result<(), ConnectorError> {
-        let mut sessions = crate::lock_recover(&self.sessions);
-        if sessions.contains_key(&stream_id_hex) {
-            return Err(ConnectorError::StreamIdInUse);
-        }
-        sessions.insert(stream_id_hex, session);
-        Ok(())
-    }
-
-    pub(crate) fn get_authorized(
-        &self,
-        stream_id_hex: &str,
-        stream_capability: &str,
-    ) -> Result<ActiveStreamSession, ConnectorError> {
-        let stream_id_hex = normalize_hex(stream_id_hex)?;
-        let mut sessions = crate::lock_recover(&self.sessions);
-        let session = sessions
-            .get_mut(&stream_id_hex)
-            .ok_or(ConnectorError::StreamCapabilityDenied)?;
-        if !stream_capability_matches(&session.stream_capability, stream_capability) {
-            return Err(ConnectorError::StreamCapabilityDenied);
-        }
-        // Touching the session on any command keeps it alive against the idle sweep.
-        session.last_activity = Instant::now();
-        Ok(session.clone())
-    }
-
-    pub(crate) fn reserve_stream_begin(
-        &self,
-        request_id: String,
-        fingerprint: String,
-        requested_stream_id_hex: Option<String>,
-    ) -> Result<StreamBeginReservation, ConnectorError> {
-        // Keep the lock order stable: active sessions first, then begin state.
-        // No DNS, runtime, or broker work runs while either mutex is held.
-        let sessions = crate::lock_recover(&self.sessions);
-        let mut receipts = crate::lock_recover(&self.begin_receipts);
-
-        if let Some(receipt) = receipts.by_request_id.get(&request_id) {
-            if !constant_time_eq(receipt.fingerprint.as_bytes(), fingerprint.as_bytes()) {
-                return Err(ConnectorError::StreamBeginRequestConflict);
-            }
-            return Ok(StreamBeginReservation::Completed(receipt.clone()));
-        }
-        if let Some(in_flight) = receipts.in_flight_by_request_id.get(&request_id) {
-            if !constant_time_eq(in_flight.fingerprint.as_bytes(), fingerprint.as_bytes()) {
-                return Err(ConnectorError::StreamBeginRequestConflict);
-            }
-            return Ok(StreamBeginReservation::Wait(
-                in_flight.completion.subscribe(),
-            ));
-        }
-
-        let (stream_id, stream_id_hex) = if let Some(stream_id_hex) = requested_stream_id_hex {
-            if sessions.contains_key(&stream_id_hex)
-                || receipts.reserved_stream_ids.contains(&stream_id_hex)
-                || receipts
-                    .by_request_id
-                    .values()
-                    .any(|receipt| receipt.stream_id_hex == stream_id_hex)
-            {
-                return Err(ConnectorError::StreamIdInUse);
-            }
-            (hex::decode(&stream_id_hex)?, stream_id_hex)
-        } else {
-            loop {
-                let stream_id = transport_quic_stream::random_stream_id();
-                let stream_id_hex = hex::encode(&stream_id);
-                if !sessions.contains_key(&stream_id_hex)
-                    && !receipts.reserved_stream_ids.contains(&stream_id_hex)
-                    && !receipts
-                        .by_request_id
-                        .values()
-                        .any(|receipt| receipt.stream_id_hex == stream_id_hex)
-                {
-                    break (stream_id, stream_id_hex);
-                }
-            }
-        };
-        let (completion, _receiver) = watch::channel(false);
-        receipts.reserved_stream_ids.insert(stream_id_hex.clone());
-        receipts.in_flight_by_request_id.insert(
-            request_id.clone(),
-            InFlightStreamBegin {
-                fingerprint,
-                stream_id_hex: stream_id_hex.clone(),
-                completion,
-            },
-        );
-        drop(receipts);
-        drop(sessions);
-
-        Ok(StreamBeginReservation::Leader {
-            stream_id,
-            stream_id_hex: stream_id_hex.clone(),
-            guard: StreamBeginReservationGuard {
-                store: self.clone(),
-                request_id,
-                stream_id_hex,
-                active: true,
-            },
-        })
-    }
-
-    fn complete_stream_begin(
-        &self,
-        request_id: &str,
-        stream_id_hex: &str,
-        receipt: StreamBeginReceipt,
-    ) -> bool {
-        let mut receipts = crate::lock_recover(&self.begin_receipts);
-        let matches = receipts
-            .in_flight_by_request_id
-            .get(request_id)
-            .is_some_and(|in_flight| in_flight.stream_id_hex == stream_id_hex);
-        if !matches {
-            return false;
-        }
-        let completion = receipts
-            .in_flight_by_request_id
-            .remove(request_id)
-            .expect("checked in-flight reservation")
-            .completion;
-        receipts.reserved_stream_ids.remove(stream_id_hex);
-        if !receipts.by_request_id.contains_key(request_id) {
-            if receipts.order.len() >= STREAM_BEGIN_RECEIPT_CAPACITY
-                && let Some(evicted) = receipts.order.pop_front()
-            {
-                receipts.by_request_id.remove(&evicted);
-            }
-            receipts.order.push_back(request_id.to_owned());
-            receipts
-                .by_request_id
-                .insert(request_id.to_owned(), receipt);
-        }
-        drop(receipts);
-        let _ = completion.send(true);
-        true
-    }
-
-    fn release_stream_begin(&self, request_id: &str, stream_id_hex: &str) {
-        let mut receipts = crate::lock_recover(&self.begin_receipts);
-        let matches = receipts
-            .in_flight_by_request_id
-            .get(request_id)
-            .is_some_and(|in_flight| in_flight.stream_id_hex == stream_id_hex);
-        if !matches {
-            return;
-        }
-        let in_flight = receipts
-            .in_flight_by_request_id
-            .remove(request_id)
-            .expect("checked in-flight reservation");
-        receipts.reserved_stream_ids.remove(stream_id_hex);
-        drop(receipts);
-        let _ = in_flight.completion.send(true);
-    }
-
-    /// Remove the entry for `stream_id_hex` only when it is still the same
-    /// session as `session` (identified by command-channel identity).
-    ///
-    /// With a get-first finalize flow, an unconditional removal could tear
-    /// down a same-stream-id replacement session inserted concurrently
-    /// between the `get` and the removal; the channel-identity check makes
-    /// the removal a no-op in that case.
-    pub(crate) fn remove_if_same(
-        &self,
-        stream_id_hex: &str,
-        session: &ActiveStreamSession,
-    ) -> Option<ActiveStreamSession> {
-        let mut sessions = crate::lock_recover(&self.sessions);
-        match sessions.get(stream_id_hex) {
-            Some(entry) if Arc::ptr_eq(&entry.publisher, &session.publisher) => {
-                sessions.remove(stream_id_hex)
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn remove_authorized(
-        &self,
-        stream_id_hex: &str,
-        stream_capability: &str,
-    ) -> Result<ActiveStreamSession, ConnectorError> {
-        let stream_id_hex = normalize_hex(stream_id_hex)?;
-        let mut sessions = crate::lock_recover(&self.sessions);
-        let session = sessions
-            .get(&stream_id_hex)
-            .ok_or(ConnectorError::StreamCapabilityDenied)?;
-        if !stream_capability_matches(&session.stream_capability, stream_capability) {
-            return Err(ConnectorError::StreamCapabilityDenied);
-        }
-        sessions
-            .remove(&stream_id_hex)
-            .ok_or(ConnectorError::StreamCapabilityDenied)
-    }
-
-    /// Evict idle active publishers, retaining sealed durable-send retries.
-    pub(crate) async fn sweep_idle(&self, max_idle: Duration) -> usize {
-        let now = Instant::now();
-        let stale = {
-            let mut sessions = crate::lock_recover(&self.sessions);
-            let keys: Vec<_> = sessions
-                .iter()
-                .filter(|(_, session)| {
-                    session.publisher.is_idle_evictable()
-                        && now.duration_since(session.last_activity) >= max_idle
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            keys.into_iter()
-                .filter_map(|id| sessions.remove(&id))
-                .collect::<Vec<_>>()
-        };
-        let count = stale.len();
-        for session in stale {
-            session.publisher.cancel().await;
-        }
-        count
-    }
-}
-
-fn stream_capability_matches(expected: &[u8; 32], provided_hex: &str) -> bool {
-    let decoded = hex::decode(provided_hex).unwrap_or_default();
-    let mut provided = [0u8; 32];
-    if decoded.len() == provided.len() {
-        provided.copy_from_slice(&decoded);
-    }
-    let mut difference = u8::from(decoded.len() != provided.len());
-    for (expected_byte, provided_byte) in expected.iter().zip(provided) {
-        difference |= expected_byte ^ provided_byte;
-    }
-    difference == 0
-}
-
-pub(crate) fn normalize_stream_capability(provided_hex: &str) -> Result<String, ConnectorError> {
-    let decoded = hex::decode(provided_hex).map_err(|_| ConnectorError::StreamCapabilityDenied)?;
-    if decoded.len() != 32 {
-        return Err(ConnectorError::StreamCapabilityDenied);
-    }
-    Ok(hex::encode(decoded))
 }

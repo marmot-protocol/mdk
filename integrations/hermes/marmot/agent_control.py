@@ -57,13 +57,6 @@ _EXPECTED_RESPONSE_TYPES = {
     "allowlist_list": frozenset({"allowlist"}),
     "allowlist_add": frozenset({"allowlist"}),
     "allowlist_remove": frozenset({"allowlist"}),
-    "stream_begin": frozenset({"stream_begun"}),
-    "stream_append": frozenset({"ack"}),
-    "stream_status": frozenset({"ack"}),
-    "stream_progress": frozenset({"ack"}),
-    "stream_finish": frozenset({"stream_finalized"}),
-    "stream_finalize": frozenset({"stream_finalized"}),
-    "stream_cancel": frozenset({"ack"}),
     "send_agent_activity": frozenset({"app_event_sent"}),
     "send_agent_operation_event": frozenset({"app_event_sent"}),
 }
@@ -86,16 +79,10 @@ class MarmotAgentControlClient:
         socket_path: str | Path,
         *,
         request_timeout: float = 30.0,
-        preview_request_timeout: float = 8.0,
         auth_token: Optional[str] = None,
     ):
         self.socket_path = str(Path(socket_path).expanduser())
         self.request_timeout = float(request_timeout)
-        # Best-effort live-preview ops use a short timeout so a wedged preview
-        # broker abandons the preview in a few seconds instead of pinning the
-        # agent turn for the full request_timeout per op (mirrors client.ts
-        # DEFAULT_PREVIEW_REQUEST_TIMEOUT_MS).
-        self.preview_request_timeout = float(preview_request_timeout)
         self.auth_token = str(auth_token).strip() if auth_token else None
 
     async def request(
@@ -535,145 +522,6 @@ class MarmotAgentControlClient:
             }
         )
 
-    async def stream_begin(
-        self,
-        account_id_hex: str,
-        group_id_hex: str,
-        *,
-        stream_id_hex: Optional[str] = None,
-        parent_message_id_hex: Optional[str] = None,
-        quic_candidates: Iterable[str] = (),
-        request_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "type": "stream_begin",
-            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
-            "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
-            "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex") if stream_id_hex else None,
-            "quic_candidates": [str(candidate).strip() for candidate in quic_candidates if str(candidate).strip()],
-        }
-        if parent_message_id_hex:
-            payload["parent_message_id_hex"] = _normalize_hex(
-                parent_message_id_hex,
-                "parent_message_id_hex",
-            )
-        return await self.request(
-            payload,
-            request_id=request_id,
-            timeout=self.preview_request_timeout,
-        )
-
-    async def stream_append(
-        self,
-        stream_id_hex: str,
-        stream_capability: str,
-        append_text: str,
-        idempotency_key: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        key = str(idempotency_key or "").strip()
-        return await self.request(
-            {
-                "type": "stream_append",
-                "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
-                "stream_capability": _normalize_stream_capability(stream_capability),
-                "append_text": str(append_text or ""),
-                **({"idempotency_key": key} if key else {}),
-            },
-            timeout=self.preview_request_timeout,
-        )
-
-    async def stream_status(
-        self,
-        stream_id_hex: str,
-        stream_capability: str,
-        status: str,
-        idempotency_key: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        key = str(idempotency_key or "").strip()
-        return await self.request(
-            {
-                "type": "stream_status",
-                "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
-                "stream_capability": _normalize_stream_capability(stream_capability),
-                "status": str(status or ""),
-                **({"idempotency_key": key} if key else {}),
-            },
-            timeout=self.preview_request_timeout,
-        )
-
-    async def stream_progress(
-        self,
-        stream_id_hex: str,
-        stream_capability: str,
-        text: str,
-        idempotency_key: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        key = str(idempotency_key or "").strip()
-        return await self.request(
-            {
-                "type": "stream_progress",
-                "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
-                "stream_capability": _normalize_stream_capability(stream_capability),
-                "text": str(text or ""),
-                **({"idempotency_key": key} if key else {}),
-            },
-            timeout=self.preview_request_timeout,
-        )
-
-    async def stream_finish(
-        self,
-        stream_id_hex: str,
-        stream_capability: str,
-        final_text: str,
-        idempotency_key: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        key = str(idempotency_key or "").strip()
-        return await self.request({
-            "type": "stream_finish",
-            "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
-            "stream_capability": _normalize_stream_capability(stream_capability),
-            "final_text": str(final_text or ""),
-            **({"idempotency_key": key} if key else {}),
-        })
-
-    async def stream_finalize(
-        self,
-        stream_id_hex: str,
-        stream_capability: str,
-        final_text: str,
-        transcript_hash_hex: str,
-        chunk_count: int,
-        idempotency_key: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        key = str(idempotency_key or "").strip()
-        return await self.request(
-            {
-                "type": "stream_finalize",
-                "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
-                "stream_capability": _normalize_stream_capability(stream_capability),
-                "final_text": str(final_text or ""),
-                "transcript_hash_hex": _normalize_hex(transcript_hash_hex, "transcript_hash_hex"),
-                "chunk_count": int(chunk_count),
-                **({"idempotency_key": key} if key else {}),
-            }
-        )
-
-    async def stream_cancel(
-        self,
-        stream_id_hex: str,
-        stream_capability: str,
-        reason: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        return await self.request(
-            {
-                "type": "stream_cancel",
-                "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
-                "stream_capability": _normalize_stream_capability(stream_capability),
-                "reason": reason,
-            },
-            timeout=self.preview_request_timeout,
-        )
-
     async def send_agent_activity(
         self,
         account_id_hex: str,
@@ -952,18 +800,6 @@ def _require_relay_lists(response: Dict[str, Any]) -> None:
             raise AgentControlError(
                 "wn-agent returned invalid relay_lists response", code="protocol_error"
             )
-
-
-def _normalize_stream_capability(value: Any) -> str:
-    capability = _normalize_hex(value, "stream_capability")
-    if len(capability) != 64:
-        raise AgentControlError(
-            "stream_capability must encode exactly 32 bytes",
-            code="invalid_stream_capability",
-        )
-    return capability
-
-
 
 
 async def _close_writer(writer: asyncio.StreamWriter) -> None:

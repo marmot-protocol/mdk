@@ -10,7 +10,6 @@ import {
   decodeAgentControlEvent,
   normalizeHex,
 } from "../src/client.js";
-import { MarmotLivePreview } from "../src/live.js";
 
 const PROTOCOL = "marmot.agent-control.v2";
 const HEX32 = (b: string) => b.repeat(32);
@@ -147,26 +146,6 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         size_bytes: 4,
       });
       break;
-    case "stream_begin":
-      send(socket, id, {
-        type: "stream_begun",
-        stream_id_hex: HEX32("ee"),
-        stream_capability: HEX32("55"),
-        start_message_id_hex: HEX32("ff"),
-        quic_candidates: [],
-        echoed_parent_message_id_hex: req.parent_message_id_hex ?? null,
-      });
-      break;
-    case "stream_finish":
-    case "stream_finalize":
-      send(socket, id, {
-        type: "stream_finalized",
-        stream_id_hex: req.stream_id_hex ?? HEX32("ee"),
-        message_ids_hex: [HEX32("99")],
-        echoed_idempotency_key: req.idempotency_key ?? null,
-        echoed_stream_capability: req.stream_capability ?? null,
-      });
-      break;
     case "group_info":
       send(socket, id, {
         type: "group_info",
@@ -218,7 +197,7 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
   }
 }
 
-function startServer(socketPath: string, responseDelayMs = 0, handle = handleRequest): Promise<Server> {
+function startServer(socketPath: string): Promise<Server> {
   const server = createServer((socket) => {
     let buffer = Buffer.alloc(0);
     socket.on("data", (chunk) => {
@@ -228,12 +207,7 @@ function startServer(socketPath: string, responseDelayMs = 0, handle = handleReq
         const line = buffer.subarray(0, index);
         buffer = buffer.subarray(index + 1);
         if (line.length > 0) {
-          const req = JSON.parse(line.toString("utf8"));
-          if (responseDelayMs > 0) {
-            setTimeout(() => handle(socket, req), responseDelayMs);
-          } else {
-            handle(socket, req);
-          }
+          handleRequest(socket, JSON.parse(line.toString("utf8")));
         }
         index = buffer.indexOf(0x0a);
       }
@@ -335,50 +309,6 @@ describe("MarmotAgentControlClient", () => {
       "done",
     )) as unknown as { echoed_idempotency_key?: string | null };
     expect(withoutKey.echoed_idempotency_key).toBeNull();
-  });
-
-  it("forwards an idempotency_key on stream_finalize when supplied, and omits it otherwise", async () => {
-    const withKey = (await client.streamFinalize(
-      HEX32("ee"),
-      HEX32("55"),
-      "done",
-      HEX32("aa"),
-      1,
-      "stream-key-1",
-    )) as unknown as {
-      echoed_idempotency_key?: string | null;
-      echoed_stream_capability?: string | null;
-    };
-    expect(withKey.echoed_idempotency_key).toBe("stream-key-1");
-    expect(withKey.echoed_stream_capability).toBe(HEX32("55"));
-
-    const withoutKey = (await client.streamFinalize(
-      HEX32("ee"),
-      HEX32("55"),
-      "done",
-      HEX32("aa"),
-      1,
-    )) as unknown as { echoed_idempotency_key?: string | null };
-    expect(withoutKey.echoed_idempotency_key).toBeNull();
-  });
-
-  it("finishes server-owned transcripts without hash fields", async () => {
-    const result = await client.streamFinish(HEX32("ee"), HEX32("55"), "done", "finish-key");
-    expect(result).toMatchObject({ type: "stream_finalized", echoed_idempotency_key: "finish-key", echoed_stream_capability: HEX32("55") });
-  });
-
-  it("forwards the optional parent message id on stream_begin", async () => {
-    const parentMessageIdHex = HEX32("dd");
-    const withParent = (await client.streamBegin(HEX32("aa"), HEX32("cc"), {
-      parentMessageIdHex,
-    })) as unknown as { echoed_parent_message_id_hex?: string | null };
-    expect(withParent.echoed_parent_message_id_hex).toBe(parentMessageIdHex);
-
-    const withoutParent = (await client.streamBegin(
-      HEX32("aa"),
-      HEX32("cc"),
-    )) as unknown as { echoed_parent_message_id_hex?: string | null };
-    expect(withoutParent.echoed_parent_message_id_hex).toBeNull();
   });
 
   it("deletes a message and returns the deletion event ids", async () => {
@@ -499,36 +429,6 @@ describe("MarmotAgentControlClient", () => {
     });
   });
 
-  it("retries a retryable stream_finish response with the same key", async () => {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    const keys: unknown[] = [];
-    server = await startServer(socketPath, 0, (socket, req) => {
-      if (req.type === "stream_append") {
-        send(socket, req.id, { type: "ack" });
-        return;
-      }
-      if (req.type === "stream_finish") {
-        keys.push(req.idempotency_key);
-        if (keys.length === 1) {
-          send(socket, req.id, {
-            type: "error", code: "send_failed", message: "retry", retryable: true,
-          });
-          return;
-        }
-      }
-      handleRequest(socket, req);
-    });
-    const preview = new MarmotLivePreview(client, {
-      accountIdHex: HEX32("aa"), groupIdHex: HEX32("cc"), quicCandidates: [],
-    });
-    await expect(preview.finalize("done")).resolves.toMatchObject({
-      messageIdsHex: [HEX32("99")],
-    });
-    expect(keys).toHaveLength(2);
-    expect(keys[0]).toEqual(expect.any(String));
-    expect(keys[1]).toBe(keys[0]);
-  });
-
   it("rejects a mismatched response id", async () => {
     await expect(client.request({ type: "wrong_id" })).rejects.toMatchObject({
       code: "id_mismatch",
@@ -559,46 +459,6 @@ describe("MarmotAgentControlClient", () => {
       requestTimeoutMs: 1000,
     });
     await expect(broken.accountList()).rejects.toMatchObject({ retryable: true });
-  });
-});
-
-describe("preview op timeouts", () => {
-  let dir: string;
-  let socketPath: string;
-  let server: Server;
-
-  beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), "oc-marmot-delay-"));
-    socketPath = join(dir, "delay.sock");
-    // Every response is delayed 400ms: well past the short preview timeout, well
-    // under the durable request timeout.
-    server = await startServer(socketPath, 400);
-  });
-
-  afterEach(async () => {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    await rm(dir, { recursive: true, force: true });
-  });
-
-  it("abandons a best-effort preview op at the short preview timeout", async () => {
-    const client = new MarmotAgentControlClient({
-      socketPath,
-      requestTimeoutMs: 3000,
-      previewRequestTimeoutMs: 80,
-    });
-    await expect(client.streamBegin(HEX32("aa"), HEX32("cc"))).rejects.toMatchObject({
-      code: "timeout",
-    });
-  });
-
-  it("still completes a durable send under the full request timeout", async () => {
-    const client = new MarmotAgentControlClient({
-      socketPath,
-      requestTimeoutMs: 3000,
-      previewRequestTimeoutMs: 80,
-    });
-    const res = await client.sendFinal(HEX32("aa"), HEX32("cc"), "done");
-    expect(res.message_ids_hex).toEqual([HEX32("ab")]);
   });
 });
 

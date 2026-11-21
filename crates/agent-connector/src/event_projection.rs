@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use agent_control::{
     AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX, AGENT_CONTROL_REFERENCED_TEXT_MAX_CHARS,
-    AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlActor, AgentControlAttachmentSummary,
-    AgentControlEvent, AgentControlMediaLocator, AgentControlMediaRef, AgentControlMessage,
-    AgentControlReferencedMessage, AgentControlReferencedMessageAvailability,
+    AgentControlActor, AgentControlAttachmentSummary, AgentControlEvent, AgentControlMediaLocator,
+    AgentControlMediaRef, AgentControlMessage, AgentControlReferencedMessage,
+    AgentControlReferencedMessageAvailability,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_EVENT_VERSION,
@@ -16,9 +16,8 @@ use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED, GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED,
     GROUP_SYSTEM_TYPE_GROUP_DISBANDED, GROUP_SYSTEM_TYPE_GROUP_RENAMED,
     GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
-    GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GroupSystemEvent, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
-    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION, STREAM_TAG,
+    GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GroupSystemEvent, MARMOT_APP_EVENT_KIND_DELETE,
+    MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
     group_system_canonical_id,
 };
 use cgka_traits::is_chat_message;
@@ -74,9 +73,9 @@ fn plaintext_has_nostr_hex_ref(plaintext: &str, reference: &str) -> bool {
 /// Upper bound for the plaintext scanned for visible `npub` mention tokens.
 /// Mention classification runs on attacker-controlled inbound plaintext during
 /// live delivery and replay, so keep the per-message work bounded even though
-/// the scanner below is linear. Mirrors the UniFFI Markdown cap/frame size.
-const MAX_MENTION_PLAINTEXT_SCAN_BYTES: usize =
-    cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
+/// the scanner below is linear. Matches the UniFFI Markdown input cap
+/// (`MAX_FFI_MARKDOWN_INPUT_BYTES`), far above any typed chat message.
+pub(crate) const MAX_MENTION_PLAINTEXT_SCAN_BYTES: usize = 65_519;
 
 /// Scan `plaintext` for a visible npub mention token for the account.
 ///
@@ -674,36 +673,6 @@ pub(crate) fn control_event_from_runtime_event_with_runtime(
                 group_filter,
             )
         }
-        MarmotAppEvent::AgentStreamStarted(update) => {
-            if update.message.kind != MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
-                return Ok(None);
-            }
-            let Some(group_id_hex) = inbound_event_group_id_hex(
-                account_filter,
-                &update.account_id_hex,
-                group_filter,
-                &update.message.group_id,
-                &update.message.sender,
-            ) else {
-                return Ok(None);
-            };
-            let Some(stream_id_hex) = update
-                .message
-                .tags
-                .iter()
-                .find(|tag| tag.first().is_some_and(|name| name == STREAM_TAG))
-                .and_then(|tag| tag.get(1))
-                .and_then(|stream_id_hex| normalize_hex(stream_id_hex).ok())
-            else {
-                return Ok(None);
-            };
-            Ok(Some(AgentControlEvent::StreamUpdate {
-                account_id_hex: update.account_id_hex,
-                group_id_hex,
-                stream_id_hex,
-                status: AGENT_CONTROL_STREAM_STATUS_STARTED.to_owned(),
-            }))
-        }
         MarmotAppEvent::GroupEvent(group_event) => match group_event.event {
             GroupEvent::GroupJoined {
                 group_id,
@@ -878,11 +847,6 @@ pub(crate) fn control_event_from_debug_event(
             account_id_hex,
             group_id_hex,
             ..
-        }
-        | AgentControlEvent::StreamUpdate {
-            account_id_hex,
-            group_id_hex,
-            ..
         } => (account_id_hex, group_id_hex),
         // ResyncRequired carries optional account/group scope and is never produced by the
         // debug-inject path; apply the subscription filters against whatever scope it carries.
@@ -962,10 +926,6 @@ pub(crate) fn inbound_message_event_from_record_with_runtime(
     account_filter: Option<&str>,
     group_filter: Option<&str>,
 ) -> Result<Option<AgentControlEvent>, AppError> {
-    debug_assert_ne!(
-        MARMOT_APP_EVENT_KIND_CHAT,
-        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
-    );
     project_durable_record(
         runtime,
         account_ref,

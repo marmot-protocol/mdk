@@ -5,10 +5,11 @@ The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` and `
 
 ## Scope
 
-- A thin, **control-plane-only** Hermes platform plugin. `wn-agent` owns the Marmot account, MLS state, Nostr
-  transport, and QUIC previews; this plugin only speaks `marmot.agent-control.v2` (NDJSON over a Unix socket).
-- Use `stream_finish` with acknowledged final text; Rust owns transcript hashing and chunking.
-- No QUIC, crypto, relay, or MLS logic here.
+- A thin, **control-plane-only** Hermes platform plugin. `wn-agent` owns the Marmot account, MLS state, and Nostr
+  transport; this plugin only speaks `marmot.agent-control.v2` (NDJSON over a Unix socket).
+- Deliver final replies as durable `send_final` messages. Marmot has no live previews and cannot edit a sent message, so
+  keep Hermes token streaming pinned off for the Marmot platform (`scripts/hermes_marmot_configure_gateway.py`).
+- No crypto, relay, or MLS logic here.
 - Privacy-safe logging only: no account ids, group ids, message ids, pubkeys, relay URLs, payloads, ciphertext,
   plaintext, or key material.
 
@@ -17,8 +18,7 @@ The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` and `
 - `plugin.yaml` — Hermes platform plugin manifest.
 - `__init__.py` — plugin entry registration.
 - `adapter.py` — Hermes platform adapter: inbound/outbound bridging, activation, sender ACL, media, the registered
-  platform tools (`marmot_status`, `marmot_history`, `marmot_group_profile`, `marmot_reaction`), and live-preview
-  state machine.
+  platform tools (`marmot_status`, `marmot_history`, `marmot_group_profile`, `marmot_reaction`).
 - `inbound_spool.py` — crash-safe inbound obligation spool ahead of Hermes' in-memory debounce/queue.
 - `ambient_context.py` — private durable quiet-context facts (hashed keys only; no message text or identifiers).
 - `agent_control.py` — hardened v2 NDJSON control-socket client (framing, correlation, typed requests including the

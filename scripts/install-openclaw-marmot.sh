@@ -51,7 +51,6 @@ MIN_OPENCLAW_VERSION="2026.10.10"
 ASSUME_YES=0
 CONFIGURE_OPENCLAW=1
 DRY_RUN=0
-ENABLE_STREAMING=0
 FORCE=0
 INSTALL_SERVICE=1
 INTERACTIVE=0
@@ -72,7 +71,6 @@ WN_AGENT_TEMP_PID=""
 
 RELAYS=()
 ALLOW_WELCOMERS=()
-QUIC_CANDIDATES=()
 
 usage() {
     cat <<'USAGE'
@@ -99,8 +97,6 @@ Options:
                            key, never an nsec or raw secret key
   --generate-identity      Explicitly use generated-identity onboarding (default)
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
-  --enable-streaming       Configure OpenClaw/Marmot live preview streaming
-  --quic-candidate URI     QUIC preview candidate used with --enable-streaming
   --no-service             Do not install/start a LaunchAgent or systemd user unit
   --no-start-wn-agent      Do not start wn-agent before bootstrap
   --no-configure-openclaw  Install assets but do not patch OpenClaw config
@@ -682,12 +678,6 @@ bootstrap_agent() {
     fi
     local relay
     for relay in "${RELAYS[@]}"; do args+=(--relay "$relay"); done
-    if [ "$ENABLE_STREAMING" -eq 1 ]; then
-        local candidate
-        for candidate in "${QUIC_CANDIDATES[@]}"; do args+=(--quic-candidate "$candidate"); done
-    else
-        args+=(--no-quic)
-    fi
     if [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ]; then
         local welcomer
         for welcomer in "${ALLOW_WELCOMERS[@]}"; do args+=(--allow-welcomer "$welcomer"); done
@@ -739,16 +729,8 @@ openclaw_config_path() {
 
 configure_openclaw_gateway() {
     if [ "$CONFIGURE_OPENCLAW" -ne 1 ]; then return 0; fi
-    local config_path stream_mode quic_csv
+    local config_path
     config_path="$(openclaw_config_path)"
-    if [ "$ENABLE_STREAMING" -eq 1 ]; then stream_mode="block"; else stream_mode="off"; fi
-    quic_csv=""
-    if [ "$ENABLE_STREAMING" -eq 1 ] && [ "${#QUIC_CANDIDATES[@]}" -gt 0 ]; then
-        local candidate
-        for candidate in "${QUIC_CANDIDATES[@]}"; do
-            if [ -z "$quic_csv" ]; then quic_csv="$candidate"; else quic_csv="$quic_csv,$candidate"; fi
-        done
-    fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would patch OpenClaw config: $config_path"
@@ -765,27 +747,20 @@ configure_openclaw_gateway() {
         printf '{}\n' >"$config_path"
     fi
 
-    node - "$config_path" "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET" "$BOOTSTRAP_ACCOUNT_ID_HEX" "$stream_mode" "$quic_csv" "$BOOTSTRAP_WELCOMER_ALLOWLIST_CSV" <<'NODE'
+    node - "$config_path" "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET" "$BOOTSTRAP_ACCOUNT_ID_HEX" "$BOOTSTRAP_WELCOMER_ALLOWLIST_CSV" <<'NODE'
 const fs = require("fs");
-const [configPath, marmotHome, socketPath, accountIdHex, streamMode, quicCsv, allowCsv] = process.argv.slice(2);
+const [configPath, marmotHome, socketPath, accountIdHex, allowCsv] = process.argv.slice(2);
 const raw = fs.readFileSync(configPath, "utf8").trim();
 const cfg = raw ? JSON.parse(raw) : {};
 cfg.channels = cfg.channels || {};
-const existing = cfg.channels.marmot || {};
-const existingStreaming = existing.streaming || {};
-const quicCandidates = quicCsv ? quicCsv.split(",").map((item) => item.trim()).filter(Boolean) : [];
+// Live previews were removed; drop the preview keys earlier installers wrote.
+const { quicCandidates, streaming, blockStreaming, ...existing } = cfg.channels.marmot || {};
 const channel = {
   ...existing,
   enabled: true,
   home: marmotHome,
   socketPath,
   accountIdHex,
-  quicCandidates,
-  streaming: {
-    ...existingStreaming,
-    mode: streamMode,
-    block: { ...(existingStreaming.block || {}), enabled: streamMode !== "off" },
-  },
 };
 const allowFrom = allowCsv ? allowCsv.split(",").map((item) => item.trim()).filter(Boolean) : [];
 if (allowFrom.length > 0) {
@@ -793,10 +768,6 @@ if (allowFrom.length > 0) {
   channel[directMessageKey] = { ...(existing[directMessageKey] || {}), allowFrom };
 }
 cfg.channels.marmot = channel;
-if (streamMode !== "off") {
-  cfg.agents = cfg.agents || {};
-  cfg.agents.defaults = { ...(cfg.agents.defaults || {}), blockStreamingDefault: "on" };
-}
 fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n");
 NODE
     log "patched OpenClaw Marmot channel config -> $config_path"
@@ -874,8 +845,6 @@ while [ $# -gt 0 ]; do
         --generate-identity) GENERATE_IDENTITY_EXPLICIT=1; shift ;;
         --allow-welcomer) ALLOW_WELCOMERS+=("${2:?missing value for --allow-welcomer}"); shift 2 ;;
         --relay) CLI_RELAYS=1; RELAYS+=("${2:?missing value for --relay}"); shift 2 ;;
-        --enable-streaming) ENABLE_STREAMING=1; shift ;;
-        --quic-candidate) QUIC_CANDIDATES+=("${2:?missing value for --quic-candidate}"); shift 2 ;;
         --no-service) INSTALL_SERVICE=0; shift ;;
         --no-start-wn-agent) NO_START_WN_AGENT=1; shift ;;
         --no-configure-openclaw) CONFIGURE_OPENCLAW=0; shift ;;
@@ -899,7 +868,6 @@ if [ "${#RELAYS[@]}" -eq 0 ]; then RELAYS+=("wss://relay.eu.whitenoise.chat" "ws
 if [ -n "${MARMOT_WELCOMER_ALLOWLIST:-}" ]; then
     while IFS= read -r welcomer; do ALLOW_WELCOMERS+=("$welcomer"); done < <(append_csv "$MARMOT_WELCOMER_ALLOWLIST")
 fi
-if [ "${#QUIC_CANDIDATES[@]}" -eq 0 ]; then QUIC_CANDIDATES+=("quic://quic-broker.ipf.dev:4450"); fi
 
 if [ "$INTERACTIVE" -eq 1 ]; then
     log "guided setup will prompt on /dev/tty; press Enter to accept defaults"
