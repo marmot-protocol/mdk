@@ -19,7 +19,6 @@ const IV_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const MAX_CIPHER: usize = MAGIC.len() + IV_LEN + MAX_VALUE + TAG_LEN;
 const MAX_LEGACY_XML: usize = 8 * 1024 * 1024;
-const PENDING: &str = ".pending-";
 const UNPUBLISHED: &str = ".unpublished-";
 const PROVIDER: &str = "AndroidKeyStore";
 const TRANSFORM: &str = "AES/GCM/NoPadding";
@@ -191,28 +190,6 @@ impl NativeVault {
         )?)
     }
 
-    /// The vault lease excludes publication and deletion while recovering a stage.
-    fn read_receipt_under_lease(
-        &self,
-        directory: &Path,
-        path: &Path,
-        name: &str,
-    ) -> AccountHomeResult<Option<Zeroizing<String>>> {
-        if let Some(bytes) = read_record(path, MAX_CIPHER)? {
-            return self.decrypt(name, &bytes).map(Some);
-        }
-        let pending = directory.join(format!("{PENDING}{name}"));
-        let Some(file) = open_file(&pending)? else {
-            return Ok(None);
-        };
-        let bytes = read_open_file(&file, MAX_CIPHER, check_file)?;
-        let value = self.decrypt(name, &bytes)?;
-        file.sync_all()?;
-        fs::rename(&pending, path)?;
-        sync_directory(directory)?;
-        Ok(Some(value))
-    }
-
     fn aad(&self, name: &str) -> Vec<u8> {
         let mut aad = Vec::with_capacity(self.namespace.len() + 1 + name.len());
         aad.extend_from_slice(self.namespace.as_bytes());
@@ -315,13 +292,9 @@ impl VaultStorage for NativeVault {
         let directory = self.directory(kind);
         let path = directory.join(name);
         match kind {
-            RecordKind::Receipt => {
-                if let Some(bytes) = read_record(&path, MAX_CIPHER)? {
-                    return self.decrypt(name, &bytes).map(Some);
-                }
-                let _lease = self.lease()?;
-                self.read_receipt_under_lease(&directory, &path, name)
-            }
+            RecordKind::Receipt => read_record(&path, MAX_CIPHER)?
+                .map(|bytes| self.decrypt(name, &bytes))
+                .transpose(),
             RecordKind::Retirement => read_record(&path, MAX_VALUE)?
                 .map(|bytes| secret_string(&bytes))
                 .transpose(),
@@ -339,10 +312,8 @@ impl VaultStorage for NativeVault {
         match kind {
             RecordKind::Retirement => publish_record(&directory, name, value.as_bytes()),
             RecordKind::Receipt => {
-                if let Some(existing) =
-                    self.read_receipt_under_lease(&directory, &directory.join(name), name)?
-                {
-                    if existing.as_str() != value {
+                if let Some(bytes) = read_record(&directory.join(name), MAX_CIPHER)? {
+                    if self.decrypt(name, &bytes)?.as_str() != value {
                         return Err(failure("Android receipt is immutable"));
                     }
                     return sync_directory(&directory);
@@ -358,8 +329,6 @@ impl VaultStorage for NativeVault {
         let _lease = self.lease()?;
         let directory = self.directory(kind);
         let mut result = remove_record(&directory.join(name));
-        let pending = remove_record(&directory.join(format!("{PENDING}{name}")));
-        result = combine_errors(result, pending);
         let unpublished = remove_record(&directory.join(format!("{UNPUBLISHED}{name}")));
         result = combine_errors(result, unpublished);
         result = combine_errors(result, sync_directory(&directory));
@@ -370,7 +339,6 @@ impl VaultStorage for NativeVault {
     }
 
     fn names(&self, kind: RecordKind) -> AccountHomeResult<Vec<String>> {
-        let _lease = self.lease()?;
         let mut names = Vec::new();
         for entry in fs::read_dir(self.directory(kind))? {
             let entry = entry?;
@@ -382,23 +350,16 @@ impl VaultStorage for NativeVault {
                 validate_name(unpublished)?;
                 continue;
             }
-            if !entry.file_type()?.is_file() {
-                return Err(failure("Android vault record is not a regular file"));
-            }
-            check_file(&entry.metadata()?)?;
-            let name = match name.strip_prefix(PENDING) {
-                Some(pending) if matches!(kind, RecordKind::Retirement) => {
-                    validate_name(pending)?;
-                    continue;
-                }
-                Some(pending) => pending,
-                None => name,
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
             };
+            check_file(&metadata)?;
             validate_name(name)?;
             names.push(name.to_owned());
         }
         names.sort_unstable();
-        names.dedup();
         Ok(names)
     }
 
@@ -845,7 +806,6 @@ fn read_open_file(
 }
 
 fn publish_record(directory: &Path, name: &str, bytes: &[u8]) -> AccountHomeResult<()> {
-    let pending = directory.join(format!("{PENDING}{name}"));
     let unpublished = directory.join(format!("{UNPUBLISHED}{name}"));
     remove_record(&unpublished)?;
     let mut file = OpenOptions::new()
@@ -856,10 +816,7 @@ fn publish_record(directory: &Path, name: &str, bytes: &[u8]) -> AccountHomeResu
         .open(&unpublished)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    // Publish a recoverable receipt only after the complete ciphertext is synced.
-    fs::rename(&unpublished, &pending)?;
-    sync_directory(directory)?;
-    fs::rename(&pending, directory.join(name))?;
+    fs::rename(&unpublished, directory.join(name))?;
     sync_directory(directory)
 }
 
