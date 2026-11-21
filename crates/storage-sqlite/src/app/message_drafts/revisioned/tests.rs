@@ -623,3 +623,79 @@ fn cancelling_older_event_preserves_a_replacement_for_the_same_draft_revision() 
         .unwrap();
     assert!(app.selected_message_draft(GROUP).unwrap().draft.is_none());
 }
+
+/// mdk#3586: an update keeps every attachment it does not name, inline ones
+/// included, after the ones it names; `Removed` deletes one, and
+/// removing an id the draft no longer holds changes nothing.
+#[test]
+fn an_update_keeps_attachments_it_does_not_name_and_removes_only_named_ones() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store);
+    let inline = |id: &str| {
+        StoredMessageDraftAttachmentInput::Inline(StoredMessageDraftAttachment {
+            id: id.into(),
+            plaintext: id.as_bytes().to_vec(),
+            ..attachment()
+        })
+    };
+    let removed = |id: &str| StoredMessageDraftAttachmentInput::Removed(id.into());
+    let ids = |selected: &SelectedMessageDraft| {
+        selected
+            .draft
+            .as_ref()
+            .unwrap()
+            .media_attachments
+            .iter()
+            .map(|attachment| attachment.id.clone())
+            .collect::<Vec<_>>()
+    };
+    let initial = app.selected_message_draft(GROUP).unwrap();
+    let full = app
+        .save_message_draft_if_revision(
+            &initial.revision,
+            "",
+            None,
+            &[inline("a"), inline("b"), inline("c")],
+        )
+        .unwrap();
+
+    let typed = app
+        .update_message_draft_if_revision(&full.revision, "typed", None, &[])
+        .unwrap();
+    assert_eq!(typed.draft.as_ref().unwrap().content, "typed");
+    assert_eq!(ids(&typed), ["a", "b", "c"], "naming none keeps all");
+
+    let partial = app
+        .update_message_draft_if_revision(
+            &typed.revision,
+            "typed",
+            None,
+            &[inline("c"), inline("d")],
+        )
+        .unwrap();
+    assert_eq!(
+        ids(&partial),
+        ["c", "d", "a", "b"],
+        "named first, kept after"
+    );
+
+    let trimmed = app
+        .update_message_draft_if_revision(
+            &partial.revision,
+            "typed",
+            None,
+            &[removed("a"), removed("never-held")],
+        )
+        .unwrap();
+    assert_eq!(ids(&trimmed), ["c", "d", "b"]);
+
+    let replaced = app
+        .save_message_draft_if_revision(&trimmed.revision, "typed", None, &[inline("b")])
+        .unwrap();
+    assert_eq!(
+        ids(&replaced),
+        ["b"],
+        "a whole-list save still drops the rest"
+    );
+}

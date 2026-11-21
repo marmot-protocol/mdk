@@ -122,24 +122,33 @@ impl MarmotMessageDraftAttachmentInput {
 
 /// One attachment of `marmot_save_message_draft_inputs_if_revision`.
 /// Borrowed input only. A non-NULL `retained_id` keeps the draft's own
-/// attachment with that id, body untouched, and `attachment` is ignored;
-/// a NULL `retained_id` saves `attachment` as a new inline body. Keep every
-/// file-backed attachment by id: leaving one out deletes its file.
+/// attachment with that id, body untouched; a non-NULL `removed_id` removes
+/// the draft's attachment with that id (and its file). Either way
+/// `attachment` is ignored. With both NULL, `attachment` is saved as a new
+/// inline body; both non-NULL is MARMOT_STATUS_INVALID_ARGUMENT. An
+/// attachment the save does not name stays in the draft.
 #[repr(C)]
 pub struct MarmotMessageDraftAttachmentSaveInput {
     /// Nullable.
     pub retained_id: *const ::std::ffi::c_char,
     pub attachment: MarmotMessageDraftAttachmentInput,
+    /// Nullable.
+    pub removed_id: *const ::std::ffi::c_char,
 }
 
 impl MarmotMessageDraftAttachmentSaveInput {
     /// # Safety
-    /// `retained_id` must be NULL or valid; otherwise `attachment` must meet
+    /// `retained_id` and `removed_id` must each be NULL or valid; with both
+    /// NULL, `attachment` must meet
     /// [`MarmotMessageDraftAttachmentInput::to_ffi`]'s contract.
     pub(crate) unsafe fn to_ffi(&self) -> Result<MessageDraftAttachmentInputFfi, MarmotStatus> {
-        Ok(match unsafe { optional_str(self.retained_id) }? {
-            Some(id) => MessageDraftAttachmentInputFfi::Retained { id },
-            None => MessageDraftAttachmentInputFfi::Inline {
+        let retained = unsafe { optional_str(self.retained_id) }?;
+        let removed = unsafe { optional_str(self.removed_id) }?;
+        Ok(match (retained, removed) {
+            (Some(_), Some(_)) => return Err(MarmotStatus::InvalidArgument),
+            (Some(id), None) => MessageDraftAttachmentInputFfi::Retained { id },
+            (None, Some(id)) => MessageDraftAttachmentInputFfi::Removed { id },
+            (None, None) => MessageDraftAttachmentInputFfi::Inline {
                 attachment: unsafe { self.attachment.to_ffi() }?,
             },
         })

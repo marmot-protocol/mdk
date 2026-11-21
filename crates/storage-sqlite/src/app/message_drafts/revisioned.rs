@@ -164,25 +164,69 @@ impl SqliteAppStorage {
         reply: Option<&str>,
         attachments: &[StoredMessageDraftAttachmentInput],
     ) -> Result<SelectedMessageDraft, MessageDraftRevisionError> {
-        let attachments = attachments
+        self.write_message_draft_if_revision(expected, content, reply, attachments, false)
+    }
+
+    /// [`Self::save_message_draft_if_revision`], except that an attachment
+    /// the draft holds and the save does not name stays: a save never drops
+    /// one its caller did not know about. Name one
+    /// [`StoredMessageDraftAttachmentInput::Removed`] to delete it. The named attachments come first, in
+    /// order, then the kept ones in their stored order. Removing an id the
+    /// draft does not hold changes nothing.
+    pub fn update_message_draft_if_revision(
+        &self,
+        expected: &MessageDraftRevision,
+        content: &str,
+        reply: Option<&str>,
+        attachments: &[StoredMessageDraftAttachmentInput],
+    ) -> Result<SelectedMessageDraft, MessageDraftRevisionError> {
+        self.write_message_draft_if_revision(expected, content, reply, attachments, true)
+    }
+
+    fn write_message_draft_if_revision(
+        &self,
+        expected: &MessageDraftRevision,
+        content: &str,
+        reply: Option<&str>,
+        attachments: &[StoredMessageDraftAttachmentInput],
+        keep_unnamed: bool,
+    ) -> Result<SelectedMessageDraft, MessageDraftRevisionError> {
+        let named = attachments
             .iter()
-            .map(DraftAttachmentInput::from)
+            .map(|attachment| match attachment {
+                StoredMessageDraftAttachmentInput::Inline(attachment) => attachment.id.as_str(),
+                StoredMessageDraftAttachmentInput::Retained(id)
+                | StoredMessageDraftAttachmentInput::Removed(id) => id,
+            })
+            .collect::<HashSet<_>>();
+        let kept = attachments
+            .iter()
+            .filter_map(DraftAttachmentInput::kept)
             .collect::<Vec<_>>();
-        validate_waveform_samples(attachments.iter().filter_map(DraftAttachmentInput::inline))?;
+        validate_waveform_samples(kept.iter().filter_map(DraftAttachmentInput::inline))?;
         self.connection.with_transaction(|| {
-            {
+            let stored = {
                 let conn = self.lock()?;
                 check_revision_tx(&conn, expected)?;
-                let stored = draft_attachment_ids_tx(&conn, &expected.group_id_hex)?;
-                if attachments.iter().any(|attachment| {
-                    matches!(attachment, DraftAttachmentInput::Retained(id) if !stored.contains(*id))
-                }) {
-                    return Err(MessageDraftRevisionError::Invalid(
-                        "a retained attachment is not in the draft",
-                    ));
-                }
+                draft_attachment_ids_tx(&conn, &expected.group_id_hex)?
+            };
+            if kept.iter().any(|attachment| {
+                matches!(attachment, DraftAttachmentInput::Retained(id) if !stored.iter().any(|stored| stored == id))
+            }) {
+                return Err(MessageDraftRevisionError::Invalid(
+                    "a retained attachment is not in the draft",
+                ));
             }
-            self.write_message_draft(&expected.group_id_hex, content, reply, &attachments)?;
+            let mut kept = kept.clone();
+            if keep_unnamed {
+                kept.extend(
+                    stored
+                        .iter()
+                        .filter(|id| !named.contains(id.as_str()))
+                        .map(|id| DraftAttachmentInput::Retained(id)),
+                );
+            }
+            self.write_message_draft(&expected.group_id_hex, content, reply, &kept)?;
             Ok(self.selected_message_draft(&expected.group_id_hex)?)
         })
     }

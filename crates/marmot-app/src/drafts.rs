@@ -37,20 +37,22 @@ impl fmt::Debug for MessageDraftAttachment {
     }
 }
 
-/// One attachment of a draft being saved: new inline bytes, or the id of an
-/// attachment already in the draft, kept as stored. Retaining is how a
-/// file-backed attachment stays in a draft without its bytes crossing again.
+/// One attachment of a draft being saved: new inline bytes, the id of an
+/// attachment already in the draft, kept as stored, or the id of one to
+/// remove. Retaining places a kept attachment in the save's order without
+/// its bytes crossing again.
 #[derive(Clone, PartialEq)]
 pub enum MessageDraftAttachmentInput {
     Inline(MessageDraftAttachment),
     Retained(String),
+    Removed(String),
 }
 
 impl MessageDraftAttachmentInput {
     fn id(&self) -> &str {
         match self {
             Self::Inline(attachment) => &attachment.id,
-            Self::Retained(id) => id,
+            Self::Retained(id) | Self::Removed(id) => id,
         }
     }
 }
@@ -60,6 +62,7 @@ impl fmt::Debug for MessageDraftAttachmentInput {
         match self {
             Self::Inline(attachment) => formatter.debug_tuple("Inline").field(attachment).finish(),
             Self::Retained(_) => formatter.debug_tuple("Retained").finish_non_exhaustive(),
+            Self::Removed(_) => formatter.debug_tuple("Removed").finish_non_exhaustive(),
         }
     }
 }
@@ -69,6 +72,7 @@ impl From<MessageDraftAttachmentInput> for StoredMessageDraftAttachmentInput {
         match value {
             MessageDraftAttachmentInput::Inline(attachment) => Self::Inline(attachment.into()),
             MessageDraftAttachmentInput::Retained(id) => Self::Retained(id),
+            MessageDraftAttachmentInput::Removed(id) => Self::Removed(id),
         }
     }
 }
@@ -319,6 +323,9 @@ impl MarmotApp {
             .selected_message_draft(group)
             .map_err(|error| draft_storage_error(error, group))
     }
+    /// Replace the draft's text and attachments if `expected` is still
+    /// current. An attachment left out is deleted, and a file it owned is
+    /// unlinked.
     pub fn save_message_draft_if_revision(
         &self,
         account_ref: &str,
@@ -327,20 +334,27 @@ impl MarmotApp {
         reply: Option<&str>,
         attachments: Vec<MessageDraftAttachment>,
     ) -> Result<SelectedMessageDraft, AppError> {
-        self.save_message_draft_inputs_if_revision(
+        let attachments = attachments
+            .into_iter()
+            .map(MessageDraftAttachmentInput::Inline)
+            .collect();
+        self.write_message_draft_if_revision(
             account_ref,
             expected,
             content,
             reply,
-            attachments
-                .into_iter()
-                .map(MessageDraftAttachmentInput::Inline)
-                .collect(),
+            attachments,
+            false,
         )
     }
-    /// [`Self::save_message_draft_if_revision`] where each attachment is new
-    /// inline bytes or a retained id of one already in the draft. An
-    /// attachment left out is deleted, and a file it owned is unlinked.
+    /// Save the draft if `expected` is still current. Each attachment is new
+    /// inline bytes, the retained id of one already in the draft, or the id
+    /// of one to remove. Every attachment the draft holds that the save does
+    /// not name stays, so a save never drops one its caller did not know
+    /// about. [`MessageDraftAttachmentInput::Removed`] deletes one, and an
+    /// `Inline` input reusing a held id replaces its body; either unlinks a
+    /// file it owned. The named attachments come first, in order, then the
+    /// kept ones in their stored order.
     pub fn save_message_draft_inputs_if_revision(
         &self,
         account_ref: &str,
@@ -349,15 +363,36 @@ impl MarmotApp {
         reply: Option<&str>,
         attachments: Vec<MessageDraftAttachmentInput>,
     ) -> Result<SelectedMessageDraft, AppError> {
+        self.write_message_draft_if_revision(
+            account_ref,
+            expected,
+            content,
+            reply,
+            attachments,
+            true,
+        )
+    }
+    fn write_message_draft_if_revision(
+        &self,
+        account_ref: &str,
+        expected: &MessageDraftRevision,
+        content: &str,
+        reply: Option<&str>,
+        attachments: Vec<MessageDraftAttachmentInput>,
+        keep_unnamed: bool,
+    ) -> Result<SelectedMessageDraft, AppError> {
         validate_message_draft_inputs(&attachments)?;
         let storage = self.draft_storage(account_ref)?;
         let attachments = attachments.into_iter().map(Into::into).collect::<Vec<_>>();
         let group = expected.group_id_hex();
         let result = self.releasing_draft_files(account_ref, &storage, group, || {
-            storage
-                .app_storage()
-                .save_message_draft_if_revision(expected, content, reply, &attachments)
-                .map_err(|error| revision_error(error, group))
+            let drafts = storage.app_storage();
+            if keep_unnamed {
+                drafts.update_message_draft_if_revision(expected, content, reply, &attachments)
+            } else {
+                drafts.save_message_draft_if_revision(expected, content, reply, &attachments)
+            }
+            .map_err(|error| revision_error(error, group))
         })?;
         self.notify_draft_changed(account_ref, group);
         Ok(result)

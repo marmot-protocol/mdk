@@ -28,6 +28,9 @@
 
 ### Added
 
+- `SqliteAppStorage::update_message_draft_if_revision` saves a draft like `save_message_draft_if_revision` but keeps
+  every attachment it does not name, after the named ones; `StoredMessageDraftAttachmentInput` gains `Removed(id)`,
+  which deletes one. Exhaustive matches on the enum need the new arm (#3586).
 - `SqliteAppStorage::thread_root_hint` returns the kind and author of a thread root this device no longer stores, as
   the nearest ancestor naming it with `E`/`K`/`P` records them.
 

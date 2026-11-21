@@ -111,10 +111,14 @@ impl Marmot {
             .into())
     }
     /// `save_message_draft_if_revision` for drafts with file-backed
-    /// attachments: each input is a new inline body or an attachment the
-    /// draft already holds, kept by id. Saving text never copies a retained
-    /// body. Leaving a file-backed attachment out deletes its file; an id
-    /// the draft does not hold is `InvalidMessageDraft`.
+    /// attachments: each input is a new inline body, an attachment the draft
+    /// already holds, kept by id, or the id of one to remove. Saving text
+    /// never copies a retained body. Every attachment the save does not name
+    /// stays, after the named ones in their stored order, so a save never
+    /// drops one the host did not know about. `Removed` deletes one and its
+    /// file; `Inline` with a held id replaces its body and releases a file it
+    /// had. Retaining an id the draft does not hold is
+    /// `InvalidMessageDraft`; removing one changes nothing.
     pub fn save_message_draft_inputs_if_revision(
         &self,
         account_ref: String,

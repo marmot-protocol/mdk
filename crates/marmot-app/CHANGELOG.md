@@ -16,6 +16,12 @@
   message is an ordinary chat message.
 - New groups still require the agent text stream component (`0x8006`) and every role capability is still advertised,
   so existing groups keep working. A group record now carries `0x8006` in `unknown_components`.
+- `save_message_draft_inputs_if_revision` keeps every attachment the draft holds that the save does not name,
+  inline or file-backed, after the named ones in their stored order. Remove one with the new
+  `MessageDraftAttachmentInput::Removed(id)`, which also unlinks its file; removing an id the draft no longer holds
+  changes nothing. A save from a composer that has not loaded the draft, or that races a staging copy, no longer
+  deletes a file it did not know about. Hosts that removed attachments by leaving them out must send `Removed`
+  (#3586). `save_message_draft_if_revision` still replaces the whole list.
 
 ### Added
 

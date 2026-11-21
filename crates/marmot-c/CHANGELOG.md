@@ -19,6 +19,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   on `MarmotTimelineMessageRecord` and `MarmotTimelineReplyPreview`. `MarmotTimelineUpdateTrigger` loses
   `AgentStreamStarted` and `AgentStreamFinished`, so the values after them are renumbered, and the `MarmotEvent`
   tags after `AccountError` shift by one. Rebuild clients with the matching header and library.
+- `MarmotMessageDraftAttachmentSaveInput` gains a trailing nullable `removed_id`, and
+  `marmot_save_message_draft_inputs_if_revision` keeps every attachment the draft holds that the save does not
+  name, after the named ones in their stored order. An input with `removed_id` deletes an attachment (and its
+  file), and a new inline body with a held id still replaces it; `retained_id` and `removed_id` both set is `MARMOT_STATUS_INVALID_ARGUMENT`. Clients that removed
+  attachments by leaving them out must send `removed_id`. Rebuild clients with the matching header and library
+  (#3586).
 
 ### Added
 

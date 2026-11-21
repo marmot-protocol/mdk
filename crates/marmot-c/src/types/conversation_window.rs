@@ -106,8 +106,11 @@ opt_str thumbhash,
 opt_copy has_duration_seconds/duration_seconds: f64,
 prim_vec waveform_samples/waveform_samples_len: f64,
 /// The body is a staged media-store file: read it with
-/// marmot_read_message_draft_attachment or a handoff, and keep it across
-/// saves by id with marmot_save_message_draft_inputs_if_revision.
+/// marmot_read_message_draft_attachment or a handoff.
+/// marmot_save_message_draft_inputs_if_revision keeps it unless the save
+/// names it by `removed_id` or saves new inline bytes under its id;
+/// marmot_save_message_draft_if_revision replaces the whole list and drops
+/// it.
 copy file_backed: bool,
 } }
 c_mirror! { MarmotSelectedMessageDraftContent from SelectedMessageDraftContentFfi {

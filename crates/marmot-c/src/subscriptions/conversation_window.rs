@@ -389,9 +389,12 @@ pub unsafe extern "C" fn marmot_message_draft_attachment_if_revision(
 }
 
 /// Save only if the selected revision still matches, keeping attachments the
-/// draft already holds by id (bodies untouched) and copying new inline ones.
-/// Leaving a file-backed attachment out deletes its file; an id the draft
-/// does not hold is MARMOT_STATUS_INVALID_MESSAGE_DRAFT.
+/// draft already holds by id (bodies untouched), copying new inline ones and
+/// removing those named by `removed_id`. Every attachment the save does not
+/// name stays, after the named ones in their stored order. A removal deletes
+/// one and its file; a new inline body with a held id replaces it and
+/// releases a file it had. Retaining an id the draft does not hold is
+/// MARMOT_STATUS_INVALID_MESSAGE_DRAFT; removing one changes nothing.
 /// # Safety
 /// As marmot_save_message_draft_if_revision, with inputs pointing to len
 /// readable items (or NULL with zero len).

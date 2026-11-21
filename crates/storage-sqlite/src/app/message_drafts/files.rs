@@ -299,7 +299,10 @@ impl SqliteAppStorage {
     ) -> Result<(u64, u64), MessageDraftRevisionError> {
         self.connection.with_deferred_read(|conn| {
             check_revision_tx(conn, expected)?;
-            if draft_attachment_ids_tx(conn, expected.group_id_hex())?.contains(attachment_id) {
+            if draft_attachment_ids_tx(conn, expected.group_id_hex())?
+                .iter()
+                .any(|id| id == attachment_id)
+            {
                 return Err(MessageDraftRevisionError::Invalid(
                     "attachment ids must be unique",
                 ));

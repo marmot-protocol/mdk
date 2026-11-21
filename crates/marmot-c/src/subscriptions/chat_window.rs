@@ -1078,13 +1078,22 @@ mod tests {
                 (1, &b"backed"[..])
             );
             crate::marmot_bytes_free(bytes, bytes_len);
-            let keep = [crate::types::draft::MarmotMessageDraftAttachmentSaveInput {
-                retained_id: c"clip".as_ptr(),
-                attachment: crate::types::draft::MarmotMessageDraftAttachmentInput {
-                    id: ptr::null(),
-                    ..attachment
+            let unnamed = || crate::types::draft::MarmotMessageDraftAttachmentInput {
+                id: ptr::null(),
+                ..attachment
+            };
+            let keep = [
+                crate::types::draft::MarmotMessageDraftAttachmentSaveInput {
+                    retained_id: c"clip".as_ptr(),
+                    attachment: unnamed(),
+                    removed_id: ptr::null(),
                 },
-            }];
+                crate::types::draft::MarmotMessageDraftAttachmentSaveInput {
+                    retained_id: ptr::null(),
+                    attachment: unnamed(),
+                    removed_id: c"empty".as_ptr(),
+                },
+            ];
             let mut kept = ptr::null_mut();
             assert_eq!(
                 marmot_save_message_draft_inputs_if_revision(

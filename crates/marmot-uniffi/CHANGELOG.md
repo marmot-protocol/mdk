@@ -14,6 +14,11 @@
   `agentTextStreamJson` on `TimelineMessageRecordFfi` and `TimelineReplyPreviewFfi`. A kind-1200 stream start no
   longer reaches message subscribers or the timeline; a stream-final kind-9 message is an ordinary chat message.
   Regenerate Swift or Kotlin bindings with the matching native library.
+- `saveMessageDraftInputsIfRevision` keeps every attachment the draft holds that the save does not name, after the
+  named ones in their stored order, and `MessageDraftAttachmentInputFfi` gains `Removed { id }`, which deletes one
+  (and its file); `Inline` with a held id still replaces it. A save from a composer that has not loaded the draft, or that races a
+  staging copy, no longer deletes a file it did not know about. Hosts that removed attachments by leaving them out
+  must send `Removed`; exhaustive `switch`/`when` over the enum needs the new case (#3586).
 
 ### Added
 

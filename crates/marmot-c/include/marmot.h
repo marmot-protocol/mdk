@@ -7704,8 +7704,11 @@ typedef struct MarmotSelectedMessageDraftAttachment {
   uintptr_t waveform_samples_len;
   /**
    * The body is a staged media-store file: read it with
-   * marmot_read_message_draft_attachment or a handoff, and keep it across
-   * saves by id with marmot_save_message_draft_inputs_if_revision.
+   * marmot_read_message_draft_attachment or a handoff.
+   * marmot_save_message_draft_inputs_if_revision keeps it unless the save
+   * names it by `removed_id` or saves new inline bytes under its id;
+   * marmot_save_message_draft_if_revision replaces the whole list and drops
+   * it.
    */
   bool file_backed;
 } MarmotSelectedMessageDraftAttachment;
@@ -7752,9 +7755,11 @@ typedef struct MarmotConversationWindowSnapshot {
 /**
  * One attachment of `marmot_save_message_draft_inputs_if_revision`.
  * Borrowed input only. A non-NULL `retained_id` keeps the draft's own
- * attachment with that id, body untouched, and `attachment` is ignored;
- * a NULL `retained_id` saves `attachment` as a new inline body. Keep every
- * file-backed attachment by id: leaving one out deletes its file.
+ * attachment with that id, body untouched; a non-NULL `removed_id` removes
+ * the draft's attachment with that id (and its file). Either way
+ * `attachment` is ignored. With both NULL, `attachment` is saved as a new
+ * inline body; both non-NULL is MARMOT_STATUS_INVALID_ARGUMENT. An
+ * attachment the save does not name stays in the draft.
  */
 typedef struct MarmotMessageDraftAttachmentSaveInput {
   /**
@@ -7762,6 +7767,10 @@ typedef struct MarmotMessageDraftAttachmentSaveInput {
    */
   const char *retained_id;
   struct MarmotMessageDraftAttachmentInput attachment;
+  /**
+   * Nullable.
+   */
+  const char *removed_id;
 } MarmotMessageDraftAttachmentSaveInput;
 
 /**
@@ -15122,9 +15131,12 @@ MarmotStatus marmot_message_draft_attachment_if_revision(const struct MarmotClie
 
 /**
  * Save only if the selected revision still matches, keeping attachments the
- * draft already holds by id (bodies untouched) and copying new inline ones.
- * Leaving a file-backed attachment out deletes its file; an id the draft
- * does not hold is MARMOT_STATUS_INVALID_MESSAGE_DRAFT.
+ * draft already holds by id (bodies untouched), copying new inline ones and
+ * removing those named by `removed_id`. Every attachment the save does not
+ * name stays, after the named ones in their stored order. A removal deletes
+ * one and its file; a new inline body with a held id replaces it and
+ * releases a file it had. Retaining an id the draft does not hold is
+ * MARMOT_STATUS_INVALID_MESSAGE_DRAFT; removing one changes nothing.
  * # Safety
  * As marmot_save_message_draft_if_revision, with inputs pointing to len
  * readable items (or NULL with zero len).

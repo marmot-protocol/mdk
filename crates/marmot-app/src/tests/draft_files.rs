@@ -244,7 +244,8 @@ async fn a_staged_draft_file_survives_saves_and_restart_and_sends_with_the_draft
 
 /// Staging refuses what the draft could never upload before copying it, and
 /// a cancelled copy leaves no file, no row and no change to the draft. A
-/// save that leaves a staged attachment out unlinks its file at once.
+/// save that leaves a staged attachment out keeps it; one that removes it
+/// unlinks its file at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn staging_refuses_oversize_and_cancelled_copies_and_saves_release_files() {
     let dir = tempfile::tempdir().unwrap();
@@ -375,8 +376,24 @@ async fn staging_refuses_oversize_and_cancelled_copies_and_saves_release_files()
         .unwrap();
     assert_eq!(media_files(), 1);
     let files = draft_files(&app, &group_hex);
-    app.save_message_draft_inputs_if_revision("alice", &staged.revision, "", None, vec![])
+    // A composer that never learned of the file saves without it (mdk#3586).
+    let saved = app
+        .save_message_draft_inputs_if_revision("alice", &staged.revision, "typed", None, vec![])
         .unwrap();
+    assert_eq!(
+        draft_files(&app, &group_hex),
+        files,
+        "the save kept the file"
+    );
+    assert_eq!(media_files(), 1);
+    app.save_message_draft_inputs_if_revision(
+        "alice",
+        &saved.revision,
+        "typed",
+        None,
+        vec![crate::MessageDraftAttachmentInput::Removed("video".into())],
+    )
+    .unwrap();
     assert!(released(&app, &files));
     assert_eq!(media_files(), 0, "the save unlinked the released file");
     runtime.shutdown_and_close().await.unwrap();

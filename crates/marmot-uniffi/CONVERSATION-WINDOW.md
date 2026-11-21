@@ -186,8 +186,11 @@ encrypted-media blob limit, so no full-size buffer crosses the binding:
    during the copy discards the copy (`MessageDraftRevisionConflict`). The host
    may delete its file.
 2. Selected descriptors mark such attachments `file_backed`. Save edits with
-   `save_message_draft_inputs_if_revision`, keeping each attachment with
-   `Retained { id }`; one left out is deleted with its file.
+   `save_message_draft_inputs_if_revision`. An attachment the save does not
+   name stays in the draft, so a save from a composer that has not loaded the
+   draft yet loses nothing; remove one with `Removed { id }`, which also
+   deletes its file. `Retained { id }` places a kept attachment in the save's
+   order.
 3. Read previews with `read_message_draft_attachment` (1 MiB chunks), or lend a
    real file to the OS with `open_message_draft_attachment_handoff` and
    `release_attachment_handoff`. `message_draft_attachment_if_revision` refuses
