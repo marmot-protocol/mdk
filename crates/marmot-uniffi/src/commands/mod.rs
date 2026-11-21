@@ -8,7 +8,6 @@
 //! attached to the same methods, so the generated bindings are unaffected.
 
 mod account;
-mod agent_stream;
 mod audit;
 mod backups;
 mod chat_list;

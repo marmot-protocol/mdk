@@ -23,7 +23,6 @@ macro_rules! redact {
 mod product_analytics;
 pub use product_analytics::*;
 mod account;
-mod agent_stream;
 mod audit;
 mod backups;
 mod chat_list;
@@ -56,7 +55,6 @@ pub(super) fn saturating_u32(value: usize) -> u32 {
 }
 
 pub use account::*;
-pub use agent_stream::*;
 pub use audit::*;
 pub use backups::*;
 pub use chat_list::*;
@@ -555,7 +553,6 @@ mod tests {
                 tags: Vec::new(),
                 source_epoch: None,
                 media: None,
-                agent_text_stream: None,
                 deleted: false,
                 deletion_source: Default::default(),
                 invalidation_status: Some("LosingBranch".to_owned()),
@@ -564,9 +561,6 @@ mod tests {
             thread: None,
             media: Some(serde_json::json!({
                 "imeta": [["imeta", "url https://blob.example/file"]]
-            })),
-            agent_text_stream: Some(serde_json::json!({
-                "stream_id_hex": "22"
             })),
             reactions: TimelineReactionSummary {
                 by_emoji: BTreeMap::from([("+".to_owned(), vec!["bob".to_owned()])]),
@@ -628,10 +622,6 @@ mod tests {
             message.media_json.as_deref(),
             Some(r#"{"imeta":[["imeta","url https://blob.example/file"]]}"#)
         );
-        assert_eq!(
-            message.agent_text_stream_json.as_deref(),
-            Some(r#"{"stream_id_hex":"22"}"#)
-        );
         assert!(message.group_system.is_none());
         assert_eq!(message.reactions.by_emoji[0].emoji, "+");
         assert_eq!(message.reactions.by_emoji[0].count, 1);
@@ -691,7 +681,6 @@ mod tests {
             reply_preview: None,
             thread: None,
             media: None,
-            agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,
             deletion_source: Default::default(),
@@ -747,7 +736,6 @@ mod tests {
             reply_preview: None,
             thread: None,
             media: None,
-            agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,
             deletion_source: Default::default(),

@@ -11,7 +11,6 @@ path = "src/bin/wn-agent.rs"
 
 [dependencies]
 agent-control.workspace = true
-agent-stream-compose.workspace = true
 cgka-traits.workspace = true
 clap.workspace = true
 fs-private.workspace = true
@@ -26,7 +25,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
 tracing.workspace = true
-transport-quic-stream.workspace = true
 url.workspace = true
 zeroize.workspace = true
 

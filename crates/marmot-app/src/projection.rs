@@ -4,16 +4,18 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cgka_traits::app_components::{
+    AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+};
 use rusqlite::{Connection, Transaction, params, types::Type};
 use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
 
 use crate::notifications::StoredPushRegistration;
 use crate::{
-    AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent, AppError,
-    AppGroupAdminPolicyComponent, AppGroupImageInput, AppGroupMessageRetentionComponent,
-    AppGroupNostrRoutingComponent, AppGroupRecord, AppMessageProjection, AppMessageQuery,
-    AppMessageRecord, GroupPushTokenRecord, NOSTR_ROUTING_COMPONENT_ID, NotificationSettings,
-    PushPlatform, PushRegistration,
+    AccountState, AppError, AppGroupAdminPolicyComponent, AppGroupImageInput,
+    AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent, AppGroupOpaqueComponent,
+    AppGroupRecord, AppMessageProjection, AppMessageQuery, AppMessageRecord, GroupPushTokenRecord,
+    NOSTR_ROUTING_COMPONENT_ID, NotificationSettings, PushPlatform, PushRegistration,
 };
 
 pub(crate) struct LegacyAccountProjectionDb {
@@ -251,7 +253,7 @@ impl LegacyAccountProjectionDb {
         let group_rows = group_statement.query_map(
             params![
                 i64::from(NOSTR_ROUTING_COMPONENT_ID),
-                i64::from(AGENT_TEXT_STREAM_COMPONENT_ID)
+                i64::from(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID)
             ],
             |row| {
                 Ok(RawGroupRow {
@@ -289,9 +291,12 @@ impl LegacyAccountProjectionDb {
                 AppGroupMessageRetentionComponent::disabled(),
             );
             if !row.agent_text_stream_data_hex.is_empty() {
-                let agent_text_stream_bytes = hex::decode(&row.agent_text_stream_data_hex)?;
-                group.agent_text_stream =
-                    AppAgentTextStreamComponent::from_bytes(&agent_text_stream_bytes);
+                hex::decode(&row.agent_text_stream_data_hex)?;
+                group.unknown_components.push(AppGroupOpaqueComponent {
+                    component_id: AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+                    component: AGENT_TEXT_STREAM_QUIC_COMPONENT.to_owned(),
+                    data_hex: row.agent_text_stream_data_hex,
+                });
             }
             group.archived = row.archived;
             group.pending_confirmation = row.pending_confirmation;
@@ -411,7 +416,11 @@ impl LegacyAccountProjectionDb {
                 ],
             )?;
 
-            if group.agent_text_stream.required {
+            let agent_text_stream = group
+                .unknown_components
+                .iter()
+                .find(|component| component.component_id == AGENT_TEXT_STREAM_QUIC_COMPONENT_ID);
+            if let Some(agent_text_stream) = agent_text_stream {
                 tx.execute(
                     "DELETE FROM group_app_components
                      WHERE group_id_hex = ?1
@@ -422,7 +431,7 @@ impl LegacyAccountProjectionDb {
                         i64::from(group.image.component_id),
                         i64::from(group.admin_policy.component_id),
                         i64::from(group.nostr_routing.component_id),
-                        i64::from(group.agent_text_stream.component_id),
+                        i64::from(agent_text_stream.component_id),
                     ],
                 )?;
             } else {
@@ -472,13 +481,13 @@ impl LegacyAccountProjectionDb {
                 &group.nostr_routing.data_hex,
                 now,
             )?;
-            if group.agent_text_stream.required {
+            if let Some(agent_text_stream) = agent_text_stream {
                 upsert_group_component(
                     &tx,
                     &group.group_id_hex,
-                    group.agent_text_stream.component_id,
-                    &group.agent_text_stream.component,
-                    &group.agent_text_stream.data_hex,
+                    agent_text_stream.component_id,
+                    &agent_text_stream.component,
+                    &agent_text_stream.data_hex,
                     now,
                 )?;
             }

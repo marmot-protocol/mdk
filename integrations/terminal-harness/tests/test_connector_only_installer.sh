@@ -294,7 +294,7 @@ expect_success
 assert_line "$case_log" "systemctl --user enable wn-agent-standalone.service"
 assert_line "$case_log" "systemctl --user restart wn-agent-standalone.service"
 assert_excludes "$case_log" "enable --now"
-assert_line "$case_log" "wn-agent bootstrap --json --home $case_home --socket $case_home/dev/wn-agent.sock --label standalone-agent --no-quic --relay wss://relay.eu.whitenoise.chat --relay wss://relay.us.whitenoise.chat --allow-welcomer $welcomer_hex"
+assert_line "$case_log" "wn-agent bootstrap --json --home $case_home --socket $case_home/dev/wn-agent.sock --label standalone-agent --relay wss://relay.eu.whitenoise.chat --relay wss://relay.us.whitenoise.chat --allow-welcomer $welcomer_hex"
 assert_excludes "$case_log" "import-identity"
 [ "$(line_of "$case_log" "wn-agent --home")" = 0 ] || fail "started a temporary wn-agent beside the service"
 [ "$(line_of "$case_log" "systemctl --user restart")" -lt "$(line_of "$case_log" "wn-agent bootstrap")" ] ||
@@ -313,7 +313,7 @@ assert_excludes "$case_output" "No agent identity was created"
 run_case linux-import Linux 0 --import-identity --expected-identity "$expected_npub"
 expect_success
 assert_line "$case_log" "wn-agent import-identity --json --home $case_home --label standalone-agent --prompt --expected-identity $expected_npub"
-assert_contains "$case_log" "wn-agent bootstrap --json --home $case_home --socket $case_home/dev/wn-agent.sock --label standalone-agent --no-quic --no-create --account-id-hex $imported_account"
+assert_contains "$case_log" "wn-agent bootstrap --json --home $case_home --socket $case_home/dev/wn-agent.sock --label standalone-agent --no-create --account-id-hex $imported_account"
 import_line="$(line_of "$case_log" "wn-agent import-identity")"
 start_line="$(line_of "$case_log" "systemctl --user enable --now")"
 bootstrap_line="$(line_of "$case_log" "wn-agent bootstrap")"

@@ -1,12 +1,8 @@
 use std::collections::HashMap;
 
-use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_ROLE_FANOUT,
-    AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND, AgentTextStreamQuicPolicyV1,
-};
 use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
-    BlobStoreEndpointV2, EncryptedMediaPolicyV1, EncryptedMediaPolicyV2,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData,
+    BlobStoreEndpointV1, BlobStoreEndpointV2, EncryptedMediaPolicyV1, EncryptedMediaPolicyV2,
     GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT,
     GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
@@ -175,8 +171,6 @@ pub struct AppGroupRecord {
     pub admin_policy: AppGroupAdminPolicyComponent,
     #[serde(default)]
     pub message_retention: AppGroupMessageRetentionComponent,
-    #[serde(default)]
-    pub agent_text_stream: AppAgentTextStreamComponent,
     #[serde(default)]
     pub encrypted_media: AppGroupEncryptedMediaComponent,
     /// Optional GroupContext components this client does not project into typed
@@ -646,6 +640,21 @@ impl std::fmt::Debug for AppGroupOpaqueComponent {
     }
 }
 
+/// GroupContext components the group projection reads from MLS without
+/// projecting them into typed fields, keeping them in the record as opaque
+/// components. The retired agent text stream component (`0x8006`) is one:
+/// groups that require it keep working, so their record keeps it too.
+pub(crate) const CARRIED_OPAQUE_COMPONENTS: [(u16, &str); 1] = [(
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT,
+)];
+
+pub(crate) fn is_carried_opaque_component(component_id: u16) -> bool {
+    CARRIED_OPAQUE_COMPONENTS
+        .iter()
+        .any(|(id, _)| *id == component_id)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupProfileComponent {
     pub component_id: u16,
@@ -750,19 +759,6 @@ pub struct AppPriorNostrRoute {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AppAgentTextStreamComponent {
-    pub component_id: u16,
-    pub component: String,
-    pub required: bool,
-    pub required_member_roles: Vec<String>,
-    pub allowed_member_roles: Vec<String>,
-    pub max_plaintext_frame_len: u32,
-    pub replay_ttl_secs: u32,
-    pub padding_bucket_bytes: u16,
-    pub data_hex: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppBlobEndpoint {
     pub locator_kind: String,
     pub base_url: String,
@@ -785,12 +781,6 @@ pub(crate) struct AppEncryptedMediaPolicy {
     pub(crate) version: EncryptedMediaVersion,
     pub(crate) allowed_locator_kinds: Vec<String>,
     pub(crate) default_blob_endpoints: Vec<AppBlobEndpoint>,
-}
-
-impl Default for AppAgentTextStreamComponent {
-    fn default() -> Self {
-        Self::disabled()
-    }
 }
 
 impl Default for AppGroupEncryptedMediaComponent {
@@ -848,7 +838,6 @@ impl AppGroupRecord {
             avatar_url: AppGroupAvatarUrlComponent::absent(),
             admin_policy,
             message_retention,
-            agent_text_stream: AppAgentTextStreamComponent::disabled(),
             encrypted_media: AppGroupEncryptedMediaComponent::disabled(),
             unknown_components: Vec::new(),
             archived: false,
@@ -875,7 +864,7 @@ impl AppGroupRecord {
         group: Option<&Group>,
         admin_policy: AppGroupAdminPolicyComponent,
         message_retention: AppGroupMessageRetentionComponent,
-        agent_text_stream: AppAgentTextStreamComponent,
+        opaque_components: Vec<AppGroupOpaqueComponent>,
         avatar_url: AppGroupAvatarUrlComponent,
         encrypted_media: AppGroupEncryptedMediaComponent,
         image: AppGroupImageInput,
@@ -892,7 +881,7 @@ impl AppGroupRecord {
             admin_policy,
             message_retention,
         );
-        record.agent_text_stream = agent_text_stream;
+        record.unknown_components = opaque_components;
         record.avatar_url = avatar_url;
         record.encrypted_media = encrypted_media;
         if let Some(group) = group {
@@ -932,7 +921,12 @@ impl AppGroupRecord {
         });
         self.admin_policy = projection.admin_policy.clone();
         self.message_retention = projection.message_retention.clone();
-        self.agent_text_stream = projection.agent_text_stream.clone();
+        // MLS is authoritative for the components the projection carries
+        // opaquely; any other unknown component stays as stored.
+        self.unknown_components
+            .retain(|component| !is_carried_opaque_component(component.component_id));
+        self.unknown_components
+            .extend(projection.opaque_components.iter().cloned());
         self.avatar_url = projection.avatar_url.clone();
         self.encrypted_media = projection.encrypted_media.clone();
         self.image = AppGroupImageComponent::new(projection.image.clone());
@@ -1227,7 +1221,7 @@ mod prior_nostr_route_tests {
             profile: AppGroupProfileComponent::new(group.name.clone(), group.description.clone()),
             admin_policy: AppGroupAdminPolicyComponent::new(Vec::new()),
             message_retention: AppGroupMessageRetentionComponent::disabled(),
-            agent_text_stream: AppAgentTextStreamComponent::disabled(),
+            opaque_components: Vec::new(),
             avatar_url: AppGroupAvatarUrlComponent::absent(),
             encrypted_media: AppGroupEncryptedMediaComponent::disabled(),
             image: AppGroupImageInput::default(),
@@ -1760,53 +1754,6 @@ impl AppGroupNostrRoutingComponent {
     }
 }
 
-impl AppAgentTextStreamComponent {
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
-        match AgentTextStreamQuicPolicyV1::decode_component_state(bytes) {
-            Ok(policy) => Self::from_policy(policy, bytes.to_vec()),
-            Err(_) => Self {
-                component_id: AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-                component: AGENT_TEXT_STREAM_QUIC_COMPONENT.to_owned(),
-                required: true,
-                required_member_roles: Vec::new(),
-                allowed_member_roles: Vec::new(),
-                max_plaintext_frame_len: 0,
-                replay_ttl_secs: 0,
-                padding_bucket_bytes: 0,
-                data_hex: hex::encode(bytes),
-            },
-        }
-    }
-
-    fn from_policy(policy: AgentTextStreamQuicPolicyV1, data: Vec<u8>) -> Self {
-        Self {
-            component_id: AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-            component: AGENT_TEXT_STREAM_QUIC_COMPONENT.to_owned(),
-            required: true,
-            required_member_roles: role_names(policy.required_member_roles),
-            allowed_member_roles: role_names(policy.allowed_member_roles),
-            max_plaintext_frame_len: policy.max_plaintext_frame_len,
-            replay_ttl_secs: policy.replay_ttl_secs,
-            padding_bucket_bytes: policy.padding_bucket_bytes,
-            data_hex: hex::encode(data),
-        }
-    }
-
-    pub(crate) fn disabled() -> Self {
-        Self {
-            component_id: AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-            component: AGENT_TEXT_STREAM_QUIC_COMPONENT.to_owned(),
-            required: false,
-            required_member_roles: Vec::new(),
-            allowed_member_roles: Vec::new(),
-            max_plaintext_frame_len: 0,
-            replay_ttl_secs: 0,
-            padding_bucket_bytes: 0,
-            data_hex: String::new(),
-        }
-    }
-}
-
 impl AppGroupEncryptedMediaComponent {
     pub(crate) fn new_v1(policy: EncryptedMediaPolicyV1) -> Result<Self, AppError> {
         let data =
@@ -2078,7 +2025,8 @@ pub(crate) struct EventGroupProjection<'a> {
     pub(crate) profile: AppGroupProfileComponent,
     pub(crate) admin_policy: AppGroupAdminPolicyComponent,
     pub(crate) message_retention: AppGroupMessageRetentionComponent,
-    pub(crate) agent_text_stream: AppAgentTextStreamComponent,
+    /// The [`CARRIED_OPAQUE_COMPONENTS`] the group's MLS state holds.
+    pub(crate) opaque_components: Vec<AppGroupOpaqueComponent>,
     pub(crate) avatar_url: AppGroupAvatarUrlComponent,
     pub(crate) encrypted_media: AppGroupEncryptedMediaComponent,
     pub(crate) image: AppGroupImageInput,
@@ -2523,7 +2471,7 @@ pub(crate) fn add_group(
         projection.group_metadata,
         projection.admin_policy.clone(),
         projection.message_retention.clone(),
-        projection.agent_text_stream.clone(),
+        projection.opaque_components.clone(),
         projection.avatar_url.clone(),
         projection.encrypted_media.clone(),
         projection.image.clone(),
@@ -2708,20 +2656,6 @@ pub(crate) fn validate_group_profile(name: &str, description: &str) -> Result<()
         ));
     }
     Ok(())
-}
-
-fn role_names(mask: u8) -> Vec<String> {
-    let mut roles = Vec::new();
-    if mask & AGENT_TEXT_STREAM_ROLE_RECEIVE != 0 {
-        roles.push("receive".to_owned());
-    }
-    if mask & AGENT_TEXT_STREAM_ROLE_SEND != 0 {
-        roles.push("send".to_owned());
-    }
-    if mask & AGENT_TEXT_STREAM_ROLE_FANOUT != 0 {
-        roles.push("fanout".to_owned());
-    }
-    roles
 }
 
 #[cfg(test)]

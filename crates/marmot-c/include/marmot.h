@@ -1457,8 +1457,6 @@ typedef enum MarmotTimelineUpdateTrigger {
   MARMOT_TIMELINE_UPDATE_TRIGGER_REACTION_REMOVED,
   MARMOT_TIMELINE_UPDATE_TRIGGER_MESSAGE_DELETED,
   MARMOT_TIMELINE_UPDATE_TRIGGER_REPLY_PREVIEW_CHANGED,
-  MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_STREAM_STARTED,
-  MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_STREAM_FINISHED,
   MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_ACTIVITY,
   MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_OPERATION,
   MARMOT_TIMELINE_UPDATE_TRIGGER_GROUP_SYSTEM,
@@ -1697,45 +1695,6 @@ typedef uint32_t MarmotRelayPolicy;
 #endif // __cplusplus
 
 /**
- * Transcript record type. Pass the discriminant as uint32_t.
- */
-enum MarmotPublisherRecord
-#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
- {
-  MARMOT_PUBLISHER_RECORD_TEXT = 0,
-  MARMOT_PUBLISHER_RECORD_STATUS = 1,
-  MARMOT_PUBLISHER_RECORD_PROGRESS = 2,
-};
-#ifndef __cplusplus
-#if __STDC_VERSION__ >= 202311L
-typedef enum MarmotPublisherRecord MarmotPublisherRecord;
-#else
-typedef uint32_t MarmotPublisherRecord;
-#endif // __STDC_VERSION__ >= 202311L
-#endif // __cplusplus
-
-/**
- * Broker trust policy. AllowLoopback is an explicit local-test opt-in.
- */
-enum MarmotPublisherTrust
-#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
- {
-  MARMOT_PUBLISHER_TRUST_PUBLIC_ONLY = 0,
-  MARMOT_PUBLISHER_TRUST_ALLOW_LOOPBACK = 1,
-};
-#ifndef __cplusplus
-#if __STDC_VERSION__ >= 202311L
-typedef enum MarmotPublisherTrust MarmotPublisherTrust;
-#else
-typedef uint32_t MarmotPublisherTrust;
-#endif // __STDC_VERSION__ >= 202311L
-#endif // __cplusplus
-
-/**
  * What woke the background collection.
  */
 typedef enum MarmotNotificationWakeSource {
@@ -1905,20 +1864,6 @@ typedef struct MarmotAccountAttachmentVersion MarmotAccountAttachmentVersion;
  * Free before its client. Concurrent next and commands are supported; never free during a call.
  */
 typedef struct MarmotAccountAttentionSubscription MarmotAccountAttentionSubscription;
-
-/**
- * Single live stream. Free before its creating `MarmotClient`; never free
- * concurrently with an in-flight call on this handle.
- */
-typedef struct MarmotAgentPublisher MarmotAgentPublisher;
-
-/**
- * Opaque handle to a live agent-text-stream watch: incremental
- * `Chunk`s, then a terminal `Finished` / `Failed`, after which the
- * stream closes. Created by `marmot_watch_agent_text_stream`; the
- * matching anchor/start command is `marmot_start_agent_text_stream`.
- */
-typedef struct MarmotAgentStreamSubscription MarmotAgentStreamSubscription;
 
 typedef struct MarmotAttachmentHistoryCursor MarmotAttachmentHistoryCursor;
 
@@ -5739,7 +5684,6 @@ typedef struct MarmotTimelineReplyPreview {
    */
   struct MarmotMediaAttachmentOutcome *media;
   uintptr_t media_len;
-  char *agent_text_stream_json;
   bool deleted;
   enum MarmotDeletionSource deletion_source;
   /**
@@ -5890,10 +5834,9 @@ typedef struct MarmotTimelineMessageRecord {
    */
   struct MarmotMediaAttachmentOutcome *media;
   uintptr_t media_len;
-  char *agent_text_stream_json;
   /**
    * Parsed view of kind-1210 group system rows. NULL for chat,
-   * reactions, stream rows, and malformed assertions.
+   * reactions, and malformed assertions.
    */
   struct MarmotGroupSystemEvent *group_system;
   struct MarmotTimelineReactionSummary reactions;
@@ -5992,16 +5935,6 @@ typedef struct MarmotBackgroundNotificationCollection {
   uintptr_t notifications_len;
   char *error;
 } MarmotBackgroundNotificationCollection;
-
-/**
- * Result of starting (anchoring) an agent text stream.
- */
-typedef struct MarmotAgentStreamStart {
-  char *stream_id_hex;
-  uint32_t published;
-  char **message_ids;
-  uintptr_t message_ids_len;
-} MarmotAgentStreamStart;
 
 /**
  * One attachment to stage in a draft. Borrowed input only: the
@@ -6779,39 +6712,6 @@ typedef struct MarmotNip46Status {
 } MarmotNip46Status;
 
 /**
- * Stable stream and start-message identifiers.
- */
-typedef struct MarmotPublisherInfo {
-  char *stream_id_hex;
-  char *start_message_id_hex;
-} MarmotPublisherInfo;
-
-/**
- * Accepted record receipt. A live preview error does not discard the
- * transcript; finish still produces the durable final.
- */
-typedef struct MarmotPublisherAck {
-  uint64_t chunk_count;
-  /**
-   * NULL when no preview error occurred; otherwise an error string.
-   * Either is possible after a successful append; check before dereferencing.
-   */
-  char *live_error;
-} MarmotPublisherAck;
-
-/**
- * Borrowed broker options. NULL certificate with zero length selects the
- * bundled public-CA roots (not the OS trust store). `trust` is a
- * `MarmotPublisherTrust` discriminant.
- */
-typedef struct MarmotPublisherOptions {
-  const char *candidate;
-  const uint8_t *server_cert_der;
-  uintptr_t server_cert_der_len;
-  uint32_t trust;
-} MarmotPublisherOptions;
-
-/**
  * One live-received message.
  */
 typedef struct MarmotReceivedMessage {
@@ -7100,7 +7000,6 @@ typedef enum MarmotEvent_Tag {
   MARMOT_EVENT_PROJECTION_UPDATED,
   MARMOT_EVENT_GROUP_EVENT,
   MARMOT_EVENT_ACCOUNT_ERROR,
-  MARMOT_EVENT_AGENT_STREAM_ACTIVITY,
   /**
    * A canonical create or confirmed Add still owes a Welcome to
    * `recipient_hex`; pending does not prove whether the recipient received it.
@@ -7223,11 +7122,6 @@ typedef struct MarmotEvent_AccountError_Body {
   char *message;
 } MarmotEvent_AccountError_Body;
 
-typedef struct MarmotEvent_AgentStreamActivity_Body {
-  char *account_id_hex;
-  char *account_label;
-} MarmotEvent_AgentStreamActivity_Body;
-
 typedef struct MarmotEvent_WelcomeDeliveryPending_Body {
   char *account_id_hex;
   char *account_label;
@@ -7318,7 +7212,6 @@ typedef struct MarmotEvent {
     MarmotEvent_ProjectionUpdated_Body PROJECTION_UPDATED;
     MarmotEvent_GroupEvent_Body GROUP_EVENT;
     MarmotEvent_AccountError_Body ACCOUNT_ERROR;
-    MarmotEvent_AgentStreamActivity_Body AGENT_STREAM_ACTIVITY;
     MarmotEvent_WelcomeDeliveryPending_Body WELCOME_DELIVERY_PENDING;
     MarmotEvent_EpochStallEscalated_Body EPOCH_STALL_ESCALATED;
     MarmotEvent_GroupChangeSuperseded_Body GROUP_CHANGE_SUPERSEDED;
@@ -7439,30 +7332,20 @@ typedef struct MarmotChatListSubscriptionUpdate {
  */
 typedef enum MarmotMessageUpdate_Tag {
   /**
-   * A raw message update: chat, reply, media, reaction, delete, or the
-   * kind-9 stream-final.
+   * A raw message update: chat, reply, media, reaction, delete, or any
+   * other received app event.
    */
   MARMOT_MESSAGE_UPDATE_MESSAGE,
-  /**
-   * A kind-1200 agent text stream start — the signal to open the QUIC
-   * preview. Its stream id, route, and brokers live on `message.tags`.
-   */
-  MARMOT_MESSAGE_UPDATE_AGENT_STREAM_STARTED,
 } MarmotMessageUpdate_Tag;
 
 typedef struct MarmotMessageUpdate_Message_Body {
   struct MarmotRuntimeMessageReceived received;
 } MarmotMessageUpdate_Message_Body;
 
-typedef struct MarmotMessageUpdate_AgentStreamStarted_Body {
-  struct MarmotRuntimeMessageReceived received;
-} MarmotMessageUpdate_AgentStreamStarted_Body;
-
 typedef struct MarmotMessageUpdate {
   MarmotMessageUpdate_Tag tag;
   union {
     MarmotMessageUpdate_Message_Body MESSAGE;
-    MarmotMessageUpdate_AgentStreamStarted_Body AGENT_STREAM_STARTED;
   };
 } MarmotMessageUpdate;
 
@@ -7478,69 +7361,6 @@ typedef void (*MarmotMessageUpdateCallback)(const struct MarmotMessageUpdate *it
  */
 typedef void (*MarmotGroupStateRecordCallback)(const struct MarmotAppGroupRecord *item,
                                                void *user_data);
-
-/**
- * One live agent-stream update. `Chunk`s arrive incrementally; a
- * terminal `Finished` / `Failed` precedes stream close.
- */
-typedef enum MarmotAgentStreamUpdate_Tag {
-  MARMOT_AGENT_STREAM_UPDATE_CHUNK,
-  MARMOT_AGENT_STREAM_UPDATE_STATUS,
-  MARMOT_AGENT_STREAM_UPDATE_PROGRESS,
-  MARMOT_AGENT_STREAM_UPDATE_RECORD,
-  MARMOT_AGENT_STREAM_UPDATE_FINISHED,
-  MARMOT_AGENT_STREAM_UPDATE_FAILED,
-} MarmotAgentStreamUpdate_Tag;
-
-typedef struct MarmotAgentStreamUpdate_Chunk_Body {
-  uint64_t seq;
-  char *text;
-} MarmotAgentStreamUpdate_Chunk_Body;
-
-typedef struct MarmotAgentStreamUpdate_Status_Body {
-  uint64_t seq;
-  char *status;
-} MarmotAgentStreamUpdate_Status_Body;
-
-typedef struct MarmotAgentStreamUpdate_Progress_Body {
-  uint64_t seq;
-  char *text;
-} MarmotAgentStreamUpdate_Progress_Body;
-
-typedef struct MarmotAgentStreamUpdate_Record_Body {
-  uint64_t seq;
-  uint8_t record_type;
-  char *text;
-} MarmotAgentStreamUpdate_Record_Body;
-
-typedef struct MarmotAgentStreamUpdate_Finished_Body {
-  char *text;
-  char *transcript_hash_hex;
-  uint64_t chunk_count;
-} MarmotAgentStreamUpdate_Finished_Body;
-
-typedef struct MarmotAgentStreamUpdate_Failed_Body {
-  char *message;
-} MarmotAgentStreamUpdate_Failed_Body;
-
-typedef struct MarmotAgentStreamUpdate {
-  MarmotAgentStreamUpdate_Tag tag;
-  union {
-    MarmotAgentStreamUpdate_Chunk_Body CHUNK;
-    MarmotAgentStreamUpdate_Status_Body STATUS;
-    MarmotAgentStreamUpdate_Progress_Body PROGRESS;
-    MarmotAgentStreamUpdate_Record_Body RECORD;
-    MarmotAgentStreamUpdate_Finished_Body FINISHED;
-    MarmotAgentStreamUpdate_Failed_Body FAILED;
-  };
-} MarmotAgentStreamUpdate;
-
-/**
- * Callback invoked with each item (borrowed; valid only during
- * the call) and finally with NULL when the stream closes.
- */
-typedef void (*MarmotAgentStreamUpdateCallback)(const struct MarmotAgentStreamUpdate *item,
-                                                void *user_data);
 
 /**
  * Why a search update fired.
@@ -12440,23 +12260,6 @@ MarmotStatus marmot_collect_notifications_after_wake(const struct MarmotClient *
                                                      struct MarmotBackgroundNotificationCollection **out);
 
 /**
- * Publish a kind-1200 agent text stream start (anchor) for the group.
- * `stream_id_hex` NULL mints a fresh id; `quic_candidates` are the
- * broker route candidates. Free with `marmot_agent_stream_start_free`.
- *
- * # Safety
- * `client` must be a live handle; strings valid; the candidate array
- * must hold `len` valid strings (or be NULL with len 0); `out` valid.
- */
-MarmotStatus marmot_start_agent_text_stream(const struct MarmotClient *client,
-                                            const char *account_ref,
-                                            const char *group_id_hex,
-                                            const char *stream_id_hex,
-                                            const char *const *quic_candidates,
-                                            uintptr_t quic_candidates_len,
-                                            struct MarmotAgentStreamStart **out);
-
-/**
  * Encrypt `plaintext` (the raw image bytes, `media_type` e.g.
  * `"image/jpeg"`), upload it to Blossom, and commit it as the group's
  * avatar. Requires admin. The bytes are copied — the caller keeps
@@ -14078,90 +13881,6 @@ MarmotStatus marmot_nip46_logout(const struct MarmotNip46Session *session);
 void marmot_nip46_free(struct MarmotNip46Session *session);
 
 /**
- * Free a value of this type returned by this library. NULL
- * is a no-op.
- *
- * # Safety
- * The pointer must be NULL or an unfreed pointer returned by
- * this library.
- */
-void marmot_publisher_info_free(struct MarmotPublisherInfo *ptr);
-
-/**
- * Free a value of this type returned by this library. NULL
- * is a no-op.
- *
- * # Safety
- * The pointer must be NULL or an unfreed pointer returned by
- * this library.
- */
-void marmot_publisher_ack_free(struct MarmotPublisherAck *ptr);
-
-/**
- * Anchor a new stream and return its publisher. Broker connection happens
- * in the background. Invalid inputs/out-pointers fail before anchoring.
- *
- * # Safety
- * `client` is live; required strings and options are valid for this call;
- * certificate is NULL with zero length or references that many bytes;
- * `out` is writable. Input memory is neither retained nor freed.
- */
-MarmotStatus marmot_agent_publisher_new(const struct MarmotClient *client,
-                                        const char *account_ref,
-                                        const char *group_id_hex,
-                                        const struct MarmotPublisherOptions *options,
-                                        struct MarmotAgentPublisher **out);
-
-/**
- * Read stream identifiers. Free with `marmot_publisher_info_free`.
- *
- * # Safety
- * `publisher` is live and `out` is writable.
- */
-MarmotStatus marmot_agent_publisher_info(const struct MarmotAgentPublisher *publisher,
-                                         struct MarmotPublisherInfo **out);
-
-/**
- * Append one text/status/progress record; free the receipt with
- * `marmot_publisher_ack_free`. Unknown record types fail before appending.
- *
- * # Safety
- * `publisher` is live, `text` is valid UTF-8/NUL-terminated, `out` writable.
- */
-MarmotStatus marmot_agent_publisher_append(const struct MarmotAgentPublisher *publisher,
-                                           uint32_t kind,
-                                           const char *text,
-                                           struct MarmotPublisherAck **out);
-
-/**
- * Seal and send the final transcript. Failed sends retain the sealed
- * request for retry; a successful repeated call returns the original receipt.
- * Free with `marmot_send_summary_free`. Inspect its delivery disposition.
- *
- * # Safety
- * `publisher` is live and `out` is writable.
- */
-MarmotStatus marmot_agent_publisher_finish(const struct MarmotAgentPublisher *publisher,
-                                           struct MarmotSendSummary **out);
-
-/**
- * Cancel the preview. Does not retract a final already being published.
- *
- * # Safety
- * `publisher` is a live handle.
- */
-MarmotStatus marmot_agent_publisher_cancel(const struct MarmotAgentPublisher *publisher);
-
-/**
- * Release a publisher, requesting preview cancellation. NULL is a no-op.
- *
- * # Safety
- * `publisher` is NULL or a live root returned by this library, with no
- * concurrent call using it. Free before the creating client.
- */
-void marmot_agent_publisher_free(struct MarmotAgentPublisher *publisher);
-
-/**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_event_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
  *
  * # Safety
@@ -14703,90 +14422,6 @@ MarmotStatus marmot_subscribe_group_state(const struct MarmotClient *client,
  */
 MarmotStatus marmot_group_state_subscription_snapshot(const struct MarmotGroupStateSubscription *sub,
                                                       struct MarmotAppGroupRecord **out_record);
-
-/**
- *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_agent_stream_update_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
- *
- * # Safety
- * `sub` must be a live handle; `out` must be a valid pointer.
- */
-MarmotStatus marmot_agent_stream_subscription_next(const struct MarmotAgentStreamSubscription *sub,
-                                                   uint32_t timeout_ms,
-                                                   struct MarmotAgentStreamUpdate **out);
-
-/**
- * Install a callback pump for this subscription. `callback` runs
- * on a runtime worker thread with a borrowed item pointer (valid
- * only during the call; do not store or free it) and a final
- * NULL item on close. `callback` and `user_data` access must be
- * thread-safe. Fails if a callback is already installed.
- *
- * # Safety
- * `sub` must be a live handle; `callback` a valid function
- * pointer. `user_data` must outlive every callback invocation —
- * clear/free only *request* cancellation without waiting (see
- * the module docs).
- */
-MarmotStatus marmot_agent_stream_subscription_set_callback(const struct MarmotAgentStreamSubscription *sub,
-                                                           MarmotAgentStreamUpdateCallback callback,
-                                                           void *user_data);
-
-/**
- * Request cancellation of this subscription's callback pump, if
- * any. Non-blocking: a callback already running keeps executing
- * after this returns (see the module docs).
- *
- * # Safety
- * `sub` must be a live handle.
- */
-MarmotStatus marmot_agent_stream_subscription_clear_callback(const struct MarmotAgentStreamSubscription *sub);
-
-/**
- * Free the subscription handle. Requests callback-pump
- * cancellation without waiting (a callback may still be running
- * after this returns — do not free `user_data` on that basis).
- * NULL is a no-op. Free every handle before the client that
- * created it.
- *
- * # Safety
- * `sub` must be NULL or an unfreed handle pointer.
- */
-void marmot_agent_stream_subscription_free(struct MarmotAgentStreamSubscription *sub);
-
-/**
- * Watch a live agent text stream over the brokered QUIC channel. Pass
- * `stream_id_hex = NULL` to follow the latest stream in the group.
- * `server_cert_der` (+ `server_cert_der_len`) pins a self-signed broker
- * certificate; pass NULL with length 0 to use the bundled public-CA roots
- * (not the OS trust store). The bytes
- * are copied — the caller keeps ownership. `insecure_local` is
- * loopback-only for testing. Free with
- * `marmot_agent_stream_subscription_free`.
- *
- * # Safety
- * `client` must be a live handle; `account_ref` and `group_id_hex`
- * valid strings; `stream_id_hex` NULL or a valid string;
- * `server_cert_der` NULL with length 0, or a pointer to
- * `server_cert_der_len` valid bytes; `out_sub` valid.
- */
-MarmotStatus marmot_watch_agent_text_stream(const struct MarmotClient *client,
-                                            const char *account_ref,
-                                            const char *group_id_hex,
-                                            const char *stream_id_hex,
-                                            const uint8_t *server_cert_der,
-                                            uintptr_t server_cert_der_len,
-                                            uint8_t insecure_local,
-                                            struct MarmotAgentStreamSubscription **out_sub);
-
-/**
- * The resolved stream id this watch is following (hex). Writes an owned
- * copy: free it with `marmot_string_free`.
- *
- * # Safety
- * `sub` must be a live handle; `out_stream_id_hex` valid.
- */
-MarmotStatus marmot_agent_stream_subscription_stream_id_hex(const struct MarmotAgentStreamSubscription *sub,
-                                                            char **out_stream_id_hex);
 
 /**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_user_search_update_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
@@ -15711,24 +15346,6 @@ void marmot_wipe_outcome_free(struct MarmotWipeOutcome *ptr);
  * this library.
  */
 void marmot_sign_out_outcome_free(struct MarmotSignOutOutcome *ptr);
-
-/**
- * Free a value of this type returned by this library. NULL
- * is a no-op.
- *
- * # Safety
- * The pointer must be NULL or an unfreed pointer returned by
- * this library.
- */
-void marmot_agent_stream_start_free(struct MarmotAgentStreamStart *ptr);
-
-/**
- * Free an agent-stream update returned by this library. NULL is a no-op.
- *
- * # Safety
- * `update` must be NULL or an unfreed pointer returned by this library.
- */
-void marmot_agent_stream_update_free(struct MarmotAgentStreamUpdate *update);
 
 /**
  * Free a value of this type returned by this library. NULL

@@ -10,8 +10,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
-use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
 use cgka_traits::transport_adapter::TransportEndpointRejectionCategory;
@@ -28,7 +26,6 @@ use tokio::sync::{
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
-use crate::agent_streams::AgentStreamWatchManager;
 use crate::client::read_state::read_state_channel;
 use crate::client::sign_out::{SiblingSignOut, SignOutAdminLeave, SignOutLeave};
 use crate::directory_resources::directory_account;
@@ -41,8 +38,8 @@ use crate::{
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountCatchUpFailure,
     AccountKeyPackageInventoryEntry, AccountKeyPackageRecord, AccountKeyPackageRelayEvent,
     AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
-    AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
-    AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest, AppError,
+    AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
     AuditLogDeleteOutcome, AuditLogFile, AuditLogRetention, AuditLogSettings, AuditLogSource,
     AuditLogTrackerUpdateResult, BackgroundNotificationCollection, BackupSettings, ChatListRow,
@@ -68,13 +65,8 @@ const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
 /// Attachment downloads in flight at once across every account of a runtime.
 pub(crate) const ATTACHMENT_TRANSFER_LIMIT: usize = 4;
 
-pub(crate) mod account_worker;
-mod agent_publisher;
-mod agent_stream_watch;
-pub use agent_publisher::{
-    AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
-};
 mod account_attention;
+pub(crate) mod account_worker;
 mod audit_delivery_status;
 mod audit_otlp_delivery;
 pub use audit_otlp_delivery::AuditOtlpAttemptOutcome;
@@ -152,13 +144,11 @@ pub use user_blocks::RuntimeBlockListSubscription;
 
 // Re-export the public surface so `crate::runtime::Item` and the
 // `marmot_app::...` paths in `lib.rs` resolve unchanged after the split.
-pub use agent_stream_watch::StreamStartView;
 pub use subscriptions::{
-    AgentStreamWatchOptions, AgentTextStreamCryptoContext, ChatListUpdateTrigger,
-    RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch, RuntimeChatListSubscription,
-    RuntimeChatListUpdate, RuntimeChatsSubscription, RuntimeEventsSubscription,
-    RuntimeGroupStateSubscription, RuntimeMessagesSubscription, RuntimeNotificationsSubscription,
-    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, TimelineWindowHandle,
+    ChatListUpdateTrigger, RuntimeChatListSubscription, RuntimeChatListUpdate,
+    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupStateSubscription,
+    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeTimelineMessageUpdate,
+    RuntimeTimelineMessagesSubscription, TimelineWindowHandle,
 };
 
 // Bring split-out items the orchestration core references back into scope.
@@ -183,11 +173,6 @@ pub(crate) use account_worker::{
     AccountWorkerReconnectBackoff, STARTUP_HYDRATION_BATCH_SIZE_FOR_TEST,
 };
 #[cfg(test)]
-pub(crate) use agent_stream_watch::{
-    broker_trust_for_candidate, latest_agent_stream_start, parse_quic_candidate,
-    parse_quic_candidates,
-};
-#[cfg(test)]
 pub(crate) use subscriptions::{
     TIMELINE_WINDOW_LIMIT, TimelineOrder, TimelineQueryFn, TimelineSubscriptionSignal,
     TimelineWindow, TimelineWindowEdge, apply_projection_to_window, chat_list_row_fingerprint,
@@ -199,12 +184,6 @@ pub(crate) use subscriptions::{
 // orchestration core itself no longer references after the split.
 #[cfg(test)]
 use crate::TimelineMessageChange;
-#[cfg(test)]
-use crate::messages::STREAM_ROUTE_QUIC;
-#[cfg(test)]
-use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, STREAM_ROUTE_TAG, STREAM_TAG,
-};
 
 #[derive(Clone)]
 pub struct MarmotAppRuntime {
@@ -402,7 +381,6 @@ pub struct RuntimeSharedServices {
     product_worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
     diagnostics_executor: Arc<StdMutex<Option<tokio::runtime::Handle>>>,
     relay_plane: MarmotRelayPlane,
-    agent_streams: AgentStreamWatchManager,
     lifecycle: RuntimeLifecycle,
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
     relay_telemetry_runtime_config: Arc<StdMutex<RelayTelemetryRuntimeConfig>>,
@@ -512,7 +490,6 @@ impl Default for RuntimeSharedServices {
             observer: marmot_observability::Observer::default(),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
-            agent_streams: AgentStreamWatchManager::default(),
             lifecycle: RuntimeLifecycle::new(),
             relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
             relay_telemetry_runtime_config: Arc::new(StdMutex::new(
@@ -618,7 +595,6 @@ impl RuntimeSharedServices {
             observer: marmot_observability::Observer::sharing(&app.product_analytics),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
-            agent_streams: AgentStreamWatchManager::default(),
             lifecycle,
             relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
             relay_telemetry_runtime_config: Arc::new(StdMutex::new(
@@ -644,10 +620,6 @@ impl RuntimeSharedServices {
 
     pub fn app_performance_telemetry(&self) -> AppPerformanceTelemetry {
         AppPerformanceTelemetry::clone(self.observer.performance())
-    }
-
-    pub fn agent_streams(&self) -> AgentStreamWatchManager {
-        self.agent_streams.clone()
     }
 
     /// Test-only hook: install the barrier the detached post-create-group
@@ -1516,38 +1488,21 @@ pub struct RuntimeAccountError {
     pub message: String,
 }
 
-/// A kind-1200 agent-text-stream **start** observed in a group. The inner
-/// event's stream metadata lives on `message.tags`; clients use it to open the
-/// ephemeral QUIC preview. Raw message subscribers receive this as
-/// [`RuntimeMessageUpdate::AgentStreamStarted`]; materialized timeline
-/// subscribers see the same kind-1200 as a timeline row. The eventual kind-9
-/// stream-final flows as a normal [`RuntimeMessageUpdate::Message`] carrying
-/// `stream`/`stream-start` tags.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeAgentStreamMessage {
-    pub account_id_hex: String,
-    pub account_label: String,
-    pub message: ReceivedMessage,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeMessageUpdate {
     Message(RuntimeMessageReceived),
-    AgentStreamStarted(RuntimeAgentStreamMessage),
 }
 
 impl RuntimeMessageUpdate {
     pub fn account_id_hex(&self) -> &str {
         match self {
             Self::Message(update) => &update.account_id_hex,
-            Self::AgentStreamStarted(update) => &update.account_id_hex,
         }
     }
 
     pub fn message(&self) -> &ReceivedMessage {
         match self {
             Self::Message(update) => &update.message,
-            Self::AgentStreamStarted(update) => &update.message,
         }
     }
 }
@@ -1568,7 +1523,6 @@ pub enum MarmotAppEvent {
         group_id: GroupId,
     },
     MessageReceived(RuntimeMessageReceived),
-    AgentStreamStarted(RuntimeAgentStreamMessage),
     ProjectionUpdated(RuntimeProjectionUpdate),
     GroupEvent(RuntimeGroupEvent),
     AccountError(RuntimeAccountError),
@@ -2541,21 +2495,6 @@ impl MarmotAppRuntime {
     ) -> Result<String, AppError> {
         self.accounts
             .export_encrypted_secret_key(account_ref, passphrase, caller_context)
-    }
-
-    pub async fn agent_text_stream_exporter_secret(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-    ) -> Result<SecretBytes, AppError> {
-        self.accounts
-            .exporter_secret(
-                account_ref,
-                group_id,
-                AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY,
-                32,
-            )
-            .await
     }
 
     pub async fn invite_members(
@@ -4696,64 +4635,6 @@ impl MarmotAppRuntime {
     ) -> Result<SendSummary, AppError> {
         self.accounts
             .redeliver_welcome(account_ref, message_id_hex)
-            .await
-    }
-
-    /// Anchor a kind-1200 agent text stream start. The `created_at` argument is
-    /// retained for call-site stability; the worker stamps the inner event with
-    /// its own clock so the canonical id matches the authoring time. Returns the
-    /// built inner event (its tags carry the stream id, route, and brokers).
-    pub async fn start_agent_text_stream(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        stream_id: &[u8],
-        created_at: u64,
-        quic_candidates: Vec<String>,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.start_agent_text_stream_with_parent(
-            account_ref,
-            group_id,
-            stream_id,
-            created_at,
-            None,
-            quic_candidates,
-        )
-        .await
-    }
-
-    /// Anchor a kind-1200 agent text stream start, optionally threading it to the
-    /// inbound message that triggered the agent turn.
-    pub async fn start_agent_text_stream_with_parent(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        stream_id: &[u8],
-        _created_at: u64,
-        parent_message_id: Option<String>,
-        quic_candidates: Vec<String>,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.accounts
-            .start_agent_text_stream(
-                account_ref,
-                group_id,
-                stream_id.to_vec(),
-                parent_message_id,
-                quic_candidates,
-            )
-            .await
-    }
-
-    /// Send the kind-9 stream-final chat carrying `stream`/`stream-hash`/
-    /// `stream-chunks` tags. Returns the built inner event.
-    pub async fn finish_agent_text_stream(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        request: AgentTextStreamFinishRequest,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.accounts
-            .finish_agent_text_stream(account_ref, group_id, request)
             .await
     }
 

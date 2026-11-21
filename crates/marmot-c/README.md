@@ -35,7 +35,6 @@ per feature.
   [turning on account devices](#turning-on-account-devices),
   [undelivered Welcomes](#undelivered-welcomes),
   [backup recovery](#backup-recovery),
-  [host-driven agent publishing](#host-driven-agent-publishing),
   [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [audit source metadata and legacy files](#audit-source-metadata-and-legacy-files)
 - [Smoke test and example](#smoke-test-and-example)
 - [Regenerating the header](#regenerating-the-header)
@@ -274,9 +273,8 @@ before anything opens. White Noise hosts pass `marmot_deployment_white_noise()`.
 
 For private integration fixtures, `marmot_client_new_with_options` accepts
 an explicit loopback relay policy and an optional host secret-store vtable.
-Existing constructors keep their public-only policy. Loopback broker access
-requires a separate publisher trust opt-in; neither permits private or
-link-local endpoints. Local insecure trust is intended only for tests.
+Existing constructors keep their public-only policy. Neither permits private or
+link-local endpoints.
 
 <a id="experimental-device-group-test-builds"></a>
 
@@ -809,26 +807,6 @@ The C ABI mirrors the [shared flow](../marmot-uniffi/README.md#turning-on-accoun
 `marmot_account_devices_activation` and offer `marmot_enable_account_devices` only on
 `MARMOT_ACCOUNT_DEVICES_ACTIVATION_ELIGIBLE`. A refused activation returns
 `MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED`; the last-error detail names the aggregate reason.
-
-## Host-driven agent publishing
-
-`marmot_agent_publisher_new` anchors a stream and returns an opaque handle.
-Pass a QUIC candidate and broker trust options; cryptographic keys and
-transcript framing stay inside MDK. Append text, status, or progress using
-`marmot_agent_publisher_append`. Its receipt reports accepted record count
-and any preview transport failure; transport loss preserves the transcript.
-
-`marmot_agent_publisher_finish` seals the transcript and sends the durable
-final message. Inspect the returned send disposition for delivery state.
-If sending fails, call finish again on the same handle; the sealed request
-is retained. After success, repeated finish returns the original receipt.
-Appends after sealing fail. These guarantees last for the handle's lifetime;
-publisher state is not restored after a process restart.
-
-Cancel or free a handle to stop its preview. A finish already in progress
-wins over cancellation. Free every publisher before its client, and never
-free a handle concurrently with another call using it. Free info, append
-receipts, and send receipts with their matching generated free functions.
 
 ## Audit v5 recording and delivery
 

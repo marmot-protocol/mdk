@@ -12,9 +12,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
 use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID;
-use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION, STREAM_TAG,
-};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
@@ -3567,48 +3565,6 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
         )
     })
     .await;
-
-    let stream_id = [0x44; 32];
-    runtime
-        .start_agent_text_stream(
-            &alice.account.account_id_hex,
-            &group_id,
-            &stream_id,
-            123,
-            vec!["quic://127.0.0.1:4450".to_owned()],
-        )
-        .await
-        .unwrap();
-    let stream_event = wait_for_event(&mut events, |event| {
-        matches!(
-            event,
-            MarmotAppEvent::AgentStreamStarted(stream)
-                if stream.account_id_hex == bob_id
-                    && stream.message.group_id == group_id
-                    && stream.message.kind == cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
-                    && tag_value(&stream.message.tags, STREAM_TAG)
-                        == Some(hex::encode(stream_id).as_str())
-        )
-    })
-    .await;
-    let MarmotAppEvent::AgentStreamStarted(stream_event) = stream_event else {
-        panic!("expected agent stream start event");
-    };
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let stream_id_hex = hex::encode(stream_id);
-    let stream_crypto = runtime
-        .agent_text_stream_crypto_for_start_event(
-            Some(&bob.account.account_id_hex),
-            Some(group_id_hex.as_str()),
-            Some(stream_id_hex.as_str()),
-            &stream_event.message.message_id_hex,
-        )
-        .await
-        .unwrap();
-    assert_eq!(stream_crypto.account_id_hex, bob.account.account_id_hex);
-    assert_eq!(stream_crypto.group_id, group_id);
-    assert_eq!(stream_crypto.stream_id, stream_id.to_vec());
-    assert_eq!(stream_crypto.policy_max_plaintext_frame_len, Some(4096));
 
     runtime.shutdown().await;
 }
@@ -7899,7 +7855,7 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
         )
         .await
         .unwrap();
-    let update = wait_for_message_update(&mut subscription, |update| {
+    wait_for_message_update(&mut subscription, |update| {
         matches!(
             update,
             RuntimeMessageUpdate::Message(message)
@@ -7909,7 +7865,6 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
         )
     })
     .await;
-    assert!(matches!(update, RuntimeMessageUpdate::Message(_)));
 
     runtime.shutdown().await;
 }
@@ -9884,13 +9839,15 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
     assert!(bad_media.to_string().contains("media plaintext_sha256"));
 }
 
+/// New groups still require the retired agent text stream component
+/// (`0x8006`), and a metadata update keeps it in every member's MLS state and
+/// account record, carried as an opaque component.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relay_app_runtime_creates_default_agent_text_stream_group() {
+async fn retired_agent_text_stream_component_survives_group_metadata_updates() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
-    let alice_id = home.account("alice").unwrap().account_id_hex;
 
     let (_relay, app, _url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
@@ -9904,47 +9861,42 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
         .operation
         .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
-
-    let alice_group = app.group("alice", &group_id_hex).unwrap().unwrap();
-    assert!(alice_group.agent_text_stream.required);
-    assert_eq!(alice_group.agent_text_stream.component_id, 0x8006);
-    assert_eq!(
-        alice_group.agent_text_stream.component,
-        "marmot.group.agent-text-stream.quic.v1"
-    );
-    assert_eq!(
-        alice_group.agent_text_stream.required_member_roles,
-        vec!["receive".to_owned()]
-    );
-    assert_eq!(
-        alice_group.agent_text_stream.allowed_member_roles,
-        vec!["receive".to_owned(), "send".to_owned()]
-    );
-    assert_eq!(
-        alice_group.agent_text_stream.data_hex,
-        "010300001000000000000000"
-    );
+    let retired = |label: &str| {
+        let group = app.group(label, &group_id_hex).unwrap().unwrap();
+        let component = group
+            .unknown_components
+            .iter()
+            .find(|component| component.component_id == 0x8006)
+            .map(|component| (component.component.clone(), component.data_hex.clone()));
+        (group.profile.name, component)
+    };
+    let user_to_agent_default = Some((
+        "marmot.group.agent-text-stream.quic.v1".to_owned(),
+        "010300001000000000000000".to_owned(),
+    ));
 
     bob.sync().await.unwrap();
-    let bob_group = app.group("bob", &group_id_hex).unwrap().unwrap();
-    assert!(bob_group.agent_text_stream.required);
+    for label in ["alice", "bob"] {
+        assert_eq!(
+            retired(label),
+            ("agent".to_owned(), user_to_agent_default.clone()),
+            "{label}"
+        );
+    }
 
-    alice.send(&group_id, b"write a summary").await.unwrap();
-    let prompt = bob.sync().await.unwrap();
-    assert_eq!(prompt.messages.len(), 1);
-    assert_eq!(prompt.messages[0].sender, alice_id);
-    assert_eq!(
-        prompt.messages[0].sender_display_name.as_deref(),
-        Some("alice")
-    );
-    assert_eq!(prompt.messages[0].plaintext, "write a summary");
-
-    let alice_secret = alice.agent_text_stream_exporter_secret(&group_id).unwrap();
-    let bob_secret = bob.agent_text_stream_exporter_secret(&group_id).unwrap();
-    let repeated_alice_secret = alice.agent_text_stream_exporter_secret(&group_id).unwrap();
-
-    assert_eq!(alice_secret, bob_secret);
-    assert_eq!(alice_secret, repeated_alice_secret);
+    alice
+        .update_group_profile(&group_id, Some("renamed"), None)
+        .await
+        .unwrap();
+    let renamed_epoch = alice.group_mls_state(&group_id).unwrap().epoch;
+    sync_to_epoch(&mut bob, &group_id, renamed_epoch).await;
+    for label in ["alice", "bob"] {
+        assert_eq!(
+            retired(label),
+            ("renamed".to_owned(), user_to_agent_default.clone()),
+            "{label}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -20,7 +20,6 @@ name = "wnd"
 path = "src/bin/wnd.rs"
 
 [dependencies]
-agent-stream-compose.workspace = true
 cgka-traits.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -38,8 +37,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "signal"] }
-transport-quic-broker.workspace = true
-transport-quic-stream.workspace = true
 unicode-properties.workspace = true
 unicode-segmentation.workspace = true
 url.workspace = true

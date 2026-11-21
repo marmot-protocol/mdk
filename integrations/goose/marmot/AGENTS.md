@@ -9,7 +9,7 @@ Rust Goose harness for Marmot through the local `wn-agent` control socket. Read
   Nostr transport, durable sends, and invite handling; this crate invokes
   `goose run` and parses its `stream-json` event stream.
 - Every message from an allowed sender is a prompt. Do not add gateway,
-  mention-activation, profile, QUIC-preview, or protocol behavior here.
+  mention-activation, profile, or protocol behavior here.
 - Send prompts over stdin (`--instructions -`) and emit each assistant
   message's joined text deltas once the next message starts or `complete`
   arrives. Never expose thinking, tool requests/responses, notifications,

@@ -1,8 +1,8 @@
 # nextest configuration.
 #
 # The `wn-cli::cli` integration tests behave like mini end-to-end
-# systems: each one spawns `wn` subprocesses, a `wnd` daemon, local relays, QUIC
-# brokers, and account/runtime workers, then drives polling loops. nextest runs
+# systems: each one spawns `wn` subprocesses, a `wnd` daemon, local relays,
+# and account/runtime workers, then drives polling loops. nextest runs
 # every test in its own process at per-CPU parallelism, so under load the heavy
 # per-test setup is multiplied across the box and worker/daemon startup is
 # starved, surfacing as `account worker startup timed out` flakes (issue #103).

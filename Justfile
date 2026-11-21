@@ -712,7 +712,7 @@ binding-docs-update:
 convergence-ledger-gate:
     ./scripts/check_convergence_constant_ledger.sh
 
-# Keep the distributed campaign and QUIC broker images on the pinned toolchain.
+# Keep the distributed campaign image on the pinned toolchain.
 campaign-toolchain-gate:
     ./scripts/check_campaign_toolchain.sh
     ./scripts/tests/test_campaign_toolchain.sh

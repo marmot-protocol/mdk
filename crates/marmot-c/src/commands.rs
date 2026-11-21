@@ -32,7 +32,6 @@ use crate::types::account::{
     MarmotAccountSummaryList, MarmotAccountUnreadList, MarmotIdentityCreationResult,
     MarmotSendSummary, MarmotSignOutOutcome, MarmotUserProfileMetadata, MarmotWipeOutcome,
 };
-use crate::types::agent_stream::MarmotAgentStreamStart;
 use crate::types::audit::{
     MarmotAuditDeliveryStatusV5List, MarmotAuditLogDeleteResult, MarmotAuditLogFileList,
     MarmotAuditLogRetention, MarmotAuditLogSettings, MarmotAuditLogSource,
@@ -2469,44 +2468,6 @@ pub unsafe extern "C" fn marmot_collect_notifications_after_wake(
                         .marmot
                         .collect_notifications_after_wake(max_wait_ms, source.into()),
                 ),
-                out,
-            )
-        }
-    })
-}
-
-/// Publish a kind-1200 agent text stream start (anchor) for the group.
-/// `stream_id_hex` NULL mints a fresh id; `quic_candidates` are the
-/// broker route candidates. Free with `marmot_agent_stream_start_free`.
-///
-/// # Safety
-/// `client` must be a live handle; strings valid; the candidate array
-/// must hold `len` valid strings (or be NULL with len 0); `out` valid.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn marmot_start_agent_text_stream(
-    client: *const MarmotClient,
-    account_ref: *const c_char,
-    group_id_hex: *const c_char,
-    stream_id_hex: *const c_char,
-    quic_candidates: *const *const c_char,
-    quic_candidates_len: usize,
-    out: *mut *mut MarmotAgentStreamStart,
-) -> MarmotStatus {
-    ffi_guard(|| {
-        try_arg!(unsafe { crate::preflight_out_ptr(out) });
-        let client = try_arg!(unsafe { client_ref(client) });
-        let account_ref = try_arg!(unsafe { required_str(account_ref) });
-        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
-        let stream_id_hex = try_arg!(unsafe { crate::memory::optional_str(stream_id_hex) });
-        let quic_candidates = try_arg!(unsafe { str_array(quic_candidates, quic_candidates_len) });
-        unsafe {
-            deliver(
-                client.block_on(client.marmot.start_agent_text_stream(
-                    account_ref,
-                    group_id_hex,
-                    stream_id_hex,
-                    quic_candidates,
-                )),
                 out,
             )
         }

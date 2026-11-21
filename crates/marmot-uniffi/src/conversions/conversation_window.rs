@@ -462,7 +462,6 @@ fn presented_timeline_with_tokens(
         thread: row.thread.clone().map(Into::into),
         media_json: None,
         media: super::media::timeline_media_outcomes_ffi(&row.media, row.source_epoch),
-        agent_text_stream_json: row.agent_text_stream.as_ref().map(ToString::to_string),
         group_system: if trusted {
             row.group_system.clone().map(Into::into)
         } else {
@@ -615,7 +614,6 @@ impl ConversationConversionCache {
             reply_preview: row.reply_preview.clone(),
             thread: row.thread.clone(),
             media: row.media.clone(),
-            agent_text_stream: row.agent_text_stream.clone(),
             group_system: if trusted {
                 row.group_system.clone()
             } else {
@@ -686,7 +684,6 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         reply_preview,
         thread,
         media,
-        agent_text_stream,
         group_system,
         poll,
         reactions: _,
@@ -720,7 +717,6 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
             reply_to_message_id_hex,
             reply_preview,
             media,
-            agent_text_stream,
             edit,
             has_reports,
             deleted,
@@ -879,7 +875,6 @@ mod tests {
             reply_preview: None,
             thread: None,
             media: None,
-            agent_text_stream: None,
             reactions: app::TimelineReactionSummary::default(),
             deleted: false,
             deletion_source: Default::default(),

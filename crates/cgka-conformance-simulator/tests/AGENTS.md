@@ -68,11 +68,6 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 - **File:** `app_runtime_adapter.rs`
   - **Owns:** Long-lived black-box app-runtime adapter coverage, including owner-death child cleanup.
 
-- **File:** `agent_text_stream_vectors.rs`
-  - **Owns:** Byte-level conformance vectors for the agent text stream QUIC feature: `AgentTextStreamKeyContextV1`
-    encoding, HKDF-SHA256 record key / nonce derivation, record AEAD AAD, transcript hashes, and the
-    `QuicBrokerControlEnvelopeV1` envelope.
-
 - **File:** `asymmetric_relay_release.rs`
   - **Owns:** Late input after a group is released on one relay's coverage: the past-epoch, sender-generation,
     gap-commit, rival-commit and rewind-horizon windows, pinned from both sides, plus ignored sweeps that assert

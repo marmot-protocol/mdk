@@ -114,8 +114,7 @@ impl Marmot {
     /// Materialized conversation timeline for a group or account-wide tail.
     ///
     /// This is the app-facing aggregated view: kind-9 chat/reply/media rows,
-    /// kind-1200 stream-start rows, stream-final metadata pointing back to the
-    /// start, reaction summaries, delete tombstones, and pagination flags. Raw
+    /// reaction summaries, delete tombstones, and pagination flags. Raw
     /// kind-7/kind-5 events remain available through `messages(...)` for
     /// diagnostics.
     ///

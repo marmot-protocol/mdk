@@ -1,6 +1,3 @@
-use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN,
-};
 use cgka_traits::app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
     AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
@@ -8,8 +5,6 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
-    STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG,
-    STREAM_PARENT_TAG, STREAM_ROUTE_TAG, STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
 };
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
@@ -26,7 +21,7 @@ use nostr::nips::nip21::Nip21;
 use serde_json::{Map, Value, json};
 
 use crate::ids::parse_account_id_hex;
-use crate::{AgentTextStreamFinishRequest, AppError, MediaAttachmentReference};
+use crate::{AppError, MediaAttachmentReference};
 use crate::{
     MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
     MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
@@ -38,9 +33,9 @@ pub(crate) const PUBKEY_REF_TAG: &str = "p";
 /// Upper bound for app-internal Markdown mention scans over untrusted message
 /// plaintext. The sender stores the full content, but p-tag derivation only
 /// parses this bounded prefix so one hostile message cannot force unbounded
-/// synchronous Markdown work before send/classification (mdk#654).
-pub(crate) const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize =
-    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
+/// synchronous Markdown work before send/classification (mdk#654). The value
+/// is the plaintext frame cap the retired agent text stream used.
+pub(crate) const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize = 65_519;
 
 /// Reactions are display metadata that flow into timelines and notification
 /// previews. Keep them compact and free of terminal/control sequences while
@@ -194,13 +189,6 @@ fn append_mention_tags(tags: &mut Vec<Vec<String>>, content: &str) {
 
 pub(crate) use cgka_traits::is_nip22_comment;
 
-/// Value of the `stream-type` tag on an agent text stream start event.
-const STREAM_TYPE_TEXT: &str = "text";
-/// Value of the `route` tag on a brokered QUIC agent text stream start event.
-pub(crate) const STREAM_ROUTE_QUIC: &str = "quic";
-/// `final-kind` tag value: the kind of the eventual stream-final chat message.
-const STREAM_FINAL_KIND_CHAT: &str = "9";
-
 /// A structured outgoing app message, resolved into a [`MarmotInnerEvent`] by
 /// the account worker, which owns the authoring account id and the clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,14 +268,6 @@ pub(crate) enum AppMessageIntent {
         attachments: Vec<MediaAttachmentReference>,
         message_tags: Vec<Vec<String>>,
         placement: Option<ThreadPlacement>,
-    },
-    StreamStart {
-        stream_id: Vec<u8>,
-        parent_message_id: Option<String>,
-        quic_candidates: Vec<String>,
-    },
-    StreamFinal {
-        request: AgentTextStreamFinishRequest,
     },
     AgentActivity {
         status: String,
@@ -672,81 +652,6 @@ pub(crate) fn build_inner_event_with_media_reply(
                 content.clone(),
             ))
         }
-        AppMessageIntent::StreamStart {
-            stream_id,
-            parent_message_id,
-            quic_candidates,
-        } => {
-            let stream_id_hex = hex::encode(stream_id);
-            if stream_id.len() != AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "agent text stream id must be 32 bytes".into(),
-                ));
-            }
-            for candidate in quic_candidates {
-                transport_quic_stream::QuicCandidate::parse(candidate)
-                    .map_err(|_| AppError::AgentStreamInvalidCandidate(candidate.clone()))?;
-            }
-            let mut tags = vec![
-                vec![STREAM_TAG.to_owned(), stream_id_hex],
-                vec![STREAM_TYPE_TAG.to_owned(), STREAM_TYPE_TEXT.to_owned()],
-                vec![
-                    STREAM_FINAL_KIND_TAG.to_owned(),
-                    STREAM_FINAL_KIND_CHAT.to_owned(),
-                ],
-                vec![STREAM_ROUTE_TAG.to_owned(), STREAM_ROUTE_QUIC.to_owned()],
-            ];
-            if let Some(parent_message_id) = parent_message_id {
-                tags.push(vec![
-                    STREAM_PARENT_TAG.to_owned(),
-                    normalize_stream_parent_message_id(parent_message_id)?,
-                ]);
-            }
-            tags.extend(
-                quic_candidates
-                    .iter()
-                    .map(|candidate| vec![STREAM_BROKER_TAG.to_owned(), candidate.clone()]),
-            );
-            Ok(event(
-                MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-                tags,
-                String::new(),
-            ))
-        }
-        AppMessageIntent::StreamFinal { request } => {
-            if request.stream_id.len() != AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "agent text stream id must be 32 bytes".into(),
-                ));
-            }
-            let start_event_id = hex::decode(&request.start_event_id).map_err(|_| {
-                AppError::InvalidAppMessagePayload(
-                    "agent text stream start event id must be 32-byte hex".into(),
-                )
-            })?;
-            if start_event_id.len() != 32 {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "agent text stream start event id must be 32-byte hex".into(),
-                ));
-            }
-            let tags = vec![
-                vec![STREAM_TAG.to_owned(), hex::encode(&request.stream_id)],
-                vec![STREAM_START_TAG.to_owned(), request.start_event_id.clone()],
-                vec![
-                    STREAM_HASH_TAG.to_owned(),
-                    hex::encode(request.transcript_hash),
-                ],
-                vec![
-                    STREAM_CHUNKS_TAG.to_owned(),
-                    request.chunk_count.to_string(),
-                ],
-            ];
-            Ok(event(
-                MARMOT_APP_EVENT_KIND_CHAT,
-                tags,
-                request.final_text_or_reference.clone(),
-            ))
-        }
         AppMessageIntent::AgentActivity {
             status,
             text,
@@ -997,20 +902,6 @@ fn validate_message_ref(target_message_id: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn normalize_stream_parent_message_id(parent_message_id: &str) -> Result<String, AppError> {
-    let raw = hex::decode(parent_message_id).map_err(|_| {
-        AppError::InvalidAppMessagePayload(
-            "agent text stream parent message id must be 32-byte hex".into(),
-        )
-    })?;
-    if raw.len() != 32 {
-        return Err(AppError::InvalidAppMessagePayload(
-            "agent text stream parent message id must be 32-byte hex".into(),
-        ));
-    }
-    Ok(hex::encode(raw))
-}
-
 fn validate_non_empty_field(value: &str, field: &str) -> Result<String, AppError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1049,16 +940,6 @@ pub(crate) fn encode_inner_event(event: &MarmotInnerEvent) -> Result<Vec<u8>, Ap
     event
         .encode()
         .map_err(|err| AppError::InvalidAppMessagePayload(err.to_string()))
-}
-
-/// True when an inner event is a kind-9 chat that finalizes an agent text
-/// stream (it carries a `stream` tag plus a `stream-start` or `stream-hash`
-/// tag). Such events flow as normal timeline messages, not start signals.
-pub fn is_stream_final_event(kind: u64, tags: &[Vec<String>]) -> bool {
-    kind == MARMOT_APP_EVENT_KIND_CHAT
-        && tag_value(tags, STREAM_TAG).is_some()
-        && (tag_value(tags, STREAM_START_TAG).is_some()
-            || tag_value(tags, STREAM_HASH_TAG).is_some())
 }
 
 /// First value of the named tag (`tag[0] == name` -> `tag[1]`).

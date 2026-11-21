@@ -118,14 +118,9 @@ c_mirror! {
 /// One message-subscription update.
 #[repr(C)]
 pub enum MarmotMessageUpdate {
-    /// A raw message update: chat, reply, media, reaction, delete, or the
-    /// kind-9 stream-final.
+    /// A raw message update: chat, reply, media, reaction, delete, or any
+    /// other received app event.
     Message {
-        received: MarmotRuntimeMessageReceived,
-    },
-    /// A kind-1200 agent text stream start — the signal to open the QUIC
-    /// preview. Its stream id, route, and brokers live on `message.tags`.
-    AgentStreamStarted {
         received: MarmotRuntimeMessageReceived,
     },
 }
@@ -136,9 +131,6 @@ impl From<MessageUpdateFfi> for MarmotMessageUpdate {
             MessageUpdateFfi::Message { received } => Self::Message {
                 received: received.into(),
             },
-            MessageUpdateFfi::AgentStreamStarted { received } => Self::AgentStreamStarted {
-                received: received.into(),
-            },
         }
     }
 }
@@ -146,9 +138,7 @@ impl From<MessageUpdateFfi> for MarmotMessageUpdate {
 impl CFree for MarmotMessageUpdate {
     unsafe fn free_in_place(&mut self) {
         match self {
-            Self::Message { received } | Self::AgentStreamStarted { received } => unsafe {
-                received.free_in_place()
-            },
+            Self::Message { received } => unsafe { received.free_in_place() },
         }
     }
 }

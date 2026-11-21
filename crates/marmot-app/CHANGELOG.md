@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- The agent text stream over QUIC (live agent text previews) is removed. Gone: `MarmotAppRuntime::open_agent_publisher`,
+  `start_agent_text_stream`, `start_agent_text_stream_with_parent`, `finish_agent_text_stream`,
+  `watch_agent_text_stream`, `agent_text_stream_crypto_for_start_event`, `agent_text_stream_exporter_secret` and
+  `agent_streams`; `AppClient::agent_text_stream_exporter_secret`; `AgentPublisher*`, `AgentStream*`,
+  `AgentTextStreamCryptoContext`, `AgentTextStreamFinishRequest`, `RuntimeAgentStream*`, `StreamStartView` and
+  `is_stream_final_event`; `MarmotAppEvent::AgentStreamStarted` and `RuntimeMessageUpdate::AgentStreamStarted`; the
+  `AppError::AgentStream*` variants; `AppAgentTextStreamComponent`, `AppGroupRecord::agent_text_stream` and the
+  `AGENT_TEXT_STREAM_COMPONENT(_ID)` re-exports.
+- A kind-1200 stream start no longer reaches message subscribers and has no timeline row; a stream-final kind-9
+  message is an ordinary chat message.
+- New groups still require the agent text stream component (`0x8006`) and every role capability is still advertised,
+  so existing groups keep working. A group record now carries `0x8006` in `unknown_components`.
+
 ### Added
 
 - `MarmotAppRuntime::send_thread_message` sends a NIP-22 thread message (kind 1111) with text, attachments or both,

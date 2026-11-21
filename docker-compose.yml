@@ -39,16 +39,6 @@ services:
       setup:
         condition: service_completed_successfully
 
-  quic-broker:
-    image: marmot-quic-broker:local
-    build:
-      context: .
-      dockerfile: Dockerfile.quic-broker
-    ports:
-      - "127.0.0.1:4450:4450/udp"
-    restart: unless-stopped
-    command: ["--bind", "0.0.0.0:4450"]
-
   hermes-marmot-phone-test:
     profiles: ["hermes-phone-test"]
     image: hermes-marmot-phone-test:local
@@ -69,11 +59,8 @@ services:
       MARMOT_AGENT_DEV_ALLOW_ANY_INVITES: "1"
       MARMOT_AGENT_DEBUG_CONTROLS: "1"
       MARMOT_RELAYS: wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat
-      MARMOT_QUIC_CANDIDATES: quic://quic-broker.ipf.dev:4450
       HERMES_MARMOT_AUTO_BOOTSTRAP: "1"
       HERMES_MARMOT_START_GATEWAY: "1"
-      HERMES_MARMOT_STREAMING: ${HERMES_MARMOT_STREAMING:-1}
-      HERMES_MARMOT_STREAMING_TRANSPORT: ${HERMES_MARMOT_STREAMING_TRANSPORT:-auto}
       HERMES_MARMOT_TOOL_PROGRESS: ${HERMES_MARMOT_TOOL_PROGRESS:-off}
       HERMES_MARMOT_INTERIM_MESSAGES: ${HERMES_MARMOT_INTERIM_MESSAGES:-0}
       HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS: ${HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS:-0}
@@ -114,8 +101,6 @@ services:
       MARMOT_AGENT_DEV_ALLOW_ANY_INVITES: "1"
       MARMOT_AGENT_DEBUG_CONTROLS: "1"
       MARMOT_RELAYS: wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat
-      MARMOT_QUIC_CANDIDATES: quic://quic-broker.ipf.dev:4450
-      MARMOT_STREAM_MODE: ${MARMOT_STREAM_MODE:-block}
       # The agent offers to publish a public Nostr profile name when it joins a
       # group (on by default; the user's in-chat reply is the consent). Uncomment
       # to disable that prompt:
@@ -135,11 +120,10 @@ services:
     restart: unless-stopped
 
   # Self-contained local harness: a real OpenClaw gateway + Marmot plugin +
-  # wn-agent wired to the in-repo nostr relay + QUIC broker (no public relays,
-  # no phone needed). wn-agent runs with --dev-allow-any-invites +
-  # --debug-controls so an
+  # wn-agent wired to the in-repo nostr relay (no public relays, no phone
+  # needed). wn-agent runs with --dev-allow-any-invites + --debug-controls so an
   # inbound message can be injected over the control socket to wire/validate the
-  # inbound->agent turn dispatch and live-preview paths.
+  # inbound->agent turn dispatch and durable reply paths.
   openclaw-gateway:
     profiles: ["openclaw-gateway"]
     image: openclaw-marmot-gateway:local
@@ -159,8 +143,6 @@ services:
       MARMOT_AGENT_DEV_ALLOW_ANY_INVITES: "1"
       MARMOT_AGENT_DEBUG_CONTROLS: "1"
       MARMOT_RELAYS: ws://nostr-rs-relay:8080
-      MARMOT_QUIC_CANDIDATES: quic://quic-broker:4450
-      MARMOT_STREAM_MODE: ${MARMOT_STREAM_MODE:-block}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
@@ -168,8 +150,6 @@ services:
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
     depends_on:
       nostr-rs-relay:
-        condition: service_started
-      quic-broker:
         condition: service_started
     tmpfs:
       - /run/marmot-agent

@@ -53,7 +53,7 @@ pub(crate) fn media_download_root() -> PathBuf {
 /// is named after the ciphertext SHA-256 and holds a sender-controlled media
 /// filename, so a readable parent leaks ciphertext/message metadata to other
 /// local users. Mirror the connector's other private paths
-/// (`socket::prepare_socket_dir`, `stream_session::persist_to_disk`,
+/// (`socket::prepare_socket_dir`, `send_idempotency::persist_to_disk`,
 /// `AllowlistStore::write_record`), which all chmod their parent dir to 0700.
 ///
 /// Ordering matters: the secret-named child must never be materialized inside a

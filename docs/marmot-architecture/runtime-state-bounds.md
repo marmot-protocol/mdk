@@ -1,13 +1,13 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-11-14
-tags: [marmot, architecture, runtime, daemon, broker, memory]
+updated: 2026-11-21
+tags: [marmot, architecture, runtime, daemon, memory]
 ---
 
 # Long-lived runtime state — bounds and reclamation
 
-The daemon (`wn-agent`), the QUIC preview broker, and the app runtime are long-lived processes. Every long-lived
+The `wn-agent` and `wnd` daemons and the app runtime are long-lived processes. Every long-lived
 collection, handle set, counter, and temp artifact they hold must have a defined lifecycle: creation, accounting,
 eviction/expiry, and reclamation, with an enforced bound. Unbounded growth is a contract violation, not a latent leak.
 Tracking issue: marmot-protocol/mdk#381.
@@ -126,17 +126,6 @@ it does not promise to erase every trace of a moderation decision. Message bodie
 secure erasure. The moderation replay fence applies only to targets with this retained evidence. Ordinary message
 re-delivery and expiry continue through the existing ingress deduplication and retention lifecycle.
 
-### `transport-quic-broker` (`src/state.rs`, `src/server.rs`)
-
-| Structure | Bound | Reclamation |
-| --- | --- | --- |
-| `BrokerStateInner.rooms` | `max_rooms` (default 512) | Removed when the last subscriber leaves an empty unfinished room; finished rooms drop after a 60 s TTL; stale unfinished rooms are purged activity-driven on every state-touching op. A publisher reusing a finished key resets the room in place. |
-| Per-room `backlog` | `max_backlog` records (default 1024) per room, `max_backlog_bytes` (default 64 MiB) global, `replay_ttl` (default 0 = retain nothing) | Expired entries purged on subscribe/publish/purge; oldest dropped when over depth or byte budget. |
-| `total_backlog_bytes` | Derived from room backlogs | Adjusted symmetrically on every backlog mutation, including the finished-room in-place reset (mdk#372); recomputed wholesale by `purge_expired_rooms`. |
-| Per-subscriber queue | `per_subscriber_queue` records (default 32) | A lagging subscriber is dropped rather than buffered. |
-| Per-publish-stream forwarding | `publish_max_records` (default 65536) records, `publish_max_frame_bytes` (default 64 MiB) cumulative wire frame bytes (ciphertext for encrypted previews — the broker never decrypts) | Forward-role bounds from broker config (never the subscriber-sized receive defaults, mdk#391); on breach the room is finished so subscribers see a clean end. Record reads also carry the shared 120 s quiet-gap deadline, so an alive-but-wedged publisher cannot pin a room via QUIC keepalives. |
-| Connections | `max_connections` semaphore (default 256), `max_streams_per_connection` (default 64) | Over-cap connections are refused at accept; permits release on disconnect. TLS handshakes are bounded by `read_timeout`, so a stalling peer cannot pin a connection permit pre-handshake. |
-
 ### `agent-connector` / `wn-agent` (`src/lib.rs` and modules)
 
 | Structure | Bound | Reclamation |
@@ -144,15 +133,7 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 | Control-socket connections | `max_connections` semaphore (default `MAX_CONTROL_CONNECTIONS` = 64, `--max-connections`) | Over-cap connections are closed at accept time (mdk#390); each served connection holds one permit for its whole session, released on disconnect. A zero cap is rejected as unsafe config. |
 | `DeliveredInboundCursor` (per `SubscribeInbound` session) | 4096 ids (`DELIVERED_INBOUND_CURSOR_CAPACITY`) | FIFO eviction of oldest ids; dropped with the session. |
 | `SendIdempotencyStore` | 1024 entries, persisted | FIFO eviction on insert. |
-| Stream compose sessions | Idle timeout 300 s (`STREAM_SESSION_IDLE_TIMEOUT`) | Background sweeper aborts idle sessions every 30 s. |
 | Decrypted-media temp dirs (`$TMPDIR/marmot-media/<hash>/`) | TTL 1 h (`MEDIA_TEMP_MAX_AGE`) | Swept every 60 s, keyed on the newest mtime within the per-blob dir so an in-place re-download refreshes liveness (mdk#374); un-inspectable dirs are skipped, never swept blind. |
-
-### `marmot-app` runtime (`src/agent_streams.rs`)
-
-| Structure | Bound | Reclamation |
-| --- | --- | --- |
-| `AgentStreamWatchManager.watches` | 256 (`AGENT_STREAM_WATCH_RETAIN_LIMIT`), including `running` watches | Enforced on both start and finish. Finished watches evict oldest-first; when running watches alone exceed the cap (a finish that never arrives), the oldest running watches evict too (mdk#343). |
-| `recent_updates` replay ring | 256 (`AGENT_STREAM_UPDATE_REPLAY_LIMIT`) | Oldest popped on publish. |
 
 ### Presented chat-list subscriptions (`marmot-app/src/runtime/presented_chat_list.rs`)
 
@@ -244,7 +225,6 @@ defaults off until native local access/removal and policy controls land. C8-C3 a
 | Daemon connections | `MAX_DAEMON_CONNECTIONS` semaphore (256) | Over-cap connections are closed at accept time; permits release on disconnect. Finished per-connection task handles are reaped every accept iteration. |
 | `DaemonEventHub.recent_messages` replay ring | 256 (`DAEMON_EVENT_REPLAY_LIMIT`) | Oldest popped on publish. |
 | Per-subscription dedup ids | 256 (`MESSAGE_SUBSCRIPTION_DEDUP_LIMIT`) | FIFO eviction; dropped with the subscription. |
-| `StreamWatchWorkers.handles` | Live watches + finished-since-last-start | Finished handles reaped on every watch start and on status; all aborted at shutdown. |
 
 ### `transport-nostr-adapter` (`src/lib.rs`, `src/telemetry.rs`)
 

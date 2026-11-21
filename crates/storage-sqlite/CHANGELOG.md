@@ -10,6 +10,13 @@
   stored parents. Struct literals need the field.
 - Account migration 0217 projects stored kind-1111 events that carry a lowercase `e` but no numeric `k` as comments
   (parent, media, author edits, media-key references). Older binaries refuse schema 217; downgrade is unsupported.
+- The agent text stream is retired. Account migration 0218 drops `agent_stream_starts`,
+  `agent_stream_publisher_sequences` and `message_timeline.agent_stream_json`, and deletes kind-1200 timeline rows;
+  the source `app_events` stay. Older binaries refuse schema 218; downgrade is unsupported. A kind-1200 stream start
+  projects no row, and a stream-final kind-9 message is an ordinary chat row. Gone: the agent stream publisher
+  reservation API (`AgentStreamPublisher*`, `MAX_AGENT_STREAM_PUBLISHER_CONTEXTS`), `agent_text_stream` on
+  `TimelineMessageRecord` and `TimelineReplyPreview`, and `TimelineUpdateTrigger::AgentStreamStarted` /
+  `AgentStreamFinished`.
 
 ### Changed
 

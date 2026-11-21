@@ -1,7 +1,7 @@
 ---
 title: "Multi-Step State Changes"
 created: 2026-07-04
-updated: 2026-08-18
+updated: 2026-11-21
 tags: [marmot, overview, state, atomicity, error-paths]
 status: overview
 ---
@@ -18,8 +18,7 @@ Snapshots and Horizons) to every crate in the workspace. Tracking issue: mdk#711
 
 1. **Validate before you mutate.** An operation that both validates input (client-supplied or derived) and tears down
    or advances durable state runs the validation first and mutates only on success. If teardown and validation cannot
-   be separated, move the validation to where it is atomic with the teardown decision (the agent stream finalize path
-   validates inside the compose task's `Finish` handling — mdk#366).
+   be separated, move the validation to where it is atomic with the teardown decision.
 
 2. **Compensation covers every applied step.** Where staging must precede a fallible step, the error path restores
    *all* state the operation already advanced — not just one layer of it. Prefer restructuring so the hard-to-undo
@@ -28,7 +27,7 @@ Snapshots and Horizons) to every crate in the workspace. Tracking issue: mdk#711
    window applied (`PendingCommitCleanupGuard` clears the staged commit, releases the snapshot, and removes the stored
    proposal).
 
-3. **Record intent before external side effects.** Reconciliation against an external system (relays, brokers)
+3. **Record intent before external side effects.** Reconciliation against an external system (relays)
    persists the desired state first, then drives the side effects, re-enqueueing failures for retry instead of
    abandoning the state update (the Nostr adapter's group sync updates routing state before unsubscribing and queues
    failed unsubscribes — mdk#337). Purely local observable state that exists to mirror a successful external effect

@@ -201,7 +201,7 @@ jobs:
           python3 scripts/check_install_example_sha256.py
           python3 scripts/test_install_example_sha256_gate.py
 
-      - name: Campaign and QUIC broker image toolchain gate
+      - name: Campaign image toolchain gate
         run: |
           ./scripts/check_campaign_toolchain.sh
           ./scripts/tests/test_campaign_toolchain.sh

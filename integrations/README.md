@@ -47,7 +47,7 @@ Choose the runtime you already use:
 
 | Runtime | Connector style | Best fit |
 | --- | --- | --- |
-| Hermes | Gateway plugin | Rich chat history, reactions, media, and live previews |
+| Hermes | Gateway plugin | Rich chat history, reactions, and media |
 | OpenClaw | Channel plugin | Gateway routing, history and media |
 | Claude Code | Terminal harness | Repository and coding tasks through Claude Code |
 | Codex | Terminal harness | Repository and coding tasks through Codex |
@@ -437,7 +437,7 @@ Choose by the features you need:
 
 | Connector | Conversation and controls | Files |
 | --- | --- | --- |
-| [Hermes](hermes/marmot/README.md#what-you-can-do) | DM/group activation; history, quotes, reactions, own-message deletion, admin group profile updates; optional live previews/presence/approval reactions | Inbound media; image/document/video/voice sends with approved-root staging |
+| [Hermes](hermes/marmot/README.md#what-you-can-do) | DM/group activation; history, quotes, reactions, own-message deletion, admin group profile updates; optional presence/approval reactions | Inbound media; image/document/video/voice sends with approved-root staging |
 | [OpenClaw](openclaw/marmot/README.md#what-you-can-do) | Gateway routing; DM/group activation; history, quotes, quiet changes, own-message edits and deletion, reactions, admin group profile updates, consent-based public profile naming; current inbound turns are final-only | Host-authorized inbound/outbound media via normal message tool |
 | [Claude Code](claude/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; admin group profile updates; text replies | Text-only; no attachments or generated-file return |
 | [Codex](codex/marmot/README.md#what-you-can-do) | Per-chat thread/project/goal; shared chat and recovery commands; admin group profile updates; completed text replies | Native images and supported staged files; opt-in generated-file return with exact grants |
@@ -449,7 +449,7 @@ For terminal harnesses, start with `/cd src/my-project`, send an ordinary reques
 then use `/status`, `/goal <instruction>` or `/new` as needed. The complete
 [chat-command reference](terminal-harness/README.md#chat-commands) explains
 recovery, session resets and slash escaping. These harnesses do not add gateway
-mention activation, reaction tools or live previews.
+mention activation or reaction tools.
 
 For gateway plugins, ask in the current chat and use the runtime's registered
 Marmot tools and media-delivery contract. A file accepted by a connector is not
@@ -502,8 +502,8 @@ Current integrations:
   Claude Code, Codex, OpenCode, Pi, and Goose terminal harnesses.
 
 All integrations are intentionally thin at the Marmot boundary. They do not own MLS
-state, Nostr transport, local account storage, relay access, QUIC preview
-transport, or durable encrypted sends. `wn-agent` owns those concerns and exposes
+state, Nostr transport, local account storage, relay access, or durable
+encrypted sends. `wn-agent` owns those concerns and exposes
 the local `marmot.agent-control.v2` newline-delimited JSON protocol over a Unix
 socket.
 
@@ -618,10 +618,10 @@ Each integration also makes its own activation decision:
   inbound sender ACL before activation. In multi-party groups they default to
   mention-style activation and always reply in effective DMs. Activation cannot
   widen sender authorization. They also support richer gateway features such as
-  live previews, durable reply routing, profile onboarding, and media handling.
+  durable reply routing, profile onboarding, and media handling.
 - `wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose` are pure harnesses. They currently support only
   `always` activation for prompt messages from explicitly allowed senders, and
-  have no profile onboarding or live-preview behavior. Their shared runtime
+  have no profile onboarding. Their shared runtime
   validates and privately stages bounded ordered attachment batches. `wn-codex`
   maps image batches to ordered Codex image inputs; `wn-opencode` passes each
   file as an ordered `opencode run --file` argument; `wn-pi` passes each image

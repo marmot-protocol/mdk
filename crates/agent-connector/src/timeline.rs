@@ -257,7 +257,6 @@ mod tests {
             reply_preview: None,
             thread: None,
             media: None,
-            agent_text_stream: None,
             reactions: TimelineReactionSummary {
                 by_emoji: Default::default(),
                 user_reactions: vec![TimelineUserReaction {

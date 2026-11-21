@@ -69,8 +69,8 @@ pub use encrypted_media_v2::{
     encode_encrypted_media_policy_v2, validate_and_normalize_blob_endpoint_url_v2,
 };
 pub use host_safety::{
-    is_loopback_candidate_host, is_loopback_host, is_loopback_ip, is_public_ip, is_public_ipv4,
-    is_public_ipv6, reject_non_public_ip, reject_non_public_socket_addr,
+    is_loopback_host, is_loopback_ip, is_public_ip, is_public_ipv4, is_public_ipv6,
+    reject_non_public_ip, reject_non_public_socket_addr,
 };
 pub use lifecycle::{GroupLifecycleV1, decode_group_lifecycle_v1, encode_group_lifecycle_v1};
 pub use profile::{

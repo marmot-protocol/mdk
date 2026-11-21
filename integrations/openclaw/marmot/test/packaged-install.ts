@@ -390,7 +390,10 @@ function upgradeInstall(host: Host, tarball: string, previous: string, workRoot:
         authTokenFile: join(marmotHome, "dev", "control.token"),
         dm: { policy: "allowlist", allowFrom: [HEX("bb")] },
         senderPolicy: { allowedUsers: [HEX("bb"), HEX("cc")] },
-        streaming: { mode: "off" },
+        // Older installers wrote these live-preview keys. Previews were removed,
+        // but the strict channel schema must keep accepting them on upgrade.
+        quicCandidates: [],
+        streaming: { mode: "off", block: { enabled: false } },
         profileNameOnboarding: true,
       },
     };

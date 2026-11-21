@@ -11,7 +11,7 @@ The crate owns the `wn-agent` control client, account and sender selection,
 inbound reconnect and resync, per-group bounded queues, deduplication, working
 directory selection, private group-to-session mappings, reply chunking, and a
 shared JSONL child-process runner. It does not own MLS, Nostr transport,
-storage, QUIC previews, or backend-specific CLI semantics.
+storage, or backend-specific CLI semantics.
 
 ## Contents
 

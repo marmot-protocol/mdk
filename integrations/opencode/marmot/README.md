@@ -6,8 +6,8 @@ sends every message from an allowed sender to `opencode run --format json`.
 
 `wn-agent` owns the Marmot account, MLS state, Nostr transport, invite allowlist,
 and durable encrypted sends. `wn-opencode` is intentionally thinner than the
-Hermes and OpenClaw gateway integrations: it has no mention activation, profile
-onboarding, or live previews. It is a pure harness for an authorized operator.
+Hermes and OpenClaw gateway integrations: it has no mention activation or profile
+onboarding. It is a pure harness for an authorized operator.
 Files sent with a message reach OpenCode through `opencode run --file`; see
 [Inbound attachments](#inbound-attachments).
 
@@ -53,8 +53,7 @@ commands share the [terminal-harness command guide](../../terminal-harness/READM
 
 Tool access, credentials and model choices come from the backend's native
 configuration and the [execution profile](../../terminal-harness/README.md#execution-profiles).
-The harness does not implement mention activation, reaction tools
-or live previews. An interactive backend's slash commands are not automatically
+The harness does not implement mention activation or reaction tools. An interactive backend's slash commands are not automatically
 available through this chat; shared harness commands are handled locally.
 
 ## First-install checklist

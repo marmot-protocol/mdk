@@ -13,11 +13,8 @@ fi
 : "${MARMOT_AGENT_SOCKET_MODE:=0660}"
 : "${MARMOT_OUTBOUND_MEDIA_DIR:=$MARMOT_HOME/dev/outbound-media}"
 : "${MARMOT_RELAYS:=${MARMOT_RELAY:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}}"
-: "${MARMOT_QUIC_CANDIDATES:=quic://quic-broker.ipf.dev:4450}"
 : "${HERMES_MARMOT_AUTO_BOOTSTRAP:=1}"
 : "${HERMES_MARMOT_START_GATEWAY:=1}"
-: "${HERMES_MARMOT_STREAMING:=1}"
-: "${HERMES_MARMOT_STREAMING_TRANSPORT:=auto}"
 : "${HERMES_MARMOT_TOOL_PROGRESS:=off}"
 : "${HERMES_MARMOT_INTERIM_MESSAGES:=0}"
 : "${HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS:=0}"
@@ -32,7 +29,6 @@ export MARMOT_AGENT_SOCKET_DIR_MODE
 export MARMOT_AGENT_SOCKET_MODE
 export MARMOT_OUTBOUND_MEDIA_DIR
 export MARMOT_RELAYS
-export MARMOT_QUIC_CANDIDATES
 export MARMOT_PROFILE_NAME_ONBOARDING
 export PATH="/opt/hermes-agent/.venv/bin:$PATH"
 
@@ -118,19 +114,11 @@ configure_args=(
     --socket-path "$MARMOT_AGENT_SOCKET"
     --account-id-hex "${MARMOT_ACCOUNT_ID_HEX:-}"
     --profile-name-onboarding "$MARMOT_PROFILE_NAME_ONBOARDING"
-    --streaming "$HERMES_MARMOT_STREAMING"
-    --transport "$HERMES_MARMOT_STREAMING_TRANSPORT"
     --tool-progress "$HERMES_MARMOT_TOOL_PROGRESS"
     --interim-messages "$HERMES_MARMOT_INTERIM_MESSAGES"
     --long-running-notifications "$HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS"
     --busy-ack-detail "$HERMES_MARMOT_BUSY_ACK_DETAIL"
 )
-streaming_normalized="$(printf '%s' "$HERMES_MARMOT_STREAMING" | tr '[:upper:]' '[:lower:]')"
-case "$streaming_normalized" in
-    1|true|yes|on)
-        configure_args+=(--configure-global-streaming)
-        ;;
-esac
 marmot-configure-hermes-gateway "${configure_args[@]}"
 
 if [ "$HERMES_MARMOT_START_GATEWAY" = "0" ]; then

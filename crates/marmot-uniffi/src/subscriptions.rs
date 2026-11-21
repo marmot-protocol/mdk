@@ -19,19 +19,19 @@ use std::sync::Mutex as StdMutex;
 use std::sync::PoisonError;
 
 use marmot_app::{
-    RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatsSubscription,
-    RuntimeEventsSubscription, RuntimeGroupStateSubscription, RuntimeMessagesSubscription,
-    RuntimeNotificationsSubscription, RuntimeTimelineMessagesSubscription, TimelineMessageRecord,
-    TimelinePage, TimelineWindowHandle, UserSearchSubscription as AppUserSearchSubscription,
+    RuntimeChatListSubscription, RuntimeChatsSubscription, RuntimeEventsSubscription,
+    RuntimeGroupStateSubscription, RuntimeMessagesSubscription, RuntimeNotificationsSubscription,
+    RuntimeTimelineMessagesSubscription, TimelineMessageRecord, TimelinePage, TimelineWindowHandle,
+    UserSearchSubscription as AppUserSearchSubscription,
 };
 use tokio::sync::Mutex;
 
 use crate::MarmotKitError;
 mod relay_liveness;
 use crate::conversions::{
-    AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi,
-    ChatListSubscriptionUpdateFfi, MarmotEventFfi, MessageUpdateFfi, NotificationUpdateFfi,
-    TimelineMessageRecordFfi, TimelinePageFfi, TimelineSubscriptionUpdateFfi, UserSearchUpdateFfi,
+    AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi, ChatListSubscriptionUpdateFfi,
+    MarmotEventFfi, MessageUpdateFfi, NotificationUpdateFfi, TimelineMessageRecordFfi,
+    TimelinePageFfi, TimelineSubscriptionUpdateFfi, UserSearchUpdateFfi,
 };
 pub use relay_liveness::RelayLivenessSubscription;
 
@@ -390,24 +390,6 @@ impl NotificationsSubscription {
     }
 }
 
-/// A live agent-text-stream watch. Drive `next()` in a `while let` loop to fill
-/// a bubble; it yields `Chunk` deltas then a terminal `Finished`/`Failed`,
-/// after which it returns `None`.
-#[derive(uniffi::Object)]
-pub struct AgentStreamSubscription {
-    stream_id_hex: String,
-    inner: Mutex<RuntimeAgentStreamWatch>,
-}
-
-impl AgentStreamSubscription {
-    pub(crate) fn new(inner: RuntimeAgentStreamWatch) -> Arc<Self> {
-        Arc::new(Self {
-            stream_id_hex: inner.stream_id_hex.clone(),
-            inner: Mutex::new(inner),
-        })
-    }
-}
-
 fn take_snapshot<T>(snapshot: &StdMutex<Option<T>>) -> Option<T> {
     match snapshot.lock() {
         Ok(mut guard) => guard.take(),
@@ -447,21 +429,6 @@ impl UserSearchSubscription {
     pub async fn next_update(&self) -> Option<UserSearchUpdateFfi> {
         let mut inner = self.inner.lock().await;
         inner.next_update().await.map(Into::into)
-    }
-}
-
-#[marmot_uniffi_macros::on_tokio_runtime]
-#[uniffi::export]
-impl AgentStreamSubscription {
-    /// The resolved stream id this watch is following (hex).
-    pub fn stream_id_hex(&self) -> String {
-        self.stream_id_hex.clone()
-    }
-
-    #[marmot_uniffi_macros::receive]
-    pub async fn next(&self) -> Option<AgentStreamUpdateFfi> {
-        let mut inner = self.inner.lock().await;
-        inner.recv().await.map(Into::into)
     }
 }
 

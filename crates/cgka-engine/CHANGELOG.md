@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `group_context` no longer exports the `agent-text-stream-quic` MLS exporter secret
+  (`marmot/agent-text-stream-quic`); the agent text stream is retired. Component `0x8006` is still validated and its
+  required roles still enforced on create and invite.
+
 ### Fixed
 
 - Encrypted-media keys are kept for a kind-1111 thread message recognized by a lowercase `e` alone, as storage

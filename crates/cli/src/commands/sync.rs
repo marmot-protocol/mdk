@@ -4,8 +4,8 @@ use marmot_app::{MarmotApp, ReceivedMessage, SyncFailure, SyncSummary};
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, WnError, agent_text_stream_payload_value, display_name_for_sender,
-    error::SyncCommandError, npub_for_account_id, terminal_safe_text,
+    CommandOutput, WnError, display_name_for_sender, error::SyncCommandError, npub_for_account_id,
+    terminal_safe_text,
 };
 
 pub(crate) async fn sync_command(
@@ -56,7 +56,7 @@ fn sync_plain_with_empty(summary: &SyncSummary, empty: &str) -> String {
     for group_id in &summary.joined_groups {
         lines.push(format!("joined group {}", hex::encode(group_id.as_slice())));
     }
-    for message in &summary.messages {
+    for message in summary.messages.iter().filter(|message| shown(message)) {
         lines.push(format!(
             "received group={} from={}: {}",
             hex::encode(message.group_id.as_slice()),
@@ -107,14 +107,13 @@ fn sync_json(
 fn sync_messages_json(app: &MarmotApp, messages: Vec<ReceivedMessage>) -> Vec<Value> {
     messages
         .into_iter()
+        .filter(shown)
         .map(|message| {
-            let agent_text_stream =
-                agent_text_stream_payload_value(message.kind, &message.tags, &message.plaintext);
             let from_display_name = message
                 .sender_display_name
                 .clone()
                 .or_else(|| display_name_for_sender(app, &message.sender));
-            let mut value = json!({
+            json!({
                 "message_id": message.message_id_hex,
                 "direction": "received",
                 "from": message.sender,
@@ -123,13 +122,15 @@ fn sync_messages_json(app: &MarmotApp, messages: Vec<ReceivedMessage>) -> Vec<Va
                 "plaintext": message.plaintext,
                 "kind": message.kind,
                 "tags": message.tags,
-            });
-            if let Some(agent_text_stream) = agent_text_stream {
-                value["agent_text_stream"] = agent_text_stream;
-            }
-            value
+            })
         })
         .collect()
+}
+
+/// A retired agent stream start (kind 1200) from an older peer is never shown;
+/// storage keeps the raw event.
+fn shown(message: &ReceivedMessage) -> bool {
+    message.kind != cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
 }
 
 fn partial_sync_plain(summary: &SyncSummary) -> String {
@@ -275,6 +276,57 @@ mod tests {
         );
         assert!(rendered["partial"]["npub"].is_null());
         assert_eq!(error.to_string(), "sync failed");
+    }
+
+    #[test]
+    fn sync_output_hides_retired_stream_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let received = |id: &str, kind: u64, plaintext: &str| ReceivedMessage {
+            authority: None,
+            message_id_hex: id.repeat(32),
+            source_message_id_hex: id.repeat(32),
+            sender: account.account_id_hex.clone(),
+            sender_display_name: None,
+            group_id: GroupId::new(vec![3; 16]),
+            source_epoch: 1,
+            retention: None,
+            plaintext: plaintext.to_owned(),
+            kind,
+            tags: Vec::new(),
+            recorded_at: 1,
+            received_at: 2,
+        };
+        let summary = SyncSummary {
+            messages: vec![
+                received(
+                    "11",
+                    cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+                    "",
+                ),
+                received("22", 9, "hello"),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            sync_plain(&summary),
+            format!(
+                "received group={} from={}: hello",
+                "03".repeat(16),
+                account.account_id_hex
+            )
+        );
+        let rendered = sync_json(&app, account, summary).unwrap();
+        let ids = rendered["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["message_id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [json!("22".repeat(32))]);
     }
 
     #[test]

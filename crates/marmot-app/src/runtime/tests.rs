@@ -1409,55 +1409,6 @@ fn message_kind_filter_treats_none_and_empty_as_unrestricted() {
 }
 
 #[test]
-fn parse_quic_candidate_ignores_path_query_and_fragment_after_authority() {
-    // Per transports/quic.md a receiver MUST ignore any path, query, or
-    // fragment after the authority. A spec-valid start payload from another
-    // implementation that appends one of these must still be watchable: the
-    // authority (and thus the resolvable port) stops at the first '/', '?',
-    // or '#'.
-    for (candidate, authority, server_name) in [
-        (
-            "quic://relay.example:443/path",
-            "relay.example:443",
-            "relay.example",
-        ),
-        (
-            "quic://relay.example:443?x=1",
-            "relay.example:443",
-            "relay.example",
-        ),
-        (
-            "quic://relay.example:443#frag",
-            "relay.example:443",
-            "relay.example",
-        ),
-        (
-            "quic://relay.example:443/p?x=1#frag",
-            "relay.example:443",
-            "relay.example",
-        ),
-        (
-            "quic://[2001:db8::1]:443?x=1",
-            "[2001:db8::1]:443",
-            "2001:db8::1",
-        ),
-        (
-            "quic://[2001:db8::1]:443#frag",
-            "[2001:db8::1]:443",
-            "2001:db8::1",
-        ),
-    ] {
-        let parsed = parse_quic_candidate(candidate)
-            .unwrap_or_else(|_| panic!("candidate should parse: {candidate}"));
-        assert_eq!(parsed.authority, authority, "authority for {candidate}");
-        assert_eq!(
-            parsed.server_name, server_name,
-            "server name for {candidate}"
-        );
-    }
-}
-
-#[test]
 fn stamp_published_profile_created_at_replaces_zero_with_now() {
     // FFI-published profiles arrive with created_at == 0; they must be
     // stamped so the cached own-account entry survives a directory refresh
@@ -1662,7 +1613,6 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         reply_preview: None,
         thread: None,
         media: None,
-        agent_text_stream: None,
         reactions: Default::default(),
     }
 }
@@ -1703,24 +1653,6 @@ fn direct_conversation_group_system_projection_does_not_claim_new_chat_list_acti
         ChatListUpdateTrigger::from_timeline_changes(&[change], false),
         ChatListUpdateTrigger::SnapshotRefresh,
     );
-}
-
-#[test]
-fn agent_stream_updates_still_advance_the_chat_list_like_new_messages() {
-    for trigger in [
-        crate::TimelineUpdateTrigger::AgentStreamStarted,
-        crate::TimelineUpdateTrigger::AgentStreamFinished,
-    ] {
-        let change = TimelineMessageChange::Upsert {
-            trigger,
-            message: Box::new(timeline_test_record("agent-stream", 10)),
-        };
-
-        assert_eq!(
-            ChatListUpdateTrigger::from_timeline_changes(&[change], false),
-            ChatListUpdateTrigger::NewLastMessage,
-        );
-    }
 }
 
 #[test]
@@ -1910,38 +1842,6 @@ async fn timeline_subscription_recv_ends_when_runtime_shutdown_begins() {
 
     assert!(subscription.recv().await.is_none());
     drop(updates_tx);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_stream_watch_recv_prioritizes_terminal_update() {
-    let lifecycle = RuntimeLifecycle::new();
-    let (updates_tx, updates) = mpsc::channel(1);
-    updates_tx
-        .try_send(RuntimeAgentStreamUpdate::Progress {
-            seq: 1,
-            text: "searching".to_owned(),
-        })
-        .expect("provisional queue should accept first update");
-    let (terminal_tx, terminal) = oneshot::channel();
-    let expected = RuntimeAgentStreamUpdate::Finished {
-        text: "done".to_owned(),
-        transcript_hash_hex: "00".to_owned(),
-        chunk_count: 1,
-    };
-    terminal_tx
-        .send(expected.clone())
-        .expect("terminal receiver should be alive");
-    let handle = tokio::spawn(async {});
-    let mut watch = RuntimeAgentStreamWatch {
-        stream_id_hex: "stream".to_owned(),
-        updates,
-        terminal: Some(terminal),
-        abort: handle.abort_handle(),
-        stopping: lifecycle.subscribe_shutdown(),
-    };
-
-    assert_eq!(watch.recv().await, Some(expected));
-    assert!(watch.recv().await.is_none());
 }
 
 #[test]
@@ -2946,39 +2846,6 @@ fn chat_list_expiry_tracking_includes_new_interaction_state() {
     assert!(chat_list_mute_expiries(&[indefinite]).is_empty());
 }
 
-#[test]
-fn latest_agent_stream_start_accepts_mixed_case_filter() {
-    let stream_id_hex = hex::encode([0xab; 32]);
-    let (message_id_hex, start, sender) = latest_agent_stream_start(
-        vec![AppMessageRecord {
-            authority: None,
-            message_id_hex: "11".repeat(32),
-            direction: "inbound".to_owned(),
-            group_id_hex: "22".repeat(32),
-            sender: "33".repeat(32),
-            plaintext: String::new(),
-            kind: MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-            tags: vec![
-                vec![STREAM_TAG.to_owned(), stream_id_hex.clone()],
-                vec![STREAM_ROUTE_TAG.to_owned(), STREAM_ROUTE_QUIC.to_owned()],
-            ],
-            source_epoch: None,
-            retention: None,
-            recorded_at: 0,
-            received_at: 0,
-            insert_order: 0,
-            invalidated: false,
-            moderation_grant: false,
-        }],
-        Some(&stream_id_hex.to_uppercase()),
-    )
-    .unwrap();
-
-    assert_eq!(message_id_hex, "11".repeat(32));
-    assert_eq!(start.stream_id_hex, stream_id_hex);
-    assert_eq!(sender, "33".repeat(32));
-}
-
 fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
     ChatListRow {
         group_id_hex: group_id_hex.to_owned(),
@@ -3049,49 +2916,19 @@ fn recovery_record_maps_chat_message_to_message_update() {
     )
     .expect("update");
 
-    match update {
-        RuntimeMessageUpdate::Message(received) => {
-            assert_eq!(received.account_id_hex, "ac".repeat(32));
-            assert_eq!(received.account_label, "alice");
-            assert_eq!(received.message.message_id_hex, "11".repeat(32));
-            assert_eq!(
-                received.message.sender_display_name.as_deref(),
-                Some("Alice")
-            );
-            assert_eq!(received.message.source_epoch, 7);
-            assert_eq!(
-                hex::encode(received.message.group_id.as_slice()),
-                group_id_hex
-            );
-        }
-        other => panic!("expected Message update, got {other:?}"),
-    }
-}
-
-#[test]
-fn recovery_record_reclassifies_agent_stream_start() {
-    let group_id_hex = "cd".repeat(32);
-    let record = message_record(
-        &"22".repeat(32),
-        &group_id_hex,
-        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    let RuntimeMessageUpdate::Message(received) = update;
+    assert_eq!(received.account_id_hex, "ac".repeat(32));
+    assert_eq!(received.account_label, "alice");
+    assert_eq!(received.message.message_id_hex, "11".repeat(32));
+    assert_eq!(
+        received.message.sender_display_name.as_deref(),
+        Some("Alice")
     );
-
-    let update = received_message_update_from_record(
-        "ac".repeat(32).as_str(),
-        "alice",
-        record,
-        &HashMap::new(),
-    )
-    .expect("update");
-
-    match update {
-        RuntimeMessageUpdate::AgentStreamStarted(received) => {
-            assert_eq!(received.message.message_id_hex, "22".repeat(32));
-            assert_eq!(received.message.sender_display_name, None);
-        }
-        other => panic!("expected AgentStreamStarted update, got {other:?}"),
-    }
+    assert_eq!(received.message.source_epoch, 7);
+    assert_eq!(
+        hex::encode(received.message.group_id.as_slice()),
+        group_id_hex
+    );
 }
 
 #[test]
@@ -3371,46 +3208,6 @@ fn invite_catch_up_is_not_spawned_after_shutdown_stops_accepting_tasks() {
             .handles
             .is_empty()
     );
-}
-
-// Sender-controlled broker candidates must clear the shared dial-safety gate
-// at resolve time: literal-IP authorities resolve without DNS, so these cover
-// the canonical non-public classes end to end (issue #331).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn broker_resolve_rejects_non_public_candidates_without_dev_opt_in() {
-    for authority in [
-        "10.0.0.5:4433",      // private
-        "169.254.169.254:80", // link-local (cloud metadata)
-        "100.64.0.1:4433",    // CGNAT
-        "192.168.1.1:4433",   // private
-        "127.0.0.1:4433",     // loopback
-        "[::1]:4433",         // loopback v6
-        "[fc00::1]:4433",     // unique-local
-    ] {
-        let result = agent_stream_watch::resolve_broker_addr(authority, false).await;
-        assert!(
-            matches!(result, Err(AppError::AgentStreamInvalidCandidate(_))),
-            "{authority} must be rejected without the dev opt-in"
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn broker_resolve_dev_opt_in_admits_loopback_only() {
-    let addr = agent_stream_watch::resolve_broker_addr("127.0.0.1:4433", true)
-        .await
-        .expect("loopback resolves under the dev opt-in");
-    assert!(addr.ip().is_loopback());
-
-    // The opt-in opens loopback only; private/link-local candidates stay
-    // rejected even in dev mode.
-    for authority in ["10.0.0.5:4433", "169.254.169.254:80", "[fc00::1]:4433"] {
-        let result = agent_stream_watch::resolve_broker_addr(authority, true).await;
-        assert!(
-            matches!(result, Err(AppError::AgentStreamInvalidCandidate(_))),
-            "{authority} must be rejected even with the dev opt-in"
-        );
-    }
 }
 
 /// A group speaks for who you know only while you are actually in it. Each
@@ -5979,9 +5776,7 @@ fn recovery_preserves_persisted_authority_after_reopen() {
         let update =
             received_message_update_from_record("account", "alice", record, &HashMap::new())
                 .unwrap();
-        let RuntimeMessageUpdate::Message(received) = update else {
-            panic!("expected message")
-        };
+        let RuntimeMessageUpdate::Message(received) = update;
         assert_eq!(received.message.source_epoch, 7);
         assert_eq!(received.message.authority, authority);
     }

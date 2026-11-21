@@ -12,6 +12,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - `MarmotTimelineMessageRecord` and `MarmotTimelineReplyPreview` gain a trailing nullable
   `thread: MarmotTimelineThreadRef *`; `MarmotTimelineReplyPreview` also gains a trailing nullable
   `reply_to_message_id_hex`. Rebuild clients with the matching header and library.
+- The agent text stream over QUIC is removed: `marmot_start_agent_text_stream`, `marmot_watch_agent_text_stream`,
+  the `marmot_agent_publisher_*`, `marmot_agent_stream_*` and `marmot_publisher_*_free` functions, and the
+  `MarmotAgentStream*`, `MarmotAgentPublisher*` and `MarmotPublisher*` types are gone, as are
+  `MarmotEvent`'s `AgentStreamActivity`, `MarmotMessageUpdate`'s `AgentStreamStarted`, and `agent_text_stream_json`
+  on `MarmotTimelineMessageRecord` and `MarmotTimelineReplyPreview`. `MarmotTimelineUpdateTrigger` loses
+  `AgentStreamStarted` and `AgentStreamFinished`, so the values after them are renumbered, and the `MarmotEvent`
+  tags after `AccountError` shift by one. Rebuild clients with the matching header and library.
 
 ### Added
 

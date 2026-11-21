@@ -113,26 +113,11 @@ const fs = require("fs");
 const p = process.argv[1];
 const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
 cfg.channels = cfg.channels || {};
-const streamMode = process.env.MARMOT_STREAM_MODE || "block";
-if (!["off", "partial", "block", "progress"].includes(streamMode)) {
-  throw new Error(`invalid MARMOT_STREAM_MODE: ${streamMode}`);
-}
-// Enable the channel + live QUIC previews. streaming.mode gates our preview and
-// streaming.block.enabled + agents.defaults.blockStreamingDefault make OpenClaw
-// emit the progressive block deliveries the preview is built from.
-cfg.channels.marmot = {
-  ...(cfg.channels.marmot || {}),
-  enabled: true,
-  streaming: {
-    ...(cfg.channels.marmot || {}).streaming,
-    mode: streamMode,
-    block: { ...((cfg.channels.marmot || {}).streaming || {}).block, enabled: true },
-  },
-};
-cfg.agents = cfg.agents || {};
-cfg.agents.defaults = { ...(cfg.agents.defaults || {}), blockStreamingDefault: "on" };
+// Drop the live-preview keys older images wrote; previews were removed.
+const { quicCandidates, streaming, blockStreaming, ...marmot } = cfg.channels.marmot || {};
+cfg.channels.marmot = { ...marmot, enabled: true };
 fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n");
-' "$openclaw_config" && echo "marmot: enabled channels.marmot (streaming.mode=${MARMOT_STREAM_MODE:-block}) in OpenClaw config"
+' "$openclaw_config" && echo "marmot: enabled channels.marmot in OpenClaw config"
 fi
 
 exec openclaw gateway run

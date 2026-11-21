@@ -23,7 +23,6 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised on hosts with
 
 
 VALID_TOOL_PROGRESS = {"off", "new", "all", "verbose"}
-VALID_STREAMING_TRANSPORT = {"auto", "draft", "edit", "off"}
 MANAGED_ENV_KEYS = ("MARMOT_ALLOWED_USERS", "MARMOT_ALLOW_ALL_USERS")
 ACCOUNT_ID_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -621,8 +620,6 @@ def prepare_gateway_config(
     *,
     hermes_home: Path,
     platform: str,
-    streaming_enabled: bool,
-    streaming_transport: str,
     tool_progress: str,
     interim_assistant_messages: bool,
     long_running_notifications: bool,
@@ -632,23 +629,13 @@ def prepare_gateway_config(
     account_id_hex: str | None = None,
     welcomer_allowlist: list[str] | None = None,
     profile_name_onboarding: bool | None = None,
-    configure_global_streaming: bool = False,
 ) -> tuple[Path, str]:
-    if streaming_transport not in VALID_STREAMING_TRANSPORT:
-        valid = ", ".join(sorted(VALID_STREAMING_TRANSPORT))
-        raise ValueError(f"streaming transport must be one of: {valid}")
     if tool_progress not in VALID_TOOL_PROGRESS:
         valid = ", ".join(sorted(VALID_TOOL_PROGRESS))
         raise ValueError(f"tool progress must be one of: {valid}")
 
     config_path = hermes_home / "config.yaml"
     config = load_config(config_path)
-    effective_streaming = streaming_enabled and streaming_transport != "off"
-
-    if configure_global_streaming:
-        streaming = _ensure_mapping(config, "streaming")
-        streaming["enabled"] = streaming_enabled
-        streaming["transport"] = streaming_transport
 
     platform_entries = _ensure_mapping(config, "platforms")
     platform_entry = _ensure_mapping(platform_entries, platform)
@@ -672,7 +659,12 @@ def prepare_gateway_config(
     display = _ensure_mapping(config, "display")
     platforms = _ensure_mapping(display, "platforms")
     platform_config = _ensure_mapping(platforms, platform)
-    platform_config["streaming"] = effective_streaming
+    # Marmot cannot edit a sent message, so Hermes's edit-based token
+    # streaming would leave a durable partial reply beside the final one.
+    # Always pin the platform override off so a global streaming.enabled:
+    # true cannot be inherited, and so a stale Marmot true from an older
+    # live-preview install is repaired on every install/reconfigure.
+    platform_config["streaming"] = False
     platform_config["tool_progress"] = tool_progress
     platform_config["interim_assistant_messages"] = interim_assistant_messages
     platform_config["long_running_notifications"] = long_running_notifications
@@ -690,8 +682,6 @@ def configure_gateway_config(
     *,
     hermes_home: Path,
     platform: str,
-    streaming_enabled: bool,
-    streaming_transport: str,
     tool_progress: str,
     interim_assistant_messages: bool,
     long_running_notifications: bool,
@@ -701,14 +691,11 @@ def configure_gateway_config(
     account_id_hex: str | None = None,
     welcomer_allowlist: list[str] | None = None,
     profile_name_onboarding: bool | None = None,
-    configure_global_streaming: bool = False,
     backup: bool = True,
 ) -> Path:
     config_path, config_text = prepare_gateway_config(
         hermes_home=hermes_home,
         platform=platform,
-        streaming_enabled=streaming_enabled,
-        streaming_transport=streaming_transport,
         tool_progress=tool_progress,
         interim_assistant_messages=interim_assistant_messages,
         long_running_notifications=long_running_notifications,
@@ -718,7 +705,6 @@ def configure_gateway_config(
         account_id_hex=account_id_hex,
         welcomer_allowlist=welcomer_allowlist,
         profile_name_onboarding=profile_name_onboarding,
-        configure_global_streaming=configure_global_streaming,
     )
     commit_env_and_config_transaction(
         env_path=None,
@@ -747,12 +733,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile-name-onboarding",
         default=os.environ.get("MARMOT_PROFILE_NAME_ONBOARDING"),
     )
-    parser.add_argument("--streaming", default=os.environ.get("HERMES_MARMOT_STREAMING", "0"))
-    parser.add_argument(
-        "--transport",
-        default=os.environ.get("HERMES_MARMOT_STREAMING_TRANSPORT", "auto"),
-        choices=sorted(VALID_STREAMING_TRANSPORT),
-    )
     parser.add_argument(
         "--tool-progress",
         default=os.environ.get("HERMES_MARMOT_TOOL_PROGRESS", "off"),
@@ -769,11 +749,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--busy-ack-detail",
         default=os.environ.get("HERMES_MARMOT_BUSY_ACK_DETAIL", "0"),
-    )
-    parser.add_argument(
-        "--configure-global-streaming",
-        action="store_true",
-        help="Also update Hermes' global streaming block; off by default to preserve other connectors",
     )
     parser.add_argument("--no-backup", action="store_true")
     parser.add_argument("--quiet", action="store_true")
@@ -816,7 +791,6 @@ def main(argv: list[str] | None = None) -> int:
         if allowed_users:
             validate_sender_auth_entries(allowed_users)
 
-        streaming_enabled = parse_bool(args.streaming, name="streaming")
         interim_assistant_messages = parse_bool(
             args.interim_messages,
             name="interim messages",
@@ -862,7 +836,6 @@ def main(argv: list[str] | None = None) -> int:
             or args.account_id_hex
             or args.welcomer_allowlist
             or args.profile_name_onboarding is not None
-            or args.configure_global_streaming
         )
         if env_only:
             if env_prepared is not None:
@@ -886,8 +859,6 @@ def main(argv: list[str] | None = None) -> int:
         config_path, config_text = prepare_gateway_config(
             hermes_home=hermes_home,
             platform=args.platform,
-            streaming_enabled=streaming_enabled,
-            streaming_transport=args.transport,
             tool_progress=args.tool_progress,
             interim_assistant_messages=interim_assistant_messages,
             long_running_notifications=long_running_notifications,
@@ -897,7 +868,6 @@ def main(argv: list[str] | None = None) -> int:
             account_id_hex=args.account_id_hex,
             welcomer_allowlist=welcomer_allowlist,
             profile_name_onboarding=profile_name_onboarding,
-            configure_global_streaming=args.configure_global_streaming,
         )
         env_path, env_lines = env_prepared if env_prepared is not None else (None, None)
         commit_env_and_config_transaction(
@@ -915,13 +885,10 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "Hermes Marmot gateway config:"
             f" path={config_path}"
-            f" streaming={str(streaming_enabled).lower()}"
-            f" transport={args.transport}"
             f" tool_progress={args.tool_progress}"
             f" interim_messages={str(interim_assistant_messages).lower()}"
             f" long_running_notifications={str(long_running_notifications).lower()}"
             f" busy_ack_detail={str(busy_ack_detail).lower()}"
-            f" global_streaming={str(args.configure_global_streaming).lower()}"
         )
         if env_state is not None:
             print_env_summary(

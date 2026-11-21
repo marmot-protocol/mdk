@@ -129,8 +129,6 @@ class ConfigureGatewayTests(unittest.TestCase):
             config_path = self.module.configure_gateway_config(
                 hermes_home=home,
                 platform="marmot",
-                streaming_enabled=False,
-                streaming_transport="off",
                 tool_progress="off",
                 interim_assistant_messages=False,
                 long_running_notifications=False,
@@ -196,8 +194,6 @@ class ConfigureGatewayTests(unittest.TestCase):
             self.module.configure_gateway_config(
                 hermes_home=home,
                 platform="marmot",
-                streaming_enabled=False,
-                streaming_transport="draft",
                 tool_progress="new",
                 interim_assistant_messages=True,
                 long_running_notifications=True,
@@ -241,28 +237,43 @@ class ConfigureGatewayTests(unittest.TestCase):
 
     def test_rejects_invalid_bool(self):
         with self.assertRaises(ValueError):
-            self.module.parse_bool("maybe", name="streaming")
+            self.module.parse_bool("maybe", name="interim messages")
 
-    def test_can_update_global_streaming_when_explicit(self):
+    def test_pins_marmot_streaming_off_under_global_streaming(self):
         with tempfile.TemporaryDirectory() as tempdir:
             home = Path(tempdir)
-            config_path = self.module.configure_gateway_config(
+            config_path = home / "config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "streaming:",
+                        "  enabled: true",
+                        "  transport: auto",
+                        "display:",
+                        "  platforms:",
+                        "    marmot:",
+                        "      streaming: true",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            self.module.configure_gateway_config(
                 hermes_home=home,
                 platform="marmot",
-                streaming_enabled=True,
-                streaming_transport="auto",
                 tool_progress="off",
                 interim_assistant_messages=False,
                 long_running_notifications=False,
                 busy_ack_detail=False,
-                configure_global_streaming=True,
+                backup=False,
             )
 
             config = self.module.load_config(config_path)
 
         self.assertTrue(config["streaming"]["enabled"])
         self.assertEqual(config["streaming"]["transport"], "auto")
-        self.assertTrue(config["display"]["platforms"]["marmot"]["streaming"])
+        self.assertIs(config["display"]["platforms"]["marmot"]["streaming"], False)
 
     def test_persisted_config_creates_adapter_without_marmot_env(self):
         adapter_module = load_adapter_module()
@@ -283,8 +294,6 @@ class ConfigureGatewayTests(unittest.TestCase):
                     self.module.configure_gateway_config(
                         hermes_home=home,
                         platform="marmot",
-                        streaming_enabled=False,
-                        streaming_transport="off",
                         tool_progress="off",
                         interim_assistant_messages=False,
                         long_running_notifications=False,
@@ -314,8 +323,6 @@ class ConfigureGatewayTests(unittest.TestCase):
 def _quiet_display_kwargs():
     return {
         "platform": "marmot",
-        "streaming_enabled": False,
-        "streaming_transport": "off",
         "tool_progress": "off",
         "interim_assistant_messages": False,
         "long_running_notifications": False,
@@ -962,7 +969,7 @@ class ConfigureGatewayTransactionTests(unittest.TestCase):
                     USER_B,
                     "--agent-home",
                     str(home / "marmot-agent"),
-                    "--streaming",
+                    "--interim-messages",
                     "maybe",
                 ],
                 capture_output=True,
@@ -1032,7 +1039,7 @@ class ConfigureGatewayTransactionTests(unittest.TestCase):
                     "--quiet",
                     "--allow-user",
                     USER_B,
-                    "--streaming",
+                    "--interim-messages",
                     "maybe",
                 ],
                 capture_output=True,
@@ -1063,8 +1070,6 @@ class ConfigureGatewayTransactionTests(unittest.TestCase):
                     USER_B,
                     "--agent-home",
                     str(home / "marmot-agent"),
-                    "--streaming",
-                    "0",
                 ],
                 capture_output=True,
                 text=True,

@@ -9,7 +9,7 @@ Rust Pi harness for Marmot through the local `wn-agent` control socket. Read
   durable sends, and invite handling; this crate invokes Pi and parses its JSON
   event stream.
 - Every message from an allowed sender is a prompt. Do not add gateway,
-  mention-activation, profile, or QUIC preview behavior here.
+  mention-activation, or profile behavior here.
 - Attachment batches map to ordered `@<absolute staged path>` operands after all
   Pi options, in one turn. `prepare_attachments` in `src/pi.rs` revalidates each
   staged copy through the shared `attachment_preflight` and classifies it with

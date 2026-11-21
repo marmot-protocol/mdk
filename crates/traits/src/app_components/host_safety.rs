@@ -27,24 +27,6 @@ fn is_loopback_domain(domain: &str) -> bool {
     unrooted == "localhost" || unrooted.ends_with(".localhost")
 }
 
-/// Whether a `quic://` broker candidate host is a literal loopback: exactly
-/// `localhost` (rooted or not) or a loopback IP literal. Deliberately narrower
-/// than [`is_loopback_host`] — it does not match `*.localhost` subdomains —
-/// because it gates the no-cert-verification `InsecureLocal` trust, which must
-/// only be reachable for an unambiguous local endpoint plus an explicit dev
-/// flag. Shared by the agent-stream watch and agent-connector dial sites so the
-/// two cannot drift.
-pub fn is_loopback_candidate_host(host: &str) -> bool {
-    let unrooted = host.strip_suffix('.').unwrap_or(host);
-    if unrooted.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    unrooted
-        .parse::<IpAddr>()
-        .map(is_loopback_ip)
-        .unwrap_or(false)
-}
-
 /// Whether `addr` is an IPv4 or IPv6 loopback address.
 pub fn is_loopback_ip(addr: IpAddr) -> bool {
     match addr {

@@ -26,7 +26,6 @@ setup, group and message projection, and Nostr directory refresh.
   - [Messages](#messages)
   - [Media](#media)
   - [Directory, profile, relays, and settings](#directory-profile-relays-and-settings)
-  - [Agent text streams](#agent-text-streams)
   - [Sync](#sync)
 - [Daemon](#daemon)
 - [TUI](#tui)
@@ -486,14 +485,15 @@ or `failed`), counts, `media_ciphertext_sha256` purge hints, and a privacy-safe
 
 **Custom events.** `messages send-event <group-hex> <kind> [content]` sends an app-defined event. Kind, tags, and content
 pass through verbatim into the encrypted group message. Kinds MDK owns (chat, reactions, edits, deletes, agent activity,
-agent stream anchors, group system rows, push token records, and the device-group kinds 457, 458, 459, 460, 461, 473, 475 and 476) are rejected with `reserved_app_event_kind`. Each `--tag`
+retired agent stream starts (kind 1200), group system rows, push token records, and the device-group kinds 457, 458,
+459, 460, 461, 473, 475 and 476) are rejected with `reserved_app_event_kind`. Each `--tag`
 takes a JSON array of strings and is repeatable; a malformed tag fails with `invalid_event_tag`. Custom events project as
 standalone rows with their own kind and tags and never fold onto a target message. `messages list` and
 `messages subscribe` accept repeatable `--kind <KIND>` filters and return every kind without one. On the subscribe feed
 a custom event arrives as type `message`; on the timeline feed its change trigger is `CustomEvent`.
 
 **Timeline.** `messages timeline list|search|subscribe` read the materialized timeline, which interleaves messages,
-media, and agent-stream anchors/finals. Group lists and subscriptions use canonical conversation order.
+media, and group system rows. Group lists and subscriptions use canonical conversation order.
 
 **Timeline search.** `messages timeline search` searches retained local history, across the account unless a group
 is supplied. Text is a trimmed, case-insensitive literal substring; query operators and wildcards have no special
@@ -524,9 +524,6 @@ responses with a typed `result.type`:
 | `reaction` | reactions |
 | `message_delete` | deletions |
 | `media` | media references |
-| `agent_stream_start`, `agent_stream_final` | durable agent stream anchors and finals |
-| `agent_stream_delta` | live brokered QUIC chunks |
-| `stream_preview` | runtime-owned QUIC preview summaries |
 | `chat` | chat rows |
 | `group_state` | group state rows |
 
@@ -622,65 +619,13 @@ wn usage-diagnostics disable
   [host and operator contract](../../docs/marmot-architecture/usage-diagnostics.md) for disclosure, endpoint/key
   configuration, and reporting limitations.
 
-### Agent text streams
-
-Provisional QUIC previews of agent text, anchored by durable Marmot messages:
-
-```sh
-marmot-quic-broker --bind 127.0.0.1:4450
-wn --account <npub-or-hex> stream start <group-hex> \
-  --stream-id <stream-hex> --quic-candidate quic://127.0.0.1:4450
-wn --account <npub-or-hex> stream watch <group-hex> --stream-id <stream-hex> --insecure-local
-wn --account <npub-or-hex> stream watch <group-hex> --stream-id <stream-hex> --insecure-local --background
-wn stream send --broker --connect 127.0.0.1:4450 --insecure-local \
-  --stream-id <stream-hex> --start-event-id <start-message-id-hex> "hello over quic"
-wn stream send --connect <host:port> --server-name <dns-name> "hello over quic"
-wn stream receive --bind 127.0.0.1:4450
-wn --account <npub-or-hex> stream compose-open <group-hex> \
-  --stream-id <stream-hex> --quic-candidate quic://127.0.0.1:4450 --insecure-local
-wn --account <npub-or-hex> stream compose-append --stream-id <stream-hex> "hello "
-wn --account <npub-or-hex> stream compose-finish --stream-id <stream-hex>
-wn --account <npub-or-hex> stream compose-cancel --stream-id <stream-hex>
-wn --account <npub-or-hex> stream finish <group-hex> \
-  --stream-id <stream-hex> --start-event-id <start-message-id-hex> \
-  --transcript-hash <hash-hex> --chunk-count <n> "hello over quic"
-wn --account <npub-or-hex> stream verify <group-hex> \
-  --stream-id <stream-hex> --transcript-hash <hash-hex> --chunk-count <n>
-```
-
-- `stream start` and `stream finish` send typed payloads through the normal encrypted Marmot message path. Brokered
-  starts include concrete `quic://host:port` candidates.
-- `stream watch` reads the durable start payload, subscribes to the broker candidate, and prints the provisional text
-  preview plus transcript hash. With `--background` and a running `wnd`, the daemon owns the subscription and the
-  command returns immediately; `wn daemon status --json` reports the running/completed/failed state under
-  `stream_watches`, and `messages subscribe` emits it as `stream_preview` updates (individual chunks as
-  `agent_stream_delta`).
-- `stream send --broker` publishes ordered `TextDelta` records through the memory-only broker. Without `--broker` it
-  connects directly to a peer receiver (`wn stream receive`).
-- `stream verify` compares a received QUIC transcript hash and chunk count against the latest durable final payload for
-  the same stream id.
-- `stream compose-open|append|finish|cancel` are the daemon-owned live composer used by the TUI and agent connectors,
-  and require `wnd`. Opening publishes the durable stream anchor and starts live preview publication; append feeds
-  preview text; finish publishes the durable final message; cancel tears down the session without faking a final.
-
-QUIC chunks are transient preview data; normal Marmot messages remain the durable group history.
-
-**Destination safety.** Explicit `--connect` destinations must be public unicast addresses. `--insecure-local` is the
-only exception, and it opens loopback only. A pinned `--server-cert-der-hex` is TLS trust, not address authorization, so
-unflagged loopback, private, link-local, and CGNAT targets are rejected; local probes therefore need
-`wn stream receive --bind 127.0.0.1:4450` plus `--insecure-local` on send. The client source bind is a family-matched
-wildcard (`0.0.0.0:0` / `[::]:0`) and does not authorize the remote destination. Use
-`quic://quic-broker.ipf.dev:4450` with default trust for the shared production broker, and `--insecure-local` only for
-loopback development with generated self-signed certificates. Default trust verifies broker certificates against the
-bundled Mozilla roots (`webpki-roots`) that relays and HTTP also use, not the OS trust store.
-
 ### Sync
 
 ```sh
 wn --account <npub-or-hex> sync
 ```
 
-`sync` is a diagnostic and repair command. Normal daemon-backed chat, group, and stream flows use runtime subscriptions
+`sync` is a diagnostic and repair command. Normal daemon-backed chat, group, and message flows use runtime subscriptions
 and should not need it.
 
 ## Device linking
@@ -794,7 +739,7 @@ other devices removed it. No new storage migration or background scheduler is in
 `wn daemon start` launches `wnd` in the background for the selected home. The daemon owns the Unix socket, writes
 `dev/wnd.pid`, appends startup errors to `dev/wnd.log`, and hosts one `MarmotAppRuntime`. The runtime keeps long-lived
 relay subscriptions for local signing accounts using the daemon's discovery and account-relay defaults, and updates them
-automatically after identity, group, message, and stream mutations forwarded through it.
+automatically after identity, group, and message mutations forwarded through it.
 
 ```sh
 export WN_HOME="$PWD/dev/data/daemon-demo"
@@ -830,7 +775,7 @@ wn daemon stop
   seconds. Meanwhile `wn daemon status` prints `daemon starting` (`"starting": true` in `--json`), `wn daemon stop`
   stops it, and other commands wait until the accounts are open.
 - `wn daemon status --json` includes `device_groups` (false when that `wnd` runs with `WN_DEVICE_GROUPS=0`),
-  `last_runtime_activity`, background `stream_watches`, and a redacted `relay_health`
+  `last_runtime_activity`, and a redacted `relay_health`
   object with aggregate relay counts and connection-status buckets. It does not include relay URLs, account ids, group
   ids, subscription ids, or message ids.
 - Subscription commands (see [Messages](#messages)) use the daemon socket directly.
@@ -844,14 +789,14 @@ wnd --home "$WN_HOME" \
   --default-account-relays ws://127.0.0.1:27777
 ```
 
-### Two-terminal local stream demo
+### Two-terminal live subscription demo
 
 Terminal 1 owns the daemon and the live subscription:
 
 ```sh
 just relay-up
 
-export WN_HOME="$PWD/dev/data/stream-demo"
+export WN_HOME="$PWD/dev/data/subscription-demo"
 export WN_SECRET_STORE=file
 export WN_ALLOW_LOOPBACK_RELAYS=1   # loopback relays are dev/test only; unset in production
 unset WN_SOCKET
@@ -865,10 +810,10 @@ wn daemon start \
 wn --account "$BOB" messages subscribe "$GROUP" --limit 20
 ```
 
-Terminal 2 creates Alice and Bob, starts the durable stream, and sends live broker chunks:
+Terminal 2 creates Alice and Bob and sends a message:
 
 ```sh
-export WN_HOME="$PWD/dev/data/stream-demo"
+export WN_HOME="$PWD/dev/data/subscription-demo"
 export WN_SECRET_STORE=file
 export WN_ALLOW_LOOPBACK_RELAYS=1   # loopback relays are dev/test only; unset in production
 unset WN_SOCKET
@@ -878,19 +823,9 @@ BOB=$(wn --json create-identity | jq -r '.result.account_id')
 
 GROUP=$(wn --account "$ALICE" --json groups create agent "$BOB" | jq -r '.result.group_id')
 wn --account "$ALICE" messages send "$GROUP" "hello bob"
-
-STREAM_ID=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-START_ID=$(wn --account "$ALICE" --json stream start "$GROUP" \
-  --stream-id "$STREAM_ID" \
-  --quic-candidate quic://127.0.0.1:4450 | jq -r '.result.message_ids[0]')
-
-wn --account "$BOB" stream watch "$GROUP" --stream-id "$STREAM_ID" --insecure-local --background
-wn stream send --broker --connect 127.0.0.1:4450 --server-name localhost --insecure-local \
-  --stream-id "$STREAM_ID" --start-event-id "$START_ID" --chunk-bytes 8 "hello from the stream"
 ```
 
-Terminal 1 should print typed `message`, `agent_stream_start`, `agent_stream_delta`, and `stream_preview` JSON lines in
-real time.
+Terminal 1 should print the typed `message` line in real time.
 
 ## TUI
 
@@ -1067,12 +1002,6 @@ crashed session are swept at startup.
 /profile name <display-name>
 /users [query]
 /search [query]
-/stream [--stream-id <hex>] [--quic-candidate <quic-url>]
-/stream start [--stream-id <hex>] --quic-candidate <quic-url>
-/stream watch [--stream-id <hex>] [--insecure-local]
-/stream status
-/stream finish <stream-id> <transcript-hash> <chunk-count> <text>
-/stream verify <stream-id> <transcript-hash> [chunk-count]
 /quit
 ```
 
@@ -1092,10 +1021,6 @@ crashed session are swept at startup.
   per-message failed-send state.
 - `/image` uses the real encrypted media path (`wn media upload <group> <file> --send`) with the optional caption as
   message text.
-- Stream commands operate on the selected chat. `/stream watch` starts a daemon background watch whose completed preview
-  appears as a provisional row. `/stream` opens the stream composer, publishes the anchor, starts the receiver watch
-  through the daemon, and treats the next submitted line as the streamed text. It uses
-  `quic://quic-broker.ipf.dev:4450` when no candidate is supplied.
 - There is no `/sync`; the TUI rejects it because live updates come from subscriptions. Use `wn sync` outside the TUI
   as a diagnostic/repair escape hatch.
 

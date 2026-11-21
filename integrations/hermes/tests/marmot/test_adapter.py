@@ -675,75 +675,6 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(requests[1]["before_inclusive"])
         self.assertEqual(requests[1]["limit"], 50)
 
-    async def test_stream_begin_includes_parent_message_id_only_when_supplied(self):
-        requests = []
-
-        async def handler(reader, writer):
-            request = await read_json_line(reader)
-            requests.append(request)
-            await write_json_line(
-                writer,
-                {
-                    "marmot_agent_control": "marmot.agent-control.v2",
-                    "id": request["id"],
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": [],
-                },
-            )
-            writer.close()
-
-        await self.start_server(handler)
-        client = self.adapter.MarmotAgentControlClient(self.socket_path)
-
-        await client.stream_begin(
-            "11" * 32,
-            "22" * 32,
-            parent_message_id_hex="33" * 32,
-        )
-        await client.stream_begin("11" * 32, "22" * 32)
-
-        self.assertEqual(requests[0]["parent_message_id_hex"], "33" * 32)
-        self.assertNotIn("parent_message_id_hex", requests[1])
-
-    async def test_stream_finalize_includes_idempotency_key_only_when_supplied(self):
-        requests = []
-
-        async def handler(reader, writer):
-            request = await read_json_line(reader)
-            requests.append(request)
-            await write_json_line(
-                writer,
-                {
-                    "marmot_agent_control": "marmot.agent-control.v2",
-                    "id": request["id"],
-                    "type": "stream_finalized",
-                    "stream_id_hex": request["stream_id_hex"],
-                    "message_ids_hex": ["aa"],
-                },
-            )
-            writer.close()
-
-        await self.start_server(handler)
-        client = self.adapter.MarmotAgentControlClient(self.socket_path)
-
-        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1, idempotency_key="key-1")
-        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1, idempotency_key="   ")
-        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1)
-
-        await client.stream_finish("55" * 32, "33" * 32, "final", idempotency_key="finish-1")
-        self.assertEqual(requests[3]["type"], "stream_finish")
-        self.assertEqual(requests[3]["final_text"], "final")
-        self.assertEqual(requests[3]["idempotency_key"], "finish-1")
-        self.assertNotIn("transcript_hash_hex", requests[3])
-        self.assertNotIn("chunk_count", requests[3])
-        self.assertEqual(requests[0]["idempotency_key"], "key-1")
-        self.assertNotIn("idempotency_key", requests[1])
-        self.assertNotIn("idempotency_key", requests[2])
-        self.assertTrue(all(request["stream_capability"] == "33" * 32 for request in requests))
-
     async def test_auth_token_is_written_when_configured(self):
         requests = []
 
@@ -1529,14 +1460,6 @@ class TranscriptTests(unittest.TestCase):
     def setUp(self):
         self.adapter = load_adapter_module()
 
-    def test_append_only_delta_rejects_replacements(self):
-        state = self.adapter.AppendOnlyTextState()
-
-        self.assertEqual(state.suffix_for("hello"), "hello")
-        self.assertEqual(state.suffix_for("hello world"), " world")
-        with self.assertRaises(self.adapter.NonAppendOnlyUpdate):
-            state.suffix_for("goodbye")
-
     def test_profile_name_reply_parser_normalizes_names_and_skip_replies(self):
         parse = self.adapter.parse_profile_name_reply
 
@@ -1800,7 +1723,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         retry = await adapter.edit_message(
             chat_id="22" * 32,
             message_id=first.message_id,
-            content='* search: "glp-1"\u2589',
+            content='* search: "glp-1"',
         )
 
         self.assertTrue(retry.success)
@@ -1809,6 +1732,47 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.tool_events[0][0:2], fake_client.tool_events[1][0:2])
         self.assertEqual(fake_client.tool_events[0][2], fake_client.tool_events[1][2])
         self.assertEqual(fake_client.tool_events[1][2]["reply_to_message_id_hex"], "33" * 32)
+
+    async def test_edit_of_a_durable_message_is_refused_without_sending(self):
+        # Marmot has no edit-in-place or live preview: Hermes must fall back to
+        # a fresh durable send rather than mutate an already-sent message.
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=fake_client,
+        )
+
+        result = await adapter.edit_message("22" * 32, "77" * 32, "hello", finalize=True)
+
+        self.assertFalse(result.success)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.activities, [])
+
+    async def test_token_stream_preview_send_is_refused_and_a_final_send_goes_out(self):
+        # Hermes token streaming sends a partial reply it expects to edit
+        # (`expect_edits` without `notify`). Refusing it makes Hermes stop
+        # streaming and send the reply once; publishing it would leave a
+        # durable partial. A complete send keeps working.
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=fake_client,
+        )
+
+        preview = await adapter.send(
+            "22" * 32, "A partial reply ▉", metadata={"expect_edits": True}
+        )
+        self.assertFalse(preview.success)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.activities, [])
+
+        final = await adapter.send(
+            "22" * 32,
+            "A partial reply with its continuation.",
+            metadata={"expect_edits": True, "notify": True},
+        )
+        self.assertTrue(final.success)
+        self.assertEqual(len(fake_client.final_sends), 1)
 
     async def test_disconnect_clears_tool_progress_dedupe_cache(self):
         adapter = self.adapter_module.MarmotPlatformAdapter(
@@ -2758,57 +2722,39 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(fake_client.final_sends), 1)
             self.assertEqual((await store.get(account)).get("status"), "prompted")
 
-    async def test_inbound_turn_parent_reaches_draft_stream_without_state_leak(self):
+    async def test_inbound_turn_parent_anchors_commentary_without_state_leak(self):
         class FakeClient:
             def __init__(self):
-                self.stream_begin_parents = []
+                self.activity_parents = []
 
-            async def stream_begin(
+            async def send_agent_activity(
                 self,
                 account_id_hex,
                 group_id_hex,
                 *,
-                stream_id_hex=None,
-                parent_message_id_hex=None,
-                quic_candidates=(),
-                request_id=None,
+                status,
+                text,
+                reply_to_message_id_hex=None,
             ):
-                self.stream_begin_parents.append(parent_message_id_hex)
-                index = len(self.stream_begin_parents)
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": f"{index:02x}" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": f"{index + 16:02x}" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                return {"type": "ack"}
-
-            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
-                return {"type": "ack"}
+                self.activity_parents.append(reply_to_message_id_hex)
+                return {"type": "app_event_sent", "message_ids_hex": ["aa" * 32]}
 
         fake_client = FakeClient()
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(
                 extra={
                     "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
                     "group_activation": "always",
                 }
             ),
             client=fake_client,
         )
-        next_draft_id = 0
 
         async def message_handler(event):
-            nonlocal next_draft_id
-            next_draft_id += 1
-            result = await adapter.send_draft(
+            result = await adapter.send(
                 event.source.chat_id,
-                next_draft_id,
-                "hello",
+                "Checking.",
+                metadata={"is_turn_final": False},
             )
             self.assertTrue(result.success)
 
@@ -2837,615 +2783,10 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter._session_tasks[session_key]
 
         self.assertEqual(
-            fake_client.stream_begin_parents,
+            fake_client.activity_parents,
             ["33" * 32, "34" * 32, None],
         )
         self.assertIsNone(self.adapter_module._TURN_PARENT_MESSAGE_ID_HEX.get())
-
-    async def test_progressive_edit_stream_finalizes_then_sends_durable_message(self):
-        class FakeClient:
-            def __init__(self):
-                self.stream_appends = []
-                self.stream_finalizes = []
-                self.final_sends = []
-
-            async def stream_begin(
-                self,
-                account_id_hex,
-                group_id_hex,
-                *,
-                stream_id_hex=None,
-                parent_message_id_hex=None,
-                quic_candidates=(),
-                request_id=None,
-            ):
-                self.stream_begin_args = (
-                    account_id_hex,
-                    group_id_hex,
-                    parent_message_id_hex,
-                    tuple(quic_candidates),
-                )
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                self.stream_appends.append((stream_id_hex, append_text))
-                return {"type": "ack"}
-
-            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text))
-                return {
-                    "type": "stream_finalized",
-                    "stream_id_hex": stream_id_hex,
-                    "message_ids_hex": ["77" * 32],
-                }
-
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
-                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
-                return {
-                    "type": "final_sent",
-                    "message_ids_hex": ["88" * 32],
-                }
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        first = await adapter.send("22" * 32, "hel\u2589", reply_to="33" * 32)
-        self.assertTrue(first.success)
-        self.assertEqual(first.message_id, "marmot-stream:" + "55" * 32)
-        self.assertEqual(
-            fake_client.stream_begin_args,
-            ("11" * 32, "22" * 32, "33" * 32, ("quic://127.0.0.1:4433",)),
-        )
-
-        edited = await adapter.edit_message("22" * 32, first.message_id, "hello\u2589")
-        self.assertTrue(edited.success)
-
-        final = await adapter.edit_message("22" * 32, first.message_id, "hello", finalize=True)
-
-        self.assertTrue(final.success)
-        self.assertEqual(final.message_id, "77" * 32)
-        self.assertEqual(
-            fake_client.stream_appends,
-            [("55" * 32, "hel"), ("55" * 32, "lo")],
-        )
-        self.assertEqual(len(fake_client.stream_finalizes), 1)
-        self.assertEqual(fake_client.stream_finalizes[0][1], "hello")
-        self.assertEqual(fake_client.final_sends, [])
-
-    async def test_stream_finish_leaves_policy_chunking_to_server(self):
-        class FakeClient:
-            def __init__(self):
-                self.stream_appends = []
-                self.stream_finalizes = []
-                self.final_sends = []
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                    "policy_max_plaintext_frame_len": 4,
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                self.stream_appends.append((stream_id_hex, append_text))
-                return {"type": "ack"}
-
-            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text))
-                return {
-                    "type": "stream_finalized",
-                    "stream_id_hex": stream_id_hex,
-                    "message_ids_hex": ["77" * 32],
-                }
-
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
-                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
-                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        preview = await adapter.send("22" * 32, "abcdefghi\u2589")
-        final = await adapter.edit_message("22" * 32, preview.message_id, "abcdefghi", finalize=True)
-
-        self.assertTrue(preview.success)
-        self.assertTrue(final.success)
-        self.assertEqual(fake_client.stream_appends, [("55" * 32, "abcdefghi")])
-        self.assertEqual(len(fake_client.stream_finalizes), 1)
-        self.assertEqual(fake_client.stream_finalizes[0][1], "abcdefghi")
-        self.assertEqual(fake_client.final_sends, [])
-
-    async def test_draft_stream_skips_empty_visible_frames(self):
-        class FakeClient:
-            def __init__(self):
-                self.stream_begins = []
-                self.stream_appends = []
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                self.stream_begins.append((account_id_hex, group_id_hex, tuple(quic_candidates)))
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                self.stream_appends.append((stream_id_hex, append_text))
-                return {"type": "ack"}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        result = await adapter.send_draft("22" * 32, 1, "\u2589")
-
-        self.assertTrue(result.success)
-        self.assertEqual(fake_client.stream_begins, [])
-        self.assertEqual(fake_client.stream_appends, [])
-
-    async def test_draft_stream_clear_cancels_existing_preview(self):
-        class FakeClient:
-            def __init__(self):
-                self.stream_appends = []
-                self.stream_cancels = []
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                self.stream_appends.append((stream_id_hex, append_text))
-                return {"type": "ack"}
-
-            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
-                self.stream_cancels.append((stream_id_hex, reason))
-                return {"type": "ack"}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        first = await adapter.send_draft("22" * 32, 1, "Let me search")
-        cleared = await adapter.send_draft("22" * 32, 1, "\u2589")
-
-        self.assertTrue(first.success)
-        self.assertTrue(cleared.success)
-        self.assertEqual(fake_client.stream_appends, [("55" * 32, "Let me search")])
-        self.assertEqual(fake_client.stream_cancels, [("55" * 32, "draft cleared")])
-        self.assertEqual(adapter._draft_streams, {})
-
-    async def test_draft_stream_rotation_cancels_previous_preview(self):
-        class FakeClient:
-            def __init__(self):
-                self.next_stream = 0
-                self.stream_appends = []
-                self.stream_cancels = []
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                self.next_stream += 1
-                stream_byte = f"{0x54 + self.next_stream:02x}"
-                start_byte = f"{0x64 + self.next_stream:02x}"
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": stream_byte * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": start_byte * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                self.stream_appends.append((stream_id_hex, append_text))
-                return {"type": "ack"}
-
-            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
-                self.stream_cancels.append((stream_id_hex, reason))
-                return {"type": "ack"}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        first = await adapter.send_draft("22" * 32, 1, "Let me search")
-        second = await adapter.send_draft("22" * 32, 2, "Based on")
-
-        self.assertTrue(first.success)
-        self.assertTrue(second.success)
-        self.assertEqual(
-            fake_client.stream_appends,
-            [("55" * 32, "Let me search"), ("56" * 32, "Based on")],
-        )
-        self.assertEqual(fake_client.stream_cancels, [("55" * 32, "superseded by newer draft")])
-
-    async def test_new_preview_cancels_previous_chat_stream(self):
-        class FakeClient:
-            def __init__(self):
-                self.next_stream = 0
-                self.stream_cancels = []
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                self.next_stream += 1
-                stream_byte = f"{0x54 + self.next_stream:02x}"
-                start_byte = f"{0x64 + self.next_stream:02x}"
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": stream_byte * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": start_byte * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                return {"type": "ack"}
-
-            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
-                self.stream_cancels.append((stream_id_hex, reason))
-                return {"type": "ack"}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        first = await adapter.send("22" * 32, "hel\u2589")
-        second = await adapter.send("22" * 32, "hello\u2589")
-
-        self.assertTrue(first.success)
-        self.assertTrue(second.success)
-        self.assertEqual(
-            fake_client.stream_cancels,
-            [("55" * 32, "superseded by newer preview")],
-        )
-        self.assertEqual(second.message_id, "marmot-stream:" + "56" * 32)
-
-    async def test_send_final_extension_finalizes_stream(self):
-        class FakeClient:
-            def __init__(self):
-                self.stream_appends = []
-                self.stream_finalizes = []
-                self.final_sends = []
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                self.stream_appends.append((stream_id_hex, append_text))
-                return {"type": "ack"}
-
-            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text))
-                return {
-                    "type": "stream_finalized",
-                    "stream_id_hex": stream_id_hex,
-                    "message_ids_hex": ["77" * 32],
-                }
-
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
-                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
-                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        preview = await adapter.send("22" * 32, "Based on my research\u2589")
-        final = await adapter.send("22" * 32, "Based on my research, here's the answer")
-
-        self.assertTrue(preview.success)
-        self.assertTrue(final.success)
-        self.assertEqual(final.message_id, "77" * 32)
-        self.assertEqual(fake_client.final_sends, [])
-        self.assertEqual(len(fake_client.stream_finalizes), 1)
-        self.assertEqual(
-            fake_client.stream_finalizes[0][1],
-            "Based on my research, here's the answer",
-        )
-
-    async def test_markdown_balancers_after_cursor_stay_a_preview(self):
-        class FakeClient:
-            def __init__(self):
-                self.stream_appends = []
-                self.stream_finalizes = []
-                self.final_sends = []
-
-            async def stream_begin(
-                self,
-                account_id_hex,
-                group_id_hex,
-                *,
-                stream_id_hex=None,
-                parent_message_id_hex=None,
-                quic_candidates=(),
-                request_id=None,
-            ):
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                self.stream_appends.append((stream_id_hex, append_text))
-                return {"type": "ack"}
-
-            async def stream_finish(
-                self,
-                stream_id_hex,
-                stream_capability,
-                final_text,
-                idempotency_key=None,
-            ):
-                self.stream_finalizes.append((stream_id_hex, final_text))
-                return {
-                    "type": "stream_finalized",
-                    "stream_id_hex": stream_id_hex,
-                    "message_ids_hex": ["77" * 32],
-                }
-
-            async def send_final(
-                self,
-                account_id_hex,
-                group_id_hex,
-                text,
-                reply_to_message_id_hex=None,
-                idempotency_key=None,
-            ):
-                self.final_sends.append((account_id_hex, group_id_hex, text))
-                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        # Hermes balances an open inline-code span after adding its cursor. The
-        # trailing backtick is display-only and must not hide the preview marker.
-        preview = await adapter.send("22" * 32, "Result: `partial \u2589`")
-        final = await adapter.send("22" * 32, "Result: `partial value`")
-
-        self.assertTrue(preview.success)
-        self.assertTrue(final.success)
-        self.assertEqual(fake_client.final_sends, [])
-        self.assertEqual(fake_client.stream_appends[0][1], "Result: `partial ")
-        self.assertEqual(
-            fake_client.stream_finalizes,
-            [("55" * 32, "Result: `partial value`")],
-        )
-
-        # Fenced blocks are balanced with a newline plus three backticks.
-        append_offset = len(fake_client.stream_appends)
-        finalize_offset = len(fake_client.stream_finalizes)
-        fenced_preview = await adapter.send("22" * 32, "```text\npartial \u2589\n```")
-        fenced_final = await adapter.send("22" * 32, "```text\npartial value\n```")
-
-        self.assertTrue(fenced_preview.success)
-        self.assertTrue(fenced_final.success)
-        self.assertEqual(fake_client.final_sends, [])
-        self.assertEqual(fake_client.stream_appends[append_offset][1], "```text\npartial ")
-        self.assertEqual(len(fake_client.stream_finalizes), finalize_offset + 1)
-        self.assertEqual(
-            fake_client.stream_finalizes[finalize_offset],
-            ("55" * 32, "```text\npartial value\n```"),
-        )
-
-        both_balancers = "`outside\n```text\npartial \u2589\n````"
-        self.assertTrue(adapter._looks_like_stream_preview(both_balancers))
-        self.assertEqual(
-            adapter._strip_streaming_cursor(both_balancers),
-            "`outside\n```text\npartial ",
-        )
-
-        # Whitespace after the cursor is part of the visible snapshot. Preserve
-        # its exact bytes so later append-only comparisons see the same text.
-        for trailing_whitespace in (" ", "\t", "\r\n", " \t\r\n"):
-            with self.subTest(trailing_whitespace=repr(trailing_whitespace)):
-                preview_with_whitespace = "partial \u2589`" + trailing_whitespace
-                self.assertEqual(
-                    adapter._split_stream_preview(preview_with_whitespace),
-                    ("partial " + trailing_whitespace, True),
-                )
-
-    async def test_whitespace_mismatched_final_replaces_preview_without_duplication(self):
-        class FakeClient:
-            def __init__(self):
-                self.stream_finalizes = []
-                self.stream_cancels = []
-                self.final_sends = []
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                return {"type": "ack"}
-
-            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text))
-                return {
-                    "type": "stream_finalized",
-                    "stream_id_hex": stream_id_hex,
-                    "message_ids_hex": ["77" * 32],
-                }
-
-            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
-                self.stream_cancels.append((stream_id_hex, reason))
-                return {"type": "ack"}
-
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
-                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
-                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        # The preview snapshot keeps a trailing space before the cursor; the
-        # final send is the rstripped text. The mismatch must not duplicate or
-        # concatenate text in the durable final.
-        segment = "\n\nLet me use the web search tool to find current titanium prices:"
-        preview = await adapter.send("22" * 32, segment + " \u2589")
-        final = await adapter.send("22" * 32, segment)
-
-        self.assertTrue(preview.success)
-        self.assertTrue(final.success)
-        self.assertEqual(fake_client.stream_finalizes, [])
-        self.assertEqual(
-            fake_client.stream_cancels,
-            [("55" * 32, "final text was not append-only")],
-        )
-        self.assertEqual(len(fake_client.final_sends), 1)
-        self.assertEqual(fake_client.final_sends[0][2], segment)
-
-    async def test_final_send_cancels_non_append_only_draft_preview(self):
-        class FakeClient:
-            def __init__(self):
-                self.stream_appends = []
-                self.stream_finalizes = []
-                self.stream_cancels = []
-                self.final_sends = []
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                self.stream_appends.append((stream_id_hex, append_text))
-                return {"type": "ack"}
-
-            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text))
-                return {"type": "stream_finalized", "stream_id_hex": stream_id_hex}
-
-            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
-                self.stream_cancels.append((stream_id_hex, reason))
-                return {"type": "ack"}
-
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
-                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
-                return {
-                    "type": "final_sent",
-                    "message_ids_hex": ["88" * 32],
-                }
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        draft = await adapter.send_draft("22" * 32, 1, "Let me search")
-        final = await adapter.send("22" * 32, "Based on my search")
-
-        self.assertTrue(draft.success)
-        self.assertTrue(final.success)
-        self.assertEqual(fake_client.stream_appends, [("55" * 32, "Let me search")])
-        self.assertEqual(fake_client.stream_finalizes, [])
-        self.assertEqual(fake_client.stream_cancels, [("55" * 32, "final text was not append-only")])
-        self.assertEqual(
-            fake_client.final_sends,
-            [("11" * 32, "22" * 32, "Based on my search", None)],
-        )
 
 
 class _DeliveryRoutingFakeClient:
@@ -3453,22 +2794,12 @@ class _DeliveryRoutingFakeClient:
         self.activities = []
         self.tool_events = []
         self.final_sends = []
-        self.stream_begins = []
-        self.stream_appends = []
-        self.stream_finalizes = []
-        self.stream_cancels = []
-        self.activity_attempts = 0
-        self.fail_next_activity = False
         self.activity_response = {
             "type": "app_event_sent",
             "message_ids_hex": ["aa" * 32],
         }
 
     async def send_agent_activity(self, account_id_hex, group_id_hex, **kwargs):
-        self.activity_attempts += 1
-        if self.fail_next_activity:
-            self.fail_next_activity = False
-            raise OSError("temporary activity failure")
         self.activities.append((account_id_hex, group_id_hex, kwargs))
         return self.activity_response
 
@@ -3487,47 +2818,6 @@ class _DeliveryRoutingFakeClient:
         self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
         return {"type": "final_sent", "message_ids_hex": ["cc" * 32]}
 
-    async def stream_begin(
-        self,
-        account_id_hex,
-        group_id_hex,
-        *,
-        stream_id_hex=None,
-        quic_candidates=(),
-        request_id=None,
-        parent_message_id_hex=None,
-    ):
-        self.stream_begins.append((account_id_hex, group_id_hex, parent_message_id_hex))
-        return {
-            "type": "stream_begun",
-            "stream_id_hex": "55" * 32,
-            "stream_capability": "33" * 32,
-            "start_message_id_hex": "66" * 32,
-            "quic_candidates": list(quic_candidates),
-        }
-
-    async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-        self.stream_appends.append((stream_id_hex, append_text))
-        return {"type": "ack"}
-
-    async def stream_finish(
-        self,
-        stream_id_hex,
-        stream_capability,
-        final_text,
-        idempotency_key=None,
-    ):
-        self.stream_finalizes.append((stream_id_hex, final_text))
-        return {
-            "type": "stream_finalized",
-            "stream_id_hex": stream_id_hex,
-            "message_ids_hex": ["77" * 32],
-        }
-
-    async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
-        self.stream_cancels.append((stream_id_hex, reason))
-        return {"type": "ack"}
-
 
 class DeliveryMetadataRoutingTests(unittest.IsolatedAsyncioTestCase):
     NON_FINAL_COMMENTARY = {"is_turn_final": False, "delivery_class": "commentary"}
@@ -3536,12 +2826,9 @@ class DeliveryMetadataRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.adapter_module = load_adapter_module()
         self.config_cls = sys.modules["gateway.config"].PlatformConfig
 
-    def _adapter(self, fake_client, *, quic_candidates=None):
-        extra = {"account_id_hex": "11" * 32}
-        if quic_candidates is not None:
-            extra["quic_candidates"] = quic_candidates
+    def _adapter(self, fake_client):
         return self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(extra=extra),
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
             client=fake_client,
         )
 
@@ -3728,158 +3015,6 @@ class DeliveryMetadataRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
-
-    async def test_non_final_preview_stream_lifecycle_emits_one_activity(self):
-        fake_client = _DeliveryRoutingFakeClient()
-        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
-        metadata = self.NON_FINAL_COMMENTARY
-
-        preview = await adapter.send(
-            chat_id="22" * 32,
-            content="Let me search\u2589",
-            reply_to="33" * 32,
-            metadata=metadata,
-        )
-        self.assertTrue(preview.success)
-        self.assertEqual(len(fake_client.stream_begins), 1)
-        self.assertEqual(fake_client.activities, [])
-        self.assertEqual(fake_client.final_sends, [])
-
-        edited = await adapter.edit_message(
-            "22" * 32,
-            preview.message_id,
-            "Let me search the docs\u2589",
-            metadata=metadata,
-        )
-        self.assertTrue(edited.success)
-        self.assertEqual(fake_client.activities, [])
-        self.assertEqual(fake_client.stream_finalizes, [])
-        self.assertEqual(fake_client.final_sends, [])
-
-        result = await adapter.edit_message(
-            "22" * 32,
-            preview.message_id,
-            "Let me search the docs",
-            finalize=True,
-            metadata=metadata,
-        )
-        self.assertTrue(result.success)
-        self.assertEqual(result.message_id, "aa" * 32)
-        self.assertEqual(len(fake_client.activities), 1)
-        self.assertEqual(fake_client.activities[0][2]["text"], "Let me search the docs")
-        self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
-        self.assertEqual(fake_client.stream_finalizes, [])
-        self.assertEqual(fake_client.final_sends, [])
-
-    async def test_non_final_draft_frames_then_sealed_send_emits_one_activity(self):
-        fake_client = _DeliveryRoutingFakeClient()
-        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
-        metadata = self.NON_FINAL_COMMENTARY
-
-        first = await adapter.send_draft(
-            "22" * 32,
-            1,
-            "Let me search",
-            metadata={
-                **metadata,
-                "parent_message_id_hex": "33" * 32,
-            },
-        )
-        second = await adapter.send_draft(
-            "22" * 32,
-            1,
-            "Let me search the docs",
-            metadata=metadata,
-        )
-
-        self.assertTrue(first.success)
-        self.assertTrue(second.success)
-        self.assertEqual(len(fake_client.stream_begins), 1)
-        self.assertEqual(len(fake_client.stream_appends), 2)
-        self.assertEqual(fake_client.activities, [])
-        self.assertEqual(fake_client.final_sends, [])
-
-        result = await adapter.send(
-            chat_id="22" * 32,
-            content="Let me search the docs",
-            metadata=metadata,
-        )
-        self.assertTrue(result.success)
-        self.assertEqual(len(fake_client.activities), 1)
-        self.assertEqual(fake_client.activities[0][2]["text"], "Let me search the docs")
-        self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
-        self.assertEqual(fake_client.stream_finalizes, [])
-        self.assertEqual(fake_client.final_sends, [])
-
-    async def test_commentary_finalize_retryable_failure_preserves_stream_for_same_message_id(
-        self,
-    ):
-        fake_client = _DeliveryRoutingFakeClient()
-        fake_client.fail_next_activity = True
-        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
-        metadata = self.NON_FINAL_COMMENTARY
-        chat_id = "22" * 32
-
-        preview = await adapter.send(
-            chat_id=chat_id,
-            content="Let me search\u2589",
-            reply_to="33" * 32,
-            metadata=metadata,
-        )
-        self.assertTrue(preview.success)
-        message_id = preview.message_id
-        self.assertIn(message_id, adapter._active_streams)
-
-        first = await adapter.edit_message(
-            chat_id,
-            message_id,
-            "Let me search the docs",
-            finalize=True,
-            metadata=metadata,
-        )
-        self.assertFalse(first.success)
-        self.assertTrue(first.retryable)
-        self.assertEqual(fake_client.activity_attempts, 1)
-        self.assertEqual(len(fake_client.activities), 0)
-        self.assertEqual(fake_client.final_sends, [])
-        self.assertEqual(fake_client.stream_finalizes, [])
-        self.assertEqual(fake_client.stream_cancels, [])
-        self.assertIn(message_id, adapter._active_streams)
-
-        second = await adapter.edit_message(
-            chat_id,
-            message_id,
-            "Let me search the docs",
-            finalize=True,
-            metadata=metadata,
-        )
-        self.assertTrue(second.success)
-        self.assertEqual(second.message_id, "aa" * 32)
-        self.assertEqual(fake_client.activity_attempts, 2)
-        self.assertEqual(len(fake_client.activities), 1)
-        self.assertEqual(fake_client.activities[0][2]["text"], "Let me search the docs")
-        self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
-        self.assertEqual(fake_client.final_sends, [])
-        self.assertEqual(fake_client.stream_finalizes, [])
-        self.assertEqual(fake_client.stream_cancels, [("55" * 32, "non-final commentary")])
-        self.assertNotIn(message_id, adapter._active_streams)
-
-    async def test_turn_final_true_streaming_path_still_finalizes_kind_9(self):
-        fake_client = _DeliveryRoutingFakeClient()
-        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
-
-        preview = await adapter.send("22" * 32, "Based on my research\u2589")
-        final = await adapter.send(
-            "22" * 32,
-            "Based on my research, here's the answer",
-            metadata={"is_turn_final": True, "delivery_class": "final"},
-        )
-
-        self.assertTrue(preview.success)
-        self.assertTrue(final.success)
-        self.assertEqual(fake_client.activities, [])
-        self.assertEqual(len(fake_client.stream_finalizes), 1)
-        self.assertEqual(fake_client.final_sends, [])
 
 
 def _install_stream_events_module():
@@ -4184,59 +3319,6 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fact["omitted_message_count"], 9)
         self.assertEqual(fact["oversized_message_count"], 1)
 
-    # --- Behavior 1: append-only commits only after a successful append --------
-    async def test_append_only_state_consistent_after_failed_stream_append(self):
-        class FakeClient:
-            def __init__(self):
-                self.appends = []
-                self.fail_next = True
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                self.appends.append((stream_id_hex, append_text))
-                if self.fail_next:
-                    self.fail_next = False
-                    raise RuntimeError("transient append failure")
-                return {"type": "ack"}
-
-        fake_client = FakeClient()
-        adapter = self._adapter(
-            fake_client,
-            {"quic_candidates": ["quic://127.0.0.1:4433"]},
-        )
-        stream = await adapter._begin_live_stream("22" * 32)
-
-        # First append fails: local append-only text and transcript must NOT advance.
-        with self.assertRaises(RuntimeError):
-            await stream.append_replacement("hello")
-        self.assertEqual(stream.text.text, "")
-
-        # The same text is re-appendable and now commits exactly once.
-        await stream.append_replacement("hello")
-        self.assertEqual(stream.text.text, "hello")
-        self.assertEqual(fake_client.appends, [("55" * 32, "hello"), ("55" * 32, "hello")])
-
-    async def test_pending_suffix_for_does_not_mutate_and_commit_advances(self):
-        state = self.adapter_module.AppendOnlyTextState()
-        self.assertEqual(state.pending_suffix_for("hello"), "hello")
-        # No mutation yet.
-        self.assertEqual(state.text, "")
-        self.assertEqual(state.pending_suffix_for("hello"), "hello")
-        state.commit("hello")
-        self.assertEqual(state.text, "hello")
-        self.assertEqual(state.pending_suffix_for("hello world"), " world")
-        # Rejection semantics preserved on pending check.
-        with self.assertRaises(self.adapter_module.NonAppendOnlyUpdate):
-            state.pending_suffix_for("goodbye")
-
     # --- Behavior 2: client-side inbound message-id dedupe --------------------
     async def test_duplicate_inbound_message_id_is_dropped(self):
         event = {
@@ -4484,40 +3566,6 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("pre_handoff_retry_exhausted", failed.disposition)
         admitted = adapter._inbound_spool.claim(second["message_id_hex"])
         self.assertEqual(second["message_id_hex"], admitted.message_id)
-
-    # --- Behavior 3: stream_progress wire type --------------------------------
-    async def test_stream_progress_sends_progress_wire_type(self):
-        requests = []
-
-        async def handler(reader, writer):
-            raw = await reader.readline()
-            requests.append(json.loads(raw.decode("utf-8")))
-            await write_json_line(
-                writer,
-                {
-                    "marmot_agent_control": "marmot.agent-control.v2",
-                    "id": requests[-1]["id"],
-                    "type": "ack",
-                },
-            )
-            writer.close()
-
-        with tempfile.TemporaryDirectory() as tempdir:
-            socket_path = str(Path(tempdir) / "wn-agent.sock")
-            server = await asyncio.start_unix_server(handler, path=socket_path)
-            try:
-                client = self.adapter_module.MarmotAgentControlClient(socket_path)
-                # The dead stream_tool method is gone; stream_progress exists.
-                self.assertFalse(hasattr(client, "stream_tool"))
-                response = await client.stream_progress("55" * 32, "33" * 32, "Working...")
-            finally:
-                server.close()
-                await server.wait_closed()
-
-        self.assertEqual(response["type"], "ack")
-        self.assertEqual(requests[0]["type"], "stream_progress")
-        self.assertEqual(requests[0]["stream_id_hex"], "55" * 32)
-        self.assertEqual(requests[0]["text"], "Working...")
 
     # --- Behavior 4: sender_display_name + reply threading --------------------
     async def test_inbound_uses_sender_display_name_and_threads_reply(self):
@@ -5689,395 +4737,6 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observations.recovery_count, 1)
         snapshot = observations.snapshot()
         self.assertEqual(snapshot["last_disconnect_reason"], "socket_closed")
-
-    # --- Behavior 8: preview vs durable timeout -------------------------------
-    async def test_preview_ops_use_short_timeout_durable_uses_full(self):
-        seen = []
-
-        class TimeoutRecordingClient(self.adapter_module.MarmotAgentControlClient):
-            async def request(
-                self,
-                payload,
-                *,
-                request_id=None,
-                timeout=None,
-                response_timeout=self.adapter_module._DEFAULT_READ_TIMEOUT,
-            ):
-                seen.append((payload.get("type"), timeout))
-                return {"type": "ack", "message_ids_hex": ["77" * 32], "stream_id_hex": "55" * 32, "start_message_id_hex": "66" * 32, "quic_candidates": []}
-
-        client = TimeoutRecordingClient(
-            "/tmp/does-not-matter.sock",
-            request_timeout=30.0,
-            preview_request_timeout=8.0,
-        )
-        self.assertEqual(client.preview_request_timeout, 8.0)
-
-        await client.stream_begin("11" * 32, "22" * 32, quic_candidates=["quic://x"])
-        await client.stream_append("55" * 32, "33" * 32, "hi")
-        await client.stream_status("55" * 32, "33" * 32, "thinking")
-        await client.stream_progress("55" * 32, "33" * 32, "Working...")
-        await client.stream_cancel("55" * 32, "33" * 32, "done")
-        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1)
-        await client.send_final("11" * 32, "22" * 32, "durable")
-
-        by_type = dict(seen)
-        for preview_op in ("stream_begin", "stream_append", "stream_status", "stream_progress", "stream_cancel"):
-            self.assertEqual(by_type[preview_op], 8.0, preview_op)
-        # Durable ops use the full timeout (request() default -> None -> request_timeout).
-        self.assertIsNone(by_type["stream_finalize"])
-        self.assertIsNone(by_type["send_final"])
-
-
-class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.adapter_module = load_adapter_module()
-        self.config_cls = sys.modules["gateway.config"].PlatformConfig
-
-    async def test_stream_begin_retries_with_the_same_request_id(self):
-        adapter_module = self.adapter_module
-
-        class FakeClient:
-            def __init__(self):
-                self.request_ids = []
-
-            async def stream_begin(
-                self,
-                account_id_hex,
-                group_id_hex,
-                *,
-                stream_id_hex=None,
-                parent_message_id_hex=None,
-                quic_candidates=(),
-                request_id=None,
-            ):
-                self.request_ids.append(request_id)
-                if len(self.request_ids) == 1:
-                    raise adapter_module.AgentControlError(
-                        "timed out waiting for stream begin",
-                        code="timeout",
-                        retryable=True,
-                    )
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-        client = FakeClient()
-        stream = await adapter_module.MarmotLiveStream.begin(
-            client=client,
-            account_id_hex="11" * 32,
-            group_id_hex="22" * 32,
-            quic_candidates=(),
-        )
-
-        self.assertTrue(client.request_ids[0])
-        self.assertEqual(client.request_ids[1], client.request_ids[0])
-        self.assertEqual(stream.stream_capability, "33" * 32)
-
-    async def test_preview_mutation_retries_reuse_keys_and_keep_finalize_aligned(self):
-        adapter_module = self.adapter_module
-
-        class FakeClient:
-            def __init__(self):
-                self.attempt_keys = {"append": [], "status": [], "progress": []}
-                self.applied_keys = set()
-                self.records = []
-                self.finalize_calls = []
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def _preview(self, operation, record_type, text, idempotency_key):
-                self.attempt_keys[operation].append(idempotency_key)
-                if idempotency_key not in self.applied_keys:
-                    self.applied_keys.add(idempotency_key)
-                    self.records.append((record_type, text))
-                    raise adapter_module.AgentControlError(
-                        f"timed out waiting for {operation}",
-                        code="timeout",
-                        retryable=True,
-                    )
-                return {"type": "ack"}
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                return await self._preview("append", "append", append_text, idempotency_key)
-
-            async def stream_status(self, stream_id_hex, stream_capability, status_text, idempotency_key=None):
-                return await self._preview("status", "status", status_text, idempotency_key)
-
-            async def stream_progress(self, stream_id_hex, stream_capability, progress_text, idempotency_key=None):
-                return await self._preview("progress", "progress", progress_text, idempotency_key)
-
-            async def stream_finish(
-                self,
-                stream_id_hex,
-                stream_capability,
-                final_text,
-                idempotency_key=None,
-            ):
-                self.finalize_calls.append((final_text, idempotency_key))
-                assert final_text == "".join(text for kind, text in self.records if kind == "append")
-                return {
-                    "type": "stream_finalized",
-                    "stream_id_hex": stream_id_hex,
-                    "message_ids_hex": ["77" * 32],
-                }
-
-        fake_client = FakeClient()
-        stream = await adapter_module.MarmotLiveStream.begin(
-            client=fake_client,
-            account_id_hex="11" * 32,
-            group_id_hex="22" * 32,
-            quic_candidates=["quic://127.0.0.1:4433"],
-        )
-        await stream.append_replacement("hello")
-        await stream.status("thinking")
-        await stream.progress(" halfway")
-        finalized = await stream.finalize("hello")
-
-        self.assertEqual(finalized["type"], "stream_finalized")
-        for operation in ("append", "status", "progress"):
-            self.assertEqual(len(fake_client.attempt_keys[operation]), 2)
-            self.assertTrue(fake_client.attempt_keys[operation][0])
-            self.assertEqual(
-                fake_client.attempt_keys[operation][1],
-                fake_client.attempt_keys[operation][0],
-            )
-        self.assertEqual(len(fake_client.records), 3)
-        self.assertEqual(len(fake_client.finalize_calls), 1)
-        self.assertTrue(fake_client.finalize_calls[0][1])
-
-    async def test_exhausted_preview_retry_blocks_a_different_pending_mutation(self):
-        adapter_module = self.adapter_module
-
-        class FakeClient:
-            def __init__(self):
-                self.append_calls = []
-
-            async def stream_begin(
-                self,
-                account_id_hex,
-                group_id_hex,
-                *,
-                stream_id_hex=None,
-                quic_candidates=(),
-                request_id=None,
-            ):
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(
-                self,
-                stream_id_hex,
-                stream_capability,
-                append_text,
-                idempotency_key=None,
-            ):
-                self.append_calls.append((append_text, idempotency_key))
-                raise adapter_module.AgentControlError(
-                    "timed out waiting for append",
-                    code="timeout",
-                    retryable=True,
-                )
-
-        fake_client = FakeClient()
-        stream = await adapter_module.MarmotLiveStream.begin(
-            client=fake_client,
-            account_id_hex="11" * 32,
-            group_id_hex="22" * 32,
-            quic_candidates=(),
-        )
-
-        with unittest.mock.patch.object(adapter_module, "STREAM_PREVIEW_RETRY_BACKOFF_S", ()):
-            with self.assertRaises(adapter_module.AgentControlError):
-                await stream.append_replacement("first")
-            with self.assertRaises(adapter_module.AgentControlError) as raised:
-                await stream.append_replacement("different")
-
-        self.assertEqual(raised.exception.code, "preview_mutation_pending")
-        self.assertEqual(len(fake_client.append_calls), 1)
-        self.assertTrue(fake_client.append_calls[0][1])
-
-    async def test_stream_finalize_retries_retryable_failure_with_same_idempotency_key(self):
-        adapter_module = self.adapter_module
-
-        class FakeClient:
-            def __init__(self):
-                self.stream_finalizes = []
-                self.final_sends = []
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                return {"type": "ack"}
-
-            async def stream_finish(
-                self,
-                stream_id_hex,
-                stream_capability,
-                final_text,
-                idempotency_key=None,
-            ):
-                self.stream_finalizes.append(
-                    (stream_id_hex, final_text, idempotency_key)
-                )
-                if len(self.stream_finalizes) == 1:
-                    raise adapter_module.AgentControlError(
-                        "timed out waiting for stream finalize",
-                        code="timeout",
-                        retryable=True,
-                    )
-                return {
-                    "type": "stream_finalized",
-                    "stream_id_hex": stream_id_hex,
-                    "message_ids_hex": ["77" * 32],
-                }
-
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
-                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex, idempotency_key))
-                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        preview = await adapter.send("22" * 32, "hello\u2589")
-        final = await adapter.send("22" * 32, "hello world")
-
-        self.assertTrue(preview.success)
-        self.assertTrue(final.success)
-        self.assertEqual(fake_client.final_sends, [])
-        self.assertEqual(len(fake_client.stream_finalizes), 2)
-        self.assertTrue(fake_client.stream_finalizes[0][2])
-        self.assertEqual(fake_client.stream_finalizes[1][2], fake_client.stream_finalizes[0][2])
-
-    async def test_finish_retains_retry_key(self):
-        module = self.adapter_module
-        for operation in ("send", "edit"):
-            with self.subTest(operation=operation):
-                client = unittest.mock.Mock()
-                client.stream_append = unittest.mock.AsyncMock(return_value={"type": "ack"})
-                client.stream_cancel = unittest.mock.AsyncMock()
-                client.send_final = unittest.mock.AsyncMock()
-                receipt = {"type": "stream_finalized", "message_ids_hex": ["77" * 32]}
-                client.stream_finish = unittest.mock.AsyncMock(side_effect=[
-                    module.AgentControlError("lost receipt", code="timeout", retryable=True),
-                    receipt,
-                ])
-                adapter = module.MarmotPlatformAdapter(
-                    self.config_cls(extra={"account_id_hex": "11" * 32}), client=client,
-                )
-                stream = module.MarmotLiveStream(
-                    client=client, account_id_hex="11" * 32, group_id_hex="22" * 32,
-                    stream_id_hex="55" * 32, stream_capability="33" * 32,
-                    start_message_id_hex="66" * 32, parent_message_id_hex=None,
-                )
-                message_id = module._stream_message_id(stream.stream_id_hex)
-                adapter._active_streams[message_id] = stream
-                adapter._last_chat_stream["22" * 32] = stream
-                with unittest.mock.patch.object(module, "STREAM_FINALIZE_RETRY_BACKOFF_S", ()):
-                    if operation == "send":
-                        failed = await adapter.send("22" * 32, "hello")
-                    else:
-                        failed = await adapter.edit_message("22" * 32, message_id, "hello", finalize=True)
-                    self.assertFalse(failed.success)
-                    self.assertTrue(failed.retryable)
-                    self.assertIs(adapter._last_chat_stream["22" * 32], stream)
-                    self.assertIs(adapter._active_streams[message_id], stream)
-                    if operation == "send":
-                        retried = await adapter.send("22" * 32, "hello")
-                    else:
-                        retried = await adapter.edit_message("22" * 32, message_id, "hello", finalize=True)
-                self.assertTrue(retried.success)
-                self.assertEqual(retried.message_id, "77" * 32)
-                self.assertEqual(client.stream_finish.await_count, 2)
-                for call in client.stream_finish.await_args_list:
-                    self.assertEqual(call.kwargs["idempotency_key"], stream.finalize_idempotency_key)
-                client.stream_cancel.assert_not_awaited()
-                client.send_final.assert_not_awaited()
-
-    async def test_finalize_rejection_falls_back_to_plain_send_final(self):
-        adapter_module = self.adapter_module
-
-        class FakeClient:
-            def __init__(self):
-                self.stream_cancels = []
-                self.final_sends = []
-
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
-                return {
-                    "type": "stream_begun",
-                    "stream_id_hex": "55" * 32,
-                    "stream_capability": "33" * 32,
-                    "start_message_id_hex": "66" * 32,
-                    "quic_candidates": list(quic_candidates),
-                }
-
-            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                return {"type": "ack"}
-
-            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
-                raise adapter_module.AgentControlError(
-                    "transcript hash mismatch",
-                    code="stream_finalize_rejected",
-                )
-
-            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
-                self.stream_cancels.append((stream_id_hex, reason))
-                return {"type": "ack"}
-
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
-                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
-                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(
-                extra={
-                    "account_id_hex": "11" * 32,
-                    "quic_candidates": ["quic://127.0.0.1:4433"],
-                }
-            ),
-            client=fake_client,
-        )
-
-        preview = await adapter.send("22" * 32, "hello\u2589")
-        final = await adapter.send("22" * 32, "hello world")
-
-        self.assertTrue(preview.success)
-        self.assertTrue(final.success)
-        self.assertEqual(len(fake_client.final_sends), 1)
-        self.assertEqual(fake_client.final_sends[0][2], "hello world")
-        self.assertTrue(fake_client.stream_cancels)
 
 
 class MediaSupportTests(unittest.IsolatedAsyncioTestCase):

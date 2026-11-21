@@ -227,26 +227,6 @@ pub enum AppError {
     /// The composer changed after the caller selected it; reload before retrying.
     #[error("message draft revision no longer matches")]
     MessageDraftRevisionConflict,
-    #[error("no agent text stream start found for this group")]
-    AgentStreamMissingStart,
-    #[error("agent publisher: {0}")]
-    AgentStreamPublisher(String),
-    /// The finish expectation disagrees with the sealed transcript. Retrying
-    /// with the same inputs cannot succeed.
-    #[error("stream finalize does not match the sealed transcript")]
-    AgentStreamFinishMismatch,
-    /// The durable final send failed after sealing. The sealed transcript is
-    /// retained, so the same finish request may be retried.
-    #[error("agent stream durable send failed: {0}")]
-    AgentStreamSendFailed(#[source] Box<AppError>),
-    #[error("agent text stream start has no confirmed message id yet")]
-    AgentStreamStartNotConfirmed,
-    #[error("unsupported agent text stream route (only brokered QUIC is supported)")]
-    AgentStreamUnsupportedRoute,
-    #[error("agent text stream start has no usable quic:// candidate")]
-    AgentStreamMissingCandidate,
-    #[error("invalid quic candidate: {0}")]
-    AgentStreamInvalidCandidate(String),
     #[error("publish failed: {0}")]
     Publish(String),
     /// Every target refused this artifact for size on the observed attempt.
@@ -763,14 +743,6 @@ impl AppError {
             Self::GroupCommitPending(_) => "group_commit_pending",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::MessageDraftRevisionConflict => "message_draft_revision_conflict",
-            Self::AgentStreamMissingStart => "agent_stream_missing_start",
-            Self::AgentStreamPublisher(_) => "agent_stream_publisher",
-            Self::AgentStreamFinishMismatch => "agent_stream_finish_mismatch",
-            Self::AgentStreamSendFailed(_) => "agent_stream_send_failed",
-            Self::AgentStreamStartNotConfirmed => "agent_stream_start_not_confirmed",
-            Self::AgentStreamUnsupportedRoute => "agent_stream_unsupported_route",
-            Self::AgentStreamMissingCandidate => "agent_stream_missing_candidate",
-            Self::AgentStreamInvalidCandidate(_) => "agent_stream_invalid_candidate",
             Self::Publish(_) => "publish",
             Self::EventTooLarge { .. } => "event_too_large",
             Self::NoUsableRelay => "no_usable_relay",

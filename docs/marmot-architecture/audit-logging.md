@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-11-20
+updated: 2026-11-21
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -1808,8 +1808,6 @@ minutes. It schedules passes after these triggers:
 - `remove_push_registration`
 - `send_app_event`
 - `upload_media_send`
-- `start_agent_text_stream`
-- `finish_agent_text_stream`
 - `retry_group_convergence`
 - `startup_sync`
 - `catch_up`

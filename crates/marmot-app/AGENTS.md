@@ -10,13 +10,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 
 - Own the app-facing runtime that ties `AccountHome`, SQLCipher session storage, Nostr peeling, and Nostr transport
   adapter support together.
-- Keep runtime orchestration, managed account workers, subscriptions, and live agent stream watches in the `src/runtime/`
+- Keep runtime orchestration, managed account workers, and subscriptions in the `src/runtime/`
   module instead of regrowing `src/lib.rs`. The module splits along these seams: `mod.rs` (the `MarmotAppRuntime`
   orchestration core — construction/start/shutdown, shared services, lifecycle, module wiring and re-exports),
   `account_worker.rs` (the per-account worker: command enum, worker loop, reconnect backoff, runtime-event publishers),
   `subscriptions.rs` (the `Runtime*Subscription` handles and the materialized-timeline window), `commands.rs` (the
-  `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
-  (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (account
+  `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `onboarding.rs` and `onboarding/` (account
   setup: durable preflight, cancellation, advisory installation detection, the usage-diagnostics pause
   observation in `onboarding/analytics.rs`, generated setup's procedures in
   `onboarding/generated_setup.rs`, and its background tasks and teardown fence in `onboarding/generated_setup_tasks.rs`), `audit_tracker.rs` (the forensic audit-log tracker's
@@ -725,6 +724,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.
+  The retired agent text stream component (`0x8006`) has no typed projection: `CARRIED_OPAQUE_COMPONENTS` reads it
+  from MLS into `AppGroupRecord::unknown_components`, so a group that requires it keeps it in its record.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`, `avatar.rs` for downloaded avatar admission).
   `media/attachment_resume.rs` adapts attempt-fenced checkpoints (metadata rows in storage, ciphertext in the media
@@ -1179,10 +1180,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   ends; one that releases early lets a failed ingest's checkpoint pass the delivery.
 - Keep Nostr group routing sourced from `marmot.transport.nostr.routing.v1` component bytes; relay filtering may affect
   connections, but must not rewrite signed routing state. Relay endpoints pass through the `RelaySafetyPolicy`
-  host-safety chokepoint (`transport-nostr`'s `src/safety.rs`), and agent-stream broker candidates through
-  `src/runtime/agent_stream_watch.rs`, before any connect; both follow the one dial discipline in
+  host-safety chokepoint (`transport-nostr`'s `src/safety.rs`) before any connect, following the one dial discipline in
   `docs/marmot-architecture/overview/dial-safety.md` (validate + pin, trust from config, loopback only under an explicit
-  dev flag). Do not add an outbound relay/broker path that bypasses them.
+  dev flag). Do not add an outbound relay path that bypasses it.
 - Floor every history REQ at an anchor, less `HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE` (`history_floor`, ledger A14): the
   post-join maintenance REQ at the Welcome that installed the copy (`Group::local_copy_welcome_created_at`, never the
   local join time, which an offline member reaches long after the Welcome), and a retained route at the moment
@@ -1398,8 +1398,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
   `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `profile_pseudonyms.rs` (cosmetic display names; not a
-  security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
-  stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `usage_diagnostics.rs`
+  security primitive), `root_runtime_lease.rs` (cross-process exclusive root lease), `usage_diagnostics.rs`
   (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
   product collector only through `marmot_observability::wiring`, consent lock before state lock), `projection.rs` (legacy account
   projection import), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and

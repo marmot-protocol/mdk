@@ -21,7 +21,7 @@ Current tracks:
 - Marmot C binding releases use tags like `marmotc-v0.9.0`. These build the C ABI bundle (shared/static library,
   `marmot.h`, pkg-config file) from `crates/marmot-c` and attach it to a GitHub Release.
 
-Future binary or package tracks should follow the same shape, for example `quic-broker-v0.9.0` or `wn-cli-v0.9.0`, only
+Future binary or package tracks should follow the same shape, for example `wn-cli-v0.9.0`, only
 when those artifacts become independently consumed release surfaces.
 
 When multiple tracks correspond to the same source snapshot, create the tags on the same commit:
@@ -860,5 +860,3 @@ name reusable.
 - MarmotKit publishes SwiftPM binary-target ZIPs and separate Swift/privacy assets, but no remote version-resolved
   Swift wrapper package repository or Maven package. Hosts must synchronize the matching inputs and own resource wiring.
 - Android consumers still need the UniFFI Kotlin runtime dependencies required by the generated Kotlin file.
-- The QUIC broker image has its own GHCR flow in `.github/workflows/quic-broker-image.yml`; it is not part of the
-  MarmotKit binding release.

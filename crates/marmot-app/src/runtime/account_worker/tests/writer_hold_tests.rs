@@ -107,7 +107,7 @@ fn exporter_secret(runtime: &crate::MarmotAppRuntime, group: &GroupId) -> HostCa
             .exporter_secret(
                 "alice",
                 &group,
-                cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY,
+                cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
                 32,
             )
             .await

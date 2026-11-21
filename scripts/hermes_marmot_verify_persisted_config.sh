@@ -99,8 +99,6 @@ python3 "$repo_root/scripts/hermes_marmot_configure_gateway.py" \
     --agent-home "$MARMOT_HOME" \
     --socket-path "$socket_path" \
     --account-id-hex "$account_id_hex" \
-    --streaming 0 \
-    --transport off \
     --tool-progress off \
     --interim-messages 0 \
     --long-running-notifications 0 \

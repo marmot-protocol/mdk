@@ -26,7 +26,7 @@ The crate is split by which side owns each table.
 | `src/base/` | Connection, codec, migration runner and bodies, open progress, test support. Both sides build on it. |
 | `src/protocol/` | The engine's storage: its handle (`handle.rs`), the `StorageProvider` impls (`provider.rs`), `storage/` and `openmls_storage/`. |
 | `src/app/` | App storage: projections, timeline, chat list, recovery ledger, drafts, attachments, avatars, media catalog. |
-| `src/app/transport/` | App storage specific to one transport (NIP-77, NIP-51, relay-plane spill, NIP-59 outbox, QUIC sequences, prepared Blossom uploads), kept together for a later move. |
+| `src/app/transport/` | App storage specific to one transport (NIP-77, NIP-51, relay-plane spill, NIP-59 outbox, prepared Blossom uploads), kept together for a later move. |
 | `src/cross/` | Code that must touch both sides in one transaction, one named function per crossing; its `README.md` lists them. |
 | `src/shared.rs`, `src/shared/` | The separate shared database. |
 
@@ -79,7 +79,6 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 | `src/app/sibling_welcome_resends.rs`, `src/cross/sibling_welcome_resends.rs` | One delivered-Welcome repair generation per original Welcome (0169/0174): immutable actual first accepted-publication time, carrier reservation/high-water and a current-incarnation D35 heartbeat query; no per-message observation journal or copied Welcome material. |
 | `src/app/sibling_welcomes.rs` | Sibling Welcomes this device admitted from its trusted device group and has not joined from yet, keyed by their carrier's message id, at most 64 at once (mdk#2628 item 3.5b, migration 0160). A held row keeps its chat's id; a full stash drops its oldest held row for a new one. |
 | `src/app/local_submissions.rs` | Device-local submission identity and durable admission before engine work. |
-| `src/app/transport/agent_stream_sequences.rs` | Durable, fail-closed publisher sequence reservations for QUIC previews. |
 | `src/app/account_projection.rs` | Account-level event projection. |
 | `src/app/chat_list.rs` | Chat-list projection, including avatar URLs; `chat_list/` holds attention, pages, and windows. |
 | `src/app/chat_list/small_state.rs` | Small state shared with the account's other devices (mdk#2628 item 4.3, migration 0161): each chat's read position, pin, mute and archive as items. One transaction records local changes (a local state that differs from what this device last observed), merges received items under the app's `SmallStateRule`, and applies winners; archives go back to the caller, which owns the in-memory account state. An item held at the highest version is put back, never changed. Invalid items, and chats whose MLS group id is over 256 bytes, are skipped, never stored. A read marker on a row no position names gives the furthest delivered message before it. Also this device's broadcast schedule: its last broadcast's time and tip, and whether it owes a broadcast request or an answer. |

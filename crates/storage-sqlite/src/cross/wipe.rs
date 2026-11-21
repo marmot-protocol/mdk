@@ -22,8 +22,7 @@ impl SqliteAccountStorage {
     /// Transactionally removes all app-local data for one group without touching
     /// the stored MLS/OpenMLS group state. This is the storage primitive for the
     /// local delete/wipe UX: it drops the chat-list/account projection, plaintext
-    /// app events, timeline rows, agent-stream start projection rows, cached
-    /// encrypted-media epoch secrets, and group push-token and gossip-state rows keyed by
+    /// app events, timeline rows, cached encrypted-media epoch secrets, and group push-token and gossip-state rows keyed by
     /// `group_id_hex`. A metadata-only media-secret retirement barrier remains
     /// because protocol/MLS state is intentionally retained; without it that
     /// state could immediately rederive wiped key bytes. `seen_events` and
@@ -111,7 +110,6 @@ impl SqliteAccountStorage {
                 for table in [
                     "app_events",
                     "message_timeline",
-                    "agent_stream_starts",
                     "conversation_read_state",
                     "chat_list_rows",
                     "account_group_app_components",

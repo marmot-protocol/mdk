@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- The retired QUIC live preview of agent text is removed (marmot-protocol/marmot#513). The `transport-quic-stream`,
+  `transport-quic-broker` (`marmot-quic-broker`) and `agent-stream-compose` crates, the broker Docker image and its
+  GHCR workflow are gone, and so are the agent stream APIs in `marmot-app`, UniFFI and the C bindings and `wn stream`.
+  The per-crate changelogs list each removed surface. Groups that already require
+  `marmot.group.agent-text-stream.quic.v1` (`0x8006`) keep working: clients still advertise and validate it.
+- `wn-agent` and the Hermes and OpenClaw plugins no longer send live agent text previews over QUIC; every reply is one
+  durable message. The `agent-control` v2 stream operations (`stream_begin`, `stream_append`, `stream_status`,
+  `stream_progress`, `stream_finish`, `stream_finalize`, `stream_cancel`), their `stream_begun` and
+  `stream_finalized` responses and the `stream_update` event are removed; `send_final` is the reply path.
+  `wn-agent` drops `--insecure-local-broker` and the bootstrap `--quic-candidate(s)` flags and the `quic_candidates`
+  bootstrap output, and still accepts `--no-quic` as a hidden no-op for older installers. The Hermes and OpenClaw
+  installers drop `--enable-streaming` and `--quic-candidate`; OpenClaw still accepts and ignores the
+  `quicCandidates`, `streaming` and `blockStreaming` keys older installers wrote, and the Hermes gateway configure
+  helper drops `--streaming`, `--transport` and `--configure-global-streaming` and keeps Marmot streaming off.
+
 ### Changed
 
 - `wn-agent` passes NIP-22 thread messages (kind 1111 with a parent) to the agent like chat: as inbound messages whose

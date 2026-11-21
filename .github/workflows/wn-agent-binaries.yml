@@ -36,7 +36,6 @@ on:
       - rust-toolchain.toml
       - crates/agent-connector/**
       - crates/agent-control/**
-      - crates/agent-stream-compose/**
       - crates/cgka-engine/**
       - crates/fs-private/**
       - crates/marmot-account/**
@@ -53,8 +52,6 @@ on:
       - crates/transport-nostr/**
       - crates/transport-nostr-adapter/**
       - crates/transport-nostr-peeler/**
-      - crates/transport-quic-broker/**
-      - crates/transport-quic-stream/**
       - '!*.md'
       - '!**/*.md'
       - integrations/openclaw/marmot/README.md

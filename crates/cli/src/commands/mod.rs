@@ -13,7 +13,6 @@ pub(crate) mod profile;
 pub(crate) mod relay_stats;
 pub(crate) mod relays;
 pub(crate) mod settings;
-pub(crate) mod stream;
 pub(crate) mod sync;
 pub(crate) mod users;
 

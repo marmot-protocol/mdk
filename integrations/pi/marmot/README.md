@@ -3,7 +3,7 @@
 `wn-pi` is a terminal-harness connector that sends authorized Marmot group
 messages to [Pi](https://pi.dev) through the local `wn-agent` control socket.
 It is intentionally a thin harness: no mention activation, profile onboarding,
-live previews, MLS, or relay logic.
+MLS, or relay logic.
 
 For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
 [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
@@ -46,8 +46,7 @@ commands share the [terminal-harness command guide](../../terminal-harness/READM
 
 Tool access, credentials and model choices come from the backend's native
 configuration and the [execution profile](../../terminal-harness/README.md#execution-profiles).
-The harness does not implement mention activation, reaction tools
-or live previews. An interactive backend's slash commands are not automatically
+The harness does not implement mention activation or reaction tools. An interactive backend's slash commands are not automatically
 available through this chat; shared harness commands are handled locally.
 
 ## Attachments

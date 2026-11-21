@@ -572,7 +572,7 @@ async fn host_reads_wait_behind_held_worker_units() {
                 .exporter_secret(
                     "alice",
                     &group,
-                    cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY,
+                    cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
                     32,
                 )
                 .await

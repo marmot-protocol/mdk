@@ -210,10 +210,6 @@ pub use shared::{
     StoredUsageDiagnosticsSettings,
 };
 
-pub use app::transport::agent_stream_sequences::{
-    AgentStreamPublisherReservation, AgentStreamPublisherReservationRequest,
-    AgentStreamPublisherState, MAX_AGENT_STREAM_PUBLISHER_CONTEXTS,
-};
 pub(crate) use base::codec::{
     SQLITE_BIND_PARAMETER_CHUNK, SqliteResultExt, bool_i64, created_at_to_i64, deserialize,
     epoch_to_i64, i64_to_u64, i64_to_usize, message_state_from_i64, message_state_to_i64,

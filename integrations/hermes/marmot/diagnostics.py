@@ -307,9 +307,6 @@ def env_enablement_seed(
     home = env_lookup("MARMOT_HOME", env_values)
     account = env_lookup("MARMOT_ACCOUNT_ID_HEX", env_values)
     group = env_lookup("MARMOT_GROUP_ID_HEX", env_values)
-    candidates = env_lookup("MARMOT_QUIC_CANDIDATES", env_values) or env_lookup(
-        "MARMOT_QUIC_CANDIDATE", env_values
-    )
     seed: dict[str, Any] = {}
     if socket or home:
         if socket:
@@ -320,8 +317,6 @@ def env_enablement_seed(
             seed["account_id_hex"] = account
         if group:
             seed["group_id_hex"] = group
-        if candidates:
-            seed["quic_candidates"] = split_config_list(candidates)
         auth_token_file = env_lookup("MARMOT_AGENT_AUTH_TOKEN_FILE", env_values)
         if auth_token_file:
             seed["auth_token_file"] = auth_token_file

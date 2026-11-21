@@ -7,6 +7,13 @@
 - `TimelineMessageRecordFfi` and `TimelineReplyPreviewFfi` gain `thread: TimelineThreadRefFfi?` (root and parent of
   a NIP-22 thread), and `TimelineReplyPreviewFfi` gains the previewed message's `replyToMessageIdHex`. Thread
   messages get Markdown `contentTokens` like kind 9. Regenerate Swift or Kotlin bindings with the matching native library.
+- The agent text stream over QUIC (live agent text previews) is removed: `startAgentTextStream`,
+  `watchAgentTextStream`, `openAgentPublisher`, `AgentTextPublisher`, `AgentStreamSubscription`, `AgentStreamStartFfi`,
+  `AgentStreamUpdateFfi` and the `Publisher*Ffi` types, `MarmotEventFfi.agentStreamActivity`,
+  `MessageUpdateFfi.agentStreamStarted`, `TimelineUpdateTriggerFfi.agentStreamStarted` / `agentStreamFinished`, and
+  `agentTextStreamJson` on `TimelineMessageRecordFfi` and `TimelineReplyPreviewFfi`. A kind-1200 stream start no
+  longer reaches message subscribers or the timeline; a stream-final kind-9 message is an ordinary chat message.
+  Regenerate Swift or Kotlin bindings with the matching native library.
 
 ### Added
 

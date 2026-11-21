@@ -3098,7 +3098,6 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::Publish(_)
         | AppError::EventTooLarge { .. }
         | AppError::BlobStore(_)
-        | AppError::AgentStreamSendFailed(_)
         | AppError::MediaUploadTimedOut
         | AppError::MediaDownloadFailed(_)
         | AppError::AuditLogUpload(_)
@@ -3139,8 +3138,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidPushServer(_)
         | AppError::InvalidPushGossip(_)
         | AppError::InvalidRelayTelemetrySettings(_)
-        | AppError::InvalidAuditLogFile(_)
-        | AppError::AgentStreamInvalidCandidate(_) => SubjectFailureCategory::Protocol,
+        | AppError::InvalidAuditLogFile(_) => SubjectFailureCategory::Protocol,
         AppError::MissingKeyPackage { .. }
         | AppError::MissingMemberInboxRoute(_)
         | AppError::UnknownGroup(_)
@@ -3152,12 +3150,6 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::ExperimentalDeviceGroupsRequired
         | AppError::GroupDisbanding(_)
         | AppError::GroupRemoved(_)
-        | AppError::AgentStreamPublisher(_)
-        | AppError::AgentStreamFinishMismatch
-        | AppError::AgentStreamMissingStart
-        | AppError::AgentStreamStartNotConfirmed
-        | AppError::AgentStreamUnsupportedRoute
-        | AppError::AgentStreamMissingCandidate
         | AppError::MissingDefaultRelays
         | AppError::MissingRelayLists(_)
         | AppError::FollowListUnavailable
@@ -3567,7 +3559,6 @@ mod tests {
             },
             AppError::AccountWorkerResponseTimedOut,
             AppError::ChatPresentationNotReady,
-            AppError::AgentStreamSendFailed(Box::new(AppError::Publish(marker.into()))),
         ] {
             let resource = app_error(failure);
             assert_eq!(resource.category, SubjectFailureCategory::Resource);

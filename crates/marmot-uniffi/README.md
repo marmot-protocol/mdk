@@ -175,7 +175,6 @@ All methods, including less common management/diagnostic operations, are listed 
 | Media and avatars | Sending/uploading media is separate from discovery, receiving, retained-byte access and decoding. Use original source slots and current opaque references; preserve rejected attachment positions. |
 | Notifications and push | Notification preferences, native registration, bounded wake/catch-up and notification subscriptions. The host owns OS tokens, permission prompts, background budgets and notification presentation. |
 | Relays and maintenance | Relay safety/classification, account/user relay lists, health, connectivity restoration, KeyPackage rotation and periodic group updates. Loopback development policy is explicit; connectivity recovery is not permission to reset user settings. |
-| Agent streams | Start/watch live text previews or use a publisher handle to append then finish a durable transcript. Preview transport and durable message delivery have different outcomes; ephemeral handles do not provide restart persistence. |
 | Diagnostics | Fixed performance milestones/snapshots, consent-gated product events, relay telemetry, audit recording/files/v5 delivery. Keep each configuration and consent boundary explicit; do not dump secrets or DTOs into logs. |
 
 ### Runtime lifecycle, threads and errors

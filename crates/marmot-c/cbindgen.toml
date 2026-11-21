@@ -46,8 +46,6 @@ include = [
     "MarmotConversationOpenMode",
     "MarmotConversationPageDirection",
     "MarmotRelayPolicy",
-    "MarmotPublisherRecord",
-    "MarmotPublisherTrust",
     "MarmotNotificationWakeSource",
     "MarmotCursorPersistence",
     "MarmotSecretStoreStatus",

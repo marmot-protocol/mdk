@@ -233,7 +233,6 @@ pub struct TimelineReplyPreviewFfi {
     /// a typed reason so the preview can show a placeholder. Empty when the
     /// previewed message has no media.
     pub media: Vec<MediaAttachmentOutcomeFfi>,
-    pub agent_text_stream_json: Option<String>,
     pub deleted: bool,
     pub deletion_source: DeletionSourceFfi,
     /// Convergence invalidation reason for the previewed message. The content
@@ -278,7 +277,6 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
             sticker,
             media_json: value.media.map(|media| media.to_string()),
             media,
-            agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
             deleted: value.deleted,
             deletion_source: value.deletion_source.into(),
             invalidation_status: value.invalidation_status,
@@ -407,9 +405,8 @@ pub struct TimelineMessageRecordFfi {
     /// with a typed `rejection.kind` (mdk#1787): render a placeholder for it;
     /// the message text and its valid sibling attachments are unaffected.
     pub media: Vec<MediaAttachmentOutcomeFfi>,
-    pub agent_text_stream_json: Option<String>,
     /// Parsed view of kind-1210 group system rows. `None` for chat, reactions,
-    /// stream rows, and malformed/free-text kind-1210 assertions.
+    /// and malformed/free-text kind-1210 assertions.
     pub group_system: Option<GroupSystemEventFfi>,
     pub reactions: TimelineReactionSummaryFfi,
     pub edit: Option<TimelineEditSummaryFfi>,
@@ -478,7 +475,6 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             thread: value.thread.map(Into::into),
             media_json: value.media.map(|media| media.to_string()),
             media,
-            agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
             group_system: group_system.map(Into::into),
             reactions: value.reactions.into(),
             edit: value.edit.map(Into::into),
@@ -549,8 +545,6 @@ pub enum TimelineUpdateTriggerFfi {
     ReactionRemoved,
     MessageDeleted,
     ReplyPreviewChanged,
-    AgentStreamStarted,
-    AgentStreamFinished,
     AgentActivity,
     AgentOperation,
     GroupSystem,
@@ -569,8 +563,6 @@ impl From<TimelineUpdateTrigger> for TimelineUpdateTriggerFfi {
             TimelineUpdateTrigger::ReactionRemoved => Self::ReactionRemoved,
             TimelineUpdateTrigger::MessageDeleted => Self::MessageDeleted,
             TimelineUpdateTrigger::ReplyPreviewChanged => Self::ReplyPreviewChanged,
-            TimelineUpdateTrigger::AgentStreamStarted => Self::AgentStreamStarted,
-            TimelineUpdateTrigger::AgentStreamFinished => Self::AgentStreamFinished,
             TimelineUpdateTrigger::AgentActivity => Self::AgentActivity,
             TimelineUpdateTrigger::AgentOperation => Self::AgentOperation,
             TimelineUpdateTrigger::GroupSystem => Self::GroupSystem,
@@ -747,8 +739,6 @@ mod tests {
         trigger!(ReactionRemoved);
         trigger!(MessageDeleted);
         trigger!(ReplyPreviewChanged);
-        trigger!(AgentStreamStarted);
-        trigger!(AgentStreamFinished);
         trigger!(AgentActivity);
         trigger!(AgentOperation);
         trigger!(GroupSystem);
@@ -1003,7 +993,6 @@ mod tests {
             reply_preview,
             thread: None,
             media,
-            agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,
             deletion_source: Default::default(),
@@ -1198,7 +1187,6 @@ mod tests {
             // from the replying message's epoch.
             source_epoch: Some(3),
             media: Some(imeta_metadata(&[imeta_tag(0x22, "video/mp4", "clip.mp4")])),
-            agent_text_stream: None,
             deleted: false,
             deletion_source: Default::default(),
             invalidation_status: Some("LosingBranch".to_owned()),
@@ -1235,7 +1223,6 @@ mod tests {
             tags,
             source_epoch: Some(3),
             media: None,
-            agent_text_stream: None,
             deleted,
             deletion_source: Default::default(),
             invalidation_status: None,

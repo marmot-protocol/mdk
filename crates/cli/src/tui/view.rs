@@ -21,131 +21,12 @@ pub(crate) fn daemon_status_sentence(daemon: &DaemonView) -> String {
             )
         })
         .unwrap_or_default();
-    let streams = stream_watch_status(daemon);
-    let streams = if streams == "streams: none" {
-        String::new()
-    } else {
-        format!(" {streams}")
-    };
     let state = if daemon.starting {
         "starting"
     } else {
         "running"
     };
-    format!("daemon {state}{activity}{streams}")
-}
-
-pub(crate) fn stream_watch_status(daemon: &DaemonView) -> String {
-    if daemon.stream_watches.is_empty() {
-        return "streams: none".to_owned();
-    }
-    let running = daemon
-        .stream_watches
-        .iter()
-        .filter(|watch| watch.status == "running")
-        .count();
-    let completed = daemon
-        .stream_watches
-        .iter()
-        .filter(|watch| watch.status == "completed")
-        .count();
-    let failed = daemon
-        .stream_watches
-        .iter()
-        .filter(|watch| watch.status == "failed")
-        .count();
-    let latest = daemon
-        .stream_watches
-        .last()
-        .map(|watch| {
-            watch
-                .stream_id
-                .as_deref()
-                .map(|stream_id| shorten(stream_id, 18))
-                .unwrap_or_else(|| shorten(&watch.watch_id, 18))
-        })
-        .unwrap_or_else(|| "none".to_owned());
-    format!("streams: running={running} completed={completed} failed={failed} latest={latest}")
-}
-
-pub(crate) fn stream_preview_lines(
-    daemon: &DaemonView,
-    live_previews: &[LiveStreamPreview],
-    group_id: Option<&str>,
-) -> Vec<Line<'static>> {
-    let Some(group_id) = group_id else {
-        return Vec::new();
-    };
-    let mut lines = live_previews
-        .iter()
-        .filter(|preview| preview.group_id == group_id)
-        .filter_map(|preview| {
-            stream_preview_line_pair(
-                &preview.author,
-                &preview.status,
-                &preview.text,
-                preview.error.as_deref(),
-            )
-        })
-        .flatten()
-        .collect::<Vec<_>>();
-    lines.extend(
-        daemon
-            .stream_watches
-            .iter()
-            .filter(|watch| watch.group_id == group_id)
-            .filter(|watch| {
-                let Some(stream_id) = watch.stream_id.as_deref() else {
-                    return true;
-                };
-                !live_previews
-                    .iter()
-                    .any(|preview| preview.group_id == group_id && preview.stream_id == stream_id)
-            })
-            .filter_map(|watch| {
-                stream_preview_line_pair(
-                    "stream",
-                    &watch.status,
-                    watch.text.as_deref().unwrap_or_default(),
-                    watch.error.as_deref(),
-                )
-            })
-            .flatten(),
-    );
-    lines
-}
-
-pub(crate) fn stream_preview_line_pair(
-    author: &str,
-    status: &str,
-    text: &str,
-    error: Option<&str>,
-) -> Option<[Line<'static>; 2]> {
-    let body = match status {
-        "completed" => return None,
-        "failed" => format!(
-            "stream failed: {}",
-            terminal_safe_text(error.unwrap_or("stream watch failed"))
-        ),
-        _ => {
-            if text.is_empty() {
-                return None;
-            } else {
-                terminal_safe_text(text)
-            }
-        }
-    };
-    Some([
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                terminal_safe_text(author),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::raw(": "),
-            Span::raw(body),
-        ]),
-    ])
+    format!("daemon {state}{activity}")
 }
 
 /// The messages-pane title: the loaded chat's name (its `base`, or plain
@@ -664,20 +545,18 @@ pub(crate) fn input_field_lines(
 /// cursor cell when focused. Empty input shows the cursor cell (focused) or a dim
 /// placeholder. The value is redacted (`/login <hidden nsec>`) via
 /// `composer_display_text` and made terminal-safe before rendering.
-pub(crate) fn composer_lines(input: &Input, focused: bool, streaming: bool) -> Vec<Line<'static>> {
+pub(crate) fn composer_lines(input: &Input, focused: bool) -> Vec<Line<'static>> {
     let prompt = Span::styled("> ", Style::default().fg(FOCUS_ACCENT));
     if input.is_empty() {
-        if focused && !streaming {
+        if focused {
             return input_field_lines("", 0, true, Some(prompt));
         }
-        let placeholder = if streaming {
-            "streaming... type text, Enter finishes, Esc cancels"
-        } else {
-            "type a message or / for commands"
-        };
         return vec![Line::from(vec![
             prompt,
-            Span::styled(placeholder.to_owned(), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "type a message or / for commands".to_owned(),
+                Style::default().fg(Color::DarkGray),
+            ),
         ])];
     }
     let display = composer_display_text(input.value());
@@ -689,13 +568,8 @@ pub(crate) fn composer_lines(input: &Input, focused: bool, streaming: bool) -> V
 /// with the same wrap the renderer uses (`Paragraph::line_count`) so the reserved
 /// height matches what is drawn; the growth steals from the flexible messages
 /// row, never the bars.
-pub(crate) fn composer_height(
-    input: &Input,
-    focused: bool,
-    streaming: bool,
-    inner_width: u16,
-) -> u16 {
-    let lines = composer_lines(input, focused, streaming);
+pub(crate) fn composer_height(input: &Input, focused: bool, inner_width: u16) -> u16 {
+    let lines = composer_lines(input, focused);
     let content = if inner_width == 0 {
         lines.len()
     } else {
@@ -800,7 +674,6 @@ impl TuiApp {
         let composer_rows = composer_height(
             &self.input,
             self.focus == Focus::Composer,
-            self.streaming.is_some(),
             area.width.saturating_sub(2),
         );
         let mut constraints = vec![Constraint::Min(6)];
@@ -1074,17 +947,6 @@ impl TuiApp {
             .unwrap_or_else(|| "Messages".to_owned())
     }
 
-    /// A retained pane can outlive the foreground account's list/feed. Only
-    /// that pane's own account-wide source may contribute its preview text.
-    fn message_stream_previews(&self) -> &[LiveStreamPreview] {
-        match self.messages_account_id.as_deref() {
-            Some(account) if self.stream_previews_account_id.as_deref() == Some(account) => {
-                &self.live_stream_previews
-            }
-            _ => &[],
-        }
-    }
-
     pub(crate) fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Messages;
         let base_title = self.loaded_chat_title();
@@ -1106,20 +968,6 @@ impl TuiApp {
 
         let inner_width = area.width.saturating_sub(2);
         let inner_height = area.height.saturating_sub(2);
-
-        // Live stream previews sit in a bottom block that only exists (and only
-        // reserves viewport rows) while the view is anchored at the newest row.
-        let group_id = self
-            .messages_group_id
-            .as_deref()
-            .or_else(|| self.selected_chat_row().map(|chat| chat.group_id.as_str()));
-        let preview_lines =
-            stream_preview_lines(&self.daemon, self.message_stream_previews(), group_id);
-        let bottom_block = if self.timeline_scroll.is_pinned() {
-            u16::try_from(preview_lines.len()).unwrap_or(u16::MAX)
-        } else {
-            0
-        };
 
         let selected_account = self.message_account_row();
         let media = self.media.view();
@@ -1146,68 +994,63 @@ impl TuiApp {
 
         // One algorithm decides both the reported visible range and what is drawn,
         // so the follow-scroll feedback and the rendered rows never diverge.
-        let (title, mut lines, range) = match timeline_visible_range(
-            &heights,
-            inner_height,
-            self.timeline_scroll.offset,
-            bottom_block,
-        ) {
-            Some((first, last)) => {
-                let mut lines = Vec::new();
-                // Rows below the pane's top edge, tracking each row's block start so
-                // reserved image blocks can be turned into absolute rects.
-                let mut cursor_y: u16 = 0;
-                // `index` addresses three parallel collections (the timeline rows,
-                // their heights, and the selection), so a range loop reads clearer
-                // than zipping them.
-                #[allow(clippy::needless_range_loop)]
-                for index in first..=last {
-                    let mut row_lines =
-                        timeline_row_lines_media(&self.timeline[index], selected_account, media);
-                    if selected == Some(index) {
-                        row_lines = highlight_timeline_lines(row_lines);
-                    }
-                    lines.extend(row_lines);
-                    // Blank separator row, counted in each row's rendered height.
-                    lines.push(Line::from(""));
-
-                    for (hash, offset, rows) in timeline_row_image_blocks(
-                        &self.timeline[index],
-                        selected_account,
-                        inner_width,
-                        media,
-                    ) {
-                        let rect = Rect {
-                            x: area.x + 1,
-                            y: area.y + 1 + cursor_y + offset,
-                            width: inner_width,
-                            height: rows,
-                        };
-                        let inner = Rect {
-                            x: area.x + 1,
-                            y: area.y + 1,
-                            width: inner_width,
-                            height: inner_height,
-                        };
-                        let clipped = rect.intersection(inner);
-                        if clipped.height > 0 && clipped.width > 0 {
-                            image_draws.push((hash, clipped));
+        let (title, lines, range) =
+            match timeline_visible_range(&heights, inner_height, self.timeline_scroll.offset) {
+                Some((first, last)) => {
+                    let mut lines = Vec::new();
+                    // Rows below the pane's top edge, tracking each row's block start so
+                    // reserved image blocks can be turned into absolute rects.
+                    let mut cursor_y: u16 = 0;
+                    // `index` addresses three parallel collections (the timeline rows,
+                    // their heights, and the selection), so a range loop reads clearer
+                    // than zipping them.
+                    #[allow(clippy::needless_range_loop)]
+                    for index in first..=last {
+                        let mut row_lines = timeline_row_lines_media(
+                            &self.timeline[index],
+                            selected_account,
+                            media,
+                        );
+                        if selected == Some(index) {
+                            row_lines = highlight_timeline_lines(row_lines);
                         }
-                    }
-                    cursor_y = cursor_y.saturating_add(heights[index]);
-                }
-                (
-                    timeline_pane_title(&base_title, total, first, last),
-                    lines,
-                    Some((first, last)),
-                )
-            }
-            None => (base_title.clone(), Vec::new(), None),
-        };
-        if bottom_block > 0 {
-            lines.extend(preview_lines);
-        }
+                        lines.extend(row_lines);
+                        // Blank separator row, counted in each row's rendered height.
+                        lines.push(Line::from(""));
 
+                        for (hash, offset, rows) in timeline_row_image_blocks(
+                            &self.timeline[index],
+                            selected_account,
+                            inner_width,
+                            media,
+                        ) {
+                            let rect = Rect {
+                                x: area.x + 1,
+                                y: area.y + 1 + cursor_y + offset,
+                                width: inner_width,
+                                height: rows,
+                            };
+                            let inner = Rect {
+                                x: area.x + 1,
+                                y: area.y + 1,
+                                width: inner_width,
+                                height: inner_height,
+                            };
+                            let clipped = rect.intersection(inner);
+                            if clipped.height > 0 && clipped.width > 0 {
+                                image_draws.push((hash, clipped));
+                            }
+                        }
+                        cursor_y = cursor_y.saturating_add(heights[index]);
+                    }
+                    (
+                        timeline_pane_title(&base_title, total, first, last),
+                        lines,
+                        Some((first, last)),
+                    )
+                }
+                None => (base_title.clone(), Vec::new(), None),
+            };
         if let Some((first, last)) = range {
             self.timeline_scroll
                 .record_visible_range(first, last, total);
@@ -1234,7 +1077,7 @@ impl TuiApp {
 
     pub(crate) fn render_composer(&self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Composer;
-        let lines = composer_lines(&self.input, focused, self.streaming.is_some());
+        let lines = composer_lines(&self.input, focused);
         frame.render_widget(
             Paragraph::new(lines)
                 .block(panel_block("Composer", focused))
@@ -1244,7 +1087,7 @@ impl TuiApp {
     }
 
     pub(crate) fn render_slash_suggestions(&self, frame: &mut Frame, composer_area: Rect) {
-        if self.focus != Focus::Composer || self.streaming.is_some() || self.popup.is_some() {
+        if self.focus != Focus::Composer || self.popup.is_some() {
             return;
         }
         let lines = slash_suggestion_lines(self.input.value(), SLASH_SUGGESTION_LIMIT);

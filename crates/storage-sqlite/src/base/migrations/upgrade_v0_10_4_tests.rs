@@ -138,11 +138,13 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
             .iter()
             .map(|table| {
                 // 0200 invalidates every stored presentation once, so its
-                // search text is written; checked separately below.
+                // search text is written; checked separately below. 0218 drops
+                // the retired agent stream column, which v0.10.4 left empty.
                 let columns = table_columns(&conn, table)
                     .into_iter()
                     .filter(|column| {
-                        !(*table == "chat_list_rows" && column == "presentation_source_revision")
+                        !(*table == "chat_list_rows" && column == "presentation_source_revision"
+                            || *table == "message_timeline" && column == "agent_stream_json")
                     })
                     .collect::<Vec<_>>();
                 let rows = table_rows(&conn, table, &columns);

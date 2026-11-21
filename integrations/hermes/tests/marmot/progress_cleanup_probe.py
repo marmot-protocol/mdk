@@ -466,8 +466,6 @@ def _quiet_helper_kwargs(
     return {
         "hermes_home": home,
         "platform": "marmot",
-        "streaming_enabled": False,
-        "streaming_transport": "off",
         "tool_progress": tool_progress,
         "interim_assistant_messages": False,
         "long_running_notifications": False,

@@ -973,8 +973,8 @@ impl Marmot {
     /// caller should cancel any active UI subscriptions for the group before
     /// invoking the wipe. The runtime removes the active transport route, then
     /// transactionally drops the chat-list/account projection, plaintext app
-    /// events, timeline rows, agent-stream projection rows, push-token rows, and
-    /// cached encrypted-media epoch secrets. MLS/OpenMLS group state is left
+    /// events, timeline rows, push-token rows, and cached encrypted-media epoch
+    /// secrets. MLS/OpenMLS group state is left
     /// intact; a future fresh group delivery can recreate a local chat row.
     /// Returns true if any local rows or a live route were removed.
     pub async fn delete_group_local(

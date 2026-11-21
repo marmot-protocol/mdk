@@ -57,11 +57,8 @@ use cgka_traits::app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
     AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
     MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
-    STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_PARENT_TAG, STREAM_START_TAG,
-    STREAM_TAG, STREAM_TYPE_TAG,
 };
 use cgka_traits::storage::{DisbandCandidate, DisbandCandidateStorage};
 use cgka_traits::{GroupStorage as _, Timestamp};
@@ -77,7 +74,6 @@ use transport_nostr_adapter::{
     NostrSubscription,
 };
 use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
-use transport_quic_broker::BrokerServerTrust;
 
 use crate::audit_log::AUDIT_ID_BYTES;
 use crate::conversions::{
@@ -87,7 +83,6 @@ use crate::key_package_records::{
     relay_list_queries, relay_list_status_from_records, require_key_package_tag,
     require_multi_value_key_package_tag_matches,
 };
-use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
 use nostr_directory::npub_for_account_id_lossy;
 use nostr_directory::{FetchedFollowList, profile_content_json, public_directory_user_record};
@@ -14904,66 +14899,6 @@ fn relay_plane_rebuild_uses_persisted_cursor_with_bounded_overlap() {
 }
 
 #[test]
-fn agent_stream_candidate_parser_skips_malformed_quic_candidates() {
-    let candidates = vec![
-        "quic://".to_owned(),
-        "https://127.0.0.1:4450".to_owned(),
-        "quic://127.0.0.1:4450".to_owned(),
-    ];
-
-    let parsed = runtime::parse_quic_candidates(&candidates).expect("valid fallback candidate");
-
-    assert_eq!(parsed.len(), 1);
-    assert_eq!(parsed[0].authority, "127.0.0.1:4450");
-    assert_eq!(parsed[0].server_name, "127.0.0.1");
-}
-
-#[test]
-fn agent_stream_insecure_local_only_applies_to_loopback_brokers() {
-    assert!(matches!(
-        runtime::broker_trust_for_candidate("127.0.0.1", None, true),
-        BrokerServerTrust::InsecureLocal
-    ));
-    assert!(matches!(
-        runtime::broker_trust_for_candidate("localhost", None, true),
-        BrokerServerTrust::InsecureLocal
-    ));
-    assert!(matches!(
-        runtime::broker_trust_for_candidate("::1", None, true),
-        BrokerServerTrust::InsecureLocal
-    ));
-    assert!(matches!(
-        runtime::broker_trust_for_candidate("203.0.113.10", None, true),
-        BrokerServerTrust::Platform
-    ));
-    assert!(matches!(
-        runtime::broker_trust_for_candidate("203.0.113.10", Some(vec![1, 2, 3]), true),
-        BrokerServerTrust::CertificateDer(der) if der == vec![1, 2, 3]
-    ));
-    // Without the explicit dev opt-in even a literal loopback candidate keeps
-    // certificate verification.
-    assert!(matches!(
-        runtime::broker_trust_for_candidate("127.0.0.1", None, false),
-        BrokerServerTrust::Platform
-    ));
-}
-
-#[test]
-fn agent_stream_trust_is_keyed_on_the_literal_candidate_host_not_resolution() {
-    // A DOMAIN candidate never selects the no-cert-verification trust, even
-    // with the dev opt-in set: a hostname that merely resolves to 127.0.0.1
-    // must not downgrade trust (resolution-dependent downgrade, issue #356).
-    assert!(matches!(
-        runtime::broker_trust_for_candidate("broker.example", None, true),
-        BrokerServerTrust::Platform
-    ));
-    assert!(matches!(
-        runtime::broker_trust_for_candidate("broker.example", Some(vec![7]), true),
-        BrokerServerTrust::CertificateDer(der) if der == vec![7]
-    ));
-}
-
-#[test]
 fn remembered_seen_events_are_bounded_in_memory() {
     let mut state = AccountState {
         label: "alice".to_owned(),
@@ -15354,126 +15289,6 @@ fn media_intent_builds_kind_nine_with_ordered_imeta_tags() {
             "locator blossom-v1 https://media.example/{}.bin",
             hex::encode([0x44_u8; 32])
         )));
-}
-
-#[test]
-fn stream_start_intent_builds_kind_1200_with_broker_tags() {
-    let parent_message_id = "cd".repeat(32);
-    let event = build(AppMessageIntent::StreamStart {
-        stream_id: vec![0xab; 32],
-        parent_message_id: Some(parent_message_id.clone()),
-        quic_candidates: vec![
-            "quic://broker.example:4450".to_owned(),
-            "quic://[::1]:4450".to_owned(),
-        ],
-    });
-    assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START);
-    assert_eq!(event.content, "");
-    let start = StreamStartView::from_event(event.kind, &event.tags).unwrap();
-    assert_eq!(start.stream_id_hex, hex::encode([0xab; 32]));
-    assert_eq!(start.route, STREAM_ROUTE_QUIC);
-    assert_eq!(
-        start.quic_candidates,
-        vec![
-            "quic://broker.example:4450".to_owned(),
-            "quic://[::1]:4450".to_owned(),
-        ]
-    );
-    assert_eq!(tag_value(&event.tags, STREAM_TYPE_TAG), Some("text"));
-    assert_eq!(tag_value(&event.tags, STREAM_FINAL_KIND_TAG), Some("9"));
-    assert_eq!(
-        tag_value(&event.tags, STREAM_PARENT_TAG),
-        Some(parent_message_id.as_str())
-    );
-}
-
-#[test]
-fn stream_start_intent_without_parent_omits_parent_tag() {
-    let event = build(AppMessageIntent::StreamStart {
-        stream_id: vec![0xab; 32],
-        parent_message_id: None,
-        quic_candidates: vec!["quic://broker.example:4450".to_owned()],
-    });
-    assert_eq!(tag_value(&event.tags, STREAM_PARENT_TAG), None);
-}
-
-#[test]
-fn stream_start_intent_accepts_zero_brokers_for_durable_fallback() {
-    let event = build(AppMessageIntent::StreamStart {
-        stream_id: vec![0xab; 32],
-        parent_message_id: None,
-        quic_candidates: Vec::new(),
-    });
-    let start = StreamStartView::from_event(event.kind, &event.tags).unwrap();
-    assert!(start.quic_candidates.is_empty());
-}
-
-#[test]
-fn stream_start_intent_rejects_each_malformed_broker_value() {
-    for candidate in [
-        "   ",
-        "https://broker.example:4450",
-        "quic://broker.example",
-    ] {
-        let result = build_inner_event(
-            &AppMessageIntent::StreamStart {
-                stream_id: vec![0xab; 32],
-                parent_message_id: None,
-                quic_candidates: vec![candidate.to_owned()],
-            },
-            SENDER_HEX,
-            1,
-        );
-        assert!(matches!(
-            result,
-            Err(AppError::AgentStreamInvalidCandidate(_))
-        ));
-    }
-}
-
-#[test]
-fn stream_start_intent_rejects_a_non_message_id_parent() {
-    let result = build_inner_event(
-        &AppMessageIntent::StreamStart {
-            stream_id: vec![0xab; 32],
-            parent_message_id: Some("abcd".to_owned()),
-            quic_candidates: vec!["quic://broker.example:4450".to_owned()],
-        },
-        SENDER_HEX,
-        1,
-    );
-    assert!(matches!(result, Err(AppError::InvalidAppMessagePayload(_))));
-}
-
-#[test]
-fn stream_final_intent_builds_kind_nine_stream_final() {
-    let start_event_id = "aa".repeat(32);
-    let event = build(AppMessageIntent::StreamFinal {
-        request: AgentTextStreamFinishRequest {
-            stream_id: vec![0xcd; 32],
-            start_event_id: start_event_id.clone(),
-            final_text_or_reference: "done".to_owned(),
-            transcript_hash: [0xee; 32],
-            chunk_count: 3,
-            finished_at: 9,
-        },
-    });
-    assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
-    assert_eq!(event.content, "done");
-    assert!(is_stream_final_event(event.kind, &event.tags));
-    assert_eq!(
-        tag_value(&event.tags, STREAM_TAG),
-        Some(hex::encode([0xcd; 32]).as_str())
-    );
-    assert_eq!(
-        tag_value(&event.tags, STREAM_START_TAG),
-        Some(start_event_id.as_str())
-    );
-    assert_eq!(
-        tag_value(&event.tags, STREAM_HASH_TAG),
-        Some(hex::encode([0xee; 32]).as_str())
-    );
-    assert_eq!(tag_value(&event.tags, STREAM_CHUNKS_TAG), Some("3"));
 }
 
 #[test]

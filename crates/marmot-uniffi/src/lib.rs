@@ -46,14 +46,9 @@ mod errors;
 mod external_signer;
 mod markdown;
 mod nip46;
-mod publisher;
 mod secret_store;
-mod tokio_runtime;
-pub use publisher::{
-    AgentTextPublisher, PublisherAckFfi, PublisherInfoFfi, PublisherOptionsFfi, PublisherRecordFfi,
-    PublisherTrustFfi,
-};
 pub mod subscriptions;
+mod tokio_runtime;
 
 pub use conversions::conversation_window::*;
 use conversions::group_id_from_hex;

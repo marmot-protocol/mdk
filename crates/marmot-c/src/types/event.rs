@@ -340,10 +340,6 @@ pub enum MarmotEvent {
         account_label: *mut c_char,
         message: *mut c_char,
     },
-    AgentStreamActivity {
-        account_id_hex: *mut c_char,
-        account_label: *mut c_char,
-    },
     /// A canonical create or confirmed Add still owes a Welcome to
     /// `recipient_hex`; pending does not prove whether the recipient received it.
     WelcomeDeliveryPending {
@@ -510,13 +506,6 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 account_label: owned_c_string(account_label),
                 message: owned_c_string(message),
             },
-            F::AgentStreamActivity {
-                account_id_hex,
-                account_label,
-            } => Self::AgentStreamActivity {
-                account_id_hex: owned_c_string(account_id_hex),
-                account_label: owned_c_string(account_label),
-            },
             F::WelcomeDeliveryPending {
                 account_id_hex,
                 account_label,
@@ -670,11 +659,7 @@ impl CFree for MarmotEvent {
                     free_c_string(*account_label);
                     free_c_string(*message);
                 }
-                Self::AgentStreamActivity {
-                    account_id_hex,
-                    account_label,
-                }
-                | Self::HistoryNoticesChanged {
+                Self::HistoryNoticesChanged {
                     account_id_hex,
                     account_label,
                 }

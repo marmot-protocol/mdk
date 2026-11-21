@@ -705,11 +705,7 @@ async fn local_forget_commits_before_dropping_pending_work_and_survives_reopen()
     let first_retained = stage(&mut alice, &retained).await;
     let before_failed = GroupContextSnapshot::from_context(
         alice.group_context(&forgotten).unwrap().as_ref(),
-        &[
-            "marmot/group-event",
-            "marmot/encrypted-media",
-            "marmot/agent-text-stream-quic",
-        ],
+        &["marmot/group-event", "marmot/encrypted-media"],
     );
     // A real second connection aborts the durable delete. No mock decides
     // whether the engine's pending references or emitted events survive it.
@@ -737,11 +733,7 @@ async fn local_forget_commits_before_dropping_pending_work_and_survives_reopen()
     assert_eq!(
         GroupContextSnapshot::from_context(
             alice.group_context(&forgotten).unwrap().as_ref(),
-            &[
-                "marmot/group-event",
-                "marmot/encrypted-media",
-                "marmot/agent-text-stream-quic"
-            ]
+            &["marmot/group-event", "marmot/encrypted-media"]
         ),
         before_failed
     );
@@ -782,11 +774,7 @@ async fn local_forget_commits_before_dropping_pending_work_and_survives_reopen()
     let retained_queue = storage.list_queued_outbound_intents(&retained).unwrap();
     let retained_context = GroupContextSnapshot::from_context(
         alice.group_context(&retained).unwrap().as_ref(),
-        &[
-            "marmot/group-event",
-            "marmot/encrypted-media",
-            "marmot/agent-text-stream-quic",
-        ],
+        &["marmot/group-event", "marmot/encrypted-media"],
     );
     assert!(alice.forget_group_local(&forgotten).unwrap());
     assert!(storage.is_group_forgotten(&forgotten).unwrap());
@@ -809,11 +797,7 @@ async fn local_forget_commits_before_dropping_pending_work_and_survives_reopen()
     assert_eq!(
         GroupContextSnapshot::from_context(
             alice.group_context(&retained).unwrap().as_ref(),
-            &[
-                "marmot/group-event",
-                "marmot/encrypted-media",
-                "marmot/agent-text-stream-quic"
-            ]
+            &["marmot/group-event", "marmot/encrypted-media"]
         ),
         retained_context
     );

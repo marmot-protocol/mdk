@@ -38,7 +38,6 @@ pub(crate) async fn handle_messages_subscription(
         let _ = write_stream_end(stream).await;
         return Ok(());
     };
-    let stream_manager = runtime.shared_services().agent_streams();
     let mut runtime_subscription = match runtime
         .subscribe_messages(
             &account_ref,
@@ -60,10 +59,7 @@ pub(crate) async fn handle_messages_subscription(
     };
     let mut seen_messages =
         BoundedMessageSubscriptionIds::with_limit(MESSAGE_SUBSCRIPTION_DEDUP_LIMIT);
-    let mut seen_stream_previews =
-        BoundedMessageSubscriptionIds::with_limit(MESSAGE_SUBSCRIPTION_DEDUP_LIMIT);
     let mut event_rx = events.subscribe_messages();
-    let mut stream_rx = stream_manager.subscribe();
     if !write_stream_response(
         stream,
         &DaemonStreamResponse::ok(serde_json::json!({
@@ -103,52 +99,15 @@ pub(crate) async fn handle_messages_subscription(
             kinds.as_deref(),
             &account_ref,
             &mut seen_messages,
-            &mut seen_stream_previews,
         )
         .await
         {
             return Ok(());
-        }
-    }
-
-    for update in stream_manager.recent_updates() {
-        let response = agent_stream_update_response(update, false);
-        if !write_message_subscription_event(
-            stream,
-            response,
-            group_id.as_deref(),
-            kinds.as_deref(),
-            &account_ref,
-            &mut seen_messages,
-            &mut seen_stream_previews,
-        )
-        .await
-        {
-            return Ok(());
-        }
-    }
-
-    if let Some(group_id) = group_id.as_deref() {
-        for preview in stream_manager.previews_for_group(Some(&account_ref), group_id) {
-            let preview =
-                serde_json::to_value(preview).expect("stream preview serialization cannot fail");
-            let fingerprint = stream_preview_fingerprint(&preview);
-            if !seen_stream_previews.insert(fingerprint) {
-                continue;
-            }
-            let response = stream_preview_response(preview, true);
-            if !write_stream_response(stream, &response).await {
-                return Ok(());
-            }
         }
     }
 
     loop {
         tokio::select! {
-            // Stream-start messages are published before their preview updates; keep that
-            // ordering stable when both broadcast channels are ready in the same poll.
-            biased;
-
             update = runtime_subscription.recv() => {
                 let Some(update) = update else {
                     return Ok(());
@@ -161,7 +120,6 @@ pub(crate) async fn handle_messages_subscription(
                     kinds.as_deref(),
                     &account_ref,
                     &mut seen_messages,
-                    &mut seen_stream_previews,
                 )
                 .await
                 {
@@ -178,7 +136,6 @@ pub(crate) async fn handle_messages_subscription(
                             kinds.as_deref(),
                             &account_ref,
                             &mut seen_messages,
-                            &mut seen_stream_previews,
                         )
                         .await
                         {
@@ -188,35 +145,6 @@ pub(crate) async fn handle_messages_subscription(
                     Err(broadcast::error::RecvError::Lagged(count)) => {
                         let response = DaemonStreamResponse::err(format!(
                             "message stream lagged: {count} updates dropped"
-                        ));
-                        if !write_stream_response(stream, &response).await {
-                            return Ok(());
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                }
-            }
-            stream_update = stream_rx.recv() => {
-                match stream_update {
-                    Ok(update) => {
-                        let response = agent_stream_update_response(update, false);
-                        if !write_message_subscription_event(
-                            stream,
-                            response,
-                            group_id.as_deref(),
-                            kinds.as_deref(),
-                            &account_ref,
-                            &mut seen_messages,
-                            &mut seen_stream_previews,
-                        )
-                        .await
-                        {
-                            return Ok(());
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(count)) => {
-                        let response = DaemonStreamResponse::err(format!(
-                            "agent stream update stream lagged: {count} updates dropped"
                         ));
                         if !write_stream_response(stream, &response).await {
                             return Ok(());
@@ -346,7 +274,6 @@ pub(crate) async fn write_message_subscription_event(
     kinds: Option<&[u64]>,
     account_id: &str,
     seen_messages: &mut BoundedMessageSubscriptionIds,
-    seen_stream_previews: &mut BoundedMessageSubscriptionIds,
 ) -> bool {
     if !stream_response_matches_subscription(&response, group_id, account_id) {
         return true;
@@ -354,7 +281,7 @@ pub(crate) async fn write_message_subscription_event(
     if !stream_response_matches_kinds(&response, kinds) {
         return true;
     }
-    if mark_stream_response_seen(&response, seen_messages, seen_stream_previews) {
+    if mark_stream_response_seen(&response, seen_messages) {
         write_stream_response(stream, &response).await
     } else {
         true
@@ -364,8 +291,8 @@ pub(crate) async fn write_message_subscription_event(
 /// The daemon merges the kind-filtered runtime subscription with the shared
 /// broadcast hub; apply the subscriber's kind filter to the hub side too, so
 /// `messages subscribe --kind …` never surfaces other kinds. Payloads that
-/// carry no app-event kind (stream previews/deltas, control rows) pass
-/// through — only `message` payloads with a parseable kind are constrained.
+/// carry no app-event kind (control rows) pass through — only `message`
+/// payloads with a parseable kind are constrained.
 pub(crate) fn stream_response_matches_kinds(
     response: &DaemonStreamResponse,
     kinds: Option<&[u64]>,

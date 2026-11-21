@@ -480,8 +480,6 @@ fn response_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::MaintenanceScheduled { .. } => "maintenance_scheduled",
         AgentControlResponse::MaintenancePolicy { .. } => "maintenance_policy",
         AgentControlResponse::MaintenanceRun { .. } => "maintenance_run",
-        AgentControlResponse::StreamBegun { .. } => "stream_begun",
-        AgentControlResponse::StreamFinalized { .. } => "stream_finalized",
         AgentControlResponse::DebugRecordedFinals { .. } => "debug_recorded_finals",
         AgentControlResponse::MediaDownloaded { .. } => "media_downloaded",
         AgentControlResponse::Attachment { .. } => "attachment",

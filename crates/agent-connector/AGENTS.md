@@ -6,23 +6,21 @@ and control-plane security model: [`README.md`](README.md).
 ## Scope
 
 - Own `serve_socket`/`AgentConnector` and the `wn-agent` Unix-socket daemon that bridges the `agent-control` protocol
-  and `agent-stream-compose` previews to `MarmotApp`/`MarmotAppRuntime`.
+  to `MarmotApp`/`MarmotAppRuntime`.
 - Own `wn-agent bootstrap`, which creates or reuses a local agent account through the running control socket and prints
   phone invite details (`npub`, `nprofile`, optional terminal QR).
 - Own `wn-agent doctor`, which only reads: it never chmods, removes sockets, creates accounts, publishes KeyPackages or
   writes relay lists, and prints no paths, identifiers, relay URLs or tokens.
 - Own connector socket binding and permission hardening (`bind_connector_socket`, `default_socket_path`).
-- Keep agent-facing wire types in `agent-control` and stream composition in `agent-stream-compose`; this crate is the
-  process glue, not the protocol or composition owner.
-- Publisher routing and TLS trust use `marmot-app` host-safety validation.
-  `allow_insecure_local_broker` remains an explicit dev-only opt-in.
+- Keep agent-facing wire types in `agent-control`; this crate is the process glue, not the protocol owner.
+- `wn-agent bootstrap` accepts the retired `--no-quic` flag as a hidden no-op because installers released before the
+  live-preview removal pass it; do not reintroduce other QUIC or broker flags.
 
 ## Invariants
 
 - The control plane is local-only: Unix socket, no TCP listener, restrictive default modes (`0700` dir, `0600`
   socket), same effective UID unless a bearer token is configured; reject world-readable/writable socket modes. The
   token is all-or-nothing full control; do not add implied scopes without designing them.
-- `stream_capability` values are bearer secrets: compare without data-dependent early exit; never log or persist them.
 - Logging stays privacy-safe: no account ids, group ids, message ids, relay URLs, pubkeys, payloads, ciphertext,
   plaintext, or key material. Use explicit `target`/`method` tracing fields.
 - Every invite policy fails closed without an authenticated welcomer. `--dev-allow-any-invites` requires
@@ -53,9 +51,7 @@ several files in the same crate); methods shared across those files are `pub(cra
   (`apply_relay_edit` keeps every entry the request did not name, and a read that cannot be
   confirmed is refused rather than published as a partial replacement).
 - `src/messaging.rs` — final-message sends, agent activity/operation/group-system event handlers, and debug send
-  recording/inject helpers.
-- `src/stream.rs` — QUIC text-stream preview session lifecycle (begin/append/status/progress/finalize/cancel) and the
-  idle-session sweeper.
+  recording/inject helpers (`DebugFinalSendStore`).
 - `src/inbound.rs` — `SubscribeInbound` drain loop and storage-backed `missed_inbound` recovery after broadcast
   lag.
 - `src/invite_policy.rs` — background reconciliation of pending group invites against the welcomer allowlist
@@ -75,12 +71,10 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/socket.rs` — socket path/bind/hardening (`default_socket_path`, `bind_connector_socket*`, stale-socket recovery).
   The connector's own refusals carry fixed, path-free `SocketRejection` text that startup prints.
 - `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account invite-policy and welcomer-allowlist persistence.
-- `src/stream_session.rs` — `StreamSessionStore`/`ActiveStreamSession`, the shared runtime publisher handles, and persisted
-  `SendIdempotencyStore` (`$MARMOT_HOME/dev/send-idempotency.json`, 1024-entry FIFO,
-  versioned SHA-256 request fingerprints, `stream_finalize_v2:` / `stream_finish_v1:` keys for durable finalized sends,
-  crash-safe atomic writes, plus bounded same-key/same-fingerprint in-flight gates whose followers
-  reuse a leader's successful result or receive `send_in_progress` when the gate wait expires), and
-  the `DebugFinalSendStore` recorder.
+- `src/send_idempotency.rs` — persisted `SendIdempotencyStore` (`$MARMOT_HOME/dev/send-idempotency.json`, 1024-entry
+  FIFO, versioned SHA-256 request fingerprints, crash-safe atomic writes, plus bounded same-key/same-fingerprint
+  in-flight gates whose followers reuse a leader's successful result or receive `send_in_progress` when the gate wait
+  expires). `acquire_strict` binds a key to its first fingerprint for media sends.
 - `src/media_temp.rs` — TTL sweep of decrypted inbound media temp dirs under
   `$TMPDIR/marmot-media/`.
 - `src/event_projection.rs` — runtime/debug event → control event projection, the `DeliveredInboundCursor`, and the
@@ -90,7 +84,7 @@ several files in the same crate); methods shared across those files are `pub(cra
   `AccountError`, which a failing pass could self-emit) resets the net and wakes a backed-off pass, never faster
   than the base cadence (mdk#1380). Subscription initial catch-ups stay prompt out-of-band requests.
 - `src/validation.rs` — control-plane/profile/hex validation helpers and the invite-policy retry-state holders.
-- `src/bootstrap.rs` — `wn-agent bootstrap` flow, default relays/QUIC candidate, and `MARMOT_*` env resolution,
+- `src/bootstrap.rs` — `wn-agent bootstrap` flow, default relays, and `MARMOT_*` env resolution,
   including `resolve_relays`, the relay order `serve` and `bootstrap` share.
 - `src/doctor.rs` — read-only `wn-agent doctor`: local setup checks that evaluate the socket rules in `src/socket.rs`
   without binding, plus one `diagnostic_status` request; output carries only counts, modes and statuses.

@@ -241,7 +241,6 @@ fn classify_openmls_welcome_error<StorageError: std::fmt::Debug>(
 pub(crate) const EXPORTER_LABEL: &str = "marmot";
 pub(crate) const EXPORTER_CONTEXT: &[u8] = b"group-event";
 pub(crate) const ENCRYPTED_MEDIA_EXPORTER_CONTEXT: &[u8] = b"encrypted-media";
-pub(crate) const AGENT_TEXT_STREAM_EXPORTER_CONTEXT: &[u8] = b"agent-text-stream-quic";
 
 /// Key used in [`cgka_traits::group_context::GroupContextSnapshot`] so peelers
 /// can request the registered group-event exporter without separately carrying
@@ -249,8 +248,6 @@ pub(crate) const AGENT_TEXT_STREAM_EXPORTER_CONTEXT: &[u8] = b"agent-text-stream
 pub(crate) const EXPORTER_SNAPSHOT_KEY: &str = "marmot/group-event";
 pub(crate) const ENCRYPTED_MEDIA_EXPORTER_SNAPSHOT_KEY: &str =
     cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY;
-pub(crate) const AGENT_TEXT_STREAM_EXPORTER_SNAPSHOT_KEY: &str =
-    cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
 
 /// Deletes a not-yet-owned group if creation returns early
 /// or the async future is cancelled after OpenMLS first persists it.
