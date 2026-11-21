@@ -6,15 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cgka_traits::TransportEndpoint;
-use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_START_TAG,
-    STREAM_TAG,
-};
 use clap::Parser;
 use marmot_account::AccountHome;
 use marmot_app::{
     AccountRelayListStatus, AppError, AppGroupRecord, ChatListRow, MarmotApp, MarmotAppConfig,
-    SelfMembership, StreamStartView, UserProfileMetadata, tag_value,
+    SelfMembership, UserProfileMetadata,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,12 +30,11 @@ pub(crate) use args::{
     AccountCommand, ChatsCommand, Cli, Command, DaemonCommand, DebugCommand, FollowsCommand,
     GroupCommand, GroupsCommand, KeyPackageCommand, MaintenancePolicySetting, MediaCommand,
     MessageCommand, MessageTimelineCommand, NotificationsCommand, ProfileCommand, RelaysCommand,
-    SettingsCommand, StreamCommand, UsageDiagnosticsCommand, UsersCommand,
+    SettingsCommand, UsageDiagnosticsCommand, UsersCommand,
 };
 pub(crate) use error::{WnError, wn_error_json};
 pub(crate) use secret::ImportNsec;
 
-pub(crate) const DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE: &str = "quic://quic-broker.ipf.dev:4450";
 const PRIVATE_DIR_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 
@@ -136,8 +131,6 @@ pub struct CliOutput {
     pub stderr: String,
 }
 
-pub(crate) type AgentStreamDelta = marmot_app::AgentStreamDelta;
-
 #[derive(Debug)]
 pub(crate) struct CommandOutput {
     pub(crate) plain: String,
@@ -225,14 +218,6 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
     }
 
     let home = resolve_home(cli.home.clone());
-    if is_background_stream_watch(&cli) {
-        let socket = daemon_socket_path_for_client(&cli, &home);
-        return match daemon::send_stream_watch(&socket, cli.clone()).await {
-            Ok(output) => output,
-            Err(err) => daemon_client_error(cli.json, err),
-        };
-    }
-
     if is_messages_subscribe(&cli) {
         let socket = daemon_socket_path_for_client(&cli, &home);
         return match daemon::send_messages_subscribe(&socket, cli.clone()).await {
@@ -434,18 +419,6 @@ pub(crate) fn resolve_relative_paths(cli: &mut Cli, base: &Path) {
     }
 }
 
-fn is_background_stream_watch(cli: &Cli) -> bool {
-    matches!(
-        &cli.command,
-        Command::Stream {
-            command: StreamCommand::Watch {
-                background: true,
-                ..
-            }
-        }
-    )
-}
-
 fn is_messages_subscribe(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -561,21 +534,6 @@ async fn execute_inner(
     let home = resolve_home(cli.home.clone());
     let account_flag = cli.account.clone();
     let command = cli.command.clone();
-    if let Command::Stream { command } = &command
-        && matches!(command, StreamCommand::Receive { .. })
-    {
-        return commands::stream::stream_command_local(command.clone()).await;
-    }
-    if let Command::Stream {
-        command:
-            stream_command @ StreamCommand::Send {
-                start_event_id: None,
-                ..
-            },
-    } = &command
-    {
-        return commands::stream::stream_command_local(stream_command.clone()).await;
-    }
     let secret_store = resolve_secret_store(cli.secret_store)?;
     let keychain_service = resolve_keychain_service(cli.keychain_service);
     let runtime_info = CliRuntimeInfo {
@@ -732,9 +690,6 @@ async fn execute_inner(
         Command::Notifications { command } => {
             commands::notifications::notifications_command(command)
         }
-        Command::Stream { command } => {
-            commands::stream::stream_command_app(&account_home, &app, command, account_flag).await
-        }
         Command::Daemon { .. } => Ok(CommandOutput {
             plain: "daemon command is handled by wn".to_owned(),
             json: json!({"handled": "client"}),
@@ -754,12 +709,6 @@ async fn execute_inner(
 }
 
 fn daemon_socket_for_client(cli: &Cli, home: &Path) -> Option<PathBuf> {
-    if let Command::Stream { command } = &cli.command
-        && client_hosted_stream_command(command).is_some()
-    {
-        return None;
-    }
-
     let socket = daemon_socket_path_for_client(cli, home);
     let explicit_daemon_socket = cli.socket.is_some() || std::env::var_os("WN_SOCKET").is_some();
     if matches!(cli.command, Command::Logout { .. }) && !explicit_daemon_socket {
@@ -769,31 +718,6 @@ fn daemon_socket_for_client(cli: &Cli, home: &Path) -> Option<PathBuf> {
         Some(socket)
     } else {
         None
-    }
-}
-
-pub(crate) fn client_hosted_stream_command(
-    command: &StreamCommand,
-) -> Option<(&'static str, &'static str)> {
-    match command {
-        StreamCommand::Receive { .. } => Some((
-            "stream receive",
-            "it waits for incoming stream traffic; run wn stream receive directly without --socket",
-        )),
-        StreamCommand::Send {
-            start_event_id: None,
-            ..
-        } => Some((
-            "stream send",
-            "it opens a client-hosted stream; anchor the send to an existing stream or run it directly without --socket",
-        )),
-        StreamCommand::Watch {
-            background: false, ..
-        } => Some((
-            "stream watch",
-            "foreground stream watches run until the stream ends; use --background or run directly without --socket",
-        )),
-        _ => None,
     }
 }
 
@@ -959,46 +883,6 @@ pub(crate) fn unix_now_seconds() -> u64 {
         .as_secs()
 }
 
-/// Render the `agent_text_stream` JSON view for a message's inner-event kind,
-/// tags, and content, or `None` if the message is neither a kind-1200 start nor
-/// a kind-9 stream-final. The shape stays stable for the TUI and daemon.
-pub(crate) fn agent_text_stream_payload_value(
-    kind: u64,
-    tags: &[Vec<String>],
-    content: &str,
-) -> Option<Value> {
-    if kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
-        let start = StreamStartView::from_event(kind, tags)?;
-        return Some(json!({
-            "kind": "start",
-            "stream_id": start.stream_id_hex,
-            "route": stream_route_label(&start.route),
-            "quic_candidates": start.quic_candidates,
-        }));
-    }
-    if marmot_app::is_stream_final_event(kind, tags) {
-        return Some(json!({
-            "kind": "final",
-            "stream_id": tag_value(tags, STREAM_TAG).unwrap_or_default(),
-            "start_event_id": tag_value(tags, STREAM_START_TAG).unwrap_or_default(),
-            "final_text_or_reference": content,
-            "transcript_hash": tag_value(tags, STREAM_HASH_TAG).unwrap_or_default(),
-            "chunk_count": tag_value(tags, STREAM_CHUNKS_TAG)
-                .and_then(|count| count.parse::<u64>().ok())
-                .unwrap_or_default(),
-        }));
-    }
-    None
-}
-
-/// Map the inner-event `route` tag value to the historical JSON route label.
-pub(crate) fn stream_route_label(route: &str) -> &str {
-    match route {
-        "quic" => "brokered_quic",
-        other => other,
-    }
-}
-
 pub(crate) fn profile_display_name(profile: Option<&UserProfileMetadata>) -> Option<String> {
     let profile = profile?;
     profile
@@ -1058,7 +942,6 @@ pub(crate) fn group_json(group: AppGroupRecord) -> Value {
         "avatar_url": group.avatar_url,
         "admin_policy": group.admin_policy,
         "nostr_routing": group.nostr_routing,
-        "agent_text_stream": group.agent_text_stream,
         "encrypted_media": group.encrypted_media,
         "message_retention": group.message_retention,
         "archived": group.archived,
@@ -1545,13 +1428,9 @@ mod tests {
         apply_message_cursors, reject_misplaced_reply_to, validate_message_list_cursors,
     };
     use super::commands::relay_stats::{relay_stats_output, relay_stats_plain};
-    use super::commands::stream::{
-        broker_trust_for_candidate, first_quic_candidate_is_loopback, parse_quic_candidate,
-        quic_candidate_host, resolve_quic_candidate_addr,
-    };
     use super::{
-        Cli, Command, StreamCommand, WnError, daemon, daemon_socket_for_client,
-        default_home_from_env, insert_chat_projection, npub_for_account_id, relay_endpoints,
+        Cli, Command, WnError, daemon, daemon_socket_for_client, default_home_from_env,
+        insert_chat_projection, npub_for_account_id, relay_endpoints,
         resolve_dev_settlement_quiescence_ms, resolve_relay, run_from,
     };
 
@@ -1807,45 +1686,6 @@ mod tests {
         }
     }
 
-    fn loopback_stream_addr() -> std::net::SocketAddr {
-        "127.0.0.1:4450".parse().expect("loopback address")
-    }
-
-    #[test]
-    fn daemon_execute_socket_skips_stream_commands_that_must_run_in_client() {
-        let home = Path::new("/tmp/wn-home");
-        let commands = [
-            StreamCommand::Receive {
-                bind: loopback_stream_addr(),
-                start_event_id: None,
-            },
-            StreamCommand::Send {
-                broker: false,
-                connect: loopback_stream_addr(),
-                server_name: "localhost".to_owned(),
-                server_cert_der_hex: None,
-                insecure_local: true,
-                stream_id: None,
-                start_event_id: None,
-                chunk_bytes: 1024,
-                chunk_delay_ms: 0,
-                text: vec!["hello".to_owned()],
-            },
-            StreamCommand::Watch {
-                group: "aa".repeat(32),
-                stream_id: None,
-                server_cert_der_hex: None,
-                insecure_local: true,
-                background: false,
-            },
-        ];
-
-        for command in commands {
-            let cli = test_cli(Command::Stream { command });
-            assert_eq!(daemon_socket_for_client(&cli, home), None);
-        }
-    }
-
     #[test]
     fn daemon_execute_socket_skips_implicit_logout() {
         // WN_SOCKET makes the socket selection explicit; this regression covers
@@ -1882,47 +1722,6 @@ mod tests {
             daemon_socket_for_client(&cli, home).as_deref(),
             Some(socket)
         );
-    }
-
-    #[test]
-    fn daemon_execute_socket_keeps_finite_stream_commands() {
-        let home = Path::new("/tmp/wn-home");
-        let socket = Path::new("/tmp/wnd.sock");
-        let commands = [
-            StreamCommand::Start {
-                group: "aa".repeat(32),
-                stream_id: None,
-                quic_candidates: vec!["quic://127.0.0.1:4450".to_owned()],
-            },
-            StreamCommand::Send {
-                broker: false,
-                connect: loopback_stream_addr(),
-                server_name: "localhost".to_owned(),
-                server_cert_der_hex: None,
-                insecure_local: true,
-                stream_id: None,
-                start_event_id: Some("bb".repeat(32)),
-                chunk_bytes: 1024,
-                chunk_delay_ms: 0,
-                text: vec!["hello".to_owned()],
-            },
-            StreamCommand::Finish {
-                group: "aa".repeat(32),
-                stream_id: "cc".repeat(32),
-                start_event_id: "bb".repeat(32),
-                transcript_hash: "dd".repeat(32),
-                chunk_count: 1,
-                text: vec!["hello".to_owned()],
-            },
-        ];
-
-        for command in commands {
-            let cli = test_cli(Command::Stream { command });
-            assert_eq!(
-                daemon_socket_for_client(&cli, home).as_deref(),
-                Some(socket)
-            );
-        }
     }
 
     #[cfg(unix)]
@@ -2160,144 +1959,6 @@ mod tests {
         assert_eq!(
             resolve_relay(Some(" wss://relay.example/path ".to_owned())).unwrap(),
             Some("wss://relay.example/path".to_owned())
-        );
-    }
-
-    #[test]
-    fn first_quic_candidate_loopback_detection_is_literal_and_localhost_only() {
-        assert!(first_quic_candidate_is_loopback(&[
-            "quic://127.0.0.1:4450".to_owned()
-        ]));
-        assert!(first_quic_candidate_is_loopback(&[
-            "quic://[::1]:4450".to_owned()
-        ]));
-        assert!(first_quic_candidate_is_loopback(&[
-            "quic://localhost:4450".to_owned()
-        ]));
-        assert!(!first_quic_candidate_is_loopback(&[
-            "quic://quic-broker.ipf.dev:4450".to_owned()
-        ]));
-    }
-
-    #[tokio::test]
-    async fn resolve_quic_candidate_rejects_unsafe_endpoints_without_opt_in() {
-        // Numeric IP candidates resolve without network access so this regression
-        // does not depend on DNS. Sender-controlled candidates that resolve to
-        // loopback/private/link-local/ULA must be rejected unless the local user
-        // explicitly opts into local endpoints.
-        for candidate in [
-            "quic://127.0.0.1:4450",          // IPv4 loopback
-            "quic://10.0.0.1:4450",           // RFC1918 private
-            "quic://192.168.1.1:4450",        // RFC1918 private
-            "quic://100.64.0.1:4450",         // shared address space
-            "quic://169.254.169.254:4450",    // link-local cloud metadata
-            "quic://192.0.2.1:4450",          // documentation range
-            "quic://192.88.99.1:4450",        // 6to4 relay anycast
-            "quic://198.18.0.1:4450",         // benchmarking range
-            "quic://224.0.0.1:4450",          // multicast
-            "quic://255.255.255.255:4450",    // limited broadcast
-            "quic://[::1]:4450",              // IPv6 loopback
-            "quic://[::ffff:127.0.0.1]:4450", // IPv4-mapped loopback
-            "quic://[::ffff:10.0.0.1]:4450",  // IPv4-mapped private
-            "quic://[fd00::1]:4450",          // IPv6 unique-local (ULA)
-            "quic://[fe80::1]:4450",          // IPv6 unicast link-local
-            "quic://[ff02::1]:4450",          // IPv6 multicast
-            "quic://[2001::1]:4450",          // Teredo transition prefix
-            "quic://[2001:db8::1]:4450",      // IPv6 documentation range
-            "quic://[2002::1]:4450",          // 6to4 transition prefix
-            "quic://[3fff::1]:4450",          // IPv6 documentation range
-            "quic://0.0.0.0:4450",            // unspecified
-        ] {
-            let parsed = parse_quic_candidate(candidate).expect("candidate parses");
-            let result = resolve_quic_candidate_addr(&parsed, false).await;
-            assert!(
-                matches!(result, Err(WnError::UnsafeQuicCandidateEndpoint { .. })),
-                "expected {candidate} to be rejected without opt-in, got {result:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn resolve_quic_candidate_allows_local_endpoint_with_opt_in() {
-        // With explicit local opt-in (`--insecure-local`), a loopback candidate
-        // resolves successfully; final loopback trust enforcement still happens in
-        // `broker_trust`/`stream_trust`.
-        let parsed = parse_quic_candidate("quic://127.0.0.1:4450").expect("candidate parses");
-        let addr = resolve_quic_candidate_addr(&parsed, true)
-            .await
-            .expect("loopback resolves with opt-in");
-        assert!(addr.ip().is_loopback());
-    }
-
-    #[tokio::test]
-    async fn resolve_quic_candidate_rejects_non_loopback_endpoints_with_opt_in() {
-        // `--insecure-local` is a loopback-only development escape hatch. It
-        // must not let a sender steer QUIC at other non-public network ranges.
-        for candidate in [
-            "quic://10.0.0.1:4450",        // RFC1918 private
-            "quic://100.64.0.1:4450",      // shared address space
-            "quic://169.254.169.254:4450", // link-local cloud metadata
-            "quic://[fd00::1]:4450",       // IPv6 unique-local (ULA)
-            "quic://[fe80::1]:4450",       // IPv6 unicast link-local
-        ] {
-            let parsed = parse_quic_candidate(candidate).expect("candidate parses");
-            let result = resolve_quic_candidate_addr(&parsed, true).await;
-            assert!(
-                matches!(result, Err(WnError::UnsafeQuicCandidateEndpoint { .. })),
-                "expected {candidate} to remain rejected with opt-in, got {result:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn candidate_trust_rejects_conflicting_insecure_and_certificate_flags() {
-        let result = broker_trust_for_candidate(
-            "broker.example",
-            "203.0.113.10:4450".parse().unwrap(),
-            Some(hex::encode([1_u8; 8])),
-            true,
-        );
-        assert!(matches!(result, Err(WnError::ConflictingStreamTrust)));
-    }
-
-    #[tokio::test]
-    async fn resolve_quic_candidate_accepts_public_address() {
-        // A public numeric address is accepted even without local opt-in.
-        let parsed = parse_quic_candidate("quic://93.184.216.34:4450").expect("candidate parses");
-        let addr = resolve_quic_candidate_addr(&parsed, false)
-            .await
-            .expect("public address resolves");
-        assert_eq!(addr.to_string(), "93.184.216.34:4450");
-    }
-
-    #[test]
-    fn parse_quic_candidate_ignores_path_query_and_fragment() {
-        // The authority ends at the first `/`, `?`, or `#` (transports/quic.md);
-        // a path/query/fragment after it MUST be ignored, not folded into the
-        // host:port (which would break server_name + host resolution). Mirrors
-        // the marmot-app `parse_quic_candidate` fix (#230).
-        for candidate in [
-            "quic://broker.example:4450/path",
-            "quic://broker.example:4450?x=1",
-            "quic://broker.example:4450#frag",
-            "quic://broker.example:4450/p?x=1#frag",
-        ] {
-            let parsed = parse_quic_candidate(candidate).expect("candidate parses");
-            assert_eq!(
-                parsed.authority, "broker.example:4450",
-                "authority must stop at the first /?#: {candidate}"
-            );
-            assert_eq!(
-                quic_candidate_host(candidate),
-                Some("broker.example".to_owned())
-            );
-        }
-        let parsed =
-            parse_quic_candidate("quic://[2001:db8::1]:4450?x=1").expect("ipv6 candidate parses");
-        assert_eq!(parsed.authority, "[2001:db8::1]:4450");
-        assert_eq!(
-            quic_candidate_host("quic://[2001:db8::1]:4450#frag"),
-            Some("2001:db8::1".to_owned())
         );
     }
 
@@ -3225,17 +2886,6 @@ mod tests {
         assert!(
             notifications_message.starts_with("notifications subscribe"),
             "expected notification-specific subscribe message, got {notifications_message:?}"
-        );
-
-        let stream_compose = super::wn_error_json(&WnError::StreamComposeRequiresDaemon);
-        assert_eq!(stream_compose["code"], "daemon_required");
-        assert_eq!(stream_compose["repair"]["start"], "wn daemon start");
-        let stream_compose_message = stream_compose["message"]
-            .as_str()
-            .expect("stream compose message");
-        assert!(
-            stream_compose_message.starts_with("stream compose"),
-            "expected stream-compose-specific daemon message, got {stream_compose_message:?}"
         );
     }
 

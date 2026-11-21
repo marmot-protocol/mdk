@@ -21,13 +21,14 @@ pub(crate) fn runtime_message_update_stream_response(
             ),
             "MessageReceived",
         ),
+        // Agent text streams have no CLI surface; a start is an ordinary message.
         marmot_app::RuntimeMessageUpdate::AgentStreamStarted(message) => message_stream_response(
             runtime_message_json(
                 &message.message,
                 &message.account_id_hex,
                 &message.account_label,
             ),
-            "AgentStreamStarted",
+            "MessageReceived",
         ),
     }
 }
@@ -76,100 +77,6 @@ pub(crate) fn notification_stream_response(
         "notification_key": notification.notification_key,
         "notification": notification,
     }))
-}
-
-pub(crate) fn cli_output_result(output: CliOutput) -> Result<serde_json::Value, String> {
-    let value = serde_json::from_str::<serde_json::Value>(output.stdout.trim())
-        .map_err(|err| format!("daemon command returned invalid JSON: {err}"))?;
-    if output.code != 0 || value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        let message = value
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                if output.stderr.trim().is_empty() {
-                    None
-                } else {
-                    Some(output.stderr.trim())
-                }
-            })
-            .unwrap_or("daemon command failed");
-        return Err(message.to_owned());
-    }
-    Ok(value
-        .get("result")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null))
-}
-
-pub(crate) fn stream_preview_fingerprint(preview: &serde_json::Value) -> String {
-    let watch_id = preview
-        .get("watch_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let status = preview
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let text = preview
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let transcript_hash = preview
-        .get("transcript_hash")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let error = preview
-        .get("error")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    format!("{watch_id}:{status}:{text}:{transcript_hash}:{error}")
-}
-
-pub(crate) fn stream_preview_response(
-    preview: serde_json::Value,
-    initial: bool,
-) -> DaemonStreamResponse {
-    let trigger = if initial {
-        "InitialStreamPreview"
-    } else {
-        match preview
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-        {
-            "completed" => "StreamPreviewCompleted",
-            "failed" => "StreamPreviewFailed",
-            _ => "StreamPreviewUpdated",
-        }
-    };
-    DaemonStreamResponse::ok(serde_json::json!({
-        "trigger": trigger,
-        "type": "stream_preview",
-        "stream_preview": preview,
-    }))
-}
-
-pub(crate) fn agent_stream_delta_response(delta: crate::AgentStreamDelta) -> DaemonStreamResponse {
-    DaemonStreamResponse::ok(serde_json::json!({
-        "trigger": "AgentStreamDelta",
-        "type": "agent_stream_delta",
-        "agent_stream_delta": delta,
-    }))
-}
-
-pub(crate) fn agent_stream_update_response(
-    update: marmot_app::AgentStreamUpdate,
-    initial: bool,
-) -> DaemonStreamResponse {
-    match update {
-        marmot_app::AgentStreamUpdate::WatchUpdated(report) => {
-            let preview =
-                serde_json::to_value(report).expect("stream preview serialization cannot fail");
-            stream_preview_response(preview, initial)
-        }
-        marmot_app::AgentStreamUpdate::Delta(delta) => agent_stream_delta_response(delta),
-    }
 }
 
 pub(crate) fn message_stream_response(
@@ -288,20 +195,6 @@ pub(crate) fn timeline_stream_type(trigger: &str) -> &'static str {
 }
 
 pub(crate) fn message_stream_type(message: &serde_json::Value) -> &'static str {
-    // Agent text stream classification is derived from the inner-event tags and
-    // exposed under `agent_text_stream`; prefer it so stream-final chats surface
-    // as `agent_stream_final` rather than a bare `message`.
-    if let Some(stream_kind) = message
-        .get("agent_text_stream")
-        .and_then(|stream| stream.get("kind"))
-        .and_then(serde_json::Value::as_str)
-    {
-        return match stream_kind {
-            "start" => "agent_stream_start",
-            "final" => "agent_stream_final",
-            _ => "message",
-        };
-    }
     let kind = message.get("kind").and_then(serde_json::Value::as_u64);
     let has_imeta = message
         .get("tags")
@@ -331,28 +224,11 @@ pub(crate) fn stream_response_matches_subscription(
         return true;
     };
     match result.get("type").and_then(serde_json::Value::as_str) {
-        Some("message")
-        | Some("reaction")
-        | Some("message_delete")
-        | Some("media")
-        | Some("agent_stream_start")
-        | Some("agent_stream_final") => {
+        Some("message") | Some("reaction") | Some("message_delete") | Some("media") => {
             let Some(message) = result.get("message") else {
                 return false;
             };
             value_matches_group_and_account(message, group_id, account_id)
-        }
-        Some("stream_preview") => {
-            let Some(preview) = result.get("stream_preview") else {
-                return false;
-            };
-            value_matches_group_and_account(preview, group_id, account_id)
-        }
-        Some("agent_stream_delta") => {
-            let Some(delta) = result.get("agent_stream_delta") else {
-                return false;
-            };
-            value_matches_group_and_account(delta, group_id, account_id)
         }
         _ => false,
     }
@@ -375,27 +251,16 @@ pub(crate) fn value_matches_group_and_account(
 pub(crate) fn mark_stream_response_seen(
     response: &DaemonStreamResponse,
     seen_messages: &mut BoundedMessageSubscriptionIds,
-    seen_stream_previews: &mut BoundedMessageSubscriptionIds,
 ) -> bool {
     let Some(result) = &response.result else {
         return true;
     };
     match result.get("type").and_then(serde_json::Value::as_str) {
-        Some("message")
-        | Some("reaction")
-        | Some("message_delete")
-        | Some("media")
-        | Some("agent_stream_start")
-        | Some("agent_stream_final") => result
+        Some("message") | Some("reaction") | Some("message_delete") | Some("media") => result
             .get("message")
             .and_then(|message| message.get("message_id"))
             .and_then(serde_json::Value::as_str)
             .is_none_or(|message_id| seen_messages.insert(message_id.to_owned())),
-        Some("stream_preview") => result
-            .get("stream_preview")
-            .map(stream_preview_fingerprint)
-            .is_none_or(|fingerprint| seen_stream_previews.insert(fingerprint)),
-        Some("agent_stream_delta") => true,
         _ => true,
     }
 }
@@ -411,7 +276,7 @@ pub(crate) fn runtime_message_json(
     } else {
         message.sender_display_name.clone()
     };
-    let mut value = serde_json::json!({
+    serde_json::json!({
         "account_id": account_id_hex,
         "message_id": message.message_id_hex,
         "direction": if is_own_sender { "sent" } else { "received" },
@@ -423,11 +288,5 @@ pub(crate) fn runtime_message_json(
         "tags": message.tags,
         "recorded_at": message.recorded_at,
         "received_at": message.received_at,
-    });
-    if let Some(agent_text_stream) =
-        crate::agent_text_stream_payload_value(message.kind, &message.tags, &message.plaintext)
-    {
-        value["agent_text_stream"] = agent_text_stream;
-    }
-    value
+    })
 }

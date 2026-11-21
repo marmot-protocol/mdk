@@ -1544,7 +1544,6 @@ pub(crate) fn created_group_json(
         "profile": group.profile,
         "image": group_image_summary_json(&group.image),
         "admin_policy": group.admin_policy,
-        "agent_text_stream": group.agent_text_stream,
         "message_retention": group.message_retention,
         "members": group_members_json(members)?,
     }))

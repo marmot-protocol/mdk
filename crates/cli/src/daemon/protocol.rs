@@ -109,7 +109,6 @@ pub struct DaemonStatus {
     pub log: Option<PathBuf>,
     pub last_runtime_activity: Option<DaemonRuntimeActivityReport>,
     pub relay_health: Option<marmot_app::RelayPlaneHealth>,
-    pub stream_watches: Vec<DaemonStreamWatchReport>,
     /// Whether this daemon runs with device groups on (`WN_DEVICE_GROUPS`),
     /// so clients such as the TUI follow the daemon's setting, not their
     /// own. A daemon from before this field reads as false.
@@ -125,18 +124,11 @@ pub(crate) struct DaemonShutdownAck {
     pub(crate) pid: u32,
 }
 
-pub type DaemonStreamWatchReport = marmot_app::AgentStreamWatchReport;
-
-pub type DaemonOutgoingStreamReport = StreamComposeReport;
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum DaemonRequest {
     Ping,
     Status,
     Shutdown,
-    StreamWatch {
-        cli: Box<Cli>,
-    },
     MessagesSubscribe {
         cli: Box<Cli>,
     },
@@ -263,13 +255,6 @@ pub(crate) async fn send_execute(
     }
 }
 
-pub(crate) async fn send_stream_watch(
-    socket: &Path,
-    cli: Cli,
-) -> Result<CliOutput, DaemonClientError> {
-    DaemonClient::new(socket).stream_watch(cli).await
-}
-
 pub(crate) async fn send_messages_subscribe(
     socket: &Path,
     cli: Cli,
@@ -324,14 +309,6 @@ impl DaemonClient {
 
     pub async fn shutdown(&self) -> Result<CliOutput, DaemonClientError> {
         send_request(&self.socket, &DaemonRequest::Shutdown).await
-    }
-
-    pub(crate) async fn stream_watch(&self, cli: Cli) -> Result<CliOutput, DaemonClientError> {
-        send_request(
-            &self.socket,
-            &DaemonRequest::StreamWatch { cli: Box::new(cli) },
-        )
-        .await
     }
 
     pub(crate) async fn messages_subscribe(
@@ -665,16 +642,9 @@ pub(crate) fn write_client_stream_response(
 
 pub(crate) fn stream_result_plain(result: &serde_json::Value) -> String {
     match result.get("type").and_then(serde_json::Value::as_str) {
-        Some("message")
-        | Some("reaction")
-        | Some("message_delete")
-        | Some("media")
-        | Some("agent_stream_start")
-        | Some("agent_stream_final") => {
+        Some("message") | Some("reaction") | Some("message_delete") | Some("media") => {
             let message = result.get("message").unwrap_or(&serde_json::Value::Null);
             let label = match result.get("type").and_then(serde_json::Value::as_str) {
-                Some("agent_stream_start") => "agent stream start",
-                Some("agent_stream_final") => "agent stream final",
                 Some("reaction") => "reaction",
                 Some("message_delete") => "message delete",
                 Some("media") => "media",
@@ -697,56 +667,6 @@ pub(crate) fn stream_result_plain(result: &serde_json::Value) -> String {
                 crate::terminal_safe_text(
                     message
                         .get("plaintext")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                )
-            )
-        }
-        Some("stream_preview") => {
-            let preview = result
-                .get("stream_preview")
-                .unwrap_or(&serde_json::Value::Null);
-            format!(
-                "stream preview {} [{}]: {}",
-                crate::terminal_safe_text(
-                    preview
-                        .get("stream_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("<latest>")
-                ),
-                crate::terminal_safe_text(
-                    preview
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown")
-                ),
-                crate::terminal_safe_text(
-                    preview
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                )
-            )
-        }
-        Some("agent_stream_delta") => {
-            let delta = result
-                .get("agent_stream_delta")
-                .unwrap_or(&serde_json::Value::Null);
-            format!(
-                "agent stream delta {} #{}: {}",
-                crate::terminal_safe_text(
-                    delta
-                        .get("stream_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("<unknown>")
-                ),
-                delta
-                    .get("seq")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default(),
-                crate::terminal_safe_text(
-                    delta
-                        .get("text")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("")
                 )

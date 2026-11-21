@@ -21,7 +21,6 @@ pub(crate) struct AppRuntimeHost {
     /// down.
     pub(crate) starting: Option<marmot_app::MarmotAppRuntime>,
     pub(crate) bridge: Option<JoinHandle<()>>,
-    pub(crate) stream_watch: StreamWatchWorkers,
     /// Holds a runtime start until the test releases it.
     #[cfg(test)]
     pub(crate) start_gate: Option<Arc<StartGate>>,
@@ -58,7 +57,6 @@ impl AppRuntimeHost {
         if let Some(handle) = self.bridge.take() {
             handle.abort();
         }
-        self.stream_watch.abort_all();
         self.runtime = None;
     }
 }
@@ -66,13 +64,11 @@ impl AppRuntimeHost {
 #[derive(Default)]
 pub(crate) struct DaemonWorkers {
     pub(crate) runtime: AppRuntimeHost,
-    pub(crate) stream_compose: StreamComposeWorkers,
 }
 
 impl DaemonWorkers {
     pub(crate) async fn abort_all(&mut self) {
         self.runtime.abort_all().await;
-        self.stream_compose.abort_all();
     }
 }
 
@@ -156,29 +152,6 @@ pub(crate) async fn handle_app_runtime_command_request(
         ));
     };
     dispatch_hosted_runtime_command(cli, defaults, &runtime).await
-}
-
-/// Host-based entry used by the stream-compose path (`run_hosted_stream_marker_cli_json`), which
-/// already holds the workers lock and owns a `&mut AppRuntimeHost`. Reconciles in place and
-/// dispatches against the host's runtime — no re-entrant lock (which would deadlock).
-pub(crate) async fn handle_hosted_runtime_command_with_host(
-    cli: &Cli,
-    defaults: &DaemonDefaults,
-    state: Arc<Mutex<DaemonState>>,
-    events: DaemonEventHub,
-    host: &mut AppRuntimeHost,
-) -> Option<CliOutput> {
-    if !app_runtime_enabled(defaults) || !is_hosted_runtime_command(cli) {
-        return None;
-    }
-    reconcile_app_runtime(defaults, state, events, host).await;
-    let Some(runtime) = &host.runtime else {
-        return Some(crate::command_output_result(
-            cli.json,
-            Err(crate::WnError::MissingRelay),
-        ));
-    };
-    dispatch_hosted_runtime_command(cli, defaults, runtime).await
 }
 
 /// Dispatch a hosted runtime command against an already-resolved runtime handle. Performs the
@@ -278,16 +251,6 @@ async fn dispatch_hosted_runtime_command(
             )
             .await
         }
-        crate::Command::Stream { command } => {
-            crate::commands::stream::stream_command_app_with_runtime(
-                &account_home,
-                &app,
-                runtime,
-                command,
-                cli.account.clone(),
-            )
-            .await
-        }
         crate::Command::Keys { command } => {
             crate::commands::key_package::key_package_command_with_runtime(
                 &account_home,
@@ -371,16 +334,6 @@ pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
         crate::Command::Message { command } | crate::Command::Messages { command } => {
             !matches!(command, crate::MessageCommand::Subscribe { .. })
         }
-        crate::Command::Stream { command } => matches!(
-            command,
-            crate::StreamCommand::Start { .. }
-                | crate::StreamCommand::Finish { .. }
-                | crate::StreamCommand::Watch { .. }
-                | crate::StreamCommand::Send {
-                    start_event_id: Some(_),
-                    ..
-                }
-        ),
         crate::Command::Keys { .. }
         | crate::Command::Follows { .. }
         | crate::Command::Profile { .. }
@@ -485,9 +438,9 @@ pub(crate) fn app_runtime_refresh_after_execute(cli: &Cli) -> AppRuntimeRefresh 
         crate::Command::Group { .. } | crate::Command::Groups { .. } => {
             AppRuntimeRefresh::CatchUpAll
         }
-        crate::Command::Message { .. }
-        | crate::Command::Messages { .. }
-        | crate::Command::Stream { .. } => AppRuntimeRefresh::CatchUpAll,
+        crate::Command::Message { .. } | crate::Command::Messages { .. } => {
+            AppRuntimeRefresh::CatchUpAll
+        }
         crate::Command::Sync => AppRuntimeRefresh::RestartSelected(cli.account.clone()),
         _ => AppRuntimeRefresh::None,
     }
@@ -602,12 +555,8 @@ pub(crate) async fn reconcile_app_runtime(
             return;
         }
         host.bridge = Some(spawn_app_runtime_bridge(
-            defaults.clone(),
             state.clone(),
             events.clone(),
-            host.stream_watch.clone(),
-            runtime.clone(),
-            runtime.shared_services().agent_streams(),
             receiver,
         ));
         host.runtime = Some(runtime);
@@ -623,15 +572,7 @@ pub(crate) async fn reconcile_app_runtime(
             .as_ref()
             .is_none_or(|handle| handle.is_finished())
         {
-            host.bridge = Some(spawn_app_runtime_bridge(
-                defaults.clone(),
-                state,
-                events,
-                host.stream_watch.clone(),
-                runtime.clone(),
-                runtime.shared_services().agent_streams(),
-                runtime.subscribe(),
-            ));
+            host.bridge = Some(spawn_app_runtime_bridge(state, events, runtime.subscribe()));
         }
     }
 }
@@ -655,28 +596,15 @@ pub(crate) fn open_app_runtime(
 }
 
 pub(crate) fn spawn_app_runtime_bridge(
-    defaults: DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
-    stream_workers: StreamWatchWorkers,
-    runtime: marmot_app::MarmotAppRuntime,
-    stream_manager: marmot_app::AgentStreamWatchManager,
     mut receiver: broadcast::Receiver<marmot_app::MarmotAppEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match receiver.recv().await {
                 Ok(event) => {
-                    handle_app_runtime_event(
-                        &defaults,
-                        state.clone(),
-                        events.clone(),
-                        stream_workers.clone(),
-                        runtime.clone(),
-                        stream_manager.clone(),
-                        event,
-                    )
-                    .await;
+                    handle_app_runtime_event(state.clone(), events.clone(), event);
                 }
                 Err(broadcast::error::RecvError::Lagged(count)) => {
                     record_runtime_activity_error(
@@ -690,13 +618,9 @@ pub(crate) fn spawn_app_runtime_bridge(
     })
 }
 
-pub(crate) async fn handle_app_runtime_event(
-    defaults: &DaemonDefaults,
+pub(crate) fn handle_app_runtime_event(
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
-    stream_workers: StreamWatchWorkers,
-    runtime: marmot_app::MarmotAppRuntime,
-    stream_manager: marmot_app::AgentStreamWatchManager,
     event: marmot_app::MarmotAppEvent,
 ) {
     let started_at = unix_now();
@@ -713,54 +637,23 @@ pub(crate) async fn handle_app_runtime_event(
         }
         marmot_app::MarmotAppEvent::GroupStateUpdated { .. } => {}
         marmot_app::MarmotAppEvent::ProjectionUpdated(_) => {}
-        marmot_app::MarmotAppEvent::MessageReceived(message) => {
-            // Raw message updates keep kind-1200 starts separate as
-            // `AgentStreamStarted`; materialized timeline subscriptions include
-            // those starts as timeline rows.
-            events.publish_message(message_stream_response(
-                runtime_message_json(
-                    &message.message,
-                    &message.account_id_hex,
-                    &message.account_label,
-                ),
-                "MessageReceived",
-            ));
-            let summary = marmot_app::SyncSummary {
-                messages: vec![message.message],
-                ..marmot_app::SyncSummary::default()
-            };
-            record_runtime_activity_report(
-                &state,
-                runtime_activity_report_from_summary(started_at, 1, &summary),
-            );
-        }
-        marmot_app::MarmotAppEvent::AgentStreamStarted(message) => {
-            events.publish_message(message_stream_response(
-                runtime_message_json(
-                    &message.message,
-                    &message.account_id_hex,
-                    &message.account_label,
-                ),
-                "AgentStreamStarted",
-            ));
-            let summary = marmot_app::SyncSummary {
-                messages: vec![message.message],
-                ..marmot_app::SyncSummary::default()
-            };
-            auto_watch_agent_stream_starts(
-                defaults,
-                &message.account_id_hex,
-                &summary,
-                stream_workers,
-                runtime,
-                stream_manager,
-            )
-            .await;
-            record_runtime_activity_report(
-                &state,
-                runtime_activity_report_from_summary(started_at, 1, &summary),
-            );
-        }
+        marmot_app::MarmotAppEvent::MessageReceived(message) => publish_received_message(
+            &state,
+            &events,
+            started_at,
+            &message.account_id_hex,
+            &message.account_label,
+            message.message,
+        ),
+        // Agent text streams have no CLI surface; a start is an ordinary message.
+        marmot_app::MarmotAppEvent::AgentStreamStarted(message) => publish_received_message(
+            &state,
+            &events,
+            started_at,
+            &message.account_id_hex,
+            &message.account_label,
+            message.message,
+        ),
         marmot_app::MarmotAppEvent::GroupEvent(group_event) => {
             let summary = marmot_app::SyncSummary {
                 events: vec![group_event.event],
@@ -821,82 +714,28 @@ pub(crate) async fn handle_app_runtime_event(
     }
 }
 
-pub(crate) async fn auto_watch_agent_stream_starts(
-    defaults: &DaemonDefaults,
-    account_id: &str,
-    summary: &marmot_app::SyncSummary,
-    stream_workers: StreamWatchWorkers,
-    runtime: marmot_app::MarmotAppRuntime,
-    stream_manager: marmot_app::AgentStreamWatchManager,
+/// Publish a received message to the daemon's message subscribers and record
+/// it as runtime activity.
+fn publish_received_message(
+    state: &Arc<Mutex<DaemonState>>,
+    events: &DaemonEventHub,
+    started_at: u64,
+    account_id_hex: &str,
+    account_label: &str,
+    message: marmot_app::ReceivedMessage,
 ) {
-    let secret_store = match crate::resolve_secret_store(defaults.secret_store) {
-        Ok(secret_store) => secret_store,
-        Err(_) => return,
+    events.publish_message(message_stream_response(
+        runtime_message_json(&message, account_id_hex, account_label),
+        "MessageReceived",
+    ));
+    let summary = marmot_app::SyncSummary {
+        messages: vec![message],
+        ..marmot_app::SyncSummary::default()
     };
-    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
-    let account_home =
-        match crate::open_account_home(&defaults.home, secret_store, &keychain_service) {
-            Ok(account_home) => account_home,
-            Err(_) => return,
-        };
-    let app = match crate::app_for(
-        defaults.home.clone(),
-        defaults.relay.clone(),
-        defaults.discovery_relays.clone(),
-        account_home.clone(),
-    ) {
-        Ok(app) => app,
-        Err(_) => return,
-    };
-    for message in &summary.messages {
-        let Some(start) = marmot_app::StreamStartView::from_event(message.kind, &message.tags)
-        else {
-            continue;
-        };
-        if start.route != "quic" {
-            continue;
-        }
-        let group_id = hex::encode(message.group_id.as_slice());
-        // Daemon auto-watch is triggered by sender-controlled stream-start
-        // candidates, so it must never select no-cert-verification trust or
-        // resolve to local/private endpoints. Local trust is only ever chosen
-        // via an explicit local user `--insecure-local`, never here.
-        let insecure_local = false;
-        let stream_id = start.stream_id_hex;
-        if stream_manager.watch_exists(Some(account_id), &group_id, Some(stream_id.as_str())) {
-            continue;
-        }
-
-        let cli = Cli {
-            home: Some(defaults.home.clone()),
-            socket: None,
-            relay: defaults.relay.clone(),
-            daemon_discovery_relays: defaults.discovery_relays.clone(),
-            daemon_default_account_relays: defaults.default_account_relays.clone(),
-            secret_store: defaults.secret_store,
-            keychain_service: defaults.keychain_service.clone(),
-            account: Some(account_id.to_owned()),
-            json: true,
-            command: crate::Command::Stream {
-                command: crate::StreamCommand::Watch {
-                    group: group_id,
-                    stream_id: Some(stream_id),
-                    server_cert_der_hex: None,
-                    insecure_local,
-                    background: false,
-                },
-            },
-        };
-        if let Ok((report, handle)) = spawn_stream_watch(
-            cli,
-            account_home.clone(),
-            app.clone(),
-            runtime.clone(),
-            stream_manager.clone(),
-        ) {
-            stream_workers.replace(report.watch_id, handle);
-        }
-    }
+    record_runtime_activity_report(
+        state,
+        runtime_activity_report_from_summary(started_at, 1, &summary),
+    );
 }
 
 pub(crate) fn empty_runtime_activity_report(started_at: u64) -> DaemonRuntimeActivityReport {

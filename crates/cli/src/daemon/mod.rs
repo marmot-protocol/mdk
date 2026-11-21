@@ -11,19 +11,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-#[cfg(test)]
-use agent_stream_compose::run_stream_compose_session;
-use agent_stream_compose::{
-    StreamComposeCommand, StreamComposeReport, run_stream_compose_session_candidates,
-    run_stream_compose_session_without_live,
-};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use transport_quic_broker::OpenBrokerTextPublisher;
 
 use cgka_traits::GroupId;
 use cgka_traits::app_event::{
@@ -39,21 +32,19 @@ mod lifecycle;
 mod protocol;
 mod responses;
 mod runtime_host;
-mod stream_workers;
 mod subscriptions;
 
 pub use lifecycle::{default_log_path, default_pid_path, default_socket_path};
 pub(crate) use protocol::send_execute;
 pub use protocol::{
-    DaemonClient, DaemonClientError, DaemonOutgoingStreamReport, DaemonRuntimeActivityReport,
-    DaemonStatus, DaemonStreamError, DaemonStreamResponse, DaemonStreamWatchReport,
+    DaemonClient, DaemonClientError, DaemonRuntimeActivityReport, DaemonStatus, DaemonStreamError,
+    DaemonStreamResponse,
 };
 
 pub(crate) use lifecycle::*;
 pub(crate) use protocol::*;
 pub(crate) use responses::*;
 pub(crate) use runtime_host::*;
-pub(crate) use stream_workers::*;
 pub(crate) use subscriptions::*;
 
 const DAEMON_EVENT_REPLAY_LIMIT: usize = 256;
@@ -253,9 +244,8 @@ async fn serve_daemon(
                         continue;
                     }
                 };
-                // Bound concurrent per-connection tasks like the connector and
-                // broker accept loops: beyond the cap the connection is closed
-                // instead of served.
+                // Bound concurrent per-connection tasks: beyond the cap the
+                // connection is closed instead of served.
                 let Ok(permit) = Arc::clone(&connection_limiter).try_acquire_owned() else {
                     // Return a protocol-level error that both one-shot and
                     // streaming clients can decode. Bound this tiny rejection
@@ -478,17 +468,6 @@ async fn handle_daemon_connection(
             };
             let _ = handle_notifications_subscription(&mut stream, runtime, *cli).await;
         }
-        DaemonRequest::StreamWatch { cli } => {
-            let _ = handle_stream_watch_connection(
-                cli,
-                &mut stream,
-                &defaults,
-                state,
-                events,
-                &workers,
-            )
-            .await;
-        }
         DaemonRequest::Execute { cli, import_nsec } => {
             let _ = handle_execute_connection(
                 cli,
@@ -554,45 +533,16 @@ async fn daemon_status_output(
     state: Arc<Mutex<DaemonState>>,
     workers: SharedDaemonWorkers,
 ) -> CliOutput {
-    let (runtime, stream_watch) = match workers.try_lock() {
-        Ok(workers_guard) => (
-            workers_guard.runtime.runtime.clone(),
-            workers_guard.runtime.stream_watch.clone(),
-        ),
-        Err(_) => (None, StreamWatchWorkers::default()),
+    let runtime = match workers.try_lock() {
+        Ok(workers_guard) => workers_guard.runtime.runtime.clone(),
+        Err(_) => None,
     };
-    let status = server_status(defaults, &state, runtime.as_ref(), &stream_watch).await;
+    let status = server_status(defaults, &state, runtime.as_ref()).await;
     CliOutput {
         code: 0,
         stdout: serde_json::to_string(&status).expect("daemon status serializes"),
         stderr: String::new(),
     }
-}
-
-async fn handle_stream_watch_connection(
-    mut cli: Box<Cli>,
-    stream: &mut UnixStream,
-    defaults: &DaemonDefaults,
-    state: Arc<Mutex<DaemonState>>,
-    events: DaemonEventHub,
-    workers: &SharedDaemonWorkers,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    apply_defaults(&mut cli, defaults);
-    // Hold the lock only for the host-mutating reconcile; clone the runtime handle and the
-    // (interior-mutable) stream-watch registry, then spawn the watch + open the broker
-    // connection off the lock (#633).
-    let (runtime, stream_watch) = {
-        let mut guard = workers.lock().await;
-        reconcile_app_runtime(defaults, state.clone(), events.clone(), &mut guard.runtime).await;
-        (
-            guard.runtime.runtime.clone(),
-            guard.runtime.stream_watch.clone(),
-        )
-    };
-    let output = start_stream_watch(*cli, defaults, runtime.as_ref(), &stream_watch).await;
-
-    write_daemon_output(stream, &output).await;
-    Ok(())
 }
 
 async fn handle_execute_connection(
@@ -608,38 +558,6 @@ async fn handle_execute_connection(
     if let Some(output) = blocked_daemon_execute_output(cli.as_ref()) {
         write_daemon_output(stream, &output).await;
         return Ok(());
-    }
-    // Stream-compose commands mutate the compose session map and the runtime host together, so
-    // that low-traffic QUIC-preview path keeps the lock for its (short) duration. Gate on the
-    // compose subcommands specifically: non-compose stream commands (start/finish/watch/send) are
-    // hosted-runtime commands and must not take the workers lock here, or they would block behind
-    // an unrelated busy workers mutex before falling through to the off-lock hosted path.
-    if matches!(
-        cli.command,
-        crate::Command::Stream {
-            command: crate::StreamCommand::ComposeOpen { .. }
-                | crate::StreamCommand::ComposeAppend { .. }
-                | crate::StreamCommand::ComposeFinish { .. }
-                | crate::StreamCommand::ComposeCancel { .. },
-        }
-    ) {
-        let compose_output = {
-            let mut guard = workers.lock().await;
-            let guard = &mut *guard;
-            handle_stream_compose_request(
-                &cli,
-                defaults,
-                state.clone(),
-                events.clone(),
-                &mut guard.runtime,
-                &mut guard.stream_compose,
-            )
-            .await
-        };
-        if let Some(output) = compose_output {
-            write_daemon_output(stream, &output).await;
-            return Ok(());
-        }
     }
     let refresh = app_runtime_refresh_after_execute(&cli);
     if let Some(output) = handle_app_runtime_account_setup_request(

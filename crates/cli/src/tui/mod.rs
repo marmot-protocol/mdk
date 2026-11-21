@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command as StdCommand, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -43,13 +43,11 @@ const UI_EVENT_WAIT: Duration = Duration::from_millis(50);
 /// the user settles on instead of one load per row. Each move resets the count;
 /// the tick loop counts it down (no separate timer).
 const FLICK_PREVIEW_DEBOUNCE_TICKS: u32 = 3;
-const STREAM_APPEND_FLUSH_INTERVAL: Duration = Duration::from_millis(125);
 /// Chrome accent: focused borders, labels, prompts, and selected markers. Cyan
 /// in the color-role split — green is reserved strictly for self (own messages)
 /// and the daemon-connection dot.
 const FOCUS_ACCENT: Color = Color::Cyan;
 const ACCOUNT_ACCENT: Color = Color::White;
-const DEFAULT_STREAM_CANDIDATE: &str = crate::DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE;
 const SLASH_SUGGESTION_LIMIT: usize = 8;
 const TUI_MESSAGE_SCROLLBACK_LIMIT: usize = 1_000;
 /// Materialized-timeline page size for the snapshot load and each history page.
@@ -85,12 +83,10 @@ const MEDIA_MAX_IN_FLIGHT: usize = 3;
 /// inline retention needs re-download support (status un-tracking plus
 /// re-entrant downloads) and is a deliberate follow-up, not this change.
 const MEDIA_VIEWER_RETAINED_IMAGES: usize = 4;
-const TUI_LIVE_STREAM_PREVIEW_LIMIT: usize = 128;
 /// Cap on the notification-key dedup set. Dedup only needs to cover the recent
 /// event window (the runtime feed emits duplicates close together), so the set
 /// ages out the oldest keys past this bound instead of growing per-session.
 const TUI_SEEN_NOTIFICATION_KEYS_LIMIT: usize = 512;
-const TUI_LIVE_STREAM_TEXT_LIMIT: usize = 64 * 1024;
 /// Max chars of the chat-list last-message preview line before trailing-ellipsis
 /// truncation. The List widget clips overflow too; this keeps a stored preview
 /// tidy and bounded independent of the panel width.

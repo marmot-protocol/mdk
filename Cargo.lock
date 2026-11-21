@@ -7813,7 +7813,6 @@ dependencies = [
 name = "wn-cli"
 version = "0.19.0-dev"
 dependencies = [
- "agent-stream-compose",
  "cgka-traits",
  "chrono",
  "clap",
@@ -7834,8 +7833,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "transport-quic-broker",
- "transport-quic-stream",
  "unicode-properties",
  "unicode-segmentation",
  "url",

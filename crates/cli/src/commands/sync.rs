@@ -4,8 +4,8 @@ use marmot_app::{MarmotApp, ReceivedMessage, SyncFailure, SyncSummary};
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, WnError, agent_text_stream_payload_value, display_name_for_sender,
-    error::SyncCommandError, npub_for_account_id, terminal_safe_text,
+    CommandOutput, WnError, display_name_for_sender, error::SyncCommandError, npub_for_account_id,
+    terminal_safe_text,
 };
 
 pub(crate) async fn sync_command(
@@ -108,13 +108,11 @@ fn sync_messages_json(app: &MarmotApp, messages: Vec<ReceivedMessage>) -> Vec<Va
     messages
         .into_iter()
         .map(|message| {
-            let agent_text_stream =
-                agent_text_stream_payload_value(message.kind, &message.tags, &message.plaintext);
             let from_display_name = message
                 .sender_display_name
                 .clone()
                 .or_else(|| display_name_for_sender(app, &message.sender));
-            let mut value = json!({
+            json!({
                 "message_id": message.message_id_hex,
                 "direction": "received",
                 "from": message.sender,
@@ -123,11 +121,7 @@ fn sync_messages_json(app: &MarmotApp, messages: Vec<ReceivedMessage>) -> Vec<Va
                 "plaintext": message.plaintext,
                 "kind": message.kind,
                 "tags": message.tags,
-            });
-            if let Some(agent_text_stream) = agent_text_stream {
-                value["agent_text_stream"] = agent_text_stream;
-            }
-            value
+            })
         })
         .collect()
 }

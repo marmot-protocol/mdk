@@ -9,6 +9,17 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Removed
+
+- The retired agent text streams over QUIC (live agent text previews) are gone from `wn`, `wnd` and `wn tui`. This is
+  a breaking change: `wn stream` and all its subcommands (`start`, `watch`, `send`, `receive`, `finish`, `verify` and
+  `compose-open|append|finish|cancel`) no longer exist, and the TUI drops the `/stream` commands and the streaming
+  composer. `wnd` no longer watches stream starts on its own, so it no longer connects to QUIC hosts named in a
+  received message. `messages subscribe` no longer emits `agent_stream_start`, `agent_stream_final`,
+  `agent_stream_delta` or `stream_preview` updates; message, group and timeline JSON drop the `agent_text_stream`
+  field; `wn daemon status` JSON drops `stream_watches`; and the QUIC, broker and stream-compose JSON error codes are
+  gone.
+
 ## [0.18.0] - 2026-11-20
 
 ### Changed

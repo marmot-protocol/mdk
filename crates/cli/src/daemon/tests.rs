@@ -1,12 +1,8 @@
 use super::*;
 use cgka_traits::GroupId;
-use cgka_traits::MessageId;
-use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
-};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn daemon_stream_response_write_times_out_when_flush_stalls() {
@@ -528,110 +524,6 @@ fn apply_defaults_adds_daemon_account_relays_to_account_create() {
     assert_eq!(bootstrap_relays, vec!["wss://discovery.example"]);
 }
 
-fn test_stream_compose_open(
-    stream_id: Vec<u8>,
-    start_event_id: MessageId,
-) -> OpenBrokerTextPublisher {
-    OpenBrokerTextPublisher {
-        broker_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9),
-        server_name: "localhost".to_owned(),
-        trust: transport_quic_broker::BrokerServerTrust::InsecureLocal,
-        stream_id,
-        start_event_id,
-        crypto: None,
-        max_plaintext_frame_len: None,
-    }
-}
-
-fn test_stream_compose_report(stream_id: &[u8]) -> DaemonOutgoingStreamReport {
-    DaemonOutgoingStreamReport {
-        account: Some("account".to_owned()),
-        group_id: hex::encode([0x11; 32]),
-        stream_id: hex::encode(stream_id),
-        start_message_id: hex::encode([0x22; 32]),
-        candidate: "quic://127.0.0.1:9".to_owned(),
-        status: "streaming".to_owned(),
-        text: String::new(),
-        transcript_hash: None,
-        chunk_count: 0,
-        error: None,
-    }
-}
-
-fn expected_stream_transcript_hash_for_appends(
-    stream_id: &[u8],
-    start_event_id: &MessageId,
-    appends: &[&str],
-    chunk_bytes: usize,
-) -> String {
-    let mut transcript =
-        AgentTextStreamTranscriptV1::new(stream_id.to_vec(), start_event_id.clone());
-    let mut seq = 1_u64;
-    for text in appends {
-        for chunk in transport_quic_stream::split_text_deltas(text, chunk_bytes) {
-            transcript.append(seq, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, &chunk);
-            seq += 1;
-        }
-    }
-    hex::encode(transcript.hash())
-}
-
-#[tokio::test]
-async fn stream_compose_final_report_contains_full_transcript_text() {
-    let stream_id = vec![0xcc; 32];
-    let start_event_id = MessageId::new(vec![0xdd; 32]);
-    let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
-    let report = test_stream_compose_report(&stream_id);
-    let (tx, rx) = mpsc::channel(4);
-    let (_cancel_tx, cancel_rx) = mpsc::channel(1);
-    let session = tokio::spawn(run_stream_compose_session(open, 5, rx, cancel_rx, report));
-
-    for text in ["hello ", "world"] {
-        let (respond, response) = oneshot::channel();
-        tx.send(StreamComposeCommand::Append {
-            text: text.to_owned(),
-            respond,
-        })
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_millis(250), response)
-            .await
-            .expect("append should complete")
-            .unwrap()
-            .unwrap();
-    }
-
-    let (respond, response) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish {
-        expected: None,
-        respond,
-    })
-    .await
-    .unwrap();
-    let finished = tokio::time::timeout(Duration::from_millis(250), response)
-        .await
-        .expect("finish should complete")
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(finished.text, "hello world");
-    assert_eq!(finished.chunk_count, 3);
-    assert_eq!(
-        finished.transcript_hash.as_deref(),
-        Some(
-            expected_stream_transcript_hash_for_appends(
-                &stream_id,
-                &start_event_id,
-                &["hello ", "world"],
-                5,
-            )
-            .as_str()
-        )
-    );
-
-    session.await.unwrap();
-}
-
 #[test]
 fn destructive_execute_commands_are_refused_over_daemon() {
     let reset =
@@ -652,60 +544,6 @@ fn destructive_execute_commands_are_refused_over_daemon() {
     assert_eq!(logout.code, 1);
     assert_eq!(logout_json["error"]["code"], "daemon_forbidden");
     assert_eq!(logout_json["error"]["command"], "logout");
-}
-
-#[test]
-fn long_running_stream_execute_commands_are_refused_over_daemon() {
-    let receive = blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Stream {
-        command: crate::StreamCommand::Receive {
-            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4450),
-            start_event_id: None,
-        },
-    }))
-    .expect("stream receive should be blocked");
-    let receive_json: serde_json::Value =
-        serde_json::from_str(receive.stdout.trim()).expect("receive error JSON");
-    assert_eq!(receive.code, 1);
-    assert_eq!(receive_json["error"]["code"], "daemon_forbidden");
-    assert_eq!(receive_json["error"]["command"], "stream receive");
-
-    let unanchored_send = blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Stream {
-        command: crate::StreamCommand::Send {
-            broker: false,
-            connect: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4450),
-            server_name: "localhost".to_owned(),
-            server_cert_der_hex: None,
-            insecure_local: true,
-            stream_id: None,
-            start_event_id: None,
-            chunk_bytes: 1024,
-            chunk_delay_ms: 0,
-            text: vec!["hello".to_owned()],
-        },
-    }))
-    .expect("unanchored stream send should be blocked");
-    let unanchored_send_json: serde_json::Value =
-        serde_json::from_str(unanchored_send.stdout.trim()).expect("send error JSON");
-    assert_eq!(unanchored_send.code, 1);
-    assert_eq!(unanchored_send_json["error"]["code"], "daemon_forbidden");
-    assert_eq!(unanchored_send_json["error"]["command"], "stream send");
-
-    let foreground_watch =
-        blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Stream {
-            command: crate::StreamCommand::Watch {
-                group: "aa".repeat(32),
-                stream_id: None,
-                server_cert_der_hex: None,
-                insecure_local: true,
-                background: false,
-            },
-        }))
-        .expect("foreground stream watch should be blocked");
-    let foreground_watch_json: serde_json::Value =
-        serde_json::from_str(foreground_watch.stdout.trim()).expect("watch error JSON");
-    assert_eq!(foreground_watch.code, 1);
-    assert_eq!(foreground_watch_json["error"]["code"], "daemon_forbidden");
-    assert_eq!(foreground_watch_json["error"]["command"], "stream watch");
 }
 
 #[tokio::test]
@@ -1241,241 +1079,6 @@ fn runtime_message_json_marks_account_id_sender_as_me() {
     assert_eq!(value["from_display_name"], serde_json::Value::Null);
 }
 
-#[tokio::test]
-async fn stream_watch_workers_reap_finished_handles_on_replace() {
-    let workers = StreamWatchWorkers::default();
-    let mut finished = tokio::spawn(async {});
-    (&mut finished).await.expect("finished task completes");
-    workers.replace("finished".to_owned(), finished);
-
-    workers.replace("running".to_owned(), tokio::spawn(std::future::pending()));
-
-    let handles = workers.handles.lock().expect("worker lock");
-    assert!(!handles.contains_key("finished"));
-    assert!(handles.contains_key("running"));
-    handles["running"].abort();
-}
-
-fn stub_compose_session(stream_id: &str) -> StreamComposeSession {
-    let report = StreamComposeReport {
-        account: None,
-        group_id: "abcd".to_owned(),
-        stream_id: stream_id.to_owned(),
-        start_message_id: "ef01".to_owned(),
-        candidate: "quic://127.0.0.1:9000".to_owned(),
-        status: "streaming".to_owned(),
-        text: "hello transcript".to_owned(),
-        transcript_hash: Some("aa".to_owned()),
-        chunk_count: 1,
-        error: None,
-    };
-    stub_compose_session_with_report(report)
-}
-
-fn stub_compose_session_with_report(report: StreamComposeReport) -> StreamComposeSession {
-    let (tx, mut rx) = mpsc::channel::<StreamComposeCommand>(4);
-    let (cancel_tx, _cancel_rx) = mpsc::channel::<()>(1);
-    let handle = tokio::spawn(async move {
-        // Minimal stand-in for the compose worker: answer a single Finish with a
-        // completed report, then exit like the real session does.
-        while let Some(command) = rx.recv().await {
-            if let StreamComposeCommand::Finish { respond, .. } = command {
-                let _ = respond.send(Ok(report.clone()));
-                return;
-            }
-        }
-    });
-    StreamComposeSession {
-        tx,
-        cancel_tx,
-        handle,
-        finalized: None,
-    }
-}
-
-#[tokio::test]
-async fn finish_stream_compose_removes_session_for_invalid_terminal_report() {
-    let defaults = DaemonDefaults {
-        home: PathBuf::from("/tmp/wn-daemon-home"),
-        socket: PathBuf::from("/tmp/wn-daemon.sock"),
-        pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
-        log_path: PathBuf::from("/tmp/wn-daemon.log"),
-        relay: None,
-        discovery_relays: Vec::new(),
-        default_account_relays: Vec::new(),
-        secret_store: None,
-        keychain_service: None,
-    };
-    let cli = daemon_test_cli(crate::Command::Sync);
-
-    for (stream_id, text, transcript_hash) in [
-        (
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "",
-            Some("aa".to_owned()),
-        ),
-        (
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "hello",
-            None,
-        ),
-    ] {
-        let state = Arc::new(Mutex::new(DaemonState {
-            pid: 0,
-            started_at: 0,
-            starting: false,
-            last_runtime_activity: None,
-        }));
-        let mut runtime_host = AppRuntimeHost::default();
-        let mut workers = StreamComposeWorkers::default();
-        let key = stream_compose_key(None, stream_id);
-        let report = StreamComposeReport {
-            account: None,
-            group_id: "abcd".to_owned(),
-            stream_id: stream_id.to_owned(),
-            start_message_id: "ef01".to_owned(),
-            candidate: "quic://127.0.0.1:9000".to_owned(),
-            status: "streaming".to_owned(),
-            text: text.to_owned(),
-            transcript_hash,
-            chunk_count: 1,
-            error: None,
-        };
-        workers.insert(key.clone(), stub_compose_session_with_report(report));
-
-        let output = finish_stream_compose(
-            &cli,
-            &defaults,
-            state,
-            DaemonEventHub::new(),
-            &mut runtime_host,
-            &mut workers,
-            stream_id,
-        )
-        .await;
-
-        assert_ne!(output.code, 0);
-        assert!(
-            workers.get(&key).is_none(),
-            "a consumed compose task with an invalid report must be removed"
-        );
-    }
-}
-
-#[tokio::test]
-async fn finish_stream_compose_keeps_session_when_marker_publish_fails() {
-    // Canonical 32-byte (64 hex char) stream id so the test always reaches the
-    // marker-publish-failure branch and never short-circuits on stream-id
-    // normalization (which would otherwise let it pass for the wrong reason).
-    let stream_id = "abababababababababababababababababababababababababababababababab";
-    // `relay: None` disables the hosted runtime, so the finish-marker command
-    // returns an error without any live runtime — the deterministic stand-in for
-    // a marker publish failure.
-    let defaults = DaemonDefaults {
-        home: PathBuf::from("/tmp/wn-daemon-home"),
-        socket: PathBuf::from("/tmp/wn-daemon.sock"),
-        pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
-        log_path: PathBuf::from("/tmp/wn-daemon.log"),
-        relay: None,
-        discovery_relays: Vec::new(),
-        default_account_relays: Vec::new(),
-        secret_store: None,
-        keychain_service: None,
-    };
-    let state = Arc::new(Mutex::new(DaemonState {
-        pid: 0,
-        started_at: 0,
-        starting: false,
-        last_runtime_activity: None,
-    }));
-    let events = DaemonEventHub::new();
-    let mut runtime_host = AppRuntimeHost::default();
-    let mut workers = StreamComposeWorkers::default();
-    let key = stream_compose_key(None, stream_id);
-    workers.insert(key.clone(), stub_compose_session(stream_id));
-
-    let cli = daemon_test_cli(crate::Command::Sync);
-    let output = finish_stream_compose(
-        &cli,
-        &defaults,
-        state.clone(),
-        events.clone(),
-        &mut runtime_host,
-        &mut workers,
-        stream_id,
-    )
-    .await;
-
-    let expected_error = serde_json::json!({
-        "ok": false,
-        "error": {
-            "code": "stream_compose_failed",
-            "message": "stream marker command did not use the daemon runtime",
-        },
-    });
-    assert_eq!(output.code, 1);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(output.stdout.trim()).unwrap(),
-        expected_error
-    );
-    assert!(output.stderr.is_empty());
-    assert!(
-        workers.get(&key).is_some(),
-        "the compose session must be retained so the transcript stays retryable"
-    );
-    // The final report must be frozen on the session so a retry no longer needs
-    // the compose task (which exits after answering `Finish`).
-    let expected_report = serde_json::json!({
-        "account": null,
-        "group_id": "abcd",
-        "stream_id": stream_id,
-        "start_message_id": "ef01",
-        "candidate": "quic://127.0.0.1:9000",
-        "status": "streaming",
-        "text": "hello transcript",
-        "transcript_hash": "aa",
-        "chunk_count": 1,
-        "error": null,
-    });
-    let finalized = workers
-        .get(&key)
-        .and_then(|session| session.finalized.as_ref())
-        .expect("the finalized report must be retained for a marker retry");
-    assert_eq!(serde_json::to_value(finalized).unwrap(), expected_report);
-
-    // Retry `stream finish`: the compose task has exited, so the previous code
-    // would send `Finish` to a closed channel and fail with
-    // "stream compose session is closed". With the frozen report, the retry
-    // re-runs the marker publish directly — it still fails here (no runtime),
-    // but with the marker error, proving the dead compose task was not touched.
-    let retry = finish_stream_compose(
-        &cli,
-        &defaults,
-        state,
-        events,
-        &mut runtime_host,
-        &mut workers,
-        stream_id,
-    )
-    .await;
-    assert_eq!(retry.code, 1);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(retry.stdout.trim()).unwrap(),
-        expected_error,
-        "the retry must use the frozen report, not the exited compose task"
-    );
-    assert!(retry.stderr.is_empty());
-    assert!(
-        workers.get(&key).is_some(),
-        "a failed marker retry must keep the session for a further retry"
-    );
-    let finalized = workers
-        .get(&key)
-        .and_then(|session| session.finalized.as_ref())
-        .expect("a marker retry must keep the complete frozen report");
-    assert_eq!(serde_json::to_value(finalized).unwrap(), expected_report);
-}
-
 #[test]
 fn runtime_message_json_carries_named_peer_display_name() {
     let message = marmot_app::ReceivedMessage {
@@ -1626,18 +1229,13 @@ fn message_subscription_filters_group_events_by_account() {
 #[test]
 fn message_subscription_seen_message_ids_are_bounded_to_recent_ids() {
     let mut seen_messages = BoundedMessageSubscriptionIds::with_limit(3);
-    let mut seen_stream_previews = BoundedMessageSubscriptionIds::with_limit(3);
 
     for index in 0..5 {
         let response = DaemonStreamResponse::ok(serde_json::json!({
             "type": "message",
             "message": { "message_id": format!("message-{index}") }
         }));
-        assert!(mark_stream_response_seen(
-            &response,
-            &mut seen_messages,
-            &mut seen_stream_previews
-        ));
+        assert!(mark_stream_response_seen(&response, &mut seen_messages));
     }
 
     assert_eq!(seen_messages.len(), 3);
@@ -1650,39 +1248,7 @@ fn message_subscription_seen_message_ids_are_bounded_to_recent_ids() {
         "type": "message",
         "message": { "message_id": "message-2" }
     }));
-    assert!(!mark_stream_response_seen(
-        &duplicate,
-        &mut seen_messages,
-        &mut seen_stream_previews
-    ));
-}
-
-#[test]
-fn message_subscription_seen_stream_previews_are_bounded_to_recent_ids() {
-    let mut seen_messages = BoundedMessageSubscriptionIds::with_limit(3);
-    let mut seen_stream_previews = BoundedMessageSubscriptionIds::with_limit(3);
-
-    for index in 0..5 {
-        let response = DaemonStreamResponse::ok(serde_json::json!({
-            "type": "stream_preview",
-            "stream_preview": {
-                "watch_id": format!("watch-{index}"),
-                "status": "running",
-                "text": format!("chunk-{index}")
-            }
-        }));
-        assert!(mark_stream_response_seen(
-            &response,
-            &mut seen_messages,
-            &mut seen_stream_previews
-        ));
-    }
-
-    assert_eq!(seen_stream_previews.len(), 3);
-    assert!(!seen_stream_previews.contains("watch-0:running:chunk-0::"));
-    assert!(!seen_stream_previews.contains("watch-1:running:chunk-1::"));
-    assert!(seen_stream_previews.contains("watch-2:running:chunk-2::"));
-    assert!(seen_stream_previews.contains("watch-4:running:chunk-4::"));
+    assert!(!mark_stream_response_seen(&duplicate, &mut seen_messages));
 }
 
 #[test]
@@ -1752,12 +1318,13 @@ fn message_subscription_kind_filter_applies_to_hub_broadcasts() {
     assert!(stream_response_matches_kinds(&custom, Some(&kinds)));
     assert!(!stream_response_matches_kinds(&chat, Some(&kinds)));
     assert!(stream_response_matches_kinds(&chat, None));
-    // Payloads with no app-event kind (stream previews, control rows) pass.
-    let preview = DaemonStreamResponse::ok(serde_json::json!({
-        "type": "stream_preview",
-        "stream_preview": { "group_id": "x", "stream_id": "y", "status": "running", "text": "hi" }
+    // Payloads with no app-event kind (control rows) pass.
+    let ready = DaemonStreamResponse::ok(serde_json::json!({
+        "trigger": "SubscriptionReady",
+        "type": "subscription_ready",
+        "group_id": null
     }));
-    assert!(stream_response_matches_kinds(&preview, Some(&kinds)));
+    assert!(stream_response_matches_kinds(&ready, Some(&kinds)));
 }
 
 async fn read_subscription_frames(mut client: UnixStream) -> Vec<serde_json::Value> {
@@ -1805,32 +1372,6 @@ async fn message_subscription_writer_filters_before_dedup_and_emits_exact_frames
     let wrong_account = message(OTHER_ACCOUNT, "aa", "01", 9);
     let wrong_group = message(ACCOUNT, "bb", "01", 9);
     let wrong_kind = message(ACCOUNT, "aa", "01", 30078);
-    let preview = agent_stream_update_response(
-        marmot_app::AgentStreamUpdate::WatchUpdated(marmot_app::AgentStreamWatchReport {
-            watch_id: "watch".to_owned(),
-            account: Some(ACCOUNT.to_owned()),
-            group_id: "aa".to_owned(),
-            stream_id: Some("cc".repeat(32)),
-            started_at: 1,
-            finished_at: None,
-            status: "running".to_owned(),
-            text: Some("hello".to_owned()),
-            transcript_hash: None,
-            chunk_count: Some(1),
-            error: None,
-            result: None,
-        }),
-        false,
-    );
-    let delta = agent_stream_delta_response(crate::AgentStreamDelta {
-        account: Some(ACCOUNT.to_owned()),
-        group_id: "aa".to_owned(),
-        stream_id: "cc".repeat(32),
-        seq: 1,
-        record_type: AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
-        flags: 0,
-        text: "delta".to_owned(),
-    });
     for (name, group, kinds, inputs, expected) in [
         (
             "account",
@@ -1874,24 +1415,9 @@ async fn message_subscription_writer_filters_before_dedup_and_emits_exact_frames
             vec![matching.clone(), matching.clone()],
             vec![matching],
         ),
-        (
-            "preview dedup without kind",
-            Some("aa"),
-            Some(vec![9]),
-            vec![preview.clone(), preview.clone()],
-            vec![preview],
-        ),
-        (
-            "delta without dedup",
-            Some("aa"),
-            Some(vec![9]),
-            vec![delta.clone(), delta.clone()],
-            vec![delta.clone(), delta],
-        ),
     ] {
         let (mut server, client) = UnixStream::pair().expect("unix stream pair");
         let mut seen_messages = BoundedMessageSubscriptionIds::with_limit(3);
-        let mut seen_previews = BoundedMessageSubscriptionIds::with_limit(3);
         let marker = message(ACCOUNT, "aa", "02", 9);
         for response in inputs.into_iter().chain([marker.clone()]) {
             assert!(
@@ -1902,7 +1428,6 @@ async fn message_subscription_writer_filters_before_dedup_and_emits_exact_frames
                     kinds.as_deref(),
                     ACCOUNT,
                     &mut seen_messages,
-                    &mut seen_previews,
                 )
                 .await,
                 "{name}: filtering must keep the connection usable"
@@ -2228,32 +1753,6 @@ fn stream_plain_output_sanitizes_hostile_remote_fields() {
         "reaction group=aa from=bob: +]52;c;YXR0YWNr"
     );
 
-    let preview = serde_json::json!({
-        "type": "stream_preview",
-        "stream_preview": {
-            "stream_id": "s\u{1b}1",
-            "status": "run\u{7}ning",
-            "text": "part\u{9b}ial"
-        }
-    });
-    assert_eq!(
-        stream_result_plain(&preview),
-        "stream preview s1 [running]: partial"
-    );
-
-    let delta = serde_json::json!({
-        "type": "agent_stream_delta",
-        "agent_stream_delta": {
-            "stream_id": "s1",
-            "seq": 3,
-            "text": "chunk\u{202e}text"
-        }
-    });
-    assert_eq!(
-        stream_result_plain(&delta),
-        "agent stream delta s1 #3: chunktext"
-    );
-
     let page = serde_json::json!({
         "type": "initial_timeline_page",
         "has_more_before": true,
@@ -2329,62 +1828,6 @@ fn stream_plain_output_sanitizes_hostile_remote_fields() {
         message: "boom\u{1b}[2J".to_owned(),
     };
     assert_eq!(crate::terminal_safe_text(&error.message), "boom[2J");
-}
-
-#[test]
-fn message_subscription_filters_stream_updates_fail_closed_without_account() {
-    let scoped_delta = DaemonStreamResponse::ok(serde_json::json!({
-        "type": "agent_stream_delta",
-        "agent_stream_delta": {
-            "account": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "group_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            "stream_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-            "text": "hello"
-        }
-    }));
-    let accountless_preview = DaemonStreamResponse::ok(serde_json::json!({
-        "type": "stream_preview",
-        "stream_preview": {
-            "group_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            "stream_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-            "status": "running",
-            "text": "hello"
-        }
-    }));
-
-    assert!(!stream_response_matches_subscription(
-        &scoped_delta,
-        Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    ));
-    assert!(stream_response_matches_subscription(
-        &scoped_delta,
-        Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    ));
-    assert!(!stream_response_matches_subscription(
-        &accountless_preview,
-        Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    ));
-}
-
-#[test]
-fn background_stream_watch_requires_account_scope() {
-    let cli = daemon_test_cli(crate::Command::Stream {
-        command: crate::StreamCommand::Watch {
-            group: "aa".repeat(32),
-            stream_id: None,
-            server_cert_der_hex: None,
-            insecure_local: true,
-            background: true,
-        },
-    });
-
-    assert_eq!(
-        new_stream_watch_start(&cli).unwrap_err(),
-        "background stream watch requires --account"
-    );
 }
 
 fn gated_daemon(home: &Path) -> (DaemonDefaults, Arc<StartGate>) {
@@ -2849,7 +2292,6 @@ fn fake_starting_daemon_status(
                 log: None,
                 last_runtime_activity: None,
                 relay_health: None,
-                stream_watches: Vec::new(),
                 device_groups: false,
             };
             starting = starting.saturating_sub(1);

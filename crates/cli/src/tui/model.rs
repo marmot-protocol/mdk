@@ -428,7 +428,6 @@ pub(crate) struct DaemonView {
     pub(crate) starting: bool,
     pub(crate) pid: Option<u64>,
     pub(crate) last_runtime_activity: Option<DaemonRuntimeActivityView>,
-    pub(crate) stream_watches: Vec<DaemonStreamWatchView>,
     /// The daemon runs with device groups on (`WN_DEVICE_GROUPS`).
     pub(crate) device_groups: bool,
 }
@@ -440,29 +439,6 @@ pub(crate) struct DaemonRuntimeActivityView {
     pub(crate) joined_groups: u64,
     pub(crate) messages: u64,
     pub(crate) errors: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DaemonStreamWatchView {
-    pub(crate) watch_id: String,
-    pub(crate) group_id: String,
-    pub(crate) stream_id: Option<String>,
-    pub(crate) status: String,
-    pub(crate) text: Option<String>,
-    pub(crate) transcript_hash: Option<String>,
-    pub(crate) chunk_count: Option<u64>,
-    pub(crate) error: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LiveStreamPreview {
-    pub(crate) group_id: String,
-    pub(crate) stream_id: String,
-    pub(crate) author: String,
-    pub(crate) status: String,
-    pub(crate) text: String,
-    pub(crate) error: Option<String>,
-    pub(crate) optimistic: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -485,19 +461,6 @@ pub(crate) enum SubscriptionEvent {
     Result(Value),
     Error(String),
     Ended,
-}
-
-pub(crate) struct MessageSubscription {
-    pub(crate) account_id: String,
-    pub(crate) child: Child,
-    pub(crate) rx: Receiver<SubscriptionEvent>,
-}
-
-impl Drop for MessageSubscription {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 pub(crate) struct ChatSubscription {
@@ -2575,30 +2538,6 @@ pub(crate) enum SlashCommand {
     MessageSearch {
         query: Option<String>,
     },
-    StreamCompose {
-        stream_id: Option<String>,
-        quic_candidates: Vec<String>,
-    },
-    StreamStart {
-        stream_id: Option<String>,
-        quic_candidates: Vec<String>,
-    },
-    StreamWatch {
-        stream_id: Option<String>,
-        insecure_local: bool,
-    },
-    StreamStatus,
-    StreamFinish {
-        stream_id: String,
-        transcript_hash: String,
-        chunk_count: u64,
-        text: String,
-    },
-    StreamVerify {
-        stream_id: String,
-        transcript_hash: String,
-        chunk_count: Option<u64>,
-    },
     Quit,
 }
 
@@ -2742,46 +2681,10 @@ pub(crate) const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
         description: "publish a profile display name",
     },
     SlashCommandSuggestion {
-        usage: "/stream [--stream-id <id>] [--quic-candidate <url>]",
-        description: "open the streaming composer",
-    },
-    SlashCommandSuggestion {
-        usage: "/stream start <quic-candidate> [...]",
-        description: "anchor an agent stream start",
-    },
-    SlashCommandSuggestion {
-        usage: "/stream watch [stream-id] [--insecure-local]",
-        description: "watch brokered stream previews",
-    },
-    SlashCommandSuggestion {
-        usage: "/stream status",
-        description: "show daemon stream-watch state",
-    },
-    SlashCommandSuggestion {
-        usage: "/stream finish <stream-id> <transcript-hash> <chunk-count> <text>",
-        description: "anchor an agent stream final",
-    },
-    SlashCommandSuggestion {
-        usage: "/stream verify <stream-id> <transcript-hash> [chunk-count]",
-        description: "verify a stream transcript",
-    },
-    SlashCommandSuggestion {
         usage: "/quit",
         description: "exit the TUI",
     },
 ];
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StreamComposer {
-    pub(crate) stream_id: String,
-    pub(crate) group_id: String,
-    pub(crate) pending_text: String,
-    pub(crate) last_flush: Instant,
-    /// Total bytes flushed to the compose session so far. Tracked locally
-    /// because the per-append ack no longer echoes the accumulated
-    /// transcript back.
-    pub(crate) flushed_bytes: usize,
-}
 
 pub(crate) fn subscription_event_from_json(envelope: Value) -> SubscriptionEvent {
     if envelope.get("stream_end").and_then(Value::as_bool) == Some(true) {
@@ -2947,31 +2850,6 @@ pub(crate) fn group_system_summary(value: &Value, plaintext: &str) -> Option<Str
     Some(summary)
 }
 
-pub(crate) fn agent_text_stream_summary(value: &Value) -> Option<String> {
-    let stream_id = value_string(value, "stream_id")
-        .map(|stream_id| shorten(&stream_id, 18))
-        .unwrap_or_else(|| "unknown".to_owned());
-    match value.get("kind").and_then(Value::as_str)? {
-        "start" => {
-            let route = value_string(value, "route").unwrap_or_else(|| "unknown".to_owned());
-            let candidates = value
-                .get("quic_candidates")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            Some(format!(
-                "stream start {stream_id} route={route} candidates={candidates}"
-            ))
-        }
-        "final" => {
-            let text = value_string(value, "final_text_or_reference")
-                .filter(|text| !text.is_empty())
-                .unwrap_or_else(|| format!("stream final {stream_id}"));
-            Some(text)
-        }
-        _ => None,
-    }
-}
-
 /// Phase 1 `wn tui` timeline core: row parsing, the idempotent projection fold,
 /// the message-offset scroll model, and rendering (per-row heights, the
 /// visibility walk, and line building). Consumed by the timeline
@@ -2991,7 +2869,7 @@ mod timeline {
     /// A row of the materialized message timeline (`messages timeline`), as folded by
     /// the runtime: reactions, reply preview, deletion tombstones, and structured
     /// media are already resolved server-side. This is the messages-pane row for
-    /// Phase 1; the plain feed now carries only live stream previews and unread counts.
+    /// Phase 1.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) struct TimelineRow {
         pub(crate) message_id: String,
@@ -3144,27 +3022,15 @@ mod timeline {
         }
     }
 
-    /// Parse a materialized timeline row. Returns `None` for rows the pane does not
-    /// render: `agent_text_stream` `start` markers are skipped.
-    pub(crate) fn parse_timeline_row(value: &Value) -> Option<TimelineRow> {
-        if value
-            .get("agent_text_stream")
-            .and_then(|stream| stream.get("kind"))
-            .and_then(Value::as_str)
-            == Some("start")
-        {
-            return None;
-        }
+    /// Parse a materialized timeline row.
+    pub(crate) fn parse_timeline_row(value: &Value) -> TimelineRow {
         let plaintext = value_string(value, "plaintext").unwrap_or_default();
         let display_text = if value.get("kind").and_then(Value::as_u64) == Some(GROUP_SYSTEM_KIND) {
             group_system_summary(value, &plaintext).unwrap_or_else(|| plaintext.clone())
         } else {
-            value
-                .get("agent_text_stream")
-                .and_then(agent_text_stream_summary)
-                .unwrap_or_else(|| plaintext.clone())
+            plaintext.clone()
         };
-        Some(TimelineRow {
+        TimelineRow {
             message_id: value_string(value, "message_id").unwrap_or_default(),
             direction: value_string(value, "direction").unwrap_or_else(|| "received".to_owned()),
             from: value_string(value, "from").unwrap_or_else(|| "unknown".to_owned()),
@@ -3186,7 +3052,7 @@ mod timeline {
             reactions: parse_timeline_reactions(value),
             reply: parse_timeline_reply(value),
             attachments: parse_timeline_attachments(value),
-        })
+        }
     }
 
     fn parse_timeline_reactions(value: &Value) -> Vec<TimelineReaction> {
@@ -3351,7 +3217,7 @@ mod timeline {
     fn parse_timeline_rows(messages: Option<&Value>) -> Vec<TimelineRow> {
         messages
             .and_then(Value::as_array)
-            .map(|rows| rows.iter().filter_map(parse_timeline_row).collect())
+            .map(|rows| rows.iter().map(parse_timeline_row).collect())
             .unwrap_or_default()
     }
 
@@ -3378,7 +3244,7 @@ mod timeline {
         match change.get("type").and_then(Value::as_str)? {
             "upsert" => Some(TimelineChange::Upsert(Box::new(parse_timeline_row(
                 change.get("message")?,
-            )?))),
+            )))),
             "remove" => Some(TimelineChange::Remove {
                 message_id: value_string(change, "message_id")?,
             }),
@@ -3961,8 +3827,7 @@ mod timeline {
     /// anchor is `newest - offset`; the walk fills backward from it until the
     /// viewport is full, then renders forward from where it stopped. The anchor is
     /// always included, so a message taller than the viewport still renders (never a
-    /// blank pane). `bottom_block_height` reserves rows for a bottom-pinned block
-    /// (live stream previews) but only when the anchor is the newest message.
+    /// blank pane).
     ///
     /// This is the single algorithm the renderer also uses to draw, so the reported
     /// range and the drawn rows never diverge.
@@ -3970,19 +3835,13 @@ mod timeline {
         heights: &[u16],
         viewport_height: u16,
         offset: usize,
-        bottom_block_height: u16,
     ) -> Option<(usize, usize)> {
         let total = heights.len();
         if total == 0 || viewport_height == 0 {
             return None;
         }
         let anchor = total - 1 - offset.min(total - 1);
-        let viewport = if anchor == total - 1 {
-            viewport_height.saturating_sub(bottom_block_height)
-        } else {
-            viewport_height
-        };
-        let viewport = usize::from(viewport.max(1));
+        let viewport = usize::from(viewport_height.max(1));
         let height = |index: usize| usize::from(heights[index].max(1));
 
         // Fill backward from the anchor to the topmost row that still fits.
@@ -4199,23 +4058,6 @@ pub(crate) fn account_display_label(account: &AccountRow) -> String {
         .display_name
         .clone()
         .unwrap_or_else(|| account.npub.clone())
-}
-
-pub(crate) fn stream_preview_author(
-    message: &Value,
-    selected_account: Option<&AccountRow>,
-) -> String {
-    let direction = value_string(message, "direction").unwrap_or_else(|| "received".to_owned());
-    let from = value_string(message, "from").unwrap_or_else(|| "stream".to_owned());
-    if direction == "sent" {
-        return "me".to_owned();
-    }
-    if selected_account.is_some_and(|account| {
-        from == account.account_id || from == account.npub || from == account_display_label(account)
-    }) {
-        return "me".to_owned();
-    }
-    non_empty_value_string(message, "from_display_name").unwrap_or_else(|| shorten(&from, 18))
 }
 
 pub(crate) fn unix_now_seconds() -> u64 {
@@ -4448,16 +4290,6 @@ pub(crate) fn parse_daemon_view(value: &Value) -> DaemonView {
         last_runtime_activity: value
             .get("last_runtime_activity")
             .and_then(parse_daemon_runtime_activity_view),
-        stream_watches: value
-            .get("stream_watches")
-            .and_then(Value::as_array)
-            .map(|watches| {
-                watches
-                    .iter()
-                    .filter_map(parse_daemon_stream_watch)
-                    .collect()
-            })
-            .unwrap_or_default(),
     }
 }
 
@@ -4477,29 +4309,6 @@ pub(crate) fn parse_daemon_runtime_activity_view(
             .and_then(Value::as_array)
             .map_or(0, Vec::len),
     })
-}
-
-pub(crate) fn parse_daemon_stream_watch(value: &Value) -> Option<DaemonStreamWatchView> {
-    Some(DaemonStreamWatchView {
-        watch_id: value_string(value, "watch_id")?,
-        group_id: value_string(value, "group_id")?,
-        stream_id: value_string(value, "stream_id"),
-        status: value_string(value, "status").unwrap_or_else(|| "unknown".to_owned()),
-        text: value_string(value, "text"),
-        transcript_hash: value_string(value, "transcript_hash"),
-        chunk_count: value.get("chunk_count").and_then(Value::as_u64),
-        error: value_string(value, "error"),
-    })
-}
-
-/// Whether a `messages subscribe` result is an initial-replay event rather than
-/// a live one. The plain feed exists only for QUIC stream previews now, so the
-/// drain skips these replays; unread is runtime-backed and never counted here.
-pub(crate) fn is_initial_subscription_result(result: &Value) -> bool {
-    matches!(
-        result.get("trigger").and_then(Value::as_str),
-        Some("InitialMessage" | "InitialAgentStreamWatch")
-    )
 }
 
 /// Extract the `chat_list_row` projection embedded on a
@@ -4673,185 +4482,6 @@ pub(crate) fn apply_notification_event(
     }
 }
 
-/// Apply one plain `messages subscribe` event to the account-wide live-stream
-/// preview state. The materialized-timeline feed owns the messages pane now, so
-/// message/reaction/media/delete rows drive nothing here; the plain feed is kept
-/// only for what the timeline feed does not carry — the QUIC preview types that
-/// render in the pane's bottom block, plus the preview cleanup when an agent
-/// stream's final row lands. Unread is runtime-backed (the chat projection), so
-/// nothing here counts messages.
-pub(crate) fn apply_subscription_result(
-    live_previews: &mut Vec<LiveStreamPreview>,
-    result: &Value,
-) -> Option<String> {
-    match result.get("type").and_then(Value::as_str) {
-        Some("agent_stream_final") => {
-            let message_value = result.get("message")?;
-            let stream_id = message_value
-                .get("agent_text_stream")
-                .and_then(|stream| value_string(stream, "stream_id"))?;
-            let group_id = value_string(message_value, "group_id");
-            remove_live_stream_preview(live_previews, group_id.as_deref(), &stream_id);
-            None
-        }
-        Some("message" | "reaction" | "message_delete" | "media") => None,
-        Some("agent_stream_start") => {
-            let message = result.get("message")?;
-            let stream = message
-                .get("agent_text_stream")
-                .and_then(|stream| value_string(stream, "stream_id"))?;
-            let group_id = value_string(message, "group_id")?;
-            let author = stream_preview_author(message, None);
-            upsert_live_stream_preview(
-                live_previews,
-                LiveStreamPreview {
-                    group_id,
-                    stream_id: stream.clone(),
-                    author,
-                    status: "streaming".to_owned(),
-                    text: String::new(),
-                    error: None,
-                    optimistic: false,
-                },
-                false,
-            );
-            Some(format!("stream started {}", shorten(&stream, 18)))
-        }
-        Some("agent_stream_delta") => {
-            let delta = result.get("agent_stream_delta")?;
-            let group_id = value_string(delta, "group_id")?;
-            let stream_id = value_string(delta, "stream_id")?;
-            let text = value_string(delta, "text").unwrap_or_default();
-            append_live_stream_delta(live_previews, group_id, stream_id.clone(), text);
-            Some(format!("streaming {}", shorten(&stream_id, 18)))
-        }
-        Some("stream_preview") => {
-            let preview = result.get("stream_preview")?;
-            let group_id = value_string(preview, "group_id")?;
-            let stream_id =
-                value_string(preview, "stream_id").or_else(|| value_string(preview, "watch_id"))?;
-            let status = value_string(preview, "status").unwrap_or_else(|| "streaming".to_owned());
-            let text = value_string(preview, "text").unwrap_or_default();
-            let error = value_string(preview, "error");
-            upsert_live_stream_preview(
-                live_previews,
-                LiveStreamPreview {
-                    group_id,
-                    stream_id: stream_id.clone(),
-                    author: "stream".to_owned(),
-                    status: status.clone(),
-                    text,
-                    error,
-                    optimistic: false,
-                },
-                true,
-            );
-            Some(format!("stream {status} {}", shorten(&stream_id, 18)))
-        }
-        _ => None,
-    }
-}
-
-pub(crate) fn append_live_stream_delta(
-    live_previews: &mut Vec<LiveStreamPreview>,
-    group_id: String,
-    stream_id: String,
-    text: String,
-) {
-    if let Some(preview) = live_previews
-        .iter_mut()
-        .find(|preview| preview.group_id == group_id && preview.stream_id == stream_id)
-    {
-        if preview.optimistic {
-            return;
-        }
-        preview.status = "streaming".to_owned();
-        preview.text.push_str(&text);
-        cap_live_stream_text(&mut preview.text);
-        preview.error = None;
-        return;
-    }
-    let mut preview = LiveStreamPreview {
-        group_id,
-        stream_id,
-        author: "stream".to_owned(),
-        status: "streaming".to_owned(),
-        text,
-        error: None,
-        optimistic: false,
-    };
-    cap_live_stream_preview(&mut preview);
-    live_previews.push(preview);
-    cap_live_stream_previews(live_previews);
-}
-
-pub(crate) fn upsert_live_stream_preview(
-    live_previews: &mut Vec<LiveStreamPreview>,
-    mut preview: LiveStreamPreview,
-    replace_text: bool,
-) {
-    cap_live_stream_preview(&mut preview);
-    if let Some(existing) = live_previews.iter_mut().find(|existing| {
-        existing.group_id == preview.group_id && existing.stream_id == preview.stream_id
-    }) {
-        if existing.optimistic && !preview.optimistic && !replace_text {
-            existing.status = preview.status;
-            existing.error = preview.error;
-            return;
-        }
-        existing.author = preview.author;
-        existing.status = preview.status;
-        existing.error = preview.error;
-        existing.optimistic = preview.optimistic;
-        if replace_text || existing.text.is_empty() {
-            existing.text = preview.text;
-        }
-        cap_live_stream_preview(existing);
-        return;
-    }
-    live_previews.push(preview);
-    cap_live_stream_previews(live_previews);
-}
-
-pub(crate) fn cap_live_stream_previews(live_previews: &mut Vec<LiveStreamPreview>) {
-    if live_previews.len() <= TUI_LIVE_STREAM_PREVIEW_LIMIT {
-        return;
-    }
-    let excess = live_previews.len() - TUI_LIVE_STREAM_PREVIEW_LIMIT;
-    live_previews.drain(0..excess);
-}
-
-pub(crate) fn cap_live_stream_preview(preview: &mut LiveStreamPreview) {
-    cap_live_stream_text(&mut preview.text);
-}
-
-pub(crate) fn cap_live_stream_text(text: &mut String) {
-    if text.len() <= TUI_LIVE_STREAM_TEXT_LIMIT {
-        return;
-    }
-    let mut start = text.len() - TUI_LIVE_STREAM_TEXT_LIMIT;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    text.drain(..start);
-}
-
-pub(crate) fn remove_live_stream_preview(
-    live_previews: &mut Vec<LiveStreamPreview>,
-    group_id: Option<&str>,
-    stream_id: &str,
-) {
-    live_previews.retain(|preview| {
-        if preview.stream_id != stream_id {
-            return true;
-        }
-        if let Some(group_id) = group_id {
-            return preview.group_id != group_id;
-        }
-        false
-    });
-}
-
 pub(crate) fn unique_member_refs(members: Vec<String>) -> Vec<String> {
     let mut unique = Vec::new();
     for member in members {
@@ -4921,22 +4551,16 @@ pub(crate) fn parse_group_diagnostics(value: &Value) -> Option<GroupDiagnostics>
 }
 
 pub(crate) fn group_component_diagnostics(group: &Value) -> Vec<GroupComponentDiagnostics> {
-    [
-        "profile",
-        "image",
-        "admin_policy",
-        "nostr_routing",
-        "agent_text_stream",
-    ]
-    .into_iter()
-    .filter_map(|key| {
-        let component = group.get(key)?;
-        Some(GroupComponentDiagnostics {
-            component: value_string(component, "component").unwrap_or_else(|| key.to_owned()),
-            component_id: component.get("component_id").and_then(Value::as_u64),
+    ["profile", "image", "admin_policy", "nostr_routing"]
+        .into_iter()
+        .filter_map(|key| {
+            let component = group.get(key)?;
+            Some(GroupComponentDiagnostics {
+                component: value_string(component, "component").unwrap_or_else(|| key.to_owned()),
+                component_id: component.get("component_id").and_then(Value::as_u64),
+            })
         })
-    })
-    .collect()
+        .collect()
 }
 
 pub(crate) fn shorten(value: &str, max_len: usize) -> String {
@@ -5018,15 +4642,6 @@ pub(crate) fn daemon_start_has_relay_source(
         || !discovery_relays.is_empty()
         || !default_account_relays.is_empty()
         || env_relay.is_some_and(|relay| !relay.trim().is_empty())
-}
-
-pub(crate) fn message_subscription_args() -> Vec<String> {
-    vec![
-        "messages".to_owned(),
-        "subscribe".to_owned(),
-        "--limit".to_owned(),
-        "0".to_owned(),
-    ]
 }
 
 /// Args for the runtime-wide notification subscription (`notifications

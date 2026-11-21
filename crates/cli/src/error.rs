@@ -1,7 +1,5 @@
 //! CLI error type and its `--json` error-rendering functions.
 
-use std::net::SocketAddr;
-
 use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
 use marmot_app::{
@@ -39,10 +37,6 @@ pub(crate) enum WnError {
     App(#[from] AppError),
     #[error(transparent)]
     Sync(Box<SyncCommandError>),
-    #[error(transparent)]
-    QuicStream(#[from] transport_quic_stream::QuicTextStreamError),
-    #[error(transparent)]
-    QuicBroker(#[from] transport_quic_broker::QuicBrokerError),
     #[error(transparent)]
     Hex(#[from] hex::FromHexError),
     #[error(transparent)]
@@ -83,37 +77,6 @@ pub(crate) enum WnError {
         "WN_DEV_SETTLEMENT_QUIESCENCE_MS requires a test-policy-overrides build; unset it in normal binaries"
     )]
     DevSettlementOverrideInRelease,
-    #[error("stream text is required")]
-    EmptyStreamText,
-    #[error("no brokered stream start found")]
-    MissingStreamStart,
-    #[error("brokered stream start has no confirmed message id yet")]
-    StreamStartNotConfirmed,
-    #[error("brokered stream start has no QUIC candidates")]
-    MissingQuicCandidate,
-    #[error("unsupported stream route for broker watch: {0}")]
-    UnsupportedStreamRoute(String),
-    #[error("invalid QUIC candidate: {0}")]
-    InvalidQuicCandidate(String),
-    #[error("failed to resolve QUIC candidate {candidate}: {source}")]
-    QuicCandidateResolve {
-        candidate: String,
-        source: std::io::Error,
-    },
-    #[error(
-        "QUIC candidate {candidate} resolved to a non-public endpoint {addr}; --insecure-local permits loopback endpoints only"
-    )]
-    UnsafeQuicCandidateEndpoint { candidate: String, addr: SocketAddr },
-    #[error("transcript hash must be 32 bytes, got {0}")]
-    InvalidTranscriptHashLength(usize),
-    #[error("choose either --server-cert-der-hex or --insecure-local")]
-    ConflictingStreamTrust,
-    #[error(
-        "QUIC endpoint must be a public address; --insecure-local permits loopback endpoints only"
-    )]
-    UnsafeQuicEndpoint,
-    #[error("--insecure-local is only allowed for loopback QUIC endpoints, got {0}")]
-    InsecureLocalRequiresLoopback(SocketAddr),
     #[error(
         "devices requires a running wnd with device groups and relay defaults; start it with `wn daemon start --discovery-relays <urls> --default-account-relays <urls>` with `WN_DEVICE_GROUPS` unset (0, false, off or no turns device groups off)"
     )]
@@ -124,8 +87,6 @@ pub(crate) enum WnError {
     ChatsSubscribeRequiresDaemon,
     #[error("notifications subscribe requires the daemon; start it with `wn daemon start`")]
     NotificationsSubscribeRequiresDaemon,
-    #[error("stream compose requires the daemon; start it with `wn daemon start`")]
-    StreamComposeRequiresDaemon,
     #[error("login requires --nsec-stdin or an npub identity")]
     MissingLoginIdentity,
     #[error(
@@ -282,14 +243,6 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             }
             value
         }
-        WnError::QuicStream(err) => json!({
-            "code": "quic_stream",
-            "message": err.to_string(),
-        }),
-        WnError::QuicBroker(err) => json!({
-            "code": "quic_broker",
-            "message": err.to_string(),
-        }),
         WnError::Hex(err) => json!({
             "code": "invalid_hex",
             "message": err.to_string(),
@@ -315,63 +268,6 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "code": "invalid_event_tag",
             "message": err.to_string(),
         }),
-        WnError::EmptyStreamText => json!({
-            "code": "empty_stream_text",
-            "message": err.to_string(),
-        }),
-        WnError::MissingStreamStart => json!({
-            "code": "missing_stream_start",
-            "message": err.to_string(),
-        }),
-        WnError::StreamStartNotConfirmed => json!({
-            "code": "stream_start_not_confirmed",
-            "message": err.to_string(),
-        }),
-        WnError::MissingQuicCandidate => json!({
-            "code": "missing_quic_candidate",
-            "message": err.to_string(),
-        }),
-        WnError::UnsupportedStreamRoute(route) => json!({
-            "code": "unsupported_stream_route",
-            "message": err.to_string(),
-            "route": route,
-        }),
-        WnError::InvalidQuicCandidate(candidate) => json!({
-            "code": "invalid_quic_candidate",
-            "message": err.to_string(),
-            "candidate": candidate,
-        }),
-        WnError::QuicCandidateResolve { candidate, source } => json!({
-            "code": "quic_candidate_resolve",
-            "message": err.to_string(),
-            "candidate": candidate,
-            "source": source.to_string(),
-        }),
-        WnError::UnsafeQuicCandidateEndpoint { candidate, addr } => json!({
-            "code": "unsafe_quic_candidate_endpoint",
-            "message": err.to_string(),
-            "candidate": candidate,
-            "addr": addr.to_string(),
-        }),
-        WnError::InvalidTranscriptHashLength(actual) => json!({
-            "code": "invalid_transcript_hash",
-            "message": err.to_string(),
-            "actual_bytes": actual,
-            "expected_bytes": 32,
-        }),
-        WnError::ConflictingStreamTrust => json!({
-            "code": "conflicting_stream_trust",
-            "message": err.to_string(),
-        }),
-        WnError::UnsafeQuicEndpoint => json!({
-            "code": "unsafe_quic_endpoint",
-            "message": err.to_string(),
-        }),
-        WnError::InsecureLocalRequiresLoopback(addr) => json!({
-            "code": "insecure_local_requires_loopback",
-            "message": err.to_string(),
-            "addr": addr.to_string(),
-        }),
         WnError::DevicesRequireDaemon => json!({
             "code": "daemon_required",
             "message": err.to_string(),
@@ -392,13 +288,6 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             },
         }),
         WnError::NotificationsSubscribeRequiresDaemon => json!({
-            "code": "daemon_required",
-            "message": err.to_string(),
-            "repair": {
-                "start": "wn daemon start",
-            },
-        }),
-        WnError::StreamComposeRequiresDaemon => json!({
             "code": "daemon_required",
             "message": err.to_string(),
             "repair": {
@@ -1011,26 +900,6 @@ mod tests {
     use marmot_app::AccountError;
 
     use super::*;
-
-    #[test]
-    fn unsafe_quic_endpoint_json_omits_addresses_and_certificates() {
-        let err = WnError::UnsafeQuicEndpoint;
-        let message = err.to_string();
-        assert!(message.contains("public address"));
-        assert!(message.contains("--insecure-local"));
-        assert!(!message.contains("127.0.0.1"));
-        assert!(!message.contains("::1"));
-        assert!(!message.contains("cert"));
-
-        let json = wn_error_json(&err);
-        assert_eq!(json["code"], "unsafe_quic_endpoint");
-        assert_eq!(json["message"], message);
-        assert!(json.get("addr").is_none());
-        assert!(json.get("candidate").is_none());
-        let rendered = json.to_string();
-        assert!(!rendered.contains("127.0.0.1"));
-        assert!(!rendered.contains("cert"));
-    }
 
     #[test]
     fn invalid_edit_target_has_a_distinct_code() {
