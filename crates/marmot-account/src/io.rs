@@ -562,7 +562,7 @@ mod tests {
     #[test]
     fn fifo_reads_do_not_block() {
         use std::os::unix::ffi::OsStrExt;
-        use std::process::Command;
+        use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
 
         const FIFO_PROBE: &str = "MDK_ACCOUNT_FIFO_PROBE";
@@ -591,13 +591,25 @@ mod tests {
                 "--nocapture",
             ])
             .env(FIFO_PROBE, &fifo)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let observed = child.try_wait();
             if let Ok(Some(status)) = &observed {
-                assert!(status.success(), "FIFO reader child failed: {status}");
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    status.success(),
+                    "FIFO reader child failed: {status}; {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+                    "FIFO probe did not run: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
                 return;
             }
             if observed.is_err() || Instant::now() >= deadline {
