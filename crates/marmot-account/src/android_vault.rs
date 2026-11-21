@@ -20,6 +20,7 @@ const TAG_LEN: usize = 16;
 const MAX_CIPHER: usize = MAGIC.len() + IV_LEN + MAX_VALUE + TAG_LEN;
 const MAX_LEGACY_XML: usize = 8 * 1024 * 1024;
 const PENDING: &str = ".pending-";
+const UNPUBLISHED: &str = ".unpublished-";
 const PROVIDER: &str = "AndroidKeyStore";
 const TRANSFORM: &str = "AES/GCM/NoPadding";
 
@@ -186,7 +187,7 @@ impl NativeVault {
 
     fn lease(&self) -> AccountHomeResult<fs_private::PrivateExclusiveFileLease> {
         Ok(fs_private::try_acquire_private_exclusive_file_lease(
-            &self.root.join(".credential-store.lock"),
+            &self.root.join(crate::CREDENTIAL_STORE_LOCK_FILE),
         )?)
     }
 
@@ -359,6 +360,8 @@ impl VaultStorage for NativeVault {
         let mut result = remove_record(&directory.join(name));
         let pending = remove_record(&directory.join(format!("{PENDING}{name}")));
         result = combine_errors(result, pending);
+        let unpublished = remove_record(&directory.join(format!("{UNPUBLISHED}{name}")));
+        result = combine_errors(result, unpublished);
         result = combine_errors(result, sync_directory(&directory));
         if matches!(kind, RecordKind::Receipt) {
             result = combine_errors(result, self.delete_key(name));
@@ -375,6 +378,10 @@ impl VaultStorage for NativeVault {
             let name = filename
                 .to_str()
                 .ok_or_else(|| failure("Android vault record name is not UTF-8"))?;
+            if let Some(unpublished) = name.strip_prefix(UNPUBLISHED) {
+                validate_name(unpublished)?;
+                continue;
+            }
             if !entry.file_type()?.is_file() {
                 return Err(failure("Android vault record is not a regular file"));
             }
@@ -839,17 +846,19 @@ fn read_open_file(
 
 fn publish_record(directory: &Path, name: &str, bytes: &[u8]) -> AccountHomeResult<()> {
     let pending = directory.join(format!("{PENDING}{name}"));
-    remove_record(&pending)?;
+    let unpublished = directory.join(format!("{UNPUBLISHED}{name}"));
+    remove_record(&unpublished)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(&pending)?;
+        .open(&unpublished)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    // The caller holds the vault lease and has checked receipt immutability.
-    // Ordinary rename is atomic and avoids Android's hard-link prohibition.
+    // Publish a recoverable receipt only after the complete ciphertext is synced.
+    fs::rename(&unpublished, &pending)?;
+    sync_directory(directory)?;
     fs::rename(&pending, directory.join(name))?;
     sync_directory(directory)
 }

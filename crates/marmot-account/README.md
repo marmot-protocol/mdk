@@ -79,6 +79,11 @@ a signing account only after acquisition succeeds. Owner IDs are random and neve
 
 Native backends store one protected copy per owner. Android uses AES-GCM encrypted files and per-receipt
 Android Keystore keys on API 23 or later. SharedPreferences is read only for legacy migration.
+On Android, a read that misses the final receipt and any receipt listing take the vault lease. Without it,
+a writer could be publishing a receipt while the reader reports absence. The writer syncs the complete
+ciphertext before renaming it to `.pending-…`. Reads can recover an authenticated pending receipt. Invalid
+pending data remains an error, not absence. Unpublished writes are not listed or recovered, and exact-owner
+removal deletes them along with the pending and final receipts and the Keystore key.
 Windows managed copies use local-machine persistence and bind to the user SID and MachineGuid, not the computer
 name; they do not roam. macOS binds to the selected keychain domain and path, not the replaceable file inode.
 The development file store keeps plaintext receipts under `.owned-secrets-v1` with private permissions.
