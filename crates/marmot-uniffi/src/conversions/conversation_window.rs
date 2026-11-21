@@ -251,8 +251,8 @@ pub struct SelectedMessageDraftAttachmentFfi {
     pub duration_seconds: Option<f64>,
     pub waveform_samples: Vec<f64>,
     /// The body is a staged file in the media store, not inline bytes:
-    /// read it with `read_message_draft_attachment` or a handoff, and keep
-    /// it across saves with `MessageDraftAttachmentInputFfi::Retained`.
+    /// read it with `read_message_draft_attachment` or a handoff. Saves keep
+    /// it unless they name it `MessageDraftAttachmentInputFfi::Removed`.
     #[uniffi(default = false)]
     pub file_backed: bool,
 }

@@ -60,16 +60,19 @@ impl From<MessageDraftAttachmentFfi> for MessageDraftAttachment {
     }
 }
 
-/// One attachment of a revisioned draft save: a new inline body, or an
-/// attachment the draft already holds, kept by id with its body untouched.
-/// Retain every file-backed attachment (`file_backed` on the selected
-/// draft) by id; leaving one out deletes its staged file.
+/// One attachment of a revisioned draft save: a new inline body, an
+/// attachment the draft already holds, kept by id with its body untouched,
+/// or the id of one to remove. An attachment the save does not name stays
+/// in the draft; only `Removed` deletes one (and its staged file).
 #[derive(Clone, uniffi::Enum)]
 pub enum MessageDraftAttachmentInputFfi {
     Inline {
         attachment: MessageDraftAttachmentFfi,
     },
     Retained {
+        id: String,
+    },
+    Removed {
         id: String,
     },
 }
@@ -82,6 +85,7 @@ impl fmt::Debug for MessageDraftAttachmentInputFfi {
                 .field("attachment", attachment)
                 .finish(),
             Self::Retained { .. } => formatter.debug_struct("Retained").finish_non_exhaustive(),
+            Self::Removed { .. } => formatter.debug_struct("Removed").finish_non_exhaustive(),
         }
     }
 }
@@ -93,6 +97,7 @@ impl From<MessageDraftAttachmentInputFfi> for MessageDraftAttachmentInput {
                 Self::Inline(attachment.into())
             }
             MessageDraftAttachmentInputFfi::Retained { id } => Self::Retained(id),
+            MessageDraftAttachmentInputFfi::Removed { id } => Self::Removed(id),
         }
     }
 }
@@ -312,6 +317,9 @@ mod tests {
                 attachment: draft.media_attachments[0].clone(),
             },
             MessageDraftAttachmentInputFfi::Retained {
+                id: draft.media_attachments[0].id.clone(),
+            },
+            MessageDraftAttachmentInputFfi::Removed {
                 id: draft.media_attachments[0].id.clone(),
             },
         ];
