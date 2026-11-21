@@ -75,7 +75,7 @@ fn save_state_rolls_back_all_tables_when_component_write_fails() {
 }
 
 #[test]
-fn load_state_uses_agent_text_stream_component_row() {
+fn load_state_keeps_the_retired_agent_text_stream_component_row() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("test-key").unwrap();
     let mut db = LegacyAccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
@@ -88,9 +88,12 @@ fn load_state_uses_agent_text_stream_component_row() {
         AppGroupAdminPolicyComponent::new(Vec::new()),
         AppGroupMessageRetentionComponent::disabled(),
     );
-    group.agent_text_stream = AppAgentTextStreamComponent::from_bytes(&[
-        0x01, 0x03, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ]);
+    let retired = AppGroupOpaqueComponent {
+        component_id: 0x8006,
+        component: "marmot.group.agent-text-stream.quic.v1".to_owned(),
+        data_hex: "010300001000000000000000".to_owned(),
+    };
+    group.unknown_components.push(retired.clone());
     let state = AccountState {
         label: "alice".to_owned(),
         seen_events: Vec::new(),
@@ -101,12 +104,8 @@ fn load_state_uses_agent_text_stream_component_row() {
     db.save_state(&state).unwrap();
     let restored = db.load_state("alice").unwrap();
 
-    assert!(restored.groups[0].agent_text_stream.required);
     assert_eq!(restored.last_transport_timestamp, Some(1_700_000_003));
-    assert_eq!(
-        restored.groups[0].agent_text_stream.data_hex,
-        "010300001000000000000000"
-    );
+    assert_eq!(restored.groups[0].unknown_components, vec![retired]);
 }
 
 #[test]

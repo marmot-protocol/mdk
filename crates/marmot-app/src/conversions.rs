@@ -8,15 +8,15 @@
 use crate::error::AppError;
 use crate::notifications;
 use crate::{
-    AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent,
-    AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent,
-    AppGroupImageInput, AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent,
-    AppGroupOpaqueComponent, AppGroupProfileComponent, AppGroupRecord, AppMessageProjection,
-    AppMessageRecord, AuditLogSettings, ChatNotificationSettings, GROUP_ADMIN_POLICY_COMPONENT_ID,
-    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupPushTokenRecord,
-    NOSTR_ROUTING_COMPONENT_ID, NotificationSettings, PushPlatform, PushRegistration,
-    RelayTelemetrySettings, UsageDiagnosticsDecision, UsageDiagnosticsSettings,
+    AccountState, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppGroupEncryptedMediaComponent, AppGroupImageInput, AppGroupMessageRetentionComponent,
+    AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
+    AppGroupRecord, AppMessageProjection, AppMessageRecord, AuditLogSettings,
+    ChatNotificationSettings, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID, GroupPushTokenRecord, NOSTR_ROUTING_COMPONENT_ID,
+    NotificationSettings, PushPlatform, PushRegistration, RelayTelemetrySettings,
+    UsageDiagnosticsDecision, UsageDiagnosticsSettings,
 };
 use cgka_traits::app_components::{
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
@@ -128,13 +128,6 @@ pub(crate) fn stored_components_from_app_group(
             component_data_hex: group.nostr_routing.data_hex.clone(),
         },
     ]);
-    if group.agent_text_stream.required {
-        components.push(StoredAccountGroupComponent {
-            component_id: group.agent_text_stream.component_id,
-            component_name: group.agent_text_stream.component.clone(),
-            component_data_hex: group.agent_text_stream.data_hex.clone(),
-        });
-    }
     if group.avatar_url.present {
         components.push(StoredAccountGroupComponent {
             component_id: group.avatar_url.component_id,
@@ -209,13 +202,6 @@ pub(crate) fn app_group_from_stored_group(
         .as_deref()
         .map(AppGroupProfileComponent::from_bytes)
         .unwrap_or_else(AppGroupProfileComponent::absent);
-    if let Some(agent_hex) =
-        account_component_data_hex(&stored.components, AGENT_TEXT_STREAM_COMPONENT_ID)
-        && !agent_hex.is_empty()
-    {
-        let agent_bytes = hex::decode(agent_hex)?;
-        group.agent_text_stream = AppAgentTextStreamComponent::from_bytes(&agent_bytes);
-    }
     if let Some(avatar_hex) =
         account_component_data_hex(&stored.components, GROUP_AVATAR_URL_COMPONENT_ID)
         && !avatar_hex.is_empty()
@@ -272,7 +258,6 @@ fn is_projected_group_component(component_id: u16) -> bool {
             | GROUP_ADMIN_POLICY_COMPONENT_ID
             | NOSTR_ROUTING_COMPONENT_ID
             | GROUP_MESSAGE_RETENTION_COMPONENT_ID
-            | AGENT_TEXT_STREAM_COMPONENT_ID
             | GROUP_AVATAR_URL_COMPONENT_ID
             | GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID
             | GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID

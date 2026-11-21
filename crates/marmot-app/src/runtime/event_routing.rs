@@ -11,13 +11,7 @@ pub(crate) fn runtime_message_update_from_event(
     event: MarmotAppEvent,
 ) -> Option<RuntimeMessageUpdate> {
     match event {
-        // Raw message updates keep kind-1200 stream starts distinct from
-        // message rows. The materialized storage timeline still includes those
-        // starts when clients call `timeline_messages`.
         MarmotAppEvent::MessageReceived(message) => Some(RuntimeMessageUpdate::Message(message)),
-        MarmotAppEvent::AgentStreamStarted(message) => {
-            Some(RuntimeMessageUpdate::AgentStreamStarted(message))
-        }
         MarmotAppEvent::GroupJoined { .. }
         | MarmotAppEvent::GroupStateUpdated { .. }
         | MarmotAppEvent::ProjectionUpdated(_)
@@ -46,7 +40,6 @@ pub(crate) fn projection_update_from_event(
         MarmotAppEvent::GroupJoined { .. }
         | MarmotAppEvent::GroupStateUpdated { .. }
         | MarmotAppEvent::MessageReceived(_)
-        | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::GroupEvent(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
         | MarmotAppEvent::EpochStallEscalated { .. }
@@ -109,7 +102,6 @@ pub(crate) fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str,
         },
         MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::MessageReceived(_)
-        | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
@@ -144,7 +136,6 @@ pub(crate) fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &Gr
         },
         MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::MessageReceived(_)
-        | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
@@ -191,7 +182,6 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
         },
         MarmotAppEvent::ProjectionUpdated(update) => update.update.chat_list_trigger,
         MarmotAppEvent::MessageReceived(_)
-        | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
         // A stalled group's escalation reports a repair need, not a state
         // change: the chat list has nothing new to show for it.

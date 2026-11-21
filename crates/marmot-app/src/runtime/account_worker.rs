@@ -40,8 +40,8 @@ use super::conversation_window::{
     CapturedConversation, ConversationWindowError, capture_conversation,
 };
 use super::{
-    MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeGroupEvent,
-    RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
+    MarmotAppEvent, RuntimeAccountError, RuntimeGroupEvent, RuntimeLifecycle,
+    RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
     runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
 use crate::client::history_recovery::recovery_runner::host::{SpawnedRunner, next_runner_turn};
@@ -54,17 +54,16 @@ use crate::messages::AppMessageIntent;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT, AccountCatchUpFailure,
-    AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppCreateGroupOptions,
-    AppDisbandRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppPreparedGroupImageUpload, AppProjectionUpdate, AppQuarantinedGroup, CanonicalCreatedGroup,
-    ChatListUpdateTrigger, ClassifiedSyncFailure, ConvergenceScheduleState,
-    EpochBackfillRunOutcome, GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp,
-    MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadResult,
-    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
-    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
-    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
+    AppBlobEndpoint, AppClient, AppCreateGroupOptions, AppDisbandRequest, AppError,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppPreparedGroupImageUpload,
+    AppProjectionUpdate, AppQuarantinedGroup, CanonicalCreatedGroup, ChatListUpdateTrigger,
+    ClassifiedSyncFailure, ConvergenceScheduleState, EpochBackfillRunOutcome,
+    GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp, MarmotRelayPlane,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadResult, NotificationSettings,
+    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
+    PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    SyncSummary,
 };
-use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use marmot_observability::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 
 pub(crate) struct ManagedAccountWorker {
@@ -807,18 +806,6 @@ pub(crate) enum AccountWorkerCommand {
     SweepExpiredRetention {
         now_ms: u64,
         respond: oneshot::Sender<Result<RetentionSweepReport, AppError>>,
-    },
-    StartAgentTextStream {
-        group_id: GroupId,
-        stream_id: Vec<u8>,
-        parent_message_id: Option<String>,
-        quic_candidates: Vec<String>,
-        respond: oneshot::Sender<Result<(MarmotInnerEvent, SendSummary), AppError>>,
-    },
-    FinishAgentTextStream {
-        group_id: GroupId,
-        request: AgentTextStreamFinishRequest,
-        respond: oneshot::Sender<Result<(MarmotInnerEvent, SendSummary), AppError>>,
     },
     RetryGroupConvergence {
         group_id: GroupId,
@@ -7867,52 +7854,6 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
             true
         }),
-        AccountWorkerCommand::StartAgentTextStream {
-            group_id,
-            stream_id,
-            parent_message_id,
-            quic_candidates,
-            respond,
-        } => Box::pin(async move {
-            let result = client
-                .start_agent_text_stream_with_local_projection(
-                    &group_id,
-                    &stream_id,
-                    parent_message_id,
-                    quic_candidates,
-                    |update| {
-                        publish_app_runtime_projection_update(
-                            Emit::Unpublished(Unpublished::LocalEcho),
-                            events,
-                            account_id_hex,
-                            account_label,
-                            update,
-                        );
-                    },
-                )
-                .await;
-            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
-            true
-        }),
-        AccountWorkerCommand::FinishAgentTextStream {
-            group_id,
-            request,
-            respond,
-        } => Box::pin(async move {
-            let result = client
-                .finish_agent_text_stream_with_local_projection(&group_id, request, |update| {
-                    publish_app_runtime_projection_update(
-                        Emit::Unpublished(Unpublished::LocalEcho),
-                        events,
-                        account_id_hex,
-                        account_label,
-                        update,
-                    );
-                })
-                .await;
-            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
-            true
-        }),
         AccountWorkerCommand::RetryGroupConvergence { group_id, respond } => Box::pin(async move {
             let _unit = unit.enter(WorkerUnit::Convergence);
             let result = client.retry_group_convergence(&group_id).await;
@@ -9344,19 +9285,16 @@ fn publish_app_runtime_summary(
         });
     }
     for message in &summary.messages {
-        // Raw message subscribers get kind-1200 starts as a typed open-preview
-        // signal. The storage timeline still materializes the same start as a
-        // kind-1200 timeline row so timeline-only subscribers can discover and
-        // watch the live stream.
-        if let Some(event) = agent_stream_runtime_event(account_id_hex, account_label, message) {
-            send(event);
-        } else {
-            send(MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
-                account_id_hex: account_id_hex.to_owned(),
-                account_label: account_label.to_owned(),
-                message: message.clone(),
-            }));
+        // The retired agent stream start reaches no subscriber, as it has no
+        // timeline row.
+        if message.kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
+            continue;
         }
+        send(MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            message: message.clone(),
+        }));
     }
     for update in &summary.projection_updates {
         send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
@@ -9820,25 +9758,6 @@ fn publish_pending_welcome_delivery_events(
             },
         );
     }
-}
-
-/// Emit a runtime `AgentStreamStarted` for a kind-1200 start event. Kind-9
-/// stream-final messages are normal timeline messages and do not fire here.
-fn agent_stream_runtime_event(
-    account_id_hex: &str,
-    account_label: &str,
-    message: &ReceivedMessage,
-) -> Option<MarmotAppEvent> {
-    if message.kind != MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
-        return None;
-    }
-    Some(MarmotAppEvent::AgentStreamStarted(
-        RuntimeAgentStreamMessage {
-            account_id_hex: account_id_hex.to_owned(),
-            account_label: account_label.to_owned(),
-            message: message.clone(),
-        },
-    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

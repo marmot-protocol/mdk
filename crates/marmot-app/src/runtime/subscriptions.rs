@@ -11,11 +11,10 @@ use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_MEMBER_LEFT, GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG,
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
 };
-use cgka_traits::{GroupId, MessageId, storage::StorageError};
+use cgka_traits::{GroupId, storage::StorageError};
 use serde::{Deserialize, Serialize};
 use storage_sqlite::AppEventReplayCursor;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use transport_quic_stream::AgentTextStreamCrypto;
+use tokio::sync::{broadcast, mpsc, watch};
 
 use super::event_routing::{
     chat_list_event_route, chat_list_trigger_from_event, projection_update_from_event,
@@ -24,8 +23,8 @@ use super::event_routing::{
 };
 use super::{
     MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT, MarmotAppEvent, MarmotAppRuntime,
-    MessageSubscriptionSeenIds, RuntimeAgentStreamMessage, RuntimeMessageReceived,
-    RuntimeMessageUpdate, RuntimeProjectionUpdate, blocking_app_task, runtime_shutdown_requested,
+    MessageSubscriptionSeenIds, RuntimeMessageReceived, RuntimeMessageUpdate,
+    RuntimeProjectionUpdate, blocking_app_task, runtime_shutdown_requested,
     wait_for_runtime_shutdown,
 };
 use crate::ids::normalize_group_id_hex_app;
@@ -844,10 +843,7 @@ fn change_advances_chat_list(
 ) -> bool {
     match change {
         TimelineMessageChange::Upsert {
-            trigger:
-                TimelineUpdateTrigger::NewMessage
-                | TimelineUpdateTrigger::AgentStreamStarted
-                | TimelineUpdateTrigger::AgentStreamFinished,
+            trigger: TimelineUpdateTrigger::NewMessage,
             ..
         } => true,
         TimelineMessageChange::Upsert {
@@ -941,98 +937,6 @@ impl RuntimeEventsSubscription {
                 _ = wait_for_runtime_shutdown(&mut self.stopping) => return None,
             }
         }
-    }
-}
-
-/// One update from watching a live agent text stream over QUIC.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RuntimeAgentStreamUpdate {
-    /// An incremental text delta. `text` is the new fragment, not the full text.
-    Chunk { seq: u64, text: String },
-    /// A provisional stream status label. This is not final-answer text.
-    Status { seq: u64, status: String },
-    /// A provisional agent progress record. This is not final-answer text.
-    Progress { seq: u64, text: String },
-    /// A non-text stream record kept for diagnostics/future UI.
-    Record {
-        seq: u64,
-        record_type: u8,
-        text: String,
-    },
-    /// The stream closed cleanly; `text` is the complete transcript.
-    Finished {
-        text: String,
-        transcript_hash_hex: String,
-        chunk_count: u64,
-    },
-    /// The watch failed (connection/broker error).
-    Failed { message: String },
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct AgentStreamWatchOptions {
-    /// Watch a specific stream id; `None` watches the latest stream in the group.
-    pub stream_id_hex: Option<String>,
-    /// DER cert for a self-signed broker; `None` uses the bundled public-CA
-    /// roots, not the OS trust store.
-    pub server_cert_der: Option<Vec<u8>>,
-    /// Loopback-only insecure trust, for local testing.
-    pub insecure_local: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct AgentTextStreamCryptoContext {
-    pub account_id_hex: String,
-    pub account_label: String,
-    pub group_id: GroupId,
-    pub stream_id: Vec<u8>,
-    pub start_event_id: MessageId,
-    pub crypto: AgentTextStreamCrypto,
-    pub policy_max_plaintext_frame_len: Option<u32>,
-}
-
-/// A live agent-text-stream watch. Drains chunk/finished/failed updates from a
-/// background QUIC subscription task.
-pub struct RuntimeAgentStreamWatch {
-    pub stream_id_hex: String,
-    pub(crate) updates: mpsc::Receiver<RuntimeAgentStreamUpdate>,
-    pub(crate) terminal: Option<oneshot::Receiver<RuntimeAgentStreamUpdate>>,
-    pub(crate) abort: tokio::task::AbortHandle,
-    pub(crate) stopping: watch::Receiver<bool>,
-}
-
-impl RuntimeAgentStreamWatch {
-    pub async fn recv(&mut self) -> Option<RuntimeAgentStreamUpdate> {
-        if let Some(mut terminal) = self.terminal.take() {
-            return tokio::select! {
-                biased;
-                terminal = &mut terminal => {
-                    self.updates.close();
-                    while self.updates.try_recv().is_ok() {}
-                    terminal.ok()
-                }
-                update = self.updates.recv() => {
-                    self.terminal = Some(terminal);
-                    update
-                }
-                _ = wait_for_runtime_shutdown(&mut self.stopping) => {
-                    self.terminal = Some(terminal);
-                    None
-                }
-            };
-        }
-        tokio::select! {
-            update = self.updates.recv() => update,
-            _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
-        }
-    }
-}
-
-impl Drop for RuntimeAgentStreamWatch {
-    fn drop(&mut self) {
-        // Cancel the background QUIC subscriber so dropping the watch handle
-        // doesn't leak a task driving a (possibly hung) broker connection.
-        self.abort.abort();
     }
 }
 
@@ -2017,8 +1921,7 @@ pub(crate) fn recovery_row_is_pre_subscription(
 /// Re-read the message projection on broadcast lag and rebuild the runtime
 /// message updates a subscriber would have received. The caller filters these
 /// through its `seen_message_ids` set so only genuinely-missed messages are
-/// re-emitted. Kind-1200 agent-stream starts are reclassified as
-/// `AgentStreamStarted`, matching the live forwarding path.
+/// re-emitted.
 fn messages_recovery_updates(
     app: &MarmotApp,
     account_id_hex: &str,
@@ -2060,13 +1963,17 @@ fn messages_recovery_updates(
 }
 
 /// Rebuild a `RuntimeMessageUpdate` from a stored projection row. Returns
-/// `None` when the row carries an undecodable group id (it cannot be routed).
+/// `None` when the row carries an undecodable group id (it cannot be routed)
+/// or is a retired agent stream start, which the live path drops too.
 pub(crate) fn received_message_update_from_record(
     account_id_hex: &str,
     account_label: &str,
     record: AppMessageRecord,
     display_names: &HashMap<String, String>,
 ) -> Option<RuntimeMessageUpdate> {
+    if record.kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
+        return None;
+    }
     let group_id = GroupId::new(hex::decode(&record.group_id_hex).ok()?);
     let sender_display_name = display_names.get(&record.sender).cloned();
     let message = ReceivedMessage {
@@ -2086,22 +1993,11 @@ pub(crate) fn received_message_update_from_record(
         recorded_at: record.recorded_at,
         received_at: record.received_at,
     };
-    let received = RuntimeMessageReceived {
+    Some(RuntimeMessageUpdate::Message(RuntimeMessageReceived {
         account_id_hex: account_id_hex.to_owned(),
         account_label: account_label.to_owned(),
         message,
-    };
-    if received.message.kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
-        Some(RuntimeMessageUpdate::AgentStreamStarted(
-            RuntimeAgentStreamMessage {
-                account_id_hex: received.account_id_hex,
-                account_label: received.account_label,
-                message: received.message,
-            },
-        ))
-    } else {
-        Some(RuntimeMessageUpdate::Message(received))
-    }
+    }))
 }
 
 fn removed_chat_record(

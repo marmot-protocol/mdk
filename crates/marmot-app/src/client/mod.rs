@@ -2,9 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
-};
+use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
 use cgka_traits::app_components::{
     AppComponentData, AppComponentSet, BLOSSOM_LOCATOR_KIND_V1, BlobStoreEndpointV1,
     BlobStoreEndpointV2, ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2,
@@ -54,12 +52,12 @@ use crate::messages::{
 };
 use crate::notifications;
 use crate::{
-    AccountState, AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions,
-    AppDisbandRequest, AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
-    AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
-    AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
-    AppInitialGroupImage, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
-    AppQuarantinedGroup, AppRoutingState, AppRuntime, AppTransportRouting, CanonicalCreatedGroup,
+    AccountState, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest, AppError,
+    AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent,
+    AppGroupImageComponent, AppGroupImageInput, AppGroupMemberRecord,
+    AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord, AppInitialGroupImage,
+    AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState, AppQuarantinedGroup,
+    AppRoutingState, AppRuntime, AppTransportRouting, CanonicalCreatedGroup,
     GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
     MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
     PendingWelcomeDelivery, SelfMembership, SendSummary, unix_now_seconds,
@@ -3044,14 +3042,6 @@ impl AppClient {
         Ok(self.runtime.safe_export_secret(group_id, component_id)?)
     }
 
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub fn agent_text_stream_exporter_secret(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<SecretBytes, AppError> {
-        self.exporter_secret(group_id, AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, 32)
-    }
-
     pub(crate) fn exporter_secret(
         &self,
         group_id: &GroupId,
@@ -4736,9 +4726,9 @@ impl AppClient {
     }
 
     /// Build, encrypt, send, and project the inner Marmot app event for `intent`.
-    /// Returns the built event so callers (agent-stream start/finish) can surface
-    /// its tags. The authoring account id and clock are resolved here so the
-    /// inner `pubkey` always equals the MLS-authenticated sender.
+    /// Returns the built event so callers can surface its tags. The authoring
+    /// account id and clock are resolved here so the inner `pubkey` always
+    /// equals the MLS-authenticated sender.
     pub(crate) async fn send_app_event(
         &mut self,
         group_id: &GroupId,
@@ -4901,8 +4891,6 @@ impl AppClient {
                 (Family::Notification, "update")
             }
             AppMessageIntent::PushTokenRemoval { .. } => (Family::Notification, "remove"),
-            AppMessageIntent::StreamStart { .. } => (Family::Stream, "start"),
-            AppMessageIntent::StreamFinal { .. } => (Family::Stream, "finalize"),
             AppMessageIntent::AgentActivity { .. }
             | AppMessageIntent::AgentOperation { .. }
             | AppMessageIntent::GroupSystem { .. }
@@ -6392,46 +6380,6 @@ impl AppClient {
             server: self.app.deployment().group_image_endpoint_for(None)?,
             transport: self.blossom_http_transport.clone(),
         })
-    }
-
-    pub(crate) async fn start_agent_text_stream_with_local_projection<F>(
-        &mut self,
-        group_id: &GroupId,
-        stream_id: &[u8],
-        parent_message_id: Option<String>,
-        quic_candidates: Vec<String>,
-        on_local_projection: F,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
-    where
-        F: FnMut(crate::AppProjectionUpdate),
-    {
-        self.send_app_event_with_local_projection(
-            group_id,
-            AppMessageIntent::StreamStart {
-                stream_id: stream_id.to_vec(),
-                parent_message_id,
-                quic_candidates,
-            },
-            on_local_projection,
-        )
-        .await
-    }
-
-    pub(crate) async fn finish_agent_text_stream_with_local_projection<F>(
-        &mut self,
-        group_id: &GroupId,
-        request: AgentTextStreamFinishRequest,
-        on_local_projection: F,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
-    where
-        F: FnMut(crate::AppProjectionUpdate),
-    {
-        self.send_app_event_with_local_projection(
-            group_id,
-            AppMessageIntent::StreamFinal { request },
-            on_local_projection,
-        )
-        .await
     }
 
     /// Send an app-defined event with an arbitrary non-reserved kind. `tags`

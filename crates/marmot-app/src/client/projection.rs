@@ -1,9 +1,8 @@
 use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
 use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
-    GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::group::ProtocolProfile;
@@ -11,11 +10,14 @@ use cgka_traits::storage::{GroupStorage, MessageStorage, StorageProvider};
 use cgka_traits::{GroupId, TransportGroupSubscription};
 use storage_sqlite::StoredNostrRoute;
 
-use crate::groups::{EventGroupProjection, GroupConfirmationProjection, add_group, event_group_id};
+use crate::groups::{
+    CARRIED_OPAQUE_COMPONENTS, EventGroupProjection, GroupConfirmationProjection, add_group,
+    event_group_id, is_carried_opaque_component,
+};
 use crate::{
-    AppAgentTextStreamComponent, AppError, AppGroupAdminPolicyComponent,
-    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageInput,
-    AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent, AppGroupProfileComponent,
+    AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppGroupEncryptedMediaComponent, AppGroupImageInput, AppGroupMessageRetentionComponent,
+    AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
     AppGroupRecord, AppMessageProjection, AppPriorNostrRoute, AppTransportRouting,
     SecureDeleteExpiredResult, unix_now_seconds,
 };
@@ -738,7 +740,7 @@ impl AppClient {
     }
 
     /// Build the full [`EventGroupProjection`] for one group: one batched
-    /// engine read answers all 7 components (instead of 7 state loads), plus
+    /// engine read answers every component (instead of a state load each), plus
     /// the admin-policy lookup. Per-component fallbacks match the individual
     /// `*_for_group` helpers. Errs when the batched component read itself
     /// fails, or when the routing component is missing or unparseable — the
@@ -765,7 +767,11 @@ impl AppClient {
                 profile: previous.profile,
                 admin_policy: previous.admin_policy,
                 message_retention: previous.message_retention,
-                agent_text_stream: previous.agent_text_stream,
+                opaque_components: previous
+                    .unknown_components
+                    .into_iter()
+                    .filter(|component| is_carried_opaque_component(component.component_id))
+                    .collect(),
                 avatar_url: previous.avatar_url,
                 encrypted_media: previous.encrypted_media,
                 image: AppGroupImageInput {
@@ -784,11 +790,13 @@ impl AppClient {
             NOSTR_ROUTING_COMPONENT_ID,
             GROUP_PROFILE_COMPONENT_ID,
             GROUP_MESSAGE_RETENTION_COMPONENT_ID,
-            AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
             GROUP_AVATAR_URL_COMPONENT_ID,
             media_component_id,
             GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-        ];
+        ]
+        .into_iter()
+        .chain(CARRIED_OPAQUE_COMPONENTS.iter().map(|(id, _)| *id))
+        .collect::<Vec<_>>();
         let components = self.runtime.app_components(group_id, &component_ids)?;
 
         // Keyed by id, not positional consumption order, so reordering the
@@ -800,6 +808,16 @@ impl AppClient {
             .filter_map(|(id, bytes)| bytes.map(|bytes| (id, bytes)))
             .collect();
         let mut take = |id: u16| by_id.remove(&id);
+        let opaque_components = CARRIED_OPAQUE_COMPONENTS
+            .iter()
+            .filter_map(|(id, name)| {
+                take(*id).map(|data| AppGroupOpaqueComponent {
+                    component_id: *id,
+                    component: (*name).to_owned(),
+                    data_hex: hex::encode(data),
+                })
+            })
+            .collect();
         Ok(EventGroupProjection {
             nostr_routing: parse_routing_component(take(NOSTR_ROUTING_COMPONENT_ID))?,
             group_metadata,
@@ -808,9 +826,7 @@ impl AppClient {
             message_retention: parse_retention_component(take(
                 GROUP_MESSAGE_RETENTION_COMPONENT_ID,
             )),
-            agent_text_stream: parse_agent_stream_component(take(
-                AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-            )),
+            opaque_components,
             avatar_url: parse_avatar_component(take(GROUP_AVATAR_URL_COMPONENT_ID)),
             encrypted_media: parse_media_component(
                 media_component_id,
@@ -1371,12 +1387,6 @@ fn parse_retention_component(bytes: Option<Vec<u8>>) -> AppGroupMessageRetention
         .unwrap_or_else(AppGroupMessageRetentionComponent::disabled)
 }
 
-fn parse_agent_stream_component(bytes: Option<Vec<u8>>) -> AppAgentTextStreamComponent {
-    bytes
-        .map(|bytes| AppAgentTextStreamComponent::from_bytes(&bytes))
-        .unwrap_or_else(AppAgentTextStreamComponent::disabled)
-}
-
 fn parse_avatar_component(bytes: Option<Vec<u8>>) -> AppGroupAvatarUrlComponent {
     bytes
         .map(|bytes| AppGroupAvatarUrlComponent::from_bytes(&bytes))
@@ -1511,22 +1521,6 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
             "read_marker_failed:message_draft_revision_conflict"
         }
         AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",
-        AppError::AgentStreamPublisher(_) => "read_marker_failed:agent_stream_publisher",
-        AppError::AgentStreamFinishMismatch => "read_marker_failed:agent_stream_finish_mismatch",
-        AppError::AgentStreamSendFailed(_) => "read_marker_failed:agent_stream_send_failed",
-        AppError::AgentStreamMissingStart => "read_marker_failed:agent_stream_missing_start",
-        AppError::AgentStreamStartNotConfirmed => {
-            "read_marker_failed:agent_stream_start_not_confirmed"
-        }
-        AppError::AgentStreamUnsupportedRoute => {
-            "read_marker_failed:agent_stream_unsupported_route"
-        }
-        AppError::AgentStreamMissingCandidate => {
-            "read_marker_failed:agent_stream_missing_candidate"
-        }
-        AppError::AgentStreamInvalidCandidate(_) => {
-            "read_marker_failed:agent_stream_invalid_candidate"
-        }
         AppError::Publish(_) => "read_marker_failed:publish",
         AppError::EventTooLarge { .. } => "read_marker_failed:event_too_large",
         AppError::NoUsableRelay => "read_marker_failed:no_usable_relay",

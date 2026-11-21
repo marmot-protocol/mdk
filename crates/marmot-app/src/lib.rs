@@ -23,8 +23,6 @@ use cgka_traits::app_components::{
 };
 #[allow(deprecated)]
 pub use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT as AGENT_TEXT_STREAM_COMPONENT,
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID as AGENT_TEXT_STREAM_COMPONENT_ID,
     GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_COMPONENT, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
@@ -78,7 +76,6 @@ mod unlinked_publish_gate;
 mod user_blocks;
 pub use runtime::RuntimeBlockListSubscription;
 pub use user_blocks::{BlockListSnapshot, BlockedUser};
-mod agent_streams;
 mod app_outcome;
 mod network_proxy;
 mod usage_diagnostics;
@@ -138,7 +135,6 @@ mod notifications;
 mod observability_tests;
 mod profile_publication;
 mod projection;
-mod publisher_sequences;
 mod relay_caps;
 mod relay_event_limits;
 mod root_closers;
@@ -185,9 +181,7 @@ pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
     AccountAttentionUnavailable, AccountManager, AccountSetup, AccountSetupReadiness,
-    AccountSetupRequest, AccountSetupResult, AgentPublisher, AgentPublisherOptions,
-    AgentPublisherRecord, AgentPublisherRouting, AgentStreamWatchOptions,
-    AgentTextStreamCryptoContext, AuditOtlpAttemptOutcome, BackgroundBackupOutcome,
+    AccountSetupRequest, AccountSetupResult, AuditOtlpAttemptOutcome, BackgroundBackupOutcome,
     CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport,
     ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction, OnboardingCheckOutcome,
     OnboardingCheckPurpose, OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding,
@@ -197,13 +191,12 @@ pub use runtime::{
     OnboardingRelayTagRole, OnboardingRepairProposal, OnboardingSingleDeviceNotice,
     OnboardingSnapshot, OnboardingStatus, OnboardingStep, OnboardingStepState,
     OnboardingSubscription, RelayFailure, RuntimeAccountAttentionSubscription, RuntimeAccountError,
-    RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
     RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
     RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
     RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
     RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeRelayLivenessSubscription,
     RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
-    SignOutOptions, SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
+    SignOutOptions, SignOutOutcome, TimelineWindowHandle, WipeOutcome,
 };
 pub use runtime::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
@@ -233,10 +226,6 @@ pub use storage_sqlite::{
     TimelineRemoveReason, TimelineUpdateTrigger,
 };
 
-pub use agent_streams::{
-    AgentStreamDelta, AgentStreamUpdate, AgentStreamWatchCompletion, AgentStreamWatchManager,
-    AgentStreamWatchReport, AgentStreamWatchStart,
-};
 pub use audit_log::{
     AUDIT_LOG_DEFAULT_MAX_BYTES_PER_ACCOUNT, AUDIT_LOG_MAX_AGE_DAYS,
     AUDIT_LOG_MIN_MAX_BYTES_PER_ACCOUNT, AuditDeliveryBacklog, AuditDeliveryFailure,
@@ -299,18 +288,17 @@ pub use error::{
     AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason, MissingKeyPackageReason,
 };
 pub use groups::{
-    AppAccountDevicesActivation, AppAgentTextStreamComponent, AppBlobEndpoint,
-    AppCreateGroupOptions, AppDisbandFailureReason, AppDisbandRequest,
-    AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupConversationSnapshot,
-    AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason, AppGroupImageComponent,
-    AppGroupLifecycleState, AppGroupMemberIds, AppGroupMemberRecord,
-    AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupNostrRoutingComponent,
-    AppGroupOpaqueComponent, AppGroupProfileComponent, AppGroupRecord, AppGroupRoster,
-    AppGroupRosterMember, AppGroupSystemEvent, AppInitialGroupImage, AppPreparedGroupImageUpload,
-    AppPreparedGroupImageUploadState, AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup,
-    DirectConversationOptions, GroupRecoveryStatus, GroupRejoinInvitation,
-    GroupSystemEventProvenance, MAX_GROUP_MEMBER_IDS_PAGE_SIZE, PendingGroupInvite,
-    group_system_event_from_message,
+    AppAccountDevicesActivation, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandFailureReason,
+    AppDisbandRequest, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppGroupConversationSnapshot, AppGroupEncryptedMediaComponent,
+    AppGroupHydrationQuarantineReason, AppGroupImageComponent, AppGroupLifecycleState,
+    AppGroupMemberIds, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
+    AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
+    AppGroupRecord, AppGroupRoster, AppGroupRosterMember, AppGroupSystemEvent,
+    AppInitialGroupImage, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
+    AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, DirectConversationOptions,
+    GroupRecoveryStatus, GroupRejoinInvitation, GroupSystemEventProvenance,
+    MAX_GROUP_MEMBER_IDS_PAGE_SIZE, PendingGroupInvite, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -346,7 +334,7 @@ pub use media::{
     media_attachment_from_imeta_tag, media_attachment_outcomes_from_media_json,
     media_attachment_outcomes_from_tags, parse_media_attachment,
 };
-pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
+pub use messages::{is_reserved_app_event_kind, tag_value, tag_values};
 pub use nostr_directory::Directory;
 #[cfg(test)]
 use nostr_directory::USER_DIRECTORY_SEARCH_MAX_FRONTIER;
@@ -574,7 +562,6 @@ const ACCOUNT_WORKER_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const ACCOUNT_WORKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 const ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS: u64 = 500;
 const APP_RUNTIME_SUBSCRIPTION_BUFFER: usize = 1024;
-const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
 const DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER: &str =
     ".marmot-directory-future-created-at-cleanup-v1";
 pub(crate) const MAX_SEEN_EVENT_IDS: usize = 16_384;
@@ -754,19 +741,6 @@ pub struct MarmotApp {
     /// Cancelled for good when the runtime shuts down or storage closes:
     /// every running emoji set install stops and later ones are refused.
     emoji_install_stop: tokio_util::sync::CancellationToken,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentTextStreamFinishRequest {
-    pub stream_id: Vec<u8>,
-    /// Hex-encoded MLS message id of the kind-1200 stream-start event. Carried
-    /// on the kind-9 stream-final as the `["stream-start", <start_event_id>]`
-    /// tag (`spec/features/agent-text-streams-quic.md:310-318`).
-    pub start_event_id: String,
-    pub final_text_or_reference: String,
-    pub transcript_hash: [u8; 32],
-    pub chunk_count: u64,
-    pub finished_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]

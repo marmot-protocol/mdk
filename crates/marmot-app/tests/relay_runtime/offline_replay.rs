@@ -339,17 +339,15 @@ async fn offline_plaintext_replay(senders: usize, per_sender: usize, offline: Du
         .collect();
     let complete = timeout(Duration::from_secs(60), async {
         while observed.len() < expected.len() {
-            if let RuntimeMessageUpdate::Message(message) = subscription
+            let RuntimeMessageUpdate::Message(message) = subscription
                 .recv()
                 .await
-                .expect("permanent message consumer stays open")
-            {
-                assert!(
-                    expected.contains(&message.message.plaintext),
-                    "only the expected authenticated chat texts are delivered"
-                );
-                observed.insert(message.message.plaintext);
-            }
+                .expect("permanent message consumer stays open");
+            assert!(
+                expected.contains(&message.message.plaintext),
+                "only the expected authenticated chat texts are delivered"
+            );
+            observed.insert(message.message.plaintext);
         }
     })
     .await;

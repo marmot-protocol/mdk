@@ -1242,10 +1242,7 @@ pub(crate) fn notification_trigger_for_intent(
         | AppMessageIntent::Reply { .. }
         | AppMessageIntent::Media { .. }
         | AppMessageIntent::ThreadMessage { .. }
-        | AppMessageIntent::Poll { .. }
-        | AppMessageIntent::StreamFinal { .. } => {
-            Some(notifications::NotificationTrigger::NewMessage)
-        }
+        | AppMessageIntent::Poll { .. } => Some(notifications::NotificationTrigger::NewMessage),
         // A thread message sent through the custom-event path wakes members too.
         AppMessageIntent::Custom { kind, tags, .. }
             if cgka_traits::thread_message_parent(*kind, tags).is_some() =>
@@ -1261,7 +1258,6 @@ pub(crate) fn notification_trigger_for_intent(
         | AppMessageIntent::Edit { .. }
         | AppMessageIntent::Delete { .. }
         | AppMessageIntent::PollResponse { .. }
-        | AppMessageIntent::StreamStart { .. }
         | AppMessageIntent::AgentActivity { .. }
         | AppMessageIntent::AgentOperation { .. }
         | AppMessageIntent::GroupSystem { .. }

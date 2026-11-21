@@ -291,8 +291,6 @@ impl AccountWorkerCommand {
             | Self::DownloadMedia { .. }
             | Self::SecureDeleteExpiredPlaintext { .. }
             | Self::DiscardFailedSend { .. }
-            | Self::StartAgentTextStream { .. }
-            | Self::FinishAgentTextStream { .. }
             | Self::RetryGroupConvergence { .. }
             | Self::MaintenanceStatus { .. }
             | Self::ScheduleManualSelfUpdate { .. }

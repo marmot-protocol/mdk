@@ -8,7 +8,6 @@ use zeroize::Zeroizing;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::{GroupId, SecretBytes};
 use tokio::sync::{mpsc, oneshot};
 
@@ -22,14 +21,14 @@ use super::{
 use crate::client::read_state::{ReadAnswer, ReadState, reissue};
 use crate::messages::AppMessageIntent;
 use crate::{
-    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
-    AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupConversationSnapshot,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster,
-    AppPreparedGroupImageUpload, AppQuarantinedGroup, CanonicalCreatedGroup, CreatedGroup,
-    GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    AgentOperationEventRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
+    AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppGroupRoster, AppPreparedGroupImageUpload, AppQuarantinedGroup, CanonicalCreatedGroup,
+    CreatedGroup, GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationSyncResult, RetentionSweepReport,
+    SecureDeleteExpiredResult, SendSummary,
 };
 use marmot_observability::AppPerformanceOperation;
 
@@ -3108,52 +3107,6 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await
-    }
-
-    pub(crate) async fn start_agent_text_stream(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        stream_id: Vec<u8>,
-        parent_message_id: Option<String>,
-        quic_candidates: Vec<String>,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::StartAgentTextStream {
-                group_id: group_id.clone(),
-                stream_id,
-                parent_message_id,
-                quic_candidates,
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let result = account_worker_response(response).await?;
-        self.schedule_audit_log_tracker_update("start_agent_text_stream");
-        Ok(result)
-    }
-
-    pub(crate) async fn finish_agent_text_stream(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        request: AgentTextStreamFinishRequest,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::FinishAgentTextStream {
-                group_id: group_id.clone(),
-                request,
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let result = account_worker_response(response).await?;
-        self.schedule_audit_log_tracker_update("finish_agent_text_stream");
-        Ok(result)
     }
 
     pub async fn retry_group_convergence(

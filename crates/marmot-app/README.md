@@ -165,8 +165,7 @@ resolved by the proxy. HTTP clients still resolve and validate destinations loca
 SOCKS5 while retaining the original HTTP Host header and TLS identity. The proxy is an explicitly trusted egress.
 
 `ALL_PROXY` cannot replace this policy and `NO_PROXY` cannot bypass it. Invalid configuration, connection failure,
-and authentication rejection do not fall back to direct connections. QUIC agent preview publishing and watching
-are unavailable with SOCKS5 enabled because this TCP proxy path cannot carry QUIC.
+and authentication rejection do not fall back to direct connections.
 
 ## Local storage
 

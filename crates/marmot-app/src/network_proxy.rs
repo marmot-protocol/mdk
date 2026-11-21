@@ -39,14 +39,3 @@ pub(crate) fn http_builder(
         None => Ok(builder),
     }
 }
-
-pub(crate) fn require_direct_transport() -> Result<(), crate::AppError> {
-    if socks5_proxy().map_err(config_error)?.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "QUIC agent previews are unavailable while WN_SOCKS5_PROXY is enabled; SOCKS5 TCP routing cannot carry QUIC",
-        )
-        .into());
-    }
-    Ok(())
-}
