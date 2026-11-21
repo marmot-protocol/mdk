@@ -36,16 +36,10 @@
           "quicCandidates": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "quic:// preview broker candidates for live previews."
+            "description": "Ignored; live previews were removed."
           },
-          "streaming": {
-            "type": ["object", "boolean"],
-            "description": "Live QUIC preview streaming: { mode: off|partial|block|progress } (boolean for legacy on/off). block is the safest preview mode; partial/progress recover durable finals from the OpenClaw transcript."
-          },
-          "blockStreaming": {
-            "type": "boolean",
-            "description": "Enable OpenClaw completed-block delivery into Marmot's live preview sink. Defaults on when QUIC candidates are configured and Marmot streaming is not off."
-          },
+          "streaming": { "type": ["object", "boolean"], "description": "Ignored; live previews were removed." },
+          "blockStreaming": { "type": "boolean", "description": "Ignored; live previews were removed." },
           "profileNameOnboarding": { "type": "boolean" },
           "dm": {
             "type": "object",

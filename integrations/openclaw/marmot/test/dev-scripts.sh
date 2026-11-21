@@ -17,7 +17,6 @@ group_id="$(printf '22%.0s' {1..32})"
     --socket-dir-mode "0770" \
     --socket-mode "0660" \
     --relay "wss://relay.example" \
-    --quic-candidate "quic://127.0.0.1:4433" \
     --print-env
 
 [ -f "$dev_root/env.sh" ]
@@ -68,12 +67,9 @@ source "$dev_root/env.sh"
 [ "$MARMOT_ACCOUNT_ID_HEX" = "$account_id" ]
 [ "$MARMOT_GROUP_ID_HEX" = "$group_id" ]
 [ "$MARMOT_RELAYS" = "wss://relay.example" ]
-[ "$MARMOT_QUIC_CANDIDATES" = "quic://127.0.0.1:4433" ]
 [ "$(cat "$MARMOT_AGENT_AUTH_TOKEN_FILE")" = "script-token" ]
 [ "${wn_agent_relay_args[0]}" = "--relay" ]
 [ "${wn_agent_relay_args[1]}" = "wss://relay.example" ]
-[ "${wn_agent_quic_args[0]}" = "--quic-candidate" ]
-[ "${wn_agent_quic_args[1]}" = "quic://127.0.0.1:4433" ]
 
 OPENCLAW_STOP_MARKER="$stop_marker" "$repo_root/scripts/openclaw_marmot_dev_teardown.sh" --root "$dev_root" --dry-run
 [ "$(cat "$stop_marker")" = "stopped" ]
@@ -92,13 +88,11 @@ source "$default_root/env.sh"
 
 [ "$MARMOT_ACCOUNT_ID_HEX" = "" ]
 [ "$MARMOT_GROUP_ID_HEX" = "" ]
-[ "$MARMOT_QUIC_CANDIDATES" = "" ]
 [ "$MARMOT_AGENT_AUTH_TOKEN_FILE" = "" ]
 [ "$MARMOT_AGENT_SOCKET_DIR_MODE" = "0700" ]
 [ "$MARMOT_AGENT_SOCKET_MODE" = "0600" ]
 [ "$MARMOT_RELAYS" = "wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat" ]
 [ "${#wn_agent_relay_args[@]}" -eq 4 ]
-[ "${#wn_agent_quic_args[@]}" -eq 0 ]
 "$repo_root/scripts/openclaw_marmot_dev_teardown.sh" --root "$default_root" --force
 [ ! -e "$default_root" ]
 

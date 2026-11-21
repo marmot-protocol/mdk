@@ -14,7 +14,6 @@ PLUGIN_SRC="$REPO_ROOT/integrations/openclaw/marmot"
 ROOT="${OPENCLAW_MARMOT_DEV_ROOT:-${TMPDIR:-/tmp}/openclaw-marmot-test}"
 PRINT_ENV=0
 RELAYS=()
-QUIC_CANDIDATES=()
 AUTH_TOKEN=""
 AUTH_TOKEN_FILE=""
 SOCKET_DIR_MODE="0700"
@@ -29,7 +28,6 @@ Usage: openclaw_marmot_dev_setup.sh [options]
 Options:
   --root DIR              Dev root (default: ${TMPDIR:-/tmp}/openclaw-marmot-test)
   --relay URL             Public relay URL (repeatable; defaults to the White Noise pilot relays)
-  --quic-candidate URL    quic:// preview broker candidate (repeatable)
   --account-id-hex HEX    Marmot account id exported for plugin/gateway helpers
   --group-id-hex HEX      Marmot group id exported for smoke/helper scripts
   --auth-token TOKEN      Write TOKEN to ROOT/control.token for a token-gated control socket
@@ -45,7 +43,6 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --root) ROOT="$2"; shift 2;;
         --relay) RELAYS+=("$2"); shift 2;;
-        --quic-candidate) QUIC_CANDIDATES+=("$2"); shift 2;;
         --account-id-hex) ACCOUNT_ID_HEX="$2"; shift 2;;
         --group-id-hex) GROUP_ID_HEX="$2"; shift 2;;
         --auth-token) AUTH_TOKEN="$2"; shift 2;;
@@ -89,8 +86,6 @@ echo "openclaw-marmot dev setup: building plugin in $PLUGIN_SRC"
         -u MARMOT_DM_ALLOW_FROM \
         -u MARMOT_GROUP_ID_HEX \
         -u MARMOT_HOME \
-        -u MARMOT_QUIC_CANDIDATE \
-        -u MARMOT_QUIC_CANDIDATES \
         -u MARMOT_RELAYS \
         -u MARMOT_WELCOMER_ALLOWLIST \
         pnpm test
@@ -102,18 +97,7 @@ if [ "${#RELAYS[@]}" -eq 0 ]; then
 fi
 
 write_env_file() {
-    local quic_csv=""
     local relay_csv=""
-    local candidate
-    if [ "${#QUIC_CANDIDATES[@]}" -gt 0 ]; then
-        for candidate in "${QUIC_CANDIDATES[@]}"; do
-            if [ -z "$quic_csv" ]; then
-                quic_csv="$candidate"
-            else
-                quic_csv="$quic_csv,$candidate"
-            fi
-        done
-    fi
     local relay
     for relay in "${RELAYS[@]}"; do
         if [ -z "$relay_csv" ]; then
@@ -139,20 +123,11 @@ write_env_file() {
         printf 'export MARMOT_ACCOUNT_ID_HEX=%q\n' "$ACCOUNT_ID_HEX"
         printf 'export MARMOT_GROUP_ID_HEX=%q\n' "$GROUP_ID_HEX"
         printf 'export MARMOT_RELAYS=%q\n' "$relay_csv"
-        printf 'export MARMOT_QUIC_CANDIDATES=%q\n' "$quic_csv"
         echo 'wn_agent_relay_args=('
         for relay in "${RELAYS[@]}"; do
             printf '  %q\n' "--relay"
             printf '  %q\n' "$relay"
         done
-        echo ')'
-        echo 'wn_agent_quic_args=('
-        if [ "${#QUIC_CANDIDATES[@]}" -gt 0 ]; then
-            for candidate in "${QUIC_CANDIDATES[@]}"; do
-                printf '  %q\n' "--quic-candidate"
-                printf '  %q\n' "$candidate"
-            done
-        fi
         echo ')'
     } >"$ENV_FILE"
 }
@@ -246,7 +221,7 @@ fi
 if [ -n "${MARMOT_ACCOUNT_ID_HEX:-}" ]; then
     bootstrap_args+=(--account-id-hex "$MARMOT_ACCOUNT_ID_HEX")
 fi
-exec cargo run -p agent-connector --bin wn-agent -- "${bootstrap_args[@]}" "${wn_agent_relay_args[@]}" "${wn_agent_quic_args[@]}" --qr "$@"
+exec cargo run -p agent-connector --bin wn-agent -- "${bootstrap_args[@]}" "${wn_agent_relay_args[@]}" --qr "$@"
 SCRIPT
 
     cat >"$ROOT/start-wn-agent.sh" <<'SCRIPT'

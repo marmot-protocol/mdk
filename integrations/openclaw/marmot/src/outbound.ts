@@ -2,10 +2,7 @@
 //
 // Built with the current `openclaw/plugin-sdk/channel-outbound` message
 // lifecycle: `send.text` is the durable final path and maps onto wn-agent's
-// `send_final`; `send.media` maps onto wn-agent's `send_media`. Live QUIC
-// previews are layered on separately via the finalizable-live-preview adapter
-// (see src/live.ts) and are only declared as capabilities once backed by
-// contract tests.
+// `send_final`; `send.media` maps onto wn-agent's `send_media`.
 
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, rm, writeFile } from "node:fs/promises";

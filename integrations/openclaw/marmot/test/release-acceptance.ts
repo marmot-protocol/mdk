@@ -396,7 +396,7 @@ async function main(): Promise<void> {
     await waitFor("wn-agent socket", () => (existsSync(socketPath) ? true : undefined), 60_000);
     const bootstrap = JSON.parse(runSync(options.wnAgent, [
       "bootstrap", "--json", "--home", agentHome, "--socket", socketPath, "--label", "acceptance",
-      "--relay", relay, "--no-quic", "--allow-welcomer", clientId,
+      "--relay", relay, "--allow-welcomer", clientId,
     ], { env: rustEnv })) as { account_id_hex: string; key_package_published: boolean };
     check(bootstrap.key_package_published, "wn-agent did not publish a KeyPackage");
     const agentId = bootstrap.account_id_hex;
@@ -452,7 +452,6 @@ async function main(): Promise<void> {
         accountIdHex: agentId,
         senderPolicy: { allowedUsers: [clientId] },
         dm: { allowFrom: [clientId] },
-        streaming: { mode: "off" },
         profileNameOnboarding: false,
       },
     };

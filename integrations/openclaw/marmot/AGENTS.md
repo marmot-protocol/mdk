@@ -6,10 +6,12 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` and `
 ## Scope
 
 - A thin, **control-plane-only** OpenClaw channel plugin. `wn-agent` owns the
-  Marmot account, MLS state, Nostr transport, and QUIC previews; this plugin
+  Marmot account, MLS state, Nostr transport, and durable sends; this plugin
   only speaks `marmot.agent-control.v2` (NDJSON over a Unix socket).
-- Use `stream_finish` with acknowledged final text; Rust owns transcript hashing and chunking.
-- No QUIC, crypto, relay, or MLS logic here.
+- Replies are final-only: each answer is one durable `send_final` through the message adapter. Live previews were
+  removed; the legacy `quicCandidates`/`streaming`/`blockStreaming` config keys stay in the schema only so existing
+  configs keep loading, and are ignored.
+- No crypto, relay, or MLS logic here.
 - Privacy-safe logging only: no account ids, group ids, message ids, pubkeys,
   relay URLs, payloads, ciphertext, plaintext, or key material.
 - Runtime agents send media through OpenClaw's normal `message` tool with
@@ -22,8 +24,6 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` and `
 ## Key files
 
 - `src/client.ts` — agent-control NDJSON client (request/response + `subscribe_inbound` stream).
-- `src/append-only.ts` — append-only suffix tracker for progressive updates.
-- `src/live.ts` — live-preview state machine → `stream_begin`/`append`/`finalize`/`cancel`.
 - `src/inbound.ts` — inbound subscription bridge (reconnect, dedupe, resync).
 - `src/gateway.ts` — OpenClaw-owned account lifecycle and inbound subscription.
 - `src/inbound-runtime.ts` — the inbound→agent dispatch seam.
@@ -31,7 +31,6 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` and `
   message context.
 - `src/group-info-cache.ts` — bounded per-(account, group) cache for `is_direct` activation and display subject.
 - `src/durable-final-idempotency.ts` — idempotency keys for durable final sends.
-- `src/session-transcript.ts` — best-effort transcript read to recover a truncated final reply.
 - `src/history-tool.ts` — `marmot_history` agent tool.
 - `src/profile-onboarding.ts` — one-time public profile (kind:0) name consent flow.
 - `src/runtime-state.ts` — process-local channel subscription status snapshots.
@@ -75,8 +74,8 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` and `
   channels; the SDK's barrels get re-cut between them (2026.7.2-beta moved
   `getDefaultLocalRoots` out of `plugin-sdk/media-runtime` and dropped
   `assertLocalMediaAllowed` from the public surface altogether).
-- The inbound→agent and live-preview-pipeline seams use OpenClaw gateway runtime
-  internals and are validated by the deterministic connector E2E plus the docker
+- The inbound→agent seam uses OpenClaw gateway runtime
+  internals and is validated by the deterministic connector E2E plus the docker
   phone test, not the unit tests alone.
 
 ## Verification
