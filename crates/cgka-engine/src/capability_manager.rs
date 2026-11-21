@@ -183,23 +183,14 @@ pub(crate) fn required_capabilities_from_group(mls_group: &MlsGroup) -> GroupCap
 /// `GroupCapabilities` so callers reuse the same `missing_from` check used for
 /// required components.
 pub(crate) fn required_role_capabilities_from_group(mls_group: &MlsGroup) -> GroupCapabilities {
-    required_role_capabilities_of(mls_group.extensions())
-}
-
-/// [`required_role_capabilities_from_group`] for a GroupContext that may not
-/// be live yet, such as the one a staged Commit would produce.
-pub(crate) fn required_role_capabilities_of(
-    extensions: &openmls::prelude::Extensions<openmls::prelude::GroupContext>,
-) -> GroupCapabilities {
-    let Some(bytes) = extensions.app_data_dictionary().and_then(|dictionary| {
-        dictionary
-            .dictionary()
-            .get(&cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID)
-    }) else {
+    let Some(bytes) = crate::app_components::app_component_data_of_group(
+        mls_group,
+        cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+    ) else {
         return GroupCapabilities::default();
     };
     let Ok(policy) =
-        cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1::decode_component_state(bytes)
+        cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1::decode_component_state(&bytes)
     else {
         // A malformed component is rejected elsewhere (component validation);
         // surface no role requirement here rather than guessing a mask.

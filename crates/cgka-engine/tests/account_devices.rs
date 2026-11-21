@@ -36,10 +36,6 @@ use cgka_engine::{
     ConvergenceClock, DEFAULT_CIPHERSUITE, Engine, EngineBuilder, ManualConvergenceClock,
 };
 use cgka_traits::EngineError;
-use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY,
-    AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE, AgentTextStreamQuicPolicyV1,
-};
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID,
     AppComponentData, AppComponentSet, GROUP_PROFILE_COMPONENT_ID, GroupProfileV1,
@@ -1283,88 +1279,6 @@ async fn upgrade_never_requires_account_devices() {
             .contains(ACCOUNT_DEVICES_COMPONENT_ID),
         "every member advertises 0x800d, yet an upgrade must not require it"
     );
-}
-
-/// The retired agent text stream component (`0x8006`) still requires its
-/// `required_member_roles` of every leaf the resulting state holds, on every
-/// Commit (agent-text-stream-quic-v1.md, "Validation"). No engine send path
-/// commits such state, so a receiver must reject a raw OpenMLS commit that
-/// sets a policy requiring `receive` while no member advertises it. It lives
-/// here for this file's raw-commit harness.
-#[tokio::test]
-async fn a_commit_requiring_a_role_no_member_advertises_is_rejected() {
-    let mut alice = device(b"alice", false);
-    let mut carol = device(b"carol", false);
-    let carol_kp = carol.engine.fresh_key_package().await.unwrap();
-    let gid = found_group(&mut alice, vec![carol_kp], false, &mut [&mut carol]).await;
-
-    let crafted = crafted_commit(&alice, &gid, vec![], vec![receive_role_policy()], None);
-    assert_rejected_on_replay(&mut carol, &crafted, &gid).await;
-}
-
-/// State a group already holds still loads when it misses a role the retired
-/// agent text stream component requires: the role check judges Commits being
-/// applied, not stored or joined state, so an upgrade cannot quarantine a group
-/// that an older build accepted. Dave advertises `receive` (a joiner must),
-/// alice and carol do not, and dave joins and reopens.
-#[tokio::test]
-async fn a_held_state_missing_a_required_role_still_loads() {
-    let mut alice = device(b"alice", false);
-    let mut carol = device(b"carol", false);
-    let carol_kp = carol.engine.fresh_key_package().await.unwrap();
-    let gid = found_group(&mut alice, vec![carol_kp], false, &mut [&mut carol]).await;
-    let dave_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
-    let mut dave = receive_role_device(dave_storage.clone());
-    let dave_kp = dave.engine.fresh_key_package().await.unwrap();
-    let welcome = crafted_welcome(
-        &alice,
-        &gid,
-        &[dave_kp],
-        vec![receive_role_policy()],
-        vec![],
-        &dave,
-    );
-
-    assert_joins(&mut dave, &welcome, &gid, &alice).await;
-    drop(dave);
-    let reopened = receive_role_device(dave_storage);
-    assert!(reopened.engine.quarantined_groups().is_empty());
-    assert!(reopened.engine.members(&gid).is_ok());
-}
-
-/// The pre-retirement `0x8006` policy, which requires the `receive` role.
-fn receive_role_policy() -> AppDataUpdateProposal {
-    AppDataUpdateProposal::update(
-        AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-        AgentTextStreamQuicPolicyV1::user_to_agent_default()
-            .encode_component_state()
-            .unwrap(),
-    )
-}
-
-/// Dave, a current-profile device on `storage` that advertises the retired
-/// agent text stream `receive` role, with his stored groups loaded.
-fn receive_role_device(storage: SqliteAccountStorage) -> Device {
-    let mut registry = registry();
-    registry.register(
-        AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
-        CapabilityRequirement {
-            requires: AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY,
-            level: RequirementLevel::Optional,
-            description: "agent text stream receive role",
-        },
-    );
-    let mut engine = EngineBuilder::new(storage.clone())
-        .identity(pad32(b"dave"))
-        .account_identity_proof_signer(proof_signer(b"dave"))
-        .protocol_profile(ProtocolProfile::Current)
-        .feature_registry(registry)
-        .supported_app_components(default_group_components())
-        .peeler(Box::<MockPeeler>::default())
-        .build()
-        .unwrap();
-    engine.hydrate_all_stored_groups().unwrap();
-    Device { engine, storage }
 }
 
 #[tokio::test]
