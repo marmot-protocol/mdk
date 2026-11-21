@@ -7,8 +7,8 @@
 //! - Every runtime record/enum has a `#[repr(C)]` mirror in [`types`],
 //!   converted from the `…Ffi` types and released by a deep-free.
 //! - Blocking calls: async runtime methods run on an embedded multi-thread
-//!   tokio runtime via `block_on`. Push-based surfaces (subscriptions,
-//!   agent streams) additionally offer callback registration.
+//!   tokio runtime via `block_on`. Push-based surfaces (subscriptions)
+//!   additionally offer callback registration.
 //! - Errors: fallible functions return [`MarmotStatus`]; detail text for
 //!   the current thread's most recent failure comes from
 //!   [`marmot_last_error_message`].
@@ -33,7 +33,6 @@ pub mod file_media;
 pub(crate) mod macros;
 pub mod memory;
 pub mod nip46;
-pub mod publisher;
 pub mod secret_store;
 pub mod status;
 pub mod subscriptions;

@@ -37,9 +37,7 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
     }
 }
 
-/// Top-level event firehose, FFI-shaped. Agent streams collapse to a single
-/// "agent stream activity" variant — host apps do not differentiate them at
-/// the surface level for v1.
+/// Top-level event firehose, FFI-shaped.
 // FFI enum: see `TimelineSubscriptionUpdateFfi` — UniFFI lowers each variant
 // by value, so boxing wouldn't change the wire size.
 #[allow(clippy::large_enum_variant)]
@@ -71,10 +69,6 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
         message: String,
-    },
-    AgentStreamActivity {
-        account_id_hex: String,
-        account_label: String,
     },
     /// A canonical create or confirmed Add still owes a Welcome to `recipient_hex`;
     /// pending does not prove whether the recipient received it (mdk#352).
@@ -527,10 +521,6 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_id_hex: e.account_id_hex,
                 account_label: e.account_label,
                 message: e.message,
-            },
-            MarmotAppEvent::AgentStreamStarted(m) => Self::AgentStreamActivity {
-                account_id_hex: m.account_id_hex,
-                account_label: m.account_label,
             },
             MarmotAppEvent::WelcomeDeliveryPending {
                 account_id_hex,
@@ -1278,56 +1268,5 @@ mod tests {
                 reason: AppGroupHydrationQuarantineReasonFfi::OpenMlsGroupMissing,
             }
         ));
-    }
-
-    #[test]
-    fn stream_start_outer_event_projects_only_account_activity() {
-        // The pure native start builder is private to marmot-app. Match its
-        // full current no-parent/no-broker fallback schema, using the public
-        // canonical event constructor. This does not run QUIC or publication.
-        let inner = cgka_traits::app_event::MarmotAppEvent::new(
-            CHOICE_SENDER,
-            11,
-            1200,
-            vec![
-                vec!["stream".into(), "55".repeat(32)],
-                vec!["stream-type".into(), "text".into()],
-                vec!["final-kind".into(), "9".into()],
-                vec!["route".into(), "quic".into()],
-            ],
-            "",
-        );
-        // Sanity-parse the fixture with the native public view. Its parser is
-        // lenient; full profile constraints above are checked against the builder.
-        let view = marmot_app::StreamStartView::from_event(inner.kind, &inner.tags).unwrap();
-        assert_eq!(view.stream_id_hex, "55".repeat(32));
-        assert_eq!(view.route, "quic");
-        assert!(view.quic_candidates.is_empty());
-        let native = MarmotAppEvent::AgentStreamStarted(marmot_app::RuntimeAgentStreamMessage {
-            account_id_hex: CHOICE_ACCOUNT.into(),
-            account_label: "alice".into(),
-            message: marmot_app::ReceivedMessage {
-                authority: None,
-                message_id_hex: inner.id,
-                source_message_id_hex: "43".repeat(32),
-                sender: inner.pubkey,
-                sender_display_name: None,
-                group_id: GroupId::new(vec![0x31; 16]),
-                source_epoch: 7,
-                retention: Some(cgka_traits::app_event::AppMessageRetentionDecision::new(
-                    11, 0,
-                )),
-                plaintext: inner.content,
-                kind: inner.kind,
-                tags: inner.tags,
-                recorded_at: inner.created_at,
-                received_at: 12,
-            },
-        });
-        assert!(
-            matches!(MarmotEventFfi::from(native), MarmotEventFfi::AgentStreamActivity {
-            account_id_hex, account_label,
-        } if account_id_hex == CHOICE_ACCOUNT && account_label == "alice")
-        );
     }
 }

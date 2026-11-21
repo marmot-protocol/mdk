@@ -7,7 +7,6 @@
 //! Hosts must inspect them before navigating to a link or fetching an image;
 //! the original untrusted destination is intentionally preserved.
 
-use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN;
 use marmot_markdown::{
     Alignment as MdAlignment, AutolinkKind as MdAutolinkKind, Block as MdBlock,
     CodeBlockKind as MdCodeBlockKind, Document as MdDocument, Inline as MdInline,
@@ -17,7 +16,9 @@ use marmot_markdown::{
 };
 
 const MAX_FFI_MARKDOWN_DEPTH: usize = 128;
-const MAX_FFI_MARKDOWN_INPUT_BYTES: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
+/// Bounds the synchronous parse of untrusted host input; the value is the
+/// plaintext frame cap the retired agent text stream used.
+const MAX_FFI_MARKDOWN_INPUT_BYTES: usize = 65_519;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct MarkdownDocumentFfi {

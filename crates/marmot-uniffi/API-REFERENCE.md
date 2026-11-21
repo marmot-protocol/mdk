@@ -533,35 +533,6 @@ Fetch one untrusted kind:0 profile `picture` URL with MDK dial-safe HTTPS policy
 </details>
 
 <details>
-<summary>commands/agent_stream.rs</summary>
-
-### `Marmot::start_agent_text_stream`
-
-**Current.**
-
-```rust
-pub async fn start_agent_text_stream( &self, account_ref: String, group_id_hex: String, stream_id_hex: Option<String>, quic_candidates: Vec<String>, ) -> Result<AgentStreamStartFfi, MarmotKitError>
-```
-
-Anchor a live agent text stream start in the encrypted group history. Host apps pass the broker candidate(s) they will publish to, such as `quic://quic-broker.ipf.dev:4450`; omit `stream_id_hex` to let Rust generate a 32-byte stream id.
-
-[Source](src/commands/agent_stream.rs#L51)
-
-### `Marmot::watch_agent_text_stream`
-
-**Current.**
-
-```rust
-pub async fn watch_agent_text_stream( &self, account_ref: String, group_id_hex: String, stream_id_hex: Option<String>, server_cert_der: Option<Vec<u8>>, insecure_local: bool, ) -> Result<Arc<AgentStreamSubscription>, MarmotKitError>
-```
-
-Watch a live agent text stream over the brokered QUIC channel. Pass `stream_id_hex = None` to follow the latest stream in the group (the common case when reacting to an AgentStreamStarted event). The returned subscription yields incremental `Chunk`s then a terminal `Finished` / `Failed`. `server_cert_der` pins a self-signed broker cert (else the bundled public-CA roots, not the OS trust store); `insecure_local` is loopback-only for testing.
-
-[Source](src/commands/agent_stream.rs#L89)
-
-</details>
-
-<details>
 <summary>commands/attachment_access.rs</summary>
 
 ### `Marmot::attachment_local_assets`
@@ -2182,7 +2153,7 @@ Reset a group on this account-device, without sending an MLS leave or disband. E
 pub async fn delete_group_local( &self, account_ref: String, group_id_hex: String, ) -> Result<bool, MarmotKitError>
 ```
 
-Delete this group's local app data without performing an MLS leave. The caller should cancel any active UI subscriptions for the group before invoking the wipe. The runtime removes the active transport route, then transactionally drops the chat-list/account projection, plaintext app events, timeline rows, agent-stream projection rows, push-token rows, and cached encrypted-media epoch secrets. MLS/OpenMLS group state is left intact; a future fresh group delivery can recreate a local chat row. Returns true if any local rows or a live route were removed.
+Delete this group's local app data without performing an MLS leave. The caller should cancel any active UI subscriptions for the group before invoking the wipe. The runtime removes the active transport route, then transactionally drops the chat-list/account projection, plaintext app events, timeline rows, push-token rows, and cached encrypted-media epoch secrets. MLS/OpenMLS group state is left intact; a future fresh group delivery can recreate a local chat row. Returns true if any local rows or a live route were removed.
 
 [Source](src/commands/group.rs#L980)
 
@@ -4762,7 +4733,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L330)
+[Source](src/lib.rs#L325)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4772,7 +4743,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 The same open as `new_with_configuration`: every constructor opens with [device groups](README.md#device-groups) on. Kept so existing hosts keep compiling.
 
-[Source](src/lib.rs#L343)
+[Source](src/lib.rs#L338)
 
 ### `Marmot::new_with_options`
 
@@ -4784,7 +4755,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L354)
+[Source](src/lib.rs#L349)
 
 ### `Marmot::new`
 
@@ -4796,7 +4767,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L383)
+[Source](src/lib.rs#L378)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4808,7 +4779,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L409)
+[Source](src/lib.rs#L404)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4820,7 +4791,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L440)
+[Source](src/lib.rs#L435)
 
 ### `Marmot::new_with_client_name`
 
@@ -4832,7 +4803,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L461)
+[Source](src/lib.rs#L456)
 
 ### `Marmot::start`
 
@@ -4844,7 +4815,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L499)
+[Source](src/lib.rs#L494)
 
 ### `Marmot::shutdown`
 
@@ -4856,7 +4827,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L511)
+[Source](src/lib.rs#L506)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4868,7 +4839,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L547)
+[Source](src/lib.rs#L542)
 
 ### `Marmot::storage_is_closed`
 
@@ -4880,7 +4851,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L555)
+[Source](src/lib.rs#L550)
 
 ### `Marmot::is_stopping`
 
@@ -4892,72 +4863,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L562)
-
-</details>
-
-<details>
-<summary>publisher.rs</summary>
-
-### `Marmot::open_agent_publisher`
-
-**Current.**
-
-```rust
-pub async fn open_agent_publisher( &self, account_ref: String, group_id_hex: String, options: PublisherOptionsFfi, ) -> Result<Arc<AgentTextPublisher>, MarmotKitError>
-```
-
-Publish a new stream start and return a handle for appending records. No exporter secret or framing state crosses the foreign boundary.
-
-[Source](src/publisher.rs#L51)
-
-### `AgentTextPublisher::info`
-
-**Current.**
-
-```rust
-pub fn info(&self) -> PublisherInfoFfi
-```
-
-Read the anchored stream information.
-
-[Source](src/publisher.rs#L86)
-
-### `AgentTextPublisher::append`
-
-**Current.**
-
-```rust
-pub async fn append( &self, kind: PublisherRecordFfi, text: String, ) -> Result<PublisherAckFfi, MarmotKitError>
-```
-
-Append transcript/preview content; transport failure does not discard accepted transcript content.
-
-[Source](src/publisher.rs#L93)
-
-### `AgentTextPublisher::finish`
-
-**Current.**
-
-```rust
-pub async fn finish(&self) -> Result<SendSummaryFfi, MarmotKitError>
-```
-
-Seal and durably send the transcript; inspect send disposition. Retry on the same handle after failure; successful repeats return the original receipt.
-
-[Source](src/publisher.rs#L110)
-
-### `AgentTextPublisher::cancel`
-
-**Current.**
-
-```rust
-pub async fn cancel(&self)
-```
-
-Stop the preview; an already-running finish wins. State is not restored after process restart.
-
-[Source](src/publisher.rs#L114)
+[Source](src/lib.rs#L557)
 
 </details>
 
@@ -5409,31 +5315,7 @@ pub async fn next_update(&self) -> Option<UserSearchUpdateFfi>
 
 Await the next step of the search, or `None` once it is over.
 
-[Source](src/subscriptions.rs#L447)
-
-### `AgentStreamSubscription::stream_id_hex`
-
-**Current.**
-
-```rust
-pub fn stream_id_hex(&self) -> String
-```
-
-The resolved stream id this watch is following (hex).
-
-[Source](src/subscriptions.rs#L457)
-
-### `AgentStreamSubscription::next`
-
-**Current.**
-
-```rust
-pub async fn next(&self) -> Option<AgentStreamUpdateFfi>
-```
-
-Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
-
-[Source](src/subscriptions.rs#L462)
+[Source](src/subscriptions.rs#L429)
 
 ### `PresentedChatListSubscription::snapshot`
 
@@ -5445,7 +5327,7 @@ pub fn snapshot(&self) -> Option<crate::conversions::PresentedChatListUpdateFfi>
 
 Take the initial snapshot once, with generation and sequence zero.
 
-[Source](src/subscriptions.rs#L496)
+[Source](src/subscriptions.rs#L463)
 
 ### `PresentedChatListSubscription::next`
 
@@ -5457,7 +5339,7 @@ pub async fn next( &self, ) -> Result<Option<crate::conversions::PresentedChatLi
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L500)
+[Source](src/subscriptions.rs#L467)
 
 </details>
 
@@ -5779,7 +5661,7 @@ pub async fn next(&self) -> Option<crate::conversions::BackupRestoreStatusFfi>
 
 Wait for the next aggregate progress or availability revision; `None` means the worker closed. This receive is cancellation-safe. Closing the observer does not cancel restore; use the named operation command.
 
-[Source](src/subscriptions.rs#L536)
+[Source](src/subscriptions.rs#L503)
 
 ### `BackupRestoreSubscription::snapshot`
 
@@ -5789,7 +5671,7 @@ pub fn snapshot(&self) -> Option<crate::conversions::BackupRestoreStatusFfi>
 
 Take the initial status exactly once; later calls return `None`. Use `next` for changes or `backupRestoreStatus` for a fresh read. This observer owns neither recovery words nor the operation.
 
-[Source](src/subscriptions.rs#L532)
+[Source](src/subscriptions.rs#L499)
 
 ### `Marmot::backup_history_availability`
 

@@ -83,7 +83,6 @@ fn projected_outcome(tag: &[String], source_epoch: u64) -> MediaAttachmentOutcom
         kind: 9,
         source_epoch: Some(source_epoch),
         media: Some(serde_json::json!({ "imeta": [tag] })),
-        agent_text_stream: None,
         deleted: false,
         deletion_source: Default::default(),
         invalidation_status: None,

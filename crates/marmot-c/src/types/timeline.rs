@@ -183,7 +183,6 @@ c_mirror! {
         /// Ordered per-attachment outcomes for the previewed message:
         /// accepted references plus typed rejections at their positions.
         vec media/media_len: MarmotMediaAttachmentOutcome,
-        opt_str agent_text_stream_json,
         copy deleted: bool,
         copy deletion_source: MarmotDeletionSource,
         /// Convergence invalidation reason for the previewed message.
@@ -296,9 +295,8 @@ c_mirror! {
         /// is a `Rejected` entry at its position with a typed reason; the
         /// text and valid sibling attachments are unaffected.
         vec media/media_len: MarmotMediaAttachmentOutcome,
-        opt_str agent_text_stream_json,
         /// Parsed view of kind-1210 group system rows. NULL for chat,
-        /// reactions, stream rows, and malformed assertions.
+        /// reactions, and malformed assertions.
         opt_rec group_system: MarmotGroupSystemEvent,
         rec reactions: MarmotTimelineReactionSummary,
         opt_rec edit: MarmotTimelineEditSummary,
@@ -345,8 +343,6 @@ c_enum! {
         ReactionRemoved,
         MessageDeleted,
         ReplyPreviewChanged,
-        AgentStreamStarted,
-        AgentStreamFinished,
         AgentActivity,
         AgentOperation,
         GroupSystem,

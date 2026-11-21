@@ -246,27 +246,15 @@ impl From<RuntimeMessageReceived> for RuntimeMessageReceivedFfi {
 /// onto the underlying marmot-app types.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum MessageUpdateFfi {
-    /// A raw message update: chat, reply, media, reaction, delete, or the kind-9
-    /// stream-final. Materialized timeline pages also include kind-1200 stream
-    /// starts as `TimelineMessageRecordFfi` rows.
+    /// A raw message update: chat, reply, media, reaction, delete, or any
+    /// other received app event.
     Message { received: RuntimeMessageReceivedFfi },
-    /// A kind-1200 agent text stream start — the signal to open the QUIC
-    /// preview for raw message subscribers. Its stream id, route, and brokers
-    /// live on `message.tags`.
-    AgentStreamStarted { received: RuntimeMessageReceivedFfi },
 }
 
 impl From<RuntimeMessageUpdate> for MessageUpdateFfi {
     fn from(value: RuntimeMessageUpdate) -> Self {
         match value {
             RuntimeMessageUpdate::Message(m) => Self::Message { received: m.into() },
-            RuntimeMessageUpdate::AgentStreamStarted(m) => Self::AgentStreamStarted {
-                received: RuntimeMessageReceivedFfi {
-                    account_id_hex: m.account_id_hex,
-                    account_label: m.account_label,
-                    message: ReceivedMessageFfi::from(&m.message),
-                },
-            },
         }
     }
 }
@@ -274,7 +262,6 @@ impl From<RuntimeMessageUpdate> for MessageUpdateFfi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use marmot_app::RuntimeAgentStreamMessage;
 
     #[test]
     fn retention_sweep_outcomes_keep_deferred_and_failed_host_choices() {
@@ -305,39 +292,30 @@ mod tests {
     }
 
     #[test]
-    fn raw_message_and_stream_start_updates_keep_different_host_tags() {
+    fn raw_message_update_keeps_the_received_message() {
         // The recovery subscription also rebuilds legacy projection rows with
-        // no authority or outer transport id; these are DTO contrasts only.
-        let message = |kind, byte| ReceivedMessage {
-            authority: None,
-            message_id_hex: hex::encode([byte; 32]),
-            source_message_id_hex: String::new(),
-            sender: "ab".repeat(32),
-            sender_display_name: None,
-            group_id: cgka_traits::GroupId::new(vec![0xcd; 16]),
-            source_epoch: 7,
-            retention: None,
-            plaintext: "hello".into(),
-            kind,
-            tags: vec![],
-            recorded_at: 11,
-            received_at: 12,
-        };
+        // no authority or outer transport id; this is a DTO check only.
         let chat = RuntimeMessageUpdate::Message(RuntimeMessageReceived {
             account_id_hex: "ac".repeat(32),
             account_label: "alice".into(),
-            message: message(9, 0x11),
-        });
-        let stream = RuntimeMessageUpdate::AgentStreamStarted(RuntimeAgentStreamMessage {
-            account_id_hex: "ac".repeat(32),
-            account_label: "alice".into(),
-            message: message(1200, 0x22),
+            message: ReceivedMessage {
+                authority: None,
+                message_id_hex: hex::encode([0x11; 32]),
+                source_message_id_hex: String::new(),
+                sender: "ab".repeat(32),
+                sender_display_name: None,
+                group_id: cgka_traits::GroupId::new(vec![0xcd; 16]),
+                source_epoch: 7,
+                retention: None,
+                plaintext: "hello".into(),
+                kind: 9,
+                tags: vec![],
+                recorded_at: 11,
+                received_at: 12,
+            },
         });
         assert!(
             matches!(MessageUpdateFfi::from(chat), MessageUpdateFfi::Message { received } if received.message.kind == 9 && received.message.message_id_hex == "11".repeat(32))
-        );
-        assert!(
-            matches!(MessageUpdateFfi::from(stream), MessageUpdateFfi::AgentStreamStarted { received } if received.message.kind == 1200 && received.message.message_id_hex == "22".repeat(32))
         );
     }
 }

@@ -47,9 +47,9 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use marmot_uniffi::subscriptions::{
-    AgentStreamSubscription, ChatListSubscription, ChatsSubscription, EventsSubscription,
-    GroupStateSubscription, MessagesSubscription, NotificationsSubscription,
-    TimelineMessagesSubscription, UserSearchSubscription,
+    ChatListSubscription, ChatsSubscription, EventsSubscription, GroupStateSubscription,
+    MessagesSubscription, NotificationsSubscription, TimelineMessagesSubscription,
+    UserSearchSubscription,
 };
 use marmot_uniffi::{MarmotKitError, OnboardingSubscription};
 use tokio::runtime::Handle;
@@ -57,11 +57,8 @@ use tokio::task::JoinHandle;
 
 use crate::MarmotStatus;
 use crate::commands::{deliver, try_arg};
-use crate::memory::{
-    CFree, boxed, free_boxed, free_c_string, optional_str, owned_c_string, required_str,
-};
+use crate::memory::{CFree, boxed, free_boxed, optional_str, required_str};
 use crate::status::{set_last_error, status_from_error};
-use crate::types::agent_stream::MarmotAgentStreamUpdate;
 use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatListSubscriptionUpdate,
 };
@@ -100,7 +97,6 @@ unsafe impl Send for MarmotNotificationUpdate {}
 unsafe impl Send for MarmotAppGroupRecord {}
 unsafe impl Send for MarmotChatListRow {}
 unsafe impl Send for MarmotMessageUpdate {}
-unsafe impl Send for MarmotAgentStreamUpdate {}
 unsafe impl Send for MarmotUserSearchUpdate {}
 unsafe impl Send for MarmotOnboardingSnapshot {}
 
@@ -939,110 +935,6 @@ pub unsafe extern "C" fn marmot_group_state_subscription_snapshot(
             Ok(()) => MarmotStatus::Ok,
             Err(status) => {
                 unsafe { free_boxed(record) };
-                status
-            }
-        }
-    })
-}
-
-c_subscription! {
-    /// Opaque handle to a live agent-text-stream watch: incremental
-    /// `Chunk`s, then a terminal `Finished` / `Failed`, after which the
-    /// stream closes. Created by `marmot_watch_agent_text_stream`; the
-    /// matching anchor/start command is `marmot_start_agent_text_stream`.
-    MarmotAgentStreamSubscription(AgentStreamSubscription),
-    item MarmotAgentStreamUpdate from marmot_uniffi::conversions::AgentStreamUpdateFfi,
-    item_free "marmot_agent_stream_update_free",
-    callback MarmotAgentStreamUpdateCallback,
-    read next,
-    next marmot_agent_stream_subscription_next,
-    set_callback marmot_agent_stream_subscription_set_callback,
-    clear_callback marmot_agent_stream_subscription_clear_callback,
-    free marmot_agent_stream_subscription_free
-}
-
-/// Watch a live agent text stream over the brokered QUIC channel. Pass
-/// `stream_id_hex = NULL` to follow the latest stream in the group.
-/// `server_cert_der` (+ `server_cert_der_len`) pins a self-signed broker
-/// certificate; pass NULL with length 0 to use the bundled public-CA roots
-/// (not the OS trust store). The bytes
-/// are copied — the caller keeps ownership. `insecure_local` is
-/// loopback-only for testing. Free with
-/// `marmot_agent_stream_subscription_free`.
-///
-/// # Safety
-/// `client` must be a live handle; `account_ref` and `group_id_hex`
-/// valid strings; `stream_id_hex` NULL or a valid string;
-/// `server_cert_der` NULL with length 0, or a pointer to
-/// `server_cert_der_len` valid bytes; `out_sub` valid.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn marmot_watch_agent_text_stream(
-    client: *const MarmotClient,
-    account_ref: *const std::ffi::c_char,
-    group_id_hex: *const std::ffi::c_char,
-    stream_id_hex: *const std::ffi::c_char,
-    server_cert_der: *const u8,
-    server_cert_der_len: usize,
-    insecure_local: u8,
-    out_sub: *mut *mut MarmotAgentStreamSubscription,
-) -> MarmotStatus {
-    ffi_guard(|| {
-        try_arg!(unsafe { preflight_out_ptr(out_sub) });
-        let client = try_arg!(unsafe { client_ref(client) });
-        let account_ref = try_arg!(unsafe { required_str(account_ref) });
-        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
-        let stream_id_hex = try_arg!(unsafe { optional_str(stream_id_hex) });
-        let server_cert_der = if server_cert_der.is_null() {
-            if server_cert_der_len != 0 {
-                set_last_error("server_cert_der was NULL with nonzero length");
-                return MarmotStatus::NullPointer;
-            }
-            None
-        } else {
-            Some(
-                unsafe { std::slice::from_raw_parts(server_cert_der, server_cert_der_len) }
-                    .to_vec(),
-            )
-        };
-        match client.block_on(client.marmot.watch_agent_text_stream(
-            account_ref,
-            group_id_hex,
-            stream_id_hex,
-            server_cert_der,
-            crate::memory::c_bool(insecure_local),
-        )) {
-            Ok(inner) => unsafe {
-                write_handle(
-                    MarmotAgentStreamSubscription {
-                        core: SubscriptionCore::new(client.runtime.handle().clone()),
-                        inner,
-                    },
-                    out_sub,
-                )
-            },
-            Err(err) => status_from_error(&err),
-        }
-    })
-}
-
-/// The resolved stream id this watch is following (hex). Writes an owned
-/// copy: free it with `marmot_string_free`.
-///
-/// # Safety
-/// `sub` must be a live handle; `out_stream_id_hex` valid.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn marmot_agent_stream_subscription_stream_id_hex(
-    sub: *const MarmotAgentStreamSubscription,
-    out_stream_id_hex: *mut *mut std::ffi::c_char,
-) -> MarmotStatus {
-    ffi_guard(|| {
-        try_arg!(unsafe { preflight_out_ptr(out_stream_id_hex) });
-        let sub = try_arg!(unsafe { sub_ref(sub) });
-        let ptr = owned_c_string(sub.inner.stream_id_hex());
-        match unsafe { write_out(out_stream_id_hex, ptr) } {
-            Ok(()) => MarmotStatus::Ok,
-            Err(status) => {
-                unsafe { free_c_string(ptr) };
                 status
             }
         }

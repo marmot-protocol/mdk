@@ -36,4 +36,3 @@ marmot-app = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 keyring-core.workspace = true
 nostr-relay-builder.workspace = true
-transport-quic-broker.workspace = true

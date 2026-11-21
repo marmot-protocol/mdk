@@ -3621,7 +3621,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "transport-nostr-adapter",
- "transport-quic-broker",
  "url",
  "zeroize",
 ]

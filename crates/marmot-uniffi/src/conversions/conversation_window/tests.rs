@@ -199,7 +199,6 @@ fn prepared_conversion_reuses_rows_and_text_but_keeps_all_visible_changes() {
                 tags: vec![],
                 source_epoch: None,
                 media: None,
-                agent_text_stream: None,
                 deleted: false,
                 deletion_source: Default::default(),
                 invalidation_status: None,

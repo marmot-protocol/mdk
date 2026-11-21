@@ -7,7 +7,6 @@
 //! the documented Swift/Kotlin surface.
 
 pub mod account;
-pub mod agent_stream;
 pub mod audit;
 pub mod backups;
 pub mod chat_list;
