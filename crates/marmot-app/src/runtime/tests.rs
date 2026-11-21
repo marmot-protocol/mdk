@@ -4190,7 +4190,7 @@ async fn another_accounts_wake_runs_no_pass_here() {
 /// Work created without a wake is a missed wake: the next tick's watchdog
 /// counts it and runs the pass, so it waits at most one tick (mdk#2923 step
 /// B). Here an avatar request goes straight to storage, which wakes nothing.
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(start_paused = true)]
 async fn work_created_without_a_wake_is_counted_and_run_by_the_watchdog() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -4199,36 +4199,18 @@ async fn work_created_without_a_wake_is_counted_and_run_by_the_watchdog() {
         .expect("create alice");
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.accounts().reconcile().await.expect("alice starts");
-    let runtime = &runtime;
-    let count = |operation| startup_stage_snapshot(runtime, operation).completed;
-    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-        while count(RuntimeOp::WorkerMaintenance) == 0 || count(RuntimeOp::WorkerAvatarPass) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the first tick and avatar pass run");
-    // Two warm-up ticks, as in the idle test, so no pass left over from
-    // startup (a presentation pass sets the avatar pass due) runs later.
-    let tick = async || {
-        let ticks = count(RuntimeOp::WorkerMaintenance);
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(15)).await;
-        tokio::time::resume();
-        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-            while count(RuntimeOp::WorkerMaintenance) == ticks {
-                tokio::task::yield_now().await;
-            }
-        })
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
         .await
-        .expect("a tick completes");
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
-        }
-    };
-    tick().await;
-    tick().await;
+        .expect("alice finishes startup");
+
+    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    // A paused timer advances only once runnable work and spawn_blocking jobs
+    // have drained, so each sleep returns with the worker idle. Two ticks run
+    // out what startup left due: a local-submission deadline wakes the
+    // account, and its presentation pass sets the avatar pass due.
+    tokio::time::sleep(Duration::from_secs(31)).await;
     let passes = count(RuntimeOp::WorkerAvatarPass);
+    assert!(count(RuntimeOp::WorkerMaintenance) >= 2 && passes > 0);
     assert_eq!(count(RuntimeOp::WatchdogMissedWakeAvatarPass), 0);
 
     app.account_storage("alice")
@@ -4243,26 +4225,23 @@ async fn work_created_without_a_wake_is_counted_and_run_by_the_watchdog() {
             false,
         )
         .expect("request");
-    for _ in 0..200 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::sleep(Duration::from_millis(1)).await;
     assert_eq!(
         count(RuntimeOp::WorkerAvatarPass),
         passes,
         "nothing woke it"
     );
 
-    tick().await;
-    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-        while count(RuntimeOp::WatchdogMissedWakeAvatarPass) == 0
-            || count(RuntimeOp::WorkerAvatarPass) == passes
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the tick's watchdog counts the miss and runs the pass");
-    assert_eq!(count(RuntimeOp::WatchdogMissedWakeAvatarPass), 1);
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    assert_eq!(
+        count(RuntimeOp::WatchdogMissedWakeAvatarPass),
+        1,
+        "the next tick's watchdog counts the miss"
+    );
+    assert!(
+        count(RuntimeOp::WorkerAvatarPass) > passes,
+        "and runs the pass"
+    );
     runtime.shutdown().await;
 }
 
