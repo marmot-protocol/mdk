@@ -63,7 +63,8 @@ impl From<MessageDraftAttachmentFfi> for MessageDraftAttachment {
 /// One attachment of a revisioned draft save: a new inline body, an
 /// attachment the draft already holds, kept by id with its body untouched,
 /// or the id of one to remove. An attachment the save does not name stays
-/// in the draft; only `Removed` deletes one (and its staged file).
+/// in the draft. `Removed` deletes one (and its staged file); `Inline` with
+/// a held id replaces its body and releases a staged file it had.
 #[derive(Clone, uniffi::Enum)]
 pub enum MessageDraftAttachmentInputFfi {
     Inline {

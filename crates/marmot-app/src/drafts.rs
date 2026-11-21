@@ -351,9 +351,10 @@ impl MarmotApp {
     /// inline bytes, the retained id of one already in the draft, or the id
     /// of one to remove. Every attachment the draft holds that the save does
     /// not name stays, so a save never drops one its caller did not know
-    /// about; only [`MessageDraftAttachmentInput::Removed`] deletes one, and
-    /// unlinks a file it owned. The named attachments come first, in order,
-    /// then the kept ones in their stored order.
+    /// about. [`MessageDraftAttachmentInput::Removed`] deletes one, and an
+    /// `Inline` input reusing a held id replaces its body; either unlinks a
+    /// file it owned. The named attachments come first, in order, then the
+    /// kept ones in their stored order.
     pub fn save_message_draft_inputs_if_revision(
         &self,
         account_ref: &str,

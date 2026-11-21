@@ -115,8 +115,9 @@ impl Marmot {
     /// already holds, kept by id, or the id of one to remove. Saving text
     /// never copies a retained body. Every attachment the save does not name
     /// stays, after the named ones in their stored order, so a save never
-    /// drops one the host did not know about; only `Removed` deletes one and
-    /// its file. Retaining an id the draft does not hold is
+    /// drops one the host did not know about. `Removed` deletes one and its
+    /// file; `Inline` with a held id replaces its body and releases a file it
+    /// had. Retaining an id the draft does not hold is
     /// `InvalidMessageDraft`; removing one changes nothing.
     pub fn save_message_draft_inputs_if_revision(
         &self,
