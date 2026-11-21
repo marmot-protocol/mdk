@@ -279,21 +279,7 @@ async fn pending_edit_is_durable_while_original_publication_is_blocked() {
         Some(crate::LocalSendStatus::Queued)
     ));
     h.relay.release_publish();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if matches!(
-                runtime
-                    .local_send_status("alice", &h.group, "edit-token")
-                    .unwrap(),
-                Some(crate::LocalSendStatus::Completed(_))
-            ) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    local_send_completed(&runtime, &h.group, "edit-token").await;
     let row = h
         .app
         .account_storage("alice")
@@ -493,42 +479,14 @@ async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_se
         changed.is_err(),
         "one edit token must never retarget another revision"
     );
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if matches!(
-                runtime
-                    .local_send_status("alice", &h.group, "edit-token")
-                    .unwrap(),
-                Some(crate::LocalSendStatus::Completed(_))
-            ) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    local_send_completed(&runtime, &h.group, "edit-token").await;
     assert!(matches!(
         runtime
             .local_send_status("alice", &h.group, "original-token")
             .unwrap(),
         Some(crate::LocalSendStatus::Completed(_))
     ));
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if matches!(
-                runtime
-                    .local_send_status("alice", &h.group, "latest-edit-token")
-                    .unwrap(),
-                Some(crate::LocalSendStatus::Completed(_))
-            ) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    local_send_completed(&runtime, &h.group, "latest-edit-token").await;
     let row = reopened
         .account_storage("alice")
         .unwrap()
@@ -729,19 +687,7 @@ async fn durable_admission_is_drained_by_a_new_worker() {
         .await
         .unwrap();
     assert_eq!(accepted, retried);
-    let completed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(crate::LocalSendStatus::Completed(summary)) = runtime
-                .local_send_status("alice", &h.group, "restart-token")
-                .unwrap()
-            {
-                break summary;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let completed = local_send_completed(&runtime, &h.group, "restart-token").await;
     assert!(
         reopened
             .account_storage("alice")
@@ -1581,6 +1527,30 @@ async fn tagged_text_and_tagged_edit_are_crash_safe_by_token() {
             .await
             .is_err(),
         "an edit token reused with other tags is a changed request"
+    );
+    let reply = runtime
+        .submit_tagged_reply(
+            "alice",
+            &h.group,
+            sent.message_id_hex.clone(),
+            "and a follow-up".into(),
+            vec![tag("turn", "turn-2")],
+            "reply-token".into(),
+        )
+        .await
+        .unwrap();
+    local_send_completed(&runtime, &h.group, "reply-token").await;
+    assert_eq!(
+        storage
+            .app_message(&group_hex, &reply.message_id_hex)
+            .unwrap()
+            .unwrap()
+            .tags,
+        vec![
+            tag("e", &sent.message_id_hex),
+            tag("q", &sent.message_id_hex),
+            tag("turn", "turn-2"),
+        ]
     );
     assert!(storage.next_local_submission().unwrap().is_none());
     runtime.shutdown_and_close().await.unwrap();
