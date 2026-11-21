@@ -1313,7 +1313,7 @@ pub fn message_draft_attachment_if_revision( &self, account_ref: String, revisio
 
 Read only the requested local attachment, rejecting a changed selected draft. A file-backed attachment is `InvalidMessageDraft`: read it with `read_message_draft_attachment`.
 
-[Source](src/commands/conversation_window.rs#L222)
+[Source](src/commands/conversation_window.rs#L226)
 
 ### `Marmot::save_message_draft_inputs_if_revision`
 
@@ -1323,9 +1323,9 @@ Read only the requested local attachment, rejecting a changed selected draft. A 
 pub fn save_message_draft_inputs_if_revision( &self, account_ref: String, revision: Arc<MessageDraftRevisionFfi>, content: String, reply_to_message_id_hex: Option<String>, media_attachments: Vec<MessageDraftAttachmentInputFfi>, ) -> Result<SelectedMessageDraftFfi, MarmotKitError>
 ```
 
-The save to use once a draft can hold file-backed attachments. Each input is a new inline body (`Inline`) or an attachment the draft already holds, kept by id (`Retained`) without reading or copying its body, so typing a caption next to a large video stays cheap. Order is the inputs' order. Retain every `file_backed` attachment you mean to keep: one left out is deleted with its staged file before this returns. A retained id the draft does not hold is `InvalidMessageDraft`; a stale revision is `MessageDraftRevisionConflict`. `save_message_draft_if_revision` remains for drafts with inline bodies only.
+The save to use once a draft can hold file-backed attachments. Each input is a new inline body (`Inline`), an attachment the draft already holds, kept by id (`Retained`) without reading or copying its body, so typing a caption next to a large video stays cheap, or the id of an attachment to remove (`Removed`). Every attachment the draft holds that the save does not name stays: a save from a composer that has not loaded the draft, or that races a staging copy, never drops a file it did not know about. `Removed` deletes an attachment, and its staged file before this returns; removing an id the draft does not hold changes nothing. An `Inline` input with an id the draft holds replaces that attachment's body, releasing a staged file it had. The named attachments come first, in the inputs' order, then the kept ones in their stored order. A retained id the draft does not hold is `InvalidMessageDraft`; a stale revision is `MessageDraftRevisionConflict`. `save_message_draft_if_revision` remains for drafts with inline bodies only, and still replaces the whole attachment list.
 
-[Source](src/commands/conversation_window.rs#L118)
+[Source](src/commands/conversation_window.rs#L122)
 
 ### `Marmot::stage_message_draft_attachment_file`
 
@@ -1337,7 +1337,7 @@ pub async fn stage_message_draft_attachment_file( &self, account_ref: String, re
 
 Add a large attachment to a draft from a host file instead of a byte array. The file (a regular file, not a symlink; `expected_size` must match when set, and it must not change while it is read) is copied with bounded buffers into the account's encrypted media store, and the draft owns that copy: it survives text saves and restarts and is released when the draft drops it, is cleared or is sent. The host may delete its own file once this returns. Attachments may reach the encrypted-media blob limit (the limit less the 16-byte AEAD tag), with at most 64 per draft and the draft within one upload batch (`max_file_media_ciphertext_bytes()`). These limits, a duplicate id and a copy the disk cannot hold beyond the attachment policy's `disk_reserve` (`StorageFull`) are refused before anything is copied. The media type is stored in its canonical form (lowercase, parameters dropped), as the upload will describe it; a type with no canonical form is refused before copying too. `revision` must be current when the call starts; text saves made while the file copies do not lose it, but the next save with an older revision conflicts, so reload with `selected_message_draft` after this returns. A draft cleared, deleted or sent during the copy stays so, and the copy is discarded with `MessageDraftRevisionConflict`. `control` reports copied bytes and cancels; a cancelled or failed copy leaves no file and no change to the draft.
 
-[Source](src/commands/conversation_window.rs#L152)
+[Source](src/commands/conversation_window.rs#L156)
 
 ### `Marmot::read_message_draft_attachment`
 
@@ -1349,7 +1349,7 @@ pub async fn read_message_draft_attachment( &self, account_ref: String, revision
 
 Read 1..=1048576 bytes at `offset` from one draft attachment, inline or file-backed, for previews and thumbnails without hydrating the whole body. `None` means the draft holds no such attachment; an empty result is the end. Every call rechecks `revision`, so a draft edited between chunks conflicts and the host must restart from a fresh revision; for long reads or OS surfaces that need a file, prefer `open_message_draft_attachment_handoff`. `message_draft_attachment_if_revision` refuses file-backed attachments.
 
-[Source](src/commands/conversation_window.rs#L173)
+[Source](src/commands/conversation_window.rs#L177)
 
 ### `Marmot::open_message_draft_attachment_handoff`
 
@@ -1361,7 +1361,7 @@ pub async fn open_message_draft_attachment_handoff( &self, account_ref: String, 
 
 `open_attachment_handoff` for a draft attachment: writes a plaintext copy under the account's `handoff/` directory for an OS surface that needs a real file (AVFoundation thumbnails, playback, share sheets) and lends it under a lease. The revision is checked once, before the copy; later draft edits neither interrupt it nor revoke the lease. `None` means the draft holds no such attachment. Release the copy with `release_attachment_handoff`. `StorageFull`, the `control` contract and the cancellation rules are those of `open_attachment_handoff`: cancel only through `control`, never by cancelling the awaiting task.
 
-[Source](src/commands/conversation_window.rs#L201)
+[Source](src/commands/conversation_window.rs#L205)
 
 </details>
 
@@ -4504,7 +4504,7 @@ pub fn includes_chat_list_version(&self, version: Arc<ChatListDraftVersionFfi>) 
 
 Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes foreign store/group metadata and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-0130).
 
-[Source](src/conversions/conversation_window.rs#L356)
+[Source](src/conversions/conversation_window.rs#L358)
 
 </details>
 

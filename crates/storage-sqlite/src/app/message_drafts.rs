@@ -42,12 +42,14 @@ impl fmt::Debug for StoredMessageDraftAttachment {
     }
 }
 
-/// One attachment of a draft being saved: new inline bytes, or the id of an
-/// attachment already in the draft, kept as stored without its bytes.
+/// One attachment of a draft being saved: new inline bytes, the id of an
+/// attachment already in the draft, kept as stored without its bytes, or the
+/// id of one to remove.
 #[derive(Clone, PartialEq)]
 pub enum StoredMessageDraftAttachmentInput {
     Inline(StoredMessageDraftAttachment),
     Retained(String),
+    Removed(String),
 }
 
 impl fmt::Debug for StoredMessageDraftAttachmentInput {
@@ -55,11 +57,12 @@ impl fmt::Debug for StoredMessageDraftAttachmentInput {
         match self {
             Self::Inline(attachment) => formatter.debug_tuple("Inline").field(attachment).finish(),
             Self::Retained(_) => formatter.debug_tuple("Retained").finish_non_exhaustive(),
+            Self::Removed(_) => formatter.debug_tuple("Removed").finish_non_exhaustive(),
         }
     }
 }
 
-/// A borrowed [`StoredMessageDraftAttachmentInput`], so inline bytes are
+/// A borrowed attachment the draft holds after a save, so inline bytes are
 /// never copied on their way into the database.
 #[derive(Clone, Copy)]
 pub(crate) enum DraftAttachmentInput<'a> {
@@ -67,16 +70,16 @@ pub(crate) enum DraftAttachmentInput<'a> {
     Retained(&'a str),
 }
 
-impl<'a> From<&'a StoredMessageDraftAttachmentInput> for DraftAttachmentInput<'a> {
-    fn from(value: &'a StoredMessageDraftAttachmentInput) -> Self {
-        match value {
-            StoredMessageDraftAttachmentInput::Inline(attachment) => Self::Inline(attachment),
-            StoredMessageDraftAttachmentInput::Retained(id) => Self::Retained(id),
+impl<'a> DraftAttachmentInput<'a> {
+    /// What `input` leaves in the draft: nothing for a removal.
+    pub(crate) fn kept(input: &'a StoredMessageDraftAttachmentInput) -> Option<Self> {
+        match input {
+            StoredMessageDraftAttachmentInput::Inline(attachment) => Some(Self::Inline(attachment)),
+            StoredMessageDraftAttachmentInput::Retained(id) => Some(Self::Retained(id)),
+            StoredMessageDraftAttachmentInput::Removed(_) => None,
         }
     }
-}
 
-impl<'a> DraftAttachmentInput<'a> {
     fn id(&self) -> &'a str {
         match self {
             Self::Inline(attachment) => &attachment.id,
@@ -364,14 +367,15 @@ fn load_message_draft_attachment_summaries(
     Ok(attachments)
 }
 
-/// The ids of a draft's attachments, for checking retained ids.
+/// The ids of a draft's attachments in their stored order.
 pub(crate) fn draft_attachment_ids_tx(
     conn: &Connection,
     group_id_hex: &str,
-) -> StorageResult<HashSet<String>> {
+) -> StorageResult<Vec<String>> {
     let mut statement = conn
         .prepare_cached(
-            "SELECT attachment_id FROM message_draft_attachments WHERE group_id_hex = ?1",
+            "SELECT attachment_id FROM message_draft_attachments
+             WHERE group_id_hex = ?1 ORDER BY position",
         )
         .storage()?;
     let ids = statement
