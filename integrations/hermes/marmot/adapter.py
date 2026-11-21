@@ -1903,6 +1903,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     ) -> SendResult:
         self._capture_loop()
         chat_id = _normalize_hex(chat_id, "chat_id")
+        if _is_token_stream_preview(metadata):
+            # Marmot cannot edit a sent message. Refusing Hermes's partial
+            # token-stream preview makes it stop streaming and send the reply
+            # once, instead of leaving a durable partial beside the rest.
+            return SendResult(success=False, error="Marmot cannot edit a streamed reply")
         if _APPROVAL_REPLY_CONTEXT.get() == (self, chat_id):
             try:
                 reply_to = _optional_hex(reply_to)
@@ -4655,6 +4660,12 @@ def _metadata_dict_value(metadata: Optional[Dict[str, Any]], key: str) -> Any:
         if isinstance(container, dict) and key in container:
             return container[key]
     return None
+
+
+def _is_token_stream_preview(metadata: Optional[Dict[str, Any]]) -> bool:
+    # Hermes's stream consumer marks a send it will edit later with
+    # `expect_edits`, and adds `notify` only to one that is the whole reply.
+    return bool(metadata) and metadata.get("expect_edits") is True and not metadata.get("notify")
 
 
 def _delivery_class(metadata: Optional[Dict[str, Any]]) -> Optional[str]:

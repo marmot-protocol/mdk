@@ -1748,6 +1748,32 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.final_sends, [])
         self.assertEqual(fake_client.activities, [])
 
+    async def test_token_stream_preview_send_is_refused_and_a_final_send_goes_out(self):
+        # Hermes token streaming sends a partial reply it expects to edit
+        # (`expect_edits` without `notify`). Refusing it makes Hermes stop
+        # streaming and send the reply once; publishing it would leave a
+        # durable partial. A complete send keeps working.
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=fake_client,
+        )
+
+        preview = await adapter.send(
+            "22" * 32, "A partial reply ▉", metadata={"expect_edits": True}
+        )
+        self.assertFalse(preview.success)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.activities, [])
+
+        final = await adapter.send(
+            "22" * 32,
+            "A partial reply with its continuation.",
+            metadata={"expect_edits": True, "notify": True},
+        )
+        self.assertTrue(final.success)
+        self.assertEqual(len(fake_client.final_sends), 1)
+
     async def test_disconnect_clears_tool_progress_dedupe_cache(self):
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(extra={"account_id_hex": "11" * 32}),

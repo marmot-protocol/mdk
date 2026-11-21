@@ -215,10 +215,7 @@ hermes plugins enable marmot
 Hermes clones the detached exact-commit checkout and copies only this plugin
 subdirectory into `~/.hermes/plugins/marmot`; it does not install an MDK
 workspace. Removing `MDK_PLUGIN_CHECKOUT` after installation does not remove the
-installed plugin. Unlike the release installer, this path does not rewrite the
-gateway config: if an older install turned Marmot streaming on, set
-`display.platforms.marmot.streaming: false` yourself, or Hermes splits each
-streamed reply into two messages. Newer Hermes versions may require a separate security-scan
+installed plugin. Newer Hermes versions may require a separate security-scan
 confirmation for source plugins. Review that report for the exact checked-out
 revision; an unattended process cannot assume the confirmation was granted.
 If admission is blocked, report the findings and obtain the runtime's required
@@ -877,8 +874,10 @@ reported as operationally connected.
 - Inbound Marmot messages become Hermes `MessageEvent`s with `chat_id` set to
   the Marmot group id and `user_id` set to the sender account id.
 - Marmot has no live previews and cannot edit a sent message. Hermes token
-  streaming stays off for the Marmot platform, and `edit_message` refuses any
-  durable message, so Hermes sends each completed reply as a new message.
+  streaming stays off for the Marmot platform. If a gateway config turns it on
+  anyway, the adapter refuses the partial preview send, and `edit_message`
+  refuses any durable message, so Hermes sends each completed reply once as a
+  new message.
 - Explicit Hermes delivery context routes non-final commentary to durable agent
   activity (`kind: 1201`, `status: commentary`).
 - Final answers and approvals remain durable `kind: 9` messages. Missing delivery
