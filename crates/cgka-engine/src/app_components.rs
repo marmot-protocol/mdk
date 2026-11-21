@@ -1833,10 +1833,12 @@ fn validate_resulting_leaf_capabilities<'a>(
                     .into(),
             ));
         }
-        if !required_roles
-            .missing_from(&crate::capabilities::capabilities_of_leaf(leaf))
-            .is_empty()
-        {
+        if !required_roles.extensions.iter().all(|role| {
+            capabilities
+                .extensions()
+                .iter()
+                .any(|advertised| u16::from(*advertised) == *role)
+        }) {
             return Err(EngineError::Other(
                 "invalid current-profile resulting state: member lacks a required role capability"
                     .into(),
