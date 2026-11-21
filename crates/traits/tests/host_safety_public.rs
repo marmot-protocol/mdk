@@ -1,8 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use cgka_traits::app_components::{
-    is_loopback_candidate_host, is_loopback_host, is_loopback_ip, is_public_ip, is_public_ipv4,
-    is_public_ipv6, reject_non_public_ip, reject_non_public_socket_addr,
+    is_loopback_host, is_loopback_ip, is_public_ip, is_public_ipv4, is_public_ipv6,
+    reject_non_public_ip, reject_non_public_socket_addr,
 };
 use url::Host;
 
@@ -25,25 +25,6 @@ fn shared_host_safety_classifies_loopback_hosts() {
     assert!(is_loopback_host(Host::Domain("localhost.")));
     assert!(is_loopback_host(Host::Domain("dev.localhost.")));
     assert!(is_loopback_host(Host::Domain("LOCALHOST.")));
-}
-
-#[test]
-fn shared_host_safety_classifies_loopback_candidate_hosts() {
-    // The QUIC-candidate loopback gate is narrower than `is_loopback_host`:
-    // only exact `localhost` (rooted or not) or a loopback IP literal.
-    for host in ["localhost", "localhost.", "LOCALHOST", "127.0.0.1", "::1"] {
-        assert!(is_loopback_candidate_host(host), "{host}");
-    }
-    // `*.localhost` subdomains are NOT candidate-loopback (they do not
-    // unambiguously name a local endpoint for the insecure-trust gate).
-    for host in [
-        "dev.localhost",
-        "dev.localhost.",
-        "broker.example",
-        "203.0.113.10",
-    ] {
-        assert!(!is_loopback_candidate_host(host), "{host}");
-    }
 }
 
 #[test]

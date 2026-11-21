@@ -73,13 +73,14 @@ pub const MARMOT_APP_EVENT_KIND_CHAT: u64 = 9;
 /// event id; `content` is the replacement plaintext. Only honored when the
 /// edit's authenticated author matches the target event's author.
 pub const MARMOT_APP_EVENT_KIND_EDIT: u64 = 1009;
+/// The retired agent text stream start. MDK sends none and shows none, but
+/// keeps the kind reserved so an app cannot send one.
 pub const MARMOT_APP_EVENT_KIND_AGENT_STREAM_START: u64 = 1200;
 pub const MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY: u64 = 1201;
 pub const MARMOT_APP_EVENT_KIND_AGENT_OPERATION: u64 = 1202;
 pub const MARMOT_APP_EVENT_KIND_GROUP_SYSTEM: u64 = 1210;
 
-/// Tag names. `e`/`q` are standard Nostr reference tags; the `stream-*` set is
-/// owned by the agent-text-stream feature.
+/// Tag names. `e`/`q` are standard Nostr reference tags.
 pub const EVENT_REF_TAG: &str = "e";
 pub const QUOTE_REF_TAG: &str = "q";
 pub const AGENT_ACTIVITY_STATUS_TAG: &str = "status";
@@ -128,16 +129,6 @@ pub const GROUP_SYSTEM_DATA_NAME: &str = "name";
 pub const GROUP_SYSTEM_DATA_OLD_NAME: &str = "old_name";
 pub const GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS: &str = "old_retention_seconds";
 pub const GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS: &str = "new_retention_seconds";
-
-pub const STREAM_TAG: &str = "stream";
-pub const STREAM_TYPE_TAG: &str = "stream-type";
-pub const STREAM_FINAL_KIND_TAG: &str = "final-kind";
-pub const STREAM_ROUTE_TAG: &str = "route";
-pub const STREAM_BROKER_TAG: &str = "broker";
-pub const STREAM_PARENT_TAG: &str = "parent";
-pub const STREAM_START_TAG: &str = "stream-start";
-pub const STREAM_HASH_TAG: &str = "stream-hash";
-pub const STREAM_CHUNKS_TAG: &str = "stream-chunks";
 
 /// An unsigned Nostr event carried as the plaintext of an MLS application
 /// message. Same fields as a Nostr event except `sig`.
@@ -603,23 +594,6 @@ mod tests {
             id,
             "da824251ccc2eb3ce8a9e9994e9b0683d520a9729c3611992f8b143cc806ba19"
         );
-    }
-
-    #[test]
-    fn stream_tags_round_trip() {
-        let event = MarmotAppEvent::new(
-            "ee".repeat(32),
-            42,
-            MARMOT_APP_EVENT_KIND_CHAT,
-            vec![
-                vec![STREAM_TAG.into(), "abc123".into()],
-                vec![STREAM_START_TAG.into(), "deadbeef".into()],
-            ],
-            "final text",
-        );
-        let decoded = MarmotAppEvent::decode(&event.encode().unwrap()).unwrap();
-        assert_eq!(decoded.first_tag_value(STREAM_TAG), Some("abc123"));
-        assert_eq!(decoded.first_tag_value(STREAM_START_TAG), Some("deadbeef"));
     }
 
     #[test]

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- The agent text stream over QUIC is retired. `agent_text_stream` keeps only what groups that require the `0x8006`
+  component need: `AgentTextStreamQuicPolicyV1`, `AgentTextStreamPolicyError`, the role bits, the role features and
+  capabilities, `AGENT_TEXT_STREAM_QUIC_ROLES`, `required_role_capabilities`, `AGENT_TEXT_STREAM_COMPONENT_STATE_LEN`
+  and the three component-state caps. Gone: `AgentTextStreamRecordV1`, `AgentTextStreamRecordError`,
+  `AgentTextStreamKeyContextV1`, `AgentTextStreamTranscriptV1`, `AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY` and the record,
+  key-context, transcript, stream-id, AEAD and ciphertext constants, and the `STREAM_*_TAG` tag names. Kind 1200
+  (`MARMOT_APP_EVENT_KIND_AGENT_STREAM_START`) stays reserved.
+
 ### Added
 
 - `threads` holds the NIP-22 thread-message profile: `NIP22_COMMENT_KIND`, `is_nip22_comment` (now also true for a

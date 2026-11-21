@@ -4864,10 +4864,9 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
 #[tokio::test]
 async fn group_context_exports_the_staged_source_then_confirmation_or_rollback() {
     use cgka_traits::types::EpochId;
-    const DOMAINS: [(&str, &[u8]); 3] = [
+    const DOMAINS: [(&str, &[u8]); 2] = [
         ("marmot/group-event", b"group-event"),
         ("marmot/encrypted-media", b"encrypted-media"),
-        ("marmot/agent-text-stream-quic", b"agent-text-stream-quic"),
     ];
     fn checked_context(
         engine: &Engine<SqliteAccountStorage>,

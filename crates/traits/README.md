@@ -38,9 +38,8 @@ between engine, peeler, transport adapter, storage, and caller imports from here
   `GroupCapabilities`, `FeatureStatus`.
 - `GroupContextSnapshot` — the cross-boundary group-context view.
 - Durable convergence-pass and maintenance/publication-recovery records.
-- Agent text stream preview values: QUIC policy/component state (`AgentTextStreamQuicPolicyV1`), role/feature bits,
-  length-delimited records (`AgentTextStreamRecordV1`), and key-context/transcript-hash helpers
-  (`AgentTextStreamKeyContextV1`, `AgentTextStreamTranscriptV1`).
+- The retired agent text stream component (`0x8006`): its state codec (`AgentTextStreamQuicPolicyV1`), role bits,
+  role features and capabilities, kept only so groups that already carry it keep working.
 
 The rustdoc on each trait in `src/` is the reference for method responsibilities: legal states, which errors fire, and
 ordering guarantees.

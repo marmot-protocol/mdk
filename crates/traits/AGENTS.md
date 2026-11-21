@@ -44,7 +44,7 @@ what lives here is in [`README.md`](README.md#what-lives-in-here).
 | `src/app_event.rs` | Typed `MarmotAppEvent` application-message event and sender-validation errors. |
 | `src/capabilities.rs` | Capability/feature negotiation types and requirement levels. |
 | `src/group_context.rs` | `GroupContextSnapshot` group-context view. |
-| `src/agent_text_stream.rs` | Agent text stream component policy, record framing, and transcript helpers. |
+| `src/agent_text_stream.rs` | The retired agent text stream component (`0x8006`): state codec, validation, role bits, features and capabilities, kept so existing groups that require it keep working. |
 | `src/convergence_pass.rs` | Durable state for one bounded convergence pass. |
 | `src/maintenance.rs` | Durable maintenance and publication-recovery value types. |
 | `src/polls.rs` | Bounded Marmot profile of NIP-88 polls carried in MLS app messages. |
