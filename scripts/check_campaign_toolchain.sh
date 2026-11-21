@@ -43,9 +43,7 @@ check_base_image_digests() {
 }
 
 check_builder_image 'campaign' Dockerfile.convergence-campaign
-check_builder_image 'quic broker' Dockerfile.quic-broker
 check_base_image_digests 'campaign' Dockerfile.convergence-campaign
-check_base_image_digests 'quic broker' Dockerfile.quic-broker
 
 check_copy_coverage() {
     local label="$1"
@@ -65,30 +63,15 @@ check_copy_coverage() {
 }
 
 check_copy_coverage 'campaign' Dockerfile.convergence-campaign
-check_copy_coverage 'quic broker' Dockerfile.quic-broker
 
-if grep -Fq 'RUSTUP_TOOLCHAIN=' Dockerfile.convergence-campaign Dockerfile.quic-broker; then
+if grep -Fq 'RUSTUP_TOOLCHAIN=' Dockerfile.convergence-campaign; then
     echo 'error: release images must use rust-toolchain.toml instead of a fixed RUSTUP_TOOLCHAIN override' >&2
     exit 1
 fi
 
-campaign_builder="$(sed -n '/^FROM rust:.* AS builder$/p' Dockerfile.convergence-campaign)"
-quic_builder="$(sed -n '/^FROM rust:.* AS builder$/p' Dockerfile.quic-broker)"
-if [[ "$quic_builder" != "$campaign_builder" ]]; then
-    echo 'error: quic broker builder pin must match the campaign builder pin' >&2
+if ! grep -Fq 'snapshot.debian.org/archive/debian/%s bookworm main' Dockerfile.convergence-campaign; then
+    echo 'error: campaign runtime packages must use the dated Debian snapshot' >&2
     exit 1
 fi
 
-campaign_runtime="$(sed -n '/^FROM /p' Dockerfile.convergence-campaign | sed -n '2p')"
-quic_runtime="$(sed -n '/^FROM /p' Dockerfile.quic-broker | sed -n '2p')"
-if [[ "$quic_runtime" != "$campaign_runtime" ]]; then
-    echo 'error: quic broker runtime pin must match the campaign runtime pin' >&2
-    exit 1
-fi
-
-if ! grep -Fq 'snapshot.debian.org/archive/debian/%s bookworm main' Dockerfile.quic-broker; then
-    echo 'error: quic broker runtime packages must use the dated Debian snapshot' >&2
-    exit 1
-fi
-
-echo "campaign and quic broker toolchain gate: rust ${toolchain}"
+echo "campaign toolchain gate: rust ${toolchain}"

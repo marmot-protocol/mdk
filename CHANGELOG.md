@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- The retired QUIC live preview of agent text is removed (marmot-protocol/marmot#513). The `transport-quic-stream`,
+  `transport-quic-broker` (`marmot-quic-broker`) and `agent-stream-compose` crates, the broker Docker image and its
+  GHCR workflow are gone, and so are the agent stream APIs in `marmot-app`, UniFFI and the C bindings and `wn stream`.
+  The per-crate changelogs list each removed surface. Groups that already require
+  `marmot.group.agent-text-stream.quic.v1` (`0x8006`) keep working: clients still advertise and validate it.
 - `wn-agent` and the Hermes and OpenClaw plugins no longer send live agent text previews over QUIC; every reply is one
   durable message. The `agent-control` v2 stream operations (`stream_begin`, `stream_append`, `stream_status`,
   `stream_progress`, `stream_finish`, `stream_finalize`, `stream_cancel`), their `stream_begun` and

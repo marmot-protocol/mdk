@@ -107,7 +107,6 @@ and reasoned about on its own:
 
  transport-nostr                     the relay plane: shared relay sessions, delivery, directory fetches
  transport-nostr-peeler / -adapter   Nostr events ⇄ engine messages, relay I/O
- transport-quic-stream / -broker     transient live previews for agent replies
  marmot-account                      account homes, signing keys, secret storage
 ```
 
@@ -148,8 +147,6 @@ still land on the same epoch and group state. The engine — not relay order or 
 | Transport | [`transport-nostr-peeler`](crates/transport-nostr-peeler/README.md) | Nostr event ⇄ engine message boundary |
 | | [`transport-nostr-adapter`](crates/transport-nostr-adapter/README.md) | Relay I/O behind an injectable client |
 | | [`transport-nostr`](crates/transport-nostr/README.md) | The relay plane: per-account relay sessions, delivery and directory fetches |
-| | [`transport-quic-stream`](crates/transport-quic-stream/README.md) | QUIC transport for live agent text previews |
-| | [`transport-quic-broker`](crates/transport-quic-broker/README.md) | Memory-only preview broker (`marmot-quic-broker`); [deployment](docs/quic-broker-deployment.md) |
 | App | [`marmot-session`](crates/marmot-session/README.md) | Account-device runtime over an encrypted engine session: publish, routing, KeyPackages; [tests](crates/marmot-session/README.md#tests) |
 | | [`marmot-account`](crates/marmot-account/README.md) | Account homes, signing keys, secret storage |
 | | [`marmot-pairing`](crates/marmot-pairing/README.md) | Device pairing: the code both screens show before a new device links (unreleased) |
@@ -165,7 +162,6 @@ still land on the same epoch and group state. The engine — not relay order or 
 | Front ends | [`cli`](crates/cli/README.md) (`wn-cli`) | `wn`, `wnd`, and `wn tui` |
 | Agents | [`agent-connector`](crates/agent-connector/README.md) | The `wn-agent` connector daemon and its `doctor` setup check |
 | | [`agent-control`](crates/agent-control/README.md) | Agent control protocol messages and framing |
-| | [`agent-stream-compose`](crates/agent-stream-compose/README.md) | Live-preview stream composition |
 | | [`integrations/`](integrations/README.md) | Per-runtime plugins and terminal harnesses |
 | Verification | [`cgka-conformance-simulator`](crates/cgka-conformance-simulator/README.md) | Multi-client scenarios, vectors, chaos, property tests |
 | | [`convergence-campaign-runner`](crates/convergence-campaign-runner/README.md) | Distributed container/VM campaigns |
@@ -266,9 +262,7 @@ and linking; use the opt-in when a change needs that signal before merging.
 Candidate packaging also runs on master when its inputs change, and the
 [nightly release](release.md#nightly-builds) builds and validates the same
 packages on nights it does not skip.
-Existing nightly and weekly campaigns retain their wider coverage. Broker image
-publishing stays serialized per ref so an older build cannot overwrite a newer
-`latest` image.
+Existing nightly and weekly campaigns retain their wider coverage.
 
 Common targeted runs:
 

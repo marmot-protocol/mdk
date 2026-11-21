@@ -21,15 +21,6 @@ pub(crate) fn runtime_message_update_stream_response(
             ),
             "MessageReceived",
         ),
-        // Agent text streams have no CLI surface; a start is an ordinary message.
-        marmot_app::RuntimeMessageUpdate::AgentStreamStarted(message) => message_stream_response(
-            runtime_message_json(
-                &message.message,
-                &message.account_id_hex,
-                &message.account_label,
-            ),
-            "MessageReceived",
-        ),
     }
 }
 

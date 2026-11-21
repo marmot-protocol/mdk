@@ -1912,7 +1912,7 @@ fn mention_classification_covers_bare_npub_mention() {
 fn mention_classification_uses_p_tag_for_mentions_beyond_inline_scan_cap() {
     let receiver = nostr::prelude::Keys::generate().public_key().to_hex();
     let npub = crate::npub_for_account_id(&receiver).unwrap();
-    let cap = cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
+    let cap = crate::messages::MAX_MARKDOWN_MENTION_SCAN_BYTES;
     let plaintext = format!("{} @{npub}", "a".repeat(cap + 1));
 
     // The inline fallback intentionally scans only the bounded prefix. A

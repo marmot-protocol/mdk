@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-11-13
+updated: 2026-11-21
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -328,12 +328,6 @@ This repository now has the main engine candidate:
   optional `sdk` feature provides the first `nostr-sdk` backed relay client.
 - `crates/transport-nostr-peeler` — Nostr boundary mapping for kind `445` / `1059` events, kind `445` group envelope
   peeling, and NIP-59 welcome wrap/peel with injected local signer/decrypter.
-- `crates/transport-quic-stream` — raw QUIC transport binding for transient agent text stream previews over reliable
-  ordered QUIC streams, with transcript hashes tied to durable MLS start/final app-message payloads. Encrypted
-  publishers reserve the next sequence and transcript in the per-account SQLCipher database before writing records;
-  ambiguous crash state disables that start's live preview rather than risking nonce reuse.
-- `crates/transport-quic-broker` — memory-only QUIC pub/sub broker for forwarding live preview records by
-  `stream_id + start_event_id` without account state, relay integration, or payload persistence.
 - `crates/cgka-conformance-simulator` — multi-client simulator, vectors, generated scenarios, and property tests.
 - `crates/marmot-markdown` — CommonMark and Nostr-aware display parser for app message rendering.
 - `crates/marmot-forensics` — opt-in v5 JSONL forensic audit schema and recorder traits, with the frozen v4 schema
@@ -344,11 +338,8 @@ This repository now has the main engine candidate:
   remnants, while preserving v4 files and the separate key-reveal log. See [audit logging](../audit-logging.md).
 - `crates/marmot-uniffi` — UniFFI bindings and build scripts for Swift/Kotlin app runtimes.
 - `crates/agent-control` — `marmot.agent-control.v2` DTOs and newline-delimited JSON framing for agent integrations.
-- `crates/agent-stream-compose` — reusable live-preview stream composition over the QUIC broker publisher.
-- `crates/agent-connector` — local `wn-agent` connector daemon bridging agent control, account runtime, and stream
-  composition; Hermes and OpenClaw plugins talk to it over a Unix socket. Version 2 stream sessions use random
-  per-stream bearer capabilities, reject active stream-id collisions, and replay the original begin receipt for an
-  identical request-id retry.
+- `crates/agent-connector` — local `wn-agent` connector daemon bridging agent control and the account runtime;
+  Hermes and OpenClaw plugins talk to it over a Unix socket.
 - `integrations/hermes/marmot` and `integrations/openclaw/marmot` — thin control-plane-only agent plugins.
 - `formal/tamarin` — formal models for the convergence selector, delivery-order robustness, lifecycle cases, and
   proof/test mapping.
@@ -404,8 +395,7 @@ now validates every resolved collector address and pins the client, with redirec
 explicit loopback-test endpoint contract remains local-only; see [Dial Safety](dial-safety.md).
 Optional process-wide [SOCKS5 routing](../../../crates/marmot-app/README.md#socks5-routing) supports anonymous and
 username/password proxies for runtime relay clients, C NIP-46 sessions, and shared HTTP paths. HTTP retains validated
-IP pins; relay DNS runs at the proxy. Invalid configuration and proxy failures never select direct routing, and
-runtime QUIC agent previews are unavailable in this mode.
+IP pins; relay DNS runs at the proxy. Invalid configuration and proxy failures never select direct routing.
 - **Nostr account transport shape** — the likely production shape includes a Nostr user directory, account bootstrap for
   relay-list events, a shared multi-account relay plane, `marmot.transport.nostr.routing.v1` group routing, and explicit
   relay URL safety policy. This is captured as a working note in

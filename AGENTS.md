@@ -33,10 +33,7 @@ before adding behavior or bindings.
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr relay plane (relay sessions, delivery, publish accounting, directory fetches) | `crates/transport-nostr/AGENTS.md` |
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
-| QUIC agent text stream previews | `crates/transport-quic-stream/AGENTS.md` |
-| QUIC preview broker | `crates/transport-quic-broker/AGENTS.md` |
 | Agent control protocol DTOs / framing | `crates/agent-control/AGENTS.md` |
-| Agent stream composition | `crates/agent-stream-compose/AGENTS.md` |
 | `wn-agent` connector daemon | `crates/agent-connector/AGENTS.md` |
 | Host integrations / connector coexistence | `integrations/AGENTS.md` |
 | Hermes gateway plugin | `integrations/hermes/marmot/AGENTS.md` (tests: `integrations/hermes/tests/marmot/AGENTS.md`) |

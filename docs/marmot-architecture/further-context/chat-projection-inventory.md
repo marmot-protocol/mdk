@@ -1,7 +1,7 @@
 ---
 title: "Chat and conversation projection inventory"
 created: 2026-09-07
-updated: 2026-09-19
+updated: 2026-11-21
 tags: [marmot, architecture, projections, chat]
 ---
 
@@ -40,7 +40,7 @@ copies of a chat screen. Public directory data also lives outside that database.
 | Account group projection | `account_groups`, `account_group_app_components`; `StoredAccountGroup` → `AppGroupRecord` | Group profile, image/URL, components, routing, member count, local archive/invite/membership state; group queries and subscriptions | Saved through account projection deltas. `MarmotApp::groups` loads account projection state and overlays operational state. `group` currently filters that list; it is not a keyed SQL group read. |
 | Direct-conversation membership index | `direct_conversation_members` | Peer-keyed existing-conversation lookup; records exact members for projected unnamed two-member groups | Maintained with account group projection. Legacy accounts have an explicit backfill/readiness path. This is useful independently of the chat-list display. |
 | Raw app-event records | `app_events`; `StoredAppEvent` / `AppMessageRecord` | Inner app events, including reactions, deletes, edits, custom kinds; raw queries, subscriptions, replay and derived timeline inputs | `record_app_event_inner` updates raw input and affected timeline records in one transaction. Raw here means decoded app events, not raw encrypted relay traffic. |
-| Materialized timeline | `message_timeline`, stream-start support; `TimelineMessageRecord` | Aggregated reactions/deletions, replies, edit-event rows, media/stream metadata, retention and invalidation; chat, tooling and agent readers | Incrementally reprojects affected rows and dependencies, but accepted edit-chain resolution remains client-owned. Supports explicit per-group rebuild. Group order uses canonical history; account-wide queries have wall-clock ordering. |
+| Materialized timeline | `message_timeline`; `TimelineMessageRecord` | Aggregated reactions/deletions, replies, edit-event rows, media metadata, retention and invalidation; chat, tooling and agent readers | Incrementally reprojects affected rows and dependencies, but accepted edit-chain resolution remains client-owned. Supports explicit per-group rebuild. Group order uses canonical history; account-wide queries have wall-clock ordering. |
 | Conversation read state | `conversation_read_state` | User read anchor and manual-unread intent | Durable input to unread derivation, not disposable presentation cache. Read mutations refresh the chat row transactionally. |
 | Unread acceleration | `chat_list_unread_messages`, `chat_list_unread_ready_groups`, `chat_list_unread_dirty_messages` | Avoid scanning the whole unread window for each changed message | Timeline SQL triggers mark changed IDs dirty; incremental reconciliation or rebuild updates counts/first unread. Dirty/ready records also support recovery. |
 | Chat-list projection | `chat_list_rows`, `chat_list_projection_meta`; `ChatListRow` | Cached group presentation, preview, unread state, activity ordering, archive/invite/membership fields | Durable but not a fully prepared screen row. Reads join/overlay other state and app code enriches preview sender names and attachment classification. Missing/stale projections can rebuild on a read. |
@@ -133,7 +133,7 @@ Additional sources: [draft ownership](../../../crates/marmot-app/src/drafts.rs),
 ### Timeline preparation already provided
 
 Persisted timeline rows include message content, reply previews, reaction summaries, deletion/invalidation state,
-source epoch, retention deadlines and media/agent-stream metadata. UniFFI adds parsed Markdown, structured group-system
+source epoch, retention deadlines and media metadata. UniFFI adds parsed Markdown, structured group-system
 events and validated downloadable media references, including reply attachment references. This work is significant and
 should be reused. A subscription-local conversion cache retains only its current window and avoids reconverting unchanged
 records; it is an optimization, not competing durable truth.
@@ -194,7 +194,7 @@ described as a cross-database snapshot transaction.
 | Treat as compatibility surface | Row-only `ChatListSubscription::next`; overlapping group/details convenience methods | A flawed event shape is a deprecation candidate; a cheap wrapper over shared implementation is not automatically redundant. Audit consumers before removal. |
 | Keep until migration policy changes | `LegacyAccountProjectionDb` importer and fixtures | Legacy code supports upgrades; its presence does not mean a second live presentation database should be maintained. |
 | Investigate independently | Account/shared directory duplication and selection rules; read-triggered rebuild costs; all-groups work in a single-group query | Possible simplifications/performance work, but none is justified for removal solely by introducing screen projections. |
-| Retain bounded ephemeral optimization | Timeline window and FFI conversion cache; transient stream watches | They hold window/render/transport work, not durable user intent. Durability of screen state does not make these unnecessary. |
+| Retain bounded ephemeral optimization | Timeline window and FFI conversion cache | They hold window/render work, not durable user intent. Durability of screen state does not make these unnecessary. |
 
 Concrete non-screen consumer: [agent timeline reader](../../../crates/agent-connector/src/timeline.rs).
 C mirrors the UniFFI surface rather than implementing an independent projection pipeline; preserve ABI compatibility

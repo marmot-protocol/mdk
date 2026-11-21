@@ -1,7 +1,7 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-11-14
+updated: 2026-11-21
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
@@ -26,7 +26,6 @@ MarmotAppRuntime                  the host API and its typed event stream
     recovery credits, local submission queue
     attachment transfers and permissions, backup conditions
     observer, relay telemetry and audit export
-    agent stream watches
   AccountManager                  the account workers
     account worker(account A)  →  AppClient
     account worker(account B)  →  AppClient
@@ -286,10 +285,7 @@ for the full comparison and consolidation constraints.
 - subscription calls attach to runtime broadcast streams;
 - initial UI state comes from runtime snapshots;
 - live updates come from runtime events;
-- `sync` can remain as a diagnostic or repair command, while normal chat and stream flows work without it.
-
-Agent stream previews belong in the same message subscription stream as other message updates. They should appear as
-typed updates such as `agent_stream_start`, `agent_stream_delta`, `stream_preview`, and `agent_stream_final`.
+- `sync` can remain as a diagnostic or repair command, while normal chat flows work without it.
 
 ## What To Borrow From whitenoise-rs
 
@@ -313,19 +309,17 @@ The first slice now proves the architecture without filling in every product sur
 2. Local signing accounts are restored into an `AccountManager`.
 3. Identity creation publishes relay lists, an empty follow list, a profile, and a fresh KeyPackage through
    runtime-backed setup.
-4. Runtime events cover group joins, group-state changes, messages, and typed agent stream start/final messages.
+4. Runtime events cover group joins, group-state changes, and messages.
 5. Live Nostr receive and ingest run inside `marmot-app` account workers.
 6. `wnd` hosts one runtime and forwards command intents into it.
 7. `messages subscribe`, `chats subscribe`, and `groups subscribe-state` use runtime snapshots plus live receivers.
-8. Agent stream preview state and deltas are owned by a runtime shared stream manager and surfaced through message
-   subscriptions.
-9. The relay plane applies bounded replay lookback, relay endpoint parsing/deduplication, shared directory discovery
+8. The relay plane applies bounded replay lookback, relay endpoint parsing/deduplication, shared directory discovery
    fetch coalescing, and redacted relay-health reporting.
-10. Daemon status reports `last_runtime_activity` instead of modeling the daemon as a background sync loop.
-11. The TUI remains a daemon client.
+9. Daemon status reports `last_runtime_activity` instead of modeling the daemon as a background sync loop.
+10. The TUI remains a daemon client.
 
-The acceptance test should create Alice and Bob, create a group, receive Bob's group join, send a normal message, start
-an agent stream, receive stream deltas, and finish the stream without calling `wn sync` or publishing keys manually.
+The acceptance test should create Alice and Bob, create a group, receive Bob's group join, and send and receive a normal
+message without calling `wn sync` or publishing keys manually.
 
 ## Remaining Hardening
 
@@ -334,9 +328,6 @@ The remaining work is narrower than the original refactor, but still real:
 - directory, profile, follow-list, and KeyPackage discovery now use a shared relay-plane fetch path with in-flight
   coalescing; the remaining production work is turning hot directory data into long-lived subscription maintenance;
 - relay auth, relay scoring, and explicit reconnect/backoff policy are still delegated mostly to `nostr-sdk`;
-- the runtime runs brokered QUIC stream watches itself (`MarmotAppRuntime::watch_agent_text_stream`) and owns stream
-  state and typed updates, but `wn stream watch` still runs through the CLI's own watch path, and the daemon tracks
-  those watch workers' lifecycle;
 - `sync` remains as a diagnostic/repair command and some internal function names still say `sync` for catch-up/replay
   work;
 - hosts can shut the runtime down (`shutdown`), close storage before a suspension (`shutdown_and_close`), report
@@ -357,6 +348,4 @@ The remaining work is narrower than the original refactor, but still real:
 - `crates/transport-nostr`: the shared Nostr relay plane.
 - `crates/transport-nostr-adapter`: reusable Nostr transport adapter and SDK bridge.
 - `crates/transport-nostr-peeler`: Nostr event peeling and wrapping.
-- `crates/transport-quic-stream`: transient agent text stream transport.
-- `crates/transport-quic-broker`: memory-only local broker for transient stream records.
 - `crates/cli`: daemon host, CLI client, and TUI client.

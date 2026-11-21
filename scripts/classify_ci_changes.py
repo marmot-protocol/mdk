@@ -55,8 +55,6 @@ C_WORKSPACE_CRATES = {
     "transport-nostr",
     "transport-nostr-adapter",
     "transport-nostr-peeler",
-    "transport-quic-broker",
-    "transport-quic-stream",
 }
 
 CONFORMANCE_WORKSPACE_CRATES = {
@@ -78,8 +76,6 @@ CONFORMANCE_WORKSPACE_CRATES = {
     "transport-nostr",
     "transport-nostr-adapter",
     "transport-nostr-peeler",
-    "transport-quic-broker",
-    "transport-quic-stream",
 }
 
 IOS_WORKSPACE_CRATES = {
@@ -97,7 +93,6 @@ IOS_WORKSPACE_CRATES = {
 INDEPENDENT_WORKSPACE_CRATES = {
     "agent-connector",
     "agent-control",
-    "agent-stream-compose",
     "cli",
 }
 

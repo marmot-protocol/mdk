@@ -1,7 +1,7 @@
 ---
 title: "Hermes Agent Production Runbook"
 created: 2026-06-08
-updated: 2026-09-17
+updated: 2026-11-21
 tags: [marmot, architecture, agents, hermes, runbook, deployment]
 status: draft-runbook
 ---
@@ -9,8 +9,7 @@ status: draft-runbook
 # Hermes Agent Production Runbook
 
 This runbook covers the supervised deployment path for a Hermes Agent account that appears as a normal Marmot member. The
-durable encrypted Marmot message is the source of truth. QUIC live previews are optional and may be disabled without
-breaking final replies.
+durable encrypted Marmot message is the source of truth.
 
 ## Production Gate
 
@@ -25,7 +24,6 @@ This setup is ready for dogfood or a supervised production pilot when all of the
   connector homes, sockets, tokens, and agent accounts.
 - At least one public Nostr relay is configured for durable Marmot traffic.
 - The phone and the agent computer use the same public relay set.
-- QUIC broker candidates are configured only when the broker is reachable from the phone.
 - The agent account has a published KeyPackage and an invite allowlist entry for the human account that will invite it.
 - Outbound media uses one dedicated staging directory that is writable by Hermes and read-only to `wn-agent`; the
   connector allows no other plaintext path roots.
@@ -34,17 +32,15 @@ Do not run this as an unattended production service until the manual phone test 
 
 ## Components
 
-- `wn-agent`: Rust connector. Owns Marmot account state, MLS state, relay IO, final sends, allowlists, and stream previews.
+- `wn-agent`: Rust connector. Owns Marmot account state, MLS state, relay IO, final sends, and allowlists.
 - Hermes gateway: model and tool runtime. Uses the Marmot platform plugin in `integrations/hermes/marmot`.
 - Public Nostr relays: durable Marmot transport. A normal deployment does not host its own relay.
-- QUIC broker: optional memory-only live-preview transport.
 - White Noise phone app: invites the agent and verifies the chat experience from the real client side.
 
 Current pilot values:
 
 ```sh
 MARMOT_RELAYS=wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat
-MARMOT_QUIC_CANDIDATES=quic://quic-broker.ipf.dev:4450
 MARMOT_OUTBOUND_MEDIA_DIR=/var/lib/marmot-media/outbound
 ```
 
@@ -122,7 +118,7 @@ sudo install -m 0644 packaging/systemd/hermes-gateway.service.example /etc/syste
 ```
 
 Edit `/etc/marmot-agent/hermes-marmot.env` before starting services. Set the public relay URLs that the phone will also
-use, optional `MARMOT_ACCOUNT_ID_HEX`, optional `MARMOT_GROUP_ID_HEX`, and optional `MARMOT_QUIC_CANDIDATES`.
+use, optional `MARMOT_ACCOUNT_ID_HEX`, and optional `MARMOT_GROUP_ID_HEX`.
 
 Hermes validates each original outbound media path, copies it into `MARMOT_OUTBOUND_MEDIA_DIR` as a random `0640`
 regular file, and deletes the copy after `wn-agent` responds. The setgid directory keeps the `marmot-agent` group on
@@ -155,7 +151,6 @@ or key material.
 7. Confirm the agent auto-accepts only the allowlisted invite.
 8. Send a normal prompt from the phone.
 9. Confirm Hermes receives the inbound message and sends a final encrypted Marmot reply.
-10. If QUIC previews are enabled, confirm previews appear before the final reply and the final reply still lands.
 
 ## Dedicated Computer Phone Test
 
@@ -164,8 +159,7 @@ it through normal Marmot traffic on public Nostr relays. Docker is optional isol
 not change the relay model.
 
 Use `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat` for this pilot so the phone and the agent
-computer exercise the same public relay set. Use `quic://quic-broker.ipf.dev:4450` for live previews. If preview
-debugging gets in the way, omit `--quic-candidate`; final encrypted replies still exercise the durable production path.
+computer exercise the same public relay set.
 
 Use the repo Compose profile for the fastest container test. Run these commands on the host from the MDK repo
 root. They start or exec into the container for you:
@@ -207,11 +201,9 @@ From the phone:
 3. Send a short prompt.
 4. Watch `wn-agent` and Hermes logs for the inbound event and final send.
 5. Confirm the phone shows the final reply.
-6. If preview is enabled, confirm the preview candidate uses an address the phone can reach. Docker `127.0.0.1` and host
-   loopback addresses are not reachable from the phone.
 
-Record the exact public relay URLs, container image or base OS, `wn-agent` commit, Hermes commit, phone app build, and
-whether the test used QUIC previews. Keep message contents out of the notes.
+Record the exact public relay URLs, container image or base OS, `wn-agent` commit, Hermes commit, and phone app build.
+Keep message contents out of the notes.
 
 Stop the container while preserving the named volume:
 

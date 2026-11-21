@@ -9888,7 +9888,8 @@ async fn retired_agent_text_stream_component_survives_group_metadata_updates() {
         .update_group_profile(&group_id, Some("renamed"), None)
         .await
         .unwrap();
-    bob.sync().await.unwrap();
+    let renamed_epoch = alice.group_mls_state(&group_id).unwrap().epoch;
+    sync_to_epoch(&mut bob, &group_id, renamed_epoch).await;
     for label in ["alice", "bob"] {
         assert_eq!(
             retired(label),

@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-10-15
+updated: 2026-11-21
 tags: [marmot, architecture, index]
 ---
 
@@ -72,7 +72,7 @@ Written to be readable in 5 minutes each, shareable as a package.
 
 - **Doc:** [`hermes-openclaw-agent-integration-plan.md`](./hermes-openclaw-agent-integration-plan.md)
   - **What it covers:** Working plan for hosting Hermes Agent and OpenClaw as server-side Marmot members with a
-    `wn-agent` connector, local gateway shims, invite allowlists, and QUIC previews.
+    `wn-agent` connector, local gateway shims, and invite allowlists.
 
 - **Doc:** [`hermes-agent-production-runbook.md`](./hermes-agent-production-runbook.md)
   - **What it covers:** Supervised deployment path for Hermes Agent with `wn-agent`, token-gated local control sockets,
@@ -169,7 +169,7 @@ These are longer working documents. Go here when you need depth, not orientation
     moderation.
 
 - **Doc:** [`runtime-state-bounds.md`](./runtime-state-bounds.md)
-  - **What it covers:** Inventory of long-lived daemon/broker runtime structures (maps, counters, handle sets, temp
+  - **What it covers:** Inventory of long-lived daemon and app runtime structures (maps, counters, handle sets, temp
     artifacts) with their bounds and eviction/reclamation rules, plus the tracked-resource discipline for adding new
     ones.
 
@@ -196,9 +196,6 @@ These are longer working documents. Go here when you need depth, not orientation
 
 - **Doc:** [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot)
   - **What it covers:** Marmot v2 protocol draft by stable protocol surface and app component.
-
-- **Doc:** [`../quic-broker-deployment.md`](../quic-broker-deployment.md)
-  - **What it covers:** Local Compose, GHCR image, and VM deployment notes for the memory-only QUIC broker.
 
 - **Doc:** [`further-context/target-architecture.md`](./further-context/target-architecture.md)
   - **What it covers:** Older long-form target architecture with illustrative trait sketches. Current orientation lives

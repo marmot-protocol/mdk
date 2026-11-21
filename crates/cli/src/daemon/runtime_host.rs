@@ -645,15 +645,6 @@ pub(crate) fn handle_app_runtime_event(
             &message.account_label,
             message.message,
         ),
-        // Agent text streams have no CLI surface; a start is an ordinary message.
-        marmot_app::MarmotAppEvent::AgentStreamStarted(message) => publish_received_message(
-            &state,
-            &events,
-            started_at,
-            &message.account_id_hex,
-            &message.account_label,
-            message.message,
-        ),
         marmot_app::MarmotAppEvent::GroupEvent(group_event) => {
             let summary = marmot_app::SyncSummary {
                 events: vec![group_event.event],

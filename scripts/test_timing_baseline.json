@@ -18,10 +18,6 @@
     "crates/agent-connector/tests/identity_security.rs": {
       "sleep": 3
     },
-    "crates/agent-stream-compose/src/tests.rs": {
-      "sleep": 6,
-      "short_timeout": 30
-    },
     "crates/cgka-conformance-simulator/src/app_runtime/process_io.rs": {
       "sleep": 1
     },
@@ -93,13 +89,13 @@
     },
     "crates/cli/src/daemon/tests.rs": {
       "sleep": 4,
-      "short_timeout": 4
+      "short_timeout": 2
     },
     "crates/cli/src/tui/tests.rs": {
-      "sleep": 12
+      "sleep": 8
     },
     "crates/cli/tests/cli.rs": {
-      "sleep": 26
+      "sleep": 22
     },
     "crates/convergence-campaign-runner/src/bin/cgka-conformance-relay.rs": {
       "short_timeout": 1
@@ -482,16 +478,6 @@
     "crates/transport-nostr/src/tests.rs": {
       "sleep": 24,
       "short_timeout": 32
-    },
-    "crates/transport-quic-broker/src/tests.rs": {
-      "sleep": 31,
-      "short_timeout": 2
-    },
-    "crates/transport-quic-broker/tests/public_endpoint.rs": {
-      "sleep": 1
-    },
-    "crates/transport-quic-stream/src/tests.rs": {
-      "sleep": 4
     },
     "experiments/relay-backend-probe/src/acquisition.rs": {
       "short_timeout": 2

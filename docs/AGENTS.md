@@ -18,7 +18,6 @@ implementation checklist.
 - `marmot-architecture/` - architecture, contracts, and diagnostics; see `marmot-architecture/AGENTS.md`.
 - `integration/` - versioned client integration guides (`<version>.md`), `README.md` index, and `TEMPLATE.md`.
 - `release/` - concise per-version release notes plus `wn-homebrew.md` (Homebrew tap checklist).
-- `quic-broker-deployment.md` - `marmot-quic-broker` sidecar deployment.
 - `external-signer-accounts.md` - accounts whose Nostr key is held by a host external signer.
 - `explorations-of-multi-device.md` - exploratory, non-normative multi-device notes.
 - `learnings.md` - historical log kept for archaeology only; do not treat as current contract.

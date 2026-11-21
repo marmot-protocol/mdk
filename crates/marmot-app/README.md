@@ -34,8 +34,8 @@ See [device linking](../cli/README.md#device-linking).
 The opt-in native startup recorder distinguishes task dispatch, account/key lookup, store-opening waits, SQLCipher phases, schema inspection and each migration transaction. `set_startup_diagnostics_enabled` and `startup_diagnostics_snapshot` change only bounded process-local diagnostic memory. Snapshots use their own short lock and remain readable while an account open is blocked; they do not open storage or query the keystore. Successful cached attachment reads and account-store lookups omit history events so ordinary reads preserve first-open evidence. An attachment read shares one active scope across queueing, account opening and result delivery; cache/admission waits remain visible, and misses, failures or unwinds retain evidence. Dropping its host future leaves running native work observable until the worker exits. Normal construction leaves capture disabled. Host exports must be explicitly requested and serialized within a separate size bound.
 
 
-`MarmotAppRuntime` owns restored signing accounts, a shared relay plane, live per-account workers, runtime event hubs,
-and the shared agent stream watch manager. The relay plane also owns shared directory discovery fetches for relay lists,
+`MarmotAppRuntime` owns restored signing accounts, a shared relay plane, live per-account workers, and runtime event
+hubs. The relay plane also owns shared directory discovery fetches for relay lists,
 profiles, follow lists, and KeyPackages, including endpoint safety and in-flight coalescing. The daemon path is
 runtime-owned subscriptions plus typed events; explicit catch-up remains available for repair and tests.
 
