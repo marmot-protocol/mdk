@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
 use cgka_traits::app_components::{
     AppComponentData, AppComponentSet, BLOSSOM_LOCATOR_KIND_V1, BlobStoreEndpointV1,
     BlobStoreEndpointV2, ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2,
@@ -2442,11 +2441,6 @@ impl AppClient {
             component_id: NOSTR_ROUTING_COMPONENT_ID,
             data: nostr_routing_bytes,
         }];
-        app_components.push(
-            AgentTextStreamQuicPolicyV1::user_to_agent_default()
-                .to_app_component_data()
-                .map_err(|err| AppError::InvalidAgentTextStreamPolicy(err.to_string()))?,
-        );
         if let Some(encrypted_media) = self.encrypted_media_component_for_new_group()? {
             app_components.push(encrypted_media);
         }

@@ -14,8 +14,10 @@
   `AGENT_TEXT_STREAM_COMPONENT(_ID)` re-exports.
 - A kind-1200 stream start no longer reaches message subscribers and has no timeline row; a stream-final kind-9
   message is an ordinary chat message.
-- New groups still require the agent text stream component (`0x8006`) and every role capability is still advertised,
-  so existing groups keep working. A group record now carries `0x8006` in `unknown_components`.
+- New groups no longer include the retired agent text stream component (`0x8006`), and the retired `send` and
+  `fanout` role capabilities are no longer advertised, so every account republishes its KeyPackage once. Groups that
+  already require `0x8006` keep working: support for it and the `receive` role stays advertised, and their record
+  carries `0x8006` in `unknown_components`. `AppError::InvalidAgentTextStreamPolicy` is gone.
 - `save_message_draft_inputs_if_revision` keeps every attachment the draft holds that the save does not name,
   inline or file-backed, after the named ones in their stored order. Remove one with the new
   `MessageDraftAttachmentInput::Removed(id)`, which also unlinks its file; removing an id the draft no longer holds
@@ -39,6 +41,9 @@
 
 - An account whose sign-out a device removal holds no longer retries maintenance every 15 s until the hold lifts.
   Maintenance, the invitation step and device-group due times share one check of whether passes run.
+- An invitation answer whose device-group update lost a fork between linked devices is sent again on the worker's
+  next turn, not at the next maintenance pass, so the other device shows it within seconds instead of after up to
+  15 s (mdk#3573).
 
 ## 0.18.0 - 2026-11-20
 

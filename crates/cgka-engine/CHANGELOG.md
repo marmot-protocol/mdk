@@ -7,6 +7,8 @@
 - `group_context` no longer exports the `agent-text-stream-quic` MLS exporter secret
   (`marmot/agent-text-stream-quic`); the agent text stream is retired. Component `0x8006` is still validated and its
   required roles still enforced on create and invite.
+- Sending a kind-1200 agent stream start is refused with `InvalidAppMessagePayload`; one queued before an upgrade is
+  retired at drain and announced as `GroupEvent::QueuedIntentRefused`. Received starts are still accepted.
 
 ### Fixed
 

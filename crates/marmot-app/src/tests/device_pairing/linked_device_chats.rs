@@ -4921,7 +4921,9 @@ async fn a_linked_device_shows_an_answered_invitation_within_seconds() {
         .unwrap();
     let answered = std::time::Instant::now();
     // Well under a maintenance pass apart, with room for a loaded runner:
-    // unloaded, it shows within a second.
+    // unloaded, it shows within a second, or about three when the devices'
+    // startup commits fork their device group. An answer that loses that
+    // fork is sent again at once (mdk#3573).
     let shown = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let rows = match laptop_chats.recv().await.expect("the chat list stays open") {

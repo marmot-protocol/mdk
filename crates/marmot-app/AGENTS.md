@@ -629,8 +629,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   to fit 32,768 bytes, each page's items marked sent only after it went out (a duplicate is harmless, a loss is not),
   and a broadcast request when owed. Updates and requests are read from any member of the trusted device group, never
   through `ensure_sent_by`. A withdrawn update owes every held item again, whoever sent it, and a withdrawn broadcast
-  request owes a new one; a withdrawn message with no record in the trusted device group owes both. A winning pin for
-  an archived chat waits, unobserved, until the chat is unarchived.
+  request owes a new one; a withdrawn message with no record in the trusted device group owes both. Invitation
+  decisions it owes again go out on the worker's next turn, as a local answer does, not at the next pass (mdk#3573).
+  A winning pin for an archived chat waits, unobserved, until the chat is unarchived.
 - Invitation decisions (`client/invitation_decisions.rs`, mdk#2628 4.3b/D96) are explicit per-admission intent, never
   inferred from archive/leave/delete snapshots. Explicit UserLeave (D99) records the current identified admission's
   Decline before departure effects when trusted device-group sync applies. Last-active-admin account refusal precedes

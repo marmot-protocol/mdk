@@ -1,10 +1,10 @@
 //! The retired agent text stream component (`0x8006`,
 //! `marmot.group.agent-text-stream.quic.v1`).
 //!
-//! MDK no longer streams agent text previews. Every group MDK has created
-//! carries this component as a required app component that requires the
-//! `receive` role, and the engine refuses invitees whose KeyPackage lacks the
-//! matching capability. This module keeps only what those existing groups need
+//! MDK no longer streams agent text previews or adds this component to new
+//! groups. Every group MDK created before its retirement carries it as a
+//! required app component that requires the `receive` role, and the engine
+//! refuses invitees whose KeyPackage lacks the matching capability. This module keeps only what those existing groups need
 //! to keep working: the component state codec and validation, the role bits,
 //! and the role features and MLS capabilities.
 

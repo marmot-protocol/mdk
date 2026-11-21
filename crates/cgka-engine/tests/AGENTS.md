@@ -157,6 +157,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** A queued admin change the settled state refuses (the sender was demoted while it waited) is retired and
     announced as `GroupEvent::QueuedIntentRefused` for each admin intent kind, the work queued behind it still drains,
     and no later drain prepares it again (mdk#2694). The storage-held counterpart lives in `record_write_atomicity.rs`.
+    A retired kind-1200 agent stream start queued before an upgrade is retired the same way, never published.
 
 - **File:** `distributed_convergence/encrypted_media_source_secret.rs`
   - **Owns:** A replayed media application carries its source-epoch encrypted-media secret on `MessageReceived`

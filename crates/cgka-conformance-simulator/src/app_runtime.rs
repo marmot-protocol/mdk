@@ -3123,7 +3123,6 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidAppComponent(_)
         | AppError::InvalidNostrRouting(_)
         | AppError::InvalidGroupAvatarUrl(_)
-        | AppError::InvalidAgentTextStreamPolicy(_)
         | AppError::InvalidEncryptedMedia(_)
         | AppError::MediaReferenceStaleEpoch { .. }
         | AppError::MediaReferenceEpochUnsettled { .. }

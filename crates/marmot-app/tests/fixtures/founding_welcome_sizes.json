@@ -10,24 +10,24 @@
   "device_groups_off": [
     {
       "members": 2,
-      "mls_welcome_bytes": 1433,
-      "rumor_json_bytes": 2224,
+      "mls_welcome_bytes": 1408,
+      "rumor_json_bytes": 2192,
       "seal_json_bytes": 3847,
       "gift_wrap_json_bytes": 5969,
       "gift_wrap_size_class": "under_64_kib"
     },
     {
       "members": 40,
-      "mls_welcome_bytes": 21229,
-      "rumor_json_bytes": 28620,
+      "mls_welcome_bytes": 21052,
+      "rumor_json_bytes": 28384,
       "seal_json_bytes": 38663,
       "gift_wrap_json_bytes": 55121,
       "gift_wrap_size_class": "under_64_kib"
     },
     {
       "members": 41,
-      "mls_welcome_bytes": 21741,
-      "rumor_json_bytes": 29300,
+      "mls_welcome_bytes": 21560,
+      "rumor_json_bytes": 29060,
       "seal_json_bytes": 44123,
       "gift_wrap_json_bytes": 66045,
       "gift_wrap_size_class": "from_64_to_128_kib"
@@ -36,24 +36,24 @@
   "device_groups_on": [
     {
       "members": 2,
-      "mls_welcome_bytes": 1437,
-      "rumor_json_bytes": 2228,
+      "mls_welcome_bytes": 1412,
+      "rumor_json_bytes": 2196,
       "seal_json_bytes": 3847,
       "gift_wrap_json_bytes": 5969,
       "gift_wrap_size_class": "under_64_kib"
     },
     {
-      "members": 39,
-      "mls_welcome_bytes": 20795,
-      "rumor_json_bytes": 28040,
+      "members": 40,
+      "mls_welcome_bytes": 21132,
+      "rumor_json_bytes": 28488,
       "seal_json_bytes": 38663,
       "gift_wrap_json_bytes": 55121,
       "gift_wrap_size_class": "under_64_kib"
     },
     {
-      "members": 40,
-      "mls_welcome_bytes": 21309,
-      "rumor_json_bytes": 28724,
+      "members": 41,
+      "mls_welcome_bytes": 21642,
+      "rumor_json_bytes": 29168,
       "seal_json_bytes": 44123,
       "gift_wrap_json_bytes": 66045,
       "gift_wrap_size_class": "from_64_to_128_kib"

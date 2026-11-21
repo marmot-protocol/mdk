@@ -882,7 +882,7 @@ async fn account_reads_during_startup_hydration_answer_as_hydrated_groups() {
 /// account reads answer from A meanwhile, so A shows the reopened client
 /// only once it is drained (mdk#1161): held in the reopened client's
 /// transport activation, after the drain, every read answers as it did
-/// before the reconnect.
+/// before the reconnect, once the worker's first maintenance pass has run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_reads_during_a_reconnect_answer_as_hydrated_groups() {
     let dir = tempfile::tempdir().unwrap();
@@ -896,8 +896,25 @@ async fn account_reads_during_a_reconnect_answer_as_hydrated_groups() {
     crate::worker_fences::worker_startup_finished(&runtime, "alice")
         .await
         .unwrap();
+    // After startup the worker runs each of its jobs once, and its first
+    // session maintenance samples the quiet group's next periodic rotation.
+    // Take the baseline after that pass: one that lands between the baseline
+    // and the reconnect changes the answer by itself.
+    let mut published = read_state_receiver(&runtime).await;
+    timeout(
+        Duration::from_secs(30),
+        published.wait_for(|state| {
+            state.maintenance_status(&groups.quiet).is_ok_and(|status| {
+                status
+                    .state
+                    .is_some_and(|state| state.next_periodic_rotation_at.is_some())
+            })
+        }),
+    )
+    .await
+    .expect("the worker's first maintenance pass samples the periodic rotation")
+    .unwrap();
     let before = AccountReads::read(&runtime, &groups).await;
-    let published = read_state_receiver(&runtime).await;
 
     // Hold the reopened client's inbox subscribe, which its transport
     // activation makes once the drain has run. Armed before the reconnect,
