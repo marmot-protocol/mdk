@@ -788,228 +788,6 @@ impl TuiApp {
         Ok(())
     }
 
-    pub(crate) fn start_stream_composer(
-        &mut self,
-        stream_id: Option<String>,
-        quic_candidates: Vec<String>,
-    ) -> TuiResult<()> {
-        self.begin_status_action();
-        let account_id = self.require_selected_local_account()?;
-        let group_id = self.require_selected_group()?;
-        let preview_group_id = group_id.clone();
-        let insecure_local =
-            crate::commands::stream::first_quic_candidate_is_loopback(&quic_candidates);
-        let mut args = vec!["stream".to_owned(), "compose-open".to_owned(), group_id];
-        if insecure_local {
-            args.push("--insecure-local".to_owned());
-        }
-        if let Some(stream_id) = stream_id {
-            args.push("--stream-id".to_owned());
-            args.push(stream_id);
-        }
-        for candidate in quic_candidates {
-            args.push("--quic-candidate".to_owned());
-            args.push(candidate);
-        }
-        let result = self.client.run_json(Some(&account_id), &args)?;
-        let stream_id = value_string(&result, "stream_id").unwrap_or_else(|| "unknown".to_owned());
-        self.adopt_message_account(&account_id);
-        self.streaming = Some(StreamComposer {
-            stream_id: stream_id.clone(),
-            group_id: preview_group_id.clone(),
-            pending_text: String::new(),
-            last_flush: Instant::now(),
-            flushed_bytes: 0,
-        });
-        self.input.clear();
-        self.refresh_messages_with_feedback(FeedbackPermission::Silent)?;
-        upsert_live_stream_preview(
-            &mut self.live_stream_previews,
-            LiveStreamPreview {
-                group_id: preview_group_id,
-                stream_id: stream_id.clone(),
-                author: "me".to_owned(),
-                status: "streaming".to_owned(),
-                text: String::new(),
-                error: None,
-                optimistic: true,
-            },
-            false,
-        );
-        self.set_status(format!(
-            "now streaming {}; type text and press Enter to finish",
-            shorten(&stream_id, 18)
-        ));
-        Ok(())
-    }
-
-    pub(crate) fn upsert_active_stream_preview(&mut self, stream_id: &str) {
-        let Some(group_id) = self
-            .streaming
-            .as_ref()
-            .map(|streaming| streaming.group_id.clone())
-        else {
-            return;
-        };
-        upsert_live_stream_preview(
-            &mut self.live_stream_previews,
-            LiveStreamPreview {
-                group_id,
-                stream_id: stream_id.to_owned(),
-                author: "me".to_owned(),
-                status: "streaming".to_owned(),
-                text: self.input.value().to_owned(),
-                error: None,
-                optimistic: true,
-            },
-            true,
-        );
-    }
-
-    pub(crate) fn flush_stream_append_if_due(&mut self, now: Instant) -> TuiResult<bool> {
-        let Some(streaming) = self.streaming.as_ref() else {
-            return Ok(false);
-        };
-        if streaming.pending_text.is_empty()
-            || now.duration_since(streaming.last_flush) < STREAM_APPEND_FLUSH_INTERVAL
-        {
-            return Ok(false);
-        }
-        match self.flush_stream_append() {
-            Ok(()) => Ok(true),
-            Err(err) => {
-                if let Some(streaming) = self.streaming.as_mut() {
-                    streaming.last_flush = Instant::now();
-                }
-                Err(err)
-            }
-        }
-    }
-
-    pub(crate) fn flush_stream_append(&mut self) -> TuiResult<()> {
-        let account_id = self.require_selected_local_account()?;
-        let Some((stream_id, text)) = self.streaming.as_mut().and_then(|streaming| {
-            if streaming.pending_text.is_empty() {
-                None
-            } else {
-                let text = std::mem::take(&mut streaming.pending_text);
-                Some((streaming.stream_id.clone(), text))
-            }
-        }) else {
-            return Ok(());
-        };
-        let args = vec![
-            "stream".to_owned(),
-            "compose-append".to_owned(),
-            "--stream-id".to_owned(),
-            stream_id.clone(),
-            text.clone(),
-        ];
-        let result = match self.client.run_json(Some(&account_id), &args) {
-            Ok(result) => result,
-            Err(err) => {
-                if let Some(streaming) = self.streaming.as_mut()
-                    && streaming.stream_id == stream_id
-                {
-                    streaming.pending_text.insert_str(0, &text);
-                }
-                return Err(err);
-            }
-        };
-        let _ = result;
-        let mut bytes = text.len();
-        if let Some(streaming) = self.streaming.as_mut()
-            && streaming.stream_id == stream_id
-        {
-            streaming.last_flush = Instant::now();
-            streaming.flushed_bytes += text.len();
-            bytes = streaming.flushed_bytes;
-        }
-        self.set_status(format!(
-            "streaming {} bytes on {}",
-            bytes,
-            shorten(&stream_id, 18)
-        ));
-        Ok(())
-    }
-
-    pub(crate) fn finish_stream_composer(&mut self) -> TuiResult<()> {
-        let account_id = self.require_selected_local_account()?;
-        let Some(streaming) = self.streaming.take() else {
-            return Ok(());
-        };
-        if self.input.is_empty() {
-            self.streaming = Some(streaming);
-            self.set_status("stream text is empty; type text or Esc cancels".to_owned());
-            return Ok(());
-        }
-        self.streaming = Some(streaming);
-        self.flush_stream_append()?;
-        let Some(streaming) = self.streaming.take() else {
-            return Ok(());
-        };
-        let args = vec![
-            "stream".to_owned(),
-            "compose-finish".to_owned(),
-            "--stream-id".to_owned(),
-            streaming.stream_id.clone(),
-        ];
-        // Restore the composer if compose-finish fails (daemon gone, broker/QUIC
-        // error, relay publish rejection — the failure class from #194). Without
-        // this, `self.streaming` stays `None` while `self.input` still holds the
-        // draft, so the caught error keeps the TUI alive but the next Enter sends
-        // the stream draft through the normal composer path as a regular message.
-        let result = match self.client.run_json(Some(&account_id), &args) {
-            Ok(result) => result,
-            Err(err) => {
-                self.streaming = Some(streaming);
-                return Err(err);
-            }
-        };
-        self.input.clear();
-        remove_live_stream_preview(
-            &mut self.live_stream_previews,
-            Some(streaming.group_id.as_str()),
-            &streaming.stream_id,
-        );
-        self.refresh_messages_with_feedback(FeedbackPermission::Silent)?;
-        self.refresh_daemon_status()?;
-        let chunk_count = result
-            .get("chunk_count")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        self.set_status(format!(
-            "finished stream {} chunks={chunk_count}",
-            shorten(&streaming.stream_id, 18)
-        ));
-        Ok(())
-    }
-
-    pub(crate) fn cancel_stream_composer(&mut self) -> TuiResult<()> {
-        let account_id = self.require_selected_local_account()?;
-        let Some(streaming) = self.streaming.take() else {
-            return Ok(());
-        };
-        let args = vec![
-            "stream".to_owned(),
-            "compose-cancel".to_owned(),
-            "--stream-id".to_owned(),
-            streaming.stream_id.clone(),
-        ];
-        let _ = self.client.run_json(Some(&account_id), &args);
-        self.input.clear();
-        remove_live_stream_preview(
-            &mut self.live_stream_previews,
-            Some(streaming.group_id.as_str()),
-            &streaming.stream_id,
-        );
-        self.set_status(format!(
-            "cancelled stream {}",
-            shorten(&streaming.stream_id, 18)
-        ));
-        Ok(())
-    }
-
     pub(crate) fn update_profile_name(&mut self, name: String) -> TuiResult<()> {
         self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
@@ -2095,128 +1873,6 @@ impl TuiApp {
         Ok(())
     }
 
-    pub(crate) fn start_stream(
-        &mut self,
-        stream_id: Option<String>,
-        quic_candidates: Vec<String>,
-    ) -> TuiResult<()> {
-        self.begin_status_action();
-        let account_id = self.require_selected_local_account()?;
-        let group_id = self.require_selected_group()?;
-        let mut args = vec!["stream".to_owned(), "start".to_owned(), group_id];
-        if let Some(stream_id) = stream_id {
-            args.push("--stream-id".to_owned());
-            args.push(stream_id);
-        }
-        for candidate in quic_candidates {
-            args.push("--quic-candidate".to_owned());
-            args.push(candidate);
-        }
-        let result = self.client.run_json(Some(&account_id), &args)?;
-        let stream_id = value_string(&result, "stream_id").unwrap_or_else(|| "unknown".to_owned());
-        let status = publish_status(
-            &format!("started stream {}", shorten(&stream_id, 18)),
-            &result,
-        );
-        self.refresh_messages_with_feedback(FeedbackPermission::Silent)?;
-        self.set_status(status);
-        Ok(())
-    }
-
-    pub(crate) fn watch_stream(
-        &mut self,
-        stream_id: Option<String>,
-        insecure_local: bool,
-    ) -> TuiResult<()> {
-        self.begin_status_action();
-        let account_id = self.require_selected_local_account()?;
-        let group_id = self.require_selected_group()?;
-        let mut args = vec![
-            "stream".to_owned(),
-            "watch".to_owned(),
-            group_id,
-            "--background".to_owned(),
-        ];
-        if let Some(stream_id) = stream_id {
-            args.push("--stream-id".to_owned());
-            args.push(stream_id);
-        }
-        if insecure_local {
-            args.push("--insecure-local".to_owned());
-        }
-        let result = self.client.run_json(Some(&account_id), &args)?;
-        self.refresh_daemon_status()?;
-        let watch_id = value_string(&result, "watch_id").unwrap_or_else(|| "stream".to_owned());
-        self.set_status(format!("watching stream {}", shorten(&watch_id, 24)));
-        Ok(())
-    }
-
-    pub(crate) fn finish_stream(
-        &mut self,
-        stream_id: String,
-        transcript_hash: String,
-        chunk_count: u64,
-        text: String,
-    ) -> TuiResult<()> {
-        self.begin_status_action();
-        let account_id = self.require_selected_local_account()?;
-        let group_id = self.require_selected_group()?;
-        let args = vec![
-            "stream".to_owned(),
-            "finish".to_owned(),
-            group_id,
-            "--stream-id".to_owned(),
-            stream_id.clone(),
-            "--transcript-hash".to_owned(),
-            transcript_hash,
-            "--chunk-count".to_owned(),
-            chunk_count.to_string(),
-            text,
-        ];
-        let result = self.client.run_json(Some(&account_id), &args)?;
-        let status = publish_status(
-            &format!("finished stream {}", shorten(&stream_id, 18)),
-            &result,
-        );
-        self.refresh_messages_with_feedback(FeedbackPermission::Silent)?;
-        self.set_status(status);
-        Ok(())
-    }
-
-    pub(crate) fn verify_stream(
-        &mut self,
-        stream_id: String,
-        transcript_hash: String,
-        chunk_count: Option<u64>,
-    ) -> TuiResult<()> {
-        self.begin_status_action();
-        let account_id = self.require_selected_local_account()?;
-        let group_id = self.require_selected_group()?;
-        let mut args = vec![
-            "stream".to_owned(),
-            "verify".to_owned(),
-            group_id,
-            "--stream-id".to_owned(),
-            stream_id.clone(),
-            "--transcript-hash".to_owned(),
-            transcript_hash,
-        ];
-        if let Some(chunk_count) = chunk_count {
-            args.push("--chunk-count".to_owned());
-            args.push(chunk_count.to_string());
-        }
-        let result = self.client.run_json(Some(&account_id), &args)?;
-        let verified = result
-            .get("verified")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        self.set_status(format!(
-            "stream {} verified={verified}",
-            shorten(&stream_id, 18)
-        ));
-        Ok(())
-    }
-
     /// Adopt a daemon status/start result: parse the view and (re)attach the
     /// daemon-backed subscriptions for the current selection. Shared by the
     /// status refresh, the synchronous `/daemon start`, and the launch
@@ -2236,7 +1892,6 @@ impl TuiApp {
         // Report acquisition failure explicitly; ambient text changes do not
         // acquire/revoke an action claim and cannot signal this through revision.
         let mut failed = self.ensure_selected_chat_subscription();
-        failed |= self.ensure_selected_message_subscription();
         failed |= self.ensure_selected_group_state_subscription();
         failed |= self.ensure_selected_timeline_subscription();
         failed |= self.ensure_selected_notification_subscription();
@@ -2314,7 +1969,6 @@ impl TuiApp {
         self.daemon = parse_daemon_view(&result);
         self.daemon_notice = DaemonNotice::Resolved;
         self.chat_subscription = None;
-        self.message_subscription = None;
         self.group_state_subscription = None;
         self.timeline_subscription = None;
         self.notification_subscription = None;
@@ -2348,7 +2002,6 @@ impl TuiApp {
             self.messages_account_id = None;
             self.messages_group_id = None;
             self.chat_subscription = None;
-            self.message_subscription = None;
             self.group_state_subscription = None;
             self.notification_subscription = None;
             self.group_diagnostics = None;
@@ -2392,7 +2045,6 @@ impl TuiApp {
                 app.messages_account_id = None;
                 app.messages_group_id = None;
                 app.chat_subscription = None;
-                app.message_subscription = None;
                 app.group_state_subscription = None;
                 app.notification_subscription = None;
                 app.group_diagnostics = None;
@@ -2406,7 +2058,6 @@ impl TuiApp {
                 app.messages_account_id = None;
                 app.messages_group_id = None;
                 app.chat_subscription = None;
-                app.message_subscription = None;
                 app.group_state_subscription = None;
                 app.notification_subscription = None;
                 app.group_diagnostics = None;
@@ -2442,10 +2093,6 @@ impl TuiApp {
                 app.messages_account_id = Some(account.account_id.clone());
                 app.messages_group_id = None;
                 app.group_state_subscription = None;
-                if let Err(err) = app.ensure_message_subscription(&account.account_id) {
-                    app.set_status(format!("message subscription failed: {err}"));
-                    return Ok(());
-                }
                 app.finish_timeline_status(
                     format!(
                         "loaded account {}; no chats",
@@ -2500,7 +2147,6 @@ impl TuiApp {
             // An owned replacement publishes its new phase before old-request
             // cancellation, so that cancellation cannot revoke the new writer.
             app.set_status(LOADING_TIMELINE_STATUS.to_owned());
-            app.adopt_message_account(&account_id);
             if app.messages_account_id.as_deref() != Some(account_id.as_str())
                 || app.messages_group_id.as_deref() != Some(group_id.as_str())
             {
@@ -2511,13 +2157,6 @@ impl TuiApp {
                 app.messages_group_id = None;
                 app.group_state_subscription = None;
                 app.group_diagnostics = None;
-            }
-            // The account-wide feed belongs to the adopted live account even if
-            // this group's page fails. Same-account loads reuse its existing child.
-            // Acquisition is provisional here: the fold retries and reports its
-            // final outcome, so this attempt must not replace the request's claim.
-            if app.daemon.running {
-                let _ = app.ensure_message_subscription(&account_id);
             }
             let feedback = app.view_feedback();
             app.loading_chat = Some(PendingTimeline {
@@ -2620,15 +2259,11 @@ impl TuiApp {
         self.messages_account_id = Some(account.clone());
         self.messages_group_id = Some(group.clone());
         self.loading_chat = None;
-        // Establish all three subscriptions regardless of any one's outcome. The
+        // Establish both subscriptions regardless of either one's outcome. The
         // timeline feed drives the pane's live updates and its `ensure_*` also
-        // kills a stale prior-group child, so a failed plain feed must not skip
-        // it. Each error surfaces on the status line; the user sees the first by
-        // precedence (message, then timeline, then group state).
-        let message_subscription_error = self
-            .ensure_message_subscription(&account)
-            .err()
-            .map(|err| format!("message subscription failed: {err}"));
+        // kills a stale prior-group child, so a failed group-state feed must not
+        // skip it. Each error surfaces on the status line; the user sees the
+        // first by precedence (timeline, then group state).
         let timeline_subscription_error = self
             .ensure_timeline_subscription(&account, &group)
             .err()
@@ -2650,9 +2285,7 @@ impl TuiApp {
         // Opening a chat clears its badge: mark it read off-loop and fold the
         // returned projection into the row rather than waiting for a push (the
         // chats feed does not emit one after a local mark-read).
-        let subscription_error = message_subscription_error
-            .or(timeline_subscription_error)
-            .or(group_state_subscription_error);
+        let subscription_error = timeline_subscription_error.or(group_state_subscription_error);
         let retained = subscription_error.is_some();
         self.finish_timeline_status(
             subscription_error
@@ -2870,49 +2503,6 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Move the account-wide feed and preview buffer together. Pane loads and
-    /// empty-list refreshes both cross this boundary; reconnecting the same
-    /// account or navigating its groups keeps already observed preview text.
-    fn adopt_message_account(&mut self, account_id: &str) {
-        if self
-            .message_subscription
-            .as_ref()
-            .is_some_and(|subscription| subscription.account_id != account_id)
-        {
-            self.message_subscription = None;
-        }
-        if self.stream_previews_account_id.as_deref() != Some(account_id) {
-            self.live_stream_previews.clear();
-            self.stream_previews_account_id = Some(account_id.to_owned());
-        }
-    }
-
-    pub(crate) fn ensure_message_subscription(&mut self, account_id: &str) -> TuiResult<()> {
-        self.adopt_message_account(account_id);
-        if !self.daemon.running {
-            self.message_subscription = None;
-            return Ok(());
-        }
-        if self
-            .message_subscription
-            .as_ref()
-            .is_some_and(|subscription| subscription.account_id == account_id)
-        {
-            return Ok(());
-        }
-
-        self.message_subscription = None;
-        let args = message_subscription_args();
-        let mut child = self.client.spawn_json_lines(Some(account_id), &args)?;
-        let rx = spawn_subscription_reader(&mut child, "message")?;
-        self.message_subscription = Some(MessageSubscription {
-            account_id: account_id.to_owned(),
-            child,
-            rx,
-        });
-        Ok(())
-    }
-
     pub(crate) fn ensure_group_state_subscription(
         &mut self,
         account_id: &str,
@@ -3039,22 +2629,6 @@ impl TuiApp {
         false
     }
 
-    pub(crate) fn ensure_selected_message_subscription(&mut self) -> bool {
-        let Some(account) = self.selected_account_row().cloned() else {
-            self.message_subscription = None;
-            return false;
-        };
-        if !account.local_signing {
-            self.message_subscription = None;
-            return false;
-        }
-        if let Err(err) = self.ensure_message_subscription(&account.account_id) {
-            self.set_drain_status(format!("message subscription failed: {err}"));
-            return true;
-        }
-        false
-    }
-
     pub(crate) fn ensure_selected_group_state_subscription(&mut self) -> bool {
         let Some(account) = self.selected_account_row().cloned() else {
             self.group_state_subscription = None;
@@ -3095,7 +2669,6 @@ impl TuiApp {
 
     /// Re-establish the runtime-wide notification subscription for the selected
     /// local signing account, dropping it for no account or a public-only one.
-    /// Mirrors `ensure_selected_message_subscription`; both are account-wide.
     pub(crate) fn ensure_selected_notification_subscription(&mut self) -> bool {
         let Some(account) = self.selected_account_row().cloned() else {
             self.notification_subscription = None;
@@ -3199,10 +2772,8 @@ impl TuiApp {
                 self.clear_timeline_pane();
                 self.messages_account_id = None;
                 self.messages_group_id = None;
-                self.message_subscription = None;
                 self.group_state_subscription = None;
             }
-            self.ensure_selected_message_subscription();
             self.ensure_selected_group_state_subscription();
         }
         true
@@ -3255,51 +2826,6 @@ impl TuiApp {
                 }
                 SubscriptionEvent::Ended => {
                     self.group_state_subscription = None;
-                    break;
-                }
-            }
-        }
-        true
-    }
-
-    pub(crate) fn drain_message_subscription(&mut self) -> bool {
-        let Some(subscription) = self.message_subscription.as_ref() else {
-            return false;
-        };
-        let account_id = subscription.account_id.clone();
-        let mut events = Vec::new();
-        loop {
-            match subscription.rx.try_recv() {
-                Ok(event) => events.push(event),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    events.push(SubscriptionEvent::Ended);
-                    break;
-                }
-            }
-        }
-        if events.is_empty() {
-            return false;
-        }
-        self.adopt_message_account(&account_id);
-        for event in events {
-            match event {
-                SubscriptionEvent::Result(result) => {
-                    // The plain feed drives only QUIC stream previews now (unread
-                    // is runtime-backed). Skip initial replays, then apply preview
-                    // updates; no local counting happens here.
-                    if !is_initial_subscription_result(&result)
-                        && let Some(status) =
-                            apply_subscription_result(&mut self.live_stream_previews, &result)
-                    {
-                        self.set_drain_status(status);
-                    }
-                }
-                SubscriptionEvent::Error(err) => {
-                    self.set_drain_status(format!("message subscription failed: {err}"));
-                }
-                SubscriptionEvent::Ended => {
-                    self.message_subscription = None;
                     break;
                 }
             }

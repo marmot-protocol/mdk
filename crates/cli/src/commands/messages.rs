@@ -23,10 +23,9 @@ use serde_json::{Value, json};
 
 use crate::args::SearchAttachmentType;
 use crate::{
-    CommandOutput, MessageCommand, MessageTimelineCommand, WnError,
-    agent_text_stream_payload_value, display_name_for_sender, ensure_local_signing,
-    normalize_group_id_hex, npub_for_account_id, parse_public_key, resolve_account,
-    terminal_safe_text,
+    CommandOutput, MessageCommand, MessageTimelineCommand, WnError, display_name_for_sender,
+    ensure_local_signing, normalize_group_id_hex, npub_for_account_id, parse_public_key,
+    resolve_account, terminal_safe_text,
 };
 
 fn message_target_and_text(
@@ -861,7 +860,6 @@ pub(crate) fn timeline_message_record_json(
         "reply_to_message_id": message.reply_to_message_id_hex,
         "reply_preview": message.reply_preview,
         "media": message.media,
-        "agent_text_stream": message.agent_text_stream,
         "reactions": message.reactions,
         "edit": message.edit,
         "deleted": message.deleted,
@@ -1027,9 +1025,7 @@ pub(crate) fn message_record_json(
     message: AppMessageRecord,
     from_display_name: Option<String>,
 ) -> Value {
-    let agent_text_stream =
-        agent_text_stream_payload_value(message.kind, &message.tags, &message.plaintext);
-    let mut value = json!({
+    json!({
         "message_id": message.message_id_hex,
         "direction": message.direction,
         "group_id": message.group_id_hex,
@@ -1044,11 +1040,7 @@ pub(crate) fn message_record_json(
         // rows delivered under no policy. Never re-derived from the current
         // group component.
         "retention": message.retention,
-    });
-    if let Some(agent_text_stream) = agent_text_stream {
-        value["agent_text_stream"] = agent_text_stream;
-    }
-    value
+    })
 }
 
 #[cfg(test)]

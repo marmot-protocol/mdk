@@ -115,11 +115,7 @@ pub(crate) struct TuiApp {
     pub(crate) show_archived_chats: bool,
     pub(crate) timeline: Vec<TimelineRow>,
     pub(crate) timeline_scroll: TimelineScroll,
-    pub(crate) live_stream_previews: Vec<LiveStreamPreview>,
-    /// Owner of the account-wide preview buffer, retained across feed reconnects.
-    pub(crate) stream_previews_account_id: Option<String>,
     pub(crate) chat_subscription: Option<ChatSubscription>,
-    pub(crate) message_subscription: Option<MessageSubscription>,
     pub(crate) timeline_subscription: Option<TimelineSubscription>,
     pub(crate) group_state_subscription: Option<GroupStateSubscription>,
     pub(crate) notification_subscription: Option<NotificationSubscription>,
@@ -166,7 +162,6 @@ pub(crate) struct TuiApp {
     pub(crate) daemon: DaemonView,
     pub(crate) group_diagnostics: Option<GroupDiagnostics>,
     pub(crate) input: Input,
-    pub(crate) streaming: Option<StreamComposer>,
     /// Coalesce invite notices per local account until Main can display them.
     /// Deduplicating receipt never discards a notice behind retained feedback.
     pub(crate) pending_invite_notices: std::collections::HashMap<String, PendingInviteNotice>,
@@ -179,7 +174,6 @@ pub(crate) struct TuiApp {
     pub(crate) status: String,
     pub(crate) status_ownership: StatusOwnership,
     pub(crate) flick_status_owner: Option<u64>,
-    pub(crate) stream_status_owner: Option<StatusOwner>,
     pub(crate) daemon_start_status_owner: Option<StatusOwner>,
     pub(crate) daemon_notice: DaemonNotice,
     /// The one open modal, or none. While set it captures every key (routed at
@@ -434,10 +428,7 @@ impl TuiApp {
             show_archived_chats: false,
             timeline: Vec::new(),
             timeline_scroll: TimelineScroll::default(),
-            live_stream_previews: Vec::new(),
-            stream_previews_account_id: None,
             chat_subscription: None,
-            message_subscription: None,
             timeline_subscription: None,
             group_state_subscription: None,
             notification_subscription: None,
@@ -454,7 +445,6 @@ impl TuiApp {
             daemon: DaemonView::default(),
             group_diagnostics: None,
             input: Input::default(),
-            streaming: None,
             pending_invite_notices: Default::default(),
             invite_notice_revision: 0,
             view_status_action: None,
@@ -465,7 +455,6 @@ impl TuiApp {
             status: "loading accounts".to_owned(),
             status_ownership: StatusOwnership::default(),
             flick_status_owner: None,
-            stream_status_owner: None,
             daemon_start_status_owner: None,
             daemon_notice: DaemonNotice::default(),
             popup: None,
@@ -543,8 +532,8 @@ impl TuiApp {
     }
 
     /// Route pasted text (from bracketed paste) into whatever input is accepting
-    /// characters — the streaming composer, a text popup's field, the nsec field,
-    /// the main composer, or a focused search query — as literal characters with
+    /// characters — a text popup's field, the nsec field, the main composer, or
+    /// a focused search query — as literal characters with
     /// no keybinding interpretation. Newlines are kept (normalized to `\n`) so
     /// multi-line content lands verbatim. Paste elsewhere is ignored, mirroring
     /// where typed characters are accepted.
@@ -556,27 +545,6 @@ impl TuiApp {
         if let Some(popup) = self.popup.as_mut() {
             if let Popup::Text { input, .. } = popup {
                 input.insert_str(&text);
-            }
-            return;
-        }
-        if self.streaming.is_some() {
-            self.begin_status_action();
-            self.input.insert_str(&text);
-            let mut stream_id = None;
-            if let Some(streaming) = self.streaming.as_mut() {
-                streaming.pending_text.push_str(&text);
-                stream_id = Some(streaming.stream_id.clone());
-                // Mirror the typed-char status so a paste is as visible as typing.
-                let status = format!(
-                    "queued {} byte(s) on {}",
-                    streaming.pending_text.len(),
-                    shorten(&streaming.stream_id, 18)
-                );
-                self.set_status(status);
-                self.stream_status_owner = Some(self.status_ownership.owner());
-            }
-            if let Some(stream_id) = stream_id {
-                self.upsert_active_stream_preview(&stream_id);
             }
             return;
         }
@@ -594,11 +562,9 @@ impl TuiApp {
     }
 
     pub(crate) fn tick(&mut self) -> bool {
-        let now = Instant::now();
         let mut changed = false;
         changed |= self.drain_chat_subscription();
         changed |= self.drain_group_state_subscription();
-        changed |= self.drain_message_subscription();
         changed |= self.drain_timeline_subscription();
         changed |= self.drain_notification_subscription();
         // Fold completed media downloads/decodes in, then start downloads for any
@@ -683,22 +649,6 @@ impl TuiApp {
             }
             changed = true;
         }
-        self.with_feedback(
-            self.stream_status_owner
-                .map_or(FeedbackPermission::Silent, FeedbackPermission::Action),
-            |app| {
-                match app.flush_stream_append_if_due(now) {
-                    Ok(flushed) => changed |= flushed,
-                    Err(err) => {
-                        app.set_status(format!("stream append failed: {err}"));
-                        changed = true;
-                    }
-                }
-                if app.status_is_owned() {
-                    app.stream_status_owner = Some(app.status_ownership.owner());
-                }
-            },
-        );
         // At most one retained notice per frame: ambient writes do not retain
         // the line, so delivering both here would immediately hide the first.
         if self.deliver_daemon_notice() {
@@ -849,28 +799,11 @@ impl TuiApp {
             return Ok(());
         }
         // A popup is modal: it captures every key (behind only Ctrl-C) so the
-        // screen behind it — and the streaming and screen dispatch below — see
+        // screen behind it — and the screen dispatch below — see
         // nothing. This is what makes `q` under the help card close the card
         // instead of quitting the app.
         if self.popup.is_some() {
             return self.handle_popup_key(key);
-        }
-        // The streaming check sits ahead of the screen dispatch (behind only
-        // Ctrl-C) so the invariant is structural: while a stream is open, keys go
-        // to the composer and `tick()` keeps flushing regardless of which screen
-        // is showing. Otherwise a future Main->Login transition with a live stream
-        // would silently bypass the streaming keys.
-        if self.streaming.is_some() {
-            // Streaming key handling (finish/cancel/append) performs fallible
-            // daemon/relay operations. Mirror the non-streaming Enter path and
-            // tick(): catch errors into the status line instead of propagating
-            // them out of run() and tearing down the whole TUI session. The
-            // composer state is preserved on failures that keep `self.streaming`
-            // set, so the user can retry Enter/Esc.
-            if let Err(err) = self.handle_streaming_key(key) {
-                self.show_action_feedback(format!("error: {err}"));
-            }
-            return Ok(());
         }
         match self.screen {
             Screen::Login(mode) => return self.handle_login_key(mode, key),
@@ -1343,50 +1276,9 @@ impl TuiApp {
         self.send_message(input)
     }
 
-    pub(crate) fn handle_streaming_key(&mut self, key: KeyEvent) -> TuiResult<()> {
-        match key.code {
-            KeyCode::Enter => {
-                self.begin_status_action();
-                self.finish_stream_composer()
-            }
-            KeyCode::Esc => {
-                self.begin_status_action();
-                self.cancel_stream_composer()
-            }
-            KeyCode::Backspace => {
-                self.begin_status_action();
-                self.set_status(
-                    "stream editing is append-only in this preview; Esc cancels".to_owned(),
-                );
-                Ok(())
-            }
-            KeyCode::Char(character) => {
-                self.begin_status_action();
-                self.input.insert(character);
-                let mut stream_id = None;
-                if let Some(streaming) = self.streaming.as_mut() {
-                    streaming.pending_text.push(character);
-                    stream_id = Some(streaming.stream_id.clone());
-                    let status = format!(
-                        "queued {} byte(s) on {}",
-                        streaming.pending_text.len(),
-                        shorten(&streaming.stream_id, 18)
-                    );
-                    self.set_status(status);
-                    self.stream_status_owner = Some(self.status_ownership.owner());
-                }
-                if let Some(stream_id) = stream_id {
-                    self.upsert_active_stream_preview(&stream_id);
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
     /// Handle a keypress on the login/account-select screen. Fallible account
     /// setup is caught into the status line so a failed create/login never tears
-    /// down the session (mirrors the streaming and main-view Enter paths).
+    /// down the session (mirrors the main-view Enter path).
     pub(crate) fn handle_login_key(&mut self, mode: LoginMode, key: KeyEvent) -> TuiResult<()> {
         match mode {
             LoginMode::Menu => self.handle_login_menu_key(key),
@@ -1584,34 +1476,6 @@ impl TuiApp {
                 Ok(())
             }
             SlashCommand::MessageSearch { query } => self.open_message_search(query),
-            SlashCommand::StreamCompose {
-                stream_id,
-                quic_candidates,
-            } => self.start_stream_composer(stream_id, quic_candidates),
-            SlashCommand::StreamStart {
-                stream_id,
-                quic_candidates,
-            } => self.start_stream(stream_id, quic_candidates),
-            SlashCommand::StreamWatch {
-                stream_id,
-                insecure_local,
-            } => self.watch_stream(stream_id, insecure_local),
-            SlashCommand::StreamStatus => {
-                self.refresh_daemon_status()?;
-                self.set_status(stream_watch_status(&self.daemon));
-                Ok(())
-            }
-            SlashCommand::StreamFinish {
-                stream_id,
-                transcript_hash,
-                chunk_count,
-                text,
-            } => self.finish_stream(stream_id, transcript_hash, chunk_count, text),
-            SlashCommand::StreamVerify {
-                stream_id,
-                transcript_hash,
-                chunk_count,
-            } => self.verify_stream(stream_id, transcript_hash, chunk_count),
             SlashCommand::Quit => {
                 self.running = false;
                 Ok(())

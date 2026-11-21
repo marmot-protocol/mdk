@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 fn system_value(from: &str, from_display_name: Option<&str>) -> Value {
     let mut value = serde_json::json!({ "from": from });
@@ -264,66 +265,6 @@ fn slash_command_parser_handles_profile_name_updates() {
     );
     assert!(parse_slash_command("/name").is_err());
     assert!(parse_slash_command("/profile name").is_err());
-}
-
-#[test]
-fn slash_command_parser_handles_stream_commands() {
-    assert_eq!(
-        parse_slash_command("/stream"),
-        Ok(SlashCommand::StreamCompose {
-            stream_id: None,
-            quic_candidates: vec![DEFAULT_STREAM_CANDIDATE.to_owned()],
-        })
-    );
-    assert_eq!(
-        parse_slash_command("/stream --stream-id aa --quic-candidate quic://127.0.0.1:4451"),
-        Ok(SlashCommand::StreamCompose {
-            stream_id: Some("aa".to_owned()),
-            quic_candidates: vec!["quic://127.0.0.1:4451".to_owned()],
-        })
-    );
-    assert_eq!(
-        parse_slash_command("/stream start --stream-id aa --quic-candidate quic://127.0.0.1:4450"),
-        Ok(SlashCommand::StreamStart {
-            stream_id: Some("aa".to_owned()),
-            quic_candidates: vec!["quic://127.0.0.1:4450".to_owned()],
-        })
-    );
-    assert_eq!(
-        parse_slash_command("/stream watch --stream-id aa --insecure-local"),
-        Ok(SlashCommand::StreamWatch {
-            stream_id: Some("aa".to_owned()),
-            insecure_local: true,
-        })
-    );
-    assert_eq!(
-        parse_slash_command("/stream watch aa"),
-        Ok(SlashCommand::StreamWatch {
-            stream_id: Some("aa".to_owned()),
-            insecure_local: false,
-        })
-    );
-    assert_eq!(
-        parse_slash_command("/stream status"),
-        Ok(SlashCommand::StreamStatus)
-    );
-    assert_eq!(
-        parse_slash_command("/stream finish aa bb 2 hello world"),
-        Ok(SlashCommand::StreamFinish {
-            stream_id: "aa".to_owned(),
-            transcript_hash: "bb".to_owned(),
-            chunk_count: 2,
-            text: "hello world".to_owned(),
-        })
-    );
-    assert_eq!(
-        parse_slash_command("/stream verify aa bb 2"),
-        Ok(SlashCommand::StreamVerify {
-            stream_id: "aa".to_owned(),
-            transcript_hash: "bb".to_owned(),
-            chunk_count: Some(2),
-        })
-    );
 }
 
 #[test]
@@ -1112,11 +1053,6 @@ fn diagnostics_panel_lines_show_mls_and_components() {
                 "component_id": 32771,
                 "component": "marmot.group.admin-policy.v1",
                 "data_hex": "aabbcc"
-            },
-            "agent_text_stream": {
-                "component_id": 32774,
-                "component": "marmot.group.agent-text-stream.quic.v1",
-                "data_hex": "ffee"
             }
         },
         "mls": {
@@ -1131,7 +1067,6 @@ fn diagnostics_panel_lines_show_mls_and_components() {
     assert!(!debug_rendered.contains(UPLOAD_KEY_HEX));
     assert!(!debug_rendered.contains("010203"));
     assert!(!debug_rendered.contains("aabbcc"));
-    assert!(!debug_rendered.contains("ffee"));
 
     // The diagnostics panel drops the leading status line (now in the status bar):
     // it starts straight at the MLS summary.
@@ -1145,7 +1080,6 @@ fn diagnostics_panel_lines_show_mls_and_components() {
     assert!(!rendered_joined.contains(UPLOAD_KEY_HEX));
     assert!(!rendered_joined.contains("010203"));
     assert!(!rendered_joined.contains("aabbcc"));
-    assert!(!rendered_joined.contains("ffee"));
 
     assert_eq!(
         rendered[0],
@@ -1166,11 +1100,6 @@ fn diagnostics_panel_lines_show_mls_and_components() {
         rendered
             .iter()
             .any(|line| line == "marmot.group.admin-policy.v1 id=32771")
-    );
-    assert!(
-        rendered
-            .iter()
-            .any(|line| line == "marmot.group.agent-text-stream.quic.v1 id=32774")
     );
 }
 
@@ -1361,18 +1290,6 @@ fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
         .collect::<Vec<_>>();
     assert_eq!(hhmm_body(&rendered[0]), "ali]0;pwnce: hi[2Jbob");
 
-    let previews = vec![LiveStreamPreview {
-        group_id: "group-a".to_owned(),
-        stream_id: "stream-a".to_owned(),
-        author: "stream\u{1b}[31m".to_owned(),
-        status: "running".to_owned(),
-        text: "part\u{9b}31mial\u{7}".to_owned(),
-        error: None,
-        optimistic: false,
-    }];
-    let preview_lines = stream_preview_lines(&DaemonView::default(), &previews, Some("group-a"));
-    assert_eq!(line_text(&preview_lines[1]), "stream[31m: part31mial");
-
     let chat = ChatRow {
         group_id: "group-a".to_owned(),
         name: "ops\u{1b}[5m".to_owned(),
@@ -1448,215 +1365,6 @@ fn daemon_status_json_becomes_status_text() {
 }
 
 #[test]
-fn daemon_stream_watches_become_status_and_preview_rows() {
-    let group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let stream_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let daemon = parse_daemon_view(&serde_json::json!({
-        "running": true,
-        "pid": 1234,
-        "stream_watches": [
-            {
-                "watch_id": "watch-1",
-                "group_id": group_id,
-                "stream_id": stream_id,
-                "status": "running",
-                "text": "daemon live text"
-            },
-            {
-                "watch_id": "watch-2",
-                "group_id": group_id,
-                "stream_id": stream_id,
-                "status": "completed",
-                "text": "daemon preview text",
-                "transcript_hash": "cccc",
-                "chunk_count": 2
-            }
-        ]
-    }));
-
-    assert_eq!(
-        daemon_status_sentence(&daemon),
-        "daemon running streams: running=1 completed=1 failed=0 latest=bbbbbbb...bbbbbbbb"
-    );
-
-    let preview_lines = stream_preview_lines(&daemon, &[], Some(group_id));
-    let rendered_preview = preview_lines[1]
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    assert_eq!(rendered_preview, "stream: daemon live text");
-    assert_eq!(preview_lines.len(), 2);
-    assert!(stream_preview_lines(&daemon, &[], Some("different-group")).is_empty());
-}
-
-#[test]
-fn active_stream_preview_pins_to_open_time_group_after_selection_shift() {
-    // Regression for issue #198: the stream composer must key its live
-    // preview upsert/cleanup on the group selected when the stream was
-    // opened, not on the chat that happens to be selected now. A
-    // background chat-subscription tick can shift selected_chat while
-    // streaming (e.g. the streamed-into chat is archived/removed by
-    // another member/device). Before the fix, keystrokes upserted the
-    // streamed text under the wrong group and finish/cancel left a ghost
-    // row under the original group.
-    let stream_group = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let other_group = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    let stream_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let account_id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-
-    // compose-cancel response; cancel_stream_composer ignores the value.
-    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{}}"#);
-    let mut app = test_tui_app(client, account_id);
-    app.chats = vec![ChatRow {
-        group_id: other_group.to_owned(),
-        name: "other".to_owned(),
-        archived: false,
-        projection: ChatProjection::default(),
-    }];
-    // Selection now points at a DIFFERENT group than the streamed-into one.
-    app.selected_chat = 0;
-    app.streaming = Some(StreamComposer {
-        stream_id: stream_id.to_owned(),
-        group_id: stream_group.to_owned(),
-        pending_text: String::new(),
-        last_flush: Instant::now(),
-        flushed_bytes: 0,
-    });
-    app.input.set_value("hello");
-
-    // A keystroke-driven preview upsert must land under the pinned group.
-    app.upsert_active_stream_preview(stream_id);
-    assert_eq!(app.live_stream_previews.len(), 1);
-    let preview = &app.live_stream_previews[0];
-    assert_eq!(preview.group_id, stream_group);
-    assert_eq!(preview.stream_id, stream_id);
-    assert_eq!(preview.text, "hello");
-
-    // Cancel must remove the preview from the pinned group, not the
-    // currently-selected one, so no ghost streaming row is left behind.
-    app.cancel_stream_composer()
-        .expect("cancel stream composer");
-    assert!(app.live_stream_previews.is_empty());
-    assert!(app.streaming.is_none());
-}
-
-#[test]
-fn stream_preview_lines_hide_empty_and_completed_previews() {
-    let group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let stream_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let daemon = parse_daemon_view(&serde_json::json!({
-        "running": true,
-        "pid": 1234,
-        "stream_watches": [
-            {
-                "watch_id": "watch-1",
-                "group_id": group_id,
-                "stream_id": stream_id,
-                "status": "completed",
-                "text": "final text should be rendered from MLS instead"
-            }
-        ]
-    }));
-    let previews = vec![LiveStreamPreview {
-        group_id: group_id.to_owned(),
-        stream_id: stream_id.to_owned(),
-        author: "me".to_owned(),
-        status: "streaming".to_owned(),
-        text: String::new(),
-        error: None,
-        optimistic: true,
-    }];
-
-    assert!(
-        stream_preview_lines(&DaemonView::default(), &previews, Some(group_id)).is_empty(),
-        "an empty local preview is hidden independently of daemon watches"
-    );
-    assert!(
-        stream_preview_lines(&daemon, &[], Some(group_id)).is_empty(),
-        "a completed daemon watch is hidden without a local preview shadowing it"
-    );
-}
-
-#[test]
-fn subscription_stream_deltas_update_live_preview_text() {
-    let group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let stream_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let mut previews = Vec::new();
-
-    apply_subscription_result(
-        &mut previews,
-        &serde_json::json!({
-            "type": "agent_stream_delta",
-            "agent_stream_delta": {
-                "group_id": group_id,
-                "stream_id": stream_id,
-                "text": "hello "
-            }
-        }),
-    );
-    apply_subscription_result(
-        &mut previews,
-        &serde_json::json!({
-            "type": "agent_stream_delta",
-            "agent_stream_delta": {
-                "group_id": group_id,
-                "stream_id": stream_id,
-                "text": "stream"
-            }
-        }),
-    );
-
-    let rendered_preview = stream_preview_lines(&DaemonView::default(), &previews, Some(group_id))
-        [1]
-    .spans
-    .iter()
-    .map(|span| span.content.as_ref())
-    .collect::<String>();
-    assert_eq!(rendered_preview, "stream: hello stream");
-}
-
-#[test]
-fn stream_previews_keep_bounded_rows_and_tail_text() {
-    let group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let long_text = format!("{}\u{00e9}", "a".repeat(TUI_LIVE_STREAM_TEXT_LIMIT));
-    let mut previews = Vec::new();
-
-    append_live_stream_delta(
-        &mut previews,
-        group_id.to_owned(),
-        "stream-long".to_owned(),
-        long_text,
-    );
-
-    assert!(previews[0].text.len() <= TUI_LIVE_STREAM_TEXT_LIMIT);
-    assert!(previews[0].text.ends_with('\u{00e9}'));
-
-    let mut previews = Vec::new();
-    for index in 0..(TUI_LIVE_STREAM_PREVIEW_LIMIT + 2) {
-        upsert_live_stream_preview(
-            &mut previews,
-            LiveStreamPreview {
-                group_id: group_id.to_owned(),
-                stream_id: format!("stream-{index}"),
-                author: "stream".to_owned(),
-                status: "streaming".to_owned(),
-                text: "partial".to_owned(),
-                error: None,
-                optimistic: false,
-            },
-            true,
-        );
-    }
-
-    assert_eq!(previews.len(), TUI_LIVE_STREAM_PREVIEW_LIMIT);
-    assert_eq!(
-        previews.first().map(|preview| preview.stream_id.as_str()),
-        Some("stream-2")
-    );
-}
-
-#[test]
 fn idle_tick_does_not_request_redraw() {
     let mut app = test_tui_app(
         test_unused_client(),
@@ -1702,126 +1410,6 @@ fn chat_subscription_result_inserts_live_invite_without_account_switch() {
 }
 
 #[test]
-fn local_stream_preview_ignores_echoed_deltas() {
-    let group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let stream_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let mut previews = vec![LiveStreamPreview {
-        group_id: group_id.to_owned(),
-        stream_id: stream_id.to_owned(),
-        author: "me".to_owned(),
-        status: "streaming".to_owned(),
-        text: "hello stream".to_owned(),
-        error: None,
-        optimistic: true,
-    }];
-
-    append_live_stream_delta(
-        &mut previews,
-        group_id.to_owned(),
-        stream_id.to_owned(),
-        "eam".to_owned(),
-    );
-
-    assert_eq!(previews[0].text, "hello stream");
-}
-
-#[test]
-fn subscription_final_message_removes_live_stream_preview() {
-    // The plain feed no longer populates the pane (the timeline feed owns it),
-    // but it still clears the live stream preview when the agent stream's final
-    // row lands so a completed stream stops rendering in the pane's bottom block.
-    let mut previews = Vec::new();
-
-    apply_subscription_result(
-        &mut previews,
-        &serde_json::json!({
-            "type": "agent_stream_start",
-            "message": {
-                "message_id": "start",
-                "direction": "received",
-                "group_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "from": "alice",
-                "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
-                "agent_text_stream": {
-                    "kind": "start",
-                    "stream_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                }
-            }
-        }),
-    );
-    assert_eq!(previews.len(), 1);
-    apply_subscription_result(
-        &mut previews,
-        &serde_json::json!({
-            "type": "agent_stream_final",
-            "message": {
-                "message_id": "final",
-                "direction": "received",
-                "group_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "from": "alice",
-                "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
-                "agent_text_stream": {
-                    "kind": "final",
-                    "stream_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "final_text_or_reference": "hello from MLS"
-                }
-            }
-        }),
-    );
-
-    assert!(previews.is_empty());
-}
-
-#[test]
-fn plain_feed_cleans_up_stream_preview_on_agent_final() {
-    // Phase 4 retired the plain feed's local unread counting (unread is
-    // runtime-backed now). The feed still owns QUIC stream previews: an agent
-    // stream's final row clears the live preview, with no message appended.
-    // (Retired with the local counting: all_chat_subscription_marks_nonselected_
-    // messages_unread, _does_not_count_selected_group_as_unread, and
-    // _ignores_initial_replay_for_unread_counts.)
-    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let stream_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    let mut previews = vec![LiveStreamPreview {
-        group_id: group_id.to_owned(),
-        stream_id: stream_id.to_owned(),
-        author: "alice".to_owned(),
-        status: "streaming".to_owned(),
-        text: "partial".to_owned(),
-        error: None,
-        optimistic: false,
-    }];
-
-    apply_subscription_result(
-        &mut previews,
-        &serde_json::json!({
-            "trigger": "AgentStreamFinalized",
-            "type": "agent_stream_final",
-            "message": {
-                "message_id": "final",
-                "direction": "received",
-                "group_id": group_id,
-                "from": "alice",
-                "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
-                "agent_text_stream": {
-                    "kind": "final",
-                    "stream_id": stream_id,
-                    "final_text_or_reference": "finished elsewhere"
-                }
-            }
-        }),
-    );
-
-    assert!(previews.is_empty());
-}
-
-// Retired in Phase 4: message_subscription_gates_on_loaded_chat_not_highlighted_chat
-// asserted the plain feed's local unread counting, which no longer exists — unread
-// is runtime-backed. The loaded-vs-highlighted gating that still matters (the
-// timeline feed and mark-read target the loaded pane) is covered by the timeline
-// and mark-read tests below.
-
-#[test]
 fn drain_status_leaves_the_login_prompt_untouched_but_updates_main() {
     // A picker reached via `A` from an active session keeps its background
     // drains running. On the login/account-select screen the status line carries
@@ -1830,7 +1418,7 @@ fn drain_status_leaves_the_login_prompt_untouched_but_updates_main() {
     let account_id = "aa".repeat(32);
     let mut app = test_tui_app(test_unused_client(), &account_id);
     let (tx, rx) = mpsc::channel();
-    app.message_subscription = Some(MessageSubscription {
+    app.notification_subscription = Some(NotificationSubscription {
         account_id: account_id.clone(),
         child: test_sleep_child(),
         rx,
@@ -1841,7 +1429,7 @@ fn drain_status_leaves_the_login_prompt_untouched_but_updates_main() {
     app.status = prompt.clone();
     tx.send(SubscriptionEvent::Error("relay dropped".to_owned()))
         .expect("send error event");
-    assert!(app.drain_message_subscription());
+    assert!(app.drain_notification_subscription());
     assert_eq!(
         app.status, prompt,
         "the login prompt survives a background drain"
@@ -1851,27 +1439,11 @@ fn drain_status_leaves_the_login_prompt_untouched_but_updates_main() {
     app.screen = Screen::Main;
     tx.send(SubscriptionEvent::Error("relay dropped".to_owned()))
         .expect("send error event");
-    assert!(app.drain_message_subscription());
+    assert!(app.drain_notification_subscription());
     assert!(
         app.status.contains("relay dropped"),
         "main-view drains still set status, got: {}",
         app.status
-    );
-}
-
-#[test]
-fn selected_message_subscription_retains_account_wide_stream_without_selected_chat() {
-    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let mut app = test_tui_app(test_unused_client(), account_id);
-    app.message_subscription = Some(test_message_subscription(account_id));
-
-    app.ensure_selected_message_subscription();
-
-    assert_eq!(
-        app.message_subscription
-            .as_ref()
-            .map(|subscription| subscription.account_id.as_str()),
-        Some(account_id)
     );
 }
 
@@ -1892,7 +1464,6 @@ fn refresh_accounts_clears_chat_state_when_no_accounts_remain() {
         },
     }];
     app.chat_subscription = Some(test_chat_subscription(account_id, false));
-    app.message_subscription = Some(test_message_subscription(account_id));
     app.notification_subscription = Some(test_notification_subscription(account_id));
     app.group_diagnostics = Some(GroupDiagnostics::unavailable(group_id, "old"));
 
@@ -1902,31 +1473,8 @@ fn refresh_accounts_clears_chat_state_when_no_accounts_remain() {
     assert!(app.chats.is_empty());
     assert!(app.timeline.is_empty());
     assert!(app.chat_subscription.is_none());
-    assert!(app.message_subscription.is_none());
     assert!(app.notification_subscription.is_none());
     assert!(app.group_diagnostics.is_none());
-}
-
-#[test]
-fn refresh_chats_starts_account_wide_stream_when_no_chats_are_visible() {
-    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"chats":[]}}"#);
-    let mut app = test_tui_app(client, account_id);
-    app.chat_subscription = Some(test_chat_subscription(account_id, false));
-    app.group_diagnostics = Some(GroupDiagnostics::unavailable(group_id, "old"));
-
-    app.refresh_chats().expect("refresh chats");
-
-    assert!(app.chats.is_empty());
-    assert!(app.timeline.is_empty());
-    assert_eq!(
-        app.message_subscription
-            .as_ref()
-            .map(|subscription| subscription.account_id.as_str()),
-        Some(account_id)
-    );
-    assert!(app.group_diagnostics.is_some());
 }
 
 #[test]
@@ -1957,7 +1505,6 @@ fn refresh_chats_clears_stale_send_targets_for_public_only_account() {
     app.messages_account_id = Some(previous_account.to_owned());
     app.messages_group_id = Some(previous_group.to_owned());
     app.chat_subscription = Some(test_chat_subscription(previous_account, false));
-    app.message_subscription = Some(test_message_subscription(previous_account));
     app.group_diagnostics = Some(GroupDiagnostics::unavailable(previous_group, "old"));
 
     app.refresh_chats().expect("refresh chats");
@@ -1967,23 +1514,9 @@ fn refresh_chats_clears_stale_send_targets_for_public_only_account() {
     assert!(app.messages_account_id.is_none());
     assert!(app.messages_group_id.is_none());
     assert!(app.chat_subscription.is_none());
-    assert!(app.message_subscription.is_none());
     assert!(app.group_state_subscription.is_none());
     assert!(app.notification_subscription.is_none());
     assert!(app.group_diagnostics.is_none());
-}
-
-#[test]
-fn message_subscription_skips_initial_replay() {
-    assert_eq!(
-        message_subscription_args(),
-        vec![
-            "messages".to_owned(),
-            "subscribe".to_owned(),
-            "--limit".to_owned(),
-            "0".to_owned(),
-        ]
-    );
 }
 
 #[test]
@@ -2390,11 +1923,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         show_archived_chats: false,
         timeline: Vec::new(),
         timeline_scroll: TimelineScroll::default(),
-        live_stream_previews: Vec::new(),
-        // The empty account fixture already owns its account-wide resources.
-        stream_previews_account_id: Some(account_id.to_owned()),
         chat_subscription: None,
-        message_subscription: None,
         timeline_subscription: None,
         group_state_subscription: None,
         notification_subscription: None,
@@ -2414,7 +1943,6 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         },
         group_diagnostics: None,
         input: Input::default(),
-        streaming: None,
         pending_invite_notices: Default::default(),
         invite_notice_revision: 0,
         view_status_action: None,
@@ -2425,7 +1953,6 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         status: String::new(),
         status_ownership: StatusOwnership::default(),
         flick_status_owner: None,
-        stream_status_owner: None,
         daemon_start_status_owner: None,
         daemon_notice: DaemonNotice::default(),
         popup: None,
@@ -2694,516 +2221,6 @@ fn test_chat_subscription(account_id: &str, include_archived: bool) -> ChatSubsc
     ChatSubscription {
         account_id: account_id.to_owned(),
         include_archived,
-        child,
-        rx,
-    }
-}
-
-#[cfg(unix)]
-fn stream_recording_executable(dir: &std::path::Path, response: &str) -> (PathBuf, PathBuf) {
-    let exe = dir.join("wn-stream");
-    let calls = dir.join("calls");
-    std::fs::create_dir(&calls).unwrap();
-    write_fake_wn(
-        &exe,
-        &format!(
-            "#!/bin/sh\nset -e\nn=0\nwhile ! mkdir '{}/'$n 2>/dev/null; do [ -d '{}' ] || exit 1; n=$((n + 1)); done\nprintf '%s\\n' \"$@\" > '{}/'$n/args.tmp\nmv '{}/'$n/args.tmp '{}/'$n/args\ncat <<'JSON'\n{response}\nJSON\n",
-            calls.display(),
-            calls.display(),
-            calls.display(),
-            calls.display(),
-            calls.display(),
-        ),
-    );
-    (exe, calls)
-}
-
-#[cfg(unix)]
-fn stream_recorded_calls(dir: &std::path::Path) -> Vec<Vec<String>> {
-    let mut calls = std::fs::read_dir(dir)
-        .unwrap()
-        .map(|entry| {
-            let entry = entry.unwrap();
-            let order = entry
-                .file_name()
-                .to_str()
-                .unwrap()
-                .parse::<usize>()
-                .unwrap();
-            let args = std::fs::read_to_string(entry.path().join("args"))
-                .unwrap()
-                .lines()
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            (order, args)
-        })
-        .collect::<Vec<_>>();
-    calls.sort_by_key(|(order, _)| *order);
-    calls.into_iter().map(|(_, args)| args).collect()
-}
-
-#[cfg(unix)]
-#[test]
-fn stream_slash_controls_forward_options_and_report_the_command_reply() {
-    let account = "aa".repeat(32);
-    let group = "cc".repeat(16);
-    let stream = "bb".repeat(32);
-    let digest = "ee".repeat(32);
-    for (input, command, selected_owner, status) in [
-        (
-            format!("/stream start --stream-id {stream} --quic-candidate quic://127.0.0.1:4451"),
-            vec![
-                "stream".into(),
-                "start".into(),
-                group.clone(),
-                "--stream-id".into(),
-                stream.clone(),
-                "--quic-candidate".into(),
-                "quic://127.0.0.1:4451".into(),
-            ],
-            true,
-            "started stream ddddddd...dddddddd; published=2",
-        ),
-        (
-            format!("/stream watch --stream-id {stream} --insecure-local"),
-            vec![
-                "stream".into(),
-                "watch".into(),
-                group.clone(),
-                "--background".into(),
-                "--stream-id".into(),
-                stream.clone(),
-                "--insecure-local".into(),
-            ],
-            true,
-            "watching stream returned-watch",
-        ),
-        (
-            format!("/stream finish {stream} {digest} 2 finished text"),
-            vec![
-                "stream".into(),
-                "finish".into(),
-                group.clone(),
-                "--stream-id".into(),
-                stream.clone(),
-                "--transcript-hash".into(),
-                digest.clone(),
-                "--chunk-count".into(),
-                "2".into(),
-                "finished text".into(),
-            ],
-            true,
-            "finished stream bbbbbbb...bbbbbbbb; published=2",
-        ),
-        (
-            format!("/stream verify {stream} {digest} 2"),
-            vec![
-                "stream".into(),
-                "verify".into(),
-                group.clone(),
-                "--stream-id".into(),
-                stream.clone(),
-                "--transcript-hash".into(),
-                digest.clone(),
-                "--chunk-count".into(),
-                "2".into(),
-            ],
-            true,
-            "stream bbbbbbb...bbbbbbbb verified=true",
-        ),
-        (
-            format!("/stream verify {stream} {digest}"),
-            vec![
-                "stream".into(),
-                "verify".into(),
-                group.clone(),
-                "--stream-id".into(),
-                stream.clone(),
-                "--transcript-hash".into(),
-                digest.clone(),
-            ],
-            true,
-            "stream bbbbbbb...bbbbbbbb verified=true",
-        ),
-        (
-            "/stream status".to_owned(),
-            vec!["daemon".into(), "status".into()],
-            false,
-            "streams: running=1 completed=0 failed=0 latest=bbbbbbb...bbbbbbbb",
-        ),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let response = serde_json::json!({"ok":true,"result":{
-            "stream_id":"dd".repeat(32),"published":2,"watch_id":"returned-watch",
-            "verified":true,"running":!selected_owner,"messages":[],"has_more_before":false,
-            "stream_watches":if selected_owner {serde_json::json!([])} else {serde_json::json!([
-                {"watch_id":"returned-watch","group_id":group,"stream_id":stream,"status":"running"}
-            ])}
-        }})
-        .to_string();
-        let (exe, args) = stream_recording_executable(dir.path(), &response);
-        let mut app = test_tui_app(
-            WnClient {
-                exe,
-                ..test_unused_client()
-            },
-            &account,
-        );
-        app.daemon.running = false;
-        app.chats = vec![flick_chat(&group, "Selected room")];
-        app.messages_account_id = Some("ff".repeat(32));
-        app.messages_group_id = Some("ff".repeat(16));
-        if !selected_owner {
-            // Global daemon status is also available to a public-only account
-            // with no chat; it must not acquire account-specific subscriptions.
-            app.accounts[0].local_signing = false;
-            app.chats.clear();
-            app.messages_account_id = None;
-            app.messages_group_id = None;
-        }
-        app.input.set_value(&input);
-        app.submit_input().expect("dispatch stream control");
-        assert_eq!(app.status, status, "{input}");
-        assert!(app.input.is_empty());
-        finish_queued_effects(&mut app);
-        // Timeline folding queues diagnostics and mark-read behind the first
-        // marker. Fence those children before reading or removing their files.
-        finish_queued_effects(&mut app);
-        let recorded = stream_recorded_calls(&args);
-        let mut expected: Vec<String> = vec!["--json".into()];
-        if selected_owner {
-            expected.extend(["--account".into(), account.clone()]);
-        }
-        expected.extend(command);
-        assert_eq!(recorded[0], expected, "{input}");
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn stream_composition_adopts_the_returned_id_and_finishes_or_cancels_typed_text() {
-    let account = "aa".repeat(32);
-    let group = "cc".repeat(16);
-    let requested_stream = "bb".repeat(32);
-    let returned_stream = "dd".repeat(32);
-    for finish in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let response = serde_json::json!({"ok":true,"result":{
-            "stream_id":returned_stream,"chunk_count":7,"running":false,
-            "messages":[],"has_more_before":false
-        }})
-        .to_string();
-        let (exe, args) = stream_recording_executable(dir.path(), &response);
-        let mut app = test_tui_app(
-            WnClient {
-                exe,
-                ..test_unused_client()
-            },
-            &account,
-        );
-        app.daemon.running = false;
-        app.chats = vec![flick_chat(&group, "Selected room")];
-        app.input.set_value(format!("/stream --stream-id {requested_stream} --quic-candidate quic://127.0.0.1:4451 --quic-candidate quic://192.0.2.1:4451"));
-        app.submit_input().expect("open stream composer");
-        assert_eq!(
-            app.status,
-            "now streaming ddddddd...dddddddd; type text and press Enter to finish"
-        );
-        assert!(app.input.is_empty());
-        finish_queued_effects(&mut app);
-        finish_queued_effects(&mut app);
-        for ch in "hello world".chars() {
-            app.handle_key(char_key(ch)).unwrap();
-        }
-        let pending = app.streaming.as_ref().unwrap();
-        assert_eq!(
-            (
-                &pending.stream_id,
-                &pending.group_id,
-                pending.pending_text.as_str()
-            ),
-            (&returned_stream, &group, "hello world")
-        );
-        assert_eq!(app.live_stream_previews[0].text, "hello world");
-        let due = pending.last_flush + STREAM_APPEND_FLUSH_INTERVAL + Duration::from_millis(1);
-        assert!(app.flush_stream_append_if_due(due).expect("flush text"));
-        assert_eq!(app.streaming.as_ref().unwrap().pending_text, "");
-        assert_eq!(app.streaming.as_ref().unwrap().flushed_bytes, 11);
-        assert_eq!(app.status, "streaming 11 bytes on ddddddd...dddddddd");
-        app.handle_key(KeyEvent::new(
-            if finish { KeyCode::Enter } else { KeyCode::Esc },
-            KeyModifiers::NONE,
-        ))
-        .unwrap();
-        assert!(app.streaming.is_none());
-        assert!(app.input.is_empty());
-        assert!(app.live_stream_previews.is_empty());
-        assert_eq!(
-            app.status,
-            if finish {
-                "finished stream ddddddd...dddddddd chunks=7"
-            } else {
-                "cancelled stream ddddddd...dddddddd"
-            }
-        );
-        finish_queued_effects(&mut app);
-        finish_queued_effects(&mut app);
-        let calls = stream_recorded_calls(&args)
-            .into_iter()
-            .filter(|args| args.iter().any(|arg| arg == "stream"))
-            .collect::<Vec<_>>();
-        let prefix = vec!["--json".to_owned(), "--account".to_owned(), account.clone()];
-        let mut expected = vec![
-            vec![
-                "stream".into(),
-                "compose-open".into(),
-                group.clone(),
-                "--insecure-local".into(),
-                "--stream-id".into(),
-                requested_stream.clone(),
-                "--quic-candidate".into(),
-                "quic://127.0.0.1:4451".into(),
-                "--quic-candidate".into(),
-                "quic://192.0.2.1:4451".into(),
-            ],
-            vec![
-                "stream".into(),
-                "compose-append".into(),
-                "--stream-id".into(),
-                returned_stream.clone(),
-                "hello world".into(),
-            ],
-            vec![
-                "stream".into(),
-                if finish {
-                    "compose-finish"
-                } else {
-                    "compose-cancel"
-                }
-                .into(),
-                "--stream-id".into(),
-                returned_stream.clone(),
-            ],
-        ];
-        for call in &mut expected {
-            call.splice(0..0, prefix.clone());
-        }
-        assert_eq!(calls, expected);
-    }
-}
-
-#[test]
-fn failed_due_stream_append_updates_last_flush_to_back_off_tick_retry() {
-    // Regression for mdk#197: automatic stream-append retries come from
-    // tick(), which runs every UI event interval. A failing append must move the
-    // retry gate forward so a down daemon/broker does not spawn a blocking `wn`
-    // subprocess on every tick.
-    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let (_tempdir, client) =
-        test_json_client(r#"{"ok":false,"error":{"message":"broker offline"}}"#);
-    let mut app = test_tui_app(client, account_id);
-    let first_due = Instant::now();
-    let stale_flush = first_due - STREAM_APPEND_FLUSH_INTERVAL - Duration::from_millis(1);
-    app.streaming = Some(StreamComposer {
-        stream_id: "stream-197".to_owned(),
-        group_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-        pending_text: "queued".to_owned(),
-        last_flush: stale_flush,
-        flushed_bytes: 0,
-    });
-
-    let first = app.flush_stream_append_if_due(first_due);
-
-    assert!(
-        first.is_err(),
-        "first due flush should report the append failure"
-    );
-    let streaming = app.streaming.as_ref().expect("composer remains active");
-    assert_eq!(streaming.pending_text, "queued");
-    assert!(streaming.last_flush >= first_due);
-    let retry_gate = streaming.last_flush;
-
-    let second = app.flush_stream_append_if_due(retry_gate + UI_EVENT_WAIT);
-
-    assert!(!second.expect("retry gate should suppress immediate retry"));
-    let streaming = app.streaming.as_ref().expect("composer remains active");
-    assert_eq!(streaming.pending_text, "queued");
-    assert_eq!(streaming.last_flush, retry_gate);
-
-    #[cfg(unix)]
-    {
-        let dir = tempfile::tempdir().unwrap();
-        let (exe, args) = test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{}}"#);
-        app.client.exe = exe;
-        assert!(
-            app.flush_stream_append_if_due(retry_gate + STREAM_APPEND_FLUSH_INTERVAL)
-                .unwrap()
-        );
-        let streaming = app.streaming.as_ref().unwrap();
-        assert_eq!(streaming.pending_text, "");
-        assert_eq!(streaming.flushed_bytes, 6);
-        assert_eq!(app.status, "streaming 6 bytes on stream-197");
-        let recorded = std::fs::read_to_string(args).unwrap();
-        let requested = recorded.lines().next().unwrap();
-        assert!(requested.ends_with("stream compose-append --stream-id stream-197 queued"));
-        assert!(requested.contains(&format!("--account {account_id}")));
-    }
-    // Automatic retry feedback remains owned by typed text across retries;
-    // a newer editing instruction revokes feedback without discarding the flush.
-    let (_retry_dir, retry_client) =
-        test_json_client(r#"{"ok":false,"error":{"message":"retry offline"}}"#);
-    app.client = retry_client;
-    app.handle_streaming_key(char_key('x')).unwrap();
-    app.streaming.as_mut().unwrap().last_flush = Instant::now() - STREAM_APPEND_FLUSH_INTERVAL;
-    app.tick();
-    assert_eq!(app.status, "stream append failed: retry offline");
-    let (_again_dir, again_client) =
-        test_json_client(r#"{"ok":false,"error":{"message":"still offline"}}"#);
-    app.client = again_client;
-    app.streaming.as_mut().unwrap().last_flush = Instant::now() - STREAM_APPEND_FLUSH_INTERVAL;
-    app.tick();
-    assert_eq!(app.status, "stream append failed: still offline");
-    app.handle_streaming_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
-        .unwrap();
-    let (_ready_dir, ready_client) = test_json_client(r#"{"ok":true,"result":{}}"#);
-    app.client = ready_client;
-    app.streaming.as_mut().unwrap().last_flush = Instant::now() - STREAM_APPEND_FLUSH_INTERVAL;
-    app.tick();
-    assert_eq!(
-        app.status,
-        "stream editing is append-only in this preview; Esc cancels"
-    );
-    assert!(app.streaming.as_ref().unwrap().pending_text.is_empty());
-}
-
-#[test]
-fn streaming_keys_capture_input_before_screen_dispatch() {
-    // The streaming-composer check must sit ahead of the screen dispatch (behind
-    // only Ctrl-C), so any future Main->Login path with an open stream still
-    // routes keys to the stream while tick() keeps flushing, instead of the login
-    // handler consuming the key. Constructed by flipping the screen to Login with
-    // a live stream.
-    let account_id = "aa".repeat(32);
-    let mut app = test_tui_app(test_unused_client(), &account_id);
-    app.streaming = Some(StreamComposer {
-        stream_id: "stream-1".to_owned(),
-        group_id: "bb".repeat(32),
-        pending_text: String::new(),
-        last_flush: Instant::now(),
-        flushed_bytes: 0,
-    });
-
-    // Main view: a character queues on the stream composer.
-    app.screen = Screen::Main;
-    app.handle_key(char_key('x')).expect("char in main");
-    assert_eq!(
-        app.streaming.as_ref().expect("stream active").pending_text,
-        "x"
-    );
-
-    // With the screen on the login/account-select flow, an open stream keeps
-    // capturing input; the login handler never sees the key.
-    app.screen = Screen::Login(LoginMode::AccountSelect);
-    app.handle_key(char_key('y'))
-        .expect("char while login screen");
-    assert_eq!(
-        app.streaming.as_ref().expect("stream active").pending_text,
-        "xy"
-    );
-    assert_eq!(
-        app.screen,
-        Screen::Login(LoginMode::AccountSelect),
-        "the login handler never consumed the streaming key"
-    );
-}
-
-#[test]
-fn streaming_enter_failure_is_caught_into_status_and_keeps_tui_running() {
-    // Regression for issue #194: a fallible streaming finish (daemon gone,
-    // broker/QUIC error, relay publish ok=false) must not propagate out of
-    // handle_key and tear down the whole TUI. It should be caught into the
-    // status line, mirroring the non-streaming Enter path and tick().
-    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let (_tempdir, client) = test_json_client(r#"{"ok":false,"error":{"message":"daemon gone"}}"#);
-    let mut app = test_tui_app(client, account_id);
-    app.streaming = Some(StreamComposer {
-        stream_id: "stream-194".to_owned(),
-        group_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-        pending_text: String::new(),
-        last_flush: Instant::now(),
-        flushed_bytes: 0,
-    });
-    app.input.set_value("hello");
-
-    let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-    // The key handler must succeed so run() keeps looping instead of exiting.
-    assert!(outcome.is_ok(), "handle_key must not propagate the error");
-    assert!(
-        app.running,
-        "TUI must stay running after a streaming failure"
-    );
-    assert!(
-        app.status.contains("daemon gone"),
-        "error must surface in the status line, got: {}",
-        app.status
-    );
-    // The compose-finish call consumes the composer before running the
-    // fallible `wn stream compose-finish`. On failure it must be restored so
-    // the draft text in `self.input` is not silently re-sent as a normal
-    // message through the non-streaming Enter path on the next keypress.
-    assert!(
-        app.streaming.is_some(),
-        "composer must be restored after a compose-finish failure so Enter/Esc retries the stream"
-    );
-    assert_eq!(
-        app.input.value(),
-        "hello",
-        "draft text must be preserved for retry after a compose-finish failure"
-    );
-}
-
-#[test]
-fn streaming_enter_failure_before_finish_preserves_composer() {
-    // When the failure occurs before the compose-finish call consumes the
-    // composer (here: empty input short-circuits, then a pending append
-    // flush fails), the composer state is kept so the user can retry.
-    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let (_tempdir, client) =
-        test_json_client(r#"{"ok":false,"error":{"message":"broker offline"}}"#);
-    let mut app = test_tui_app(client, account_id);
-    app.streaming = Some(StreamComposer {
-        stream_id: "stream-194".to_owned(),
-        group_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-        pending_text: "queued".to_owned(),
-        last_flush: Instant::now(),
-        flushed_bytes: 0,
-    });
-    app.input.set_value("queued");
-
-    let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-    assert!(outcome.is_ok(), "handle_key must not propagate the error");
-    assert!(
-        app.running,
-        "TUI must stay running after a streaming failure"
-    );
-    assert!(
-        app.status.contains("broker offline"),
-        "error must surface in the status line, got: {}",
-        app.status
-    );
-    assert!(
-        app.streaming.is_some(),
-        "composer must be preserved on a pre-finish failure so Enter/Esc can retry"
-    );
-}
-
-fn test_message_subscription(account_id: &str) -> MessageSubscription {
-    let child = test_sleep_child();
-    let (_tx, rx) = mpsc::channel();
-    MessageSubscription {
-        account_id: account_id.to_owned(),
         child,
         rx,
     }
@@ -4247,7 +3264,6 @@ fn relist_recovery_realigns_the_live_account_feeds() {
     let timeline = app.timeline.clone();
     let scroll = app.timeline_scroll.clone();
     let timeline_child = app.timeline_subscription.as_ref().unwrap().child.id();
-    let message_child = app.message_subscription.as_ref().unwrap().child.id();
     let group_child = app.group_state_subscription.as_ref().unwrap().child.id();
     app.status = "draft saved".to_owned();
 
@@ -4288,10 +3304,6 @@ fn relist_recovery_realigns_the_live_account_feeds() {
         timeline_child
     );
     assert_eq!(
-        app.message_subscription.as_ref().unwrap().child.id(),
-        message_child
-    );
-    assert_eq!(
         app.group_state_subscription.as_ref().unwrap().child.id(),
         group_child
     );
@@ -4329,7 +3341,6 @@ fn relist_recovery_realigns_the_live_account_feeds() {
     );
     let chat_child = app.chat_subscription.as_ref().unwrap().child.id();
     let notification_child = app.notification_subscription.as_ref().unwrap().child.id();
-    let current_message_child = app.message_subscription.as_ref().unwrap().child.id();
     let current_group_child = app.group_state_subscription.as_ref().unwrap().child.id();
     app.status = "draft saved".to_owned();
     app.apply_effect_done(EffectDone {
@@ -4361,64 +3372,12 @@ fn relist_recovery_realigns_the_live_account_feeds() {
         timeline_child
     );
     assert_eq!(
-        app.message_subscription.as_ref().unwrap().child.id(),
-        current_message_child
-    );
-    assert_eq!(
         app.group_state_subscription.as_ref().unwrap().child.id(),
         current_group_child
     );
     assert_eq!(
         app.status, "draft saved",
         "successful ambient repair stays quiet"
-    );
-
-    // A's real recovered chat feed has adopted A's account-wide stream source,
-    // while the retained pane deliberately still belongs to B.
-    let foreground_account = app.selected_account_row().unwrap().account_id.clone();
-    let (tx, rx) = mpsc::channel();
-    app.message_subscription = Some(MessageSubscription {
-        account_id: foreground_account.clone(),
-        child: test_sleep_child(),
-        rx,
-    });
-    tx.send(SubscriptionEvent::Result(serde_json::json!({
-        "type":"agent_stream_delta","agent_stream_delta":{
-            "group_id":group,"stream_id":"ff".repeat(32),"text":"foreground account preview"
-        }
-    })))
-    .unwrap();
-    assert!(app.drain_message_subscription());
-    app.focus = Focus::Messages;
-    app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
-        .unwrap();
-    assert!(app.timeline_scroll.is_pinned());
-    assert_eq!(app.messages_account_id.as_deref(), Some(b.as_str()));
-    assert!(
-        !rendered_buffer(&mut app).contains("foreground account preview"),
-        "A's account-wide preview cannot render inside B's retained pane"
-    );
-    app.refresh_messages().expect("open the recovered A chat");
-    app.apply_effect_done(EffectDone {
-        request_id: RequestId::default(),
-        feedback: FeedbackPermission::View(app.status_ownership.owner()),
-        effect: Effect::LoadTimeline {
-            account: foreground_account.clone(),
-            group,
-            generation: app.timeline_load_generation,
-        },
-        result: Ok(vec![serde_json::json!({"messages":[{
-            "message_id":"A recovered row","direction":"received","from":"peer",
-            "plaintext":"A recovered timeline","timeline_at":3,"received_at":3
-        }]})]),
-    });
-    assert_eq!(
-        app.messages_account_id.as_deref(),
-        Some(foreground_account.as_str())
-    );
-    assert!(
-        rendered_buffer(&mut app).contains("foreground account preview"),
-        "the same observed preview remains visible in its own account's pane"
     );
 }
 
@@ -5181,13 +4140,12 @@ fn parse_timeline_row_reads_core_fields() {
         "reply_to_message_id": null,
         "reply_preview": null,
         "media": null,
-        "agent_text_stream": null,
         "reactions": { "by_emoji": {}, "user_reactions": [] },
         "deleted": false,
         "deleted_by_message_id": null
     });
 
-    let row = parse_timeline_row(&value).expect("row parses");
+    let row = parse_timeline_row(&value);
 
     assert_eq!(row.message_id, "09be");
     assert_eq!(row.direction, "sent");
@@ -5217,7 +4175,7 @@ fn parse_timeline_row_tallies_reactions_by_emoji_in_deterministic_order() {
         }
     });
 
-    let row = parse_timeline_row(&value).expect("row parses");
+    let row = parse_timeline_row(&value);
 
     // Deterministic order regardless of JSON object ordering, and count is the
     // reactor-list length.
@@ -5251,10 +4209,7 @@ fn parse_timeline_row_reads_hydrated_reply_preview() {
         }
     });
 
-    let reply = parse_timeline_row(&value)
-        .expect("row parses")
-        .reply
-        .expect("reply present");
+    let reply = parse_timeline_row(&value).reply.expect("reply present");
 
     assert_eq!(reply.reply_to_message_id, "parent-id");
     let preview = reply.preview.expect("preview hydrated");
@@ -5272,10 +4227,7 @@ fn parse_timeline_row_reply_without_preview_keeps_parent_id_only() {
         "reply_preview": null
     });
 
-    let reply = parse_timeline_row(&value)
-        .expect("row parses")
-        .reply
-        .expect("reply present");
+    let reply = parse_timeline_row(&value).reply.expect("reply present");
 
     assert_eq!(reply.reply_to_message_id, "unresolved-parent");
     assert!(reply.preview.is_none());
@@ -5307,7 +4259,7 @@ fn parse_timeline_row_reads_media_imeta_mime_and_filename() {
         }
     });
 
-    let attachments = parse_timeline_row(&value).expect("row parses").attachments;
+    let attachments = parse_timeline_row(&value).attachments;
 
     assert_eq!(
         attachments,
@@ -5349,7 +4301,7 @@ fn parse_timeline_attachment_rejects_unsafe_plaintext_hash() {
             "media": { "imeta": [["imeta", "m image/png", "filename x.png",
                 format!("plaintext_sha256 {value}")]] }
         });
-        let attachment = &parse_timeline_row(&row).expect("row parses").attachments[0];
+        let attachment = &parse_timeline_row(&row).attachments[0];
         assert_eq!(
             attachment.plaintext_hash, None,
             "unsafe hash {value:?} must be rejected at the parse boundary"
@@ -5363,18 +4315,8 @@ fn parse_timeline_attachment_rejects_unsafe_plaintext_hash() {
         "media": { "imeta": [["imeta", "m image/png", "filename x.png",
             format!("plaintext_sha256 {good}")]] }
     });
-    let attachment = &parse_timeline_row(&row).expect("row parses").attachments[0];
+    let attachment = &parse_timeline_row(&row).attachments[0];
     assert_eq!(attachment.plaintext_hash, Some(good));
-}
-
-#[test]
-fn parse_timeline_row_filters_agent_stream_start_marker() {
-    let value = serde_json::json!({
-        "message_id": "5",
-        "plaintext": "{}",
-        "agent_text_stream": { "kind": "start", "stream_id": "abc" }
-    });
-    assert!(parse_timeline_row(&value).is_none());
 }
 
 #[test]
@@ -5385,13 +4327,13 @@ fn parse_timeline_row_marks_tombstone() {
         "deleted": true,
         "deleted_by_message_id": "a83f"
     });
-    let row = parse_timeline_row(&value).expect("tombstone row is kept");
+    let row = parse_timeline_row(&value);
     assert!(row.deleted);
     assert_eq!(row.plaintext, "");
 }
 
 #[test]
-fn parse_timeline_row_derives_group_system_and_stream_summaries() {
+fn parse_timeline_row_derives_group_system_summaries() {
     let group_system = serde_json::json!({
         "message_id": "7",
         "kind": 1210,
@@ -5399,22 +4341,8 @@ fn parse_timeline_row_derives_group_system_and_stream_summaries() {
         "plaintext": "{\"system_type\":\"member_added\",\"data\":{\"subject\":\"bob\"}}"
     });
     assert_eq!(
-        parse_timeline_row(&group_system).unwrap().display_text,
+        parse_timeline_row(&group_system).display_text,
         "alice added bob"
-    );
-
-    let stream_final = serde_json::json!({
-        "message_id": "8",
-        "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
-        "agent_text_stream": {
-            "kind": "final",
-            "stream_id": "s1",
-            "final_text_or_reference": "hello from the stream"
-        }
-    });
-    assert_eq!(
-        parse_timeline_row(&stream_final).unwrap().display_text,
-        "hello from the stream"
     );
 }
 
@@ -7518,14 +6446,14 @@ fn timeline_row_heights_maps_every_row() {
 #[test]
 fn timeline_visible_range_pins_newest_at_bottom() {
     let heights = vec![1u16; 20];
-    assert_eq!(timeline_visible_range(&heights, 10, 0, 0), Some((10, 19)));
+    assert_eq!(timeline_visible_range(&heights, 10, 0), Some((10, 19)));
 }
 
 #[test]
 fn timeline_visible_range_walks_back_from_the_anchor() {
     let heights = vec![1u16; 20];
     // offset 10: anchor = 9, fill backward then render forward through the anchor.
-    assert_eq!(timeline_visible_range(&heights, 10, 10, 0), Some((0, 9)));
+    assert_eq!(timeline_visible_range(&heights, 10, 10), Some((0, 9)));
 }
 
 #[test]
@@ -7533,7 +6461,7 @@ fn timeline_visible_range_scroll_to_top_fills_forward_not_blank() {
     let heights = vec![1u16; 20];
     // offset at the max (as `g` sets it) shows the oldest at the top and fills
     // the viewport forward — never a nearly blank pane.
-    let (first, last) = timeline_visible_range(&heights, 10, 19, 0).unwrap();
+    let (first, last) = timeline_visible_range(&heights, 10, 19).unwrap();
     assert_eq!(first, 0);
     assert!(last >= 9, "viewport filled forward, got last={last}");
 }
@@ -7541,24 +6469,13 @@ fn timeline_visible_range_scroll_to_top_fills_forward_not_blank() {
 #[test]
 fn timeline_visible_range_shows_oversized_message() {
     let heights = vec![50u16];
-    assert_eq!(timeline_visible_range(&heights, 10, 0, 0), Some((0, 0)));
-}
-
-#[test]
-fn timeline_visible_range_bottom_block_consumes_space_only_at_newest() {
-    let heights = vec![1u16; 20];
-    // Pinned at newest: a 3-row bottom block (live stream preview) shrinks the
-    // message viewport from 10 to 7.
-    assert_eq!(timeline_visible_range(&heights, 10, 0, 3), Some((13, 19)));
-    // Scrolled up: the anchor is not the newest, so the block is not shown and
-    // does not consume viewport space.
-    assert_eq!(timeline_visible_range(&heights, 10, 5, 3), Some((5, 14)));
+    assert_eq!(timeline_visible_range(&heights, 10, 0), Some((0, 0)));
 }
 
 #[test]
 fn timeline_visible_range_is_empty_without_rows_or_viewport() {
-    assert_eq!(timeline_visible_range(&[], 10, 0, 0), None);
-    assert_eq!(timeline_visible_range(&[1u16; 5], 0, 0, 0), None);
+    assert_eq!(timeline_visible_range(&[], 10, 0), None);
+    assert_eq!(timeline_visible_range(&[1u16; 5], 0, 0), None);
 }
 
 /// Render one frame: compute the visible range with the real height/visibility
@@ -7570,7 +6487,7 @@ fn timeline_frame(
     viewport: u16,
 ) -> Vec<String> {
     let heights = timeline_row_heights(rows, None, width);
-    match timeline_visible_range(&heights, viewport, scroll.offset, 0) {
+    match timeline_visible_range(&heights, viewport, scroll.offset) {
         Some((first, last)) => {
             scroll.record_visible_range(first, last, rows.len());
             rows[first..=last]
@@ -10678,22 +9595,22 @@ fn input_masked_display_hides_the_value_but_preserves_it() {
 fn composer_height_grows_with_lines_and_clamps_between_three_and_eight() {
     let mut input = Input::default();
     // A single (empty) line is the 3-row minimum (1 content + 2 borders).
-    assert_eq!(composer_height(&input, true, false, 40), 3);
+    assert_eq!(composer_height(&input, true, 40), 3);
 
     // More wrapped lines grow the composer.
     input.set_value("a\nb\nc");
-    assert_eq!(composer_height(&input, true, false, 40), 5);
+    assert_eq!(composer_height(&input, true, 40), 5);
 
     // A long single line wraps by width and grows the composer beyond one row.
     input.set_value("x".repeat(100));
     assert!(
-        composer_height(&input, false, false, 40) > 3,
+        composer_height(&input, false, 40) > 3,
         "a wrapped long line grows the composer past the minimum"
     );
 
     // Beyond the clamp, height caps at 8.
     input.set_value("a\nb\nc\nd\ne\nf\ng\nh\ni\nj");
-    assert_eq!(composer_height(&input, true, false, 40), 8);
+    assert_eq!(composer_height(&input, true, 40), 8);
 }
 
 #[test]
@@ -10757,7 +9674,7 @@ fn composer_cursor_cell_renders_at_display_end_when_redaction_shrinks_the_value(
     input.set_value("/login nsec1supersecretvalue");
     input.end();
 
-    let lines = composer_lines(&input, true, false);
+    let lines = composer_lines(&input, true);
     assert_eq!(
         cursor_cell_contents(&lines),
         vec![" ".to_owned()],
@@ -10773,7 +9690,7 @@ fn composer_cursor_keeps_exact_placement_for_unredacted_input() {
     input.home();
     input.right();
 
-    let lines = composer_lines(&input, true, false);
+    let lines = composer_lines(&input, true);
     assert_eq!(
         cursor_cell_contents(&lines),
         vec!["e".to_owned()],
@@ -11988,35 +10905,6 @@ fn handle_paste_into_masked_nsec_entry_appends_and_stays_masked() {
 }
 
 #[test]
-fn handle_paste_while_streaming_appends_to_pending_text_and_updates_status() {
-    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
-    app.streaming = Some(StreamComposer {
-        stream_id: "s1".to_owned(),
-        group_id: "bb".repeat(32),
-        pending_text: "typed".to_owned(),
-        last_flush: Instant::now(),
-        flushed_bytes: 0,
-    });
-
-    app.handle_paste("PASTED".to_owned());
-
-    let streaming = app.streaming.as_ref().expect("still streaming after paste");
-    assert_eq!(
-        streaming.pending_text, "typedPASTED",
-        "paste appends to the stream's pending text"
-    );
-    assert_eq!(
-        app.status, "queued 11 byte(s) on s1",
-        "paste updates the status line the same way typed chars do"
-    );
-    assert_eq!(
-        app.input.value(),
-        "PASTED",
-        "paste is also mirrored into the composer buffer"
-    );
-}
-
-#[test]
 fn handle_paste_is_ignored_on_the_login_menu_and_when_messages_focused() {
     // The login menu accepts single-key choices, not text; paste is a no-op.
     let mut menu = test_tui_app(test_unused_client(), &"aa".repeat(32));
@@ -12133,7 +11021,7 @@ fn composer_min_and_max_height_coexist_with_the_diagnostics_panel() {
         app.input.set_value(value);
 
         assert_eq!(
-            composer_height(&app.input, true, false, 60 - 2),
+            composer_height(&app.input, true, 60 - 2),
             expected_composer_rows,
             "composer clamps to {expected_composer_rows} rows"
         );
@@ -12335,7 +11223,6 @@ fn app_with_open_chat(client: WnClient, rows: &[(&str, &str)]) -> TuiApp {
                 ))
                 .expect("row json"),
             )
-            .expect("row parses")
         })
         .collect();
     app
@@ -15513,30 +14400,15 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
         app.messages_account_id = Some(account_a.clone());
         app.messages_group_id = Some(group.clone());
         app.timeline = vec![timeline_row("old-account-row", 1)];
-        let (tx, rx) = mpsc::channel();
-        app.message_subscription = Some(MessageSubscription {
-            account_id: account_a.clone(),
-            child: test_sleep_child(),
-            rx,
-        });
-        tx.send(SubscriptionEvent::Result(serde_json::json!({
-            "type":"agent_stream_delta","agent_stream_delta":{
-                "group_id":group,"stream_id":"dd".repeat(32),"text":"initial account stream"
-            }
-        })))
-        .unwrap();
-        assert!(app.drain_message_subscription());
         app.refresh_messages().expect("reload A");
         let generation_a = app.timeline_load_generation;
         assert_eq!(timeline_ids(&app.timeline), vec!["old-account-row"]);
-        assert!(rendered_buffer(&mut app).contains("initial account stream"));
 
         app.selected_account = usize::from(changes_account);
         app.selected_chat = usize::from(!changes_account);
         app.chats_account_id = Some(target_account.clone());
         app.refresh_messages().expect("open the selected owner");
-        // A second load can start before the first page returns. Its pending
-        // owner must keep the same-account feed alive while the pane is empty.
+        // A second load can start before the first page returns.
         app.refresh_messages().expect("reload the pending owner");
         let pending_action_account =
             match app.resolve_send_message("pending message".into()).unwrap() {
@@ -15554,14 +14426,6 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        // The account-wide feed must survive a group change within A, while
-        // opening B must disconnect A before its next delta can contaminate B.
-        let outgoing_feed_closed = tx.send(SubscriptionEvent::Result(serde_json::json!({
-            "type":"agent_stream_delta","agent_stream_delta":{
-                "group_id":target_group,"stream_id":"ff".repeat(32),"text":"outgoing account stream"
-            }
-        }))).is_err();
-        app.drain_message_subscription();
         app.apply_effect_done(EffectDone {
             request_id: RequestId::default(),
             feedback: FeedbackPermission::View(app.status_ownership.owner()),
@@ -15586,7 +14450,6 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
                 "plaintext":"selected timeline","timeline_at":2,"received_at":2
             }],"has_more_before":false})]),
         });
-        let outgoing_preview_visible = rendered_buffer(&mut app).contains("account stream");
         assert_eq!(
             (
                 pending_action_account,
@@ -15594,8 +14457,6 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
                 pending_survives_old_result,
                 timeline_ids(&app.timeline),
                 app.messages_account_id.clone(),
-                outgoing_feed_closed,
-                outgoing_preview_visible
             ),
             (
                 target_account.clone(),
@@ -15603,260 +14464,9 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
                 true,
                 vec!["new-owner-row"],
                 Some(target_account.clone()),
-                changes_account,
-                !changes_account
             ),
         );
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn an_empty_account_refresh_cannot_reuse_another_accounts_stream_preview() {
-    let account_a = "aa".repeat(32);
-    let account_b = "bb".repeat(32);
-    let group = "cc".repeat(16);
-    let dir = tempfile::tempdir().unwrap();
-    let mut gate = TestCommandGate::new(dir.path());
-    let chat = serde_json::json!({"ok":true,"result":{"type":"chat","chat":{
-        "group_id":group,"profile":{"name":"B joined room"}
-    }}})
-    .to_string();
-    let incoming =
-        serde_json::json!({"ok":true,"result":{"type":"agent_stream_delta","agent_stream_delta":{
-            "group_id":group,"stream_id":"dd".repeat(32),"text":"incoming account preview"
-        }}})
-        .to_string();
-    let reconnected = serde_json::json!({"ok":true,"result":{
-        "type":"agent_stream_delta","agent_stream_delta":{
-            "group_id":group,"stream_id":"ee".repeat(32),"text":"reconnected account A preview"
-        }
-    }})
-    .to_string();
-    let exe = dir.path().join("wn-refresh");
-    write_fake_wn(
-        &exe,
-        &format!(
-            "#!/bin/sh\ncase \"$*\" in\n*'chats subscribe'*)\n{}printf '%s\\n' '{chat}'\nexec sleep 60\n;;\n*'--account {account_a} messages subscribe'*) printf '%s\\n' '{reconnected}'; exec sleep 60;;\n*'--account {account_b} messages subscribe'*) printf '%s\\n' '{incoming}'; exec sleep 60;;\n*subscribe*) exec sleep 60;;\n*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"chats\":[],\"messages\":[]}}}}';;\nesac\n",
-            gate.script()
-        ),
-    );
-    let mut app = test_tui_app(
-        WnClient {
-            exe,
-            ..test_unused_client()
-        },
-        &account_a,
-    );
-    app.accounts.push(AccountRow {
-        account_id: account_b.clone(),
-        npub: "npub1bob".into(),
-        display_name: None,
-        local_signing: true,
-    });
-    app.chats = vec![flick_chat(&group, "A room")];
-    app.chats_account_id = Some(account_a.clone());
-    app.messages_account_id = Some(account_a.clone());
-    app.messages_group_id = Some(group.clone());
-    app.timeline = vec![timeline_row("A row", 1)];
-    let (tx, rx) = mpsc::channel();
-    app.message_subscription = Some(MessageSubscription {
-        account_id: account_a.clone(),
-        child: test_sleep_child(),
-        rx,
-    });
-    tx.send(SubscriptionEvent::Result(
-        serde_json::json!({"type":"agent_stream_delta","agent_stream_delta":{
-            "group_id":group,"stream_id":"dd".repeat(32),"text":"outgoing account preview"
-        }}),
-    ))
-    .unwrap();
-    app.drain_message_subscription();
-    assert!(rendered_buffer(&mut app).contains("outgoing account preview"));
-    tx.send(SubscriptionEvent::Ended).unwrap();
-    app.drain_message_subscription();
-    assert!(app.message_subscription.is_none());
-    app.daemon.running = true;
-    app.ensure_message_subscription(&account_a)
-        .expect("reconnect A's feed");
-    assert_eq!(
-        app.message_subscription.as_ref().unwrap().account_id,
-        account_a
-    );
-    assert!(
-        rendered_buffer(&mut app).contains("outgoing account preview"),
-        "same-account reconnect preserves observed previews"
-    );
-    let reconnected_a_child = app.message_subscription.as_ref().unwrap().child.id();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !rendered_buffer(&mut app).contains("reconnected account A preview") {
-        app.drain_message_subscription();
-        assert!(
-            Instant::now() < deadline,
-            "A's actual reconnected child did not deliver"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    app.selected_account = 1;
-    app.refresh_chats().expect("refresh B's empty list");
-    gate.wait_until_entered();
-    assert!(app.chats.is_empty());
-    assert_eq!(app.messages_account_id.as_deref(), Some(account_b.as_str()));
-    let b_feed = app
-        .message_subscription
-        .as_ref()
-        .expect("B's empty-list feed");
-    assert_eq!(b_feed.account_id, account_b);
-    assert_ne!(b_feed.child.id(), reconnected_a_child);
-    assert_eq!(
-        app.stream_previews_account_id.as_deref(),
-        Some(account_b.as_str())
-    );
-    assert!(
-        app.live_stream_previews.is_empty(),
-        "the empty-list transition clears A before any later load"
-    );
-    gate.release();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while app.chats.is_empty() {
-        app.drain_chat_subscription();
-        assert!(
-            Instant::now() < deadline,
-            "B's real chat child did not deliver its row"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert_eq!(app.chats[0].name, "B joined room");
-    app.refresh_messages().unwrap();
-    app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::View(app.status_ownership.owner()),effect:Effect::LoadTimeline {account:account_b.clone(), group, generation: app.timeline_load_generation}, result:Ok(vec![serde_json::json!({"messages":[{
-        "message_id":"B row","direction":"received","from":"peer","plaintext":"B timeline","timeline_at":2,"received_at":2
-    }]})])});
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !rendered_buffer(&mut app).contains("incoming account preview") {
-        app.drain_message_subscription();
-        assert!(
-            Instant::now() < deadline,
-            "B's real message child did not deliver its preview"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert_eq!(app.messages_account_id, Some(account_b));
-    assert_eq!(timeline_ids(&app.timeline), vec!["B row"]);
-    for text in ["outgoing account preview", "reconnected account A preview"] {
-        assert!(
-            !rendered_buffer(&mut app).contains(text),
-            "A's preview must not survive B's empty-list account transition"
-        );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn a_failed_account_page_keeps_its_live_feed_and_reuses_it_on_retry() {
-    let account_a = "aa".repeat(32);
-    let account_b = "bb".repeat(32);
-    let group = "cc".repeat(16);
-    let dir = tempfile::tempdir().unwrap();
-    let mut gate = TestCommandGate::new(dir.path());
-    let first_page = dir.path().join("first-page");
-    let chat = serde_json::json!({"ok":true,"result":{"chats":[{
-        "group_id":group,"profile":{"name":"B room"}
-    }]}})
-    .to_string();
-    let page = serde_json::json!({"ok":true,"result":{"messages":[{
-        "message_id":"B retry row","direction":"received","from":"peer",
-        "plaintext":"B recovered page","timeline_at":2,"received_at":2
-    }],"has_more_before":false}})
-    .to_string();
-    let incoming = serde_json::json!({"ok":true,"result":{
-        "type":"agent_stream_delta","agent_stream_delta":{
-            "group_id":group,"stream_id":"dd".repeat(32),"text":"B live after page error"
-        }
-    }})
-    .to_string();
-    let exe = dir.path().join("wn-page-error");
-    write_fake_wn(
-        &exe,
-        &format!(
-            "#!/bin/sh\ncase \" $* \" in\n\
-         *' --account {account_b} messages subscribe '*)\n{}printf '%s\\n' '{incoming}'\nexec sleep 60\n;;\n\
-         *' chats list '*) printf '%s\\n' '{chat}';;\n\
-         *' messages timeline list '*)\nif mkdir '{}' 2>/dev/null; then\nprintf '%s\\n' '{{\"ok\":false,\"error\":{{\"message\":\"timeline offline\"}}}}'\nelse\nprintf '%s\\n' '{page}'\nfi\n;;\n\
-         *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
-         *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
-            gate.script(),
-            first_page.display()
-        ),
-    );
-    let mut app = test_tui_app(
-        WnClient {
-            exe,
-            ..test_unused_client()
-        },
-        &account_a,
-    );
-    app.daemon.running = true;
-    app.accounts.push(AccountRow {
-        account_id: account_b.clone(),
-        npub: "npub1bob".into(),
-        display_name: None,
-        local_signing: true,
-    });
-    app.chats = vec![flick_chat(&group, "A room")];
-    app.chats_account_id = Some(account_a.clone());
-    app.messages_account_id = Some(account_a.clone());
-    app.messages_group_id = Some(group.clone());
-    app.timeline = vec![timeline_row("A row", 1)];
-    app.ensure_message_subscription(&account_a)
-        .expect("A's live feed");
-    let outgoing_child = app.message_subscription.as_ref().unwrap().child.id();
-    app.select_account_by_selector(&account_b)
-        .expect("B's real nonempty list");
-    finish_queued_effects(&mut app);
-    assert_eq!(app.status, "error: timeline offline");
-    assert!(app.loading_chat.is_none());
-    assert_eq!(
-        app.message_subscription
-            .as_ref()
-            .map(|feed| feed.account_id.as_str()),
-        Some(account_b.as_str()),
-        "a failed B page must keep B's account-wide feed"
-    );
-    let incoming_child = app.message_subscription.as_ref().unwrap().child.id();
-    assert_ne!(incoming_child, outgoing_child);
-    gate.wait_until_entered();
-    assert!(
-        app.message_subscription
-            .as_mut()
-            .unwrap()
-            .child
-            .try_wait()
-            .unwrap()
-            .is_none()
-    );
-    gate.release();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while app.live_stream_previews.is_empty() {
-        app.drain_message_subscription();
-        assert!(
-            Instant::now() < deadline,
-            "B's actual child did not deliver after the page error"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    app.refresh_messages().expect("retry B's page");
-    assert_eq!(
-        app.message_subscription.as_ref().unwrap().child.id(),
-        incoming_child
-    );
-    finish_queued_effects(&mut app);
-    assert_eq!(
-        app.message_subscription.as_ref().unwrap().child.id(),
-        incoming_child
-    );
-    assert_eq!(app.messages_account_id, Some(account_b));
-    assert_eq!(timeline_ids(&app.timeline), vec!["B retry row"]);
-    assert!(rendered_buffer(&mut app).contains("B live after page error"));
 }
 
 #[test]
@@ -16280,7 +14890,6 @@ fn a_daemon_auto_start_fold_keeps_a_users_in_flight_status() {
     // short-circuit (they are idempotent) rather than trying — and failing — to
     // spawn against the stub `wn`; that isolates the status guard under test.
     app.chat_subscription = Some(test_chat_subscription(&account_id, false));
-    app.message_subscription = Some(test_message_subscription(&account_id));
     app.notification_subscription = Some(test_notification_subscription(&account_id));
     app.set_status("sending...".to_owned());
 
@@ -16306,7 +14915,6 @@ fn a_daemon_auto_start_fold_replaces_its_own_in_flight_sentinel() {
     // Pre-attach the feeds so the re-adopt's ensures short-circuit (see the
     // in-flight-status test): isolates the sentinel replacement under test.
     app.chat_subscription = Some(test_chat_subscription(&account_id, false));
-    app.message_subscription = Some(test_message_subscription(&account_id));
     app.notification_subscription = Some(test_notification_subscription(&account_id));
     app.set_drain_status(STARTING_DAEMON_STATUS.to_owned());
     app.daemon_start_status_owner = Some(app.status_ownership.owner());
@@ -16327,16 +14935,13 @@ fn a_daemon_auto_start_fold_re_adopts_manual_subscriptions_as_a_no_op() {
     let account_id = "aa".repeat(32);
     let mut app = test_tui_app(test_unused_client(), &account_id);
     app.chat_subscription = Some(test_chat_subscription(&account_id, false));
-    app.message_subscription = Some(test_message_subscription(&account_id));
     app.notification_subscription = Some(test_notification_subscription(&account_id));
     app.status = "daemon running".to_owned();
 
     app.fold_daemon_start(Ok(serde_json::json!({"running": true, "pid": 4242})));
 
     assert!(
-        app.chat_subscription.is_some()
-            && app.message_subscription.is_some()
-            && app.notification_subscription.is_some(),
+        app.chat_subscription.is_some() && app.notification_subscription.is_some(),
         "the already-attached subscriptions are retained across the re-adopt"
     );
     assert!(
@@ -17152,7 +15757,7 @@ fn slash_management_commands_forward_the_selected_owner_and_requested_options() 
 fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
     let account = "aa".repeat(32);
     let group = "cc".repeat(16);
-    for origin in ["refresh", "start", "composer"] {
+    for origin in ["refresh", "members"] {
         for outcome in ["success", "page-error", "subscription-error"] {
             let dir = tempfile::tempdir().unwrap();
             let mut gate = TestCommandGate::new(dir.path());
@@ -17164,16 +15769,14 @@ fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
                     "plaintext":"loaded page body","timeline_at":2,"received_at":2
                 }],"has_more_before":false}})
             };
-            let ack = serde_json::json!({"ok":true,"result":{
-                "stream_id":"dd".repeat(32),"published":2
-            }});
+            let ack = serde_json::json!({"ok":true,"result":{"published":2}});
             let exe = dir.path().join("wn-status");
             write_fake_wn(
                 &exe,
                 &format!(
                     "#!/bin/sh\ncase \" $* \" in\n\
                  *' messages timeline list '*)\n{}printf '%s\\n' '{page}'\n;;\n\
-                 *' stream start '*|*' stream compose-open '*) printf '%s\\n' '{ack}';;\n\
+                 *' group invite '*) printf '%s\\n' '{ack}';;\n\
                  *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
                  *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
                     gate.script()
@@ -17193,17 +15796,10 @@ fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
                     app.refresh_messages().unwrap();
                     "loading chat..."
                 }
-                "start" => {
-                    app.input
-                        .set_value("/stream start --quic-candidate quic://127.0.0.1:4451");
+                "members" => {
+                    app.input.set_value("/members add npub1bob");
                     app.submit_input().unwrap();
-                    "started stream ddddddd...dddddddd; published=2"
-                }
-                "composer" => {
-                    app.input
-                        .set_value("/stream --quic-candidate quic://127.0.0.1:4451");
-                    app.submit_input().unwrap();
-                    "now streaming ddddddd...dddddddd; type text and press Enter to finish"
+                    "added member(s); published=2"
                 }
                 _ => unreachable!(),
             };
@@ -17237,8 +15833,7 @@ fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
                     "success" => assert_eq!(app.status, "loaded 1 message(s)"),
                     "page-error" => assert_eq!(app.status, "error: timeline offline"),
                     "subscription-error" => assert!(
-                        app.status.starts_with("message subscription failed: ")
-                            || app.status.starts_with("timeline subscription failed: "),
+                        app.status.starts_with("timeline subscription failed: "),
                         "ordinary loads must surface their actual feed failure"
                     ),
                     _ => unreachable!(),
@@ -17246,15 +15841,10 @@ fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
             }
         }
     }
-    // Ambient drains and a provisional acquisition failure belong to this
-    // request; neither is a newer command or prompt that can own its feedback.
+    // Ambient drains belong to this request; they are not a newer command or
+    // prompt that can own its feedback.
     let mut observed = Vec::new();
-    for origin in [
-        "chat-update",
-        "dispatch-error",
-        "chat-update-start",
-        "chat-update-composer",
-    ] {
+    for origin in ["chat-update", "chat-update-members"] {
         for outcome in ["success", "page-error", "subscription-error"] {
             let dir = tempfile::tempdir().unwrap();
             let mut page_gate = TestCommandGate::new(dir.path());
@@ -17280,7 +15870,7 @@ fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
                     "#!/bin/sh\ncase \" $* \" in\n\
                  *' messages timeline list '*)\n{}printf '%s\\n' '{page}'\n;;\n\
                  *' chats subscribe '*)\n{}printf '%s\\n' '{chat}'\nexec sleep 60;;\n\
-                 *' stream start '*|*' stream compose-open '*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"stream_id\":\"dddd\",\"published\":2}}}}';;\n\
+                 *' group invite '*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"published\":2}}}}';;\n\
                  *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
                  *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
                     page_gate.script(),
@@ -17296,20 +15886,10 @@ fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
             );
             app.daemon.running = true;
             app.chats = vec![flick_chat(&group, "Room")];
-            if origin.starts_with("chat-update") {
-                app.ensure_chat_subscription(&account).unwrap();
-                chat_gate.wait_until_entered();
-            } else {
-                // The real FIFO worker already owns its valid client clone.
-                // Only the foreground acquisition encounters a missing child.
-                app.client.exe = dir.path().join("unavailable-wn");
-            }
-            let retained = if origin == "chat-update-start" || origin == "chat-update-composer" {
-                app.input.set_value(if origin == "chat-update-start" {
-                    "/stream start --quic-candidate quic://127.0.0.1:4451"
-                } else {
-                    "/stream --quic-candidate quic://127.0.0.1:4451"
-                });
+            app.ensure_chat_subscription(&account).unwrap();
+            chat_gate.wait_until_entered();
+            let retained = if origin == "chat-update-members" {
+                app.input.set_value("/members add npub1bob");
                 app.submit_input().unwrap();
                 Some(app.status.clone())
             } else {
@@ -17322,27 +15902,19 @@ fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
                 "dispatch returned before release"
             );
             let dispatch_status = app.status.clone();
-            if origin == "dispatch-error" {
-                assert!(
-                    app.message_subscription.is_none(),
-                    "initial feed spawn failed"
-                );
+            if outcome == "subscription-error" {
+                // The chat drain also tries a real group-feed acquisition.
+                app.client.exe = dir.path().join("unavailable-wn");
             }
-            if origin.starts_with("chat-update") {
-                if outcome == "subscription-error" {
-                    // The chat drain also tries a real group-feed acquisition.
-                    app.client.exe = dir.path().join("unavailable-wn");
-                }
-                chat_gate.release();
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while app.chats[0].name != "Changed room" {
-                    assert!(Instant::now() < deadline, "chat child update did not drain");
-                    app.tick();
-                    thread::sleep(Duration::from_millis(1));
-                }
-                assert_eq!(app.chats[0].projection.unread_count, 3);
-                assert!(app.loading_chat.is_some(), "chat update preceded page fold");
+            chat_gate.release();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.chats[0].name != "Changed room" {
+                assert!(Instant::now() < deadline, "chat child update did not drain");
+                app.tick();
+                thread::sleep(Duration::from_millis(1));
             }
+            assert_eq!(app.chats[0].projection.unread_count, 3);
+            assert!(app.loading_chat.is_some(), "chat update preceded page fold");
             let pending_status = app.status.clone();
             app.client.exe = if outcome == "subscription-error" {
                 dir.path().join("unavailable-wn")
@@ -17361,9 +15933,6 @@ fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
             let feedback = retained.as_deref().unwrap_or(match outcome {
                 "success" => "loaded 1 message(s)",
                 "page-error" => "error: timeline offline",
-                "subscription-error" if origin == "dispatch-error" => {
-                    "message subscription failed: "
-                }
                 "subscription-error" => "timeline subscription failed: ",
                 _ => unreachable!(),
             });
@@ -17375,16 +15944,13 @@ fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
                     && app.messages_group_id.as_deref() == Some(group.as_str())
             };
             let visible = rendered_buffer(&mut app).contains(feedback.trim());
-            let healed = origin != "dispatch-error"
-                || outcome != "success"
-                || app.message_subscription.is_some();
             observed.push((
                 origin,
                 outcome,
                 dispatch_status,
                 pending_status,
                 app.status.clone(),
-                rows_folded && healed && visible && app.status.starts_with(feedback),
+                rows_folded && visible && app.status.starts_with(feedback),
             ));
         }
     }
@@ -18972,11 +17538,7 @@ fn an_empty_chat_refresh_cancels_the_same_accounts_pending_page_and_followups() 
                                 .as_ref()
                                 .is_some_and(|diag| diag.group_id == expected_group)
                     };
-                let account_feed = app
-                    .message_subscription
-                    .as_ref()
-                    .is_some_and(|sub| sub.account_id == expected_account);
-                Some((app.status.clone(), empty_state, control_state, account_feed))
+                Some((app.status.clone(), empty_state, control_state))
                 // Dropping this app kills/waits its owned subscription children
                 // before the parent reads the command recorder after join.
             });
@@ -19024,7 +17586,6 @@ fn an_empty_chat_refresh_cancels_the_same_accounts_pending_page_and_followups() 
                 after.0.clone(),
                 before_ok
                     && after.0 == before.0
-                    && after.3
                     && if list_fails { after.2 } else { after.1 }
                     && count(" account list") == 2
                     && count(" chats list") == 2
@@ -19484,9 +18045,6 @@ fn live_chat_removal_settles_only_its_pending_pages_feedback_and_releases_invite
                     delivered,
                     notice_consumed,
                     app.status.clone(),
-                    app.message_subscription
-                        .as_ref()
-                        .is_some_and(|sub| sub.account_id == expected_account),
                 ))
                 // Drop kills/waits all owned subscription children before join returns.
             });
@@ -19547,7 +18105,6 @@ fn live_chat_removal_settles_only_its_pending_pages_feedback_and_releases_invite
                 && after.2 == invite_text
                 && after.3
                 && after.4 == invite_text
-                && after.5
                 && count(" account list") == 1 + usize::from(newer_action)
                 && count(" chats list") == 1 + usize::from(newer_action)
                 && count(" messages timeline list ") == 1

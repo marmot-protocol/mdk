@@ -1,6 +1,5 @@
 //! Declarative `clap` command-line argument surface for the `wn` CLI.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -19,7 +18,7 @@ const ACCEPT_UNDELIVERED_HELP: &str = "If the group's last change has not reache
 #[command(
     name = "wn",
     version,
-    about = "White Noise account, group, message, stream, and daemon CLI",
+    about = "White Noise account, group, message, and daemon CLI",
     disable_help_subcommand = true
 )]
 pub(crate) struct Cli {
@@ -297,11 +296,6 @@ pub(crate) enum Command {
     Notifications {
         #[command(subcommand)]
         command: NotificationsCommand,
-    },
-    #[command(about = "Start, watch, finish, and verify agent text streams")]
-    Stream {
-        #[command(subcommand)]
-        command: StreamCommand,
     },
     #[command(about = "Start, stop, and inspect the local wnd runtime")]
     Daemon {
@@ -1364,185 +1358,6 @@ pub(crate) enum NotificationsCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-pub(crate) enum StreamCommand {
-    #[command(about = "Anchor a durable agent text stream start over the MLS message path")]
-    Start {
-        #[arg(help = "Group id to anchor the stream in")]
-        group: String,
-        #[arg(long, value_name = "HEX", help = "Optional stream id to use")]
-        stream_id: Option<String>,
-        #[arg(
-            long = "quic-candidate",
-            value_name = "ADDR",
-            help = "QUIC candidate URI such as quic://127.0.0.1:4450"
-        )]
-        quic_candidates: Vec<String>,
-    },
-    #[command(about = "Receive one provisional QUIC agent text stream")]
-    Receive {
-        #[arg(
-            long,
-            default_value = "127.0.0.1:4450",
-            value_name = "ADDR",
-            help = "Local address to bind"
-        )]
-        bind: SocketAddr,
-        #[arg(long, value_name = "HEX", help = "Expected stream-start event id")]
-        start_event_id: Option<String>,
-    },
-    #[command(about = "Send one provisional QUIC agent text stream")]
-    Send {
-        #[arg(
-            long,
-            help = "Use the broker protocol instead of direct QUIC stream receive"
-        )]
-        broker: bool,
-        #[arg(long, value_name = "ADDR", help = "Remote QUIC address")]
-        connect: SocketAddr,
-        #[arg(
-            long,
-            default_value = "localhost",
-            value_name = "NAME",
-            help = "TLS server name"
-        )]
-        server_name: String,
-        #[arg(
-            long,
-            value_name = "HEX",
-            help = "Pinned server certificate DER bytes as hex"
-        )]
-        server_cert_der_hex: Option<String>,
-        #[arg(long, help = "Trust loopback QUIC certificates for local testing")]
-        insecure_local: bool,
-        #[arg(long, value_name = "HEX", help = "Optional stream id to use")]
-        stream_id: Option<String>,
-        #[arg(long, value_name = "HEX", help = "Expected stream-start event id")]
-        start_event_id: Option<String>,
-        #[arg(
-            long,
-            default_value_t = 1024,
-            value_name = "BYTES",
-            help = "Maximum bytes per streamed chunk"
-        )]
-        chunk_bytes: usize,
-        #[arg(
-            long,
-            default_value_t = 0,
-            value_name = "MILLIS",
-            help = "Delay between streamed chunks"
-        )]
-        chunk_delay_ms: u64,
-        #[arg(
-            value_name = "TEXT",
-            required = true,
-            allow_hyphen_values = true,
-            help = "Text to stream"
-        )]
-        text: Vec<String>,
-    },
-    #[command(about = "Watch one brokered QUIC agent text stream from a durable MLS start payload")]
-    Watch {
-        #[arg(help = "Group id containing the stream start")]
-        group: String,
-        #[arg(long, value_name = "HEX", help = "Stream id to watch")]
-        stream_id: Option<String>,
-        #[arg(
-            long,
-            value_name = "HEX",
-            help = "Pinned server certificate DER bytes as hex"
-        )]
-        server_cert_der_hex: Option<String>,
-        #[arg(long, help = "Trust loopback QUIC certificates for local testing")]
-        insecure_local: bool,
-        #[arg(
-            long,
-            help = "Register the watch with the daemon and return immediately"
-        )]
-        background: bool,
-    },
-    #[command(about = "Open a daemon-owned live stream compose session")]
-    ComposeOpen {
-        #[arg(help = "Group id that will receive the stream anchor and final message")]
-        group: String,
-        #[arg(long, value_name = "HEX", help = "Stream id to use")]
-        stream_id: Option<String>,
-        #[arg(
-            long = "quic-candidate",
-            value_name = "ADDR",
-            help = "Broker candidate to advertise, e.g. quic://host:port"
-        )]
-        quic_candidates: Vec<String>,
-        #[arg(
-            long,
-            help = "Trust loopback QUIC broker certificates for local testing"
-        )]
-        insecure_local: bool,
-        #[arg(
-            long,
-            default_value_t = 32,
-            value_name = "BYTES",
-            help = "Maximum bytes per streamed preview chunk"
-        )]
-        chunk_bytes: usize,
-    },
-    #[command(about = "Append text to an active daemon stream compose session")]
-    ComposeAppend {
-        #[arg(long, value_name = "HEX", help = "Stream id to append to")]
-        stream_id: String,
-        #[arg(
-            value_name = "TEXT",
-            required = true,
-            allow_hyphen_values = true,
-            help = "Text to append"
-        )]
-        text: Vec<String>,
-    },
-    #[command(
-        about = "Finish a daemon stream compose session and publish the durable final message"
-    )]
-    ComposeFinish {
-        #[arg(long, value_name = "HEX", help = "Stream id to finish")]
-        stream_id: String,
-    },
-    #[command(about = "Cancel a daemon stream compose session")]
-    ComposeCancel {
-        #[arg(long, value_name = "HEX", help = "Stream id to cancel")]
-        stream_id: String,
-    },
-    #[command(about = "Commit the final agent text stream transcript over the MLS message path")]
-    Finish {
-        #[arg(help = "Group id containing the stream")]
-        group: String,
-        #[arg(long, value_name = "HEX", help = "Stream id to finish")]
-        stream_id: String,
-        #[arg(long, value_name = "HEX", help = "Stream-start message id")]
-        start_event_id: String,
-        #[arg(long, value_name = "HEX", help = "Final transcript hash")]
-        transcript_hash: String,
-        #[arg(long, help = "Number of streamed chunks")]
-        chunk_count: u64,
-        #[arg(
-            value_name = "TEXT",
-            required = true,
-            allow_hyphen_values = true,
-            help = "Final text"
-        )]
-        text: Vec<String>,
-    },
-    #[command(about = "Verify a local QUIC transcript against the durable MLS final payload")]
-    Verify {
-        #[arg(help = "Group id containing the stream")]
-        group: String,
-        #[arg(long, value_name = "HEX", help = "Stream id to verify")]
-        stream_id: String,
-        #[arg(long, value_name = "HEX", help = "Expected transcript hash")]
-        transcript_hash: String,
-        #[arg(long, help = "Expected streamed chunk count")]
-        chunk_count: Option<u64>,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum DaemonCommand {
     #[command(about = "Start wnd in the background")]
     Start {
@@ -1575,7 +1390,7 @@ pub(crate) enum DaemonCommand {
     },
     #[command(about = "Stop the background wnd daemon")]
     Stop,
-    #[command(about = "Show daemon status, relay health, and stream watches")]
+    #[command(about = "Show daemon status and relay health")]
     Status,
 }
 

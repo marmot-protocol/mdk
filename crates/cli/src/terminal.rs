@@ -24,7 +24,7 @@ pub(crate) fn terminal_safe_json_display(serialized: &str) -> String {
 }
 
 /// Decide whether a single `char` may be rendered in untrusted terminal text
-/// (message bodies, sender names, chat labels, stream previews).
+/// (message bodies, sender names, chat labels).
 ///
 /// This replaces the earlier hardcoded BiDi/zero-width denylist (see #201 /
 /// PR #459) with a width-aware whitelist, as #201 anticipated. The denylist

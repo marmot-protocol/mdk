@@ -5,7 +5,7 @@ use super::*;
 #[derive(Parser, Debug)]
 #[command(
     name = "wnd",
-    about = "White Noise background runtime daemon for live subscriptions and stream previews"
+    about = "White Noise background runtime daemon for live subscriptions"
 )]
 pub(crate) struct DaemonArgs {
     #[arg(
@@ -217,7 +217,6 @@ pub(crate) fn blocked_daemon_execute_command(
             "logout",
             "it removes a local account; run wn logout directly without --socket",
         )),
-        crate::Command::Stream { command } => crate::client_hosted_stream_command(command),
         _ => None,
     }
 }
@@ -674,7 +673,6 @@ pub(crate) async fn status_daemon(json: bool, socket: &Path) -> CliOutput {
                 home,
                 last_runtime_activity: None,
                 relay_health: None,
-                stream_watches: Vec::new(),
                 device_groups: false,
             }
         }
@@ -729,7 +727,6 @@ pub(crate) fn daemon_status_json(status: DaemonStatus) -> serde_json::Value {
         "log": status.log,
         "last_runtime_activity": status.last_runtime_activity,
         "relay_health": status.relay_health,
-        "stream_watches": status.stream_watches,
         "device_groups": status.device_groups,
     })
 }
@@ -738,9 +735,7 @@ pub(crate) async fn server_status(
     defaults: &DaemonDefaults,
     state: &Arc<Mutex<DaemonState>>,
     runtime: Option<&marmot_app::MarmotAppRuntime>,
-    stream_workers: &StreamWatchWorkers,
 ) -> DaemonStatus {
-    stream_workers.reap_finished();
     let (pid, started_at, starting, last_runtime_activity) = state
         .lock()
         .ok()
@@ -759,9 +754,6 @@ pub(crate) async fn server_status(
     } else {
         None
     };
-    let stream_watches = runtime
-        .map(|runtime| runtime.shared_services().agent_streams().reports())
-        .unwrap_or_default();
     DaemonStatus {
         running: true,
         starting,
@@ -774,7 +766,6 @@ pub(crate) async fn server_status(
         log: Some(defaults.log_path.clone()),
         last_runtime_activity,
         relay_health,
-        stream_watches,
         // The daemon built its runtime config from this same variable.
         device_groups: crate::wn_device_groups(),
     }
@@ -865,13 +856,6 @@ pub(crate) fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-pub(crate) fn unix_now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 pub(crate) async fn remove_stale_socket(
