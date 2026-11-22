@@ -295,6 +295,12 @@ pub struct StoredAppMessageQuery {
     pub limit: Option<usize>,
 }
 
+enum AppMessageRead {
+    RawReplay,
+    VisibleReplay,
+    VisibleAfter(i64),
+}
+
 #[derive(Clone, Copy, Debug)]
 enum SecurePruneAppEventsMode {
     RecordedBefore(u64),
@@ -1841,7 +1847,17 @@ impl SqliteAppStorage {
         &self,
         query: StoredAppMessageQuery,
     ) -> StorageResult<Vec<StoredAppMessageRecord>> {
-        self.app_messages_with_visibility(query, true)
+        self.read_app_messages(query, AppMessageRead::VisibleReplay)
+    }
+
+    /// Matching visible, unexpired source rows after the exclusive device-local
+    /// cursor. Apply the limit in ascending insertion order.
+    pub fn visible_app_messages_after_insert_order(
+        &self,
+        query: StoredAppMessageQuery,
+        after: i64,
+    ) -> StorageResult<Vec<StoredAppMessageRecord>> {
+        self.read_app_messages(query, AppMessageRead::VisibleAfter(after))
     }
 
     /// Raw event access for recovery and forensic consumers.
@@ -1849,23 +1865,17 @@ impl SqliteAppStorage {
         &self,
         query: StoredAppMessageQuery,
     ) -> StorageResult<Vec<StoredAppMessageRecord>> {
-        self.app_messages_with_visibility(query, false)
+        self.read_app_messages(query, AppMessageRead::RawReplay)
     }
 
-    fn app_messages_with_visibility(
+    fn read_app_messages(
         &self,
         query: StoredAppMessageQuery,
-        visible_only: bool,
+        read: AppMessageRead,
     ) -> StorageResult<Vec<StoredAppMessageRecord>> {
-        // Single-source the column list + replay ordering so the query order and
-        // the runtime recovery watermark/suppression (via `AppEventReplayCursor`)
-        // cannot drift (#630, #736). The limited variants take the newest-first
-        // `LIMIT` window, then reverse that bounded page into replay order.
         let cols = APP_EVENT_REPLAY_COLUMNS;
-        let asc = APP_EVENT_REPLAY_ORDER_ASC;
-        let desc = APP_EVENT_REPLAY_ORDER_DESC;
         let mut conditions: Vec<String> = Vec::new();
-        if visible_only {
+        if !matches!(read, AppMessageRead::RawReplay) {
             conditions.push("sender NOT IN (SELECT public_key FROM user_blocks)".into());
             conditions.push(
                 "group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites)".into(),
@@ -1878,6 +1888,13 @@ impl SqliteAppStorage {
             ));
         }
         let mut values: Vec<Value> = Vec::new();
+        if let AppMessageRead::VisibleAfter(after) = read {
+            conditions.push("insert_order > ?".into());
+            values.push(Value::Integer(after));
+            conditions.push(
+                "(retention_expires_at IS NULL OR retention_expires_at > unixepoch())".into(),
+            );
+        }
         if let Some(group_id_hex) = &query.group_id_hex {
             conditions.push("group_id_hex = ?".to_owned());
             values.push(Value::Text(group_id_hex.clone()));
@@ -1896,11 +1913,16 @@ impl SqliteAppStorage {
         } else {
             format!("WHERE {}", conditions.join(" AND "))
         };
-        let sql = match query.limit {
-            Some(_) => format!("SELECT {cols} FROM app_events {where_sql} ORDER BY {desc} LIMIT ?"),
-            None => format!("SELECT {cols} FROM app_events {where_sql} ORDER BY {asc}"),
+        // The replay query and its lag-recovery watermark share the same order
+        // (#630, #736). A limited replay selects the newest window first.
+        let (order, reverse_page) = match (read, query.limit) {
+            (AppMessageRead::VisibleAfter(_), _) => ("insert_order", false),
+            (_, Some(_)) => (APP_EVENT_REPLAY_ORDER_DESC, true),
+            (_, None) => (APP_EVENT_REPLAY_ORDER_ASC, false),
         };
+        let mut sql = format!("SELECT {cols} FROM app_events {where_sql} ORDER BY {order}");
         if let Some(limit) = query.limit {
+            sql.push_str(" LIMIT ?");
             values.push(Value::Integer(usize_to_i64(limit)?));
         }
         let conn = self.lock()?;
@@ -1909,7 +1931,7 @@ impl SqliteAppStorage {
             .query_map(params_from_iter(values.iter()), app_message_from_row)
             .storage()?;
         let mut records = rows.collect::<Result<Vec<_>, _>>().storage()?;
-        if query.limit.is_some() {
+        if reverse_page {
             // DESC reverses every component of the unique replay key. Reversing
             // the selected page avoids copying wide rows through a SQL sorter.
             records.reverse();

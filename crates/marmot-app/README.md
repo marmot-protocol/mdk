@@ -476,6 +476,22 @@ event journal.
 
 ## Conversations
 
+**Consuming received messages in local insertion order.** Rust consumers can subscribe to runtime events before
+their initial read, then call `messages_after_insert_order(account, query, after)` with a group, a positive page
+limit and a saved `AppMessageRecord::insert_order` (zero for a first read). The query returns matching source rows in
+ascending local insertion order, including late arrivals with older sender timestamps. Process each page in order and
+save the position of the last successfully handled row, including rows deliberately skipped (for example, sent or
+invalidated rows). Repeat until empty. Keep the mark with the account-device database, group and kind filter that
+produced it. Coordinate checkpointing with consumer side effects if processing must survive a crash without duplicates.
+
+Use `MessageReceived` to wake the reader for that group. After receiver lag or restart, drain every tracked group.
+Ordinary inbound projection commits a retained source before broadcasting. Recovery can announce an existing row
+again. Imported history can add rows without a `MessageReceived`, and an edit targeting erased content can have no
+stored row. Reconcile periodically if silent inserts matter.
+Each page excludes blocked authors, blocked pending invites, retired stream starts and rows past their stored expiry.
+Unblocking, updates and invalidations can change earlier results without moving their positions. Reread earlier rows
+when reconciling those changes. The existing `messages_with_query` limit selects the newest window by sender timestamp.
+
 - **Timeline search.** `timeline_messages_with_query` and `subscribe_timeline_messages` accept `TimelineMessageQuery`.
   The query combines literal Unicode-lowercased substring search, sender, inclusive `since`, exclusive `until`, and
   `TimelineAttachmentType` filters before the page limit. Time bounds use `timeline_at`. Attachment types are `Any`

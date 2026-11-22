@@ -1522,6 +1522,12 @@ pub enum MarmotAppEvent {
         account_label: String,
         group_id: GroupId,
     },
+    /// Ordinary ingress commits the source before this notification, so a
+    /// retained, visible message can be read with [`MarmotAppRuntime::message_by_id`].
+    /// An edit to an erased target can have no stored row. Recovery can announce
+    /// existing rows, so the stream can revisit earlier insertion positions.
+    /// Drain [`MarmotAppRuntime::messages_after_insert_order`] from the last
+    /// processed position on startup, notification and receiver lag.
     MessageReceived(RuntimeMessageReceived),
     ProjectionUpdated(RuntimeProjectionUpdate),
     GroupEvent(RuntimeGroupEvent),
@@ -6092,6 +6098,21 @@ impl MarmotAppRuntime {
     ) -> Result<Vec<AppMessageRecord>, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         self.accounts.app.messages_with_query(&account.label, query)
+    }
+
+    /// Read a page of visible sources in device-local insertion order, applying
+    /// group, kind and expiry filters before the limit. See
+    /// [`MarmotApp::messages_after_insert_order`] for cursor semantics.
+    pub fn messages_after_insert_order(
+        &self,
+        account_ref: &str,
+        query: AppMessageQuery,
+        after: i64,
+    ) -> Result<Vec<AppMessageRecord>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .messages_after_insert_order(&account.label, query, after)
     }
 
     pub fn message_by_id(

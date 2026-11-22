@@ -7624,7 +7624,31 @@ async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync(
     })
     .await;
 
-    assert!(matches!(received, MarmotAppEvent::MessageReceived(_)));
+    let MarmotAppEvent::MessageReceived(received) = received else {
+        unreachable!()
+    };
+    let group_hex = hex::encode(group_id.as_slice());
+    let stored = runtime
+        .message_by_id(
+            &received.account_label,
+            &group_hex,
+            &received.message.message_id_hex,
+        )
+        .unwrap()
+        .expect("ordinary inbound source is committed when the event arrives");
+    assert!(stored.insert_order > 0);
+    let page = runtime
+        .messages_after_insert_order(
+            &received.account_label,
+            AppMessageQuery {
+                group_id_hex: Some(group_hex),
+                kinds: Some(vec![received.message.kind]),
+                limit: Some(1),
+            },
+            0,
+        )
+        .unwrap();
+    assert_eq!(page, [stored]);
     runtime.shutdown().await;
 }
 
