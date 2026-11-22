@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-22
+
 ### Breaking changes
 
 - `MarmotTimelineMessageRecord` and `MarmotTimelineReplyPreview` gain a trailing nullable
@@ -1348,7 +1350,8 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.18.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.19.0...HEAD
+[0.19.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.18.0...marmotc-v0.19.0
 [0.18.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.17.0...marmotc-v0.18.0
 [0.17.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.16.0...marmotc-v0.17.0
 [0.16.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.15.0...marmotc-v0.16.0

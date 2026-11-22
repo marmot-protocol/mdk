@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.19.0 - 2026-11-22
+
 ### Breaking changes
 
 - `TimelineMessageRecordFfi` and `TimelineReplyPreviewFfi` gain `thread: TimelineThreadRefFfi?` (root and parent of

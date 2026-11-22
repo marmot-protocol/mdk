@@ -9,6 +9,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-22
+
 ### Removed
 
 - The retired agent text streams over QUIC (live agent text previews) are gone from `wn`, `wnd` and `wn tui`. This is
@@ -3410,7 +3412,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/marmot-protocol/mdk/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/marmot-protocol/mdk/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/marmot-protocol/mdk/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/marmot-protocol/mdk/compare/v0.15.0...v0.16.0

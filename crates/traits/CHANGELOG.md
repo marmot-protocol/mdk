@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.19.0 - 2026-11-22
+
 ### Breaking changes
 
 - The agent text stream over QUIC is retired. `agent_text_stream` keeps only what groups that require the `0x8006`
