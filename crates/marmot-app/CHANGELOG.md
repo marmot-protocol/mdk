@@ -35,7 +35,9 @@
   `submit_tagged_edit_for_local_send` admit kind-9 text, replies and pending edits that carry application tags inside
   the encrypted event, under `send_tagged_text`'s tag rules (`imeta` refused; a reply's `e`/`q` and an edit's `e` are
   its own). `submit_custom_event` does the same for `send_custom_event`. Each takes a client token like `submit_text`:
-  the same token and request return the same message id after a restart, `local_send_status` reports its progress,
+  an identical retry after restart returns the original message id while the same account-device and group retain
+  the association and its status is not rejected. A retry on another device or after the source expires can create
+  another message. `local_send_status` reports its progress,
   and the tags (and a custom event's kind) are part of the request, so a token reused with other tags is refused.
   Untagged submissions keep their existing request hashes.
 
