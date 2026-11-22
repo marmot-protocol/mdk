@@ -9,8 +9,8 @@ use cgka_traits::{
         GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
         GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED, GROUP_SYSTEM_TYPE_GROUP_RENAMED,
         GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
-        GROUP_SYSTEM_TYPE_MEMBER_REMOVED, MARMOT_APP_EVENT_KIND_EDIT,
-        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        GROUP_SYSTEM_TYPE_MEMBER_REMOVED, MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+        MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     },
 };
 use marmot_account::AccountHome;
@@ -855,6 +855,7 @@ pub(crate) fn timeline_message_record_json(
         "kind": message.kind,
         "tags": message.tags,
         "group_system": group_system,
+        "agent_item": message.agent_item,
         "timeline_at": message.timeline_at,
         "received_at": message.received_at,
         "reply_to_message_id": message.reply_to_message_id_hex,
@@ -871,6 +872,13 @@ pub(crate) fn timeline_message_record_json(
 }
 
 pub(crate) fn timeline_message_display_text(message: &Value) -> String {
+    // An agent item MDK cannot read, such as the old shape, holds a payload,
+    // not text; `--json` keeps it.
+    if message.get("kind").and_then(Value::as_u64) == Some(MARMOT_APP_EVENT_KIND_AGENT_ITEM)
+        && message.get("agent_item").is_none_or(Value::is_null)
+    {
+        return "[unreadable agent item]".to_owned();
+    }
     if message.get("kind").and_then(Value::as_u64) == Some(MARMOT_APP_EVENT_KIND_GROUP_SYSTEM)
         && let Some(summary) = message
             .get("group_system")
@@ -1215,6 +1223,25 @@ mod tests {
         });
 
         assert_eq!(timeline_message_display_text(&message), "fallback text");
+    }
+
+    #[test]
+    fn timeline_message_display_text_shows_a_readable_agent_item_and_labels_an_unreadable_one() {
+        let old = json!({
+            "kind": MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            "plaintext": r#"{"v":1,"status":"error"}"#,
+            "agent_item": null,
+        });
+        assert_eq!(
+            timeline_message_display_text(&old),
+            "[unreadable agent item]"
+        );
+        let readable = json!({
+            "kind": MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            "plaintext": "Ran `ls`",
+            "agent_item": { "version": 2 },
+        });
+        assert_eq!(timeline_message_display_text(&readable), "Ran `ls`");
     }
 
     #[test]

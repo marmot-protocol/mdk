@@ -121,7 +121,8 @@ mod live_notifications {
     }
 
     /// An agent item's later versions share its notification key, so the OS
-    /// replaces the earlier alert; each is still delivered once.
+    /// replaces the earlier alert; each version is still delivered once,
+    /// whichever of its events is seen and however often.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_agent_item_versions_are_each_delivered_under_the_items_key() {
         use cgka_traits::app_event::{
@@ -201,6 +202,23 @@ mod live_notifications {
 
         // The same version delivered again is not a new alert.
         runtime.events.send(edit).unwrap();
+        // An item and its next version both stored before either is seen:
+        // both events announce that version, once.
+        let batched = format!("{:064x}", 20);
+        let first = receive(
+            20,
+            MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            item_tags("1"),
+            "Allow `rm`?",
+        );
+        let mut edit_tags = vec![vec!["e".to_owned(), batched.clone()]];
+        edit_tags.extend(item_tags("2"));
+        let edit = receive(21, MARMOT_APP_EVENT_KIND_EDIT, edit_tags, "Allow `rm -r`?");
+        runtime.events.send(first).unwrap();
+        runtime.events.send(edit).unwrap();
+        let once = next(&mut subscription).await;
+        assert_eq!(once.message_id_hex, Some(batched));
+        assert_eq!(once.preview_text.as_deref(), Some("Allow `rm -r`?"));
         runtime.events.send(message(&account, &group, 12)).unwrap();
         assert_eq!(
             next(&mut subscription).await.preview_text.as_deref(),

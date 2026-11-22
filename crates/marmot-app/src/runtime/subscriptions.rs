@@ -86,15 +86,6 @@ pub enum RuntimeTimelineMessageUpdate {
 
 /// Rehydrate a queued delta by id, retaining incremental window updates even
 /// when another conversation has a blocked participant.
-/// What a notification subscription delivers once: its notification key, and
-/// the message that produced it when one did.
-fn delivery_key(update: &notifications::NotificationUpdate, message: Option<&str>) -> String {
-    match message {
-        Some(message) => format!("{}:{message}", update.notification_key),
-        None => update.notification_key.clone(),
-    }
-}
-
 fn filter_projection_for_block_policy(
     storage: &storage_sqlite::SqliteAppStorage,
     mut update: RuntimeProjectionUpdate,
@@ -1809,15 +1800,6 @@ impl MarmotAppRuntime {
                         if !notifications::notification_event_notifies(&event) {
                             continue;
                         }
-                        // A message is delivered once. An agent item's later
-                        // versions share its key, for the OS to replace, so the
-                        // message that brought each one tells them apart.
-                        let delivered_message = match &event {
-                            MarmotAppEvent::MessageReceived(received) => {
-                                Some(received.message.message_id_hex.clone())
-                            }
-                            _ => None,
-                        };
                         let app_for_lookup = app.clone();
                         #[cfg(test)]
                         app.notification_dispatches
@@ -1838,10 +1820,8 @@ impl MarmotAppRuntime {
                         resolver = returned_resolver;
                         match result {
                             Ok(Some(update)) => {
-                                if !seen_notification_keys.should_emit(delivery_key(
-                                    &update,
-                                    delivered_message.as_deref(),
-                                )) {
+                                if !seen_notification_keys.should_emit(update.delivery_key.clone())
+                                {
                                     continue;
                                 }
                                 if updates_tx.send(update).await.is_err() {
@@ -1875,10 +1855,7 @@ impl MarmotAppRuntime {
                             Err(_) => continue,
                         };
                         for update in recovered {
-                            let message = update.message_id_hex.clone();
-                            if !seen_notification_keys
-                                .should_emit(delivery_key(&update, message.as_deref()))
-                            {
+                            if !seen_notification_keys.should_emit(update.delivery_key.clone()) {
                                 continue;
                             }
                             if updates_tx.send(update).await.is_err() {

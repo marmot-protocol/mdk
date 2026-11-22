@@ -12,8 +12,8 @@
   reserved app event kinds.
 - `NotificationTrafficClass::AgentActivity` is removed. An agent item notifies on the standard class only while its
   latest version is a waiting approval or question, or a failed turn; other items, every kind 1202 and a chat message
-  tagged `["phase", "commentary"]` do not notify. Each alerting version is delivered once, under the key of the item's
-  first event, so the host replaces the earlier notification; a reaction to an unreadable item previews nothing.
+  tagged `["phase", "commentary"]` do not notify. Each alerting version is delivered once, live or after the subscription
+  catches up, under the key of the item's first event, so the host replaces the earlier notification; a reaction to an unreadable item previews nothing.
 - Whether a send wakes the group's members is read from the sent event, so a send resumed after a restart wakes them
   exactly as the first attempt would: a chat message tagged `["phase", "commentary"]`, also as a reply, wakes nobody,
   and an agent item or a new version of one wakes members only while it needs a person or its turn failed.

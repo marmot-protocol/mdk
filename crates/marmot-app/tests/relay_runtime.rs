@@ -7808,7 +7808,8 @@ async fn app_runtime_carries_agent_items_and_requests() {
         page.iter()
             .map(|message| message.message_id_hex.clone())
             .collect::<Vec<_>>(),
-        sent
+        announced,
+        "the stored order is the announced order"
     );
     runtime.shutdown().await;
 }

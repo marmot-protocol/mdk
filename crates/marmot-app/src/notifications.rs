@@ -341,6 +341,12 @@ pub struct NotificationUpdate {
     pub reacted_to_preview: Option<String>,
     pub timestamp_ms: i64,
     pub is_from_self: bool,
+    /// What a notification subscription delivers once: `notification_key`,
+    /// except for an agent item. Its versions share its key, so the latest
+    /// replaces the earlier alert, and each version announced is delivered
+    /// once, however many of its events are seen and on whichever path.
+    #[serde(skip)]
+    pub(crate) delivery_key: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2066,8 +2072,10 @@ fn notification_update_from_classified_group_state(
     let is_from_self = notice
         .actor_account_id_hex
         .is_some_and(|actor| !actor.is_empty() && actor.eq_ignore_ascii_case(account_id_hex));
+    let notification_key = format!("group-state:{account_id_hex}:{}", notice.message_id_hex);
     Ok(Some(NotificationUpdate {
-        notification_key: format!("group-state:{account_id_hex}:{}", notice.message_id_hex),
+        delivery_key: notification_key.clone(),
+        notification_key,
         conversation_key: conversation_key(account_id_hex, notice.group_id_hex),
         trigger: notice.trigger,
         traffic_class: NotificationTrafficClass::Standard,
@@ -2227,8 +2235,14 @@ fn notification_update_from_message(
         Some(row) => preview_text_for_kind(MARMOT_APP_EVENT_KIND_AGENT_ITEM, &row.plaintext),
         None => preview_text_for_message(&event.message),
     };
+    let notification_key = format!("message:{}:{message_id_hex}", event.account_id_hex);
+    let delivery_key = match agent_item.as_ref().and_then(|row| row.agent_item.as_ref()) {
+        Some(item) => format!("{notification_key}:v{}", item.version),
+        None => notification_key.clone(),
+    };
     Ok(Some(NotificationUpdate {
-        notification_key: format!("message:{}:{message_id_hex}", event.account_id_hex),
+        notification_key,
+        delivery_key,
         conversation_key: conversation_key(&event.account_id_hex, &group_id_hex),
         trigger: NotificationTrigger::NewMessage,
         traffic_class,
@@ -2343,8 +2357,10 @@ fn notification_update_from_group_join(
         .as_ref()
         .and_then(|group| group.via_welcome_message_id_hex.clone())
         .unwrap_or_else(|| group_id_hex.clone());
+    let notification_key = format!("invite:{account_id_hex}:{invite_ref}");
     Ok(Some(NotificationUpdate {
-        notification_key: format!("invite:{account_id_hex}:{invite_ref}"),
+        delivery_key: notification_key.clone(),
+        notification_key,
         conversation_key: conversation_key(account_id_hex, &group_id_hex),
         trigger: NotificationTrigger::GroupInvite,
         traffic_class: NotificationTrafficClass::Standard,
@@ -2531,7 +2547,7 @@ pub(crate) fn dedupe_notification_updates(
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for update in updates {
-        if seen.insert(update.notification_key.clone()) {
+        if seen.insert(update.delivery_key.clone()) {
             out.push(update);
         }
     }

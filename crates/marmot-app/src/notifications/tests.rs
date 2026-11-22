@@ -3812,3 +3812,46 @@ fn a_reaction_to_an_agent_item_previews_it_only_while_it_is_readable() {
     );
     assert_eq!(react(&mut chat, &"d4".repeat(32), &old), None);
 }
+
+#[test]
+fn lag_recovery_announces_an_agent_item_at_the_version_live_delivery_does() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_EDIT};
+
+    let mut chat = AgentNotifications::new();
+    let item = "e1".repeat(32);
+    let first = chat
+        .receive(
+            &item,
+            MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            agent_item_tags("question", "waiting", 1),
+            "Which branch?",
+            10,
+        )
+        .expect("a waiting question alerts");
+    let second = chat
+        .receive(
+            &"e2".repeat(32),
+            MARMOT_APP_EVENT_KIND_EDIT,
+            edit_of(&item, agent_item_tags("question", "waiting", 2)),
+            "Which branch, main or dev?",
+            11,
+        )
+        .expect("its next waiting version alerts");
+    assert_eq!(second.notification_key, first.notification_key);
+    assert_ne!(second.delivery_key, first.delivery_key);
+
+    // After a lag, recovery rebuilds the item once, at the version a live
+    // subscriber would have delivered last: new after the first version, a
+    // repeat after the second.
+    let recovered = recover_notification_updates(&chat.app, None)
+        .unwrap()
+        .into_iter()
+        .filter(|update| update.notification_key == first.notification_key)
+        .collect::<Vec<_>>();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].delivery_key, second.delivery_key);
+    assert_eq!(
+        recovered[0].preview_text.as_deref(),
+        Some("Which branch, main or dev?")
+    );
+}
