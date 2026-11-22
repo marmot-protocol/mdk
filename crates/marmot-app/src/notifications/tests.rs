@@ -2613,6 +2613,20 @@ fn an_agent_item_edit_alerts_only_as_the_items_latest_version() {
         )
         .is_none()
     );
+    // Another member's edit naming the item's version changes nothing and
+    // does not alert again under the agent's item.
+    let agent = std::mem::replace(&mut chat.agent, "cc".repeat(32));
+    assert!(
+        chat.receive(
+            &"a4".repeat(32),
+            MARMOT_APP_EVENT_KIND_EDIT,
+            edit_of(&item, agent_item_tags("turn", "failed", 3)),
+            "Failed again",
+            13,
+        )
+        .is_none()
+    );
+    chat.agent = agent;
 }
 
 #[test]

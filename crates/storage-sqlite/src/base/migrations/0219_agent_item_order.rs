@@ -7,7 +7,7 @@
 //! an item of the old shape, which carries no `seq`, keeps 0. An answer or a
 //! control (kind 1202) no longer has a timeline row; its source `app_events`
 //! row stays, like every other retained event.
-use crate::SqliteResultExt;
+use crate::{SqliteResultExt, u64_to_i64};
 use cgka_traits::storage::StorageResult;
 use rusqlite::{Transaction, params};
 
@@ -66,7 +66,7 @@ DELETE FROM message_timeline WHERE kind = 1202;
         tx.execute(
             "UPDATE message_timeline SET timeline_order_seq = ?3
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
-            params![group, message, i64::try_from(seq).unwrap_or(i64::MAX)],
+            params![group, message, u64_to_i64(seq)?],
         )
         .storage()?;
     }

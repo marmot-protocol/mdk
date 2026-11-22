@@ -149,6 +149,20 @@ fn an_item_row_holds_every_tag_of_its_latest_version() {
 }
 
 #[test]
+fn an_items_reply_target_is_the_turn_its_latest_version_names() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let mut first = item("item", 10, 1, "running", 1);
+    first.tags.retain(|t| t[0] != "started_by");
+    store.record_app_event(&first).unwrap();
+    assert_eq!(row(&store, "item").reply_to_message_id_hex, None);
+
+    store
+        .record_app_event(&item_edit("edit-2", "item", 11, 2, "done"))
+        .unwrap();
+    assert_eq!(row(&store, "item").reply_to_message_id_hex, Some(hex('a')));
+}
+
+#[test]
 fn an_edit_that_arrives_before_its_item_is_held_and_applied() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store

@@ -12585,6 +12585,28 @@ MarmotStatus marmot_send_custom_event(const struct MarmotClient *client,
                                       struct MarmotSendSummary **out);
 
 /**
+ * Durably admit a custom application event, such as an answer or a control
+ * for an agent (kind 1202), under `marmot_send_custom_event`'s rules. Returns
+ * durable local acceptance, not relay delivery; the same `client_token` after
+ * a restart returns the same event and sends nothing. `tags` is laid out as
+ * for `marmot_send_custom_event`. Free with `marmot_local_send_acceptance_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; strings valid; `tags` must point to
+ * `tags_len` valid rows (or be NULL with length 0), each row's values
+ * pointer holding its stated length; `out` valid.
+ */
+MarmotStatus marmot_send_custom_event_with_client_token(const struct MarmotClient *client,
+                                                        const char *account_ref,
+                                                        const char *group_id_hex,
+                                                        uint64_t kind,
+                                                        const struct MarmotStringArray *tags,
+                                                        uintptr_t tags_len,
+                                                        const char *content,
+                                                        const char *client_token,
+                                                        struct MarmotLocalSendAcceptance **out);
+
+/**
  * Create an encrypted NIP-88 poll in a direct or group conversation. Option ids use `"0"`
  * through `"9"`. Free `out` with `marmot_send_summary_free`.
  *

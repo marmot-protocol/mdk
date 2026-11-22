@@ -166,12 +166,6 @@ impl LocalMessageRequest {
         }
     }
 
-    /// Whether this request sends an agent item (kind 1201), whose later
-    /// versions are agent item edits.
-    pub(crate) fn is_agent_item(&self) -> bool {
-        self.custom_kind == Some(cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_ITEM)
-    }
-
     /// The pending edit this request describes once its original is resolved.
     /// An edit of an agent item carries the whole item in its tags.
     pub(crate) fn edit_intent(

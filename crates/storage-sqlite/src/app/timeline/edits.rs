@@ -160,6 +160,9 @@ pub(super) fn apply(row: &mut TimelineRow, versions: &[AcceptedEdit]) {
         // is the item changing state, not a correction, so the row is not
         // marked edited.
         row.tags.clone_from(tags);
+        row.reply_to_message_id_hex = cgka_traits::AgentItem::from_tags(tags)
+            .ok()
+            .and_then(|item| item.started_by_message_id_hex);
         return;
     }
     row.edit = Some(TimelineEditSummary {

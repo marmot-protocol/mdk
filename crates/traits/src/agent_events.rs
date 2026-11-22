@@ -301,12 +301,13 @@ fn single<'a>(
 }
 
 fn positive(value: &str, name: &'static str) -> Result<u64, AgentEventError> {
-    // Plain decimal only: no sign, no leading zeros, so one version has one spelling.
+    // Plain decimal only: no sign, no leading zeros, so one version has one
+    // spelling. At most `i64::MAX`, the largest number SQLite stores.
     let canonical = !value.is_empty()
         && value.bytes().all(|b| b.is_ascii_digit())
         && (value == "0" || !value.starts_with('0'));
     match value.parse::<u64>() {
-        Ok(number) if canonical && number > 0 => Ok(number),
+        Ok(number) if canonical && number > 0 && i64::try_from(number).is_ok() => Ok(number),
         _ => Err(AgentEventError::Invalid(name)),
     }
 }
@@ -430,6 +431,8 @@ mod tests {
             ("v", "01"),
             ("v", "+1"),
             ("seq", "x"),
+            // Past what SQLite stores, where a row's seq is kept.
+            ("seq", "9223372036854775808"),
             ("state", "paused"),
             ("fields", "[]"),
             ("fields", r#"{"body":{}}"#),
@@ -441,6 +444,13 @@ mod tests {
             tags.push(tag(&[name, value]));
             assert!(AgentItem::from_tags(&tags).is_err(), "{name}={value}");
         }
+        let mut largest = item_tags("tool", "done");
+        largest.retain(|t| t[0] != "seq");
+        largest.push(tag(&["seq", &i64::MAX.to_string()]));
+        assert_eq!(
+            AgentItem::from_tags(&largest).map(|item| item.seq),
+            Ok(i64::MAX as u64)
+        );
         let mut repeated = item_tags("tool", "done");
         repeated.push(tag(&["v", "4"]));
         assert_eq!(

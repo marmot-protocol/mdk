@@ -12,6 +12,7 @@
 
 - `agent_events`: the tags of kinds 1201 and 1202 (marmot-agents D-076), `AGENT_EVENT_MAX_BYTES`, and the parsers
   `AgentItem::from_tags` and `AgentRequest::from_tags` with the alert rule `AgentItem::alerts`.
+  An item's `v` and `seq` are at most `i64::MAX`.
 
 ## 0.19.0 - 2026-11-22
 

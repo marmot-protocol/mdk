@@ -100,6 +100,32 @@ impl Marmot {
             .into())
     }
 
+    /// Durably admit an app-defined event under [`Marmot::send_custom_event`]'s
+    /// rules, such as an answer or a control for an agent (kind 1202). The
+    /// same token after a restart returns the same event and sends nothing.
+    pub async fn send_custom_event_with_client_token(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: String,
+        client_token: String,
+    ) -> Result<LocalSendAcceptanceFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .submit_custom_event(
+                &account_ref,
+                &group_id_from_hex(&group_id_hex)?,
+                kind,
+                tags,
+                content,
+                client_token,
+            )
+            .await?
+            .into())
+    }
+
     /// Atomically consume this draft revision and admit its token-bound message.
     pub async fn send_message_draft_with_client_token(
         &self,

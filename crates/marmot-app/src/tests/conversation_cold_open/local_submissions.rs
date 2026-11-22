@@ -1697,6 +1697,9 @@ async fn agent_events_are_crash_safe_by_token() {
 
     let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
         .with_test_relay_client(h.relay.clone());
+    reopened
+        .set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     let runtime = MarmotAppRuntime::new(reopened.clone());
     let replay = runtime
         .submit_custom_event(
@@ -1842,5 +1845,14 @@ async fn agent_events_are_crash_safe_by_token() {
             .is_none(),
         "an answer or a control has no row"
     );
+    // The worker sent the new version as the agent's own traffic, as it sent
+    // the item, not as a person's edit.
+    let actions = crate::tests::recorded_audit_rows(&reopened)
+        .into_iter()
+        .filter(|row| row["event"]["record_context"]["human_action"]["origin"] == "local_user")
+        .map(|row| row["event"]["record_context"]["human_action"]["action"].clone())
+        .collect::<Vec<_>>();
+    assert!(actions.contains(&"send_custom_event".into()), "{actions:?}");
+    assert!(!actions.contains(&"edit_message".into()), "{actions:?}");
     runtime.shutdown_and_close().await.unwrap();
 }

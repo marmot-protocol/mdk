@@ -117,7 +117,7 @@ pub(crate) mod worker_due;
 
 pub(crate) use history_recovery::recovery_coverage::LiveCoverage;
 pub(crate) use push::PushFetchClock;
-use push::notification_trigger_for_intent;
+use push::event_wakes_members;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use push::{AcceptedPushAnnounce, PushAnnounceTiming};
 #[cfg(test)]
@@ -4822,12 +4822,16 @@ impl AppClient {
                     "original local send was not accepted by the engine".into(),
                 ));
             }
-            let original_is_agent_item = original
-                .request_json
-                .as_deref()
-                .map(crate::local_submissions::LocalMessageRequest::decode_retained)
-                .transpose()?
-                .is_some_and(|(original, _)| original.is_agent_item());
+            // The engine's acceptance cleared the original's request, so its
+            // row says what it is, as at admission.
+            let original_is_agent_item = self
+                .app
+                .reaction_target(
+                    &self.state.label,
+                    &submission.group_id_hex,
+                    &original.message_id_hex,
+                )?
+                .is_some_and(|row| row.kind == cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_ITEM);
             request.edit_intent(original.message_id_hex, original_is_agent_item)
         } else {
             request.intent()
@@ -5320,7 +5324,7 @@ impl AppClient {
             // the accepted fanouts.
             self.retry_send_applied_effects_best_effort().await;
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-            if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
+            if published.is_some() && event_wakes_members(event.kind, &event.tags) {
                 // A checkpoint is needed only when another transport wait follows;
                 // otherwise the worker can service the already-invalidated window.
                 if should_project_locally {

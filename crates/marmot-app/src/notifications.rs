@@ -2277,6 +2277,8 @@ fn agent_item_alert(
         .as_ref()
         .filter(|_| row.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM)
         .filter(|_| !row.deleted && row.invalidation_status.is_none())
+        // Only the agent's own edits are versions of its item.
+        .filter(|_| message.sender == row.sender)
         .filter(|item| item.alerts())
         .filter(|item| edit_version.is_none_or(|version| version == item.version));
     Ok(match latest {
