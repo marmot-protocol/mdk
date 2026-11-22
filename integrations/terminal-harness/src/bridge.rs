@@ -4308,6 +4308,174 @@ mod tests {
         serde_json::from_str(line).unwrap()
     }
 
+    /// Records each invocation and reports a durable backend session, so the
+    /// next turn resumes it. With `hold_first`, the first run stays open until
+    /// `release_first` is notified, keeping the group busy.
+    #[derive(Default)]
+    struct SessionBackend {
+        invocations: Mutex<Vec<Invocation>>,
+        invoked: tokio::sync::Notify,
+        hold_first: bool,
+        release_first: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for SessionBackend {
+        async fn run(
+            &self,
+            invocation: Invocation,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            let first = {
+                let mut invocations = self.invocations.lock().await;
+                invocations.push(invocation);
+                invocations.len() == 1
+            };
+            self.invoked.notify_one();
+            if self.hold_first && first {
+                self.release_first.notified().await;
+            }
+            Ok(Outcome {
+                observed_session: Some("backend-session".to_owned()),
+                exit_code: Some(0),
+                error_summary: None,
+                no_side_effects_proven: false,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
+    }
+
+    fn session_test_context(
+        root: &std::path::Path,
+        backend: Arc<SessionBackend>,
+    ) -> (Arc<BridgeContext>, tokio::task::JoinHandle<()>) {
+        let home = root.join("home");
+        let config = test_config(root);
+        let server = spawn_final_server(&config.socket);
+        let ctx = test_context_with_backend(root, &home, config, backend);
+        (ctx, server)
+    }
+
+    fn expected_reply_prompt(reply: &AgentControlReferencedMessage, text: &str) -> String {
+        format!(
+            "{}{}",
+            apply_reply_context(reply, text),
+            crate::group_profile::INSTRUCTIONS
+        )
+    }
+
+    #[tokio::test]
+    async fn reply_context_reaches_a_resumed_session() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(SessionBackend::default());
+        let (ctx, server) = session_test_context(root.path(), backend.clone());
+        let reply = test_reply("the earlier message");
+
+        dispatch_test_message(ctx.clone(), "first", "start the work").await;
+        assert_eq!(
+            ctx.sessions
+                .get("group")
+                .await
+                .map(|record| record.session_id),
+            Some("backend-session".to_owned())
+        );
+        dispatch_test_reply(ctx.clone(), "reply", "change this one", reply.clone()).await;
+
+        let invocations = backend.invocations.lock().await;
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].session_id, None);
+        assert_eq!(
+            invocations[1].session_id.as_deref(),
+            Some("backend-session")
+        );
+        assert_eq!(
+            invocations[1].prompt,
+            expected_reply_prompt(&reply, "change this one")
+        );
+        drop(invocations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn queued_replies_each_carry_their_own_context() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(SessionBackend {
+            hold_first: true,
+            ..SessionBackend::default()
+        });
+        let (ctx, server) = session_test_context(root.path(), backend.clone());
+
+        let first = tokio::spawn(dispatch_test_message(ctx.clone(), "first", "long task"));
+        tokio::time::timeout(Duration::from_secs(5), backend.invoked.notified())
+            .await
+            .expect("first turn starts");
+
+        // Both replies enter the group queue while the first turn is running.
+        let replies = [
+            ("reply-a", "use this one", test_reply("option A")),
+            ("reply-b", "no, this one", test_reply("option B")),
+        ];
+        let mut queued = Vec::new();
+        for (message_ref, text, reply) in &replies {
+            let disposition = classify_prompt(text);
+            let permit = acquire_dispatch_permit(&ctx.queues, "group", &disposition)
+                .await
+                .expect("queue admits the reply");
+            let inbound = InboundPrompt {
+                account_ref: "account".to_owned(),
+                group_ref: "group".to_owned(),
+                message_ref: (*message_ref).to_owned(),
+                text: (*text).to_owned(),
+                media: Vec::new(),
+                reply_to: Some(reply.clone()),
+            };
+            queued.push(tokio::spawn(handle_message(ctx.clone(), inbound, permit)));
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            backend.invocations.lock().await.len(),
+            1,
+            "queued replies wait for the busy turn"
+        );
+
+        backend.release_first.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            first.await.unwrap();
+            for task in queued {
+                task.await.unwrap();
+            }
+        })
+        .await
+        .expect("queued replies run after the busy turn");
+
+        let invocations = backend.invocations.lock().await;
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(
+            invocations[0].prompt,
+            format!("long task{}", crate::group_profile::INSTRUCTIONS)
+        );
+        for (_, text, reply) in &replies {
+            let expected = expected_reply_prompt(reply, text);
+            let matching: Vec<_> = invocations[1..]
+                .iter()
+                .filter(|invocation| invocation.prompt == expected)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "one turn renders {text:?} with its target"
+            );
+            assert_eq!(matching[0].prompt.matches(REPLY_CONTEXT_PREFIX).count(), 1);
+            // The busy turn's session is resumed by the queued follow-ups.
+            assert_eq!(matching[0].session_id.as_deref(), Some("backend-session"));
+        }
+        drop(invocations);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn reply_context_reaches_backend_without_affecting_routing() {
         let root = tempfile::tempdir().unwrap();
