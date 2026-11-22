@@ -4162,6 +4162,27 @@ fn parse_timeline_row_reads_core_fields() {
 }
 
 #[test]
+fn parse_timeline_row_labels_an_unreadable_agent_item_and_shows_a_readable_one() {
+    let old = serde_json::json!({
+        "message_id": "1",
+        "kind": 1201,
+        "plaintext": r#"{"v":1,"status":"error","extra":{"path":"/home/me"}}"#,
+        "agent_item": null
+    });
+    let row = parse_timeline_row(&old);
+    assert_eq!(row.display_text, "[unreadable agent item]");
+    assert_eq!(row.plaintext, old["plaintext"].as_str().unwrap());
+
+    let readable = serde_json::json!({
+        "message_id": "2",
+        "kind": 1201,
+        "plaintext": "Ran `ls`",
+        "agent_item": { "version": 2 }
+    });
+    assert_eq!(parse_timeline_row(&readable).display_text, "Ran `ls`");
+}
+
+#[test]
 fn parse_timeline_row_tallies_reactions_by_emoji_in_deterministic_order() {
     let value = serde_json::json!({
         "message_id": "1",

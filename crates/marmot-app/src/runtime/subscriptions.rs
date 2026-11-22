@@ -1773,7 +1773,7 @@ impl MarmotAppRuntime {
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             let mut resolver = notifications::NotificationResolver::default();
-            let mut seen_notification_keys =
+            let mut seen_delivery_keys =
                 MessageSubscriptionSeenIds::with_limit(MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT);
             let recovery_watermark = notifications::unix_now_seconds();
             loop {
@@ -1820,8 +1820,7 @@ impl MarmotAppRuntime {
                         resolver = returned_resolver;
                         match result {
                             Ok(Some(update)) => {
-                                if !seen_notification_keys.should_emit(update.delivery_key.clone())
-                                {
+                                if !seen_delivery_keys.should_emit(update.delivery_key.clone()) {
                                     continue;
                                 }
                                 if updates_tx.send(update).await.is_err() {
@@ -1855,7 +1854,7 @@ impl MarmotAppRuntime {
                             Err(_) => continue,
                         };
                         for update in recovered {
-                            if !seen_notification_keys.should_emit(update.delivery_key.clone()) {
+                            if !seen_delivery_keys.should_emit(update.delivery_key.clone()) {
                                 continue;
                             }
                             if updates_tx.send(update).await.is_err() {

@@ -871,13 +871,18 @@ pub(crate) fn timeline_message_record_json(
     })
 }
 
+/// The label shown in place of a timeline row's text when the row is an agent
+/// item MDK cannot read, such as the old shape: its plaintext is a payload,
+/// not text, and only `--json` keeps it.
+pub(crate) fn unreadable_agent_item_label(message: &Value) -> Option<&'static str> {
+    (message.get("kind").and_then(Value::as_u64) == Some(MARMOT_APP_EVENT_KIND_AGENT_ITEM)
+        && message.get("agent_item").is_none_or(Value::is_null))
+    .then_some("[unreadable agent item]")
+}
+
 pub(crate) fn timeline_message_display_text(message: &Value) -> String {
-    // An agent item MDK cannot read, such as the old shape, holds a payload,
-    // not text; `--json` keeps it.
-    if message.get("kind").and_then(Value::as_u64) == Some(MARMOT_APP_EVENT_KIND_AGENT_ITEM)
-        && message.get("agent_item").is_none_or(Value::is_null)
-    {
-        return "[unreadable agent item]".to_owned();
+    if let Some(label) = unreadable_agent_item_label(message) {
+        return label.to_owned();
     }
     if message.get("kind").and_then(Value::as_u64) == Some(MARMOT_APP_EVENT_KIND_GROUP_SYSTEM)
         && let Some(summary) = message

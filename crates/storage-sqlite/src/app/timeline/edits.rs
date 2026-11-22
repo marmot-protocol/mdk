@@ -124,10 +124,9 @@ fn resolve<'a>(
             (
                 e.agent_item.as_ref().map(|(version, _)| *version),
                 e.version.edited_at,
-                e.version.message_id_hex.clone(),
             )
         };
-        key(a).cmp(&key(b))
+        (key(a), &a.version.message_id_hex).cmp(&(key(b), &b.version.message_id_hex))
     });
     versions
 }

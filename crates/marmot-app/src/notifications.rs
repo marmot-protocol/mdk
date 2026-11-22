@@ -1715,8 +1715,8 @@ impl NotificationResolver {
 
 /// Re-derive candidate notifications from recent stored messages after the
 /// live broadcast ring overflows. Callers still dedupe against already-emitted
-/// `notification_key`s so recovery cannot replay a notification the subscriber
-/// already saw. `min_observed_at` is a per-subscription watermark in the same
+/// `delivery_key`s so recovery cannot replay a notification the subscriber
+/// already saw, while an agent item's later version still reaches it. `min_observed_at` is a per-subscription watermark in the same
 /// second-resolution units as `recorded_at` / `received_at`; rows strictly
 /// before it are pre-subscription history and must not become fresh OS alerts.
 /// Same-second rows stay eligible so in-session events are not dropped.

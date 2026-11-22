@@ -16,7 +16,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 - WN Agent refuses `send_agent_activity` and `send_agent_operation_event` with `retired_agent_event` and publishes
   nothing: MDK no longer builds the old shape of kinds 1201 and 1202.
 - `wn messages timeline list` carries a kind-1201 row's parsed `agent_item` in `--json`, and shows an item MDK cannot
-  read, such as the old shape, as `[unreadable agent item]` instead of its payload.
+  read, such as the old shape, as `[unreadable agent item]` instead of its payload; `wn tui` does the same.
 
 ## [0.19.0] - 2026-11-22
 
