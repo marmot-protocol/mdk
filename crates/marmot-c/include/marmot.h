@@ -359,7 +359,7 @@ enum MarmotStatus
    */
   MARMOT_STATUS_NO_USABLE_RELAY = 133,
   /**
-   * A recipient's KeyPackage is incompatible. No MLS group change was committed.
+   * None of a recipient's available KeyPackages is compatible. No MLS group change was committed.
    * Ask the recipient to update their client and publish a compatible KeyPackage.
    */
   MARMOT_STATUS_INCOMPATIBLE_KEY_PACKAGE = 134,

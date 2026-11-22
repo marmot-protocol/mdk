@@ -1793,7 +1793,7 @@ pub async fn start_direct_conversation_with_options( &self, account_ref: String,
 
 `start_direct_conversation` with founding options. `DirectConversationOptionsFfi.disappearingMessageSecs` uses the same values as `CreateGroupOptionsFfi`: `0` disables expiry and adds no founding requirement. A nonzero value is written into the founding MLS state and Welcome, so the recipient joins with the same duration and no follow-up retention commit is sent. Do not emulate this with `updateMessageRetention` after the start: a reused chat would have its policy overwritten.
 
-Options apply only when the call creates the group. Reuse, retry and same-account concurrent starts return the existing canonical group with its founding duration and roles, even when they propose a different duration. A nonzero duration requires the peer's KeyPackages to support message retention, exactly as `create_group_with_options` does; when the peer's do not, the start fails and nothing is created. Every other outcome follows `start_direct_conversation`.
+Options apply only when the call creates the group. Reuse, retry and same-account concurrent starts return the existing canonical group with its founding duration and roles, even when they propose a different duration. A nonzero duration requires message retention support, as in `create_group_with_options`. If the peer's available KeyPackages are all incompatible with that requirement, the start returns `MarmotKitError::IncompatibleKeyPackage` (`MARMOT_STATUS_INCOMPATIBLE_KEY_PACKAGE` in C) and creates no chat. Every other outcome follows `start_direct_conversation`.
 
 [Source](src/commands/group.rs#L458)
 
