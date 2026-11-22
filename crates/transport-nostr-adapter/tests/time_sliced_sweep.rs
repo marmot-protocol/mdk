@@ -274,6 +274,52 @@ async fn sweep_pages_a_strfry_relay_and_resolves_a_saturated_second() {
     assert_eq!(fixture.limit.stats().max_req_limit_seen, 500);
 }
 
+/// Missing metadata leaves the relay's NIP-77 support unknown. A refusal to
+/// negotiate cannot refuse the underlying history REQ or advance its cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_without_relay_metadata_advances_only_after_reconciliation() {
+    let fixture = Fixture::new().await;
+    let event = group_event(&Keys::generate(), GROUP, T0, 0);
+    fixture.store(std::slice::from_ref(&event)).await;
+    let relay = SdkSweepRelay::from_optional_caps(
+        &fixture.sdk,
+        RelayUrl::parse(&fixture.limit.url()).unwrap(),
+        None,
+        Duration::from_secs(10),
+    );
+    let range = SweepRange {
+        since: T0,
+        until: T0,
+    };
+    let store = MemoryStore::default();
+    let mut sink = Sink::default();
+    let cancel = CancellationToken::new();
+
+    // The same relay behind a document that omits NIP-77 stays sweep-only.
+    let known = fixture.relay_with_caps("{}");
+    let published = run_sweep(request(range), &known, &mut sink, &store, &cancel).await;
+    assert_eq!(published.end, SweepEnd::SaturatedSecond { second: T0 });
+    assert_eq!(fixture.limit.stats().neg_opens, 0);
+
+    fixture.limit.set_neg_fault(NegFault::ErrOnOpen);
+    let refused = run_sweep(request(range), &relay, &mut sink, &store, &cancel).await;
+    assert_eq!(refused.end, SweepEnd::InconclusiveSecond { second: T0 });
+    assert!(sink.slices.is_empty());
+
+    fixture.limit.set_neg_fault(NegFault::None);
+    fixture.limit.withhold_id_fetch_events(1);
+    let withheld = run_sweep(request(range), &relay, &mut sink, &store, &cancel).await;
+    assert_eq!(withheld.end, SweepEnd::InconclusiveSecond { second: T0 });
+    assert!(sink.slices.is_empty());
+
+    fixture.limit.withhold_id_fetch_events(0);
+    let proved = run_sweep(request(range), &relay, &mut sink, &store, &cancel).await;
+    assert_eq!(proved.end, SweepEnd::Finished);
+    assert_eq!(sink.slices.len(), 1);
+    assert_eq!(sink.slices[0].proof, SliceProof::Negentropy);
+    assert_eq!(sink.events, [event]);
+}
+
 /// A NIP-77 relay that answers a busy second inconclusively, by listing its
 /// ids and then withholding one, by sending a NEG-MSG the client cannot
 /// parse, or by repeating each event of an id fetch until a one-id reply

@@ -137,11 +137,11 @@ impl AccountRunnerHost {
     fn sdk_relay(
         &self,
         relay: &str,
-        caps: RelayCaps,
+        caps: Option<RelayCaps>,
         request_timeout: Duration,
     ) -> Option<SdkSweepRelay> {
         let endpoint = RelayUrl::parse(relay).ok()?;
-        Some(SdkSweepRelay::new(
+        Some(SdkSweepRelay::from_optional_caps(
             self.relay_client().as_ref()?,
             endpoint,
             caps,
@@ -251,7 +251,7 @@ impl RunnerHost for AccountRunnerHost {
     fn sweep_relay(
         &self,
         relay: &str,
-        caps: RelayCaps,
+        caps: Option<RelayCaps>,
         request_timeout: Duration,
     ) -> Option<Box<dyn SweepRelay>> {
         Some(Box::new(self.sdk_relay(relay, caps, request_timeout)?))
@@ -263,7 +263,11 @@ impl RunnerHost for AccountRunnerHost {
         caps: RelayCaps,
         request_timeout: Duration,
     ) -> Option<Box<dyn CompareRelay>> {
-        Some(Box::new(self.sdk_relay(relay, caps, request_timeout)?))
+        Some(Box::new(self.sdk_relay(
+            relay,
+            Some(caps),
+            request_timeout,
+        )?))
     }
 
     async fn deliveries(&self, relay: &str, event: Event) -> Option<Vec<TransportDelivery>> {

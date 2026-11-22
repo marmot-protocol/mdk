@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cgka_traits::TransportEndpointRejectionCategory;
 use nostr_sdk::prelude::{
     AcquisitionEnd, AcquisitionLimits, Client, Event, EventId, Filter, Relay, RelayAcquisition,
     RelayUrl, ReqTarget, SyncDirection, SyncOptions, Timestamp,
@@ -50,7 +51,7 @@ const SECOND_NEG_LIMIT: usize = 100_000;
 pub struct SdkSweepRelay {
     client: Client,
     endpoint: RelayUrl,
-    caps: RelayCaps,
+    caps: Option<RelayCaps>,
     neg_credit: Arc<Semaphore>,
     eose_hints: Option<Arc<EoseHints>>,
     request_timeout: Duration,
@@ -68,6 +69,17 @@ impl SdkSweepRelay {
         relay_client: &NostrSdkRelayClient,
         endpoint: RelayUrl,
         caps: RelayCaps,
+        request_timeout: Duration,
+    ) -> Self {
+        Self::from_optional_caps(relay_client, endpoint, Some(caps), request_timeout)
+    }
+
+    /// Without a current or previously read NIP-11 document, a sweep may try
+    /// NIP-77 to prove a single second after ordinary slice counts failed.
+    pub fn from_optional_caps(
+        relay_client: &NostrSdkRelayClient,
+        endpoint: RelayUrl,
+        caps: Option<RelayCaps>,
         request_timeout: Duration,
     ) -> Self {
         Self {
@@ -117,6 +129,17 @@ impl SdkSweepRelay {
             () = self.interrupted.cancelled() => {
                 Err(NegFailure::Unreachable(UnreachableKind::Disconnected))
             }
+        }
+    }
+
+    /// Refusal of an optional probe does not refuse the ordinary history
+    /// request that just succeeded. An explicit rate limit still applies.
+    fn second_refused(&self, reason: ClosedReason) -> SecondReply {
+        if self.caps.is_none() && reason.0 != Some(TransportEndpointRejectionCategory::RateLimited)
+        {
+            SecondReply::Inconclusive
+        } else {
+            SecondReply::Closed(reason)
         }
     }
 
@@ -186,7 +209,7 @@ enum FailedEnd {
 #[async_trait]
 impl SweepRelay for SdkSweepRelay {
     fn caps(&self) -> RelayCaps {
-        self.caps
+        self.caps.unwrap_or_default()
     }
 
     async fn fetch_slice(&self, query: SliceQuery) -> SliceReply {
@@ -218,7 +241,7 @@ impl SweepRelay for SdkSweepRelay {
     }
 
     async fn fetch_second(&self, route: SweepRoute, second: u64, cap: Option<u32>) -> SecondReply {
-        if !self.caps.negentropy {
+        if self.caps.is_some_and(|caps| !caps.negentropy) {
             return SecondReply::Unproven;
         }
         let Ok(Some(relay)) = self.client.relay(&self.endpoint).await else {
@@ -233,7 +256,11 @@ impl SweepRelay for SdkSweepRelay {
             .await
         {
             Ok(compared) => compared.remote,
-            Err(NegFailure::Closed(reason)) => return SecondReply::Closed(reason),
+            Err(NegFailure::Closed(reason)) => return self.second_refused(reason),
+            // A relay that ignores an unadvertised NEG-OPEN still answered its REQ.
+            Err(NegFailure::Unreachable(UnreachableKind::TimedOut)) if self.caps.is_none() => {
+                return SecondReply::Inconclusive;
+            }
             Err(NegFailure::Unreachable(kind)) => return SecondReply::Unreachable(kind),
             Err(NegFailure::Unproven) => return SecondReply::Unproven,
             Err(NegFailure::Inconclusive) => return SecondReply::Inconclusive,
@@ -268,7 +295,7 @@ impl SweepRelay for SdkSweepRelay {
             };
             match failed_end(reply.end) {
                 Ok(()) => {}
-                Err(FailedEnd::Closed(reason)) => return SecondReply::Closed(reason),
+                Err(FailedEnd::Closed(reason)) => return self.second_refused(reason),
                 Err(FailedEnd::Unreachable(kind)) => return SecondReply::Unreachable(kind),
                 // Large events can outgrow the byte budget: split the chunk
                 // and ask again.
@@ -316,7 +343,7 @@ impl SweepRelay for SdkSweepRelay {
 #[async_trait]
 impl CompareRelay for SdkSweepRelay {
     fn caps(&self) -> RelayCaps {
-        self.caps
+        self.caps.unwrap_or_default()
     }
 
     async fn compare(
