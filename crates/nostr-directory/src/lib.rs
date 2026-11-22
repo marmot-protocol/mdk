@@ -39,7 +39,7 @@ pub use ids::{
 pub use member_key_packages::{
     MemberKeyPackagePrewarmSummary, MemberKeyPackageResolutionStats, MemberResolutionOutcome,
     MemberResolutionPolicy, MemberResolutionPurpose, MemberResolutionStatus,
-    ResolvedMemberKeyPackages,
+    ResolvedMemberKeyPackages, key_package_requirements_are_incompatible,
 };
 pub use observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 pub use previews::{MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead};

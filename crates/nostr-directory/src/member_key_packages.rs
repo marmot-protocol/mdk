@@ -1394,6 +1394,20 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     }
 }
 
+/// Whether a recipient's KeyPackage failed a group compatibility requirement.
+pub fn key_package_requirements_are_incompatible(error: &cgka_traits::error::EngineError) -> bool {
+    use cgka_traits::error::EngineError;
+
+    match error {
+        EngineError::MissingRequiredCapabilities { .. }
+        | EngineError::InvalidKeyPackageCapabilities { .. } => true,
+        EngineError::Other(message) => {
+            message == "KeyPackage does not match target group profile or ciphersuite"
+        }
+        _ => false,
+    }
+}
+
 fn recipient_resolution_status(error: &DirectoryError) -> Option<MemberResolutionStatus> {
     use MemberResolutionStatus as Status;
     use cgka_traits::error::EngineError;
@@ -1412,20 +1426,16 @@ fn recipient_resolution_status(error: &DirectoryError) -> Option<MemberResolutio
         DirectoryError::DirectoryLookupIncomplete(_) | DirectoryError::MissingRelayLists(_) => {
             Some(Status::Incomplete)
         }
-        DirectoryError::KeyPackageRequirements(
-            EngineError::MissingRequiredCapabilities { .. }
-            | EngineError::InvalidKeyPackageCapabilities { .. },
-        ) => Some(Status::IncompatibleKeyPackage),
+        DirectoryError::KeyPackageRequirements(error)
+            if key_package_requirements_are_incompatible(error) =>
+        {
+            Some(Status::IncompatibleKeyPackage)
+        }
         DirectoryError::KeyPackageRequirements(
             EngineError::InvalidKeyPackageLifetime { .. }
             | EngineError::InvalidAccountIdentityProof(_)
             | EngineError::Serialize(_),
         ) => Some(Status::InvalidKeyPackage),
-        DirectoryError::KeyPackageRequirements(EngineError::Other(message))
-            if message == "KeyPackage does not match target group profile or ciphersuite" =>
-        {
-            Some(Status::IncompatibleKeyPackage)
-        }
         _ => None,
     }
 }

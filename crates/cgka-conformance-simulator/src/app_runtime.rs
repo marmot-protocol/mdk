@@ -2987,6 +2987,7 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::UserBlocked => "user_blocked",
         AppError::MessageDraftRevisionConflict => "message_draft_revision_conflict",
         AppError::MissingKeyPackage { .. } => "missing_key_package",
+        AppError::IncompatibleKeyPackage(_) => "incompatible_key_package",
         AppError::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
         AppError::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
         AppError::InvalidSticker(_) => "invalid_sticker",
@@ -3139,6 +3140,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidRelayTelemetrySettings(_)
         | AppError::InvalidAuditLogFile(_) => SubjectFailureCategory::Protocol,
         AppError::MissingKeyPackage { .. }
+        | AppError::IncompatibleKeyPackage(_)
         | AppError::MissingMemberInboxRoute(_)
         | AppError::UnknownGroup(_)
         | AppError::GroupInviteNotPending

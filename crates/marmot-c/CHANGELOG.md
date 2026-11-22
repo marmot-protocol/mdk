@@ -23,6 +23,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   answer or a control for an agent (kind 1202).
 - `marmot_submit_tagged_text`, `marmot_submit_tagged_reply`, `marmot_submit_thread_message`, and
   `marmot_submit_tagged_sticker` return durable local acceptance before relay publication.
+- `MARMOT_STATUS_INCOMPATIBLE_KEY_PACKAGE` identifies incompatible recipient chat keys that previously returned the generic runtime status.
 
 ## [0.19.0] - 2026-11-22
 

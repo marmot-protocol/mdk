@@ -358,6 +358,10 @@ enum MarmotStatus
    * while the group's relays stay the same (mdk#3305).
    */
   MARMOT_STATUS_NO_USABLE_RELAY = 133,
+  /**
+   * Ask the recipient to update their client and publish a compatible KeyPackage.
+   */
+  MARMOT_STATUS_INCOMPATIBLE_KEY_PACKAGE = 134,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

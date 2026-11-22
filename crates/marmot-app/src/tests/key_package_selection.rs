@@ -1078,6 +1078,55 @@ async fn per_author_refetch_preserves_slot_replacements_seen_in_batch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_start_rejects_a_retention_incompatible_recipient_without_creating_a_chat() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let bob = &accounts[0];
+    app.account_home().create_account("alice").unwrap();
+    let limited = fresh_key_package_with_components(
+        &app,
+        bob,
+        false,
+        app.supported_app_component_ids()
+            .into_iter()
+            .filter(|id| *id != cgka_traits::app_components::GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+            .collect(),
+    )
+    .await;
+    {
+        let mut events = fetcher.events.lock().unwrap();
+        events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        events.push(candidate(bob, limited, "limited", None, unix_now_seconds()));
+    }
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let error = runtime
+        .start_direct_conversation_with_options(
+            "alice",
+            &bob.account_id_hex,
+            crate::DirectConversationOptions {
+                disappearing_message_secs: 300,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::IncompatibleKeyPackage(_)),
+        "{error}"
+    );
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::MissingRequiredCapabilities { .. })
+    ));
+    assert!(app.groups("alice").unwrap().is_empty());
+    runtime.shutdown().await;
+    {
+        let client = app.client("alice").await.unwrap();
+        assert!(client.runtime.live_group_ids().unwrap().is_empty());
+    }
+    app.close_storage().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incompatible_slot_is_skipped_for_create_and_invite() {
     let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let bob = &accounts[0];
