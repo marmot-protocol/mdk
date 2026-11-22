@@ -1196,10 +1196,9 @@ pub struct AppMessageRecord {
     pub recorded_at: u64,
     /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
-    /// Local `app_events` insert order (rowid). The final LOCAL tiebreak of the
-    /// raw-event replay cursor used by lag-recovery watermark/suppression (#630);
-    /// not part of the cross-client display order. `#[serde(default)]` keeps
-    /// older serialized records readable.
+    /// Insertion position in this account-device database. Pass it to
+    /// [`MarmotApp::messages_after_insert_order`] to resume after this row.
+    /// Also the local tiebreaker in the timestamp-based replay cursor (#630).
     #[serde(default)]
     pub insert_order: i64,
     /// True when convergence retained this raw row only as an invalidated
@@ -3771,20 +3770,47 @@ impl MarmotApp {
         self.messages_with_query(label, AppMessageQuery::default())
     }
 
+    /// Replay visible source rows in sender-timestamp order. A limit selects
+    /// the newest matching window.
     pub fn messages_with_query(
         &self,
         label: &str,
         query: AppMessageQuery,
     ) -> Result<Vec<AppMessageRecord>, AppError> {
+        self.read_visible_messages(label, query, None)
+    }
+
+    /// Return matching, unexpired source rows strictly after `after`, in
+    /// ascending local insertion order. Start at zero and resume with the last
+    /// processed row's [`AppMessageRecord::insert_order`]. The limit applies
+    /// after filtering. A replay or update of a retained row keeps its position.
+    pub fn messages_after_insert_order(
+        &self,
+        label: &str,
+        query: AppMessageQuery,
+        after: i64,
+    ) -> Result<Vec<AppMessageRecord>, AppError> {
+        self.read_visible_messages(label, query, Some(after))
+    }
+
+    fn read_visible_messages(
+        &self,
+        label: &str,
+        query: AppMessageQuery,
+        after: Option<i64>,
+    ) -> Result<Vec<AppMessageRecord>, AppError> {
         self.ensure_account_state(label)?;
-        Ok(self
-            .account_storage(label)?
-            .app_storage()
-            .visible_app_messages(StoredAppMessageQuery {
-                group_id_hex: query.group_id_hex,
-                kinds: query.kinds,
-                limit: query.limit,
-            })?
+        let storage = self.account_storage(label)?.app_storage();
+        let query = StoredAppMessageQuery {
+            group_id_hex: query.group_id_hex,
+            kinds: query.kinds,
+            limit: query.limit,
+        };
+        let rows = match after {
+            Some(after) => storage.visible_app_messages_after_insert_order(query, after)?,
+            None => storage.visible_app_messages(query)?,
+        };
+        Ok(rows
             .into_iter()
             .map(app_message_record_from_stored)
             .collect())

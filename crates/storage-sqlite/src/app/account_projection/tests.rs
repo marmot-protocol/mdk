@@ -1364,6 +1364,75 @@ fn visible_messages_skip_retired_stream_starts_before_the_limit() {
 }
 
 #[test]
+fn visible_messages_page_after_insert_order() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let first = app_event("first", "aa", 30);
+    store.record_app_event(&first).unwrap();
+    store
+        .record_app_event_with_retention(
+            &app_event("expired", "aa", 20),
+            Some(AppMessageRetentionDecision::new(20, 1)),
+        )
+        .unwrap();
+    store
+        .record_app_event(&app_event("other-group", "bb", 25))
+        .unwrap();
+    store
+        .record_app_event(&StoredAppEvent {
+            kind: 1234,
+            ..app_event("other-kind", "aa", 32)
+        })
+        .unwrap();
+    store
+        .record_app_event(&StoredAppEvent {
+            sender: "blocked".into(),
+            ..app_event("blocked", "aa", 35)
+        })
+        .unwrap();
+    store
+        .adopt_block_list(
+            &crate::StoredBlockList {
+                event_id: "block".into(),
+                event_created_at: 1,
+                ..Default::default()
+            },
+            &[("blocked".into(), true)],
+            1,
+            "local",
+            &no_mentions,
+        )
+        .unwrap();
+    store
+        .record_app_event(&app_event("late", "aa", 10))
+        .unwrap();
+    store
+        .record_app_event(&app_event("last", "aa", 40))
+        .unwrap();
+
+    let page = |after| {
+        let query = StoredAppMessageQuery {
+            group_id_hex: Some("aa".into()),
+            kinds: Some(vec![MARMOT_APP_EVENT_KIND_CHAT]),
+            limit: Some(2),
+        };
+        store
+            .visible_app_messages_after_insert_order(query, after)
+            .unwrap()
+    };
+    let initial = page(0);
+    let ids = |rows: &[StoredAppMessageRecord]| {
+        rows.iter()
+            .map(|row| row.message_id_hex.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&initial), ["first", "late"]);
+    store.record_app_event(&first).unwrap(); // Replay preserves the original position.
+    let next = page(initial[1].insert_order);
+    assert_eq!(ids(&next), ["last"]);
+    assert!(page(next[0].insert_order).is_empty());
+}
+
+#[test]
 fn app_messages_list_raw_events_and_prune_updates_timeline() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
