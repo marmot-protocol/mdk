@@ -244,6 +244,7 @@ pub enum MarmotStatus {
     /// Nothing was sent; a commit rolled back. Retrying fails the same way
     /// while the group's relays stay the same (mdk#3305).
     NoUsableRelay = 133,
+    /// A recipient's KeyPackage is incompatible. No MLS group change was committed.
     /// Ask the recipient to update their client and publish a compatible KeyPackage.
     IncompatibleKeyPackage = 134,
 }

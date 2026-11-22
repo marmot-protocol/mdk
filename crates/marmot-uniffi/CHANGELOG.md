@@ -8,6 +8,10 @@
   `NotificationTrafficClassFfi::AgentActivity` is removed. An agent item notifies as `Standard` only while it is a
   waiting approval or question, or a failed turn.
 
+- `MarmotKitError` gains `IncompatibleKeyPackage`. Update exhaustive Swift `switch` and Kotlin `when` expressions to
+  handle it, and regenerate bindings with the matching native library. For this error, ask the recipient to update
+  their client and publish a compatible KeyPackage (#3604).
+
 ### Added
 
 - `TimelineMessageRecordFfi::agent_item_first_event_missing`: true for an agent item whose first event this device
