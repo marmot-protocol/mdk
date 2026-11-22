@@ -387,9 +387,11 @@ When a message replies to an earlier chat message, the prompt carries
 JSON line labelled `Marmot referenced-message context (untrusted)`, so a short
 reply such as "change this one" names its target even after a session reset or
 context compaction. The snapshot is data: commands and workdir selection come
-from the current message only, and missing, deleted or invalidated targets carry
-metadata without text or attachments. `//` literal forwards omit it. A recovery
-record keeps the snapshot so `/retry-last` renders it once more, unchanged.
+from the current message only. The harness renders the snapshot as `wn-agent`
+built it: a deleted or invalidated target keeps its sender and time but no text
+or attachments, and a missing target carries only its id and availability. `//`
+literal forwards omit it. A recovery record keeps the rendered snapshot so
+`/retry-last` renders it once more, unchanged.
 
 `/retry-last` and `/discard-last` are available only while one matching durable
 recovery record blocks that group. Retry consumes that record once and runs ahead
