@@ -349,7 +349,6 @@ pub(super) fn uncovered_seconds(
 pub(super) async fn run<H: RunnerHost>(
     host: &H,
     plan: &SweepPlan,
-    caps: RelayCaps,
     deadline: Instant,
     cancel: &CancellationToken,
     policy: &RecoveryRunnerPolicy,
@@ -369,7 +368,7 @@ pub(super) async fn run<H: RunnerHost>(
         observed_cap: plan.observed_cap,
         stop: None,
     };
-    let Some(relay) = host.sweep_relay(&plan.key.relay, caps, policy.request_timeout) else {
+    let Some(relay) = host.sweep_relay(&plan.key.relay, plan.caps, policy.request_timeout) else {
         report.end = SweepEnd::Unreachable(UnreachableKind::Disconnected);
         return report;
     };

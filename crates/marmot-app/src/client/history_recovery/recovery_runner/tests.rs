@@ -1304,13 +1304,13 @@ impl RunnerHost for TestHost {
     fn sweep_relay(
         &self,
         relay: &str,
-        caps: RelayCaps,
+        caps: Option<RelayCaps>,
         _request_timeout: Duration,
     ) -> Option<Box<dyn SweepRelay>> {
         let relay = self.relays.get(relay)?.clone();
         Some(Box::new(Swept {
             relay,
-            caps,
+            caps: caps.unwrap_or_default(),
             cut: CancellationToken::new(),
         }))
     }

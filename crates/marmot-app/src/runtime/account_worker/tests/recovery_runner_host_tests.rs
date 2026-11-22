@@ -770,13 +770,9 @@ async fn a_reconnect_mid_quantum_gives_the_preempted_attempt_back() {
 /// each join account-wide loss, every route owed again, and on a relay that
 /// cannot compare, the inbox never caught up.
 ///
-/// The relay publishes no caps, so a sweep proves a second only when it holds
-/// fewer events than a fuller reply did, and creating a group publishes no
-/// commit on its route: a fetch owing a second that holds one message could
-/// never prove it. The join's activation owes the group's history through
-/// its own second, which can come after the group's creation, so each
-/// group's message goes out in a later second than the one that history
-/// became owed in: it owes no message, and the message arrives live.
+/// Send each message in a later second than its join's activation owes, so
+/// it exercises live delivery across the joins. A message in the owed range
+/// could instead arrive through the recovery sweep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn successive_group_joins_lose_nothing_and_catch_up() {
     const GROUPS: u64 = 6;

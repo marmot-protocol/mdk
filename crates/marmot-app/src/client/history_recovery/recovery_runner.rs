@@ -249,7 +249,7 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
     fn sweep_relay(
         &self,
         relay: &str,
-        caps: RelayCaps,
+        caps: Option<RelayCaps>,
         request_timeout: Duration,
     ) -> Option<Box<dyn SweepRelay>>;
 
@@ -967,9 +967,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                         (report, Some(facts))
                     }
                     None => {
-                        let caps = plan.caps.unwrap_or_default();
-                        let report =
-                            quantum::run(host, &plan, caps, deadline, &preempt, &policy).await;
+                        let report = quantum::run(host, &plan, deadline, &preempt, &policy).await;
                         (report, None)
                     }
                 }
