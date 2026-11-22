@@ -1035,7 +1035,13 @@ mod reset_tree {
     struct ResetEntry {
         name: CString,
         identity: (u64, u64),
-        children: Option<ResetChildren>,
+        kind: ResetEntryKind,
+    }
+
+    enum ResetEntryKind {
+        File,
+        Lease,
+        Directory(ResetChildren),
     }
 
     struct ResetChildren {
@@ -1093,7 +1099,6 @@ mod reset_tree {
                             .push(acquire_lease(parent, path, file_name, busy)?);
                     }
                     survivors += 1;
-                    continue;
                 }
 
                 let stat = stat_at(parent, name)?;
@@ -1101,14 +1106,18 @@ mod reset_tree {
                 self.entries.push(ResetEntry {
                     name: name.to_owned(),
                     identity: stat.identity,
-                    children: None,
+                    kind: if busy.is_some() {
+                        ResetEntryKind::Lease
+                    } else {
+                        ResetEntryKind::File
+                    },
                 });
-                if stat.directory {
+                if stat.directory && busy.is_none() {
                     let child = self.entries[index].open_dir(parent)?;
                     path.push(file_name);
                     let child_survivors = self.scan(child.as_fd(), path)?;
                     path.pop();
-                    self.entries[index].children = Some(ResetChildren {
+                    self.entries[index].kind = ResetEntryKind::Directory(ResetChildren {
                         len: self.entries.len() - index - 1,
                         survivors: child_survivors,
                     });
@@ -1120,7 +1129,7 @@ mod reset_tree {
 
         fn delete(self) -> io::Result<()> {
             remove_entries(self.root, &self.entries)?;
-            check_remaining(self.root, self.survivors)
+            check_remaining(self.root, &self.entries, self.survivors)
         }
     }
 
@@ -1147,20 +1156,27 @@ mod reset_tree {
     // Reopen only those directories, and never recursively unlink new arrivals.
     fn remove_entries(parent: BorrowedFd<'_>, mut entries: &[ResetEntry]) -> io::Result<()> {
         while let Some((entry, rest)) = entries.split_first() {
-            let flags = if let Some(children) = &entry.children {
-                let child = entry.open_dir(parent)?;
-                let (descendants, siblings) = rest.split_at(children.len);
-                remove_entries(child.as_fd(), descendants)?;
-                entries = siblings;
-                if children.survivors != 0 {
-                    check_remaining(child.as_fd(), children.survivors)?;
-                    entry.check_identity(stat_at(parent, &entry.name)?.identity)?;
+            let flags = match &entry.kind {
+                ResetEntryKind::Lease => {
+                    entries = rest;
                     continue;
                 }
-                libc::AT_REMOVEDIR
-            } else {
-                entries = rest;
-                0
+                ResetEntryKind::Directory(children) => {
+                    let child = entry.open_dir(parent)?;
+                    let (descendants, siblings) = rest.split_at(children.len);
+                    remove_entries(child.as_fd(), descendants)?;
+                    entries = siblings;
+                    if children.survivors != 0 {
+                        check_remaining(child.as_fd(), descendants, children.survivors)?;
+                        entry.check_identity(stat_at(parent, &entry.name)?.identity)?;
+                        continue;
+                    }
+                    libc::AT_REMOVEDIR
+                }
+                ResetEntryKind::File => {
+                    entries = rest;
+                    0
+                }
             };
             entry.check_identity(stat_at(parent, &entry.name)?.identity)?;
             // The parent remains pinned and the name is one directory entry.
@@ -1172,7 +1188,25 @@ mod reset_tree {
     }
 
     // Retained directories do not get the emptiness check from unlinkat.
-    fn check_remaining(parent: BorrowedFd<'_>, survivors: usize) -> io::Result<()> {
+    fn check_remaining(
+        parent: BorrowedFd<'_>,
+        mut entries: &[ResetEntry],
+        survivors: usize,
+    ) -> io::Result<()> {
+        while let Some((entry, rest)) = entries.split_first() {
+            entries = rest;
+            let retained = match &entry.kind {
+                ResetEntryKind::Lease => true,
+                ResetEntryKind::File => false,
+                ResetEntryKind::Directory(children) => {
+                    entries = &rest[children.len..];
+                    children.survivors != 0
+                }
+            };
+            if retained {
+                entry.check_identity(stat_at(parent, &entry.name)?.identity)?;
+            }
+        }
         let mut stream = DirStream::open(parent)?;
         for _ in 0..survivors {
             if stream.next_name()?.is_none() {
@@ -1452,6 +1486,36 @@ mod reset_tree {
                 "reset directory gained an unplanned entry"
             );
             assert_eq!(fs::read(new.join("payload")).unwrap(), b"not in snapshot");
+        }
+
+        #[test]
+        fn reset_checks_retained_locks() {
+            for (directory, replacement) in [
+                ("", "identity-copy.json"),
+                ("nested", "identity-copy.json"),
+                ("", ROOT_MUTATION_LOCK_FILE),
+                ("nested", ROOT_MUTATION_LOCK_FILE),
+            ] {
+                let base = tempfile::tempdir().unwrap();
+                let home = base.path().join("home");
+                let parent = home.join(directory);
+                fs::create_dir_all(&parent).unwrap();
+                fs::write(parent.join(ROOT_MUTATION_LOCK_FILE), b"").unwrap();
+                fs::write(home.join("payload"), b"inside reset").unwrap();
+                let root = fs_private::inspect_directory_path(&home).unwrap().unwrap();
+                let plan = ResetPlan::new(root.as_fd(), &home).unwrap();
+
+                fs::rename(
+                    parent.join(ROOT_MUTATION_LOCK_FILE),
+                    base.path().join("old-lock"),
+                )
+                .unwrap();
+                let unplanned = parent.join(replacement);
+                fs::write(&unplanned, b"unplanned secret").unwrap();
+
+                assert!(plan.delete().is_err(), "{directory}: {replacement}");
+                assert_eq!(fs::read(unplanned).unwrap(), b"unplanned secret");
+            }
         }
     }
 }
