@@ -7652,6 +7652,168 @@ async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync(
     runtime.shutdown().await;
 }
 
+/// An agent's item reaches the person as a readable row, and the person's
+/// answers and controls reach the agent as `MessageReceived` only once stored,
+/// in their insertion order (mdk#3603), with no row of their own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_runtime_carries_agent_items_and_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let agent_id = home.create_account("alice").unwrap().account_id_hex;
+    home.create_account("bob").unwrap();
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob_setup = app.client("bob").await.unwrap();
+    bob_setup.publish_key_package().await.unwrap();
+    drop(bob_setup);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut events = runtime.subscribe();
+    runtime.start().await.unwrap();
+    let group_id = runtime
+        .create_group("alice", "agent", &["bob".to_owned()], None)
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+    let group_hex = hex::encode(group_id.as_slice());
+    let tag = |parts: &[&str]| {
+        parts
+            .iter()
+            .map(|part| (*part).to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let item = runtime
+        .send_custom_event(
+            "alice",
+            &group_id,
+            marmot_app::MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            vec![
+                tag(&["v", "1"]),
+                tag(&["state", "waiting"]),
+                tag(&["title", "Allow this command?"]),
+                tag(&["harness", "codex"]),
+                tag(&["item_id", "call-1"]),
+                tag(&["seq", "3"]),
+                tag(&["fields", r#"{"type":"approval","body":{}}"#]),
+            ],
+            "Allow `ls`?".to_owned(),
+        )
+        .await
+        .unwrap();
+    let item_id = item.message_ids[0].clone();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id && message.message.message_id_hex == item_id
+        )
+    })
+    .await;
+    let row = runtime
+        .timeline_message("bob", &group_hex, &item_id)
+        .unwrap()
+        .expect("the person sees the item");
+    let parsed = row.agent_item.expect("a readable item");
+    assert_eq!(parsed.item_type, "approval");
+    assert!(parsed.alerts());
+
+    let mut sent = Vec::new();
+    for (choice, words) in [("allow", "Allow once"), ("deny", "Deny")] {
+        let request = runtime
+            .send_custom_event(
+                "bob",
+                &group_id,
+                marmot_app::MARMOT_APP_EVENT_KIND_AGENT_REQUEST,
+                vec![
+                    tag(&["p", &agent_id]),
+                    tag(&["e", &item_id]),
+                    tag(&[
+                        "details",
+                        &format!(r#"{{"action":"choice","choice":"{choice}"}}"#),
+                    ]),
+                ],
+                words.to_owned(),
+            )
+            .await
+            .unwrap();
+        sent.push(request.message_ids[0].clone());
+    }
+    // Whatever order the relay delivers them in, each is announced after it is
+    // stored, and in the order it was stored.
+    let mut seen_orders = Vec::new();
+    let mut announced = Vec::new();
+    while announced.len() < sent.len() {
+        let received = wait_for_event(&mut events, |event| {
+            matches!(
+                event,
+                MarmotAppEvent::MessageReceived(message)
+                    if message.account_id_hex == agent_id
+                        && sent.contains(&message.message.message_id_hex)
+                        && !announced.contains(&message.message.message_id_hex)
+            )
+        })
+        .await;
+        let MarmotAppEvent::MessageReceived(received) = received else {
+            unreachable!()
+        };
+        let id = &received.message.message_id_hex;
+        announced.push(id.clone());
+        assert_eq!(
+            received.message.kind,
+            marmot_app::MARMOT_APP_EVENT_KIND_AGENT_REQUEST
+        );
+        let request = marmot_app::AgentRequest::from_tags(&received.message.tags).unwrap();
+        assert_eq!(request.agent_pubkey_hex, agent_id);
+        assert_eq!(
+            request.item_message_id_hex.as_deref(),
+            Some(item_id.as_str())
+        );
+        let stored = runtime
+            .message_by_id("alice", &group_hex, id)
+            .unwrap()
+            .expect("stored before it is announced");
+        seen_orders.push(stored.insert_order);
+        assert!(
+            runtime
+                .timeline_message("alice", &group_hex, id)
+                .unwrap()
+                .is_none(),
+            "an answer or a control has no row"
+        );
+    }
+    assert!(seen_orders.windows(2).all(|pair| pair[0] < pair[1]));
+    let page = runtime
+        .messages_after_insert_order(
+            "alice",
+            AppMessageQuery {
+                group_id_hex: Some(group_hex.clone()),
+                kinds: Some(vec![marmot_app::MARMOT_APP_EVENT_KIND_AGENT_REQUEST]),
+                limit: Some(10),
+            },
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        page.iter()
+            .map(|message| message.message_id_hex.clone())
+            .collect::<Vec<_>>(),
+        announced,
+        "the stored order is the announced order"
+    );
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_starts_directory_subscriptions_for_known_users() {
     let dir = tempfile::tempdir().unwrap();

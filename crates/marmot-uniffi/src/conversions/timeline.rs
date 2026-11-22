@@ -347,6 +347,99 @@ impl From<AppGroupSystemEvent> for GroupSystemEventFfi {
     }
 }
 
+/// An agent item's state (kind 1201).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AgentItemStateFfi {
+    Running,
+    Waiting,
+    Done,
+    Failed,
+    Declined,
+    Cancelled,
+}
+
+impl From<cgka_traits::AgentItemState> for AgentItemStateFfi {
+    fn from(value: cgka_traits::AgentItemState) -> Self {
+        use cgka_traits::AgentItemState;
+        match value {
+            AgentItemState::Running => Self::Running,
+            AgentItemState::Waiting => Self::Waiting,
+            AgentItemState::Done => Self::Done,
+            AgentItemState::Failed => Self::Failed,
+            AgentItemState::Declined => Self::Declined,
+            AgentItemState::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// The latest version of an agent item (kind 1201) on its timeline row: the
+/// highest `v` MDK holds, from the item's first event or a later edit. The
+/// row's `plaintext` is the item's plain rendering and its `tags` are that
+/// version's tags, including the ones MDK passes on unread (`native`,
+/// `left_out`, `cut`). Render the item from `item_type` and `fields_json`.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AgentItemFfi {
+    /// The item's version, from 1.
+    pub version: u64,
+    pub state: AgentItemStateFfi,
+    /// A few words: "Allow this command?".
+    pub title: String,
+    /// The harness's name, such as `codex`.
+    pub harness: String,
+    /// The harness's own id for the item.
+    pub item_id: String,
+    /// This version's place among its session's events. The row is ordered by
+    /// the first event's.
+    pub seq: u64,
+    /// `turn`, `message`, `reasoning`, `tool`, `approval`, `question`, `plan`,
+    /// `task`, `notice`, `error` or `session`.
+    pub item_type: String,
+    /// The item type and its own fields, as JSON: `{"type": ..., "body": ...}`.
+    pub fields_json: String,
+    pub session: Option<String>,
+    pub turn: Option<String>,
+    /// On a turn: the chat message that started it.
+    pub started_by_message_id_hex: Option<String>,
+    /// The answers and controls (kind 1202) whose effect this version shows.
+    /// A pressed answer stays pending until an item's version settles it.
+    pub settles: Vec<String>,
+    /// Whether this version alerts: an approval or a question while it is
+    /// waiting, or a turn that ended failed.
+    pub alerts: bool,
+}
+
+/// Names the type, state and version, and nothing the harness said.
+impl std::fmt::Debug for AgentItemFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentItemFfi")
+            .field("version", &self.version)
+            .field("state", &self.state)
+            .field("item_type", &self.item_type)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<cgka_traits::AgentItem> for AgentItemFfi {
+    fn from(value: cgka_traits::AgentItem) -> Self {
+        let alerts = value.alerts();
+        Self {
+            version: value.version,
+            state: value.state.into(),
+            title: value.title,
+            harness: value.harness,
+            item_id: value.item_id,
+            seq: value.seq,
+            item_type: value.item_type,
+            fields_json: value.fields_json,
+            session: value.session,
+            turn: value.turn,
+            started_by_message_id_hex: value.started_by_message_id_hex,
+            settles: value.settles,
+            alerts,
+        }
+    }
+}
+
 #[derive(Clone, uniffi::Record)]
 pub struct TimelineMessageRecordFfi {
     /// Opaque local submission token; absent for remote or legacy messages.
@@ -408,6 +501,11 @@ pub struct TimelineMessageRecordFfi {
     /// Parsed view of kind-1210 group system rows. `None` for chat, reactions,
     /// and malformed/free-text kind-1210 assertions.
     pub group_system: Option<GroupSystemEventFfi>,
+    /// The latest version of an agent item (kind 1201). `None` for every other
+    /// kind; a kind-1201 row with `None` here is an item MDK cannot read, such
+    /// as the old shape an outdated connector sends: render it as an
+    /// unreadable agent item.
+    pub agent_item: Option<AgentItemFfi>,
     pub reactions: TimelineReactionSummaryFfi,
     pub edit: Option<TimelineEditSummaryFfi>,
     pub deleted: bool,
@@ -476,6 +574,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             media_json: value.media.map(|media| media.to_string()),
             media,
             group_system: group_system.map(Into::into),
+            agent_item: value.agent_item.map(Into::into),
             reactions: value.reactions.into(),
             edit: value.edit.map(Into::into),
             deleted: value.deleted,
@@ -545,8 +644,9 @@ pub enum TimelineUpdateTriggerFfi {
     ReactionRemoved,
     MessageDeleted,
     ReplyPreviewChanged,
-    AgentActivity,
-    AgentOperation,
+    /// An agent item's row was added; its later versions arrive as
+    /// `MessageEditedOrReprojected`.
+    AgentItem,
     GroupSystem,
     CustomEvent,
     DeliveryOrSendStateChanged,
@@ -563,8 +663,7 @@ impl From<TimelineUpdateTrigger> for TimelineUpdateTriggerFfi {
             TimelineUpdateTrigger::ReactionRemoved => Self::ReactionRemoved,
             TimelineUpdateTrigger::MessageDeleted => Self::MessageDeleted,
             TimelineUpdateTrigger::ReplyPreviewChanged => Self::ReplyPreviewChanged,
-            TimelineUpdateTrigger::AgentActivity => Self::AgentActivity,
-            TimelineUpdateTrigger::AgentOperation => Self::AgentOperation,
+            TimelineUpdateTrigger::AgentItem => Self::AgentItem,
             TimelineUpdateTrigger::GroupSystem => Self::GroupSystem,
             TimelineUpdateTrigger::CustomEvent => Self::CustomEvent,
             TimelineUpdateTrigger::DeliveryOrSendStateChanged => Self::DeliveryOrSendStateChanged,
@@ -739,8 +838,7 @@ mod tests {
         trigger!(ReactionRemoved);
         trigger!(MessageDeleted);
         trigger!(ReplyPreviewChanged);
-        trigger!(AgentActivity);
-        trigger!(AgentOperation);
+        trigger!(AgentItem);
         trigger!(GroupSystem);
         trigger!(CustomEvent);
         trigger!(DeliveryOrSendStateChanged);
@@ -1001,6 +1099,8 @@ mod tests {
             recipient_confirmed: false,
             imported_from: None,
             history_import_provenance: None,
+            agent_item: None,
+            timeline_order_seq: 0,
         }
     }
 

@@ -671,6 +671,7 @@ fn retention_indexes_upgrade() {
                             | "deletion_source"
                             | "recipient_confirmed"
                             | "agent_stream_json"
+                            | "timeline_order_seq"
                     )
                 })
                 .collect::<Vec<_>>();

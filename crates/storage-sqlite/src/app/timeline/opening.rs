@@ -11,7 +11,7 @@ pub struct ConversationAnchor {
 }
 impl ConversationAnchor {
     pub fn message_id_hex(&self) -> &str {
-        &self.key.4
+        &self.key.5
     }
 }
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -328,11 +328,11 @@ pub(super) fn opening_tx(
     let anchors = messages
         .iter()
         .map(|message| {
-            let (class, primary, phase, at, id) = message.canonical_order_key();
+            let (class, primary, phase, at, seq, id) = message.canonical_order_key();
             ConversationAnchor {
                 store_epoch: store_epoch.clone(),
                 group_id_hex: group.to_owned(),
-                key: (class, primary, phase, at, id.to_owned()),
+                key: (class, primary, phase, at, seq, id.to_owned()),
             }
         })
         .collect();
@@ -389,12 +389,12 @@ fn neighbor_key(
     } else {
         TIMELINE_GROUP_ORDER_BY_DESC
     };
-    let sql = format!("SELECT timeline_order_class, timeline_order_primary, timeline_order_phase, timeline_order_at, message_id_hex
+    let sql = format!("SELECT timeline_order_class, timeline_order_primary, timeline_order_phase, timeline_order_at, timeline_order_seq, message_id_hex
         FROM visible_message_timeline AS timeline WHERE group_id_hex = ? AND
-        (timeline_order_class, timeline_order_primary, timeline_order_phase, timeline_order_at, message_id_hex) {op} (?, ?, ?, ?, ?)
+        (timeline_order_class, timeline_order_primary, timeline_order_phase, timeline_order_at, timeline_order_seq, message_id_hex) {op} (?, ?, ?, ?, ?, ?)
         {order} LIMIT 1");
     let mut values = vec![rusqlite::types::Value::Text(group.to_owned())];
-    values.extend(canonical_cursor_params(key.0, key.1, key.2, key.3, &key.4)?);
+    values.extend(canonical_cursor_params(key)?);
     let key = conn
         .query_row_cached(&sql, params_from_iter(values), |row| {
             Ok((
@@ -402,13 +402,21 @@ fn neighbor_key(
                 row.get::<_, i64>(1)?,
                 row.get::<_, u8>(2)?,
                 row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })
         .optional()
         .storage()?;
-    key.map(|(class, primary, phase, at, id)| {
-        Ok((class, i64_to_u64(primary)?, phase, i64_to_u64(at)?, id))
+    key.map(|(class, primary, phase, at, seq, id)| {
+        Ok((
+            class,
+            i64_to_u64(primary)?,
+            phase,
+            i64_to_u64(at)?,
+            i64_to_u64(seq)?,
+            id,
+        ))
     })
     .transpose()
 }

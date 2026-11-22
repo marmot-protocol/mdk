@@ -50,8 +50,9 @@ several files in the same crate); methods shared across those files are `pub(cra
   read-merge-publish edits behind `account_relay_list_add`/`account_relay_list_remove`
   (`apply_relay_edit` keeps every entry the request did not name, and a read that cannot be
   confirmed is refused rather than published as a partial replacement).
-- `src/messaging.rs` — final-message sends, agent activity/operation/group-system event handlers, and debug send
-  recording/inject helpers (`DebugFinalSendStore`).
+- `src/messaging.rs` — final-message sends, the group-system event handler, and debug send
+  recording/inject helpers (`DebugFinalSendStore`). `connection.rs` refuses the retired agent activity and agent
+  operation requests (`retired_agent_event`).
 - `src/inbound.rs` — `SubscribeInbound` drain loop and storage-backed `missed_inbound` recovery after broadcast
   lag.
 - `src/invite_policy.rs` — background reconciliation of pending group invites against the welcomer allowlist

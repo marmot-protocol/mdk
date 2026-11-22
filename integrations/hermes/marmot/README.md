@@ -47,8 +47,9 @@ chat policy in the actual Hermes profile and verify it on the phone.
   `marmot_group_profile` changes a group's name/description only as a current
   admin. Tool arguments, history cursors and limits are in [Behavior](#behavior).
 - **Show progress when configured.** Every reply is delivered as one durable
-  message once it is complete. Explicit host delivery context can route
-  commentary to agent activity. Final-delivery rules are in
+  message once it is complete. WN Agent no longer publishes agent activity
+  or tool progress (it refuses both requests), so commentary routed there and
+  tool progress are dropped. Final-delivery rules are in
   [Behavior](#behavior), and [presence reactions](#optional-presence-reactions)
   and [approval reactions](#approval-reactions-opt-in) are opt-in features.
 - **Check installation health.** `marmot_status` and the
@@ -595,8 +596,8 @@ reply beside the final one; the streaming override keeps a global
 Hermes inherits a global `cleanup_progress: true` when the platform key is
 missing, and would then
 treat tool-progress `SendResult` handles as temporary bubbles. Marmot tool
-progress is durable kind-1202 agent-operation history, so automatic cleanup is
-not a supported opt-in. A stale Marmot `true` (or a string/null leftover) is
+progress was durable kind-1202 agent-operation history, so automatic cleanup is
+not a supported opt-in; WN Agent now refuses tool-progress sends. A stale Marmot `true` (or a string/null leftover) is
 repaired on the next install or helper run. Global and other-platform display
 settings are left unchanged. Default tool progress stays `off`; enabling
 retained progress (`tool_progress=all` / `new` / `verbose`) does not enable

@@ -117,7 +117,7 @@ pub(crate) mod worker_due;
 
 pub(crate) use history_recovery::recovery_coverage::LiveCoverage;
 pub(crate) use push::PushFetchClock;
-use push::notification_trigger_for_intent;
+use push::event_wakes_members;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use push::{AcceptedPushAnnounce, PushAnnounceTiming};
 #[cfg(test)]
@@ -4822,7 +4822,17 @@ impl AppClient {
                     "original local send was not accepted by the engine".into(),
                 ));
             }
-            request.edit_intent(original.message_id_hex)
+            // The engine's acceptance cleared the original's request, so its
+            // row says what it is, as at admission.
+            let original_is_agent_item = self
+                .app
+                .reaction_target(
+                    &self.state.label,
+                    &submission.group_id_hex,
+                    &original.message_id_hex,
+                )?
+                .is_some_and(|row| row.kind == cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_ITEM);
+            request.edit_intent(original.message_id_hex, original_is_agent_item)
         } else {
             request.intent()
         };
@@ -4899,7 +4909,9 @@ impl AppClient {
             AppMessageIntent::Unreact { .. } | AppMessageIntent::DeleteReactions { .. } => {
                 (Family::MessageAction, "unreact")
             }
-            AppMessageIntent::Edit { .. } => (Family::MessageAction, "edit"),
+            AppMessageIntent::Edit { .. } | AppMessageIntent::AgentItemEdit { .. } => {
+                (Family::MessageAction, "edit")
+            }
             AppMessageIntent::Poll { .. } => (Family::MessageAction, "poll"),
             AppMessageIntent::PollResponse { .. } => (Family::MessageAction, "poll_response"),
             AppMessageIntent::Delete { .. } | AppMessageIntent::RemoveMessage { .. } => {
@@ -4914,10 +4926,9 @@ impl AppClient {
                 (Family::Notification, "update")
             }
             AppMessageIntent::PushTokenRemoval { .. } => (Family::Notification, "remove"),
-            AppMessageIntent::AgentActivity { .. }
-            | AppMessageIntent::AgentOperation { .. }
-            | AppMessageIntent::GroupSystem { .. }
-            | AppMessageIntent::Custom { .. } => (Family::MessageAction, "custom"),
+            AppMessageIntent::GroupSystem { .. } | AppMessageIntent::Custom { .. } => {
+                (Family::MessageAction, "custom")
+            }
         };
         let observed = self
             .app
@@ -5313,7 +5324,7 @@ impl AppClient {
             // the accepted fanouts.
             self.retry_send_applied_effects_best_effort().await;
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-            if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
+            if published.is_some() && event_wakes_members(event.kind, &event.tags) {
                 // A checkpoint is needed only when another transport wait follows;
                 // otherwise the worker can service the already-invalidated window.
                 if should_project_locally {

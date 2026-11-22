@@ -251,6 +251,10 @@ pub(crate) use client::AppClient;
 pub fn read_state_oracle_checks() -> u64 {
     client::read_state::oracle::checks()
 }
+pub use cgka_traits::agent_events::{
+    AGENT_EVENT_MAX_BYTES, AgentEventError, AgentItem, AgentItemState, AgentRequest,
+    MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_AGENT_REQUEST, is_agent_commentary,
+};
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::DevSealedHistoryBundle;
@@ -739,23 +743,6 @@ pub struct MarmotApp {
     /// Cancelled for good when the runtime shuts down or storage closes:
     /// every running emoji set install stops and later ones are refused.
     emoji_install_stop: tokio_util::sync::CancellationToken,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AgentOperationEventRequest {
-    pub event_type: String,
-    pub status: String,
-    pub operation_id: Option<String>,
-    pub run_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub name: Option<String>,
-    pub text: String,
-    pub preview: Option<String>,
-    pub details: Option<serde_json::Value>,
-    pub sequence: Option<u64>,
-    pub ok: Option<bool>,
-    pub duration_ms: Option<u64>,
-    pub reply_to_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

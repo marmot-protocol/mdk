@@ -1396,14 +1396,43 @@ async fn accepted_source_finalization_rolls_back_when_revival_conversion_fails()
 }
 
 /// A resumed accepted send owes its recipient wake after revival and checkpoint,
-/// including when either step has to finish on a later worker pass.
+/// including when either step has to finish on a later worker pass. It wakes
+/// members exactly when the same send would have: never for the agent's
+/// remarks, and for an agent item or a new version of one only while it needs
+/// a person.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_publication_wakes_after_revival_and_checkpoint() {
-    for kind in [
-        MARMOT_APP_EVENT_KIND_CHAT,
-        MARMOT_APP_EVENT_KIND_POLL,
-        cgka_traits::NIP22_COMMENT_KIND,
+    use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
+    use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_ITEM;
+    let item_tags = |state: &str| {
+        [
+            ["v", "2"],
+            ["state", state],
+            ["title", "Allow?"],
+            ["harness", "codex"],
+            ["item_id", "i"],
+            ["seq", "3"],
+            ["fields", r#"{"type":"approval"}"#],
+        ]
+        .map(|tag| tag.map(str::to_owned).to_vec())
+        .to_vec()
+    };
+    for case in [
+        "chat",
+        "poll",
+        "thread",
+        "commentary",
+        "waiting_item",
+        "settled_item",
+        "waiting_item_edit",
     ] {
+        let (kind, wakes) = match case {
+            "chat" | "commentary" => (MARMOT_APP_EVENT_KIND_CHAT, case == "chat"),
+            "poll" => (MARMOT_APP_EVENT_KIND_POLL, true),
+            "thread" => (cgka_traits::NIP22_COMMENT_KIND, true),
+            "waiting_item_edit" => (MARMOT_APP_EVENT_KIND_EDIT, true),
+            _ => (MARMOT_APP_EVENT_KIND_AGENT_ITEM, case == "waiting_item"),
+        };
         for fault in [
             "none",
             "checkpoint",
@@ -1420,11 +1449,11 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
             {
                 continue;
             }
-            if fault == "direct_acknowledgement" && kind != MARMOT_APP_EVENT_KIND_CHAT {
+            if fault == "direct_acknowledgement" && case != "chat" {
                 continue;
             }
-            // A thread message shares the kind-9 wake path past its kind check.
-            if kind == cgka_traits::NIP22_COMMENT_KIND && fault != "none" {
+            // Every other case shares the chat wake path past its first check.
+            if !matches!(case, "chat" | "poll") && fault != "none" {
                 continue;
             }
             let dir = tempfile::tempdir().unwrap();
@@ -1500,6 +1529,14 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
                     vec!["e".into(), "aa".repeat(32)],
                     vec!["k".into(), "9".into()],
                 ]
+            } else if case == "commentary" {
+                vec![vec!["phase".into(), "commentary".into()]]
+            } else if case == "waiting_item_edit" {
+                let mut tags = vec![vec!["e".into(), "aa".repeat(32)]];
+                tags.extend(item_tags("waiting"));
+                tags
+            } else if kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM {
+                item_tags(if wakes { "waiting" } else { "done" })
             } else {
                 vec![]
             };
@@ -1626,12 +1663,12 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
                     observed.unwrap();
                 }
             }
-            let expected =
-                before + usize::from(!matches!(fault, "withdrawn" | "forgotten" | "terminal"));
+            let expected = before
+                + usize::from(wakes && !matches!(fault, "withdrawn" | "forgotten" | "terminal"));
             assert_eq!(
                 relay.published_event_ids().len(),
                 expected,
-                "kind={kind} fault={fault}"
+                "case={case} fault={fault}"
             );
             if fault == "incomplete_fanout" {
                 assert_eq!(client.pending_resumed_message_notifications.len(), 1);
@@ -1678,7 +1715,7 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
             }
             assert!(
                 client.pending_resumed_message_notifications.is_empty(),
-                "kind={kind} fault={fault}"
+                "case={case} fault={fault}"
             );
             client
                 .retry_pending_runtime_group_subscription_refresh()

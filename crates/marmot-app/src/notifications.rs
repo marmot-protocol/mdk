@@ -31,9 +31,8 @@ use transport_nostr_peeler::{MarmotNostrSigner, NostrTransportEvent};
 use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
 use cgka_traits::app_event::{
     EVENT_REF_TAG, GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
-    GROUP_SYSTEM_TYPE_MEMBER_REMOVED, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
-    MARMOT_APP_EVENT_KIND_AGENT_OPERATION, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
+    GROUP_SYSTEM_TYPE_MEMBER_REMOVED, MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
     group_system_event_material,
 };
 use cgka_traits::engine::{GroupEvent, GroupStateChange};
@@ -297,7 +296,6 @@ pub struct NotificationUser {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotificationTrafficClass {
     Standard,
-    AgentActivity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +341,12 @@ pub struct NotificationUpdate {
     pub reacted_to_preview: Option<String>,
     pub timestamp_ms: i64,
     pub is_from_self: bool,
+    /// What a notification subscription delivers once: `notification_key`,
+    /// except for an agent item. Its versions share its key, so the latest
+    /// replaces the earlier alert, and each version announced is delivered
+    /// once, however many of its events are seen and on whichever path.
+    #[serde(skip)]
+    pub(crate) delivery_key: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1711,8 +1715,8 @@ impl NotificationResolver {
 
 /// Re-derive candidate notifications from recent stored messages after the
 /// live broadcast ring overflows. Callers still dedupe against already-emitted
-/// `notification_key`s so recovery cannot replay a notification the subscriber
-/// already saw. `min_observed_at` is a per-subscription watermark in the same
+/// `delivery_key`s so recovery cannot replay a notification the subscriber
+/// already saw, while an agent item's later version still reaches it. `min_observed_at` is a per-subscription watermark in the same
 /// second-resolution units as `recorded_at` / `received_at`; rows strictly
 /// before it are pre-subscription history and must not become fresh OS alerts.
 /// Same-second rows stay eligible so in-session events are not dropped.
@@ -2068,8 +2072,10 @@ fn notification_update_from_classified_group_state(
     let is_from_self = notice
         .actor_account_id_hex
         .is_some_and(|actor| !actor.is_empty() && actor.eq_ignore_ascii_case(account_id_hex));
+    let notification_key = format!("group-state:{account_id_hex}:{}", notice.message_id_hex);
     Ok(Some(NotificationUpdate {
-        notification_key: format!("group-state:{account_id_hex}:{}", notice.message_id_hex),
+        delivery_key: notification_key.clone(),
+        notification_key,
         conversation_key: conversation_key(account_id_hex, notice.group_id_hex),
         trigger: notice.trigger,
         traffic_class: NotificationTrafficClass::Standard,
@@ -2095,11 +2101,21 @@ fn notification_update_from_classified_group_state(
 /// unknown kinds keeps notification eligibility and channel routing coupled:
 /// adding a kind cannot silently fall through to the audible standard channel.
 /// A thread message notifies like chat; other kind-1111 events are custom.
+///
+/// Agent events alert only when a person is needed or a turn failed (D-024):
+/// an agent item, or an edit carrying a version of one that alerts, is a
+/// candidate here and is decided against the item's stored latest version.
+/// An answer or a control (kind 1202) and an agent's remark during a turn
+/// (`["phase", "commentary"]`, D-078) never notify.
 fn notification_traffic(kind: u64, tags: &[Vec<String>]) -> Option<NotificationTrafficClass> {
     match kind {
-        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY | MARMOT_APP_EVENT_KIND_AGENT_OPERATION => {
-            Some(NotificationTrafficClass::AgentActivity)
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM => Some(NotificationTrafficClass::Standard),
+        MARMOT_APP_EVENT_KIND_EDIT
+            if cgka_traits::AgentItem::from_tags(tags).is_ok_and(|item| item.alerts()) =>
+        {
+            Some(NotificationTrafficClass::Standard)
         }
+        MARMOT_APP_EVENT_KIND_CHAT if cgka_traits::agent_events::is_agent_commentary(tags) => None,
         MARMOT_APP_EVENT_KIND_CHAT
         | MARMOT_APP_EVENT_KIND_REACTION
         | MARMOT_APP_EVENT_KIND_POLL => Some(NotificationTrafficClass::Standard),
@@ -2165,6 +2181,11 @@ fn notification_update_from_message(
     if muted && !is_mention {
         return Ok(None);
     }
+    let agent_item = match agent_item_alert(app, event, &group_id_hex)? {
+        AgentItemAlert::NotAnAgentItem => None,
+        AgentItemAlert::Silent => return Ok(None),
+        AgentItemAlert::Alerts(row) => Some(row),
+    };
     let receiver = resolver.user(app, &event.account_id_hex)?;
     let sender = notification_user_from_message(app, resolver, &event.message)?;
     // Resolve the reacted-to row from the materialized timeline by id (not raw
@@ -2190,13 +2211,38 @@ fn notification_update_from_message(
     {
         return Ok(None);
     }
-    let (reaction_emoji, reacted_to_preview) =
+    let (reaction_emoji, mut reacted_to_preview) =
         reaction_notification_fields(&event.message, reaction_target.as_ref());
+    // An unreadable agent item, such as the old shape, holds a payload, not
+    // text to show.
+    if reaction_target
+        .as_ref()
+        .is_some_and(|target| target.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM)
+        && let Some(target_id) = tag_value(&event.message.tags, EVENT_REF_TAG)
+        && app
+            .timeline_message(&event.account_label, &group_id_hex, target_id)?
+            .is_none_or(|row| row.agent_item.is_none())
+    {
+        reacted_to_preview = None;
+    }
+    // An item's alerts name its first event, so a later alerting version
+    // replaces the earlier notification instead of adding one.
+    let message_id_hex = agent_item.as_ref().map_or_else(
+        || event.message.message_id_hex.clone(),
+        |row| row.message_id_hex.clone(),
+    );
+    let preview_text = match &agent_item {
+        Some(row) => preview_text_for_kind(MARMOT_APP_EVENT_KIND_AGENT_ITEM, &row.plaintext),
+        None => preview_text_for_message(&event.message),
+    };
+    let notification_key = format!("message:{}:{message_id_hex}", event.account_id_hex);
+    let delivery_key = match agent_item.as_ref().and_then(|row| row.agent_item.as_ref()) {
+        Some(item) => format!("{notification_key}:v{}", item.version),
+        None => notification_key.clone(),
+    };
     Ok(Some(NotificationUpdate {
-        notification_key: format!(
-            "message:{}:{}",
-            event.account_id_hex, event.message.message_id_hex
-        ),
+        notification_key,
+        delivery_key,
         conversation_key: conversation_key(&event.account_id_hex, &group_id_hex),
         trigger: NotificationTrigger::NewMessage,
         traffic_class,
@@ -2206,16 +2252,65 @@ fn notification_update_from_message(
         group_name: group_name(group.as_ref()),
         is_dm: group_is_dm(group.as_ref()),
         is_mention,
-        message_id_hex: Some(event.message.message_id_hex.clone()),
+        message_id_hex: Some(message_id_hex),
         sender,
         receiver,
-        preview_text: preview_text_for_message(&event.message),
+        preview_text,
         sticker: crate::sticker_ref_from_message(&event.message),
         reaction_emoji,
         reacted_to_preview,
         timestamp_ms: unix_now_ms(),
         is_from_self,
     }))
+}
+
+enum AgentItemAlert {
+    NotAnAgentItem,
+    Silent,
+    Alerts(Box<storage_sqlite::TimelineMessageRecord>),
+}
+
+/// Decide an agent item, or an edit of one, against the item's stored row,
+/// which holds its highest version: it alerts while that version is a
+/// waiting approval or question, or a failed turn (D-024). An edit alerts only
+/// when it is that version, so a late older one never does; an item whose
+/// edit came first alerts when the item arrives. A removed or invalidated item
+/// never alerts.
+fn agent_item_alert(
+    app: &MarmotApp,
+    event: &RuntimeMessageReceived,
+    group_id_hex: &str,
+) -> Result<AgentItemAlert, AppError> {
+    let message = &event.message;
+    let (target, edit_version) = match message.kind {
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM => (message.message_id_hex.as_str(), None),
+        MARMOT_APP_EVENT_KIND_EDIT => {
+            let Some(version) = cgka_traits::agent_events::agent_item_version(&message.tags) else {
+                return Ok(AgentItemAlert::NotAnAgentItem);
+            };
+            let Some(target) = tag_value(&message.tags, EVENT_REF_TAG) else {
+                return Ok(AgentItemAlert::Silent);
+            };
+            (target, Some(version))
+        }
+        _ => return Ok(AgentItemAlert::NotAnAgentItem),
+    };
+    let Some(row) = app.timeline_message(&event.account_label, group_id_hex, target)? else {
+        return Ok(AgentItemAlert::Silent);
+    };
+    let latest = row
+        .agent_item
+        .as_ref()
+        .filter(|_| row.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM)
+        .filter(|_| !row.deleted && row.invalidation_status.is_none())
+        // Only the agent's own edits are versions of its item.
+        .filter(|_| message.sender == row.sender)
+        .filter(|item| item.alerts())
+        .filter(|item| edit_version.is_none_or(|version| version == item.version));
+    Ok(match latest {
+        Some(_) => AgentItemAlert::Alerts(Box::new(row)),
+        None => AgentItemAlert::Silent,
+    })
 }
 
 fn notification_update_from_group_join(
@@ -2262,8 +2357,10 @@ fn notification_update_from_group_join(
         .as_ref()
         .and_then(|group| group.via_welcome_message_id_hex.clone())
         .unwrap_or_else(|| group_id_hex.clone());
+    let notification_key = format!("invite:{account_id_hex}:{invite_ref}");
     Ok(Some(NotificationUpdate {
-        notification_key: format!("invite:{account_id_hex}:{invite_ref}"),
+        delivery_key: notification_key.clone(),
+        notification_key,
         conversation_key: conversation_key(account_id_hex, &group_id_hex),
         trigger: NotificationTrigger::GroupInvite,
         traffic_class: NotificationTrafficClass::Standard,
@@ -2355,9 +2452,9 @@ pub(crate) fn message_text_mentions_account(
 
 /// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
 /// kinds, device-group kinds and blank text never produce a preview.
-/// Structured agent kinds expose only approved text/status fields;
-/// group-system rows expose supported parsed text only, so their JSON envelope
-/// never reaches a notification payload.
+/// An agent item's content is its plain rendering; group-system rows expose
+/// supported parsed text only, so their JSON envelope never reaches a
+/// notification payload.
 fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
     if is_push_gossip_kind(kind)
         || crate::client::device_group::is_device_group_kind(kind)
@@ -2371,28 +2468,12 @@ fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
         group_system_event_from_message(kind, plaintext)
             .map(|event| event.text)
             .filter(|text| !text.trim().is_empty())
-    } else if kind == MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY {
-        structured_agent_preview(plaintext, &["text", "status"])
-    } else if kind == MARMOT_APP_EVENT_KIND_AGENT_OPERATION {
-        structured_agent_preview(plaintext, &["preview", "text", "status"])
     } else {
         // Custom app kinds retain the existing raw-content fallback. A broader
         // custom-kind preview policy is separate from decoding MDK-owned kinds;
         // new structured kinds must not rely on this branch for JSON-safe text.
         Some(plaintext.to_owned())
     }
-}
-
-fn structured_agent_preview(plaintext: &str, fields: &[&str]) -> Option<String> {
-    let payload = serde_json::from_str::<serde_json::Value>(plaintext).ok()?;
-    fields.iter().find_map(|field| {
-        payload
-            .get(field)?
-            .as_str()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_owned)
-    })
 }
 
 /// Shape the (emoji, preview) pair for a reaction from its already-resolved
@@ -2466,7 +2547,7 @@ pub(crate) fn dedupe_notification_updates(
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for update in updates {
-        if seen.insert(update.notification_key.clone()) {
+        if seen.insert(update.delivery_key.clone()) {
             out.push(update);
         }
     }

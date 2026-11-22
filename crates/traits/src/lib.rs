@@ -5,6 +5,7 @@
 //!
 //! This crate is the one dependency anything crossing a seam should import.
 
+pub mod agent_events;
 pub mod agent_text_stream;
 pub mod app_components;
 pub mod app_event;
@@ -28,6 +29,10 @@ pub mod transport_adapter;
 pub mod types;
 pub mod welcome;
 
+pub use agent_events::{
+    AGENT_EVENT_MAX_BYTES, AgentEventError, AgentItem, AgentItemState, AgentRequest,
+    MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_AGENT_REQUEST,
+};
 pub use agent_text_stream::{
     AGENT_TEXT_STREAM_COMPONENT_STATE_LEN, AGENT_TEXT_STREAM_MAX_PADDING_BUCKET_BYTES,
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_MAX_REPLAY_TTL_SECS,
@@ -47,11 +52,9 @@ pub use app_components::{
     encode_component_vectors, encode_components_list, encode_nostr_routing_v1,
 };
 pub use app_event::{
-    AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
-    AGENT_OPERATION_TYPE_TAG, AppMessageRetentionDecision, EVENT_REF_TAG,
-    GROUP_SYSTEM_TYPE_GROUP_DISBANDED, GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
-    MARMOT_APP_EVENT_KIND_AGENT_OPERATION, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    AppMessageRetentionDecision, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_GROUP_DISBANDED,
+    GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent, MarmotAppEventError, QUOTE_REF_TAG,
     canonical_event_id, group_system_canonical_id, group_system_event_material,
 };

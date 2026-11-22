@@ -57,15 +57,26 @@ pub(super) fn apply_group(rows: &mut BTreeMap<String, TimelineRow>, events: &[Ra
     }
 }
 
+/// One accepted edit. An edit of an agent item also carries the item's tags,
+/// without the edit's own `e` tag, and the version they give it.
+pub(super) struct AcceptedEdit {
+    pub(super) version: TimelineEditVersion,
+    agent_item: Option<(u64, Vec<Vec<String>>)>,
+}
+
 fn resolve<'a>(
     row: &TimelineRow,
     edits: impl Iterator<Item = &'a RawAppEvent>,
     deleted: &HashSet<String>,
-) -> Vec<TimelineEditVersion> {
+) -> Vec<AcceptedEdit> {
     if !is_editable_message(row.kind, &row.tags) || row.invalidation_status.is_some() || row.deleted
     {
         return Vec::new();
     }
+    let agent_item = row.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM;
+    // The first event is version `v` of the item; an edit counts only with a
+    // higher one, so an older version that arrives late changes nothing.
+    let base_version = cgka_traits::AgentItem::from_tags(&row.tags).map_or(0, |item| item.version);
     let mut versions = edits
         .filter(|e| {
             let mut targets = e
@@ -79,21 +90,51 @@ fn resolve<'a>(
                 && targets.next().and_then(|t| t.get(1)) == Some(&row.message_id_hex)
                 && targets.next().is_none()
         })
-        .map(|e| TimelineEditVersion {
-            message_id_hex: e.message_id_hex.clone(),
-            edited_at: e.recorded_at,
-            plaintext: e.plaintext.clone(),
+        .filter_map(|e| {
+            let item = if agent_item {
+                let version = cgka_traits::AgentItem::from_tags(&e.tags)
+                    .ok()
+                    .map(|item| item.version)
+                    .filter(|version| *version > base_version)?;
+                let tags = e
+                    .tags
+                    .iter()
+                    .filter(|t| t.first().is_none_or(|name| name != EVENT_REF_TAG))
+                    .cloned()
+                    .collect();
+                Some((version, tags))
+            } else {
+                None
+            };
+            Some(AcceptedEdit {
+                version: TimelineEditVersion {
+                    message_id_hex: e.message_id_hex.clone(),
+                    edited_at: e.recorded_at,
+                    plaintext: e.plaintext.clone(),
+                },
+                agent_item: item,
+            })
         })
         .collect::<Vec<_>>();
-    versions
-        .sort_by(|a, b| (a.edited_at, &a.message_id_hex).cmp(&(b.edited_at, &b.message_id_hex)));
+    // An agent item keeps its highest version; `created_at` counts whole
+    // seconds and cannot order versions sent within one (D-025). Chat edits
+    // resolve by (second, event id).
+    versions.sort_by(|a, b| {
+        let key = |e: &AcceptedEdit| {
+            (
+                e.agent_item.as_ref().map(|(version, _)| *version),
+                e.version.edited_at,
+            )
+        };
+        (key(a), &a.version.message_id_hex).cmp(&(key(b), &b.version.message_id_hex))
+    });
     versions
 }
 
 pub(super) fn accepted_versions_tx(
     conn: &Connection,
     row: &TimelineRow,
-) -> StorageResult<Vec<TimelineEditVersion>> {
+) -> StorageResult<Vec<AcceptedEdit>> {
     if !is_editable_message(row.kind, &row.tags) || row.invalidation_status.is_some() || row.deleted
     {
         return Ok(Vec::new());
@@ -108,15 +149,26 @@ pub(super) fn accepted_versions_tx(
     Ok(resolve(row, edits.iter(), &deleted))
 }
 
-pub(super) fn apply(row: &mut TimelineRow, versions: &[TimelineEditVersion]) {
-    if let Some(latest) = versions.last() {
-        row.plaintext.clone_from(&latest.plaintext);
-        row.edit = Some(TimelineEditSummary {
-            edit_count: versions.len() as u64,
-            latest_edit_message_id_hex: latest.message_id_hex.clone(),
-            edited_at: latest.edited_at,
-        });
+pub(super) fn apply(row: &mut TimelineRow, versions: &[AcceptedEdit]) {
+    let Some(latest) = versions.last() else {
+        return;
+    };
+    row.plaintext.clone_from(&latest.version.plaintext);
+    if let Some((_, tags)) = &latest.agent_item {
+        // A later version of an agent item replaces its content and tags. It
+        // is the item changing state, not a correction, so the row is not
+        // marked edited.
+        row.tags.clone_from(tags);
+        row.reply_to_message_id_hex = cgka_traits::AgentItem::from_tags(tags)
+            .ok()
+            .and_then(|item| item.started_by_message_id_hex);
+        return;
     }
+    row.edit = Some(TimelineEditSummary {
+        edit_count: versions.len() as u64,
+        latest_edit_message_id_hex: latest.version.message_id_hex.clone(),
+        edited_at: latest.version.edited_at,
+    });
 }
 
 impl SqliteAppStorage {
@@ -159,8 +211,15 @@ impl SqliteAppStorage {
             if event.invalidated {
                 return Ok(empty());
             }
+            // An agent item's versions are its states, not a correction history.
+            if event.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM {
+                return Ok(empty());
+            }
             let row = timeline_row_from_chat(&event);
-            let mut versions = accepted_versions_tx(conn, &row)?;
+            let mut versions = accepted_versions_tx(conn, &row)?
+                .into_iter()
+                .map(|accepted| accepted.version)
+                .collect::<Vec<_>>();
             if let Some((at, id)) = before {
                 versions.retain(|v| (v.edited_at, v.message_id_hex.as_str()) < (at, id.as_str()));
             }

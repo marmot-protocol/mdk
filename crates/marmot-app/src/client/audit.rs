@@ -182,6 +182,12 @@ impl AppClient {
                 ("send_media", Some(attachments.len() as u64))
             }
             AppMessageIntent::ThreadMessage { .. } => ("reply_message", None),
+            // An agent item is the agent's own traffic, not a person's action.
+            AppMessageIntent::Custom { kind, .. }
+                if *kind == cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_ITEM =>
+            {
+                return None;
+            }
             AppMessageIntent::Custom { .. } => ("send_custom_event", None),
             AppMessageIntent::Poll { options, .. } => ("create_poll", Some(options.len() as u64)),
             AppMessageIntent::PollResponse { option_ids, .. } => {
@@ -189,8 +195,7 @@ impl AppClient {
             }
             AppMessageIntent::Report { .. } => ("report_message", None),
             AppMessageIntent::DismissReports { .. } => ("dismiss_reports", None),
-            AppMessageIntent::AgentActivity { .. }
-            | AppMessageIntent::AgentOperation { .. }
+            AppMessageIntent::AgentItemEdit { .. }
             | AppMessageIntent::GroupSystem { .. }
             | AppMessageIntent::PushTokenUpdate { .. }
             | AppMessageIntent::PushTokenList { .. }
@@ -800,12 +805,19 @@ mod tests {
         assert_eq!(action.origin, "local_user");
         assert_eq!(action.target_count, None);
 
-        let machine = AppMessageIntent::AgentActivity {
-            status: "working".to_owned(),
-            text: String::new(),
-            reply_to_message_id: None,
-            extra: None,
-        };
-        assert!(super::AppClient::message_human_action_context(&machine).is_none());
+        for machine in [
+            AppMessageIntent::Custom {
+                kind: cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+                tags: Vec::new(),
+                content: String::new(),
+            },
+            AppMessageIntent::AgentItemEdit {
+                target_message_id: "ab".repeat(32),
+                content: String::new(),
+                tags: Vec::new(),
+            },
+        ] {
+            assert!(super::AppClient::message_human_action_context(&machine).is_none());
+        }
     }
 }

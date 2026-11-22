@@ -77,7 +77,6 @@ c_enum! {
     /// Traffic class for host-side filtering.
     MarmotNotificationTrafficClass from NotificationTrafficClassFfi {
         Standard,
-        AgentActivity,
     }
 }
 

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Migration 0219 adds `message_timeline.timeline_order_seq`, rebuilds the canonical order index with it before the
+  message id, and drops kind-1202 timeline rows. `TimelineMessageRecord` gains `agent_item` and
+  `timeline_order_seq`, and `TimelineUpdateTrigger::AgentActivity`/`AgentOperation` become `AgentItem`.
+
+### Added
+
+- Kind-1009 edits apply to kind-1201 agent items: the highest `v` replaces the row's content and tags, an older
+  version is ignored, and the row is not marked edited. Agent items have no edit history.
+
 ## 0.19.0 - 2026-11-22
 
 ### Breaking changes

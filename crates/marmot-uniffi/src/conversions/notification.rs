@@ -94,15 +94,15 @@ impl From<NotificationTrigger> for NotificationTriggerFfi {
 
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
 pub enum NotificationTrafficClassFfi {
+    /// Every notification. An agent item notifies only while a person is
+    /// needed (a waiting approval or question) or when its turn failed.
     Standard,
-    AgentActivity,
 }
 
 impl From<NotificationTrafficClass> for NotificationTrafficClassFfi {
     fn from(value: NotificationTrafficClass) -> Self {
         match value {
             NotificationTrafficClass::Standard => Self::Standard,
-            NotificationTrafficClass::AgentActivity => Self::AgentActivity,
         }
     }
 }
@@ -282,18 +282,10 @@ mod tests {
             let actual: NotificationTriggerFfi = native.into();
             assert_eq!(discriminant(&actual), discriminant(&expected));
         }
-        for (native, expected) in [
-            (
-                NotificationTrafficClass::Standard,
-                NotificationTrafficClassFfi::Standard,
-            ),
-            (
-                NotificationTrafficClass::AgentActivity,
-                NotificationTrafficClassFfi::AgentActivity,
-            ),
-        ] {
-            let actual: NotificationTrafficClassFfi = native.into();
-            assert_eq!(discriminant(&actual), discriminant(&expected));
-        }
+        let actual: NotificationTrafficClassFfi = NotificationTrafficClass::Standard.into();
+        assert_eq!(
+            discriminant(&actual),
+            discriminant(&NotificationTrafficClassFfi::Standard)
+        );
     }
 }

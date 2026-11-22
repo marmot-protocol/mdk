@@ -7,6 +7,10 @@ transaction records ownership and the pending timeline row. The draft variant
 consumes only the selected revision in that transaction. Do not clear the composer
 again when delivery completes.
 
+`send_custom_event_with_client_token` admits an app-defined event the same way. Use it
+for an answer or a control sent to an agent (kind 1202), so that retrying a token after
+a restart does not send an interrupt twice.
+
 ## Host integration
 
 1. Allocate an opaque token for each logical submission and insert its optimistic

@@ -7,6 +7,19 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `MarmotTimelineMessageRecord` gains a nullable `agent_item: MarmotAgentItem *` after `group_system`.
+  `MarmotTimelineUpdateTrigger`'s `AgentActivity` becomes `AgentItem` and `AgentOperation` is removed, which
+  renumbers the later variants; `MarmotNotificationTrafficClass` loses `AgentActivity`. Rebuild clients with the
+  matching header and library.
+
+### Added
+
+- `MarmotAgentItem` and `MarmotAgentItemState`: the latest version of a kind-1201 agent item on its timeline row.
+- `marmot_send_custom_event_with_client_token`: durable token admission of a custom application event, such as an
+  answer or a control for an agent (kind 1202).
+
 ## [0.19.0] - 2026-11-22
 
 ### Breaking changes

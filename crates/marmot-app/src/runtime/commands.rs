@@ -21,8 +21,8 @@ use super::{
 use crate::client::read_state::{ReadAnswer, ReadState, reissue};
 use crate::messages::AppMessageIntent;
 use crate::{
-    AgentOperationEventRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
-    AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest, AppError,
+    AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppGroupRoster, AppPreparedGroupImageUpload, AppQuarantinedGroup, CanonicalCreatedGroup,
     CreatedGroup, GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary,
     MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
@@ -2805,71 +2805,6 @@ impl AccountManager {
         let summary = result?;
         self.schedule_audit_log_tracker_update("send_app_event");
         Ok(summary)
-    }
-
-    pub(crate) async fn send_agent_activity(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        status: String,
-        text: String,
-        reply_to_message_id: Option<String>,
-        extra: Option<serde_json::Value>,
-    ) -> Result<SendSummary, AppError> {
-        self.send_app_event(
-            account_ref,
-            group_id,
-            AppMessageIntent::AgentActivity {
-                status,
-                text,
-                reply_to_message_id,
-                extra,
-            },
-        )
-        .await
-    }
-
-    pub(crate) async fn send_agent_operation_event(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        request: AgentOperationEventRequest,
-    ) -> Result<SendSummary, AppError> {
-        let AgentOperationEventRequest {
-            event_type,
-            status,
-            operation_id,
-            run_id,
-            turn_id,
-            name,
-            text,
-            preview,
-            details,
-            sequence,
-            ok,
-            duration_ms,
-            reply_to_message_id,
-        } = request;
-        self.send_app_event(
-            account_ref,
-            group_id,
-            AppMessageIntent::AgentOperation {
-                event_type,
-                status,
-                operation_id,
-                run_id,
-                turn_id,
-                name,
-                text,
-                preview,
-                details,
-                sequence,
-                ok,
-                duration_ms,
-                reply_to_message_id,
-            },
-        )
-        .await
     }
 
     pub(crate) async fn send_group_system_event(

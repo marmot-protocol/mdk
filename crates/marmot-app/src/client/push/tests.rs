@@ -378,31 +378,91 @@ async fn push_batch_scaling() {
     }
 }
 
-/// A thread message wakes members whether it is sent typed or, as White Noise
-/// Linux does, through the custom-event path; other custom kinds do not.
+/// The sent event decides the wake, the same on a send and on its resumption
+/// after a restart. A thread message wakes members, also when sent through the
+/// custom-event path as White Noise Linux does; other custom kinds do not. The agent's remarks during a turn wake nobody, however they
+/// are sent, and an agent item or a new version of one wakes members only
+/// while it needs a person or when its turn failed.
 #[test]
-fn thread_messages_wake_members_from_either_send_path() {
-    use crate::client::push::notification_trigger_for_intent;
-    use crate::messages::AppMessageIntent;
-    let custom = |tags: Vec<Vec<String>>| AppMessageIntent::Custom {
-        kind: cgka_traits::NIP22_COMMENT_KIND,
-        tags,
-        content: "in the thread".to_owned(),
+fn the_sent_event_decides_whether_members_wake() {
+    use crate::client::push::event_wakes_members;
+    use crate::messages::{AppMessageIntent, build_inner_event};
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_EDIT};
+    let tag = |parts: &[&str]| {
+        parts
+            .iter()
+            .map(|part| (*part).to_owned())
+            .collect::<Vec<_>>()
     };
-    let parent = vec![vec!["e".to_owned(), "aa".repeat(32)]];
-    assert!(notification_trigger_for_intent(&custom(parent)).is_some());
-    assert!(
-        notification_trigger_for_intent(&custom(vec![vec!["E".to_owned(), "aa".repeat(32)]]))
-            .is_none()
-    );
-    assert!(
-        notification_trigger_for_intent(&AppMessageIntent::ThreadMessage {
-            parent_message_id: "aa".repeat(32),
-            content: "typed".to_owned(),
-            attachments: Vec::new(),
-            message_tags: Vec::new(),
-            placement: None,
-        })
-        .is_some()
-    );
+    let wakes = |intent: AppMessageIntent| {
+        let event = build_inner_event(&intent, &"aa".repeat(32), 1).unwrap();
+        event_wakes_members(event.kind, &event.tags)
+    };
+    let target = "bb".repeat(32);
+    let commentary = vec![tag(&["phase", "commentary"])];
+
+    assert!(wakes(AppMessageIntent::Chat {
+        content: "hi".to_owned()
+    }));
+    assert!(!wakes(AppMessageIntent::TaggedChat {
+        content: "Looking at the logs".to_owned(),
+        tags: commentary.clone(),
+    }));
+    assert!(!wakes(AppMessageIntent::Reply {
+        target_message_id: target.clone(),
+        text: "Looking at the logs".to_owned(),
+        tags: commentary,
+    }));
+    assert!(wakes(AppMessageIntent::Custom {
+        kind: cgka_traits::NIP22_COMMENT_KIND,
+        tags: vec![tag(&["e", &target])],
+        content: "in the thread".to_owned(),
+    }));
+    assert!(!wakes(AppMessageIntent::Custom {
+        kind: cgka_traits::NIP22_COMMENT_KIND,
+        tags: vec![tag(&["E", &target])],
+        content: "in the thread".to_owned(),
+    }));
+    assert!(!wakes(AppMessageIntent::Edit {
+        target_message_id: target.clone(),
+        content: "fixed".to_owned(),
+        tags: Vec::new(),
+    }));
+
+    let item = |item_type: &str, state: &str| {
+        vec![
+            tag(&["v", "2"]),
+            tag(&["state", state]),
+            tag(&["title", "Step"]),
+            tag(&["harness", "codex"]),
+            tag(&["item_id", "i"]),
+            tag(&["seq", "3"]),
+            tag(&["fields", &format!(r#"{{"type":"{item_type}"}}"#)]),
+        ]
+    };
+    for (item_type, state, alerts) in [
+        ("approval", "waiting", true),
+        ("question", "waiting", true),
+        ("turn", "failed", true),
+        ("approval", "done", false),
+        ("tool", "failed", false),
+        ("turn", "done", false),
+    ] {
+        let first = AppMessageIntent::Custom {
+            kind: MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            tags: item(item_type, state),
+            content: "Step".to_owned(),
+        };
+        let edit = AppMessageIntent::AgentItemEdit {
+            target_message_id: target.clone(),
+            content: "Step".to_owned(),
+            tags: item(item_type, state),
+        };
+        assert_eq!(wakes(first), alerts, "{item_type} {state}");
+        assert_eq!(wakes(edit), alerts, "{item_type} {state} edit");
+    }
+    assert!(!event_wakes_members(
+        MARMOT_APP_EVENT_KIND_EDIT,
+        &[tag(&["e", &target])]
+    ));
 }

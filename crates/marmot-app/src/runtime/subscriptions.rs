@@ -557,14 +557,15 @@ impl RuntimeTimelineMessagesSubscription {
 fn timeline_record_order_key(
     message: &TimelineMessageRecord,
     order: TimelineOrder,
-) -> (u8, u64, u8, u64, &str, &str) {
+) -> (u8, u64, u8, u64, u64, &str, &str) {
     if matches!(order, TimelineOrder::GroupCanonical) {
-        let (class, primary, phase, at, id) = message.canonical_order_key();
-        (class, primary, phase, at, id, "")
+        let (class, primary, phase, at, seq, id) = message.canonical_order_key();
+        (class, primary, phase, at, seq, id, "")
     } else {
         (
             0,
             message.timeline_at,
+            0,
             0,
             0,
             &message.message_id_hex,
@@ -640,8 +641,16 @@ pub(crate) fn apply_projection_to_window(
     // query-order upper bound. Own only the ids so delta application can
     // mutate the window without cloning the newest record's payload.
     let newest_order = window.messages.last().filter(|_| !anchored).map(|newest| {
-        let (class, primary, phase, at, id, group) = timeline_record_order_key(newest, order);
-        (class, primary, phase, at, id.to_owned(), group.to_owned())
+        let (class, primary, phase, at, seq, id, group) = timeline_record_order_key(newest, order);
+        (
+            class,
+            primary,
+            phase,
+            at,
+            seq,
+            id.to_owned(),
+            group.to_owned(),
+        )
     });
     if update.timeline_changes.is_empty() {
         for message in &update.timeline_messages {
@@ -695,7 +704,7 @@ fn insert_live_message(
     messages: &mut Vec<TimelineMessageRecord>,
     message: TimelineMessageRecord,
     anchored: bool,
-    newest_order: Option<&(u8, u64, u8, u64, String, String)>,
+    newest_order: Option<&(u8, u64, u8, u64, u64, String, String)>,
     order: TimelineOrder,
 ) {
     if let Some(existing) = messages.iter_mut().find(|existing| {
@@ -712,8 +721,9 @@ fn insert_live_message(
                 newest.1,
                 newest.2,
                 newest.3,
-                newest.4.as_str(),
+                newest.4,
                 newest.5.as_str(),
+                newest.6.as_str(),
             )
     });
     if anchored || within_window {
@@ -1763,7 +1773,7 @@ impl MarmotAppRuntime {
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             let mut resolver = notifications::NotificationResolver::default();
-            let mut seen_notification_keys =
+            let mut seen_delivery_keys =
                 MessageSubscriptionSeenIds::with_limit(MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT);
             let recovery_watermark = notifications::unix_now_seconds();
             loop {
@@ -1810,9 +1820,7 @@ impl MarmotAppRuntime {
                         resolver = returned_resolver;
                         match result {
                             Ok(Some(update)) => {
-                                if !seen_notification_keys
-                                    .should_emit(update.notification_key.clone())
-                                {
+                                if !seen_delivery_keys.should_emit(update.delivery_key.clone()) {
                                     continue;
                                 }
                                 if updates_tx.send(update).await.is_err() {
@@ -1846,8 +1854,7 @@ impl MarmotAppRuntime {
                             Err(_) => continue,
                         };
                         for update in recovered {
-                            if !seen_notification_keys.should_emit(update.notification_key.clone())
-                            {
+                            if !seen_delivery_keys.should_emit(update.delivery_key.clone()) {
                                 continue;
                             }
                             if updates_tx.send(update).await.is_err() {

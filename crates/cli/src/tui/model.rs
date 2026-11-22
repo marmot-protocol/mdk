@@ -3025,11 +3025,14 @@ mod timeline {
     /// Parse a materialized timeline row.
     pub(crate) fn parse_timeline_row(value: &Value) -> TimelineRow {
         let plaintext = value_string(value, "plaintext").unwrap_or_default();
-        let display_text = if value.get("kind").and_then(Value::as_u64) == Some(GROUP_SYSTEM_KIND) {
-            group_system_summary(value, &plaintext).unwrap_or_else(|| plaintext.clone())
-        } else {
-            plaintext.clone()
-        };
+        let display_text =
+            if let Some(label) = crate::commands::messages::unreadable_agent_item_label(value) {
+                label.to_owned()
+            } else if value.get("kind").and_then(Value::as_u64) == Some(GROUP_SYSTEM_KIND) {
+                group_system_summary(value, &plaintext).unwrap_or_else(|| plaintext.clone())
+            } else {
+                plaintext.clone()
+            };
         TimelineRow {
             message_id: value_string(value, "message_id").unwrap_or_default(),
             direction: value_string(value, "direction").unwrap_or_else(|| "received".to_owned()),

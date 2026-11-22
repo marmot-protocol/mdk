@@ -120,6 +120,113 @@ mod live_notifications {
         runtime.shutdown().await;
     }
 
+    /// An agent item's later versions share its notification key, so the OS
+    /// replaces the earlier alert; each version is still delivered once,
+    /// whichever of its events is seen and however often.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_agent_item_versions_are_each_delivered_under_the_items_key() {
+        use cgka_traits::app_event::{
+            MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_EDIT,
+        };
+        let (_root, app, account, group) = fixture();
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+        let item_tags = |version: &str| {
+            [
+                ["v", version],
+                ["state", "waiting"],
+                ["title", "Question"],
+                ["harness", "codex"],
+                ["item_id", "q"],
+                ["seq", "1"],
+                ["fields", r#"{"type":"question"}"#],
+            ]
+            .map(|tag| tag.map(str::to_owned).to_vec())
+            .to_vec()
+        };
+        let item = format!("{:064x}", 10);
+        let receive = |id: u64, kind: u64, tags: Vec<Vec<String>>, text: &str| {
+            app.account_storage("alice")
+                .unwrap()
+                .app_storage()
+                .record_app_event(&storage_sqlite::StoredAppEvent {
+                    group_id_hex: hex::encode(group.as_slice()),
+                    message_id_hex: format!("{id:064x}"),
+                    source_message_id_hex: Some(format!("{id:064x}")),
+                    source_epoch: Some(1),
+                    direction: "received".to_owned(),
+                    sender: "bb".repeat(32),
+                    plaintext: text.to_owned(),
+                    kind,
+                    tags: tags.clone(),
+                    recorded_at: 1,
+                    received_at: 1,
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                })
+                .unwrap();
+            let mut event = message(&account, &group, id);
+            if let MarmotAppEvent::MessageReceived(event) = &mut event {
+                event.message.kind = kind;
+                event.message.tags = tags;
+                event.message.plaintext = text.to_owned();
+            }
+            event
+        };
+        let first = receive(
+            10,
+            MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            item_tags("1"),
+            "Allow `ls`?",
+        );
+        runtime.events.send(first).unwrap();
+        let alerted = next(&mut subscription).await;
+        assert_eq!(alerted.preview_text.as_deref(), Some("Allow `ls`?"));
+
+        let mut edit_tags = vec![vec!["e".to_owned(), item.clone()]];
+        edit_tags.extend(item_tags("2"));
+        let edit = receive(
+            11,
+            MARMOT_APP_EVENT_KIND_EDIT,
+            edit_tags,
+            "Allow `git status`?",
+        );
+        runtime.events.send(edit.clone()).unwrap();
+        let replaced = next(&mut subscription).await;
+        assert_eq!(replaced.notification_key, alerted.notification_key);
+        assert_eq!(replaced.message_id_hex, Some(item));
+        assert_eq!(
+            replaced.preview_text.as_deref(),
+            Some("Allow `git status`?")
+        );
+
+        // The same version delivered again is not a new alert.
+        runtime.events.send(edit).unwrap();
+        // An item and its next version both stored before either is seen:
+        // both events announce that version, once.
+        let batched = format!("{:064x}", 20);
+        let first = receive(
+            20,
+            MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            item_tags("1"),
+            "Allow `rm`?",
+        );
+        let mut edit_tags = vec![vec!["e".to_owned(), batched.clone()]];
+        edit_tags.extend(item_tags("2"));
+        let edit = receive(21, MARMOT_APP_EVENT_KIND_EDIT, edit_tags, "Allow `rm -r`?");
+        runtime.events.send(first).unwrap();
+        runtime.events.send(edit).unwrap();
+        let once = next(&mut subscription).await;
+        assert_eq!(once.message_id_hex, Some(batched));
+        assert_eq!(once.preview_text.as_deref(), Some("Allow `rm -r`?"));
+        runtime.events.send(message(&account, &group, 12)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.preview_text.as_deref(),
+            Some("Message 12")
+        );
+        runtime.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_settings_and_mutes() {
         let (_root, app, account, group) = fixture();
@@ -1614,6 +1721,8 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         thread: None,
         media: None,
         reactions: Default::default(),
+        agent_item: None,
+        timeline_order_seq: 0,
     }
 }
 

@@ -7,8 +7,7 @@ use agent_control::{
 };
 use cgka_traits::GroupId;
 use marmot_app::{
-    AgentOperationEventRequest, MediaAttachmentReference, MediaLocator,
-    MediaUploadAttachmentRequest, MediaUploadRequest,
+    MediaAttachmentReference, MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
 };
 
 use crate::error::ConnectorError;
@@ -549,91 +548,6 @@ impl AgentConnector {
         } else {
             Err(ConnectorError::DebugControlsDisabled)
         }
-    }
-
-    pub(crate) async fn send_agent_activity_response(
-        &self,
-        account_id_hex: &str,
-        group_id_hex: &str,
-        status: String,
-        text: String,
-        reply_to_message_id_hex: Option<String>,
-        extra: Option<serde_json::Value>,
-    ) -> Result<AgentControlResponse, ConnectorError> {
-        let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id_hex = normalize_hex(group_id_hex)?;
-        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
-        let reply_to_message_id_hex = reply_to_message_id_hex
-            .map(|value| normalize_hex(&value))
-            .transpose()?;
-        let summary = self
-            .runtime
-            .send_agent_activity(
-                &account.label,
-                &group_id,
-                status,
-                text,
-                reply_to_message_id_hex,
-                extra,
-            )
-            .await?;
-        Ok(AgentControlResponse::AppEventSent {
-            message_ids_hex: summary.message_ids,
-            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn send_agent_operation_event_response(
-        &self,
-        account_id_hex: &str,
-        group_id_hex: &str,
-        event_type: String,
-        status: String,
-        operation_id: Option<String>,
-        run_id: Option<String>,
-        turn_id: Option<String>,
-        name: Option<String>,
-        text: String,
-        preview: Option<String>,
-        details: Option<serde_json::Value>,
-        sequence: Option<u64>,
-        ok: Option<bool>,
-        duration_ms: Option<u64>,
-        reply_to_message_id_hex: Option<String>,
-    ) -> Result<AgentControlResponse, ConnectorError> {
-        let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id_hex = normalize_hex(group_id_hex)?;
-        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
-        let reply_to_message_id_hex = reply_to_message_id_hex
-            .map(|value| normalize_hex(&value))
-            .transpose()?;
-        let summary = self
-            .runtime
-            .send_agent_operation_event(
-                &account.label,
-                &group_id,
-                AgentOperationEventRequest {
-                    event_type,
-                    status,
-                    operation_id,
-                    run_id,
-                    turn_id,
-                    name,
-                    text,
-                    preview,
-                    details,
-                    sequence,
-                    ok,
-                    duration_ms,
-                    reply_to_message_id: reply_to_message_id_hex,
-                },
-            )
-            .await?;
-        Ok(AgentControlResponse::AppEventSent {
-            message_ids_hex: summary.message_ids,
-            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
-        })
     }
 
     pub(crate) async fn send_group_system_event_response(

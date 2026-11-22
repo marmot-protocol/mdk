@@ -1232,38 +1232,24 @@ impl AppClient {
     }
 }
 
-pub(crate) fn notification_trigger_for_intent(
-    intent: &AppMessageIntent,
-) -> Option<notifications::NotificationTrigger> {
-    match intent {
-        AppMessageIntent::Chat { .. }
-        | AppMessageIntent::TaggedChat { .. }
-        | AppMessageIntent::Sticker { .. }
-        | AppMessageIntent::Reply { .. }
-        | AppMessageIntent::Media { .. }
-        | AppMessageIntent::ThreadMessage { .. }
-        | AppMessageIntent::Poll { .. } => Some(notifications::NotificationTrigger::NewMessage),
-        // A thread message sent through the custom-event path wakes members too.
-        AppMessageIntent::Custom { kind, tags, .. }
-            if cgka_traits::thread_message_parent(*kind, tags).is_some() =>
-        {
-            Some(notifications::NotificationTrigger::NewMessage)
+/// Whether sending this encoded event wakes the group's members. A chat
+/// message, a poll or a thread message does, except the agent's remarks
+/// during a turn (D-078). An agent item, or a new version of one, does only
+/// while it needs a person or when its turn failed (D-024). Nothing else does.
+/// Read from the event itself, so a send and its resumption after a restart
+/// decide alike.
+pub(crate) fn event_wakes_members(kind: u64, tags: &[Vec<String>]) -> bool {
+    use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
+    use cgka_traits::app_event::{
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_EDIT,
+    };
+    match kind {
+        MARMOT_APP_EVENT_KIND_CHAT => !cgka_traits::agent_events::is_agent_commentary(tags),
+        MARMOT_APP_EVENT_KIND_POLL => true,
+        // A chat edit's tags never read as an agent item.
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM | MARMOT_APP_EVENT_KIND_EDIT => {
+            cgka_traits::AgentItem::from_tags(tags).is_ok_and(|item| item.alerts())
         }
-        AppMessageIntent::Report { .. }
-        | AppMessageIntent::DismissReports { .. }
-        | AppMessageIntent::RemoveMessage { .. }
-        | AppMessageIntent::Reaction { .. }
-        | AppMessageIntent::Unreact { .. }
-        | AppMessageIntent::DeleteReactions { .. }
-        | AppMessageIntent::Edit { .. }
-        | AppMessageIntent::Delete { .. }
-        | AppMessageIntent::PollResponse { .. }
-        | AppMessageIntent::AgentActivity { .. }
-        | AppMessageIntent::AgentOperation { .. }
-        | AppMessageIntent::GroupSystem { .. }
-        | AppMessageIntent::Custom { .. }
-        | AppMessageIntent::PushTokenUpdate { .. }
-        | AppMessageIntent::PushTokenList { .. }
-        | AppMessageIntent::PushTokenRemoval { .. } => None,
+        _ => cgka_traits::thread_message_parent(kind, tags).is_some(),
     }
 }

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `TimelineUpdateTriggerFfi::AgentActivity` becomes `AgentItem` and `AgentOperation` is removed;
+  `NotificationTrafficClassFfi::AgentActivity` is removed. An agent item notifies as `Standard` only while it is a
+  waiting approval or question, or a failed turn.
+
+### Added
+
+- `TimelineMessageRecordFfi::agent_item` (`AgentItemFfi`, `AgentItemStateFfi`): the latest version of a kind-1201
+  agent item, with its type, fields JSON, `settles` and whether it alerts. A kind-1201 row without one is an
+  unreadable item, such as the old shape.
+- `send_custom_event_with_client_token`: durable token admission of an app-defined event, such as an answer or a
+  control for an agent (kind 1202), so a retry after a restart does not send it twice.
+
 ## 0.19.0 - 2026-11-22
 
 ### Breaking changes

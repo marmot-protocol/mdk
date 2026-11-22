@@ -3060,6 +3060,54 @@ pub unsafe extern "C" fn marmot_send_custom_event(
     })
 }
 
+/// Durably admit a custom application event, such as an answer or a control
+/// for an agent (kind 1202), under `marmot_send_custom_event`'s rules. Returns
+/// durable local acceptance, not relay delivery; the same `client_token` after
+/// a restart returns the same event and sends nothing. `tags` is laid out as
+/// for `marmot_send_custom_event`. Free with `marmot_local_send_acceptance_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `tags` must point to
+/// `tags_len` valid rows (or be NULL with length 0), each row's values
+/// pointer holding its stated length; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_custom_event_with_client_token(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    kind: u64,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    content: *const c_char,
+    client_token: *const c_char,
+    out: *mut *mut MarmotLocalSendAcceptance,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let content = try_arg!(unsafe { required_str(content) });
+        let client_token = try_arg!(unsafe { required_str(client_token) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_custom_event_with_client_token(
+                    account_ref,
+                    group_id_hex,
+                    kind,
+                    tags,
+                    content,
+                    client_token,
+                )),
+                out,
+            )
+        }
+    })
+}
+
 /// Create an encrypted NIP-88 poll in a direct or group conversation. Option ids use `"0"`
 /// through `"9"`. Free `out` with `marmot_send_summary_free`.
 ///

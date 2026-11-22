@@ -44,6 +44,8 @@ fn record(id: &str, plaintext: &str) -> TimelineMessageRecord {
         recipient_confirmed: false,
         imported_from: None,
         history_import_provenance: None,
+        agent_item: None,
+        timeline_order_seq: 0,
     }
 }
 

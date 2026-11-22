@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use cgka_traits::GroupId;
-use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
-use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION};
+use cgka_traits::app_event::{
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_REACTION,
+};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
 use storage_sqlite::{
@@ -4093,17 +4094,24 @@ impl AppClient {
         let mut groups = HashSet::new();
         let mut completed = Vec::new();
         for (group, id) in ready {
-            let message =
-                self.app
-                    .reaction_target(&self.state.label, &hex::encode(group.as_slice()), &id)?;
-            if message.is_some_and(|message| {
-                (matches!(
-                    message.kind,
-                    MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL
-                ) || message.thread_message)
-                    && !message.deleted
-                    && !message.invalidated
-            }) {
+            let group_hex = hex::encode(group.as_slice());
+            let sent = self
+                .app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .app_message(&group_hex, &id)?;
+            let wakes = match sent {
+                Some(sent) if super::push::event_wakes_members(sent.kind, &sent.tags) => {
+                    // A new version of an agent item has no row of its own.
+                    sent.kind == MARMOT_APP_EVENT_KIND_EDIT
+                        || self
+                            .app
+                            .reaction_target(&self.state.label, &group_hex, &id)?
+                            .is_some_and(|message| !message.deleted && !message.invalidated)
+                }
+                _ => false,
+            };
+            if wakes {
                 groups.insert(group.clone());
             }
             completed.push((group, id));

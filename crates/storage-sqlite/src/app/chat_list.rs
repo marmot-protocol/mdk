@@ -492,15 +492,20 @@ struct TimelineReadMarker {
 }
 
 impl TimelineReadMarker {
+    /// The read state's five-part key. It leaves out the agent item `seq` the
+    /// timeline orders by: agent items are never chat-list activity.
     fn canonical_order_key(&self) -> (u8, u64, u8, u64, &str) {
-        crate::app::timeline::canonical_timeline_order_key(
-            self.source_message_id_hex.as_deref(),
-            self.source_epoch,
-            self.invalidation_status.as_deref(),
-            self.kind,
-            self.timeline_at,
-            &self.message_id_hex,
-        )
+        let (class, primary, phase, at, _seq, id) =
+            crate::app::timeline::canonical_timeline_order_key(
+                self.source_message_id_hex.as_deref(),
+                self.source_epoch,
+                self.invalidation_status.as_deref(),
+                self.kind,
+                self.timeline_at,
+                0,
+                &self.message_id_hex,
+            );
+        (class, primary, phase, at, id)
     }
 }
 
