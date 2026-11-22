@@ -16,6 +16,7 @@ use crate::base::connection::{
     OpenedAccount, SqliteStorageOptions, apply_cipher_pragmas, ensure_private_db_files,
     finish_account_open, open_account_in_memory,
 };
+use crate::base::migrations::RENEWED_PER_DATABASE;
 use cgka_traits::storage::StorageResult;
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags};
@@ -23,24 +24,6 @@ use std::ffi::c_int;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
-
-/// The values a fresh database draws for itself while migrating, as
-/// (table, column, the statement that draws a new one). A migration that adds
-/// one needs a line here; `two_fresh_databases_differ_only_in_renewed_values`
-/// finds it, including values drawn from the clock.
-const RENEWED_PER_DATABASE: &[(&str, &str, &str)] = &[
-    (
-        "chat_presentation_meta",
-        "store_epoch",
-        "UPDATE chat_presentation_meta SET store_epoch = randomblob(16)",
-    ),
-    (
-        "cgka_schema_migrations",
-        "applied_at_unix_seconds",
-        "UPDATE cgka_schema_migrations \
-         SET applied_at_unix_seconds = CAST(strftime('%s', 'now') AS INTEGER)",
-    ),
-];
 
 const TEMPLATE_INFIX: &str = ".migrated-template-";
 

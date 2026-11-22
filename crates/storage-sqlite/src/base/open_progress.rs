@@ -12,7 +12,16 @@ pub enum StorageOpenPhase {
 pub enum StorageOpenProgress {
     Phase(StorageOpenPhase),
     MigrationStarted(u32),
-    MigrationFinished { version: u32, success: bool },
+    MigrationFinished {
+        version: u32,
+        success: bool,
+    },
+    /// A baseline transaction can commit several ledger entries at once.
+    MigrationBatchFinished {
+        version: u32,
+        success: bool,
+        migrations_completed: u32,
+    },
 }
 /// Observation failures must never become storage failures or bypass migration rollback.
 pub(crate) fn observe(

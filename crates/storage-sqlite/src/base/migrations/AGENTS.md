@@ -11,6 +11,12 @@ Shared-store migrations are separate (`../../shared/migrations.rs`).
   registry entry) in strict version order.
 - Prefer Rust migrations when data needs transformation; SQL-only DDL can still live inside `execute_batch`.
 - Keep migrations idempotent where SQLite supports it, but rely on `cgka_schema_migrations` for once-only execution.
+- An empty database starts from `baseline.sql` (migrations through `BASELINE_VERSION` in `baseline.rs`) and replays
+  only later migrations, so a new migration needs no baseline change. A value a fresh database draws for itself
+  (random or clock) needs a `RENEWED_PER_DATABASE` entry and draws it in its own body; the baseline renews only
+  columns it creates. When replay after the cutoff measurably slows fresh opens, refresh the baseline in a separate
+  change. Raise `BASELINE_VERSION` and
+  regenerate the file with `MDK_WRITE_MIGRATION_BASELINE=1 cargo test -p storage-sqlite baseline_file_matches_a_full_replay`.
 - A body must roll back completely when the runner's transaction fails: no `COMMIT`, no PRAGMA it relies on inside
   the transaction (declare `suspend_foreign_keys` instead). `tests::every_migration_body_rolls_back_completely` in
   `../migrations.rs` walks every registered body this way, so a migration's own tests need no apply/rollback probe.
