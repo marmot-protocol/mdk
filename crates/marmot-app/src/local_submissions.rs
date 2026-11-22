@@ -91,11 +91,19 @@ pub(crate) fn retained_event(
     Ok((event, payload.to_vec()))
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct LocalMessageRequest {
     pub content: String,
     pub reply_to: Option<String>,
     pub attachments: Vec<MediaAttachmentReference>,
+    /// Application tags carried inside the encrypted event. Part of the
+    /// request hash, so reusing a token with other tags is a changed request.
+    /// Omitted when empty so untagged requests keep their existing hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<Vec<String>>,
+    /// An app-defined event kind (`send_custom_event`'s rules) instead of chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_kind: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -128,7 +136,13 @@ impl LocalMessageRequest {
         .map_err(|_| AppError::InvalidAppMessagePayload("invalid local submission request".into()))
     }
     pub(crate) fn intent(&self) -> AppMessageIntent {
-        if !self.attachments.is_empty() {
+        if let Some(kind) = self.custom_kind {
+            AppMessageIntent::Custom {
+                kind,
+                tags: self.tags.clone(),
+                content: self.content.clone(),
+            }
+        } else if !self.attachments.is_empty() {
             AppMessageIntent::Media {
                 attachments: self.attachments.clone(),
                 caption: Some(self.content.clone()),
@@ -138,11 +152,26 @@ impl LocalMessageRequest {
             AppMessageIntent::Reply {
                 target_message_id: target.clone(),
                 text: self.content.clone(),
+                tags: self.tags.clone(),
+            }
+        } else if !self.tags.is_empty() {
+            AppMessageIntent::TaggedChat {
+                content: self.content.clone(),
+                tags: self.tags.clone(),
             }
         } else {
             AppMessageIntent::Chat {
                 content: self.content.clone(),
             }
+        }
+    }
+
+    /// The pending edit this request describes once its original is resolved.
+    pub(crate) fn edit_intent(&self, target_message_id: String) -> AppMessageIntent {
+        AppMessageIntent::Edit {
+            target_message_id,
+            content: self.content.clone(),
+            tags: self.tags.clone(),
         }
     }
 }
@@ -435,10 +464,7 @@ impl MarmotApp {
                         ));
                     }
                 }
-                AppMessageIntent::Edit {
-                    target_message_id: original.message_id_hex,
-                    content: request.content.clone(),
-                }
+                request.edit_intent(original.message_id_hex)
             } else {
                 request.intent()
             };

@@ -99,6 +99,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
         content: String::new(),
         reply_to: None,
         attachments: vec![],
+        ..Default::default()
     };
     let (first, update) = h
         .app
@@ -152,6 +153,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
         content: "different".into(),
         reply_to: None,
         attachments: vec![],
+        ..Default::default()
     };
     assert!(
         h.app
@@ -173,6 +175,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
                 content: String::new(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             Some(newer_draft.revision.clone()),
             42,
@@ -211,6 +214,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
                 content: "same text".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
             43,
@@ -275,21 +279,7 @@ async fn pending_edit_is_durable_while_original_publication_is_blocked() {
         Some(crate::LocalSendStatus::Queued)
     ));
     h.relay.release_publish();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if matches!(
-                runtime
-                    .local_send_status("alice", &h.group, "edit-token")
-                    .unwrap(),
-                Some(crate::LocalSendStatus::Completed(_))
-            ) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    local_send_completed(&runtime, &h.group, "edit-token").await;
     let row = h
         .app
         .account_storage("alice")
@@ -316,6 +306,7 @@ async fn pending_edit_requires_an_existing_local_original() {
                 content: "revision".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
             Some("missing-original".into()),
@@ -347,6 +338,7 @@ async fn rapid_edit_limit_reports_a_stable_retryable_error() {
                 content: "original".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
             42,
@@ -362,6 +354,7 @@ async fn rapid_edit_limit_reports_a_stable_retryable_error() {
                 content: format!("revision {revision}"),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
             Some("original-token".into()),
@@ -393,6 +386,7 @@ async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_se
                 content: "before revision".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
             42,
@@ -408,6 +402,7 @@ async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_se
                 content: "after revision".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
             Some("original-token".into()),
@@ -423,6 +418,7 @@ async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_se
                 content: "latest revision".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
             Some("original-token".into()),
@@ -483,42 +479,14 @@ async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_se
         changed.is_err(),
         "one edit token must never retarget another revision"
     );
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if matches!(
-                runtime
-                    .local_send_status("alice", &h.group, "edit-token")
-                    .unwrap(),
-                Some(crate::LocalSendStatus::Completed(_))
-            ) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    local_send_completed(&runtime, &h.group, "edit-token").await;
     assert!(matches!(
         runtime
             .local_send_status("alice", &h.group, "original-token")
             .unwrap(),
         Some(crate::LocalSendStatus::Completed(_))
     ));
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if matches!(
-                runtime
-                    .local_send_status("alice", &h.group, "latest-edit-token")
-                    .unwrap(),
-                Some(crate::LocalSendStatus::Completed(_))
-            ) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    local_send_completed(&runtime, &h.group, "latest-edit-token").await;
     let row = reopened
         .account_storage("alice")
         .unwrap()
@@ -543,6 +511,7 @@ async fn rejected_original_cannot_publish_a_retained_pending_edit() {
                 content: "not accepted".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
             42,
@@ -557,6 +526,7 @@ async fn rejected_original_cannot_publish_a_retained_pending_edit() {
                 content: "must not publish".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
             Some("original-token".into()),
@@ -684,6 +654,7 @@ async fn durable_admission_is_drained_by_a_new_worker() {
                 content: "retained before worker startup".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
         )
@@ -716,19 +687,7 @@ async fn durable_admission_is_drained_by_a_new_worker() {
         .await
         .unwrap();
     assert_eq!(accepted, retried);
-    let completed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(crate::LocalSendStatus::Completed(summary)) = runtime
-                .local_send_status("alice", &h.group, "restart-token")
-                .unwrap()
-            {
-                break summary;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let completed = local_send_completed(&runtime, &h.group, "restart-token").await;
     assert!(
         reopened
             .account_storage("alice")
@@ -767,6 +726,7 @@ async fn durable_admission_is_drained_by_a_new_worker() {
                 content: "retained before worker startup".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
         )
@@ -783,6 +743,7 @@ async fn rejected_submission_requires_a_new_token_after_restart() {
         content: "rejected attempt".into(),
         reply_to: None,
         attachments: vec![],
+        ..Default::default()
     };
     let (accepted, _) = h
         .app
@@ -860,6 +821,7 @@ async fn completion_write_failure_does_not_stall_later_submissions() {
                         content: format!("queued message {i}"),
                         reply_to: None,
                         attachments: vec![],
+                        ..Default::default()
                     },
                     None,
                 )
@@ -970,6 +932,7 @@ fn prepared_media_snapshot_fixture(
             content: "caption".into(),
             reply_to: None,
             attachments: references,
+            ..Default::default()
         },
     )
 }
@@ -1357,6 +1320,7 @@ async fn retained_edit_of_a_deleted_message_is_refused_at_admission() {
                 content: "original".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
             42,
@@ -1402,6 +1366,7 @@ async fn retained_edit_of_a_deleted_message_is_refused_at_admission() {
                 content: "revision".into(),
                 reply_to: None,
                 attachments: vec![],
+                ..Default::default()
             },
             None,
             Some("original-token".into()),
@@ -1416,4 +1381,263 @@ async fn retained_edit_of_a_deleted_message_is_refused_at_admission() {
             .is_none()
     );
     h.app.close_storage().unwrap();
+}
+
+async fn local_send_completed(
+    runtime: &MarmotAppRuntime,
+    group: &GroupId,
+    token: &str,
+) -> crate::SendSummary {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(crate::LocalSendStatus::Completed(summary)) =
+                runtime.local_send_status("alice", group, token).unwrap()
+            {
+                break summary;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+fn tag(name: &str, value: &str) -> Vec<String> {
+    vec![name.to_owned(), value.to_owned()]
+}
+
+/// The agent-words contract: a host that crashes after publication but before
+/// recording the result resubmits by token and must get the same message, with
+/// its tags, and never a second send. Its edits keep their own tags.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tagged_text_and_tagged_edit_are_crash_safe_by_token() {
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    let words = vec![tag("turn", "turn-1"), tag("phase", "commentary")];
+    let runtime = MarmotAppRuntime::new(h.app.clone());
+    let sent = runtime
+        .submit_tagged_text(
+            "alice",
+            &h.group,
+            "looking into it".into(),
+            words.clone(),
+            "words-token".into(),
+        )
+        .await
+        .unwrap();
+    let completed = local_send_completed(&runtime, &h.group, "words-token").await;
+    runtime.shutdown_and_close().await.unwrap();
+
+    // Restart without the host having recorded `sent`.
+    let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
+        .with_test_relay_client(h.relay.clone());
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    assert_eq!(
+        runtime
+            .local_send_status("alice", &h.group, "words-token")
+            .unwrap(),
+        Some(crate::LocalSendStatus::Completed(completed))
+    );
+    let replay = runtime
+        .submit_tagged_text(
+            "alice",
+            &h.group,
+            "looking into it".into(),
+            words.clone(),
+            "words-token".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, sent);
+    let storage = reopened.account_storage("alice").unwrap().app_storage();
+    assert!(
+        storage.next_local_submission().unwrap().is_none(),
+        "a replayed token must not queue a second send"
+    );
+    let changed_tags = runtime
+        .submit_tagged_text(
+            "alice",
+            &h.group,
+            "looking into it".into(),
+            vec![tag("turn", "turn-1")],
+            "words-token".into(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(changed_tags, AppError::InvalidAppMessagePayload(ref detail) if detail.contains("another submission"))
+    );
+    let original = storage
+        .app_message(&group_hex, &sent.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.kind, 9);
+    assert_eq!(original.tags, words);
+
+    let edit_tags = vec![tag("turn", "turn-1")];
+    let edit = runtime
+        .submit_tagged_edit_for_local_send(
+            "alice",
+            &h.group,
+            "words-token".into(),
+            "here is the answer".into(),
+            edit_tags.clone(),
+            "edit-token".into(),
+        )
+        .await
+        .unwrap();
+    local_send_completed(&runtime, &h.group, "edit-token").await;
+    let edit_event = storage
+        .app_message(&group_hex, &edit.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(edit_event.kind, 1009);
+    assert_eq!(edit_event.tags[0], tag("e", &sent.message_id_hex));
+    assert_eq!(&edit_event.tags[1..], edit_tags);
+    assert_eq!(
+        storage
+            .timeline_message(&group_hex, &sent.message_id_hex)
+            .unwrap()
+            .unwrap()
+            .plaintext,
+        "here is the answer"
+    );
+    let replayed_edit = runtime
+        .submit_tagged_edit_for_local_send(
+            "alice",
+            &h.group,
+            "words-token".into(),
+            "here is the answer".into(),
+            edit_tags,
+            "edit-token".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed_edit, edit);
+    assert!(
+        runtime
+            .submit_tagged_edit_for_local_send(
+                "alice",
+                &h.group,
+                "words-token".into(),
+                "here is the answer".into(),
+                words,
+                "edit-token".into(),
+            )
+            .await
+            .is_err(),
+        "an edit token reused with other tags is a changed request"
+    );
+    let reply = runtime
+        .submit_tagged_reply(
+            "alice",
+            &h.group,
+            sent.message_id_hex.clone(),
+            "and a follow-up".into(),
+            vec![tag("turn", "turn-2")],
+            "reply-token".into(),
+        )
+        .await
+        .unwrap();
+    local_send_completed(&runtime, &h.group, "reply-token").await;
+    assert_eq!(
+        storage
+            .app_message(&group_hex, &reply.message_id_hex)
+            .unwrap()
+            .unwrap()
+            .tags,
+        vec![
+            tag("e", &sent.message_id_hex),
+            tag("q", &sent.message_id_hex),
+            tag("turn", "turn-2"),
+        ]
+    );
+    assert!(storage.next_local_submission().unwrap().is_none());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_event_submission_is_crash_safe_by_token() {
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    let item_tags = vec![tag("d", "item-1"), tag("turn", "turn-1")];
+    let runtime = MarmotAppRuntime::new(h.app.clone());
+    let refused = runtime
+        .submit_custom_event(
+            "alice",
+            &h.group,
+            9,
+            vec![],
+            "forged chat".into(),
+            "reserved-token".into(),
+        )
+        .await;
+    assert!(matches!(
+        refused,
+        Err(AppError::InvalidAppMessagePayload(_))
+    ));
+    assert_eq!(
+        runtime
+            .local_send_status("alice", &h.group, "reserved-token")
+            .unwrap(),
+        None
+    );
+    let sent = runtime
+        .submit_custom_event(
+            "alice",
+            &h.group,
+            41201,
+            item_tags.clone(),
+            "{}".into(),
+            "item-token".into(),
+        )
+        .await
+        .unwrap();
+    let completed = local_send_completed(&runtime, &h.group, "item-token").await;
+    runtime.shutdown_and_close().await.unwrap();
+
+    let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
+        .with_test_relay_client(h.relay.clone());
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    let replay = runtime
+        .submit_custom_event(
+            "alice",
+            &h.group,
+            41201,
+            item_tags.clone(),
+            "{}".into(),
+            "item-token".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, sent);
+    assert_eq!(
+        runtime
+            .local_send_status("alice", &h.group, "item-token")
+            .unwrap(),
+        Some(crate::LocalSendStatus::Completed(completed))
+    );
+    assert!(
+        runtime
+            .submit_custom_event(
+                "alice",
+                &h.group,
+                41202,
+                item_tags.clone(),
+                "{}".into(),
+                "item-token".into(),
+            )
+            .await
+            .is_err(),
+        "a token reused with another kind is a changed request"
+    );
+    let storage = reopened.account_storage("alice").unwrap().app_storage();
+    assert!(storage.next_local_submission().unwrap().is_none());
+    let event = storage
+        .app_message(&group_hex, &sent.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.kind, 41201);
+    assert_eq!(event.tags, item_tags);
+    runtime.shutdown_and_close().await.unwrap();
 }

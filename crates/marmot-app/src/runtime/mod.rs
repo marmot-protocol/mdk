@@ -4366,6 +4366,7 @@ impl MarmotAppRuntime {
                 AppMessageIntent::Reply {
                     target_message_id: target_message_id.to_owned(),
                     text: text.to_owned(),
+                    tags: Vec::new(),
                 },
             )
             .await?;
@@ -4444,6 +4445,7 @@ impl MarmotAppRuntime {
                 AppMessageIntent::Edit {
                     target_message_id: target_message_id.to_owned(),
                     content: content.to_owned(),
+                    tags: Vec::new(),
                 },
             )
             .await

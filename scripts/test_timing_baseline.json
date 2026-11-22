@@ -261,7 +261,7 @@
       "sleep": 1
     },
     "crates/marmot-app/src/tests/conversation_cold_open/local_submissions.rs": {
-      "sleep": 6
+      "sleep": 3
     },
     "crates/marmot-app/src/tests/device_group/backups.rs": {
       "sleep": 2
