@@ -3768,3 +3768,47 @@ fn system_reaction_notifications_use_stored_actor_and_respect_origin_withdrawal(
         assert!(alert.and_then(|alert| alert.reacted_to_preview).is_none());
     }
 }
+
+#[test]
+fn a_reaction_to_an_agent_item_previews_it_only_while_it_is_readable() {
+    use cgka_traits::app_event::{
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_REACTION,
+    };
+
+    let mut chat = AgentNotifications::new();
+    // Items this account's own agent sent, in the new shape and the old one.
+    let reactor = std::mem::replace(&mut chat.agent, chat.account_id_hex.clone());
+    let readable = "d1".repeat(32);
+    let old = "d2".repeat(32);
+    chat.receive(
+        &readable,
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+        agent_item_tags("tool", "done", 1),
+        "Ran `ls`",
+        10,
+    );
+    chat.receive(
+        &old,
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+        vec![vec!["status".to_owned(), "error".to_owned()]],
+        r#"{"v":1,"status":"error","text":"failed","extra":{"path":"/home/me"}}"#,
+        11,
+    );
+    chat.agent = reactor;
+    let react = |chat: &mut AgentNotifications, id: &str, target: &str| {
+        chat.receive(
+            id,
+            MARMOT_APP_EVENT_KIND_REACTION,
+            vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],
+            "👍",
+            12,
+        )
+        .expect("a reaction to this account's message notifies")
+        .reacted_to_preview
+    };
+    assert_eq!(
+        react(&mut chat, &"d3".repeat(32), &readable).as_deref(),
+        Some("Ran `ls`")
+    );
+    assert_eq!(react(&mut chat, &"d4".repeat(32), &old), None);
+}

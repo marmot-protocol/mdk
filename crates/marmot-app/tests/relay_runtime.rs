@@ -7749,19 +7749,26 @@ async fn app_runtime_carries_agent_items_and_requests() {
             .unwrap();
         sent.push(request.message_ids[0].clone());
     }
+    // Whatever order the relay delivers them in, each is announced after it is
+    // stored, and in the order it was stored.
     let mut seen_orders = Vec::new();
-    for id in &sent {
+    let mut announced = Vec::new();
+    while announced.len() < sent.len() {
         let received = wait_for_event(&mut events, |event| {
             matches!(
                 event,
                 MarmotAppEvent::MessageReceived(message)
-                    if message.account_id_hex == agent_id && &message.message.message_id_hex == id
+                    if message.account_id_hex == agent_id
+                        && sent.contains(&message.message.message_id_hex)
+                        && !announced.contains(&message.message.message_id_hex)
             )
         })
         .await;
         let MarmotAppEvent::MessageReceived(received) = received else {
             unreachable!()
         };
+        let id = &received.message.message_id_hex;
+        announced.push(id.clone());
         assert_eq!(
             received.message.kind,
             marmot_app::MARMOT_APP_EVENT_KIND_AGENT_REQUEST

@@ -2203,8 +2203,20 @@ fn notification_update_from_message(
     {
         return Ok(None);
     }
-    let (reaction_emoji, reacted_to_preview) =
+    let (reaction_emoji, mut reacted_to_preview) =
         reaction_notification_fields(&event.message, reaction_target.as_ref());
+    // An unreadable agent item, such as the old shape, holds a payload, not
+    // text to show.
+    if reaction_target
+        .as_ref()
+        .is_some_and(|target| target.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM)
+        && let Some(target_id) = tag_value(&event.message.tags, EVENT_REF_TAG)
+        && app
+            .timeline_message(&event.account_label, &group_id_hex, target_id)?
+            .is_none_or(|row| row.agent_item.is_none())
+    {
+        reacted_to_preview = None;
+    }
     // An item's alerts name its first event, so a later alerting version
     // replaces the earlier notification instead of adding one.
     let message_id_hex = agent_item.as_ref().map_or_else(
