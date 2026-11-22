@@ -473,16 +473,19 @@ impl AppClient {
         Ok(self.routing.replace_group_routes(group_id, subscriptions))
     }
 
-    /// Move exact route history out of the deletion marker and into the
-    /// recreated app group before the marker is cleared transactionally.
+    /// Move exact route history and the invitation standing out of the
+    /// deletion marker and into the recreated app group before the marker is
+    /// cleared transactionally.
     pub(crate) fn adopt_local_deleted_group_prior_routes(
         &mut self,
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let routes = self
-            .app
-            .account_storage(&self.state.label)?
+        let storage = self.app.account_storage(&self.state.label)?;
+        let invitation = storage
+            .app_storage()
+            .local_group_deletion_invitation(&group_id_hex)?;
+        let routes = storage
             .app_storage()
             .local_group_deletion_prior_nostr_routes(&group_id_hex)?
             .into_iter()
@@ -501,9 +504,21 @@ impl AppClient {
         else {
             return Ok(false);
         };
-        let previous_routes = group.prior_nostr_routes.clone();
+        let previous = group.clone();
         group.adopt_prior_nostr_routes(routes);
-        let changed = group.prior_nostr_routes != previous_routes;
+        // A row rebuilt from an ordinary message starts accepted with no
+        // inviter. Give it back the standing the deleted row had, so an
+        // unanswered invitation stays one here and in what a sibling Add
+        // forwards (mdk#3555). A row that carries a Welcome came from a new
+        // invitation crossing the frontier, which decides for itself.
+        if let Some(invitation) = invitation
+            && group.via_welcome_message_id_hex.is_none()
+        {
+            group.pending_confirmation = invitation.pending_confirmation;
+            group.welcomer_account_id_hex = invitation.welcomer_account_id_hex;
+            group.via_welcome_message_id_hex = invitation.via_welcome_message_id_hex;
+        }
+        let changed = *group != previous;
         if changed {
             self.mark_group_projection_dirty_hex(group_id_hex);
         }

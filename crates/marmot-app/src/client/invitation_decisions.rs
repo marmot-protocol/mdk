@@ -275,8 +275,9 @@ impl AppClient {
     /// sibling installs its copy settled and no send takes in device-group
     /// traffic mid-scan. Only a copy founded here, or whose presented
     /// invitation is that admission's own Welcome, counts as accepted: a row
-    /// rebuilt after a local deletion is unconfirmed by default and carries no
-    /// Welcome.
+    /// rebuilt after a local deletion carries the standing and Welcome the
+    /// deleted row had, or none if its deletion predates that record
+    /// (mdk#3555).
     pub(super) fn record_unrecorded_acceptance(
         &mut self,
         group_id: &GroupId,

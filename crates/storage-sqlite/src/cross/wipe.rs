@@ -89,17 +89,39 @@ impl SqliteAccountStorage {
                     forget && active_trusted_device_group_forget(&tx, group_id_hex, &group_id)?;
                 let mut deleted =
                     retire_all_encrypted_media_secrets_for_group_tx(&tx, group_id_hex)?;
-                let prior_nostr_routes_json = tx
+                // The row is the only record of the chat's invitation standing.
+                // The frontier keeps it so a newer message that recreates the
+                // chat does not turn an unanswered invitation into an
+                // accepted one (mdk#3555).
+                let (prior_nostr_routes_json, invitation) = tx
                     .query_row_cached(
-                        "SELECT prior_nostr_routes_json
+                        "SELECT prior_nostr_routes_json, pending_confirmation,
+                                welcomer_account_id_hex, via_welcome_message_id_hex
                          FROM account_groups
                          WHERE group_id_hex = ?1",
                         params![group_id_hex],
-                        |row| row.get::<_, String>(0),
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                (
+                                    row.get::<_, bool>(1)?,
+                                    row.get::<_, Option<String>>(2)?,
+                                    row.get::<_, Option<String>>(3)?,
+                                ),
+                            ))
+                        },
                     )
                     .optional()
                     .storage()?
-                    .unwrap_or_else(|| "[]".to_owned());
+                    .map_or_else(
+                        || ("[]".to_owned(), None),
+                        |(routes, invitation)| (routes, Some(invitation)),
+                    );
+                let (pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex) =
+                    match invitation {
+                        Some((pending, welcomer, welcome)) => (Some(pending), welcomer, welcome),
+                        None => (None, None, None),
+                    };
                 deleted = deleted.saturating_add(
                     tx.execute_cached(
                         "DELETE FROM pending_application_events WHERE group_id = ?1",
@@ -152,8 +174,10 @@ impl SqliteAccountStorage {
                 if active && !terminal && !forget {
                     tx.execute_cached(
                         "INSERT INTO local_group_deletion_frontiers (
-                            group_id_hex, message_insert_order, prior_nostr_routes_json
-                         ) VALUES (?1, ?2, ?3)
+                            group_id_hex, message_insert_order, prior_nostr_routes_json,
+                            pending_confirmation, welcomer_account_id_hex,
+                            via_welcome_message_id_hex
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                          ON CONFLICT(group_id_hex) DO UPDATE SET
                             message_insert_order = MAX(
                                 local_group_deletion_frontiers.message_insert_order,
@@ -163,11 +187,30 @@ impl SqliteAccountStorage {
                                 WHEN excluded.prior_nostr_routes_json = '[]'
                                     THEN local_group_deletion_frontiers.prior_nostr_routes_json
                                 ELSE excluded.prior_nostr_routes_json
-                            END",
+                            END,
+                            -- A repeat delete with no row keeps the standing
+                            -- the first delete recorded, as a unit.
+                            welcomer_account_id_hex = CASE
+                                WHEN excluded.pending_confirmation IS NULL
+                                    THEN local_group_deletion_frontiers.welcomer_account_id_hex
+                                ELSE excluded.welcomer_account_id_hex
+                            END,
+                            via_welcome_message_id_hex = CASE
+                                WHEN excluded.pending_confirmation IS NULL
+                                    THEN local_group_deletion_frontiers.via_welcome_message_id_hex
+                                ELSE excluded.via_welcome_message_id_hex
+                            END,
+                            pending_confirmation = COALESCE(
+                                excluded.pending_confirmation,
+                                local_group_deletion_frontiers.pending_confirmation
+                            )",
                         params![
                             hex::encode(&group_id),
                             message_insert_order,
-                            prior_nostr_routes_json
+                            prior_nostr_routes_json,
+                            pending_confirmation,
+                            welcomer_account_id_hex,
+                            via_welcome_message_id_hex
                         ],
                     )
                     .storage()?;

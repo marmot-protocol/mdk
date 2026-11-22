@@ -51,8 +51,8 @@ pub use app::account_projection::{
     AccountGroupPushTokenTombstone, AccountNotificationSettings,
     AccountPendingPushRegistrationRemoval, AccountPushRegistration, AccountPushTokenRemovalProof,
     AccountStoredPushRegistration, AppEventReplayCursor, DeleteLocalGroupDataResult,
-    SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
-    StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent,
+    LocalGroupDeletionInvitation, SelfMembership, StoredAccountGroup, StoredAccountGroupComponent,
+    StoredAccountState, StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent,
     StoredEpochStallEvidence, StoredGroupStanding, StoredNostrRoute, clamp_to_max_future_skew,
 };
 pub use app::attachment_acquisition::{

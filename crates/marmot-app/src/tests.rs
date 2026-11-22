@@ -19429,6 +19429,189 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
     );
 }
 
+/// Give `alice`'s new chat the invitation standing in `standing`, delete it
+/// locally, and let a newer chat message recreate it (mdk#3555).
+async fn recreate_after_local_delete(
+    standing: (bool, Option<String>, Option<String>),
+) -> AppGroupRecord {
+    use cgka_traits::storage::MessageStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("recreated invitation", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    drop(client);
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let mut state = app.load_state("alice").unwrap();
+    let row = state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id_hex == group_id_hex)
+        .unwrap();
+    (
+        row.pending_confirmation,
+        row.welcomer_account_id_hex,
+        row.via_welcome_message_id_hex,
+    ) = standing;
+    app.save_state(&state).unwrap();
+
+    let mut client = app.client("alice").await.unwrap();
+    let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
+    let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
+    assert!(client.delete_group_local(&group_id).await.unwrap());
+    assert!(app.group("alice", &group_id_hex).unwrap().is_none());
+    let fresh_payload = crate::messages::encode_inner_event(
+        &build_inner_event(
+            &AppMessageIntent::Chat {
+                content: "a newer message".to_owned(),
+            },
+            &sender_hex,
+            unix_now_seconds(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let fresh = client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: fresh_payload.clone(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(fresh.failures.is_empty());
+    let event = cgka_traits::engine::GroupEvent::MessageReceived {
+        authority: None,
+        group_id: group_id.clone(),
+        message_id: fresh.reports[0].message_id.clone(),
+        sender,
+        sender_leaf_index: None,
+        epoch: client.runtime.group_record(&group_id).unwrap().epoch,
+        payload: fresh_payload,
+        retention: None,
+        encrypted_media_secret: None,
+    };
+    let storage = app.account_storage("alice").unwrap();
+    storage.put_pending_application_event(&event).unwrap();
+    drop(client);
+    let mut reopened = app.client("alice").await.unwrap();
+    reopened.drain_pending_session_events().await.unwrap();
+
+    assert_eq!(
+        storage
+            .app_storage()
+            .local_group_deletion_frontier(&group_id_hex)
+            .unwrap(),
+        None,
+        "recreation consumes the deletion frontier with the standing it kept",
+    );
+    // The reopened client and storage agree on the recreated row.
+    let recreated = app
+        .group("alice", &group_id_hex)
+        .unwrap()
+        .expect("a newer message recreates the chat");
+    assert_eq!(
+        reopened.state_group_record(&group_id).as_ref(),
+        Some(&recreated)
+    );
+    recreated
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_delete_recreation_keeps_an_unanswered_invitation_pending() {
+    // An invitation from before invitation generations (mdk#2914): only the
+    // app row records that it was never accepted, and a sibling Add forwards
+    // exactly these fields.
+    let inviter = "bb".repeat(32);
+    let welcome = "cc".repeat(32);
+    let recreated =
+        recreate_after_local_delete((true, Some(inviter.clone()), Some(welcome.clone()))).await;
+    assert!(
+        recreated.pending_confirmation,
+        "a recreated copy of an unanswered invitation must stay pending",
+    );
+    assert_eq!(recreated.welcomer_account_id_hex, Some(inviter));
+    assert_eq!(recreated.via_welcome_message_id_hex, Some(welcome));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_delete_recreation_keeps_an_accepted_invitation_and_its_inviter() {
+    let inviter = "bb".repeat(32);
+    let welcome = "cc".repeat(32);
+    let recreated =
+        recreate_after_local_delete((false, Some(inviter.clone()), Some(welcome.clone()))).await;
+    assert!(!recreated.pending_confirmation);
+    assert_eq!(recreated.welcomer_account_id_hex, Some(inviter));
+    assert_eq!(recreated.via_welcome_message_id_hex, Some(welcome));
+
+    let founded = recreate_after_local_delete((false, None, None)).await;
+    assert!(!founded.pending_confirmation);
+    assert_eq!(founded.welcomer_account_id_hex, None);
+    assert_eq!(founded.via_welcome_message_id_hex, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_delete_recreation_by_a_new_welcome_keeps_that_welcome() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("re-invited", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let mut row = client.state_group_record(&group_id).unwrap();
+    row.pending_confirmation = true;
+    row.welcomer_account_id_hex = Some("bb".repeat(32));
+    row.via_welcome_message_id_hex = Some("cc".repeat(32));
+    let mut state = app.load_state("alice").unwrap();
+    state.groups = vec![row.clone()];
+    app.save_state(&state).unwrap();
+    drop(client);
+    let mut client = app.client("alice").await.unwrap();
+    assert!(client.delete_group_local(&group_id).await.unwrap());
+
+    // A new invitation crossing the frontier rebuilds the row from its own
+    // Welcome, already settled; the old standing must not replace it.
+    let mut reinvited = row;
+    reinvited.pending_confirmation = false;
+    reinvited.welcomer_account_id_hex = Some("dd".repeat(32));
+    reinvited.via_welcome_message_id_hex = Some("ee".repeat(32));
+    client.state.groups.push(reinvited.clone());
+    assert!(
+        client
+            .adopt_local_deleted_group_prior_routes(&group_id)
+            .unwrap()
+    );
+    let adopted = client.state_group_record(&group_id).unwrap();
+    assert!(!adopted.pending_confirmation);
+    assert_eq!(
+        adopted.welcomer_account_id_hex,
+        reinvited.welcomer_account_id_hex
+    );
+    assert_eq!(
+        adopted.via_welcome_message_id_hex,
+        reinvited.via_welcome_message_id_hex
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_unavailable() {
     use cgka_traits::storage::MessageStorage;

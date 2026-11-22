@@ -421,6 +421,8 @@ mod migration_0219_agent_item_order;
 mod migration_0220_chat_activity_creation_fallback;
 #[path = "migrations/0221_agent_item_expired_targets.rs"]
 mod migration_0221_agent_item_expired_targets;
+#[path = "migrations/0222_local_deletion_invitation.rs"]
+mod migration_0222_local_deletion_invitation;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1601,6 +1603,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0221_agent_item_expired_targets",
         suspend_foreign_keys: &[],
         apply: migration_0221_agent_item_expired_targets::apply,
+    },
+    Migration {
+        version: 222,
+        name: "0222_local_deletion_invitation",
+        suspend_foreign_keys: &[],
+        apply: migration_0222_local_deletion_invitation::apply,
     },
 ];
 

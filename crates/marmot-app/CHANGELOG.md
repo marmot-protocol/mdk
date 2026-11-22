@@ -51,6 +51,9 @@
   added them, the same row the adder's timeline shows.
 - The README now states that chat history imported from another device, and backups, leave out group system rows
   and deleted-message placeholders, and why.
+- A locally deleted chat that a newer message brings back keeps the invitation standing it had (mdk#3555): an
+  unanswered invitation comes back pending with its inviter, and a sibling Add forwards it as pending, instead of
+  showing a chat the user never accepted. A chat deleted before this release comes back accepted, as before.
 
 ## 0.19.0 - 2026-11-22
 
