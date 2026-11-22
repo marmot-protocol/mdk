@@ -768,6 +768,20 @@ async fn availability_live_replacement_survives_pruning() {
         .clone()
         .unwrap();
     let shared = app.shared_storage().unwrap();
+    // Time the replacements from the selected publication, not the wall
+    // clock: the first one, pruned into the eviction watermark, must stay
+    // older than it even when a second passed since it was made.
+    let selected_created_at = serde_json::from_str::<nostr_directory::DirectoryKeyPackage>(
+        shared
+            .public_directory_user(&followed)
+            .unwrap()
+            .unwrap()
+            .key_package_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap()
+    .created_at;
     for index in 0..500_u64 {
         shared
             .put_public_key_package_replacement(
@@ -775,7 +789,7 @@ async fn availability_live_replacement_survives_pruning() {
                     account_id_hex: followed.clone(),
                     key_package_id: format!("later-{index:04}"),
                     event_id_hex: format!("{index:064x}"),
-                    event_created_at: now.saturating_sub(1).saturating_add(index),
+                    event_created_at: selected_created_at.saturating_sub(1).saturating_add(index),
                     observed_at: now + index,
                 },
             )
