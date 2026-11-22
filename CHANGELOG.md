@@ -4,7 +4,7 @@
 
 ## 0.19.0 - 2026-11-22
 
-See the [release notes](docs/release/0.19.0.md) and the [0.18.0 upgrade guide](docs/integration/0.19.0.md).
+See the [release notes](docs/release/0.19.0.md) and the [0.18.0 → 0.19.0 upgrade guide](docs/integration/0.19.0.md).
 
 ### Breaking changes
 
