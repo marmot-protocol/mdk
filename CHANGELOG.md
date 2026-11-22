@@ -38,6 +38,7 @@ See the [release notes](docs/release/0.19.0.md) and the [0.18.0 → 0.19.0 upgra
 
 ### Fixed
 
+- Update `url` to 2.5.9 for RUSTSEC-2026-0592 (#3601).
 - Linked devices resend invitation answers promptly after losing a device-group fork. A sign-out held by device
   removal also stops retrying maintenance every 15 seconds.
 - `wn-agent` no longer passes a message's original text and attachments to the agent when it was deleted before the
