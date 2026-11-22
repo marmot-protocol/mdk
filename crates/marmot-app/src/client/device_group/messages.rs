@@ -174,6 +174,23 @@ impl AppClient {
             self.device_group_message_withdrawn(group_id, message_id);
             return Ok(());
         }
+        if let GroupEvent::GroupStateInvalidated { group_id, .. } = event {
+            // An update sent on the withdrawn commit's branch is parked with
+            // that branch while it can still be selected, never withdrawn on
+            // its own, so the sibling may never read it (mdk#3594). A failure
+            // waits for the daily broadcast, as for a withdrawn message.
+            if let Err(error) =
+                self.small_state_message_withdrawn(group_id, KIND_SMALL_STATE_UPDATE)
+            {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "device_group_commit_withdrawn",
+                    error_kind = error.privacy_safe_kind(),
+                    "a withdrawn device-group commit was not handled"
+                );
+            }
+            return Ok(());
+        }
         let GroupEvent::MessageReceived {
             group_id,
             message_id,
