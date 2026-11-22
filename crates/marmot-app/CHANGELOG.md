@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Kinds 1201 and 1202 take the shape of marmot-agents D-076, and the old shape is gone (D-051): an agent item
+  (kind 1201) and an answer or a control (kind 1202) are sent with `submit_custom_event` or `send_custom_event`, which
+  check their shape and refuse one over `AGENT_EVENT_MAX_BYTES` (64 KiB). MDK names a turn's starting message with a
+  `started_by` tag, not `e`. `send_agent_activity`, `send_agent_operation_event`, `AgentOperationEventRequest` and the
+  `AppMessageIntent::AgentActivity` and `AgentOperation` variants are removed, and kinds 1201 and 1202 are no longer
+  reserved app event kinds.
+- `NotificationTrafficClass::AgentActivity` is removed. An agent item notifies on the standard class only while its
+  latest version is a waiting approval or question, or a failed turn; other items, every kind 1202 and a chat message
+  tagged `["phase", "commentary"]` do not notify.
+- `TimelineUpdateTrigger::AgentActivity` becomes `AgentItem`, and `AgentOperation` is removed: a kind 1202 has no
+  timeline row.
+- `TimelineMessageRecord::canonical_order_key` gains the agent item `seq` before the message id.
+
+### Added
+
+- A later version of an agent item is a kind-1009 edit carrying the whole item with a higher `v`, sent crash-safely
+  with `submit_tagged_edit_for_local_send` on the item's token. The row keeps the highest version, ignores an older
+  one that arrives late, applies an edit that arrived before its item, and is not marked edited.
+- `TimelineMessageRecord::agent_item` holds the parsed latest version of an agent item, and `timeline_order_seq` the
+  first event's `seq`, which orders a turn's rows within one second. `AgentItem`, `AgentItemState`, `AgentRequest`
+  and the agent kind constants are re-exported.
+
 ## 0.19.0 - 2026-11-22
 
 ### Breaking changes

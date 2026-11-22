@@ -54,11 +54,10 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cgka_traits::app_event::{
-    AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
-    AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
-    MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-    MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
+    EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+    MARMOT_APP_EVENT_KIND_AGENT_REQUEST, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
+    MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
 };
 use cgka_traits::storage::{DisbandCandidate, DisbandCandidateStorage};
 use cgka_traits::{GroupStorage as _, Timestamp};
@@ -15294,67 +15293,156 @@ fn media_intent_builds_kind_nine_with_ordered_imeta_tags() {
         )));
 }
 
-#[test]
-fn agent_activity_intent_builds_kind_1201_json_payload() {
-    let event = build(AppMessageIntent::AgentActivity {
-        status: "thinking".to_owned(),
-        text: "Thinking".to_owned(),
-        reply_to_message_id: Some("parent".to_owned()),
-        extra: None,
-    });
-    assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY);
-    assert_eq!(
-        tag_value(&event.tags, AGENT_ACTIVITY_STATUS_TAG),
-        Some("thinking")
-    );
-    assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("parent"));
-    let content: serde_json::Value = serde_json::from_str(&event.content).unwrap();
-    assert_eq!(content["v"], 1);
-    assert_eq!(content["status"], "thinking");
-    assert_eq!(content["text"], "Thinking");
+fn agent_tag(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|part| (*part).to_owned()).collect()
+}
+
+/// Every tag a kind-1201 version can carry, including those MDK passes on.
+fn agent_item_wire_tags(version: u64) -> Vec<Vec<String>> {
+    vec![
+        agent_tag(&["v", &version.to_string()]),
+        agent_tag(&["state", "waiting"]),
+        agent_tag(&["title", "Allow this command?"]),
+        agent_tag(&["harness", "codex"]),
+        agent_tag(&["item_id", "call-1"]),
+        agent_tag(&["seq", "12"]),
+        agent_tag(&[
+            "fields",
+            r#"{"type":"approval","body":{"choices":[{"id":"allow","label":"Allow"}]}}"#,
+        ]),
+        agent_tag(&["session", "session-1"]),
+        agent_tag(&["turn", "turn-1"]),
+        agent_tag(&["started_by", &"aa".repeat(32)]),
+        agent_tag(&["settles", &"bb".repeat(32)]),
+        agent_tag(&["settles", &"cc".repeat(32)]),
+        agent_tag(&["native", "item/started", r#"{"id":"call-1"}"#]),
+        agent_tag(&["left_out", "native", "70000"]),
+        agent_tag(&["cut", "output", "90000"]),
+        agent_tag(&["cut", "diffs", "2"]),
+        agent_tag(&["a_later_addition", "kept"]),
+    ]
+}
+
+fn agent_item_intent(tags: Vec<Vec<String>>, content: &str) -> AppMessageIntent {
+    AppMessageIntent::Custom {
+        kind: MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+        tags,
+        content: content.to_owned(),
+    }
 }
 
 #[test]
-fn agent_operation_intent_builds_kind_1202_json_payload() {
-    let event = build(AppMessageIntent::AgentOperation {
-        event_type: "tool_call".to_owned(),
-        status: "started".to_owned(),
-        operation_id: Some("call-123".to_owned()),
-        run_id: Some("run-1".to_owned()),
-        turn_id: Some("turn-1".to_owned()),
-        name: Some("search".to_owned()),
-        text: "Searching".to_owned(),
-        preview: Some("glp-1".to_owned()),
-        details: Some(serde_json::json!({"args": {"query": "glp-1"}})),
-        sequence: Some(2),
-        ok: None,
-        duration_ms: None,
-        reply_to_message_id: Some("parent".to_owned()),
+fn an_agent_item_and_its_edit_carry_every_tag_unchanged() {
+    let event = build(agent_item_intent(agent_item_wire_tags(1), "Allow `ls`?"));
+    assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_AGENT_ITEM);
+    assert_eq!(event.content, "Allow `ls`?");
+    assert_eq!(event.tags, agent_item_wire_tags(1));
+
+    let edit = build(AppMessageIntent::AgentItemEdit {
+        target_message_id: "dd".repeat(32),
+        content: "Allowed".to_owned(),
+        tags: agent_item_wire_tags(2),
     });
-    assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_AGENT_OPERATION);
     assert_eq!(
-        tag_value(&event.tags, AGENT_OPERATION_STATUS_TAG),
-        Some("started")
+        edit.kind,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_EDIT
     );
-    assert_eq!(
-        tag_value(&event.tags, AGENT_OPERATION_TYPE_TAG),
-        Some("tool_call")
-    );
-    assert_eq!(
-        tag_value(&event.tags, AGENT_OPERATION_NAME_TAG),
-        Some("search")
-    );
-    assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("parent"));
-    let content: serde_json::Value = serde_json::from_str(&event.content).unwrap();
-    assert_eq!(content["event_type"], "tool_call");
-    assert_eq!(content["status"], "started");
-    assert_eq!(content["operation_id"], "call-123");
-    assert_eq!(content["run_id"], "run-1");
-    assert_eq!(content["turn_id"], "turn-1");
-    assert_eq!(content["name"], "search");
-    assert_eq!(content["preview"], "glp-1");
-    assert_eq!(content["details"]["args"]["query"], "glp-1");
-    assert_eq!(content["sequence"], 2);
+    assert_eq!(edit.content, "Allowed");
+    let mut expected = vec![agent_tag(&["e", &"dd".repeat(32)])];
+    expected.extend(agent_item_wire_tags(2));
+    assert_eq!(edit.tags, expected);
+}
+
+#[test]
+fn an_answer_or_a_control_carries_every_tag_unchanged() {
+    for details in [
+        r#"{"action":"choice","choice":"allow"}"#,
+        r#"{"action":"questions","questions":[{"question":"q","options":["o"],"text":"t"}]}"#,
+        r#"{"action":"interrupt"}"#,
+        r#"{"action":"new_session"}"#,
+        r#"{"action":"set","setting":"model","value":"o3"}"#,
+        r#"{"action":"own","id":"compact"}"#,
+    ] {
+        let tags = vec![
+            agent_tag(&["p", &"ee".repeat(32)]),
+            agent_tag(&["e", &"dd".repeat(32)]),
+            agent_tag(&["details", details]),
+        ];
+        let event = build(AppMessageIntent::Custom {
+            kind: MARMOT_APP_EVENT_KIND_AGENT_REQUEST,
+            tags: tags.clone(),
+            content: "Allow once".to_owned(),
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_AGENT_REQUEST);
+        assert_eq!(event.tags, tags);
+        assert_eq!(event.content, "Allow once");
+    }
+}
+
+#[test]
+fn a_malformed_agent_item_or_request_is_refused() {
+    let refused = |intent: AppMessageIntent| {
+        assert!(matches!(
+            build_inner_event(&intent, SENDER_HEX, 1_700_000_000),
+            Err(AppError::InvalidAppMessagePayload(_))
+        ));
+    };
+    // The old shape (D-051).
+    refused(agent_item_intent(
+        vec![agent_tag(&["status", "error"])],
+        r#"{"v":1,"status":"error","text":"x"}"#,
+    ));
+    // An item names its turn's message with started_by; `e` is an edit's.
+    let mut with_e = agent_item_wire_tags(1);
+    with_e.push(agent_tag(&["e", &"dd".repeat(32)]));
+    refused(agent_item_intent(with_e.clone(), "x"));
+    refused(AppMessageIntent::AgentItemEdit {
+        target_message_id: "dd".repeat(32),
+        content: "x".to_owned(),
+        tags: with_e,
+    });
+    refused(AppMessageIntent::Custom {
+        kind: MARMOT_APP_EVENT_KIND_AGENT_REQUEST,
+        tags: vec![agent_tag(&["details", r#"{"action":"interrupt"}"#])],
+        content: "Stop".to_owned(),
+    });
+}
+
+#[test]
+fn an_agent_event_up_to_64_kb_is_sent_and_a_larger_one_is_refused() {
+    let limit = cgka_traits::AGENT_EVENT_MAX_BYTES;
+    let sized = |filler: usize| {
+        let mut tags = agent_item_wire_tags(1);
+        tags.push(agent_tag(&[
+            "native",
+            "item/completed",
+            &"x".repeat(filler),
+        ]));
+        tags.retain(|tag| tag[0] != "left_out");
+        agent_item_intent(tags, "Ran a command")
+    };
+    let base = build(sized(0)).encode().unwrap().len();
+    let fits = build(sized(limit - base));
+    assert_eq!(fits.encode().unwrap().len(), limit);
+    assert!(matches!(
+        build_inner_event(&sized(limit - base + 1), SENDER_HEX, 1_700_000_000),
+        Err(AppError::InvalidAppMessagePayload(_))
+    ));
+
+    // An edit is measured with its own `e` tag.
+    let edit = |filler: usize| {
+        let AppMessageIntent::Custom { tags, content, .. } = sized(filler) else {
+            unreachable!()
+        };
+        AppMessageIntent::AgentItemEdit {
+            target_message_id: "dd".repeat(32),
+            content,
+            tags,
+        }
+    };
+    let base = build(edit(0)).encode().unwrap().len();
+    assert_eq!(build(edit(limit - base)).encode().unwrap().len(), limit);
+    assert!(build_inner_event(&edit(limit - base + 1), SENDER_HEX, 1_700_000_000).is_err());
 }
 
 #[test]
@@ -15385,8 +15473,6 @@ fn custom_intent_rejects_every_reserved_kind() {
         kinds::MARMOT_APP_EVENT_KIND_CHAT,
         kinds::MARMOT_APP_EVENT_KIND_EDIT,
         kinds::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-        kinds::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
-        kinds::MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
         kinds::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         kinds::MARMOT_APP_EVENT_KIND_REPORT,
         kinds::MARMOT_APP_EVENT_KIND_REVIEW,

@@ -484,9 +484,10 @@ or `failed`), counts, `media_ciphertext_sha256` purge hints, and a privacy-safe
 `failure_kind`. A running `wnd` does not schedule this sweep; call it explicitly.
 
 **Custom events.** `messages send-event <group-hex> <kind> [content]` sends an app-defined event. Kind, tags, and content
-pass through verbatim into the encrypted group message. Kinds MDK owns (chat, reactions, edits, deletes, agent activity,
+pass through verbatim into the encrypted group message. Kinds MDK owns (chat, reactions, edits, deletes,
 retired agent stream starts (kind 1200), group system rows, push token records, and the device-group kinds 457, 458,
-459, 460, 461, 473, 475 and 476) are rejected with `reserved_app_event_kind`. Each `--tag`
+459, 460, 461, 473, 475 and 476) are rejected with `reserved_app_event_kind`. Agent items (kind 1201) and answers and
+controls (kind 1202) are accepted in the shape the marmot-app README's agent events section gives. Each `--tag`
 takes a JSON array of strings and is repeatable; a malformed tag fails with `invalid_event_tag`. Custom events project as
 standalone rows with their own kind and tags and never fold onto a target message. `messages list` and
 `messages subscribe` accept repeatable `--kind <KIND>` filters and return every kind without one. On the subscribe feed

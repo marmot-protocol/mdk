@@ -1614,6 +1614,8 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         thread: None,
         media: None,
         reactions: Default::default(),
+        agent_item: None,
+        timeline_order_seq: 0,
     }
 }
 

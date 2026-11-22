@@ -166,12 +166,31 @@ impl LocalMessageRequest {
         }
     }
 
+    /// Whether this request sends an agent item (kind 1201), whose later
+    /// versions are agent item edits.
+    pub(crate) fn is_agent_item(&self) -> bool {
+        self.custom_kind == Some(cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_ITEM)
+    }
+
     /// The pending edit this request describes once its original is resolved.
-    pub(crate) fn edit_intent(&self, target_message_id: String) -> AppMessageIntent {
-        AppMessageIntent::Edit {
-            target_message_id,
-            content: self.content.clone(),
-            tags: self.tags.clone(),
+    /// An edit of an agent item carries the whole item in its tags.
+    pub(crate) fn edit_intent(
+        &self,
+        target_message_id: String,
+        original_is_agent_item: bool,
+    ) -> AppMessageIntent {
+        if original_is_agent_item {
+            AppMessageIntent::AgentItemEdit {
+                target_message_id,
+                content: self.content.clone(),
+                tags: self.tags.clone(),
+            }
+        } else {
+            AppMessageIntent::Edit {
+                target_message_id,
+                content: self.content.clone(),
+                tags: self.tags.clone(),
+            }
         }
     }
 }
@@ -435,9 +454,13 @@ impl MarmotApp {
                             "original local message is unavailable".into(),
                         )
                     })?;
-                if original_row.kind != 9 || original_row.direction != "sent" {
+                let original_is_agent_item =
+                    original_row.kind == cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_ITEM;
+                if !(original_row.kind == 9 || original_is_agent_item)
+                    || original_row.direction != "sent"
+                {
                     return Err(AppError::InvalidAppMessagePayload(
-                        "pending edit requires an outgoing text message".into(),
+                        "pending edit requires an outgoing text message or agent item".into(),
                     ));
                 }
                 // The same fail-fast rule as direct edits, applied at admission
@@ -455,8 +478,10 @@ impl MarmotApp {
                 }
                 // Edit resolution uses (second, event id), not queue order.
                 // Give rapid local revisions strictly increasing seconds so
-                // the last submitted text remains the effective version.
-                if let Some(previous) = original_row.edit {
+                // the last submitted text remains the effective version. An
+                // agent item's versions are ordered by their `v` instead, and
+                // an agent may send many in one second.
+                if let Some(previous) = original_row.edit.filter(|_| !original_is_agent_item) {
                     event_created_at = event_created_at.max(previous.edited_at.saturating_add(1));
                     if event_created_at > created_at.saturating_add(30) {
                         return Err(AppError::InvalidAppMessagePayload(
@@ -464,7 +489,7 @@ impl MarmotApp {
                         ));
                     }
                 }
-                request.edit_intent(original.message_id_hex)
+                request.edit_intent(original.message_id_hex, original_is_agent_item)
             } else {
                 request.intent()
             };

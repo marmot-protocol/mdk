@@ -9,6 +9,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- `wn messages send-event` accepts kinds 1201 (agent item) and 1202 (answer or control) in the marmot-agents shape,
+  and refuses them in any other.
+- WN Agent refuses `send_agent_activity` and `send_agent_operation_event` with `retired_agent_event` and publishes
+  nothing: MDK no longer builds the old shape of kinds 1201 and 1202.
+
 ## [0.19.0] - 2026-11-22
 
 ### Removed

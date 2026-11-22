@@ -1122,6 +1122,8 @@ mod tests {
             recipient_confirmed: false,
             imported_from: None,
             history_import_provenance: None,
+            agent_item: None,
+            timeline_order_seq: 0,
         };
         let mut display_name_for_account = |account_id: &str| {
             if account_id == actor {
@@ -1181,6 +1183,8 @@ mod tests {
             recipient_confirmed,
             imported_from: None,
             history_import_provenance: None,
+            agent_item: None,
+            timeline_order_seq: 0,
         };
 
         for confirmed in [true, false] {

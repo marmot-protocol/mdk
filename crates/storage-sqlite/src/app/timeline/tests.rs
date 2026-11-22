@@ -800,25 +800,6 @@ fn sibling_device_vote_is_local_without_overloading_delivery_direction() {
     assert_eq!(projected.local_selection, ["1"]);
 }
 
-fn agent_operation(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
-    StoredAppEvent {
-            group_id_hex: "11".repeat(32),
-            message_id_hex: id.to_owned(),
-            source_message_id_hex: Some(format!("source-{id}")),
-            source_epoch: None,
-            direction: "received".to_owned(),
-            sender: sender.to_owned(),
-            plaintext: r#"{"v":1,"event_type":"tool_call","status":"started","name":"search","text":"Searching"}"#
-                .to_owned(),
-            kind: MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-            tags: vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],
-            recorded_at: at,
-            received_at: at,
-            origin_commit_id: None,
-        moderation_grant: false,
-        }
-}
-
 fn reply(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> StoredAppEvent {
     StoredAppEvent {
         group_id_hex: "11".repeat(32),
@@ -2241,6 +2222,7 @@ fn virtual_order_columns_match_the_rust_canonical_key() {
                 None,
                 event.kind,
                 event.recorded_at,
+                0,
                 &event.message_id_hex,
             );
             (
@@ -3284,28 +3266,6 @@ fn upserting_modifier_as_non_modifier_clears_stale_edges() {
             } if message.message_id_hex == "target"
         )
     }));
-}
-
-#[test]
-fn agent_operation_event_returns_typed_timeline_change() {
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    store
-        .record_app_event(&chat("prompt", "alice", 1, "search this"))
-        .unwrap();
-
-    let update = store
-        .record_app_event(&agent_operation("tool-1", "agent", "prompt", 2))
-        .unwrap();
-
-    assert!(matches!(
-        update.changes.as_slice(),
-        [TimelineMessageChange::Upsert {
-            trigger: TimelineUpdateTrigger::AgentOperation,
-            message,
-        }] if message.message_id_hex == "tool-1"
-            && message.kind == MARMOT_APP_EVENT_KIND_AGENT_OPERATION
-            && message.reply_to_message_id_hex.as_deref() == Some("prompt")
-    ));
 }
 
 #[test]

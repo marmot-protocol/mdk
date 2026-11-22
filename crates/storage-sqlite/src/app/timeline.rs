@@ -4,6 +4,8 @@ use cgka_traits::app_event::{
 };
 mod capture;
 pub use capture::ConversationAccountSnapshot;
+#[cfg(test)]
+mod agent_item_tests;
 mod chat_history;
 mod edits;
 mod opening;
@@ -44,8 +46,8 @@ use crate::{
     i64_to_u64, optional_u64_to_i64, tags_from_json, u64_to_i64, unix_now_seconds,
 };
 use cgka_traits::app_event::{
-    AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
-    MARMOT_APP_EVENT_KIND_AGENT_OPERATION, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+    MARMOT_APP_EVENT_KIND_AGENT_REQUEST, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
     MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG,
 };
@@ -71,6 +73,9 @@ use serde_json::{Value, json};
 /// The leading class keeps pre-source-epoch legacy and failed-local rows ahead of
 /// canonical history, while unresolved optimistic local rows (no source id, no
 /// epoch, and no invalidation) remain at the head.
+/// Within one second, an agent item's `seq` (from its first event) orders a
+/// turn's rows ahead of the event id; every other row has 0. The chat list and
+/// read state keep the five-part key: agent items are never chat-list activity.
 /// Global, cross-group queries retain wall-clock order because epochs are local
 /// to a group and therefore cannot be compared across groups.
 pub(crate) const TIMELINE_GROUP_ORDER_BY_ASC: &str = "ORDER BY
@@ -78,12 +83,14 @@ pub(crate) const TIMELINE_GROUP_ORDER_BY_ASC: &str = "ORDER BY
      timeline.timeline_order_primary ASC,
      timeline.timeline_order_phase ASC,
      timeline.timeline_order_at ASC,
+     timeline.timeline_order_seq ASC,
      timeline.message_id_hex ASC";
 pub(crate) const TIMELINE_GROUP_ORDER_BY_DESC: &str = "ORDER BY
      timeline.timeline_order_class DESC,
      timeline.timeline_order_primary DESC,
      timeline.timeline_order_phase DESC,
      timeline.timeline_order_at DESC,
+     timeline.timeline_order_seq DESC,
      timeline.message_id_hex DESC";
 pub(crate) const TIMELINE_WALL_ORDER_BY_ASC: &str =
     "ORDER BY timeline.timeline_at ASC, timeline.message_id_hex ASC";
@@ -334,6 +341,15 @@ pub struct TimelineMessageRecord {
     /// writer nor historical authorship. Live rows have none.
     #[serde(default)]
     pub history_import_provenance: Option<HistoryImportProvenance>,
+    /// The latest version of an agent item (kind 1201), read from the row's
+    /// tags. `None` for every other kind, and for an item MDK cannot read,
+    /// such as the old shape an outdated connector sends (D-051).
+    #[serde(default)]
+    pub agent_item: Option<cgka_traits::AgentItem>,
+    /// An agent item's `seq` from its first event, which orders a turn's rows
+    /// within one second; 0 for every other row.
+    #[serde(default)]
+    pub timeline_order_seq: u64,
 }
 
 impl std::fmt::Debug for TimelineMessageRecord {
@@ -348,13 +364,14 @@ impl std::fmt::Debug for TimelineMessageRecord {
 impl TimelineMessageRecord {
     /// Stable per-group order derived only from accepted history plus the
     /// authenticated inner event time. Local receive time never participates.
-    pub fn canonical_order_key(&self) -> (u8, u64, u8, u64, &str) {
+    pub fn canonical_order_key(&self) -> (u8, u64, u8, u64, u64, &str) {
         canonical_timeline_order_key(
             self.source_message_id_hex.as_deref(),
             self.source_epoch,
             self.invalidation_status.as_deref(),
             self.kind,
             self.timeline_at,
+            self.timeline_order_seq,
             &self.message_id_hex,
         )
     }
@@ -486,8 +503,9 @@ pub enum TimelineUpdateTrigger {
     ReactionRemoved,
     MessageDeleted,
     ReplyPreviewChanged,
-    AgentActivity,
-    AgentOperation,
+    /// An agent item's row was added (kind 1201). Its later versions arrive as
+    /// [`Self::MessageEditedOrReprojected`].
+    AgentItem,
     GroupSystem,
     /// A row carrying an app-defined custom kind (one MDK assigns no typed
     /// semantics to) was added or updated.
@@ -570,6 +588,9 @@ struct TimelineRow {
     /// A deletion cleared another account's reaction from the row. The
     /// reaction still proves that account received the row.
     deleted_peer_reaction: bool,
+    /// An agent item's `seq`, from its first event, which orders a turn's
+    /// rows within one second; 0 for every other row.
+    order_seq: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -579,7 +600,7 @@ enum CursorDirection {
     After,
 }
 
-type OwnedTimelineOrderKey = (u8, u64, u8, u64, String);
+type OwnedTimelineOrderKey = (u8, u64, u8, u64, u64, String);
 
 #[derive(Clone, Debug)]
 struct ValidatedPagination {
@@ -2442,14 +2463,16 @@ fn project_single_message_timeline_tx(
 
     let mut row = match event.kind {
         MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL => timeline_row_from_chat(&event),
-        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-        | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
-        | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => timeline_row_from_app_event(&event),
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => {
+            timeline_row_from_app_event(&event)
+        }
         // Modifier kinds never get a row of their own: reactions aggregate onto
         // their target and deletes tombstone it. The retired agent stream
-        // start has no row either. Every other kind — including app-defined
-        // custom kinds — projects a generic row.
+        // start has no row either, nor an answer or a control sent to an
+        // agent (D-027). Every other kind — including app-defined custom
+        // kinds — projects a generic row.
         MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
+        | MARMOT_APP_EVENT_KIND_AGENT_REQUEST
         | MARMOT_APP_EVENT_KIND_REACTION
         | MARMOT_APP_EVENT_KIND_POLL_RESPONSE
         | MARMOT_APP_EVENT_KIND_DELETE
@@ -2754,9 +2777,9 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             plaintext, kind, tags_json, timeline_at, received_at,
             reply_to_message_id_hex, media_json, reactions_json,
             deleted, deleted_by_message_id_hex, invalidation_status, edit_json, deletion_source,
-            recipient_confirmed
+            recipient_confirmed, timeline_order_seq
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
          ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
             source_message_id_hex = excluded.source_message_id_hex,
             source_epoch = excluded.source_epoch,
@@ -2775,7 +2798,8 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             invalidation_status = excluded.invalidation_status,
             edit_json = excluded.edit_json,
             deletion_source = excluded.deletion_source,
-            recipient_confirmed = excluded.recipient_confirmed",
+            recipient_confirmed = excluded.recipient_confirmed,
+            timeline_order_seq = excluded.timeline_order_seq",
         params![
             &row.group_id_hex,
             &row.message_id_hex,
@@ -2797,6 +2821,7 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             row.edit.as_ref().map(serde_json::to_string).transpose().map_err(|e| StorageError::Serialization(e.to_string()))?,
             row.deletion_source.as_str(),
             row.recipient_confirmed,
+            u64_to_i64(row.order_seq)?,
         ],
     )
     .storage()?;
@@ -2804,14 +2829,17 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
     // changes when the send is reconciled to authenticated MLS history. Keep
     // the durable anchor synchronized with that row while it exists; if
     // retention later removes the row, the last synchronized key remains.
-    let (order_class, order_primary, order_phase, order_at, _id) = canonical_timeline_order_key(
-        row.source_message_id_hex.as_deref(),
-        row.source_epoch,
-        row.invalidation_status.as_deref(),
-        row.kind,
-        row.timeline_at,
-        &row.message_id_hex,
-    );
+    // The read state keeps the five-part key (see TIMELINE_GROUP_ORDER_BY_ASC).
+    let (order_class, order_primary, order_phase, order_at, _seq, _id) =
+        canonical_timeline_order_key(
+            row.source_message_id_hex.as_deref(),
+            row.source_epoch,
+            row.invalidation_status.as_deref(),
+            row.kind,
+            row.timeline_at,
+            row.order_seq,
+            &row.message_id_hex,
+        );
     tx.execute_cached(
         "UPDATE conversation_read_state
          SET last_read_timeline_at = ?3,
@@ -3286,12 +3314,14 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
     let mut reply_preview_targets = BTreeSet::new();
     match kind {
         MARMOT_APP_EVENT_KIND_CHAT
-        | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-        | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
+        | MARMOT_APP_EVENT_KIND_AGENT_ITEM
         | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => {
             ids.insert(message_id_hex.to_owned());
             reply_preview_targets.insert(message_id_hex.to_owned());
-            if kind == MARMOT_APP_EVENT_KIND_CHAT {
+            if matches!(
+                kind,
+                MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_AGENT_ITEM
+            ) {
                 for edit in app_events_targeting_message_tx(
                     tx,
                     group_id_hex,
@@ -3315,8 +3345,9 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
         MARMOT_APP_EVENT_KIND_POLL_RESPONSE => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
-        // The retired agent stream start projects no row.
-        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => {}
+        // The retired agent stream start and an answer or a control project
+        // no row.
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START | MARMOT_APP_EVENT_KIND_AGENT_REQUEST => {}
         MARMOT_APP_EVENT_KIND_REPORT => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
@@ -3621,8 +3652,7 @@ fn timeline_trigger_for_invalidation_row(
         && (cgka_traits::is_chat_message(kind, tags)
             || matches!(
                 kind,
-                MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-                    | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
+                MARMOT_APP_EVENT_KIND_AGENT_ITEM
                     | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
                     | MARMOT_APP_EVENT_KIND_DELETE
                     | MARMOT_APP_EVENT_KIND_REMOVE
@@ -3697,8 +3727,7 @@ fn timeline_trigger_for_event_row(
         && (cgka_traits::is_chat_message(kind, tags)
             || matches!(
                 kind,
-                MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-                    | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
+                MARMOT_APP_EVENT_KIND_AGENT_ITEM
                     | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
                     | MARMOT_APP_EVENT_KIND_DELETE
                     | MARMOT_APP_EVENT_KIND_REMOVE
@@ -3710,8 +3739,7 @@ fn timeline_trigger_for_event_row(
     match kind {
         MARMOT_APP_EVENT_KIND_REMOVE if row.deleted => TimelineUpdateTrigger::MessageDeleted,
         MARMOT_APP_EVENT_KIND_CHAT => TimelineUpdateTrigger::NewMessage,
-        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY => TimelineUpdateTrigger::AgentActivity,
-        MARMOT_APP_EVENT_KIND_AGENT_OPERATION => TimelineUpdateTrigger::AgentOperation,
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM => TimelineUpdateTrigger::AgentItem,
         MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => TimelineUpdateTrigger::GroupSystem,
         MARMOT_APP_EVENT_KIND_POLL => TimelineUpdateTrigger::NewMessage,
         MARMOT_APP_EVENT_KIND_POLL_RESPONSE => TimelineUpdateTrigger::MessageEditedOrReprojected,
@@ -3836,7 +3864,7 @@ fn timeline_records_by_ids_tx(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed, timeline.timeline_order_seq,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
                     {TIMELINE_IMPORT_PROVENANCE_SQL},
@@ -3898,7 +3926,7 @@ fn timeline_order_cursor_tx(
     let row = tx
         .query_row_cached(
             "SELECT source_message_id_hex, source_epoch, invalidation_status,
-                    kind, timeline_at, message_id_hex
+                    kind, timeline_at, message_id_hex, timeline_order_seq
              FROM visible_message_timeline
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
             params![group_id_hex, message_id_hex],
@@ -3910,6 +3938,7 @@ fn timeline_order_cursor_tx(
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             },
         )
@@ -3922,6 +3951,7 @@ fn timeline_order_cursor_tx(
         kind,
         timeline_at,
         message_id_hex,
+        order_seq,
     )) = row
     else {
         return Err(StorageError::TimelineCursorExpired);
@@ -3929,15 +3959,17 @@ fn timeline_order_cursor_tx(
     let source_epoch = source_epoch.map(i64_to_u64).transpose()?;
     let kind = i64_to_u64(kind)?;
     let timeline_at = i64_to_u64(timeline_at)?;
-    let (class, primary, phase, at, _) = canonical_timeline_order_key(
+    let order_seq = i64_to_u64(order_seq)?;
+    let (class, primary, phase, at, seq, _) = canonical_timeline_order_key(
         source_message_id_hex.as_deref(),
         source_epoch,
         invalidation_status.as_deref(),
         kind,
         timeline_at,
+        order_seq,
         &message_id_hex,
     );
-    Ok((class, primary, phase, at, message_id_hex))
+    Ok((class, primary, phase, at, seq, message_id_hex))
 }
 
 fn validate_pagination(pagination: &TimelinePagination) -> StorageResult<ValidatedPagination> {
@@ -3983,18 +4015,15 @@ fn validate_pagination(pagination: &TimelinePagination) -> StorageResult<Validat
 }
 
 fn canonical_cursor_params(
-    class: u8,
-    primary: u64,
-    phase: u8,
-    timeline_at: u64,
-    message_id_hex: &str,
+    (class, primary, phase, timeline_at, seq, message_id_hex): &OwnedTimelineOrderKey,
 ) -> StorageResult<Vec<rusqlite::types::Value>> {
     Ok(vec![
-        rusqlite::types::Value::Integer(i64::from(class)),
-        rusqlite::types::Value::Integer(u64_to_i64(primary)?),
-        rusqlite::types::Value::Integer(i64::from(phase)),
-        rusqlite::types::Value::Integer(u64_to_i64(timeline_at)?),
-        rusqlite::types::Value::Text(message_id_hex.to_owned()),
+        rusqlite::types::Value::Integer(i64::from(*class)),
+        rusqlite::types::Value::Integer(u64_to_i64(*primary)?),
+        rusqlite::types::Value::Integer(i64::from(*phase)),
+        rusqlite::types::Value::Integer(u64_to_i64(*timeline_at)?),
+        rusqlite::types::Value::Integer(u64_to_i64(*seq)?),
+        rusqlite::types::Value::Text(message_id_hex.clone()),
     ])
 }
 
@@ -4093,27 +4122,29 @@ fn timeline_query_sql(
         params.push(rusqlite::types::Value::Text(cursor_group_id.clone()));
     } else {
         match (pagination.direction, pagination.cursor_order.as_ref()) {
-            (CursorDirection::Before, Some((class, primary, phase, at, id))) => {
+            (CursorDirection::Before, Some(key)) => {
                 let comparison = if pagination.inclusive { "<=" } else { "<" };
                 clauses.push(format!(
                     "(timeline.timeline_order_class,
                   timeline.timeline_order_primary,
                   timeline.timeline_order_phase,
                   timeline.timeline_order_at,
-                  timeline.message_id_hex) {comparison} (?, ?, ?, ?, ?)"
+                  timeline.timeline_order_seq,
+                  timeline.message_id_hex) {comparison} (?, ?, ?, ?, ?, ?)"
                 ));
-                params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
+                params.extend(canonical_cursor_params(key)?);
             }
-            (CursorDirection::After, Some((class, primary, phase, at, id))) => {
+            (CursorDirection::After, Some(key)) => {
                 clauses.push(
                     "(timeline.timeline_order_class,
                   timeline.timeline_order_primary,
                   timeline.timeline_order_phase,
                   timeline.timeline_order_at,
-                  timeline.message_id_hex) > (?, ?, ?, ?, ?)"
+                  timeline.timeline_order_seq,
+                  timeline.message_id_hex) > (?, ?, ?, ?, ?, ?)"
                         .to_owned(),
                 );
-                params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
+                params.extend(canonical_cursor_params(key)?);
             }
             (CursorDirection::Before, None) if !canonical_group_order => {
                 // Wall-clock-only queries retain the timestamp cursor semantics.
@@ -4175,7 +4206,7 @@ fn timeline_query_sql(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed, timeline.timeline_order_seq,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
                     {TIMELINE_IMPORT_PROVENANCE_SQL},
@@ -4201,8 +4232,9 @@ pub(crate) fn canonical_timeline_order_key<'a>(
     _invalidation_status: Option<&str>,
     kind: u64,
     timeline_at: u64,
+    order_seq: u64,
     message_id_hex: &'a str,
-) -> (u8, u64, u8, u64, &'a str) {
+) -> (u8, u64, u8, u64, u64, &'a str) {
     // All unresolved local projections, including failed sends, stay at the
     // optimistic head. Chat-list preview selection independently deprioritizes
     // permanent failures once accepted history exists.
@@ -4220,7 +4252,14 @@ pub(crate) fn canonical_timeline_order_key<'a>(
         1
     };
     let intra_epoch_at = if phase == 0 { 0 } else { timeline_at };
-    (class, primary, phase, intra_epoch_at, message_id_hex)
+    (
+        class,
+        primary,
+        phase,
+        intra_epoch_at,
+        order_seq,
+        message_id_hex,
+    )
 }
 
 fn project_group_events(
@@ -4240,9 +4279,7 @@ fn project_group_events(
                 }
                 timeline.insert(event.message_id_hex.clone(), row);
             }
-            MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-            | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
-            | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => {
+            MARMOT_APP_EVENT_KIND_AGENT_ITEM | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => {
                 let mut row = timeline_row_from_app_event(event);
                 if event.invalidated {
                     row.invalidation_status = Some(invalidation_status(event));
@@ -4254,10 +4291,11 @@ fn project_group_events(
             MARMOT_APP_EVENT_KIND_REACTION if !event.invalidated => reactions.push(event.clone()),
             MARMOT_APP_EVENT_KIND_DELETE if !event.invalidated => deletes.push(event.clone()),
             MARMOT_APP_EVENT_KIND_REMOVE if !event.invalidated => deletes.push(event.clone()),
-            // Modifier kinds and the retired agent stream start never get a
-            // row of their own. Every other kind — including app-defined
-            // custom kinds — projects a generic row.
+            // Modifier kinds, the retired agent stream start and an answer
+            // or a control never get a row of their own. Every other kind —
+            // including app-defined custom kinds — projects a generic row.
             MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
+            | MARMOT_APP_EVENT_KIND_AGENT_REQUEST
             | MARMOT_APP_EVENT_KIND_REACTION
             | MARMOT_APP_EVENT_KIND_POLL_RESPONSE
             | MARMOT_APP_EVENT_KIND_DELETE
@@ -4617,7 +4655,9 @@ fn keep_receipts_of_pruned_reactions_tx(
 }
 
 fn is_editable_message(kind: u64, tags: &[Vec<String>]) -> bool {
-    kind == MARMOT_APP_EVENT_KIND_CHAT || is_nip22_comment(kind, tags)
+    kind == MARMOT_APP_EVENT_KIND_CHAT
+        || kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM
+        || is_nip22_comment(kind, tags)
 }
 
 fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
@@ -4650,6 +4690,7 @@ fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
         invalidation_status: None,
         recipient_confirmed: false,
         deleted_peer_reaction: false,
+        order_seq: 0,
     }
 }
 
@@ -4666,7 +4707,15 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
         tags: event.tags.clone(),
         timeline_at: event.recorded_at,
         received_at: event.received_at,
-        reply_to_message_id_hex: tag_value(&event.tags, EVENT_REF_TAG).map(ToOwned::to_owned),
+        reply_to_message_id_hex: if event.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM {
+            // A turn names the chat message that started it; an unreadable
+            // item names nothing.
+            cgka_traits::AgentItem::from_tags(&event.tags)
+                .ok()
+                .and_then(|item| item.started_by_message_id_hex)
+        } else {
+            tag_value(&event.tags, EVENT_REF_TAG).map(ToOwned::to_owned)
+        },
         media: None,
         reactions: TimelineReactionSummary::default(),
         edit: None,
@@ -4676,6 +4725,7 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
         invalidation_status: None,
         recipient_confirmed: false,
         deleted_peer_reaction: false,
+        order_seq: cgka_traits::agent_events::agent_item_order_seq(event.kind, &event.tags),
     }
 }
 
@@ -4775,7 +4825,7 @@ fn visible_timeline_record(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed, timeline.timeline_order_seq,
                 {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                 (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
                     {TIMELINE_IMPORT_PROVENANCE_SQL},
@@ -4798,6 +4848,14 @@ fn visible_timeline_record(
 }
 
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
+    let mut record = timeline_record_columns(row)?;
+    record.agent_item = (record.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM && !record.deleted)
+        .then(|| cgka_traits::AgentItem::from_tags(&record.tags).ok())
+        .flatten();
+    Ok(record)
+}
+
+fn timeline_record_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
     let deleted = row.get::<_, bool>(16)?;
     Ok(TimelineMessageRecord {
         client_token: row.get("client_token")?,
@@ -4855,6 +4913,11 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         deletion_source: DeletionSource::from_storage(&row.get::<_, String>("deletion_source")?),
         invalidation_status: row.get(18)?,
         recipient_confirmed: row.get("recipient_confirmed")?,
+        timeline_order_seq: row
+            .get::<_, i64>("timeline_order_seq")?
+            .try_into()
+            .unwrap_or_default(),
+        agent_item: None,
         edit: row
             .get::<_, Option<String>>(19)?
             .map(|json| serde_json::from_str(&json))

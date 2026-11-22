@@ -76,17 +76,14 @@ pub const MARMOT_APP_EVENT_KIND_EDIT: u64 = 1009;
 /// The retired agent text stream start. MDK sends none and shows none, but
 /// keeps the kind reserved so an app cannot send one.
 pub const MARMOT_APP_EVENT_KIND_AGENT_STREAM_START: u64 = 1200;
-pub const MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY: u64 = 1201;
-pub const MARMOT_APP_EVENT_KIND_AGENT_OPERATION: u64 = 1202;
+pub use crate::agent_events::{
+    MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_AGENT_REQUEST,
+};
 pub const MARMOT_APP_EVENT_KIND_GROUP_SYSTEM: u64 = 1210;
 
 /// Tag names. `e`/`q` are standard Nostr reference tags.
 pub const EVENT_REF_TAG: &str = "e";
 pub const QUOTE_REF_TAG: &str = "q";
-pub const AGENT_ACTIVITY_STATUS_TAG: &str = "status";
-pub const AGENT_OPERATION_TYPE_TAG: &str = "operation";
-pub const AGENT_OPERATION_NAME_TAG: &str = "operation-name";
-pub const AGENT_OPERATION_STATUS_TAG: &str = "operation-status";
 pub const GROUP_SYSTEM_TYPE_TAG: &str = "system";
 
 /// Current schema version for kind-1210 group system event content.

@@ -574,59 +574,12 @@ impl AgentConnector {
                 })
                 .await
             }
-            AgentControlRequest::SendAgentActivity {
-                account_id_hex,
-                group_id_hex,
-                status,
-                text,
-                reply_to_message_id_hex,
-                extra,
-            } => {
-                self.send_agent_activity_response(
-                    &account_id_hex,
-                    &group_id_hex,
-                    status,
-                    text,
-                    reply_to_message_id_hex,
-                    extra,
-                )
-                .await
-            }
-            AgentControlRequest::SendAgentOperationEvent {
-                account_id_hex,
-                group_id_hex,
-                event_type,
-                status,
-                operation_id,
-                run_id,
-                turn_id,
-                name,
-                text,
-                preview,
-                details,
-                sequence,
-                ok,
-                duration_ms,
-                reply_to_message_id_hex,
-            } => {
-                self.send_agent_operation_event_response(
-                    &account_id_hex,
-                    &group_id_hex,
-                    event_type,
-                    status,
-                    operation_id,
-                    run_id,
-                    turn_id,
-                    name,
-                    text,
-                    preview,
-                    details,
-                    sequence,
-                    ok,
-                    duration_ms,
-                    reply_to_message_id_hex,
-                )
-                .await
+            // MDK no longer builds the old shape of kinds 1201 and 1202
+            // (marmot-agents D-051). The old connectors that still ask for
+            // them are told so and publish nothing.
+            AgentControlRequest::SendAgentActivity { .. }
+            | AgentControlRequest::SendAgentOperationEvent { .. } => {
+                Err(ConnectorError::RetiredAgentEvent)
             }
             AgentControlRequest::SendGroupSystemEvent {
                 account_id_hex,

@@ -37,14 +37,14 @@ use crate::{
     APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountCatchUpFailure,
     AccountKeyPackageInventoryEntry, AccountKeyPackageRecord, AccountKeyPackageRelayEvent,
-    AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
-    AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest, AppError,
-    AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogRetention, AuditLogSettings, AuditLogSource,
-    AuditLogTrackerUpdateResult, BackgroundNotificationCollection, BackupSettings, ChatListRow,
-    ChatNotificationSettings, ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult,
-    GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
+    AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread, AppBlobEndpoint,
+    AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupConversationSnapshot,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster, AppMessageQuery,
+    AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup, AuditLogDeleteOutcome,
+    AuditLogFile, AuditLogRetention, AuditLogSettings, AuditLogSource, AuditLogTrackerUpdateResult,
+    BackgroundNotificationCollection, BackupSettings, ChatListRow, ChatNotificationSettings,
+    ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo,
+    MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
     MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
     MessageDraft, MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
     NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
@@ -3400,38 +3400,6 @@ impl MarmotAppRuntime {
             ChatListUpdateTrigger::NewLastMessage,
         );
         Ok(summary)
-    }
-
-    pub async fn send_agent_activity(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        status: String,
-        text: String,
-        reply_to_message_id: Option<String>,
-        extra: Option<serde_json::Value>,
-    ) -> Result<SendSummary, AppError> {
-        self.accounts
-            .send_agent_activity(
-                account_ref,
-                group_id,
-                status,
-                text,
-                reply_to_message_id,
-                extra,
-            )
-            .await
-    }
-
-    pub async fn send_agent_operation_event(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        request: AgentOperationEventRequest,
-    ) -> Result<SendSummary, AppError> {
-        self.accounts
-            .send_agent_operation_event(account_ref, group_id, request)
-            .await
     }
 
     pub async fn send_group_system_event(

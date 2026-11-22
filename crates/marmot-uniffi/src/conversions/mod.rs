@@ -579,6 +579,8 @@ mod tests {
             recipient_confirmed: false,
             imported_from: None,
             history_import_provenance: None,
+            agent_item: None,
+            timeline_order_seq: 0,
         };
 
         let page = TimelinePageFfi::from(TimelinePage {
@@ -638,6 +640,72 @@ mod tests {
     }
 
     #[test]
+    fn timeline_message_record_ffi_carries_the_agent_items_latest_version() {
+        let tags = [
+            ["v", "4"],
+            ["state", "waiting"],
+            ["title", "Allow this command?"],
+            ["harness", "codex"],
+            ["item_id", "call-1"],
+            ["seq", "9"],
+            ["fields", r#"{"type":"approval","body":{}}"#],
+        ]
+        .iter()
+        .map(|tag| tag.iter().map(|part| (*part).to_owned()).collect())
+        .collect::<Vec<Vec<String>>>();
+        let mut tags = tags;
+        tags.push(vec!["settles".to_owned(), "cc".repeat(32)]);
+        let item = cgka_traits::AgentItem::from_tags(&tags).unwrap();
+        let record = TimelineMessageRecord {
+            client_token: None,
+            has_reports: false,
+            group_system: None,
+            poll: None,
+            edit: None,
+            message_id_hex: "item-1".to_owned(),
+            source_message_id_hex: Some("source-1".to_owned()),
+            source_epoch: Some(7),
+            retention_seconds: None,
+            retention_expires_at: None,
+            direction: "received".to_owned(),
+            group_id_hex: "11".repeat(32),
+            sender: "aa".repeat(32),
+            plaintext: "Allow `ls`?".to_owned(),
+            kind: 1201,
+            tags,
+            timeline_at: 10,
+            received_at: 11,
+            reply_to_message_id_hex: None,
+            reply_preview: None,
+            thread: None,
+            media: None,
+            reactions: TimelineReactionSummary::default(),
+            deleted: false,
+            deletion_source: Default::default(),
+            deleted_by_message_id_hex: None,
+            invalidation_status: None,
+            recipient_confirmed: false,
+            imported_from: None,
+            history_import_provenance: None,
+            agent_item: Some(item),
+            timeline_order_seq: 9,
+        };
+
+        let message = TimelineMessageRecordFfi::from(record);
+        let item = message
+            .agent_item
+            .expect("the parsed item crosses the binding");
+        assert_eq!(item.version, 4);
+        assert_eq!(item.state, AgentItemStateFfi::Waiting);
+        assert_eq!(item.item_type, "approval");
+        assert_eq!(item.fields_json, r#"{"type":"approval","body":{}}"#);
+        assert_eq!(item.settles, ["cc".repeat(32)]);
+        assert!(item.alerts);
+        // The raw tags still reach the app, for tags MDK does not read.
+        assert_eq!(message.tags.len(), 8);
+    }
+
+    #[test]
     fn timeline_message_record_ffi_exposes_group_system_payload() {
         let content = cgka_traits::app_event::GroupSystemEvent::new(
             cgka_traits::app_event::GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
@@ -689,6 +757,8 @@ mod tests {
             recipient_confirmed: false,
             imported_from: None,
             history_import_provenance: None,
+            agent_item: None,
+            timeline_order_seq: 0,
         };
 
         let ffi = TimelineMessageRecordFfi::from(record);
@@ -744,6 +814,8 @@ mod tests {
             recipient_confirmed: false,
             imported_from: None,
             history_import_provenance: None,
+            agent_item: None,
+            timeline_order_seq: 0,
         };
 
         let ffi = TimelineMessageRecordFfi::from(record);

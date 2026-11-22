@@ -1302,6 +1302,18 @@ typedef enum MarmotPollType {
 } MarmotPollType;
 
 /**
+ * An agent item's state (kind 1201).
+ */
+typedef enum MarmotAgentItemState {
+  MARMOT_AGENT_ITEM_STATE_RUNNING,
+  MARMOT_AGENT_ITEM_STATE_WAITING,
+  MARMOT_AGENT_ITEM_STATE_DONE,
+  MARMOT_AGENT_ITEM_STATE_FAILED,
+  MARMOT_AGENT_ITEM_STATE_DECLINED,
+  MARMOT_AGENT_ITEM_STATE_CANCELLED,
+} MarmotAgentItemState;
+
+/**
  * Outcome class of a background collection.
  */
 typedef enum MarmotNotificationCollectionStatus {
@@ -1326,7 +1338,6 @@ typedef enum MarmotNotificationTrigger {
  */
 typedef enum MarmotNotificationTrafficClass {
   MARMOT_NOTIFICATION_TRAFFIC_CLASS_STANDARD,
-  MARMOT_NOTIFICATION_TRAFFIC_CLASS_AGENT_ACTIVITY,
 } MarmotNotificationTrafficClass;
 
 /**
@@ -1457,8 +1468,7 @@ typedef enum MarmotTimelineUpdateTrigger {
   MARMOT_TIMELINE_UPDATE_TRIGGER_REACTION_REMOVED,
   MARMOT_TIMELINE_UPDATE_TRIGGER_MESSAGE_DELETED,
   MARMOT_TIMELINE_UPDATE_TRIGGER_REPLY_PREVIEW_CHANGED,
-  MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_ACTIVITY,
-  MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_OPERATION,
+  MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_ITEM,
   MARMOT_TIMELINE_UPDATE_TRIGGER_GROUP_SYSTEM,
   MARMOT_TIMELINE_UPDATE_TRIGGER_CUSTOM_EVENT,
   MARMOT_TIMELINE_UPDATE_TRIGGER_DELIVERY_OR_SEND_STATE_CHANGED,
@@ -5702,6 +5712,49 @@ typedef struct MarmotTimelineReplyPreview {
 } MarmotTimelineReplyPreview;
 
 /**
+ * The latest version of an agent item (kind 1201) on its timeline row.
+ * The row's `plaintext` is its plain rendering and its `tags` that
+ * version's tags. Render the item from `item_type` and `fields_json`.
+ */
+typedef struct MarmotAgentItem {
+  /**
+   * The item's version, from 1.
+   */
+  uint64_t version;
+  enum MarmotAgentItemState state;
+  char *title;
+  char *harness;
+  char *item_id;
+  /**
+   * This version's place among its session's events.
+   */
+  uint64_t seq;
+  /**
+   * `turn`, `tool`, `approval`, `question`, ...
+   */
+  char *item_type;
+  /**
+   * The item type and its own fields, as JSON.
+   */
+  char *fields_json;
+  char *session;
+  char *turn;
+  /**
+   * On a turn: the chat message that started it.
+   */
+  char *started_by_message_id_hex;
+  /**
+   * The answers and controls (kind 1202) this version settles.
+   */
+  char **settles;
+  uintptr_t settles_len;
+  /**
+   * A waiting approval or question, or a failed turn.
+   */
+  bool alerts;
+} MarmotAgentItem;
+
+/**
  * One emoji tally, pre-sorted by count desc then emoji asc.
  */
 typedef struct MarmotTimelineReactionEmoji {
@@ -5839,6 +5892,11 @@ typedef struct MarmotTimelineMessageRecord {
    * reactions, and malformed assertions.
    */
   struct MarmotGroupSystemEvent *group_system;
+  /**
+   * The latest version of an agent item (kind 1201). NULL for other
+   * kinds; a kind-1201 row with NULL here is an unreadable item.
+   */
+  struct MarmotAgentItem *agent_item;
   struct MarmotTimelineReactionSummary reactions;
   struct MarmotTimelineEditSummary *edit;
   bool deleted;

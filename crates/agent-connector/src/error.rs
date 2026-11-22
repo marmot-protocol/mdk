@@ -29,6 +29,11 @@ pub enum ConnectorError {
     SocketPathTooLong,
     #[error("debug controls are disabled")]
     DebugControlsDisabled,
+    /// The old shape of agent activity (kind 1201) and agent operations
+    /// (kind 1202) is gone from MDK; agent items and their answers and
+    /// controls now come from marmot-agents.
+    #[error("agent activity and agent operation events are no longer sent")]
+    RetiredAgentEvent,
     #[error("agent control request is unauthorized")]
     Unauthorized,
     #[error("unsafe agent control plane configuration: {0}")]
@@ -96,6 +101,7 @@ impl ConnectorError {
             Self::Io(_) => "io_error",
             Self::SocketPathTooLong => "socket_path_too_long",
             Self::DebugControlsDisabled => "debug_controls_disabled",
+            Self::RetiredAgentEvent => "retired_agent_event",
             Self::Unauthorized => "unauthorized",
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::InvalidGroupCreate(_) => "invalid_group_create",
@@ -125,6 +131,9 @@ impl ConnectorError {
                 "attachment reference was rejected by the native parser; check its version and fields"
             }
             Self::DebugControlsDisabled => "debug controls are disabled",
+            Self::RetiredAgentEvent => {
+                "agent activity and agent operation events are no longer sent; nothing was published"
+            }
             Self::SocketPathTooLong => {
                 "control socket path exceeds platform byte limit; shorten --home or --socket"
             }

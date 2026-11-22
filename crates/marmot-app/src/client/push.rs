@@ -1232,10 +1232,30 @@ impl AppClient {
     }
 }
 
+fn agent_item_alerts(tags: &[Vec<String>]) -> bool {
+    cgka_traits::AgentItem::from_tags(tags).is_ok_and(|item| item.alerts())
+}
+
 pub(crate) fn notification_trigger_for_intent(
     intent: &AppMessageIntent,
 ) -> Option<notifications::NotificationTrigger> {
     match intent {
+        // The agent's remarks during a turn wake nobody (D-078).
+        AppMessageIntent::TaggedChat { tags, .. }
+            if cgka_traits::agent_events::is_agent_commentary(tags) =>
+        {
+            None
+        }
+        // An agent item wakes members only while it needs a person or when its
+        // turn failed (D-024).
+        AppMessageIntent::Custom { kind, tags, .. }
+            if *kind == cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_ITEM =>
+        {
+            agent_item_alerts(tags).then_some(notifications::NotificationTrigger::NewMessage)
+        }
+        AppMessageIntent::AgentItemEdit { tags, .. } => {
+            agent_item_alerts(tags).then_some(notifications::NotificationTrigger::NewMessage)
+        }
         AppMessageIntent::Chat { .. }
         | AppMessageIntent::TaggedChat { .. }
         | AppMessageIntent::Sticker { .. }
@@ -1258,8 +1278,6 @@ pub(crate) fn notification_trigger_for_intent(
         | AppMessageIntent::Edit { .. }
         | AppMessageIntent::Delete { .. }
         | AppMessageIntent::PollResponse { .. }
-        | AppMessageIntent::AgentActivity { .. }
-        | AppMessageIntent::AgentOperation { .. }
         | AppMessageIntent::GroupSystem { .. }
         | AppMessageIntent::Custom { .. }
         | AppMessageIntent::PushTokenUpdate { .. }

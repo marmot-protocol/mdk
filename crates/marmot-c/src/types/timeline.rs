@@ -4,10 +4,11 @@ use super::sticker::MarmotStickerRef;
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
-    DeletionSourceFfi, GroupSystemEventFfi, GroupSystemEventProvenanceFfi, PollOptionResultFfi,
-    PollProjectionFfi, PollTypeFfi, PollVoteFfi, PollVotePageFfi, RuntimeProjectionUpdateFfi,
-    TimelineEditHistoryPageFfi, TimelineEditSummaryFfi, TimelineEditVersionFfi,
-    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    AgentItemFfi, AgentItemStateFfi, DeletionSourceFfi, GroupSystemEventFfi,
+    GroupSystemEventProvenanceFfi, PollOptionResultFfi, PollProjectionFfi, PollTypeFfi,
+    PollVoteFfi, PollVotePageFfi, RuntimeProjectionUpdateFfi, TimelineEditHistoryPageFfi,
+    TimelineEditSummaryFfi, TimelineEditVersionFfi, TimelineMessageChangeFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineReplyPreviewFfi, TimelineSubscriptionUpdateFfi,
     TimelineThreadRefFfi, TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
@@ -224,6 +225,46 @@ c_mirror! {
     }
 }
 
+c_enum! {
+    /// An agent item's state (kind 1201).
+    MarmotAgentItemState from AgentItemStateFfi {
+        Running,
+        Waiting,
+        Done,
+        Failed,
+        Declined,
+        Cancelled,
+    }
+}
+
+c_mirror! {
+    /// The latest version of an agent item (kind 1201) on its timeline row.
+    /// The row's `plaintext` is its plain rendering and its `tags` that
+    /// version's tags. Render the item from `item_type` and `fields_json`.
+    MarmotAgentItem from AgentItemFfi {
+        /// The item's version, from 1.
+        copy version: u64,
+        copy state: MarmotAgentItemState,
+        str title,
+        str harness,
+        str item_id,
+        /// This version's place among its session's events.
+        copy seq: u64,
+        /// `turn`, `tool`, `approval`, `question`, ...
+        str item_type,
+        /// The item type and its own fields, as JSON.
+        str fields_json,
+        opt_str session,
+        opt_str turn,
+        /// On a turn: the chat message that started it.
+        opt_str started_by_message_id_hex,
+        /// The answers and controls (kind 1202) this version settles.
+        str_vec settles/settles_len,
+        /// A waiting approval or question, or a failed turn.
+        copy alerts: bool,
+    }
+}
+
 c_mirror! {
     /// One emoji tally, pre-sorted by count desc then emoji asc.
     MarmotTimelineReactionEmoji from TimelineReactionEmojiFfi {
@@ -298,6 +339,9 @@ c_mirror! {
         /// Parsed view of kind-1210 group system rows. NULL for chat,
         /// reactions, and malformed assertions.
         opt_rec group_system: MarmotGroupSystemEvent,
+        /// The latest version of an agent item (kind 1201). NULL for other
+        /// kinds; a kind-1201 row with NULL here is an unreadable item.
+        opt_rec agent_item: MarmotAgentItem,
         rec reactions: MarmotTimelineReactionSummary,
         opt_rec edit: MarmotTimelineEditSummary,
         copy deleted: bool,
@@ -343,8 +387,7 @@ c_enum! {
         ReactionRemoved,
         MessageDeleted,
         ReplyPreviewChanged,
-        AgentActivity,
-        AgentOperation,
+        AgentItem,
         GroupSystem,
         CustomEvent,
         DeliveryOrSendStateChanged,

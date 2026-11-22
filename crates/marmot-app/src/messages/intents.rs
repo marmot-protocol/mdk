@@ -1,10 +1,12 @@
+use cgka_traits::agent_events::{
+    AGENT_EVENT_MAX_BYTES, AgentEventError, AgentRequest, validate_agent_item_tags,
+};
 use cgka_traits::app_event::{
-    AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
-    AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
-    MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-    MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
+    EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+    MARMOT_APP_EVENT_KIND_AGENT_REQUEST, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
+    MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
 };
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
@@ -273,26 +275,13 @@ pub(crate) enum AppMessageIntent {
         message_tags: Vec<Vec<String>>,
         placement: Option<ThreadPlacement>,
     },
-    AgentActivity {
-        status: String,
-        text: String,
-        reply_to_message_id: Option<String>,
-        extra: Option<Value>,
-    },
-    AgentOperation {
-        event_type: String,
-        status: String,
-        operation_id: Option<String>,
-        run_id: Option<String>,
-        turn_id: Option<String>,
-        name: Option<String>,
-        text: String,
-        preview: Option<String>,
-        details: Option<Value>,
-        sequence: Option<u64>,
-        ok: Option<bool>,
-        duration_ms: Option<u64>,
-        reply_to_message_id: Option<String>,
+    /// A later version of an agent item (kind 1201): a kind-1009 edit whose
+    /// single `e` tag names the item's first event, carrying the whole item
+    /// again (content and every tag) with a higher `v`.
+    AgentItemEdit {
+        target_message_id: String,
+        content: String,
+        tags: Vec<Vec<String>>,
     },
     GroupSystem {
         system_type: String,
@@ -660,91 +649,17 @@ pub(crate) fn build_inner_event_with_media_reply(
                 content.clone(),
             ))
         }
-        AppMessageIntent::AgentActivity {
-            status,
-            text,
-            reply_to_message_id,
-            extra,
+        AppMessageIntent::AgentItemEdit {
+            target_message_id,
+            content,
+            tags: item,
         } => {
-            let status = validate_non_empty_field(status, "agent activity status")?;
-            let mut tags = vec![vec![AGENT_ACTIVITY_STATUS_TAG.to_owned(), status.clone()]];
-            if let Some(target_message_id) = optional_message_ref(reply_to_message_id)? {
-                tags.push(event_ref_tag(&target_message_id));
-            }
-            let mut content = app_payload_base(status.clone(), text.clone());
-            if let Some(extra) = extra {
-                content.insert("extra".to_owned(), extra.clone());
-            }
-            Ok(event(
-                MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
-                tags,
-                Value::Object(content).to_string(),
-            ))
-        }
-        AppMessageIntent::AgentOperation {
-            event_type,
-            status,
-            operation_id,
-            run_id,
-            turn_id,
-            name,
-            text,
-            preview,
-            details,
-            sequence,
-            ok,
-            duration_ms,
-            reply_to_message_id,
-        } => {
-            let event_type = validate_non_empty_field(event_type, "agent operation type")?;
-            let status = validate_non_empty_field(status, "agent operation status")?;
-            let mut tags = vec![
-                vec![AGENT_OPERATION_TYPE_TAG.to_owned(), event_type.clone()],
-                vec![AGENT_OPERATION_STATUS_TAG.to_owned(), status.clone()],
-            ];
-            if let Some(name) = optional_non_empty_field(name) {
-                tags.push(vec![AGENT_OPERATION_NAME_TAG.to_owned(), name.to_owned()]);
-            }
-            if let Some(target_message_id) = optional_message_ref(reply_to_message_id)? {
-                tags.push(event_ref_tag(&target_message_id));
-            }
-            let mut content = app_payload_base(status.clone(), text.clone());
-            content.insert("event_type".to_owned(), Value::String(event_type));
-            if let Some(operation_id) = optional_non_empty_field(operation_id) {
-                content.insert(
-                    "operation_id".to_owned(),
-                    Value::String(operation_id.to_owned()),
-                );
-            }
-            if let Some(run_id) = optional_non_empty_field(run_id) {
-                content.insert("run_id".to_owned(), Value::String(run_id.to_owned()));
-            }
-            if let Some(turn_id) = optional_non_empty_field(turn_id) {
-                content.insert("turn_id".to_owned(), Value::String(turn_id.to_owned()));
-            }
-            if let Some(name) = optional_non_empty_field(name) {
-                content.insert("name".to_owned(), Value::String(name.to_owned()));
-            }
-            if let Some(preview) = optional_non_empty_field(preview) {
-                content.insert("preview".to_owned(), Value::String(preview.to_owned()));
-            }
-            if let Some(details) = details {
-                content.insert("details".to_owned(), details.clone());
-            }
-            if let Some(sequence) = sequence {
-                content.insert("sequence".to_owned(), json!(sequence));
-            }
-            if let Some(ok) = ok {
-                content.insert("ok".to_owned(), json!(ok));
-            }
-            if let Some(duration_ms) = duration_ms {
-                content.insert("duration_ms".to_owned(), json!(duration_ms));
-            }
-            Ok(event(
-                MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-                tags,
-                Value::Object(content).to_string(),
-            ))
+            validate_message_ref(target_message_id)?;
+            validate_agent_item_tags(item).map_err(agent_event_error)?;
+            let mut tags = Vec::with_capacity(item.len() + 1);
+            tags.push(event_ref_tag(target_message_id));
+            tags.extend_from_slice(item);
+            fitting_agent_event(event(MARMOT_APP_EVENT_KIND_EDIT, tags, content.clone()))
         }
         AppMessageIntent::GroupSystem {
             system_type,
@@ -786,6 +701,17 @@ pub(crate) fn build_inner_event_with_media_reply(
             content,
         } => {
             validate_custom_event_kind(*kind)?;
+            match *kind {
+                MARMOT_APP_EVENT_KIND_AGENT_ITEM => {
+                    validate_agent_item_tags(tags).map_err(agent_event_error)?;
+                    return fitting_agent_event(event(*kind, tags.clone(), content.clone()));
+                }
+                MARMOT_APP_EVENT_KIND_AGENT_REQUEST => {
+                    AgentRequest::from_tags(tags).map_err(agent_event_error)?;
+                    return fitting_agent_event(event(*kind, tags.clone(), content.clone()));
+                }
+                _ => {}
+            }
             let mut tags = tags.clone();
             if is_nip22_comment(*kind, &tags) {
                 append_mention_tags(&mut tags, content);
@@ -811,16 +737,16 @@ const RESERVED_APP_EVENT_KINDS: &[u64] = &[
     MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
     MARMOT_APP_EVENT_KIND_POLL,
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-    MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
-    MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
     MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
     MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
     MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
 ];
 
-/// True when `kind` is one MDK owns (chat, reactions, edits, agent, group
-/// system, push token, device group). Custom sends must use any other kind.
+/// True when `kind` is one MDK owns (chat, reactions, edits, group system,
+/// push token, device group). Custom sends must use any other kind. Agent
+/// items (1201) and answers and controls (1202) are not reserved: a program
+/// sends them through the custom-event path, which checks their shape.
 pub fn is_reserved_app_event_kind(kind: u64) -> bool {
     RESERVED_APP_EVENT_KINDS.contains(&kind)
         || crate::client::device_group::is_device_group_kind(kind)
@@ -873,6 +799,23 @@ pub(crate) fn validate_message_tags(tags: &[Vec<String>]) -> Result<(), AppError
         }
     }
     Ok(())
+}
+
+fn agent_event_error(error: AgentEventError) -> AppError {
+    AppError::InvalidAppMessagePayload(error.to_string())
+}
+
+/// Refuse an agent item, an edit of one, or a request larger than the agent
+/// event limit as the encoded inner event.
+fn fitting_agent_event(event: MarmotInnerEvent) -> Result<MarmotInnerEvent, AppError> {
+    let size = event
+        .encode()
+        .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?
+        .len();
+    if size > AGENT_EVENT_MAX_BYTES {
+        return Err(agent_event_error(AgentEventError::TooLarge));
+    }
+    Ok(event)
 }
 
 fn validate_custom_event_kind(kind: u64) -> Result<(), AppError> {
@@ -944,29 +887,6 @@ fn validate_non_empty_field(value: &str, field: &str) -> Result<String, AppError
         )));
     }
     Ok(trimmed.to_owned())
-}
-
-fn optional_non_empty_field(value: &Option<String>) -> Option<&str> {
-    value
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn optional_message_ref(value: &Option<String>) -> Result<Option<String>, AppError> {
-    let Some(value) = optional_non_empty_field(value) else {
-        return Ok(None);
-    };
-    validate_message_ref(value)?;
-    Ok(Some(value.to_owned()))
-}
-
-fn app_payload_base(kind_or_status: String, text: String) -> Map<String, Value> {
-    let mut content = Map::new();
-    content.insert("v".to_owned(), json!(1));
-    content.insert("status".to_owned(), Value::String(kind_or_status));
-    content.insert("text".to_owned(), Value::String(text));
-    content
 }
 
 /// Encode a built inner event into MLS application-message plaintext bytes.

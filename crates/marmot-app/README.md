@@ -19,6 +19,7 @@ See [device linking](../cli/README.md#device-linking).
 - [User directory and search](#user-directory-and-search)
 - [Groups and invitations](#groups-and-invitations)
 - [Conversations](#conversations)
+- [Agent events](#agent-events)
 - [Encrypted media endpoints](#encrypted-media-endpoints)
 - [Custom emoji sets](#custom-emoji-sets)
 - [Application-owned group state](#application-owned-group-state)
@@ -532,6 +533,31 @@ Reply references with missing, malformed, or conflicting targets fail before
 any PUT. Both wrappers retain the lowercase target through upload and durable
 admission without consulting the composer. With `send` false, their existing
 upload-only behavior is unchanged.
+
+## Agent events
+
+Agent programs (marmot-agents) send agent items as kind 1201 and people's answers and controls as kind 1202, in the
+shape of marmot-agents `docs/design/agent-kinds.md` (D-076). The content is a plain rendering; everything else is in
+tags. MDK renames one tag of that design: a turn names the chat message that started it with
+`["started_by", <event id>]`, not `e`, so an edit of the item still has exactly one `e` tag.
+
+- **Sending.** `submit_custom_event` (crash-safe, by client token) and `send_custom_event` take kinds 1201 and 1202.
+  An item must carry `v`, `state`, `title`, `harness`, `item_id`, `seq` and `fields` (JSON with a `type`), and no `e`;
+  a request must carry one `p` and `details` (JSON with an `action`). Every other tag passes through unchanged. Each
+  encoded event, an item's edits included, is at most `AGENT_EVENT_MAX_BYTES` (64 KiB); a larger one is refused.
+- **Later versions.** `submit_tagged_edit_for_local_send(original_token, content, tags, token)` with the original
+  item's token sends a kind-1009 edit naming the item's first event and carrying the whole item again with a higher
+  `v`. Resubmitting a token after a restart returns the same event and sends nothing new.
+- **Projection.** One row per item at its first event, holding the version with the highest `v`: its content and
+  tags replace the row's, an older version that arrives late changes nothing, and an edit that arrives before its
+  item is held and applied when the item arrives. The row is not marked edited. Within one second a turn's rows are
+  ordered by the first event's `seq`. `TimelineMessageRecord::agent_item` is the parsed latest version, with its
+  `settles`; it is `None` for an item MDK cannot read, such as the old shape. A kind 1202 has no row.
+- **Alerts.** An item notifies only while its latest version is an approval or a question that is `waiting`, or a
+  turn that ended `failed`; its notification is keyed by the item's first event. Kind 1202 never notifies, and nor
+  does a chat message tagged `["phase", "commentary"]`.
+- **Receiving requests.** A kind 1202 arrives as `MessageReceived` like any other message and is read with
+  `message_by_id` or `messages_after_insert_order`; `AgentRequest::from_tags` reads its agent, item and action.
 
 ## Encrypted media endpoints
 

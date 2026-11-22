@@ -4822,7 +4822,13 @@ impl AppClient {
                     "original local send was not accepted by the engine".into(),
                 ));
             }
-            request.edit_intent(original.message_id_hex)
+            let original_is_agent_item = original
+                .request_json
+                .as_deref()
+                .map(crate::local_submissions::LocalMessageRequest::decode_retained)
+                .transpose()?
+                .is_some_and(|(original, _)| original.is_agent_item());
+            request.edit_intent(original.message_id_hex, original_is_agent_item)
         } else {
             request.intent()
         };
@@ -4899,7 +4905,9 @@ impl AppClient {
             AppMessageIntent::Unreact { .. } | AppMessageIntent::DeleteReactions { .. } => {
                 (Family::MessageAction, "unreact")
             }
-            AppMessageIntent::Edit { .. } => (Family::MessageAction, "edit"),
+            AppMessageIntent::Edit { .. } | AppMessageIntent::AgentItemEdit { .. } => {
+                (Family::MessageAction, "edit")
+            }
             AppMessageIntent::Poll { .. } => (Family::MessageAction, "poll"),
             AppMessageIntent::PollResponse { .. } => (Family::MessageAction, "poll_response"),
             AppMessageIntent::Delete { .. } | AppMessageIntent::RemoveMessage { .. } => {
@@ -4914,10 +4922,9 @@ impl AppClient {
                 (Family::Notification, "update")
             }
             AppMessageIntent::PushTokenRemoval { .. } => (Family::Notification, "remove"),
-            AppMessageIntent::AgentActivity { .. }
-            | AppMessageIntent::AgentOperation { .. }
-            | AppMessageIntent::GroupSystem { .. }
-            | AppMessageIntent::Custom { .. } => (Family::MessageAction, "custom"),
+            AppMessageIntent::GroupSystem { .. } | AppMessageIntent::Custom { .. } => {
+                (Family::MessageAction, "custom")
+            }
         };
         let observed = self
             .app

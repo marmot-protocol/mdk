@@ -1641,3 +1641,206 @@ async fn custom_event_submission_is_crash_safe_by_token() {
     assert_eq!(event.tags, item_tags);
     runtime.shutdown_and_close().await.unwrap();
 }
+
+fn agent_item_tags(version: u64, state: &str, native: &str) -> Vec<Vec<String>> {
+    vec![
+        tag("v", &version.to_string()),
+        tag("state", state),
+        tag("title", "Running a command"),
+        tag("harness", "codex"),
+        tag("item_id", "call-1"),
+        tag("seq", &(10 + version).to_string()),
+        tag("fields", r#"{"type":"tool","body":{"command":"ls"}}"#),
+        tag("turn", "turn-1"),
+        vec![
+            "native".to_owned(),
+            "item/started".to_owned(),
+            native.to_owned(),
+        ],
+    ]
+}
+
+/// The agent outbox contract: an item, each later version of it, and an answer
+/// or a control are admitted by token, so a core that crashes after submitting
+/// resubmits the same token and gets the same event, and nothing is sent twice.
+/// The first version is as large as an agent event may be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_events_are_crash_safe_by_token() {
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    // A native message that brings the encoded inner event to the 64 KiB limit.
+    let probe = crate::messages::build_inner_event(
+        &crate::messages::AppMessageIntent::Custom {
+            kind: 1201,
+            tags: agent_item_tags(1, "running", ""),
+            content: "Running `ls`".into(),
+        },
+        &"00".repeat(32),
+        // As many digits as the admission's own `created_at`.
+        crate::unix_now_seconds(),
+    )
+    .unwrap();
+    let filler = cgka_traits::AGENT_EVENT_MAX_BYTES - probe.encode().unwrap().len();
+    let first = agent_item_tags(1, "running", &"x".repeat(filler));
+    let request = LocalMessageRequest {
+        content: "Running `ls`".into(),
+        tags: first.clone(),
+        custom_kind: Some(1201),
+        ..Default::default()
+    };
+    // Submitted, then the process stops before any worker publishes it.
+    let (item, _) = h
+        .app
+        .admit_local_message("alice", &h.group, "item-token".into(), request, None)
+        .unwrap();
+    h.app.close_storage().unwrap();
+
+    let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
+        .with_test_relay_client(h.relay.clone());
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    let replay = runtime
+        .submit_custom_event(
+            "alice",
+            &h.group,
+            1201,
+            first.clone(),
+            "Running `ls`".into(),
+            "item-token".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, item);
+    local_send_completed(&runtime, &h.group, "item-token").await;
+
+    let edit_tags = agent_item_tags(2, "done", "{}");
+    let edit = runtime
+        .submit_tagged_edit_for_local_send(
+            "alice",
+            &h.group,
+            "item-token".into(),
+            "Ran `ls`".into(),
+            edit_tags.clone(),
+            "item-v2-token".into(),
+        )
+        .await
+        .unwrap();
+    let request_tags = vec![
+        tag("p", &"ab".repeat(32)),
+        tag("e", &item.message_id_hex),
+        tag("details", r#"{"action":"interrupt"}"#),
+    ];
+    let control = runtime
+        .submit_custom_event(
+            "alice",
+            &h.group,
+            1202,
+            request_tags.clone(),
+            "Stop".into(),
+            "control-token".into(),
+        )
+        .await
+        .unwrap();
+    local_send_completed(&runtime, &h.group, "item-v2-token").await;
+    local_send_completed(&runtime, &h.group, "control-token").await;
+    runtime.shutdown_and_close().await.unwrap();
+
+    // Restart again without the core having recorded any of the three.
+    let published = h.relay.published_event_ids().len();
+    let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
+        .with_test_relay_client(h.relay.clone());
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    let storage = reopened.account_storage("alice").unwrap().app_storage();
+    assert_eq!(
+        runtime
+            .submit_custom_event(
+                "alice",
+                &h.group,
+                1201,
+                first,
+                "Running `ls`".into(),
+                "item-token".into(),
+            )
+            .await
+            .unwrap(),
+        item
+    );
+    assert_eq!(
+        runtime
+            .submit_tagged_edit_for_local_send(
+                "alice",
+                &h.group,
+                "item-token".into(),
+                "Ran `ls`".into(),
+                edit_tags.clone(),
+                "item-v2-token".into(),
+            )
+            .await
+            .unwrap(),
+        edit
+    );
+    assert_eq!(
+        runtime
+            .submit_custom_event(
+                "alice",
+                &h.group,
+                1202,
+                request_tags.clone(),
+                "Stop".into(),
+                "control-token".into(),
+            )
+            .await
+            .unwrap(),
+        control
+    );
+    assert!(storage.next_local_submission().unwrap().is_none());
+    assert_eq!(
+        h.relay.published_event_ids().len(),
+        published,
+        "a resubmitted token sends nothing new"
+    );
+
+    let item_event = storage
+        .app_message(&group_hex, &item.message_id_hex)
+        .unwrap()
+        .unwrap();
+    let encoded = cgka_traits::MarmotAppEvent::new(
+        item_event.sender.clone(),
+        item_event.recorded_at,
+        item_event.kind,
+        item_event.tags.clone(),
+        item_event.plaintext.clone(),
+    )
+    .encode()
+    .unwrap();
+    assert_eq!(encoded.len(), cgka_traits::AGENT_EVENT_MAX_BYTES);
+    let edit_event = storage
+        .app_message(&group_hex, &edit.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(edit_event.kind, 1009);
+    assert_eq!(edit_event.tags[0], tag("e", &item.message_id_hex));
+    assert_eq!(&edit_event.tags[1..], edit_tags);
+    let row = storage
+        .timeline_message(&group_hex, &item.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.plaintext, "Ran `ls`");
+    assert_eq!(row.agent_item.unwrap().version, 2);
+    assert!(row.edit.is_none(), "a new version is not an edit to mark");
+    assert_eq!(
+        storage
+            .app_message(&group_hex, &control.message_id_hex)
+            .unwrap()
+            .unwrap()
+            .tags,
+        request_tags
+    );
+    assert!(
+        storage
+            .timeline_message(&group_hex, &control.message_id_hex)
+            .unwrap()
+            .is_none(),
+        "an answer or a control has no row"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}

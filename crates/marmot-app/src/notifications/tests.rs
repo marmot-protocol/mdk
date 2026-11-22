@@ -2312,16 +2312,6 @@ fn normal_message_yields_no_reaction_fields() {
 }
 
 #[test]
-fn agent_activity_and_operation_kinds_are_notifiable() {
-    use cgka_traits::app_event::{
-        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-    };
-
-    assert!(notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, &[]).is_some());
-    assert!(notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_OPERATION, &[]).is_some());
-}
-
-#[test]
 fn state_change_kinds_remain_non_notifiable() {
     use cgka_traits::app_event::{
         MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_DELETE,
@@ -2337,22 +2327,56 @@ fn state_change_kinds_remain_non_notifiable() {
 #[test]
 fn notification_traffic_class_is_deterministic_from_the_wire_kind() {
     use cgka_traits::app_event::{
-        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_AGENT_REQUEST,
         MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-        MARMOT_APP_EVENT_KIND_REACTION,
+        MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_REACTION,
     };
 
+    // An agent item is a candidate, decided against its stored latest version.
     assert_eq!(
-        notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, &[]),
-        Some(NotificationTrafficClass::AgentActivity),
+        notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_ITEM, &[]),
+        Some(NotificationTrafficClass::Standard),
+    );
+    // An edit is one only when it carries a version of an item that alerts.
+    assert_eq!(
+        notification_traffic(
+            MARMOT_APP_EVENT_KIND_EDIT,
+            &agent_item_tags("approval", "waiting", 2)
+        ),
+        Some(NotificationTrafficClass::Standard),
     );
     assert_eq!(
-        notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_OPERATION, &[]),
-        Some(NotificationTrafficClass::AgentActivity),
+        notification_traffic(
+            MARMOT_APP_EVENT_KIND_EDIT,
+            &agent_item_tags("tool", "running", 2)
+        ),
+        None,
+    );
+    assert_eq!(
+        notification_traffic(MARMOT_APP_EVENT_KIND_AGENT_REQUEST, &[]),
+        None
     );
     assert_eq!(
         notification_traffic(MARMOT_APP_EVENT_KIND_CHAT, &[]),
         Some(NotificationTrafficClass::Standard),
+    );
+    assert_eq!(
+        notification_traffic(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            &[vec!["turn".to_owned(), "t-1".to_owned()]]
+        ),
+        Some(NotificationTrafficClass::Standard),
+    );
+    assert_eq!(
+        notification_traffic(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            &[
+                vec!["turn".to_owned(), "t-1".to_owned()],
+                vec!["phase".to_owned(), "commentary".to_owned()],
+            ]
+        ),
+        None,
+        "the agent's remarks during a turn do not alert (D-078)",
     );
     assert_eq!(
         notification_traffic(MARMOT_APP_EVENT_KIND_REACTION, &[]),
@@ -2387,108 +2411,299 @@ fn device_group_kinds_never_notify_or_preview() {
     }
 }
 
-#[test]
-fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
-    use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY;
+fn agent_item_tags(item_type: &str, state: &str, version: u64) -> Vec<Vec<String>> {
+    [
+        ["v", &version.to_string()],
+        ["state", state],
+        ["title", "Allow this command?"],
+        ["harness", "codex"],
+        ["item_id", "call-1"],
+        ["seq", "4"],
+        [
+            "fields",
+            &format!(r#"{{"type":"{item_type}","body":{{}}}}"#),
+        ],
+    ]
+    .iter()
+    .map(|tag| tag.iter().map(|part| (*part).to_owned()).collect())
+    .collect()
+}
 
-    let dir = tempfile::tempdir().unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let account_label = "alice";
-    let account_id_hex = app
-        .account_home()
-        .create_account(account_label)
-        .unwrap()
-        .account_id_hex;
-    let sender_id_hex = "bb".repeat(32);
-    let group_id_hex = "ee".repeat(32);
-    let message = RuntimeMessageReceived {
-        account_id_hex: account_id_hex.clone(),
-        account_label: account_label.to_owned(),
-        message: ReceivedMessage {
-            authority: None,
-            message_id_hex: "ff".repeat(32),
-            source_message_id_hex: "ff".repeat(32),
-            sender: sender_id_hex.clone(),
-            sender_display_name: Some("Agent".to_owned()),
-            group_id: cgka_traits::GroupId::new(vec![0xEE; 32]),
-            source_epoch: 1,
-            retention: None,
-            plaintext: r#"{"status":"running","text":"Searching relays"}"#.to_owned(),
-            kind: MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
-            // Even a receiver p-tag must not make a non-chat kind a mention.
-            tags: vec![vec![PUBKEY_REF_TAG.to_owned(), account_id_hex.clone()]],
-            recorded_at: 0,
-            received_at: 0,
-        },
+struct AgentNotifications {
+    _dir: tempfile::TempDir,
+    app: MarmotApp,
+    resolver: NotificationResolver,
+    account_label: &'static str,
+    account_id_hex: String,
+    agent: String,
+    group_id_hex: String,
+}
+
+impl AgentNotifications {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let account_label = "alice";
+        let account_id_hex = app
+            .account_home()
+            .create_account(account_label)
+            .unwrap()
+            .account_id_hex;
+        let agent = "bb".repeat(32);
+        let group_id_hex = "ee".repeat(32);
+        let mut resolver = NotificationResolver::default();
+        seed_group_state_resolver(
+            &app,
+            &mut resolver,
+            account_label,
+            &group_id_hex,
+            Some(&agent),
+            false,
+        );
+        Self {
+            _dir: dir,
+            app,
+            resolver,
+            account_label,
+            account_id_hex,
+            agent,
+            group_id_hex,
+        }
+    }
+
+    /// Store an event as ingress does, then hand its `MessageReceived` to
+    /// notification resolution.
+    fn receive(
+        &mut self,
+        id: &str,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: &str,
+        at: u64,
+    ) -> Option<NotificationUpdate> {
+        self.app
+            .account_storage(self.account_label)
+            .unwrap()
+            .app_storage()
+            .record_app_event(&storage_sqlite::StoredAppEvent {
+                group_id_hex: self.group_id_hex.clone(),
+                message_id_hex: id.to_owned(),
+                source_message_id_hex: Some(id.to_owned()),
+                source_epoch: Some(1),
+                direction: "received".to_owned(),
+                sender: self.agent.clone(),
+                plaintext: content.to_owned(),
+                kind,
+                tags: tags.clone(),
+                recorded_at: at,
+                received_at: at,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+        let message = RuntimeMessageReceived {
+            account_id_hex: self.account_id_hex.clone(),
+            account_label: self.account_label.to_owned(),
+            message: ReceivedMessage {
+                authority: None,
+                message_id_hex: id.to_owned(),
+                source_message_id_hex: id.to_owned(),
+                sender: self.agent.clone(),
+                sender_display_name: Some("Agent".to_owned()),
+                group_id: cgka_traits::GroupId::new(vec![0xEE; 32]),
+                source_epoch: 1,
+                retention: None,
+                plaintext: content.to_owned(),
+                kind,
+                tags,
+                recorded_at: at,
+                received_at: at,
+            },
+        };
+        notification_update_from_message(&self.app, &mut self.resolver, &message).unwrap()
+    }
+}
+
+fn edit_of(target: &str, tags: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let mut edit = vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]];
+    edit.extend(tags);
+    edit
+}
+
+#[test]
+fn an_agent_item_alerts_only_while_a_person_is_needed_or_when_its_turn_failed() {
+    use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_ITEM;
+
+    let mut chat = AgentNotifications::new();
+    let mut index = 0u8;
+    for item_type in ["approval", "question", "turn", "tool", "plan", "notice"] {
+        for state in [
+            "running",
+            "waiting",
+            "done",
+            "failed",
+            "declined",
+            "cancelled",
+        ] {
+            index += 1;
+            let id = format!("{index:02x}").repeat(32);
+            let update = chat.receive(
+                &id,
+                MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+                agent_item_tags(item_type, state, 1),
+                "Allow `ls`?",
+                10,
+            );
+            let alerts = matches!(
+                (item_type, state),
+                ("approval" | "question", "waiting") | ("turn", "failed")
+            );
+            assert_eq!(update.is_some(), alerts, "{item_type} {state}");
+            if let Some(update) = update {
+                assert_eq!(update.traffic_class, NotificationTrafficClass::Standard);
+                assert_eq!(update.message_id_hex.as_deref(), Some(id.as_str()));
+                // The content is the plain rendering.
+                assert_eq!(update.preview_text.as_deref(), Some("Allow `ls`?"));
+                assert!(!update.is_mention);
+            }
+        }
+    }
+}
+
+#[test]
+fn an_agent_item_edit_alerts_only_as_the_items_latest_version() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_EDIT};
+
+    let mut chat = AgentNotifications::new();
+    let item = "a1".repeat(32);
+    assert!(
+        chat.receive(
+            &item,
+            MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            agent_item_tags("turn", "running", 1),
+            "Working",
+            10,
+        )
+        .is_none()
+    );
+    // The turn ends failed: that edit alerts, under the item's own key.
+    let failed = chat
+        .receive(
+            &"a2".repeat(32),
+            MARMOT_APP_EVENT_KIND_EDIT,
+            edit_of(&item, agent_item_tags("turn", "failed", 3)),
+            "Failed",
+            11,
+        )
+        .expect("a failed turn alerts");
+    assert_eq!(failed.message_id_hex.as_deref(), Some(item.as_str()));
+    assert_eq!(
+        failed.notification_key,
+        format!("message:{}:{item}", chat.account_id_hex)
+    );
+    assert_eq!(failed.preview_text.as_deref(), Some("Failed"));
+    // An older version that alerts too, arriving late, is not the item's state.
+    assert!(
+        chat.receive(
+            &"a3".repeat(32),
+            MARMOT_APP_EVENT_KIND_EDIT,
+            edit_of(&item, agent_item_tags("turn", "failed", 2)),
+            "Failed earlier",
+            12,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn an_agent_item_whose_edit_came_first_alerts_when_it_arrives() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_EDIT};
+
+    let mut chat = AgentNotifications::new();
+    let item = "b1".repeat(32);
+    assert!(
+        chat.receive(
+            &"b2".repeat(32),
+            MARMOT_APP_EVENT_KIND_EDIT,
+            edit_of(&item, agent_item_tags("approval", "waiting", 2)),
+            "Allow?",
+            11,
+        )
+        .is_none(),
+        "nothing to show before the item arrives"
+    );
+    let update = chat
+        .receive(
+            &item,
+            MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            agent_item_tags("approval", "running", 1),
+            "Preparing",
+            10,
+        )
+        .expect("the held version is waiting for a person");
+    assert_eq!(update.preview_text.as_deref(), Some("Allow?"));
+}
+
+#[test]
+fn an_answer_a_control_or_a_remark_never_notifies_and_an_item_respects_mute() {
+    use cgka_traits::app_event::{
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_AGENT_REQUEST,
+        MARMOT_APP_EVENT_KIND_CHAT,
     };
-    let mut resolver = NotificationResolver::default();
-    seed_group_state_resolver(
-        &app,
-        &mut resolver,
-        account_label,
-        &group_id_hex,
-        Some(&sender_id_hex),
-        false,
-    );
 
-    let update = notification_update_from_message(&app, &mut resolver, &message)
-        .unwrap()
-        .expect("unmuted agent activity should produce a notification");
-    assert_eq!(
-        update.traffic_class,
-        NotificationTrafficClass::AgentActivity
+    let mut chat = AgentNotifications::new();
+    let account = chat.account_id_hex.clone();
+    assert!(
+        chat.receive(
+            &"c1".repeat(32),
+            MARMOT_APP_EVENT_KIND_AGENT_REQUEST,
+            vec![
+                vec!["p".to_owned(), account.clone()],
+                vec!["details".to_owned(), r#"{"action":"interrupt"}"#.to_owned()],
+            ],
+            "Stop",
+            10,
+        )
+        .is_none()
     );
-    assert_eq!(update.preview_text.as_deref(), Some("Searching relays"));
-    assert!(!update.is_mention);
-
-    app.set_chat_muted(account_label, &group_id_hex, None)
+    let remark = vec![
+        vec!["turn".to_owned(), "t-1".to_owned()],
+        vec!["phase".to_owned(), "commentary".to_owned()],
+    ];
+    assert!(
+        chat.receive(
+            &"c2".repeat(32),
+            MARMOT_APP_EVENT_KIND_CHAT,
+            remark,
+            "Running the tests now",
+            11,
+        )
+        .is_none()
+    );
+    assert!(
+        chat.receive(
+            &"c3".repeat(32),
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![vec!["turn".to_owned(), "t-1".to_owned()]],
+            "All tests pass",
+            12,
+        )
+        .is_some(),
+        "the agent's answer alerts as any chat message does"
+    );
+    chat.app
+        .set_chat_muted(chat.account_label, &chat.group_id_hex, None)
         .unwrap();
-    assert_eq!(
-        notification_update_from_message(&app, &mut resolver, &message).unwrap(),
-        None,
-        "agent activity must respect the conversation mute"
-    );
-}
-
-#[test]
-fn agent_activity_notification_preview_uses_the_structured_text() {
-    use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY;
-
-    assert_eq!(
-        preview_text_for_kind(
-            MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
-            r#"{"status":"running","text":"Searching relays"}"#,
+    assert!(
+        chat.receive(
+            &"c4".repeat(32),
+            MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            agent_item_tags("approval", "waiting", 1),
+            "Allow?",
+            13,
         )
-        .as_deref(),
-        Some("Searching relays"),
-    );
-}
-
-#[test]
-fn agent_operation_notification_preview_prefers_the_structured_preview() {
-    use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_OPERATION;
-
-    assert_eq!(
-        preview_text_for_kind(
-            MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-            r#"{"status":"running","text":"Executing browser tool","preview":"Opening example.com"}"#,
-        )
-        .as_deref(),
-        Some("Opening example.com"),
-    );
-}
-
-#[test]
-fn agent_operation_notification_preview_falls_back_to_text() {
-    use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_OPERATION;
-
-    assert_eq!(
-        preview_text_for_kind(
-            MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-            r#"{"status":"running","text":"Executing browser tool"}"#,
-        )
-        .as_deref(),
-        Some("Executing browser tool"),
+        .is_none(),
+        "a muted chat stays quiet"
     );
 }
 
