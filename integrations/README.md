@@ -111,7 +111,7 @@ install_verified() (
 ```
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.18.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.19.0"
 ```
 
 ### Hermes

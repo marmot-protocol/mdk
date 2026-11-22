@@ -2,8 +2,14 @@
 
 ## Unreleased
 
+## 0.19.0 - 2026-11-22
+
+See the [release notes](docs/release/0.19.0.md) and the [0.18.0 upgrade guide](docs/integration/0.19.0.md).
+
 ### Breaking changes
 
+- The account database advances from schema 216 to 218. Upgrade every process that opens it, including extensions.
+- Draft input saves keep omitted attachments. Send an explicit removal for an attachment the user deletes.
 - The retired QUIC live preview of agent text is removed (marmot-protocol/marmot#513). The `transport-quic-stream`,
   `transport-quic-broker` (`marmot-quic-broker`) and `agent-stream-compose` crates, the broker Docker image and its
   GHCR workflow are gone, and so are the agent stream APIs in `marmot-app`, UniFFI and the C bindings and `wn stream`.
@@ -19,6 +25,12 @@
   `quicCandidates`, `streaming` and `blockStreaming` keys older installers wrote, and the Hermes gateway configure
   helper drops `--streaming`, `--transport` and `--configure-global-streaming` and keeps Marmot streaming off.
 
+### Added
+
+- Thread views can send NIP-22 messages from Rust, MarmotKit and C. Timelines expose the thread root and parent,
+  and thread messages count toward chat activity, mentions and notifications.
+- Rust hosts can submit tagged text, replies, edits and custom events with a token that survives restart.
+
 ### Changed
 
 - `wn-agent` passes NIP-22 thread messages (kind 1111 with a parent) to the agent like chat: as inbound messages whose
@@ -26,6 +38,8 @@
 
 ### Fixed
 
+- Linked devices resend invitation answers promptly after losing a device-group fork. A sign-out held by device
+  removal also stops retrying maintenance every 15 seconds.
 - `wn-agent` no longer passes a message's original text and attachments to the agent when it was deleted before the
   agent caught up after a lag, including while earlier catch-up messages were still being written; the agent receives
   only the deletion.

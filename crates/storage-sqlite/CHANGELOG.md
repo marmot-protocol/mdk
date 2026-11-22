@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.19.0 - 2026-11-22
+
 ### Breaking changes
 
 - `TimelineMessageRecord` and `TimelineReplyPreview` gain `thread: Option<TimelineThreadRef>`, the row's NIP-22

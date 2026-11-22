@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-22
+
 ### Breaking changes
 
 - `MarmotTimelineMessageRecord` and `MarmotTimelineReplyPreview` gain a trailing nullable

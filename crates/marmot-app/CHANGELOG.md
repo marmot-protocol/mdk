@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.19.0 - 2026-11-22
+
 ### Breaking changes
 
 - The agent text stream over QUIC (live agent text previews) is removed. Gone: `MarmotAppRuntime::open_agent_publisher`,

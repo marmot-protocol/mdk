@@ -9,6 +9,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-22
+
 ### Removed
 
 - The retired agent text streams over QUIC (live agent text previews) are gone from `wn`, `wnd` and `wn tui`. This is

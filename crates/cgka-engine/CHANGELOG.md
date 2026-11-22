@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.19.0 - 2026-11-22
+
 ### Breaking changes
 
 - `group_context` no longer exports the `agent-text-stream-quic` MLS exporter secret
