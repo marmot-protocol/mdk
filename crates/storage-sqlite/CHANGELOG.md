@@ -7,6 +7,9 @@
 - Migration 0219 adds `message_timeline.timeline_order_seq`, rebuilds the canonical order index with it before the
   message id, and drops kind-1202 timeline rows. `TimelineMessageRecord` gains `agent_item` and
   `timeline_order_seq`, and `TimelineUpdateTrigger::AgentActivity`/`AgentOperation` become `AgentItem`.
+- Migration 0221 adds `agent_item_expired_targets`: the retention sweep records each agent item whose row it removed,
+  so an edit of it that arrives later does not show it again. A sweep from before the migration is not recorded, so
+  on a nightly build's database a late edit of an item removed then can still show it.
 
 ### Added
 
@@ -15,6 +18,13 @@
 - A kind-1201 agent item with an `E` tag is placed in that thread, under the parent its `e` names or else the root,
   and `reply_to_message_id_hex` is that parent unless the item names a `started_by`. An edit keeps the thread tags
   of the item's first event, whatever thread tags it carries.
+- An agent item whose first event this device does not hold, such as one sent before the member joined, gets a row
+  from its edits: the earliest readable edit stands in for the first event, at its place, and the highest version
+  shows. `TimelineMessageRecord::agent_item_first_event_missing` says so. The first event, if it arrives, takes the
+  row back to its own place. A nightly build from before this change stored such edits without a row: the item shows
+  once another event of it arrives or the chat's timeline is rebuilt.
+- A history import reports the rows it removed, such as an item whose only edit it deleted, as `Remove` changes, so
+  an open timeline drops them.
 - An agent's own words in a thread under one of its agent items (a kind 1111 with `E`, `K` 1201 and `P` its sender)
   never count as unread, in the projection, its rebuild and the retention sweep.
 

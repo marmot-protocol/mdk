@@ -508,6 +508,11 @@ pub struct TimelineMessageRecordFfi {
     /// as the old shape an outdated connector sends: render it as an
     /// unreadable agent item.
     pub agent_item: Option<AgentItemFfi>,
+    /// True for an agent item whose first event this device does not hold,
+    /// such as one that began before this member joined: the row is its
+    /// earliest edit, at that edit's place, showing the latest version. Say
+    /// the item started earlier. False once the first event arrives.
+    pub agent_item_first_event_missing: bool,
     pub reactions: TimelineReactionSummaryFfi,
     pub edit: Option<TimelineEditSummaryFfi>,
     pub deleted: bool,
@@ -577,6 +582,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             media,
             group_system: group_system.map(Into::into),
             agent_item: value.agent_item.map(Into::into),
+            agent_item_first_event_missing: value.agent_item_first_event_missing,
             reactions: value.reactions.into(),
             edit: value.edit.map(Into::into),
             deleted: value.deleted,
@@ -1103,6 +1109,7 @@ mod tests {
             history_import_provenance: None,
             agent_item: None,
             timeline_order_seq: 0,
+            agent_item_first_event_missing: false,
         }
     }
 

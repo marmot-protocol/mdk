@@ -33,7 +33,35 @@ pub struct TimelineEditHistoryPage {
     pub has_more_before: bool,
 }
 
-pub(super) fn apply_group(rows: &mut BTreeMap<String, TimelineRow>, events: &[RawAppEvent]) {
+/// Apply each row's edits. An agent item this group holds edits of, but not
+/// the first event of, first gets its row: see [`held_agent_item_row`]. One
+/// retention removed (`expired`) does not.
+pub(super) fn apply_group(
+    rows: &mut BTreeMap<String, TimelineRow>,
+    events: &[RawAppEvent],
+    expired: &HashSet<String>,
+) {
+    let stored = events
+        .iter()
+        .map(|event| event.message_id_hex.as_str())
+        .collect::<HashSet<_>>();
+    let (by_target, deleted) = edits_by_target(events);
+    for (target, edits) in by_target {
+        if !stored.contains(target)
+            && !expired.contains(target)
+            && let Some(held) = held_agent_item_row(target, edits.iter().copied(), &deleted)
+        {
+            rows.insert(target.to_owned(), held);
+        }
+        if let Some(row) = rows.get_mut(target) {
+            let versions = resolve(row, edits.into_iter(), &deleted);
+            apply(row, &versions);
+        }
+    }
+}
+
+/// Each target's edits, and the edits their own senders deleted.
+fn edits_by_target(events: &[RawAppEvent]) -> (HashMap<&str, Vec<&RawAppEvent>>, HashSet<String>) {
     let mut by_target = HashMap::<&str, Vec<&RawAppEvent>>::new();
     let mut senders = HashMap::new();
     for edit in events
@@ -59,12 +87,69 @@ pub(super) fn apply_group(rows: &mut BTreeMap<String, TimelineRow>, events: &[Ra
             }
         }
     }
-    for (target, edits) in by_target {
-        if let Some(row) = rows.get_mut(target) {
-            let versions = resolve(row, edits.into_iter(), &deleted);
-            apply(row, &versions);
-        }
+    (by_target, deleted)
+}
+
+/// The row of an agent item whose first event this device does not hold. A
+/// member added to the group after the item began can never read that event
+/// (marmot-agents D-124), and an edit carries the whole item, so the earliest
+/// readable edit stands in for the first event, at its place in the timeline,
+/// and every edit then applies to it as usual. Only that edit's sender's
+/// edits count, as a first event's sender's would. The first event, should it
+/// arrive (in a sibling's history, say), replaces the row.
+pub(super) fn held_agent_item_row<'a>(
+    target: &str,
+    edits: impl Iterator<Item = &'a RawAppEvent>,
+    deleted: &HashSet<String>,
+) -> Option<TimelineRow> {
+    let first = held_agent_item_anchor(target, edits, deleted)?;
+    Some(timeline_row_from_app_event(&RawAppEvent {
+        message_id_hex: target.to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+        tags: first
+            .tags
+            .iter()
+            .filter(|t| t.first().is_none_or(|name| name != EVENT_REF_TAG))
+            .cloned()
+            .collect(),
+        ..first.clone()
+    }))
+}
+
+/// The edit a held item's row is built from: the earliest readable agent-item
+/// edit naming `target` alone that its sender has not deleted. `target` must
+/// be an event id, since an answer to the item names it.
+pub(super) fn held_agent_item_anchor<'a>(
+    target: &str,
+    edits: impl Iterator<Item = &'a RawAppEvent>,
+    deleted: &HashSet<String>,
+) -> Option<&'a RawAppEvent> {
+    let event_id = target.len() == 64
+        && target
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !event_id {
+        return None;
     }
+    edits
+        .filter(|e| {
+            e.kind == MARMOT_APP_EVENT_KIND_EDIT
+                && !e.invalidated
+                && !deleted.contains(&e.message_id_hex)
+                && sole_target(e) == Some(target)
+                && cgka_traits::AgentItem::from_tags(&e.tags).is_ok()
+        })
+        .min_by(|a, b| (a.recorded_at, &a.message_id_hex).cmp(&(b.recorded_at, &b.message_id_hex)))
+}
+
+/// The one message an edit names with its single `e` tag.
+fn sole_target(edit: &RawAppEvent) -> Option<&str> {
+    let mut targets = edit
+        .tags
+        .iter()
+        .filter(|t| t.first().is_some_and(|name| name == EVENT_REF_TAG));
+    let target = targets.next()?.get(1)?;
+    targets.next().is_none().then_some(target.as_str())
 }
 
 /// One accepted edit. An edit of an agent item also carries the item's tags,
@@ -89,16 +174,11 @@ fn resolve<'a>(
     let base_version = cgka_traits::AgentItem::from_tags(&row.tags).map_or(0, |item| item.version);
     let mut versions = edits
         .filter(|e| {
-            let mut targets = e
-                .tags
-                .iter()
-                .filter(|t| t.first().is_some_and(|name| name == EVENT_REF_TAG));
             !e.invalidated
                 && e.sender == row.sender
                 && e.group_id_hex == row.group_id_hex
                 && !deleted.contains(&e.message_id_hex)
-                && targets.next().and_then(|t| t.get(1)) == Some(&row.message_id_hex)
-                && targets.next().is_none()
+                && sole_target(e) == Some(row.message_id_hex.as_str())
         })
         .filter_map(|e| {
             let item = if agent_item {

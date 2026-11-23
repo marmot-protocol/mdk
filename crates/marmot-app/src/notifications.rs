@@ -2245,9 +2245,20 @@ fn notification_update_from_message(
         Some(row) => preview_text_for_kind(MARMOT_APP_EVENT_KIND_AGENT_ITEM, &row.plaintext),
         None => preview_text_for_message(&event.message),
     };
-    let notification_key = format!("message:{}:{message_id_hex}", event.account_id_hex);
-    let delivery_key = match agent_item.as_ref().and_then(|row| row.agent_item.as_ref()) {
-        Some(item) => format!("{notification_key}:v{}", item.version),
+    // Event ids carry no group, and an edit can name any item id, so the key
+    // names the chat too: one chat's alert never replaces another's.
+    let notification_key = format!(
+        "message:{}:{group_id_hex}:{message_id_hex}",
+        event.account_id_hex
+    );
+    // The row's author is part of an item version's delivery: a row built
+    // from a held edit is that edit's sender's, and must not take the place
+    // of the agent's own alert once the item's first event arrives.
+    let delivery_key = match agent_item
+        .as_ref()
+        .and_then(|row| row.agent_item.as_ref().map(|item| (&row.sender, item)))
+    {
+        Some((sender, item)) => format!("{notification_key}:{sender}:v{}", item.version),
         None => notification_key.clone(),
     };
     Ok(Some(NotificationUpdate {
@@ -2283,8 +2294,9 @@ enum AgentItemAlert {
 /// Decide an agent item, or an edit of one, against the item's stored row,
 /// which holds its highest version: it alerts while that version is a
 /// waiting approval or question, or a failed turn (D-024). An edit alerts only
-/// when it is that version, so a late older one never does; an item whose
-/// edit came first alerts when the item arrives. A removed or invalidated item
+/// when it is that version, so a late older one never does; an edit that comes
+/// before its item, or of an item sent before this member joined, alerts from
+/// the row it gives the item. A removed or invalidated item
 /// never alerts.
 fn agent_item_alert(
     app: &MarmotApp,

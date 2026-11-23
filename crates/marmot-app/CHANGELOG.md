@@ -14,6 +14,8 @@
   latest version is a waiting approval or question, or a failed turn; other items, every kind 1202 and a chat message
   tagged `["phase", "commentary"]` do not notify. Each alerting version is delivered once, live or after the subscription
   catches up, under the key of the item's first event, so the host replaces the earlier notification; a reaction to an unreadable item previews nothing.
+- A message's `NotificationUpdate::notification_key` names its chat (`message:<account>:<group>:<message id>`). Event
+  ids carry no chat, so one chat's alert no longer replaces another's for the same id.
 - Whether a send wakes the group's members is read from the sent event, so a send resumed after a restart wakes them
   exactly as the first attempt would: a chat message tagged `["phase", "commentary"]`, also as a reply, wakes nobody,
   and an agent item or a new version of one wakes members only while it needs a person or its turn failed.
@@ -34,6 +36,9 @@
   and `e`/`k`/`p` (parent), and `submit_custom_event` and `send_custom_event` take its `e` only beside an `E`. An edit
   of an item still carries no `e` but its target's. A thread message answering an item in a thread names that item's
   root and the item as its parent.
+- An agent item whose first event this device never gets, such as one sent before the member joined, is shown from
+  its edits in its place in the timeline and its thread (marmot-agents D-124), with
+  `TimelineMessageRecord::agent_item_first_event_missing` set, and an alerting edit of it alerts.
 - The agent's own words in a thread under one of its items, a kind 1111 with an `E` whose `K` is 1201 and whose `P`
   is its author, neither notify nor wake members (D-122), and never count as unread or raise the @-badge. Items in a
   thread keep their own alert rule.

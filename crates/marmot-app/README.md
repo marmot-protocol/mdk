@@ -551,9 +551,16 @@ tags. MDK renames one tag of that design: a turn names the chat message that sta
   `v`. Resubmitting a token after a restart returns the same event and sends nothing new.
 - **Projection.** One row per item at its first event, holding the version with the highest `v`: its content and
   tags replace the row's, an older version that arrives late changes nothing, and an edit that arrives before its
-  item is held and applied when the item arrives. The row is not marked edited. Within one second a turn's rows are
+  item is applied when the item arrives. The row is not marked edited. Within one second a turn's rows are
   ordered by the first event's `seq`. `TimelineMessageRecord::agent_item` is the parsed latest version, with its
   `settles`; it is `None` for an item MDK cannot read, such as the old shape. A kind 1202 has no row.
+- **Late joiners.** A member added after an item began never gets its first event, only its later edits, and each
+  edit carries the whole item. Until the first event arrives (it may come in a sibling's history), the earliest edit
+  stands in for it: the row has the first event's id, sits at that edit's place, shows the highest version, and has
+  `agent_item_first_event_missing` set, so the app can say the item started earlier. An item in a thread stays in
+  it when its edits repeat `E`/`K`/`P`; without them it shows in the main timeline. Only the sender of that earliest
+  edit can change or delete the row, and its retention and import source are that edit's. Once retention removes
+  an item, an edit of it that arrives later does not show it again.
 - **Subagent threads.** A subagent is a thread hanging from its `task` item (marmot-agents D-121). Every item in it
   carries NIP-22's tags: `E`/`K`/`P` name the top-level subagent's `task` item and `e`/`k`/`p` the immediate parent,
   and the subagent's words are kind 1111 comments with the same tags. MDK places such an item in its thread

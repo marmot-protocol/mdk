@@ -347,6 +347,13 @@ pub struct TimelineMessageRecord {
     /// such as the old shape an outdated connector sends (D-051).
     #[serde(default)]
     pub agent_item: Option<cgka_traits::AgentItem>,
+    /// True for an agent item whose first event this device does not hold,
+    /// such as one that began before this member joined: the row is its
+    /// earliest edit, at that edit's place, showing the latest version
+    /// (marmot-agents D-124). An app can say the item started earlier. False
+    /// once the first event arrives, and for every other row.
+    #[serde(default)]
+    pub agent_item_first_event_missing: bool,
     /// An agent item's `seq` from its first event, which orders a turn's rows
     /// within one second; 0 for every other row.
     #[serde(default)]
@@ -1867,7 +1874,8 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
         .map(|event| event.message_id_hex.clone())
         .collect();
     let removal_targets = removal_validation::targets(tx, group_id_hex, None)?;
-    let mut rows = project_group_events(events, &removal_targets);
+    let expired_agent_items = expired_agent_items_tx(tx, group_id_hex)?;
+    let mut rows = project_group_events(events, &removal_targets, &expired_agent_items);
     let kept_receipts = kept_recipient_receipts_tx(tx, group_id_hex)?;
     for row in &mut rows {
         let receipt_kept = kept_receipts.contains(&row.message_id_hex);
@@ -2076,6 +2084,17 @@ fn secure_prune_selected_app_events_tx(
         )?);
     }
 
+    // The agent-item rows this sweep may remove: its items and its edits'
+    // targets, before anything below deletes them.
+    let item_rows = agent_item_rows_tx(
+        tx,
+        group_id_hex,
+        pruned_message_ids
+            .iter()
+            .chain(&retained_edit_targets)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+    )?;
     let roots = pruned_message_ids.clone();
     for root in &roots {
         for dependent in
@@ -2125,6 +2144,18 @@ fn secure_prune_selected_app_events_tx(
     affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
     for message_id in affected_message_ids {
         upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
+    }
+    // An item whose row is now gone stays gone, whatever edit of it comes later.
+    for message_id in &item_rows {
+        tx.execute_cached(
+            "INSERT OR IGNORE INTO agent_item_expired_targets (group_id_hex, message_id_hex)
+             SELECT ?1, ?2
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM message_timeline WHERE group_id_hex = ?1 AND message_id_hex = ?2
+             )",
+            params![group_id_hex, message_id],
+        )
+        .storage()?;
     }
     refresh_chat_list_last_message_after_secure_prune_tx(tx, group_id_hex)?;
     crate::app::chat_list::refresh_chat_list_unread_after_secure_prune_tx(
@@ -2452,13 +2483,81 @@ fn raw_app_event_tx(
         .storage()
 }
 
+/// The agent items of a group whose rows retention removed. An edit of one
+/// that arrives later must not show it again from that edit.
+fn expired_agent_items_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<HashSet<String>> {
+    let mut stmt = tx
+        .prepare_cached(
+            "SELECT message_id_hex FROM agent_item_expired_targets WHERE group_id_hex = ?1",
+        )
+        .storage()?;
+    stmt.query_map(params![group_id_hex], |row| row.get(0))
+        .storage()?
+        .collect::<Result<_, _>>()
+        .storage()
+}
+
+fn agent_item_expired_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<bool> {
+    tx.query_row_cached(
+        "SELECT EXISTS (SELECT 1 FROM agent_item_expired_targets
+                        WHERE group_id_hex = ?1 AND message_id_hex = ?2)",
+        params![group_id_hex, message_id_hex],
+        |row| row.get(0),
+    )
+    .storage()
+}
+
+/// Of `candidates`, the ids that have an agent-item row.
+fn agent_item_rows_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    candidates: impl IntoIterator<Item = String>,
+) -> StorageResult<BTreeSet<String>> {
+    let mut stmt = tx
+        .prepare_cached(&format!(
+            "SELECT EXISTS (SELECT 1 FROM message_timeline
+                            WHERE group_id_hex = ?1 AND message_id_hex = ?2
+                              AND kind = {MARMOT_APP_EVENT_KIND_AGENT_ITEM})"
+        ))
+        .storage()?;
+    let mut rows = BTreeSet::new();
+    for id in candidates {
+        let is_item: bool = stmt
+            .query_row(params![group_id_hex, id], |row| row.get(0))
+            .storage()?;
+        if is_item {
+            rows.insert(id);
+        }
+    }
+    Ok(rows)
+}
+
 fn project_single_message_timeline_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<Option<TimelineRow>> {
     let Some(event) = raw_app_event_tx(tx, group_id_hex, message_id_hex)? else {
-        return Ok(None);
+        if agent_item_expired_tx(tx, group_id_hex, message_id_hex)? {
+            return Ok(None);
+        }
+        let held = app_events_targeting_message_tx(
+            tx,
+            group_id_hex,
+            MARMOT_APP_EVENT_KIND_EDIT,
+            message_id_hex,
+        )?;
+        let deleted = deleted_reaction_ids_for_target_tx(tx, group_id_hex, &held)?;
+        let Some(mut row) = edits::held_agent_item_row(message_id_hex, held.iter(), &deleted)
+        else {
+            return Ok(None);
+        };
+        apply_targeted_modifiers_tx(tx, &mut row)?;
+        return Ok(Some(row));
     };
 
     let mut row = match event.kind {
@@ -3312,6 +3411,15 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
 ) -> StorageResult<BTreeSet<String>> {
     let mut ids = BTreeSet::new();
     let mut reply_preview_targets = BTreeSet::new();
+    // An event that is no agent item, arriving with the id of an item shown
+    // from its edits, shows those edits named no item: the row goes.
+    if kind != MARMOT_APP_EVENT_KIND_AGENT_ITEM {
+        ids.extend(agent_item_rows_tx(
+            tx,
+            group_id_hex,
+            [message_id_hex.to_owned()],
+        )?);
+    }
     match kind {
         MARMOT_APP_EVENT_KIND_CHAT
         | MARMOT_APP_EVENT_KIND_AGENT_ITEM
@@ -4265,6 +4373,7 @@ pub(crate) fn canonical_timeline_order_key<'a>(
 fn project_group_events(
     events: Vec<RawAppEvent>,
     removal_targets: &BTreeMap<String, BTreeSet<String>>,
+    expired_agent_items: &HashSet<String>,
 ) -> Vec<TimelineRow> {
     let mut timeline = BTreeMap::<String, TimelineRow>::new();
     let mut reactions = Vec::new();
@@ -4313,7 +4422,7 @@ fn project_group_events(
         }
     }
 
-    edits::apply_group(&mut timeline, &events);
+    edits::apply_group(&mut timeline, &events, expired_agent_items);
 
     let events_by_id = events
         .iter()
@@ -4916,6 +5025,7 @@ fn timeline_record_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timeline
             .try_into()
             .unwrap_or_default(),
         agent_item: None,
+        agent_item_first_event_missing: false,
         edit: row
             .get::<_, Option<String>>(19)?
             .map(|json| serde_json::from_str(&json))
@@ -5181,6 +5291,22 @@ fn hydrate_timeline_presentation(
     reports::hydrate(conn, messages)?;
     filter_blocked_reactions(conn, messages)?;
     hydrate_polls(conn, messages)?;
+    for message in messages
+        .iter_mut()
+        .filter(|message| message.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM)
+    {
+        message.agent_item_first_event_missing = !conn
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM app_events
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2)",
+                params![message.group_id_hex, message.message_id_hex],
+                |row| row.get::<_, bool>(0),
+            )
+            .storage()?;
+        if message.agent_item_first_event_missing {
+            hydrate_held_agent_item_source(conn, message)?;
+        }
+    }
     let mut legacy_roots = HashMap::new();
     for message in messages.iter_mut() {
         message.thread = threads::thread_ref(
@@ -5219,6 +5345,67 @@ fn hydrate_timeline_presentation(
             .get(&message.group_id_hex)
             .and_then(|group| group.get(target))
             .cloned();
+    }
+    Ok(())
+}
+
+/// A row built from an agent item's edits has the retention and import source
+/// of the edit it was built from, chosen as the projection chose it: the first
+/// event the row stands for has neither.
+fn hydrate_held_agent_item_source(
+    conn: &Connection,
+    message: &mut TimelineMessageRecord,
+) -> StorageResult<()> {
+    let edits = app_events_targeting_message_tx(
+        conn,
+        &message.group_id_hex,
+        MARMOT_APP_EVENT_KIND_EDIT,
+        &message.message_id_hex,
+    )?;
+    let deleted = deleted_reaction_ids_for_target_tx(conn, &message.group_id_hex, &edits)?;
+    let Some(anchor) =
+        edits::held_agent_item_anchor(&message.message_id_hex, edits.iter(), &deleted)
+    else {
+        return Ok(());
+    };
+    let anchor = conn
+        .query_row_cached(
+            &format!(
+                "SELECT source.retention_seconds, source.retention_expires_at,
+                        {TIMELINE_IMPORT_PROVENANCE_SQL},
+                        {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
+                 FROM app_events AS source
+                 LEFT JOIN app_event_imports AS imported
+                   ON imported.group_id_hex = source.group_id_hex
+                  AND imported.message_id_hex = source.message_id_hex
+                 WHERE source.group_id_hex = ?1 AND source.message_id_hex = ?2"
+            ),
+            params![message.group_id_hex, anchor.message_id_hex],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?
+                        .and_then(|value| value.try_into().ok()),
+                    row.get::<_, Option<i64>>(1)?
+                        .and_then(|value| value.try_into().ok()),
+                    history_import_provenance_from_row(row)?,
+                    row.get::<_, Option<Vec<u8>>>("imported_source_slot")?
+                        .map(|slot| -> rusqlite::Result<_> {
+                            Ok(HistoryImportSource::new(
+                                &slot,
+                                row.get("imported_source_label")?,
+                            ))
+                        })
+                        .transpose()?,
+                ))
+            },
+        )
+        .optional()
+        .storage()?;
+    if let Some((retention_seconds, retention_expires_at, provenance, imported_from)) = anchor {
+        message.retention_seconds = retention_seconds;
+        message.retention_expires_at = retention_expires_at;
+        message.history_import_provenance = provenance;
+        message.imported_from = imported_from;
     }
     Ok(())
 }

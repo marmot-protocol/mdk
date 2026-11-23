@@ -856,6 +856,7 @@ pub(crate) fn timeline_message_record_json(
         "tags": message.tags,
         "group_system": group_system,
         "agent_item": message.agent_item,
+        "agent_item_first_event_missing": message.agent_item_first_event_missing,
         "timeline_at": message.timeline_at,
         "received_at": message.received_at,
         "reply_to_message_id": message.reply_to_message_id_hex,
@@ -1137,6 +1138,7 @@ mod tests {
             history_import_provenance: None,
             agent_item: None,
             timeline_order_seq: 0,
+            agent_item_first_event_missing: false,
         };
         let mut display_name_for_account = |account_id: &str| {
             if account_id == actor {
@@ -1198,6 +1200,7 @@ mod tests {
             history_import_provenance: None,
             agent_item: None,
             timeline_order_seq: 0,
+            agent_item_first_event_missing: false,
         };
 
         for confirmed in [true, false] {

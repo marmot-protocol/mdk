@@ -343,6 +343,10 @@ c_mirror! {
         /// The latest version of an agent item (kind 1201). NULL for other
         /// kinds; a kind-1201 row with NULL here is an unreadable item.
         opt_rec agent_item: MarmotAgentItem,
+        /// True for an agent item whose first event this device does not
+        /// hold, such as one that began before this member joined: the row
+        /// is its earliest edit, showing the latest version.
+        copy agent_item_first_event_missing: bool,
         rec reactions: MarmotTimelineReactionSummary,
         opt_rec edit: MarmotTimelineEditSummary,
         copy deleted: bool,

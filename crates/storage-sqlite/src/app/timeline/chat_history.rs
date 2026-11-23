@@ -242,6 +242,9 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let mut imported = 0;
             let mut changed = BTreeSet::new();
+            // A removed row a later event in this batch brings back is an
+            // upsert, so removals are settled against the final rows.
+            let mut removed = BTreeMap::new();
             for event in events {
                 let expired = event
                     .retention
@@ -269,6 +272,13 @@ impl SqliteAppStorage {
                     event.retention,
                     None,
                 )?;
+                removed.extend(update.changes.into_iter().filter_map(|change| match change {
+                    TimelineMessageChange::Remove {
+                        message_id_hex,
+                        reason,
+                    } => Some((message_id_hex, reason)),
+                    TimelineMessageChange::Upsert { .. } => None,
+                }));
                 changed.extend(
                     update
                         .messages
@@ -353,6 +363,19 @@ impl SqliteAppStorage {
                     trigger: TimelineUpdateTrigger::SnapshotRefresh,
                     message: Box::new(message),
                 })
+                .chain(
+                    removed
+                        .into_iter()
+                        .filter(|(message_id_hex, _)| {
+                            !messages
+                                .iter()
+                                .any(|message| &message.message_id_hex == message_id_hex)
+                        })
+                        .map(|(message_id_hex, reason)| TimelineMessageChange::Remove {
+                            message_id_hex,
+                            reason,
+                        }),
+                )
                 .collect();
             Ok(AppEventImport {
                 imported,
