@@ -9234,6 +9234,12 @@ async fn pending_setup_stays_quiet() {
             .await,
         Err(AppError::AccountSetupRetryRequired)
     ));
+    home.set_account_signed_out(&label, true).unwrap();
+    assert!(matches!(
+        runtime.sign_in_account(&label).await,
+        Err(AppError::AccountSetupRetryRequired)
+    ));
+    assert!(home.account(&label).unwrap().signed_out);
     assert!(
         runtime
             .accounts()

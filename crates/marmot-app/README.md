@@ -126,6 +126,9 @@ Explicit generated creation, nsec import, and public or external sign-in finish 
 setup admission. Pending accounts cannot start workers or publish. Generated creation reads the strict account catalog;
 an unreadable record blocks cleanup and fresh identity creation.
 
+Account-picker sign-in returns `AccountSetupRetryRequired` while compensation is pending and leaves the signed-out flag
+unchanged. Retry the original setup operation to finish recovery.
+
 Interactive import and external-signer onboarding use the same recovery before admitting a new onboarding attempt.
 
 After compensating a generated attempt, retry uses the caller's new relay lists and publication flags. Saved setup
@@ -138,7 +141,8 @@ The runtime owns NIP-46 sessions for `bunker://` and client-initiated
 `nostrconnect://` pairing. Each account has an independent transport and
 communication key. Permission approval precedes connection, and stored sessions
 restore before account workers without host signer callbacks. Sign-out and wipe
-erase the communication key; terminal storage close preserves it for restart.
+attempt communication-key erasure; failed erasure leaves durable cleanup intent.
+Terminal storage close preserves the key for restart.
 Native login/register adoption is runtime-owned once admitted: dropping its future
 stops waiting, not adoption. First await successful session `connect`; `nip46_login`
 accepts only an already-verified `Ready` session and never silently connects.

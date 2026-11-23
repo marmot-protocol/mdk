@@ -1789,6 +1789,8 @@ removal and the required tagged leaves;
 successful local leave calls, not confirmed membership removal. The call still attempts local account deletion after remote leave
 failures. Show the chats in `group_leave_failures` and check `local_cleanup.completed` independently; local cleanup
 completion does not establish that this device left every chat.
+`local_cleanup.completed` confirms committed local account removal, not vault credential erasure or reclamation of
+detached bytes. Failed cleanup retains durable intent.
 A queued member Leave appears in `group_leave_failures`.
 
 ### Overdue KeyPackage refresh

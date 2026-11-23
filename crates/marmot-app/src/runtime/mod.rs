@@ -7881,10 +7881,16 @@ impl AccountManager {
             let _worker_transaction = self.worker_transactions.lock().await;
             lock_wait.finish(TelemetryOutcome::Success);
             self.shared.lifecycle().ensure_running()?;
-            let account = self
-                .app
-                .account_home()
-                .set_account_signed_out(account_ref, false)?;
+            let account = {
+                let home = self.app.account_home();
+                if home
+                    .account_setup_state(&account.label)?
+                    .is_some_and(|state| state.phase == AccountSetupPhase::CompensationPending)
+                {
+                    return Err(AppError::AccountSetupRetryRequired);
+                }
+                home.set_account_signed_out(account_ref, false)?
+            };
             self.clear_startup_retry(&account.account_id_hex);
             self.reconcile_locked_report_for(Some(&account.account_id_hex))
                 .await?

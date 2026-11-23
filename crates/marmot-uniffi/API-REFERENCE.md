@@ -252,6 +252,8 @@ pub async fn sign_in_account( &self, account_ref: String, ) -> Result<AccountSum
 
 Re-activate a non-destructively signed-out local account. This clears the durable signed-out marker and starts the account worker again; relay list/key-package repair can still be driven by the existing publish commands after sign-in.
 
+If setup compensation is pending, returns `AccountSetupRetryRequired` without changing the signed-out marker. Retry the original setup operation to finish recovery before reactivating the account.
+
 [Source](src/commands/account.rs#L377)
 
 ### `Marmot::publish_relay_lists`

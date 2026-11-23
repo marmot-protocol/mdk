@@ -2576,6 +2576,8 @@ typedef struct MarmotRelayFailure {
 
 /**
  * Local cleanup result inside a sign-out/wipe outcome.
+ * Completion confirms local account removal, not vault erasure or
+ * reclamation of detached bytes.
  */
 typedef struct MarmotLocalCleanupReport {
   bool completed;

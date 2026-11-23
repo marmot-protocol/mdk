@@ -210,6 +210,8 @@ c_mirror! {
 
 c_mirror! {
     /// Local cleanup result inside a sign-out/wipe outcome.
+    /// Completion confirms local account removal, not vault erasure or
+    /// reclamation of detached bytes.
     MarmotLocalCleanupReport from LocalCleanupReportFfi {
         copy completed: bool,
         /// Failure classification when not completed. Nullable.

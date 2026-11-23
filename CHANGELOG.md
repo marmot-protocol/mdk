@@ -19,6 +19,7 @@
 - Destructive sign-out and rollback commit local account removal before deleting vault credentials.
   A vault failure leaves cleanup pending without restoring the removed account. Rolling back a public
   account's signer setup keeps its data. Windows replaces setup journals without removing the live name.
+  `local_cleanup.completed` reports committed local removal, not vault credential erasure.
 - Explicit setup retries finish pending compensation before generated creation, import, sign-in,
   or interactive onboarding.
   Fresh generated retries use the caller's request and refuse unreadable account catalogs. Binding
