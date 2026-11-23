@@ -48,7 +48,7 @@
 
 mod messages;
 
-pub(crate) use messages::{Exchange, KIND_DEVICE_HEARTBEAT, is_device_group_kind};
+pub(crate) use messages::{DeviceGroupSend, Exchange, KIND_DEVICE_HEARTBEAT, is_device_group_kind};
 
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,

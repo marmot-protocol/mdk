@@ -18,11 +18,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cgka_traits::{GroupId, MessageId};
+use cgka_traits::GroupId;
 use marmot_session::CanonicalizationPolicy;
 use storage_sqlite::{SmallStateItem, SmallStateItemName};
 
 use super::AppClient;
+use super::device_group::DeviceGroupSend;
 use crate::small_state::{
     BROADCAST_REQUEST, KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE,
     SmallStateMergeRule, broadcast_devices, broadcast_due, decode_broadcast_request,
@@ -79,16 +80,22 @@ impl AppClient {
         let mut sent = 0;
         // Invitation decisions first: a sibling Add waits on them (mdk#3556),
         // and a page of other items no relay takes must not hold them back.
+        // Each stays owed until a relay takes a page carrying it, not only
+        // until the session holds one: the Add would otherwise go ahead while
+        // the page still waits, queued or unacknowledged. The next pass sends
+        // it again, and a duplicate merges to the same winner.
         for (content, carried) in
             encode_invitation_decision_updates(&storage.unsent_invitation_decisions()?)
         {
-            if !self
-                .send_device_group_message(&group_id, KIND_SMALL_STATE_UPDATE, content)
+            let event = self.device_group_event(KIND_SMALL_STATE_UPDATE, content)?;
+            match self
+                .send_device_group_event_with_outcome(&group_id, event, None)
                 .await?
             {
-                return Ok(());
+                DeviceGroupSend::Accepted => storage.mark_invitation_decisions_sent(&carried)?,
+                DeviceGroupSend::Pending => {}
+                DeviceGroupSend::Failed => return Ok(()),
             }
-            storage.mark_invitation_decisions_sent(&carried)?;
             sent += 1;
         }
         for (content, carried) in encode_small_state_update(&storage.unsent_small_state_items()?) {
@@ -359,39 +366,6 @@ impl AppClient {
                 }
             }
             KIND_SMALL_STATE_BROADCAST_REQUEST => storage.owe_small_state_broadcast_request()?,
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// A small-state message this device sent reached no one, after its send
-    /// counted it as sent because it was queued or unresolved: owe what it
-    /// carried again, since a sibling Add waits on a decision marked sent
-    /// (mdk#3556). Which items it carried is not kept, so every item is owed,
-    /// as for a withdrawal. It goes out at the next maintenance pass, as an
-    /// update that reached no relay does, never on the next turn: with no
-    /// relay up, that would retry at once, again and again. Any other message,
-    /// or one in a device group this device no longer trusts, is not small
-    /// state's.
-    pub(crate) fn small_state_send_failed(
-        &mut self,
-        group_id: &GroupId,
-        message_id: &MessageId,
-    ) -> Result<(), AppError> {
-        if self.ensure_small_state_group(group_id).is_err() {
-            return Ok(());
-        }
-        let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        match storage.device_group_message_kind(
-            &hex::encode(group_id.as_slice()),
-            &hex::encode(message_id.as_slice()),
-        )? {
-            Some(KIND_SMALL_STATE_UPDATE) => {
-                storage.owe_all_small_state_items()?;
-            }
-            Some(KIND_SMALL_STATE_BROADCAST_REQUEST) => {
-                storage.owe_small_state_broadcast_request()?
-            }
             _ => {}
         }
         Ok(())

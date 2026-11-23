@@ -104,6 +104,18 @@ impl Exchange {
     }
 }
 
+/// How one device-group send ended for its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeviceGroupSend {
+    /// A relay took it.
+    Accepted,
+    /// Queued, or published with no relay's acknowledgement yet: that same
+    /// message still goes out, or fails later.
+    Pending,
+    /// Its publication failed terminally and reached no one.
+    Failed,
+}
+
 impl AppClient {
     /// The exchange this device takes part in: the trusted device group's,
     /// while the roster lists this device.
@@ -374,6 +386,20 @@ impl AppClient {
         event: MarmotAppEvent,
         expected_epoch: Option<EpochPin>,
     ) -> Result<bool, AppError> {
+        Ok(self
+            .send_device_group_event_with_outcome(group_id, event, expected_epoch)
+            .await?
+            != DeviceGroupSend::Failed)
+    }
+
+    /// [`Self::send_device_group_event_at`], telling a send a relay took
+    /// from one still pending.
+    pub(crate) async fn send_device_group_event_with_outcome(
+        &mut self,
+        group_id: &GroupId,
+        event: MarmotAppEvent,
+        expected_epoch: Option<EpochPin>,
+    ) -> Result<DeviceGroupSend, AppError> {
         let kind = event.kind;
         let payload = event
             .encode()
@@ -395,14 +421,22 @@ impl AppClient {
             .failed_app_messages
             .iter()
             .any(|failed| failed.group_id == *group_id && failed.app_event_id == event.id);
+        let accepted = effects
+            .published_app_messages
+            .iter()
+            .any(|published| published.group_id == *group_id && published.app_event_id == event.id);
         let observed = self.observe_drained_session_events(&effects).await;
         // This message's terminal failure is also the drain's publish error;
         // the caller undoes its marks instead of failing.
         if !reached {
-            return Ok(false);
+            return Ok(DeviceGroupSend::Failed);
         }
         observed?;
-        Ok(true)
+        Ok(if accepted {
+            DeviceGroupSend::Accepted
+        } else {
+            DeviceGroupSend::Pending
+        })
     }
 
     /// Hand a device-group message that branch selection withdrew to the

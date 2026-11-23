@@ -729,32 +729,6 @@ async fn an_update_that_reached_no_one_is_sent_again() {
     devices.phone.run_due_maintenance().await.unwrap();
     assert!(storage().unsent_small_state_items().unwrap().is_empty());
 
-    // An update its send counted as sent, queued or unresolved, that a
-    // later drain reports reached no one is owed again (mdk#3556).
-    let (group, _) = devices.phone.trusted_device_roster().unwrap().unwrap();
-    let (app_event_id, (message_id, _)) = recorded(&devices.phone, &group)
-        .into_iter()
-        .rfind(|(_, (_, kind))| *kind == KIND_SMALL_STATE_UPDATE)
-        .expect("the phone recorded its update");
-    let failed = marmot_session::AccountDeviceEffects {
-        failed_app_messages: vec![marmot_session::FailedApplicationMessage {
-            group_id: group.clone(),
-            app_event_id,
-            message_id,
-            reason: "every relay refused it".to_owned(),
-        }],
-        ..Default::default()
-    };
-    let _ = devices.phone.observe_drained_session_events(&failed).await;
-    assert!(
-        storage()
-            .unsent_small_state_items()
-            .unwrap()
-            .contains(&owed[0])
-    );
-    devices.phone.run_due_maintenance().await.unwrap();
-    assert!(storage().unsent_small_state_items().unwrap().is_empty());
-
     deliver_all(&mut devices.laptop, &devices.relay).await;
     let held = devices
         .laptop

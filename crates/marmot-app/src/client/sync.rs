@@ -1946,7 +1946,6 @@ impl AppClient {
         {
             if pending.failed_message_update.is_none() {
                 self.history_delivery_failed(&failed.app_event_id)?;
-                self.small_state_send_failed(&failed.group_id, &failed.message_id)?;
                 pending.failed_message_update = Some(
                     self.app
                         .account_storage(&self.state.label)?

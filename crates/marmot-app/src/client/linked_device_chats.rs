@@ -41,8 +41,9 @@
 //! - A chat with this device's commit queued, in flight or settling waits for
 //!   a later pass, so an Add is never doubled.
 //! - A chat holding an invitation decision waits until this device's
-//!   broadcast has sent that decision to the new device, so the device never
-//!   shows a chat its account accepted as an invitation (mdk#3556).
+//!   broadcast has sent that decision to the new device, so the decision goes
+//!   out ahead of the chat's Welcome and the device does not show a chat its
+//!   account accepted as an invitation (mdk#3556).
 //! - Before a chat takes a KeyPackage, the engine checks the Add against the
 //!   KeyPackage it would use, writing nothing. A chat that would refuse takes
 //!   none: one that takes no same-account Add at all is counted by
