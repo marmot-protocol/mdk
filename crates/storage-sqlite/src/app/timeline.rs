@@ -5260,40 +5260,37 @@ fn hydrate_timeline_presentation(
 }
 
 /// A row built from an agent item's edits has the retention and import source
-/// of the edit that anchors it, its sender's earliest edit of the item, at the
-/// row's place: the first event the row stands for has neither.
+/// of the edit it was built from, chosen as the projection chose it: the first
+/// event the row stands for has neither.
 fn hydrate_held_agent_item_source(
     conn: &Connection,
     message: &mut TimelineMessageRecord,
 ) -> StorageResult<()> {
+    let edits = app_events_targeting_message_tx(
+        conn,
+        &message.group_id_hex,
+        MARMOT_APP_EVENT_KIND_EDIT,
+        &message.message_id_hex,
+    )?;
+    let deleted = deleted_reaction_ids_for_target_tx(conn, &message.group_id_hex, &edits)?;
+    let Some(anchor) =
+        edits::held_agent_item_anchor(&message.message_id_hex, edits.iter(), &deleted)
+    else {
+        return Ok(());
+    };
     let anchor = conn
         .query_row_cached(
             &format!(
                 "SELECT source.retention_seconds, source.retention_expires_at,
                         {TIMELINE_IMPORT_PROVENANCE_SQL},
                         {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
-                 FROM message_modifier_edges AS edges
-                 JOIN app_events AS source
-                   ON source.group_id_hex = edges.group_id_hex
-                  AND source.message_id_hex = edges.modifier_message_id_hex
+                 FROM app_events AS source
                  LEFT JOIN app_event_imports AS imported
                    ON imported.group_id_hex = source.group_id_hex
                   AND imported.message_id_hex = source.message_id_hex
-                 WHERE edges.group_id_hex = ?1
-                   AND edges.target_message_id_hex = ?2
-                   AND edges.kind = {MARMOT_APP_EVENT_KIND_EDIT}
-                   AND edges.sender = ?3
-                   AND edges.recorded_at = ?4
-                   AND source.invalidated = 0
-                 ORDER BY source.message_id_hex
-                 LIMIT 1"
+                 WHERE source.group_id_hex = ?1 AND source.message_id_hex = ?2"
             ),
-            params![
-                message.group_id_hex,
-                message.message_id_hex,
-                message.sender,
-                u64_to_i64(message.timeline_at)?
-            ],
+            params![message.group_id_hex, anchor.message_id_hex],
             |row| {
                 Ok((
                     row.get::<_, Option<i64>>(0)?

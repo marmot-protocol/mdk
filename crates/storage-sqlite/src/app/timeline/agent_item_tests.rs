@@ -578,10 +578,28 @@ fn an_item_shown_from_its_edits_sits_in_the_thread_they_name() {
 }
 
 /// An item's edit imported from a sibling's history, without the first event,
-/// shows the item with that import's source.
+/// shows the item with that import's source. When its sender deleted an
+/// earlier edit in the same second, the row and its source are both the
+/// surviving edit's.
 #[test]
 fn an_item_shown_from_an_imported_edit_names_the_import_source() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .record_app_event_with_retention(
+            &item_edit("aa-edit", "item", 20, 3, "running"),
+            Some(AppMessageRetentionDecision::new(20, 60)),
+        )
+        .unwrap();
+    store
+        .record_app_event(&event(
+            "delete",
+            "agent",
+            21,
+            MARMOT_APP_EVENT_KIND_DELETE,
+            vec![tag(&["e", "aa-edit"])],
+            "",
+        ))
+        .unwrap();
     let edit = item_edit("edit-2", "item", 20, 2, "running");
     let slot = [7; 32];
     store
@@ -605,6 +623,8 @@ fn an_item_shown_from_an_imported_edit_names_the_import_source() {
         .unwrap();
     let held = row(&store, "item");
     assert!(held.agent_item_first_event_missing);
+    assert_eq!(held.plaintext, "v2 running");
+    assert_eq!(held.retention_seconds, None);
     assert_eq!(
         held.history_import_provenance,
         Some(HistoryImportProvenance::Device(slot))

@@ -96,17 +96,7 @@ pub(super) fn held_agent_item_row<'a>(
     edits: impl Iterator<Item = &'a RawAppEvent>,
     deleted: &HashSet<String>,
 ) -> Option<TimelineRow> {
-    let first = edits
-        .filter(|e| {
-            e.kind == MARMOT_APP_EVENT_KIND_EDIT
-                && !e.invalidated
-                && !deleted.contains(&e.message_id_hex)
-                && sole_target(e) == Some(target)
-                && cgka_traits::AgentItem::from_tags(&e.tags).is_ok()
-        })
-        .min_by(|a, b| {
-            (a.recorded_at, &a.message_id_hex).cmp(&(b.recorded_at, &b.message_id_hex))
-        })?;
+    let first = held_agent_item_anchor(target, edits, deleted)?;
     Some(timeline_row_from_app_event(&RawAppEvent {
         message_id_hex: target.to_owned(),
         kind: MARMOT_APP_EVENT_KIND_AGENT_ITEM,
@@ -118,6 +108,24 @@ pub(super) fn held_agent_item_row<'a>(
             .collect(),
         ..first.clone()
     }))
+}
+
+/// The edit a held item's row is built from: the earliest readable agent-item
+/// edit naming `target` alone that its sender has not deleted.
+pub(super) fn held_agent_item_anchor<'a>(
+    target: &str,
+    edits: impl Iterator<Item = &'a RawAppEvent>,
+    deleted: &HashSet<String>,
+) -> Option<&'a RawAppEvent> {
+    edits
+        .filter(|e| {
+            e.kind == MARMOT_APP_EVENT_KIND_EDIT
+                && !e.invalidated
+                && !deleted.contains(&e.message_id_hex)
+                && sole_target(e) == Some(target)
+                && cgka_traits::AgentItem::from_tags(&e.tags).is_ok()
+        })
+        .min_by(|a, b| (a.recorded_at, &a.message_id_hex).cmp(&(b.recorded_at, &b.message_id_hex)))
 }
 
 /// The one message an edit names with its single `e` tag.
