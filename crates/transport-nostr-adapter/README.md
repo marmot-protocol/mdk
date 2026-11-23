@@ -421,9 +421,11 @@ outcome for the caller's backoff. Fullness uses the raw received count before SD
 keeps all 1,200 valid historical events exact and oldest first across that boundary. `SdkSweepRelay` (`sdk` feature) runs it over a relay already in a
 `NostrSdkRelayClient`'s pool. nostr-sdk drops NIP-67 hints, so a client built with `from_builder` reads `more` off
 the wire for the sweep's own REQs, and `more` splits a slice. No hint proves one: `finish` is ignored, since a misread
-`finish` would skip history. A call cut by its deadline or cancellation interrupts the request in flight rather than
-dropping it: `SdkSweepRelay` cancels it and still reports the event bytes it read, so a caller's byte budget sees the
-cut reply too. A request that has not ended within a second (`INTERRUPT_GRACE`) is dropped. Nothing schedules the
+`finish` would skip history. The sweep's requests go through the client's
+finite requests, which only a client built with `from_builder` has: over a client from `NostrSdkRelayClient::new`
+every slice reads as unreachable. A call cut by its deadline or cancellation ends the request in flight between
+frames and still reports every event frame the relay sent it, read or not, so a caller's byte budget sees the cut
+reply too. Nothing schedules the
 sweep yet; the recovery runner will (#2660).
 
 ## NIP-77 comparison

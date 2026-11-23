@@ -33,6 +33,7 @@ use transport_nostr_peeler::{
     KIND_MARMOT_GROUP_MESSAGE, MarmotNostrSigner, NostrTransportEvent, SdkSigner,
 };
 
+use crate::finite_req::FiniteRequests;
 use crate::network_proxy as process_proxy;
 use crate::sweep::hint_tap::{EoseHints, HintTransport};
 use crate::{
@@ -1875,11 +1876,13 @@ pub struct NostrSdkRelayClient {
     /// Clones share a pool's per-canonical-relay NEG allowance. Independently
     /// built account pools get their own credits, just like their sockets.
     neg_credits: Arc<StdMutex<HashMap<RelayUrl, Arc<Semaphore>>>>,
-    /// NIP-67 hints the sweep's REQs read off the wire, and whether each
-    /// REQ's relay sent any EVENT frame before its EOSE. Only clients built
-    /// through [`Self::from_builder`] have the tap; the rest prove slices by
-    /// counting, and their empty live counts prove nothing.
+    /// Whether each live REQ's relay sent any EVENT frame before its EOSE.
+    /// Only clients built through [`Self::from_builder`] have the tap; the
+    /// rest have empty live counts that prove nothing.
     eose_hints: Option<Arc<EoseHints>>,
+    /// History REQs whose replies skip the SDK's reader (#2885). Only clients
+    /// built through [`Self::from_builder`] can make them.
+    finite_requests: Option<FiniteRequests>,
     /// Test-only: select every route in ID order, to exercise the cursor alone.
     #[cfg(test)]
     id_order_only: bool,
@@ -2386,6 +2389,7 @@ impl NostrSdkRelayClient {
             acquisition_memory: Arc::default(),
             neg_credits: Arc::default(),
             eose_hints: None,
+            finite_requests: None,
             #[cfg(test)]
             id_order_only: false,
         }
@@ -2546,7 +2550,11 @@ impl NostrSdkRelayClient {
         let gossip = builder.gossip.clone();
         let authenticator_available = builder.authenticator.is_some();
         let eose_hints = Arc::new(EoseHints::default());
-        let transport = HintTransport::new(builder.websocket_transport.clone(), eose_hints.clone());
+        let finite_requests = FiniteRequests::for_builder(&builder);
+        let transport = HintTransport::new(
+            Arc::new(finite_requests.transport(builder.websocket_transport.clone())),
+            eose_hints.clone(),
+        );
         let observer = Arc::new(OnceLock::new());
         let transport = LivenessTransport {
             transport,
@@ -2567,6 +2575,7 @@ impl NostrSdkRelayClient {
             authenticator_available,
         };
         client.eose_hints = Some(eose_hints);
+        client.finite_requests = Some(finite_requests);
         client
     }
 
@@ -6664,9 +6673,9 @@ pub(crate) fn sweep_neg_credit(
     client.neg_credit(endpoint)
 }
 
-/// The client's NIP-67 hint tap, when it was built with one.
-pub(crate) fn sweep_eose_hints(client: &NostrSdkRelayClient) -> Option<Arc<EoseHints>> {
-    client.eose_hints.clone()
+/// The client's finite requests, when it was built with them.
+pub(crate) fn sweep_finite_requests(client: &NostrSdkRelayClient) -> Option<FiniteRequests> {
+    client.finite_requests.clone()
 }
 
 /// What a dry-run NIP-77 comparison found.

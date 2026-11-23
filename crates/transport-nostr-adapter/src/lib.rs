@@ -70,6 +70,8 @@ fn inbound_wire_metadata(
 
 mod acquisition;
 pub mod compare;
+#[cfg(feature = "sdk")]
+mod finite_req;
 mod key_package;
 #[cfg(feature = "sdk")]
 #[doc(hidden)]
