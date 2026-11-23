@@ -2126,11 +2126,21 @@ fn notification_traffic(kind: u64, tags: &[Vec<String>]) -> Option<NotificationT
     }
 }
 
+/// [`notification_traffic`] for one received message. The agent's own words in
+/// a thread under one of its items never notify (marmot-agents D-122); its
+/// items there keep their own rule (D-024).
+fn message_notification_traffic(message: &ReceivedMessage) -> Option<NotificationTrafficClass> {
+    if cgka_traits::is_agent_own_thread_comment(message.kind, &message.tags, &message.sender) {
+        return None;
+    }
+    notification_traffic(message.kind, &message.tags)
+}
+
 /// Reject non-notifying events before dispatching storage work.
 pub(crate) fn notification_event_notifies(event: &MarmotAppEvent) -> bool {
     match event {
         MarmotAppEvent::MessageReceived(message) => {
-            notification_traffic(message.message.kind, &message.message.tags).is_some()
+            message_notification_traffic(&message.message).is_some()
         }
         MarmotAppEvent::GroupJoined { .. } => true,
         MarmotAppEvent::GroupEvent(event) => {
@@ -2150,7 +2160,7 @@ fn notification_update_from_message(
     resolver: &mut NotificationResolver,
     event: &RuntimeMessageReceived,
 ) -> Result<Option<NotificationUpdate>, AppError> {
-    let Some(traffic_class) = notification_traffic(event.message.kind, &event.message.tags) else {
+    let Some(traffic_class) = message_notification_traffic(&event.message) else {
         return Ok(None);
     };
     let storage = app.account_storage(&event.account_label)?.app_storage();

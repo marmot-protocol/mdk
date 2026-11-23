@@ -2000,7 +2000,8 @@ fn muted_chat_live_event_resolver_emits_only_direct_mentions() {
 
 /// A thread message notifies like kind 9, with its text as the preview, and
 /// is a mention when it mentions the account. A kind-1111 event without a
-/// parent stays a silent custom event.
+/// parent stays a silent custom event, and the agent's words in a thread under
+/// its own agent item never notify (marmot-agents D-122).
 #[test]
 fn thread_messages_notify_and_mention_like_chat() {
     let dir = tempfile::tempdir().unwrap();
@@ -2043,6 +2044,30 @@ fn thread_messages_notify_and_mention_like_chat() {
             "kind 1111 without a parent",
             thread_message(&[&["E", &parent], &["p", &receiver]]),
             None,
+        ),
+        (
+            "the agent's words under its own item, even with a mention",
+            thread_message(&[
+                &["E", &parent, "", &sender],
+                &["K", "1201"],
+                &["P", &sender],
+                &["e", &parent, "", &sender],
+                &["k", "1201"],
+                &["p", &sender],
+                &["p", &receiver],
+            ]),
+            None,
+        ),
+        (
+            "a comment under another author's item",
+            thread_message(&[
+                &["E", &parent, "", &receiver],
+                &["K", "1201"],
+                &["P", &receiver],
+                &["e", &parent, "", &receiver],
+                &["k", "1201"],
+            ]),
+            Some(false),
         ),
     ] {
         let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {

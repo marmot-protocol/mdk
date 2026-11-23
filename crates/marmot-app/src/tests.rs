@@ -3358,8 +3358,84 @@ async fn thread_message_send_body() {
         ])
     );
 
+    // A subagent's thread hangs from its `task` item (kind 1201). Items in it
+    // name the root with E/K/P and their parent with e/k/p (marmot-agents
+    // D-121), and a person answering one gets that root and that parent.
+    let item = |item_type: &str, thread: Vec<Vec<String>>| {
+        let mut item_tags = tags(&[
+            &["v", "1"],
+            &["state", "running"],
+            &["title", "Find the fixtures"],
+            &["harness", "claude-code"],
+            &["item_id", item_type],
+            &["seq", "1"],
+            &["fields", &format!(r#"{{"type":"{item_type}"}}"#)],
+        ]);
+        item_tags.extend(thread);
+        AppMessageIntent::Custom {
+            kind: cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            tags: item_tags,
+            content: "Find the fixtures".to_owned(),
+        }
+    };
+    let (_, task) = client
+        .send_app_event(&group_id, item("task", Vec::new()))
+        .await
+        .unwrap();
+    let task = task.message_ids[0].clone();
+    let (_, tool) = client
+        .send_app_event(
+            &group_id,
+            item(
+                "tool",
+                tags(&[
+                    &["E", &task, "", &alice],
+                    &["K", "1201"],
+                    &["P", &alice],
+                    &["e", &task, "", &alice],
+                    &["k", "1201"],
+                    &["p", &alice],
+                ]),
+            ),
+        )
+        .await
+        .unwrap();
+    let tool = tool.message_ids[0].clone();
+    assert_eq!(
+        row(&tool).thread,
+        Some(storage_sqlite::TimelineThreadRef {
+            root_message_id_hex: task.clone(),
+            parent_message_id_hex: task.clone(),
+        })
+    );
+    assert_eq!(
+        row(&tool).reply_to_message_id_hex.as_deref(),
+        Some(task.as_str()),
+        "a client without a thread view quotes the item's parent"
+    );
+    for parent in [&task, &tool] {
+        let (_, answer) = client
+            .send_app_event(&group_id, thread_message(parent, "thanks", Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(
+            row(&answer.message_ids[0]).tags,
+            tags(&[
+                &["E", &task, "", &alice],
+                &["K", "1201"],
+                &["P", &alice],
+                &["e", parent, "", &alice],
+                &["k", "1201"],
+            ])
+        );
+    }
+
     let published_before = relay.published_event_ids().len();
     for (intent, case) in [
+        (
+            item("tool", tags(&[&["e", &task]])),
+            "an agent item naming an e outside a thread",
+        ),
         (
             thread_message("c0c0", "lost", Vec::new()),
             "an unknown parent",

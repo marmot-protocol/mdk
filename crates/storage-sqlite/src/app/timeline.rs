@@ -4708,11 +4708,9 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
         timeline_at: event.recorded_at,
         received_at: event.received_at,
         reply_to_message_id_hex: if event.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM {
-            // A turn names the chat message that started it; an unreadable
-            // item names nothing.
-            cgka_traits::AgentItem::from_tags(&event.tags)
-                .ok()
-                .and_then(|item| item.started_by_message_id_hex)
+            // A turn names the chat message that started it, and an item in
+            // a thread its parent; an unreadable item names nothing.
+            cgka_traits::agent_item_reply_target(&event.tags)
         } else {
             tag_value(&event.tags, EVENT_REF_TAG).map(ToOwned::to_owned)
         },

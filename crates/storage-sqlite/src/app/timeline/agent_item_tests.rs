@@ -365,3 +365,60 @@ fn an_item_in_the_old_shape_is_an_unreadable_row() {
     assert_eq!(old.reply_to_message_id_hex, None);
     assert_eq!(old.timeline_order_seq, 0);
 }
+
+/// An item in a subagent's thread (marmot-agents D-121) is placed by its
+/// NIP-22 tags: `E` names the root and `e` the parent, which a client without
+/// a thread view quotes. An edit cannot carry the parent's `e`, so the item
+/// stays where its first event placed it, whatever thread tags an edit
+/// carries; a rebuild agrees.
+#[test]
+fn an_item_in_a_thread_stays_where_its_first_event_placed_it() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let thread = |root: &str, parent: &str| {
+        vec![
+            tag(&["E", root, "", "agent"]),
+            tag(&["K", "1201"]),
+            tag(&["P", "agent"]),
+            tag(&["e", parent, "", "agent"]),
+            tag(&["k", "1201"]),
+            tag(&["p", "agent"]),
+        ]
+    };
+    let unstarted = |mut event: StoredAppEvent| {
+        event.tags.retain(|tag| tag[0] != "started_by");
+        event
+    };
+    store
+        .record_app_event(&item("task", 9, 1, "running", 1))
+        .unwrap();
+    let mut first = unstarted(item("nested", 10, 1, "running", 7));
+    first.tags.extend(thread("task", "subtask"));
+    store.record_app_event(&first).unwrap();
+    let placed = Some(TimelineThreadRef {
+        root_message_id_hex: "task".to_owned(),
+        parent_message_id_hex: "subtask".to_owned(),
+    });
+    assert_eq!(row(&store, "task").thread, None);
+    assert_eq!(row(&store, "nested").thread, placed);
+    assert_eq!(
+        row(&store, "nested").reply_to_message_id_hex.as_deref(),
+        Some("subtask")
+    );
+
+    store
+        .record_app_event(&unstarted(item_edit("edit-2", "nested", 11, 2, "running")))
+        .unwrap();
+    assert_eq!(row(&store, "nested").thread, placed);
+    let mut moved = unstarted(item_edit("edit-3", "nested", 12, 3, "done"));
+    moved
+        .tags
+        .extend(thread("elsewhere", "elsewhere").into_iter().take(3));
+    store.record_app_event(&moved).unwrap();
+    for _ in 0..2 {
+        let latest = row(&store, "nested");
+        assert_eq!(latest.plaintext, "v3 done");
+        assert_eq!(latest.thread, placed);
+        assert_eq!(latest.reply_to_message_id_hex.as_deref(), Some("subtask"));
+        store.rebuild_message_timeline_for_group(GROUP).unwrap();
+    }
+}

@@ -1,6 +1,7 @@
 //! One accepted-edit resolver for incremental projection, repair and history.
 use super::*;
 use crate::SqliteAppStorage;
+use cgka_traits::agent_events::is_agent_item_thread_tag;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineEditSummary {
@@ -157,11 +158,20 @@ pub(super) fn apply(row: &mut TimelineRow, versions: &[AcceptedEdit]) {
     if let Some((_, tags)) = &latest.agent_item {
         // A later version of an agent item replaces its content and tags. It
         // is the item changing state, not a correction, so the row is not
-        // marked edited.
-        row.tags.clone_from(tags);
-        row.reply_to_message_id_hex = cgka_traits::AgentItem::from_tags(tags)
-            .ok()
-            .and_then(|item| item.started_by_message_id_hex);
+        // marked edited. The item stays in the thread its first event named:
+        // an edit cannot carry the parent's `e`, and an item never moves.
+        let thread = row
+            .tags
+            .iter()
+            .filter(|tag| is_agent_item_thread_tag(tag))
+            .cloned();
+        row.tags = tags
+            .iter()
+            .filter(|tag| !is_agent_item_thread_tag(tag))
+            .cloned()
+            .chain(thread)
+            .collect();
+        row.reply_to_message_id_hex = cgka_traits::agent_item_reply_target(&row.tags);
         return;
     }
     row.edit = Some(TimelineEditSummary {

@@ -112,6 +112,48 @@
       "expect": { "reply_to": "not-stored-either", "thread": { "root": "root", "parent": "not-stored-either" } }
     },
     {
+      "name": "a subagent's task item (kind 1201) in the main chat: the root of its thread",
+      "id": "task",
+      "kind": 1201,
+      "tags": [["v", "1"], ["state", "running"], ["title", "Step"], ["harness", "claude-code"], ["item_id", "task"], ["seq", "1"], ["fields", "{\"type\":\"task\"}"]],
+      "expect": { "reply_to": null, "thread": null }
+    },
+    {
+      "name": "an item of that subagent: root and parent are its task item",
+      "id": "task-tool",
+      "kind": 1201,
+      "tags": [["v", "1"], ["state", "running"], ["title", "Step"], ["harness", "claude-code"], ["item_id", "tool"], ["seq", "1"], ["fields", "{\"type\":\"tool\"}"], ["E", "task", "", "agent"], ["K", "1201"], ["P", "agent"], ["e", "task", "", "agent"], ["k", "1201"], ["p", "agent"]],
+      "expect": { "reply_to": "task", "thread": { "root": "task", "parent": "task" } }
+    },
+    {
+      "name": "a nested subagent's task item, started by that subagent",
+      "id": "nested-task",
+      "kind": 1201,
+      "tags": [["v", "1"], ["state", "running"], ["title", "Step"], ["harness", "claude-code"], ["item_id", "task"], ["seq", "1"], ["fields", "{\"type\":\"task\"}"], ["E", "task", "", "agent"], ["K", "1201"], ["P", "agent"], ["e", "task", "", "agent"], ["k", "1201"], ["p", "agent"]],
+      "expect": { "reply_to": "task", "thread": { "root": "task", "parent": "task" } }
+    },
+    {
+      "name": "an item of the nested subagent: the root stays the top-level task item",
+      "id": "nested-tool",
+      "kind": 1201,
+      "tags": [["v", "1"], ["state", "running"], ["title", "Step"], ["harness", "claude-code"], ["item_id", "tool"], ["seq", "1"], ["fields", "{\"type\":\"tool\"}"], ["E", "task", "", "agent"], ["K", "1201"], ["P", "agent"], ["e", "nested-task", "", "agent"], ["k", "1201"], ["p", "agent"]],
+      "expect": { "reply_to": "nested-task", "thread": { "root": "task", "parent": "nested-task" } }
+    },
+    {
+      "name": "a subagent's words, a kind 1111 comment with the same tags",
+      "id": "nested-words",
+      "kind": 1111,
+      "tags": [["E", "task", "", "agent"], ["K", "1201"], ["P", "agent"], ["e", "nested-task", "", "agent"], ["k", "1201"], ["p", "agent"]],
+      "expect": { "reply_to": "nested-task", "thread": { "root": "task", "parent": "nested-task" } }
+    },
+    {
+      "name": "a person answering an item in the nested subagent's thread",
+      "id": "nested-answer",
+      "kind": 1111,
+      "tags": [["E", "task", "", "agent"], ["K", "1201"], ["P", "agent"], ["e", "nested-tool", "", "agent"], ["k", "1201"]],
+      "expect": { "reply_to": "nested-tool", "thread": { "root": "task", "parent": "nested-tool" } }
+    },
+    {
       "name": "kind 1111 with neither e nor a numeric k stays a custom event",
       "id": "not-a-comment",
       "kind": 1111,

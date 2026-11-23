@@ -31,7 +31,8 @@ pub mod welcome;
 
 pub use agent_events::{
     AGENT_EVENT_MAX_BYTES, AgentEventError, AgentItem, AgentItemState, AgentRequest,
-    MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_AGENT_REQUEST,
+    MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_AGENT_REQUEST, agent_item_reply_target,
+    agent_item_thread_parent, is_agent_own_thread_comment,
 };
 pub use agent_text_stream::{
     AGENT_TEXT_STREAM_COMPONENT_STATE_LEN, AGENT_TEXT_STREAM_MAX_PADDING_BUCKET_BYTES,

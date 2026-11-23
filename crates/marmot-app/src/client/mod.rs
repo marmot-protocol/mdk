@@ -5324,7 +5324,7 @@ impl AppClient {
             // the accepted fanouts.
             self.retry_send_applied_effects_best_effort().await;
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-            if published.is_some() && event_wakes_members(event.kind, &event.tags) {
+            if published.is_some() && event_wakes_members(event.kind, &event.tags, &event.pubkey) {
                 // A checkpoint is needed only when another transport wait follows;
                 // otherwise the worker can service the already-invalidated window.
                 if should_project_locally {

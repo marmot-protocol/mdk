@@ -1,5 +1,6 @@
 use cgka_traits::agent_events::{
-    AGENT_EVENT_MAX_BYTES, AgentEventError, AgentRequest, validate_agent_item_tags,
+    AGENT_EVENT_MAX_BYTES, AgentEventError, AgentRequest, validate_agent_item_edit_tags,
+    validate_agent_item_tags,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_AGENT_ITEM,
@@ -277,7 +278,9 @@ pub(crate) enum AppMessageIntent {
     },
     /// A later version of an agent item (kind 1201): a kind-1009 edit whose
     /// single `e` tag names the item's first event, carrying the whole item
-    /// again (content and every tag) with a higher `v`.
+    /// again (content and every tag) with a higher `v`. An item in a thread
+    /// repeats its root's `E`/`K`/`P` but not its parent's `e`; the item stays
+    /// where its first event placed it.
     AgentItemEdit {
         target_message_id: String,
         content: String,
@@ -655,7 +658,7 @@ pub(crate) fn build_inner_event_with_media_reply(
             tags: item,
         } => {
             validate_message_ref(target_message_id)?;
-            validate_agent_item_tags(item).map_err(agent_event_error)?;
+            validate_agent_item_edit_tags(item).map_err(agent_event_error)?;
             let mut tags = Vec::with_capacity(item.len() + 1);
             tags.push(event_ref_tag(target_message_id));
             tags.extend_from_slice(item);

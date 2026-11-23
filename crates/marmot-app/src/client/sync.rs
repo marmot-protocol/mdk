@@ -4101,7 +4101,9 @@ impl AppClient {
                 .app_storage()
                 .app_message(&group_hex, &id)?;
             let wakes = match sent {
-                Some(sent) if super::push::event_wakes_members(sent.kind, &sent.tags) => {
+                Some(sent)
+                    if super::push::event_wakes_members(sent.kind, &sent.tags, &sent.sender) =>
+                {
                     // A new version of an agent item has no row of its own.
                     sent.kind == MARMOT_APP_EVENT_KIND_EDIT
                         || self
