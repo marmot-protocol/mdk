@@ -2308,10 +2308,14 @@ fn inbound_marks_persist_per_scope_and_go_with_the_account() {
     );
 
     // A read error changes nothing: the mark is still there once the file can be read again.
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // A directory in the file's place fails the read even for root.
+    let aside = file.with_extension("aside");
+    std::fs::rename(&file, &aside).unwrap();
+    std::fs::create_dir(&file).unwrap();
     assert!(reopened.get("agent", None).is_err());
     assert!(reopened.advance("agent", None, 99).is_err());
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::rename(&aside, &file).unwrap();
     assert_eq!(reopened.get("agent", None).unwrap(), InboundMark::After(7));
 
     std::fs::write(&file, b"not json").unwrap();
@@ -5454,10 +5458,14 @@ async fn stored_backlog_longer_than_a_page_reaches_the_next_subscriber_in_order(
     // stops there and says so, and its next read resumes from the last saved mark.
     let mut subscription = connector.stored_read(Some(agent_id), None, 2);
     let saved = connector.inbound_marks.get(agent_id, None).unwrap();
-    let account_dir = connector.account_home.account_dir(agent_id);
-    std::fs::set_permissions(&account_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // A directory where the save stages its file fails the save even for root.
+    let staging = connector
+        .account_home
+        .account_dir(agent_id)
+        .join(".agent-inbound-marks.json.tmp");
+    std::fs::create_dir(&staging).unwrap();
     let failed = deliver(&mut subscription, None).await;
-    std::fs::set_permissions(&account_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_dir(&staging).unwrap();
     assert_eq!(failed, (false, backlog[..2].to_vec(), 1));
     assert_eq!(connector.inbound_marks.get(agent_id, None).unwrap(), saved);
     assert_eq!(
