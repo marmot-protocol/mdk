@@ -34,8 +34,13 @@ pub struct TimelineEditHistoryPage {
 }
 
 /// Apply each row's edits. An agent item this group holds edits of, but not
-/// the first event of, first gets its row: see [`held_agent_item_row`].
-pub(super) fn apply_group(rows: &mut BTreeMap<String, TimelineRow>, events: &[RawAppEvent]) {
+/// the first event of, first gets its row: see [`held_agent_item_row`]. One
+/// retention removed (`expired`) does not.
+pub(super) fn apply_group(
+    rows: &mut BTreeMap<String, TimelineRow>,
+    events: &[RawAppEvent],
+    expired: &HashSet<String>,
+) {
     let stored = events
         .iter()
         .map(|event| event.message_id_hex.as_str())
@@ -43,6 +48,7 @@ pub(super) fn apply_group(rows: &mut BTreeMap<String, TimelineRow>, events: &[Ra
     let (by_target, deleted) = edits_by_target(events);
     for (target, edits) in by_target {
         if !stored.contains(target)
+            && !expired.contains(target)
             && let Some(held) = held_agent_item_row(target, edits.iter().copied(), &deleted)
         {
             rows.insert(target.to_owned(), held);

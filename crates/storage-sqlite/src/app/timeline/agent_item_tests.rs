@@ -690,3 +690,31 @@ fn an_import_that_deletes_the_only_edit_removes_the_item_from_open_timelines() {
     assert!(!message.agent_item_first_event_missing);
     assert_eq!(message.plaintext, "v1 running");
 }
+
+/// Once retention has removed an item, an edit of it that reaches this device
+/// only later, still within its own retention, does not bring the item back
+/// from that edit. That holds for an item shown from its edits too.
+#[test]
+fn an_item_retention_removed_is_not_shown_again_from_a_late_edit() {
+    let swept = |first: StoredAppEvent| {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        store
+            .record_app_event_with_retention(&first, Some(AppMessageRetentionDecision::new(10, 60)))
+            .unwrap();
+        store
+            .secure_prune_expired_app_events(GROUP, 80, "self", &|_, _| false)
+            .unwrap();
+        store
+            .record_app_event_with_retention(
+                &item_edit("late", "item", 50, 3, "waiting"),
+                Some(AppMessageRetentionDecision::new(50, 60)),
+            )
+            .unwrap();
+        for _ in 0..2 {
+            assert!(store.timeline_message(GROUP, "item").unwrap().is_none());
+            store.rebuild_message_timeline_for_group(GROUP).unwrap();
+        }
+    };
+    swept(item("item", 10, 1, "running", 1));
+    swept(item_edit("edit-2", "item", 10, 2, "running"));
+}

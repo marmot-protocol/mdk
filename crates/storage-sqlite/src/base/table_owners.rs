@@ -103,6 +103,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("account_sign_in_removals", Side::App),
     ("account_sign_ins", Side::App),
     ("account_state", Side::App),
+    ("agent_item_expired_targets", Side::App),
     ("app_emoji_set_entries", Side::App),
     ("app_emoji_sets", Side::App),
     ("app_epoch_stall_evidence", Side::App),

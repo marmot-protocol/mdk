@@ -2496,6 +2496,19 @@ impl AgentNotifications {
         }
     }
 
+    /// Receive from now on in another chat with the same agent.
+    fn move_to_chat(&mut self, group_id_hex: &str) {
+        seed_group_state_resolver(
+            &self.app,
+            &mut self.resolver,
+            self.account_label,
+            group_id_hex,
+            Some(&self.agent),
+            false,
+        );
+        self.group_id_hex = group_id_hex.to_owned();
+    }
+
     /// Store an event as ingress does, then hand its `MessageReceived` to
     /// notification resolution.
     fn receive(
@@ -2535,7 +2548,7 @@ impl AgentNotifications {
                 source_message_id_hex: id.to_owned(),
                 sender: self.agent.clone(),
                 sender_display_name: Some("Agent".to_owned()),
-                group_id: cgka_traits::GroupId::new(vec![0xEE; 32]),
+                group_id: cgka_traits::GroupId::new(hex::decode(&self.group_id_hex).unwrap()),
                 source_epoch: 1,
                 retention: None,
                 plaintext: content.to_owned(),
@@ -2624,7 +2637,10 @@ fn an_agent_item_edit_alerts_only_as_the_items_latest_version() {
     assert_eq!(failed.message_id_hex.as_deref(), Some(item.as_str()));
     assert_eq!(
         failed.notification_key,
-        format!("message:{}:{item}", chat.account_id_hex)
+        format!(
+            "message:{}:{}:{item}",
+            chat.account_id_hex, chat.group_id_hex
+        )
     );
     assert_eq!(failed.preview_text.as_deref(), Some("Failed"));
     // An older version that alerts too, arriving late, is not the item's state.
@@ -2733,6 +2749,38 @@ fn an_edit_by_another_member_never_takes_the_agents_alert() {
         .expect("the agent's item is waiting for a person");
     assert_eq!(genuine.sender.account_id_hex, chat.agent);
     assert_ne!(genuine.delivery_key, forged.delivery_key);
+}
+
+/// Event ids name no chat, and an edit can name any item id. An item shown
+/// from an edit in one chat never replaces another chat's alert for that id.
+#[test]
+fn an_item_alert_in_one_chat_never_replaces_another_chats() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_EDIT};
+
+    let mut chat = AgentNotifications::new();
+    let item = "b1".repeat(32);
+    let first = chat
+        .receive(
+            &item,
+            MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            agent_item_tags("approval", "waiting", 1),
+            "Allow?",
+            10,
+        )
+        .expect("the agent's item is waiting for a person");
+    chat.move_to_chat(&"dd".repeat(32));
+    let other = chat
+        .receive(
+            &"b2".repeat(32),
+            MARMOT_APP_EVENT_KIND_EDIT,
+            edit_of(&item, agent_item_tags("approval", "waiting", 1)),
+            "Allow?",
+            11,
+        )
+        .expect("the other chat's item is waiting for a person");
+    assert_eq!(other.message_id_hex, first.message_id_hex);
+    assert_ne!(other.notification_key, first.notification_key);
+    assert_ne!(other.delivery_key, first.delivery_key);
 }
 
 #[test]

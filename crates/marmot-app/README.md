@@ -559,7 +559,8 @@ tags. MDK renames one tag of that design: a turn names the chat message that sta
   stands in for it: the row has the first event's id, sits at that edit's place, shows the highest version, and has
   `agent_item_first_event_missing` set, so the app can say the item started earlier. An item in a thread stays in
   it when its edits repeat `E`/`K`/`P`; without them it shows in the main timeline. Only the sender of that earliest
-  edit can change or delete the row, and its retention and import source are that edit's.
+  edit can change or delete the row, and its retention and import source are that edit's. Once retention removes
+  an item, an edit of it that arrives later does not show it again.
 - **Subagent threads.** A subagent is a thread hanging from its `task` item (marmot-agents D-121). Every item in it
   carries NIP-22's tags: `E`/`K`/`P` name the top-level subagent's `task` item and `e`/`k`/`p` the immediate parent,
   and the subagent's words are kind 1111 comments with the same tags. MDK places such an item in its thread

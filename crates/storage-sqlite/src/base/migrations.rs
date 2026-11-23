@@ -419,6 +419,8 @@ mod migration_0218_retired_agent_text_streams;
 mod migration_0219_agent_item_order;
 #[path = "migrations/0220_chat_activity_creation_fallback.rs"]
 mod migration_0220_chat_activity_creation_fallback;
+#[path = "migrations/0221_agent_item_expired_targets.rs"]
+mod migration_0221_agent_item_expired_targets;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1593,6 +1595,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0220_chat_activity_creation_fallback",
         suspend_foreign_keys: &[],
         apply: migration_0220_chat_activity_creation_fallback::apply,
+    },
+    Migration {
+        version: 221,
+        name: "0221_agent_item_expired_targets",
+        suspend_foreign_keys: &[],
+        apply: migration_0221_agent_item_expired_targets::apply,
     },
 ];
 

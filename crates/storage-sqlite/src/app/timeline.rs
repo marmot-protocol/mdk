@@ -1874,7 +1874,8 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
         .map(|event| event.message_id_hex.clone())
         .collect();
     let removal_targets = removal_validation::targets(tx, group_id_hex, None)?;
-    let mut rows = project_group_events(events, &removal_targets);
+    let expired_agent_items = expired_agent_items_tx(tx, group_id_hex)?;
+    let mut rows = project_group_events(events, &removal_targets, &expired_agent_items);
     let kept_receipts = kept_recipient_receipts_tx(tx, group_id_hex)?;
     for row in &mut rows {
         let receipt_kept = kept_receipts.contains(&row.message_id_hex);
@@ -2083,6 +2084,17 @@ fn secure_prune_selected_app_events_tx(
         )?);
     }
 
+    // The agent-item rows this sweep may remove: its items and its edits'
+    // targets, before anything below deletes them.
+    let item_rows = agent_item_rows_tx(
+        tx,
+        group_id_hex,
+        pruned_message_ids
+            .iter()
+            .chain(&retained_edit_targets)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+    )?;
     let roots = pruned_message_ids.clone();
     for root in &roots {
         for dependent in
@@ -2132,6 +2144,18 @@ fn secure_prune_selected_app_events_tx(
     affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
     for message_id in affected_message_ids {
         upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
+    }
+    // An item whose row is now gone stays gone, whatever edit of it comes later.
+    for message_id in &item_rows {
+        tx.execute_cached(
+            "INSERT OR IGNORE INTO agent_item_expired_targets (group_id_hex, message_id_hex)
+             SELECT ?1, ?2
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM message_timeline WHERE group_id_hex = ?1 AND message_id_hex = ?2
+             )",
+            params![group_id_hex, message_id],
+        )
+        .storage()?;
     }
     refresh_chat_list_last_message_after_secure_prune_tx(tx, group_id_hex)?;
     crate::app::chat_list::refresh_chat_list_unread_after_secure_prune_tx(
@@ -2459,12 +2483,68 @@ fn raw_app_event_tx(
         .storage()
 }
 
+/// The agent items of a group whose rows retention removed. An edit of one
+/// that arrives later must not show it again from that edit.
+fn expired_agent_items_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<HashSet<String>> {
+    let mut stmt = tx
+        .prepare_cached(
+            "SELECT message_id_hex FROM agent_item_expired_targets WHERE group_id_hex = ?1",
+        )
+        .storage()?;
+    stmt.query_map(params![group_id_hex], |row| row.get(0))
+        .storage()?
+        .collect::<Result<_, _>>()
+        .storage()
+}
+
+fn agent_item_expired_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<bool> {
+    tx.query_row_cached(
+        "SELECT EXISTS (SELECT 1 FROM agent_item_expired_targets
+                        WHERE group_id_hex = ?1 AND message_id_hex = ?2)",
+        params![group_id_hex, message_id_hex],
+        |row| row.get(0),
+    )
+    .storage()
+}
+
+/// Of `candidates`, the ids that have an agent-item row.
+fn agent_item_rows_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    candidates: impl IntoIterator<Item = String>,
+) -> StorageResult<BTreeSet<String>> {
+    let mut stmt = tx
+        .prepare_cached(&format!(
+            "SELECT EXISTS (SELECT 1 FROM message_timeline
+                            WHERE group_id_hex = ?1 AND message_id_hex = ?2
+                              AND kind = {MARMOT_APP_EVENT_KIND_AGENT_ITEM})"
+        ))
+        .storage()?;
+    let mut rows = BTreeSet::new();
+    for id in candidates {
+        let is_item: bool = stmt
+            .query_row(params![group_id_hex, id], |row| row.get(0))
+            .storage()?;
+        if is_item {
+            rows.insert(id);
+        }
+    }
+    Ok(rows)
+}
+
 fn project_single_message_timeline_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<Option<TimelineRow>> {
     let Some(event) = raw_app_event_tx(tx, group_id_hex, message_id_hex)? else {
+        if agent_item_expired_tx(tx, group_id_hex, message_id_hex)? {
+            return Ok(None);
+        }
         let held = app_events_targeting_message_tx(
             tx,
             group_id_hex,
@@ -4284,6 +4364,7 @@ pub(crate) fn canonical_timeline_order_key<'a>(
 fn project_group_events(
     events: Vec<RawAppEvent>,
     removal_targets: &BTreeMap<String, BTreeSet<String>>,
+    expired_agent_items: &HashSet<String>,
 ) -> Vec<TimelineRow> {
     let mut timeline = BTreeMap::<String, TimelineRow>::new();
     let mut reactions = Vec::new();
@@ -4332,7 +4413,7 @@ fn project_group_events(
         }
     }
 
-    edits::apply_group(&mut timeline, &events);
+    edits::apply_group(&mut timeline, &events, expired_agent_items);
 
     let events_by_id = events
         .iter()

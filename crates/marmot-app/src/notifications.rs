@@ -2245,7 +2245,12 @@ fn notification_update_from_message(
         Some(row) => preview_text_for_kind(MARMOT_APP_EVENT_KIND_AGENT_ITEM, &row.plaintext),
         None => preview_text_for_message(&event.message),
     };
-    let notification_key = format!("message:{}:{message_id_hex}", event.account_id_hex);
+    // Event ids carry no group, and an edit can name any item id, so the key
+    // names the chat too: one chat's alert never replaces another's.
+    let notification_key = format!(
+        "message:{}:{group_id_hex}:{message_id_hex}",
+        event.account_id_hex
+    );
     // The row's author is part of an item version's delivery: a row built
     // from a held edit is that edit's sender's, and must not take the place
     // of the agent's own alert once the item's first event arrives.

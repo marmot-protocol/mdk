@@ -7,6 +7,8 @@
 - Migration 0219 adds `message_timeline.timeline_order_seq`, rebuilds the canonical order index with it before the
   message id, and drops kind-1202 timeline rows. `TimelineMessageRecord` gains `agent_item` and
   `timeline_order_seq`, and `TimelineUpdateTrigger::AgentActivity`/`AgentOperation` become `AgentItem`.
+- Migration 0221 adds `agent_item_expired_targets`: the retention sweep records each agent item whose row it removed,
+  so an edit of it that arrives later does not show it again.
 
 ### Added
 
@@ -18,7 +20,8 @@
 - An agent item whose first event this device does not hold, such as one sent before the member joined, gets a row
   from its edits: the earliest readable edit stands in for the first event, at its place, and the highest version
   shows. `TimelineMessageRecord::agent_item_first_event_missing` says so. The first event, if it arrives, takes the
-  row back to its own place.
+  row back to its own place. A nightly build from before this change stored such edits without a row: the item shows
+  once another event of it arrives or the chat's timeline is rebuilt.
 - A history import reports the rows it removed, such as an item whose only edit it deleted, as `Remove` changes, so
   an open timeline drops them.
 - An agent's own words in a thread under one of its agent items (a kind 1111 with `E`, `K` 1201 and `P` its sender)
