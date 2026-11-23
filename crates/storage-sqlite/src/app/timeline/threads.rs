@@ -106,13 +106,10 @@ fn own_thread<'a>(
                 parent: reply_to_message_id_hex.unwrap_or(root),
             })
         }
-        MARMOT_APP_EVENT_KIND_AGENT_ITEM => {
-            let root = named_root?;
-            Some(OwnThread {
-                named_root,
-                parent: agent_item_thread_parent(tags).unwrap_or(root),
-            })
-        }
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM => Some(OwnThread {
+            named_root,
+            parent: agent_item_thread_parent(tags)?,
+        }),
         _ => None,
     }
 }

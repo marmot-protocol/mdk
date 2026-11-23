@@ -304,7 +304,8 @@ pub struct TimelineMessageRecord {
     /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
     /// What a client without a thread view quotes: the inline-reply target of
-    /// a chat, poll or sticker, or the parent of a thread message.
+    /// a chat, poll or sticker, the parent of a thread message, or an agent
+    /// item's `started_by`, else its thread parent.
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreview>,
     /// Where this row sits in a NIP-22 thread; `None` outside threads.
@@ -406,8 +407,8 @@ pub struct TimelineReplyPreview {
 }
 
 /// A row's place in a NIP-22 thread. A thread message (kind 1111) always has
-/// one; a chat, sticker or poll has one when it joins a thread with an `E`
-/// tag. Both ids are message ids in the same group.
+/// one; a chat, sticker, poll or agent item (kind 1201) has one when it joins
+/// a thread with an `E` tag. Both ids are message ids in the same group.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineThreadRef {
     /// The message the thread hangs from. A thread message names it with `E`;
@@ -415,8 +416,9 @@ pub struct TimelineThreadRef {
     /// found by walking parents up to the first message outside the thread,
     /// or to the last one stored locally.
     pub root_message_id_hex: String,
-    /// The message this one answers: a thread message's first `e`, or a
-    /// joining chat or poll's reply target, else the root.
+    /// The message this one answers: a thread message's first `e`, a joining
+    /// chat or poll's reply target, or a joining agent item's `e`, else the
+    /// root.
     pub parent_message_id_hex: String,
 }
 

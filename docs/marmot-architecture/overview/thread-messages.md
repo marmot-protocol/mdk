@@ -88,9 +88,11 @@ until the ancestor arrives). A kind 1111 with neither a lowercase `e` nor a nume
 Every timeline record, conversation-window message and reply preview carries:
 
 - `reply_to_message_id_hex`: what a client without a thread view quotes. For an inline reply, poll or sticker it is
-  the reply target; for a thread message it is the parent.
-- `thread`: `root_message_id_hex` and `parent_message_id_hex`, set for every thread message and for a chat, sticker or
-  poll that joined a thread with `E`. A joined row without its own reply target answers the root. `thread` is null
+  the reply target; for a thread message it is the parent. For an agent item it is the message that started its turn
+  (`started_by`), else its thread parent.
+- `thread`: `root_message_id_hex` and `parent_message_id_hex`, set for every thread message and for a chat, sticker,
+  poll or agent item that joined a thread with `E`. A joined row without its own reply target answers the root; an
+  agent item answers its `e`, or else the root, never its `started_by`. `thread` is null
   everywhere else, including on an inline reply to a thread message (its reply preview carries the target's `thread`).
 
 A deleted row keeps both fields: deletion hides its content, not where it sits, so a thread view can show the

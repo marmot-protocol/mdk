@@ -126,6 +126,13 @@
       "expect": { "reply_to": "task", "thread": { "root": "task", "parent": "task" } }
     },
     {
+      "name": "an item naming only its root answers the root",
+      "id": "task-root-only",
+      "kind": 1201,
+      "tags": [["v", "1"], ["state", "running"], ["title", "Step"], ["harness", "claude-code"], ["item_id", "tool"], ["seq", "1"], ["fields", "{\"type\":\"tool\"}"], ["E", "task", "", "agent"], ["K", "1201"], ["P", "agent"]],
+      "expect": { "reply_to": "task", "thread": { "root": "task", "parent": "task" } }
+    },
+    {
       "name": "a nested subagent's task item, started by that subagent",
       "id": "nested-task",
       "kind": 1201,

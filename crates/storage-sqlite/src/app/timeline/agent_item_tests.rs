@@ -422,3 +422,24 @@ fn an_item_in_a_thread_stays_where_its_first_event_placed_it() {
         store.rebuild_message_timeline_for_group(GROUP).unwrap();
     }
 }
+
+/// An item outside a thread takes every tag of its latest version, a
+/// lowercase `p` among them, but not an `E`: an edit cannot move it into a
+/// thread.
+#[test]
+fn an_item_outside_a_thread_takes_its_edits_tags_but_never_joins_a_thread() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let mut first = item("item", 10, 1, "running", 1);
+    first.tags.push(tag(&["p", "someone"]));
+    store.record_app_event(&first).unwrap();
+    let mut edit = item_edit("edit-2", "item", 11, 2, "done");
+    edit.tags.push(tag(&["p", "someone-else"]));
+    edit.tags.push(tag(&["E", "elsewhere"]));
+    store.record_app_event(&edit).unwrap();
+
+    let latest = row(&store, "item");
+    let mut expected = item_tags(2, "done", 102);
+    expected.push(tag(&["p", "someone-else"]));
+    assert_eq!(latest.tags, expected);
+    assert_eq!(latest.thread, None);
+}

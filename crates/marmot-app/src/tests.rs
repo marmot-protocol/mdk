@@ -3401,18 +3401,6 @@ async fn thread_message_send_body() {
         .await
         .unwrap();
     let tool = tool.message_ids[0].clone();
-    assert_eq!(
-        row(&tool).thread,
-        Some(storage_sqlite::TimelineThreadRef {
-            root_message_id_hex: task.clone(),
-            parent_message_id_hex: task.clone(),
-        })
-    );
-    assert_eq!(
-        row(&tool).reply_to_message_id_hex.as_deref(),
-        Some(task.as_str()),
-        "a client without a thread view quotes the item's parent"
-    );
     for parent in [&task, &tool] {
         let (_, answer) = client
             .send_app_event(&group_id, thread_message(parent, "thanks", Vec::new()))

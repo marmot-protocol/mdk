@@ -1,7 +1,7 @@
 //! One accepted-edit resolver for incremental projection, repair and history.
 use super::*;
 use crate::SqliteAppStorage;
-use cgka_traits::agent_events::is_agent_item_thread_tag;
+use cgka_traits::agent_events::{AGENT_ITEM_THREAD_ROOT_TAG, is_agent_item_thread_tag};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineEditSummary {
@@ -158,18 +158,28 @@ pub(super) fn apply(row: &mut TimelineRow, versions: &[AcceptedEdit]) {
     if let Some((_, tags)) = &latest.agent_item {
         // A later version of an agent item replaces its content and tags. It
         // is the item changing state, not a correction, so the row is not
-        // marked edited. The item stays in the thread its first event named:
-        // an edit cannot carry the parent's `e`, and an item never moves.
-        let thread = row
+        // marked edited. An item never moves: one in a thread keeps the thread
+        // tags of its first event, since an edit cannot carry the parent's
+        // `e`, and one outside a thread cannot join one through an edit's `E`.
+        let in_thread = cgka_traits::thread_root_tag(&row.tags).is_some();
+        let placement = row
             .tags
             .iter()
-            .filter(|tag| is_agent_item_thread_tag(tag))
-            .cloned();
+            .filter(|tag| in_thread && is_agent_item_thread_tag(tag))
+            .cloned()
+            .collect::<Vec<_>>();
         row.tags = tags
             .iter()
-            .filter(|tag| !is_agent_item_thread_tag(tag))
+            .filter(|tag| {
+                if in_thread {
+                    !is_agent_item_thread_tag(tag)
+                } else {
+                    tag.first()
+                        .is_none_or(|name| name != AGENT_ITEM_THREAD_ROOT_TAG)
+                }
+            })
             .cloned()
-            .chain(thread)
+            .chain(placement)
             .collect();
         row.reply_to_message_id_hex = cgka_traits::agent_item_reply_target(&row.tags);
         return;

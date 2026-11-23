@@ -5661,7 +5661,8 @@ typedef struct MarmotPollProjection {
 
 /**
  * A row's place in a NIP-22 thread: set for every thread message
- * (kind 1111) and for a chat, sticker or poll that joined a thread.
+ * (kind 1111) and for a chat, sticker, poll or agent item (kind 1201)
+ * that joined a thread.
  * A client without a thread view ignores it and quotes
  * `reply_to_message_id_hex`.
  */

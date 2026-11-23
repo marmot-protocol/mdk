@@ -277,6 +277,10 @@ pub fn is_agent_commentary(tags: &[Vec<String>]) -> bool {
     })
 }
 
+/// On an item in a thread: the thread root, the top-level subagent's `task`
+/// item (NIP-22's `E`).
+pub const AGENT_ITEM_THREAD_ROOT_TAG: &str = "E";
+
 /// NIP-22's tags that place an item in a thread: `E`/`K`/`P` name the root,
 /// `e`/`k`/`p` the immediate parent (marmot-agents D-121).
 pub const AGENT_ITEM_THREAD_TAGS: [&str; 6] = ["E", "K", "P", "e", "k", "p"];
@@ -287,11 +291,11 @@ pub fn is_agent_item_thread_tag(tag: &[String]) -> bool {
         .is_some_and(|name| AGENT_ITEM_THREAD_TAGS.contains(&name.as_str()))
 }
 
-/// The parent an agent item in a thread names with its `e` tag. `None` for an
-/// item outside a thread, which names no `e`.
+/// The parent of an agent item in a thread: the item its `e` tag names, or
+/// else the thread root its `E` names. `None` for an item outside a thread.
 pub fn agent_item_thread_parent(tags: &[Vec<String>]) -> Option<&str> {
-    crate::thread_root_tag(tags)?;
-    values(tags, AGENT_REQUEST_ITEM_TAG).next()
+    let root = crate::thread_root_tag(tags)?;
+    Some(values(tags, AGENT_REQUEST_ITEM_TAG).next().unwrap_or(root))
 }
 
 /// What a client without a thread view quotes above an agent item: the chat
@@ -303,17 +307,17 @@ pub fn agent_item_reply_target(tags: &[Vec<String>]) -> Option<String> {
         .or_else(|| agent_item_thread_parent(tags).map(str::to_owned))
 }
 
-/// Check an agent item's first event a program sends: readable, and with an
-/// `e` tag only as the parent of an item in a thread, once, beside the root's
-/// `E`. Any other `e` would read as an edit's target, which is MDK's to place.
+/// Check an agent item's first event a program sends: readable, with at most
+/// one thread root `E` naming an event, and with an `e` tag only as the parent
+/// of an item in a thread, once, beside that `E`. Any other `e` would read as
+/// an edit's target, which is MDK's to place.
 pub fn validate_agent_item_tags(tags: &[Vec<String>]) -> Result<AgentItem, AgentEventError> {
-    let mut parents = values(tags, AGENT_REQUEST_ITEM_TAG);
-    if let Some(parent) = parents.next() {
-        if crate::thread_root_tag(tags).is_none() {
+    let root = single(tags, AGENT_ITEM_THREAD_ROOT_TAG)?
+        .map(|root| event_id(root, AGENT_ITEM_THREAD_ROOT_TAG))
+        .transpose()?;
+    if let Some(parent) = single(tags, AGENT_REQUEST_ITEM_TAG)? {
+        if root.is_none() {
             return Err(AgentEventError::EventReference);
-        }
-        if parents.next().is_some() {
-            return Err(AgentEventError::Repeated(AGENT_REQUEST_ITEM_TAG));
         }
         event_id(parent, AGENT_REQUEST_ITEM_TAG)?;
     }
@@ -577,6 +581,24 @@ mod tests {
             validate_agent_item_tags(&twice),
             Err(AgentEventError::Repeated("e"))
         );
+        // The root must name an event too, with or without a parent.
+        for bad_root in [
+            vec![tag(&["E", ""])],
+            vec![tag(&["E", "root"]), tag(&["e", &id('f')])],
+        ] {
+            let mut tags = item_tags("tool", "running");
+            tags.extend(bad_root);
+            assert_eq!(
+                validate_agent_item_tags(&tags),
+                Err(AgentEventError::Invalid("E"))
+            );
+        }
+        // An item with a root and no parent answers the root.
+        let mut root_only = item_tags("tool", "running");
+        root_only.retain(|tag| tag[0] != "started_by");
+        root_only.push(tag(&["E", &id('d')]));
+        assert!(validate_agent_item_tags(&root_only).is_ok());
+        assert_eq!(agent_item_reply_target(&root_only), Some(id('d')));
         let mut bad_parent = item_tags("tool", "running");
         bad_parent.extend(thread_tags('d', 'f'));
         bad_parent.retain(|tag| tag[0] != "e");
