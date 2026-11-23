@@ -1880,6 +1880,64 @@ async fn a_refused_pinned_sibling_welcome_is_sent_by_the_next_pass() {
     assert_eq!(stashed(&devices.phone), 1);
 }
 
+/// A sibling Add's invitation decision is pinned like its 461: while the
+/// laptop's own device-group Commit waits on its publication, the engine
+/// refuses the decision rather than queue it, so repeated attempts queue
+/// nothing and spend no stock. Once that Commit fails, the Add goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_adds_decision_is_refused_not_queued_while_the_device_group_settles() {
+    let (mut devices, group, [chat]) = tagging_devices_with_chats::<1>().await;
+    let phone_slot = slot(&devices.phone);
+    let stock = received_from(&devices.laptop, &phone_slot).len();
+    let effects = devices
+        .laptop
+        .runtime
+        .session_mut()
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    let Some(PublishWork::GroupEvolution { pending, .. }) = effects.publish.into_iter().next()
+    else {
+        panic!("expected a group evolution")
+    };
+
+    for _ in 0..2 {
+        let candidate = private_candidate(&devices.laptop, &phone_slot);
+        assert!(
+            devices
+                .laptop
+                .add_sibling_to_chat(&chat, &phone_slot, candidate)
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        !devices
+            .laptop
+            .runtime
+            .has_queued_outbound_intents(&group)
+            .unwrap()
+    );
+    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock);
+
+    devices
+        .laptop
+        .runtime
+        .session_mut()
+        .publish_failed(pending)
+        .await
+        .unwrap();
+    let candidate = private_candidate(&devices.laptop, &phone_slot);
+    devices
+        .laptop
+        .add_sibling_to_chat(&chat, &phone_slot, candidate)
+        .await
+        .unwrap();
+    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
+}
+
 /// A 461 is pinned to the branch its tag was read on, not only the epoch
 /// number. A rival device-group commit from the same epoch that wins branch
 /// selection inside the 461's own send refuses it before anything is
@@ -1977,18 +2035,22 @@ async fn a_sibling_welcome_waits_for_its_commit() {
         .load(std::sync::atomic::Ordering::SeqCst);
     relay.block_next_publishes(2);
     let candidate = private_candidate(&devices.laptop, &phone_slot);
-    let (added, ()) = tokio::join!(
-        devices
-            .laptop
-            .add_sibling_to_chat(&chat, &phone_slot, candidate),
-        async {
-            relay.wait_for_blocked_publishes(blocked + 1).await;
-            relay.release_publish();
-            relay.wait_for_blocked_publishes(blocked + 2).await;
-            relay.reject_next_publish();
-            relay.release_publish();
-        }
-    );
+    let (added, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            devices
+                .laptop
+                .add_sibling_to_chat(&chat, &phone_slot, candidate),
+            async {
+                relay.wait_for_blocked_publishes(blocked + 1).await;
+                relay.release_publish();
+                relay.wait_for_blocked_publishes(blocked + 2).await;
+                relay.reject_next_publish();
+                relay.release_publish();
+            }
+        )
+    })
+    .await
+    .expect("the decision is accepted and the Commit refused");
     assert_eq!(added.unwrap_err().privacy_safe_kind(), "publish");
     assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
     devices.laptop.send_owed_sibling_welcomes(&[]).await;

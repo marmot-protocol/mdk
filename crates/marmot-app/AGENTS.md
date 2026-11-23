@@ -653,7 +653,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   foreground owner does, to keep it out of idle maintenance frames. A known current-generation decline holds new
   direct/gap sibling Adds at candidate and final preparation; private-stock requests follow their ordinary rules.
   Every sibling Add sends its chat's held decision first (`send_invitation_decision_before_add`) and waits, spending
-  no stock, until a relay accepted that send (`publish_device_group_message`; unresolved or queued is not enough): a
+  no stock, until a relay accepted that send (`publish_device_group_message`, epoch-pinned so it is refused, never
+  queued, while the device group settles; unresolved is not enough): a
   device linked since the decision went out cannot read the earlier send, and a broadcast answering its request can
   wait an hour (mdk#3556). Check the decline again after that send, which can apply received decisions. Keep claims/waiters and
   exposed work settlement independent. Reuse durable winner work to schedule the affected chat's existing gap work,

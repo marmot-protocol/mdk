@@ -46,9 +46,11 @@
   added them, the same row the adder's timeline shows.
 - The README now states that chat history imported from another device, and backups, leave out group system rows
   and deleted-message placeholders, and why.
-- A newly linked device no longer shows a chat the account already accepted as an invitation, where declining it
-  would take the account out of the chat on every device (mdk#3556). Before each automatic sibling Add the adding
-  device sends the chat's invitation decision again, and the Add waits for a later pass until a relay accepted it.
+- A newly linked device no longer shows a chat the account already accepted as an invitation for up to an hour, where
+  declining it would take the account out of the chat on every device (mdk#3556). Before each automatic sibling Add
+  the adding device publishes the chat's invitation decision again, epoch-pinned, and the Add waits for a later pass
+  until a relay accepted it. The decision is published ahead of the sibling Welcome but travels separately, so a device
+  that reads the Welcome from a relay not yet holding the decision can still show the invitation until it arrives.
 
 ## 0.19.0 - 2026-11-22
 

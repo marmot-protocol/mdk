@@ -109,7 +109,7 @@ impl Exchange {
 enum DeviceGroupSend {
     /// A relay accepted it.
     Published,
-    /// Unresolved or queued: that same message still goes out.
+    /// Unresolved, or queued when unpinned: that same message still goes out.
     Pending,
     /// Its publication failed terminally and reached no one.
     Failed,
@@ -346,16 +346,18 @@ impl AppClient {
         self.send_device_group_event(group_id, event).await
     }
 
-    /// [`Self::send_device_group_message`], `true` only once a relay accepted
-    /// the message: one unresolved or queued has not gone out yet.
+    /// [`Self::send_device_group_message`] pinned to `pin`, as
+    /// [`Self::send_device_group_event_at`] is, and `true` only once a relay
+    /// accepted the message: one unresolved has not gone out yet.
     pub(crate) async fn publish_device_group_message(
         &mut self,
         group_id: &GroupId,
         kind: u64,
         content: String,
+        pin: EpochPin,
     ) -> Result<bool, AppError> {
         let event = self.device_group_event(kind, content)?;
-        Ok(self.device_group_send(group_id, event, None).await? == DeviceGroupSend::Published)
+        Ok(self.device_group_send(group_id, event, Some(pin)).await? == DeviceGroupSend::Published)
     }
 
     /// A device-group message of `kind` from this device, not yet sent.
