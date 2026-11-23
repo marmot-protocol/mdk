@@ -63,8 +63,8 @@ top-level `task` item carries no thread tags.
   refuses an `e` on a kind 1201 without an `E`: there it would read as an edit's target.
 - **Edits.** A later version is a kind-1009 edit whose one `e` names its target, so it carries no parent `e`. It may
   repeat `E`/`K`/`P`. The item stays where its first event placed it, whatever thread tags an edit carries.
-- **The agent's words** are kind 1111 comments with the same tags. One whose `K` is 1201 and whose `P` is its own
-  author neither notifies nor wakes members (D-122). Items in the thread keep their own alert rule (D-024): a
+- **The agent's words** are kind 1111 comments with the same tags. One with an `E`, whose `K` is 1201 and whose `P` is its
+  own author, neither notifies nor wakes members (D-122). Items in the thread keep their own alert rule (D-024): a
   subagent's approval or question alerts.
 - **The parent `p`** always names the event's own author. A `p` is a mention only for the account it names, and an
   account's own messages never notify, raise the @-badge or count as unread, so it is never a mention.

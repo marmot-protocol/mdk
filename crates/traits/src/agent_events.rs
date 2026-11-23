@@ -281,16 +281,6 @@ pub fn is_agent_commentary(tags: &[Vec<String>]) -> bool {
 /// item (NIP-22's `E`).
 pub const AGENT_ITEM_THREAD_ROOT_TAG: &str = "E";
 
-/// NIP-22's tags that place an item in a thread: `E`/`K`/`P` name the root,
-/// `e`/`k`/`p` the immediate parent (marmot-agents D-121).
-pub const AGENT_ITEM_THREAD_TAGS: [&str; 6] = ["E", "K", "P", "e", "k", "p"];
-
-/// Whether `tag` is one of [`AGENT_ITEM_THREAD_TAGS`].
-pub fn is_agent_item_thread_tag(tag: &[String]) -> bool {
-    tag.first()
-        .is_some_and(|name| AGENT_ITEM_THREAD_TAGS.contains(&name.as_str()))
-}
-
 /// The parent of an agent item in a thread: the item its `e` tag names, or
 /// else the thread root its `E` names. `None` for an item outside a thread.
 pub fn agent_item_thread_parent(tags: &[Vec<String>]) -> Option<&str> {
@@ -334,13 +324,14 @@ pub fn validate_agent_item_edit_tags(tags: &[Vec<String>]) -> Result<AgentItem, 
 }
 
 /// Whether a thread message is an agent's own words in a thread whose root is
-/// one of its agent items: a comment whose `K` is 1201 and whose `P` is its
-/// author. It does not alert or wake anyone (marmot-agents D-122). Read from
+/// one of its agent items: a comment naming its root with `E`, whose `K` is
+/// 1201 and whose `P` is its author. It does not alert or wake anyone (marmot-agents D-122). Read from
 /// the comment's own tags, so it also holds where the root is not stored, and
 /// a sender can only silence its own message with it.
 pub fn is_agent_own_thread_comment(kind: u64, tags: &[Vec<String>], sender_hex: &str) -> bool {
     let value = |name: &'static str| values(tags, name).next();
     crate::thread_message_parent(kind, tags).is_some()
+        && crate::thread_root_tag(tags).is_some()
         && value("K").and_then(|kind| kind.parse().ok()) == Some(MARMOT_APP_EVENT_KIND_AGENT_ITEM)
         && value("P").is_some_and(|author| author.eq_ignore_ascii_case(sender_hex))
 }
@@ -654,6 +645,10 @@ mod tests {
             &comment("1201", &agent),
             &agent
         ));
+        // Without `E` the root is found by walking parents, and may be chat.
+        let mut rootless = comment("1201", &agent);
+        rootless.remove(0);
+        assert!(!is_agent_own_thread_comment(1111, &rootless, &agent));
     }
 
     #[test]

@@ -33,8 +33,8 @@
   and `e`/`k`/`p` (parent), and `submit_custom_event` and `send_custom_event` take its `e` only beside an `E`. An edit
   of an item still carries no `e` but its target's. A thread message answering an item in a thread names that item's
   root and the item as its parent.
-- The agent's own words in a thread under one of its items, a kind 1111 whose `K` is 1201 and whose `P` is its
-  author, neither notify nor wake members (D-122). Items in a thread keep their own alert rule.
+- The agent's own words in a thread under one of its items, a kind 1111 with an `E` whose `K` is 1201 and whose `P`
+  is its author, neither notify nor wake members (D-122). Items in a thread keep their own alert rule.
 
 ## 0.19.0 - 2026-11-22
 

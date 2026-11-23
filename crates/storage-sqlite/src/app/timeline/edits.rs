@@ -1,7 +1,16 @@
 //! One accepted-edit resolver for incremental projection, repair and history.
 use super::*;
 use crate::SqliteAppStorage;
-use cgka_traits::agent_events::{AGENT_ITEM_THREAD_ROOT_TAG, is_agent_item_thread_tag};
+use cgka_traits::agent_events::AGENT_ITEM_THREAD_ROOT_TAG;
+
+/// NIP-22's tags that place an agent item in a thread: `E`/`K`/`P` name the
+/// root, `e`/`k`/`p` the immediate parent (marmot-agents D-121).
+const AGENT_ITEM_THREAD_TAGS: [&str; 6] = ["E", "K", "P", "e", "k", "p"];
+
+fn is_agent_item_thread_tag(tag: &[String]) -> bool {
+    tag.first()
+        .is_some_and(|name| AGENT_ITEM_THREAD_TAGS.contains(&name.as_str()))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineEditSummary {
