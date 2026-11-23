@@ -2283,16 +2283,15 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                  last_message_deleted = ?7,
                  last_message_media_json = ?8,
                  last_message_delivery_state = ?9,
-                 activity_sort_at = MAX(
+                 activity_sort_at = COALESCE(NULLIF(MAX(
                      retained_activity_sort_at,
                      ?6,
                      COALESCE((
                          SELECT last_read_timeline_at
                          FROM conversation_read_state
                          WHERE group_id_hex = ?11
-                     ), 0),
-                     conversation_created_at
-                 ),
+                     ), 0)
+                 ), 0), conversation_created_at),
                  updated_at = ?10
              WHERE group_id_hex = ?11",
             params![
@@ -2326,15 +2325,14 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                  last_message_deleted = 0,
                  last_message_media_json = NULL,
                  last_message_delivery_state = 'not_applicable',
-                 activity_sort_at = MAX(
+                 activity_sort_at = COALESCE(NULLIF(MAX(
                      retained_activity_sort_at,
                      COALESCE((
                          SELECT last_read_timeline_at
                          FROM conversation_read_state
                          WHERE group_id_hex = ?2
-                     ), 0),
-                     conversation_created_at
-                 ),
+                     ), 0)
+                 ), 0), conversation_created_at),
                  updated_at = ?1
              WHERE group_id_hex = ?2",
             params![updated_at, group_id_hex],
