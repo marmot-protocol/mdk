@@ -416,12 +416,14 @@ pub(crate) fn second_string(text: &str) -> Option<String> {
 }
 
 /// The JSON string token `text` starts with, quotes included, and the rest,
-/// when it closes within `max` bytes.
+/// when it closes within `max` bytes. A raw control character ends it as
+/// JSON does: no string token is read.
 fn string_token(text: &str, max: usize) -> Option<(&str, &str)> {
     let body = text.strip_prefix('"')?;
     let mut escaped = false;
     for (index, byte) in body.bytes().enumerate().take(max) {
         match byte {
+            0..0x20 => return None,
             b'"' if !escaped => return Some(text.split_at(index + 2)),
             b'\\' if !escaped => escaped = true,
             _ => escaped = false,
@@ -452,13 +454,15 @@ const MAX_VERB_TOKEN: usize = 32;
 
 /// A frame's verb, its first element decoded as JSON decodes it (escapes
 /// included), when that is a string short enough to be one the tap reads.
-/// Reads only the frame's head, so it is cheap enough for every frame.
+/// A raw control character in it is not JSON, so no verb is read. Reads only
+/// the frame's head, so it is cheap enough for every frame.
 pub(crate) fn head_verb(text: &str) -> Option<Cow<'_, str>> {
     let token = text.trim_start().strip_prefix('[')?.trim_start();
     let body = token.strip_prefix('"')?;
     let mut escaped = false;
     for (index, byte) in body.bytes().enumerate().take(MAX_VERB_TOKEN) {
         match byte {
+            0..0x20 => return None,
             b'"' if !escaped => {
                 let raw = &body[..index];
                 if !raw.contains('\\') {
@@ -591,6 +595,9 @@ mod tests {
             (r#"["EOSEX","s"]"#.to_owned(), Some("EOSEX")),
             (r#"["E\"OSE","s"]"#.to_owned(), Some("E\"OSE")),
             (r#"["EVENT","EOSE"]"#.to_owned(), Some("EVENT")),
+            // A raw control character is not JSON, so no verb is read.
+            ("[\"EO\nSE\",\"s\"]".to_owned(), None),
+            ("[\"EOSE\t\",\"s\"]".to_owned(), None),
             (r#"{"EOSE":1}"#.to_owned(), None),
             (r#"[1,"EOSE"]"#.to_owned(), None),
             (r#"["EOSE"#.to_owned(), None),

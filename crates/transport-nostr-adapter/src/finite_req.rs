@@ -18,10 +18,11 @@
 //!
 //! Each request's queue holds at most its byte budget plus one frame. The
 //! queue counts whole frames as they came, envelope and padding included,
-//! while the budget counts serialized event JSON; one frame of room covers the
-//! envelopes of any page, so a relay that keeps to the request never fills it,
-//! however slow the caller. A full queue ends the request as a byte-budget
-//! cut. Frames past the item
+//! while the budget counts the serialized JSON of the valid events kept; one
+//! frame of room covers the envelopes of an ordinary page, however slow the
+//! caller. Only what the collector does not count against the budget can fill
+//! it: rejected events, or more than a frame of padding or escaping. A full
+//! queue ends the request as a byte-budget cut, never a short page. Frames past the item
 //! budget are dropped unparsed. A frame the wrapper cannot attribute to any
 //! request (one whose verb or EVENT id it cannot read) ends every request on
 //! its connection `InvalidMessage`, as it might have been one of theirs.
@@ -34,7 +35,6 @@
 //! check; the id is recomputed from the supplied bytes every time. None of
 //! these checks saves, notifies or gossips anything.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::IntoFuture;
@@ -231,13 +231,12 @@ impl Slot {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A frame for this request, read on `connection`.
-    fn receive(&self, connection: u64, verb: &str, text: String) {
+    /// A frame for this request, read on `connection`; `event` for an EVENT.
+    fn receive(&self, connection: u64, event: bool, text: String) {
         let mut state = self.lock();
         if state.binding != Binding::Sent(connection) {
             return;
         }
-        let event = verb == "EVENT";
         let bytes = text.len();
         if state.end.is_some() {
             if event {
@@ -701,6 +700,40 @@ fn says_more(hints: Option<&Value>) -> bool {
         .is_some_and(|names| names.iter().any(|name| name.as_str() == Some("more")))
 }
 
+/// How the wrapper reads a frame the relay sent.
+#[derive(Debug, PartialEq, Eq)]
+enum Inbound {
+    /// An EVENT, EOSE or CLOSED under a finite request's id.
+    Owned { event: bool, id: String },
+    /// Anyone else's frame, or one under a verb that carries no EVENT.
+    Other,
+    /// A frame whose verb, or EVENT id, cannot be read as JSON reads it: it
+    /// may have been any request's EVENT.
+    Unattributed,
+}
+
+/// Read a frame's verb and subscription id the way the SDK's parser reads
+/// them, without parsing the rest. Wherever the SDK could take a frame as an
+/// EVENT, this reads the same verb and id, so no finite request's EVENT
+/// reaches the SDK unseen.
+fn classify(text: &str) -> Inbound {
+    let Some(verb) = head_verb(text) else {
+        return Inbound::Unattributed;
+    };
+    let event = verb == "EVENT";
+    if !event && verb != "EOSE" && verb != "CLOSED" {
+        return Inbound::Other;
+    }
+    match second_string(text) {
+        Some(id) if id.starts_with(ID_PREFIX) => Inbound::Owned { event, id },
+        Some(_) => Inbound::Other,
+        None if event => Inbound::Unattributed,
+        // An unreadable EOSE or CLOSED ends nothing: its request waits out its
+        // deadline rather than completing.
+        None => Inbound::Other,
+    }
+}
+
 impl Registry {
     fn slot(&self, id: &str) -> Option<Arc<Slot>> {
         self.requests
@@ -724,27 +757,19 @@ impl Registry {
     /// keeps answering a REQ until it reads the CLOSE, and nothing in the SDK
     /// expects those frames.
     fn received(&self, connection: u64, text: String) -> Option<String> {
-        let Some(verb) = head_verb(&text).map(Cow::into_owned) else {
-            self.unattributed(connection);
-            return Some(text);
-        };
-        if !matches!(verb.as_str(), "EVENT" | "EOSE" | "CLOSED") {
-            return Some(text);
-        }
-        match second_string(&text) {
-            Some(id) if id.starts_with(ID_PREFIX) => {
-                // Unknown: a request that already ended. Dropped unread.
-                if let Some(slot) = self.slot(&id) {
-                    slot.receive(connection, &verb, text);
-                }
-                None
-            }
-            // An EVENT whose id cannot be read may have been anyone's.
-            None if verb == "EVENT" => {
+        match classify(&text) {
+            Inbound::Other => Some(text),
+            Inbound::Unattributed => {
                 self.unattributed(connection);
                 Some(text)
             }
-            _ => Some(text),
+            Inbound::Owned { event, id } => {
+                // Unknown: a request that already ended. Dropped unread.
+                if let Some(slot) = self.slot(&id) {
+                    slot.receive(connection, event, text);
+                }
+                None
+            }
         }
     }
 
@@ -1223,6 +1248,96 @@ mod tests {
         assert_eq!(slot.take().unwrap_err(), Some(FiniteEnd::Disconnected));
     }
 
+    /// The wrapper reads every frame's verb and id as the SDK's parser does.
+    /// A frame the SDK takes as a finite request's EVENT, EOSE or CLOSED is
+    /// that request's, under the same id; one it takes as anything else
+    /// passes on. A frame whose verb or EVENT id is not JSON, which the SDK
+    /// drops unread, may have been any request's EVENT: it ends the
+    /// connection's requests rather than passing on unseen.
+    #[test]
+    fn frames_are_classified_as_the_sdk_parses_them() {
+        let event = serde_json::to_string(&note(&Keys::generate(), "x")).unwrap();
+        let owned = |event: bool| Inbound::Owned {
+            event,
+            id: "~f1".to_owned(),
+        };
+        let cases = [
+            (format!(r#"["EVENT","~f1",{event}]"#), owned(true)),
+            (
+                format!(" \n [ \"EVENT\" ,\t\"~f1\" , {event} ] "),
+                owned(true),
+            ),
+            (format!(r#"["\u0045VENT","~f1",{event}]"#), owned(true)),
+            (format!(r#"["EVENT","\u007ef1",{event}]"#), owned(true)),
+            (format!(r#"["EVENT","live",{event}]"#), Inbound::Other),
+            (r#"["EOSE","~f1"]"#.to_owned(), owned(false)),
+            (r#"["EOSE","~f1",["more"]]"#.to_owned(), owned(false)),
+            (
+                r#"["CLOSED","~f1","error: refused"]"#.to_owned(),
+                owned(false),
+            ),
+            (r#"["NOTICE","~f1"]"#.to_owned(), Inbound::Other),
+            (r#"["OK","~f1",true,""]"#.to_owned(), Inbound::Other),
+            (r#"["AUTH","~f1"]"#.to_owned(), Inbound::Other),
+            // A readable EVENT id with a body that is not: its own request
+            // reads it and ends `InvalidMessage`.
+            (r#"["EVENT","~f1",{"id":7}]"#.to_owned(), owned(true)),
+            // Not JSON where the verb or EVENT id is.
+            (
+                format!("[\"EV\nENT\",\"~f1\",{event}]"),
+                Inbound::Unattributed,
+            ),
+            (
+                format!("[\"EVENT\",\"~f1\t\",{event}]"),
+                Inbound::Unattributed,
+            ),
+            (
+                format!("[\"EVENT\",\"~\u{1}f1\",{event}]"),
+                Inbound::Unattributed,
+            ),
+            (r#"["EVENT",7,{}]"#.to_owned(), Inbound::Unattributed),
+            (r#"[1,"~f1"]"#.to_owned(), Inbound::Unattributed),
+            ("not json".to_owned(), Inbound::Unattributed),
+        ];
+        for (frame, expected) in cases {
+            let class = classify(&frame);
+            assert_eq!(class, expected, "{frame:?}");
+            let agrees = |event: bool, id: &str| {
+                if id.starts_with(ID_PREFIX) {
+                    class
+                        == Inbound::Owned {
+                            event,
+                            id: id.to_owned(),
+                        }
+                } else {
+                    class == Inbound::Other
+                }
+            };
+            match RelayMessage::from_json(frame.as_str()) {
+                Ok(RelayMessage::Event {
+                    subscription_id, ..
+                }) => assert!(agrees(true, subscription_id.as_str()), "{frame:?}"),
+                Ok(RelayMessage::EndOfStoredEvents(id)) => {
+                    assert!(agrees(false, id.as_str()), "{frame:?}");
+                }
+                Ok(RelayMessage::Closed {
+                    subscription_id, ..
+                }) => assert!(agrees(false, subscription_id.as_str()), "{frame:?}"),
+                Ok(_) => assert_eq!(class, Inbound::Other, "{frame:?}"),
+                Err(_) => assert!(
+                    class != Inbound::Other || !frame.contains("EVENT"),
+                    "a frame the SDK drops passed as someone else's: {frame:?}"
+                ),
+            }
+            if class == Inbound::Unattributed {
+                assert!(
+                    RelayMessage::from_json(frame.as_str()).is_err(),
+                    "the SDK reads {frame:?}"
+                );
+            }
+        }
+    }
+
     /// A REQ still queued when its request ended, or one for no registered
     /// request, never goes out.
     #[test]
@@ -1391,8 +1506,9 @@ mod tests {
             .await
             .unwrap()
             .value;
-        loop {
-            match notifications.next().await.expect("notifications ended") {
+        let barrier_reached = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match notifications.next().await.expect("notifications ended") {
                 ClientNotification::Message { message, .. } => {
                     assert!(!message.as_json().contains(ID_PREFIX), "{message:?}");
                     if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(id) if **id == barrier)
@@ -1405,7 +1521,10 @@ mod tests {
                 }
                 _ => {}
             }
-        }
+            }
+        })
+        .await;
+        assert!(barrier_reached.is_ok(), "the later REQ's EOSE never came");
         client.shutdown().await;
     }
 
