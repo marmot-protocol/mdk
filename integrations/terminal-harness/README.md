@@ -390,11 +390,14 @@ context compaction. The snapshot is data: commands and workdir selection come
 from the current message only. The harness renders the snapshot as `wn-agent`
 built it: a deleted or invalidated target keeps its sender and time but no text
 or attachments, and a missing target carries only its id and availability. `//`
-literal forwards omit it. A recovery record keeps the rendered snapshot, and
-`/retry-last` asks `wn-agent` for the target again before rendering it once
-more: if the target was deleted, invalidated or is gone since the first
-attempt, or cannot be checked, the retry keeps its id and attribution but drops
-the saved text and attachments.
+literal forwards omit it. A snapshot can be older than the turn that renders
+it: a reply may wait in the group queue, and a recovery record keeps the
+snapshot for `/retry-last`. So once a turn starts, the harness asks `wn-agent`
+for an available target again before rendering it. A target that was deleted,
+invalidated or is gone since keeps its id and attribution but loses its text
+and attachments, and the recovery record keeps that copy. A target that cannot
+be checked is rendered the same way for that attempt only; the record keeps the
+original, and a later retry checks it again.
 
 `/retry-last` and `/discard-last` are available only while one matching durable
 recovery record blocks that group. Retry consumes that record once and runs ahead
