@@ -24,8 +24,9 @@
 //! it: rejected events, or more than a frame of padding or escaping. A full
 //! queue ends the request as a byte-budget cut, never a short page. Frames past the item
 //! budget are dropped unparsed. A frame the wrapper cannot attribute to any
-//! request (one whose verb or EVENT id it cannot read) ends every request on
-//! its connection `InvalidMessage`, as it might have been one of theirs.
+//! request (a binary frame, or one whose verb or EVENT id it cannot read) ends
+//! every request on its connection `InvalidMessage`, as it might have been one
+//! of theirs.
 //!
 //! The collector applies the checks the SDK applies to subscription input: the
 //! SDK's message and tag ceilings, expiry, the event id and signature of the
@@ -894,6 +895,12 @@ impl Stream for Diverted {
                         return Poll::Ready(Some(Ok(Message::Text(text))));
                     }
                 }
+                // The SDK drops a binary frame unread, and it may have been
+                // any request's EVENT: it ends the connection's requests.
+                Poll::Ready(Some(Ok(Message::Binary(data)))) => {
+                    self.registry.unattributed(self.connection);
+                    return Poll::Ready(Some(Ok(Message::Binary(data))));
+                }
                 Poll::Ready(Some(Err(error))) => {
                     self.end();
                     return Poll::Ready(Some(Err(error)));
@@ -924,6 +931,7 @@ mod tests {
     use nostr_sdk::prelude::{Client, ClientNotification, RelayUrl};
 
     use super::*;
+    use crate::sweep::hint_tap::escaped;
 
     const RELAY: &str = "wss://relay.example.com/";
 
@@ -1279,6 +1287,23 @@ mod tests {
             (r#"["NOTICE","~f1"]"#.to_owned(), Inbound::Other),
             (r#"["OK","~f1",true,""]"#.to_owned(), Inbound::Other),
             (r#"["AUTH","~f1"]"#.to_owned(), Inbound::Other),
+            // Every verb read whole however it is escaped.
+            (
+                format!(r#"["{}","~f1","error: refused"]"#, escaped("CLOSED")),
+                owned(false),
+            ),
+            (
+                format!(r#"["{}","~f1"]"#, escaped("NOTICE")),
+                Inbound::Other,
+            ),
+            (
+                format!(r#"["{}","~f1","00"]"#, escaped("NEG-MSG")),
+                Inbound::Other,
+            ),
+            (
+                format!(r#"["{}","~f1","blocked"]"#, escaped("NEG-ERR")),
+                Inbound::Other,
+            ),
             // A readable EVENT id with a body that is not: its own request
             // reads it and ends `InvalidMessage`.
             (r#"["EVENT","~f1",{"id":7}]"#.to_owned(), owned(true)),
@@ -1368,6 +1393,57 @@ mod tests {
         }
         assert_eq!(here.lock().end, Some(FiniteEnd::InvalidMessage));
         assert_eq!(there.lock().end, None);
+    }
+
+    /// A binary frame may have been any request's EVENT, and the SDK drops
+    /// it unread: it ends the requests on its connection, and still reaches
+    /// the SDK. The text EOSE after it cannot then read as a short page.
+    #[tokio::test]
+    async fn a_binary_frame_ends_its_connections_requests() {
+        let finite = requests();
+        let slot = register(&finite.0, "~f1", limits(10, 1 << 20));
+        let binary = frame("EVENT", "~f1").into_bytes();
+        let transport = finite.transport(Arc::new(Scripted(Mutex::new(vec![
+            Message::Binary(binary.clone()),
+            Message::Text(eose_for("~f1")),
+        ]))));
+        let url = Url::parse(RELAY).unwrap();
+        let (mut sink, mut stream) = transport.connect(&url, None).await.unwrap();
+        sink.send(Message::Text(req("~f1"))).await.unwrap();
+        assert!(
+            matches!(stream.next().await, Some(Ok(Message::Binary(data))) if data == binary),
+            "the binary frame reaches the SDK"
+        );
+        assert!(
+            futures::FutureExt::now_or_never(stream.next()).is_none(),
+            "the request's EOSE does not"
+        );
+        assert_eq!(slot.lock().end, Some(FiniteEnd::InvalidMessage));
+    }
+
+    fn eose_for(id: &str) -> String {
+        format!(r#"["EOSE","{id}"]"#)
+    }
+
+    /// A transport whose one connection sends `.0`, then waits.
+    #[derive(Debug)]
+    struct Scripted(Mutex<Vec<Message>>);
+
+    impl WebSocketTransport for Scripted {
+        fn support_ping(&self) -> bool {
+            false
+        }
+
+        fn connect<'a>(&'a self, _: &'a Url, _: Option<SocketAddr>) -> ConnectFuture<'a> {
+            let frames = std::mem::take(&mut *self.0.lock().unwrap());
+            Box::pin(async move {
+                let sink: WebSocketSink =
+                    Box::pin(futures::sink::drain().sink_map_err(|never| match never {}));
+                let stream: WebSocketStream =
+                    Box::pin(stream::iter(frames.into_iter().map(Ok)).chain(stream::pending()));
+                Ok((sink, stream))
+            })
+        }
     }
 
     /// The reader never waits on a request: frames past its item budget are

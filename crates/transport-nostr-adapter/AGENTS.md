@@ -254,8 +254,8 @@ for reconnect/backoff and relay status mechanics.
   registered: a relay keeps answering until it reads the CLOSE, and those frames must never reach the SDK. It never
   blocks or delays another frame. It reads each frame's verb and id as the SDK's JSON parser reads them
   (`classify`, pinned against `RelayMessage::from_json`); a frame whose verb or EVENT id is not JSON (a raw control
-  character included) passes on and ends that connection's requests `InvalidMessage`, so no EVENT the SDK would drop
-  can shorten a page unseen. Each request's queue holds its byte budget plus one frame, which covers an ordinary
+  character included), or any binary frame, passes on and ends that connection's requests `InvalidMessage`, so no
+  EVENT the SDK would drop can shorten a page unseen. Each request's queue holds its byte budget plus one frame, which covers an ordinary
   page's envelopes however slow the caller; only rejected events or more than a frame of padding can fill it, and
   that ends the request as a cut. The collector applies the SDK's message and tag ceilings, expiry, the filter,
   the event id and signature of the supplied bytes, the client database's deletion check and the builder's admission

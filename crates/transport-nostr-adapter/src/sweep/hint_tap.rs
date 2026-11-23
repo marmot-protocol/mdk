@@ -432,6 +432,15 @@ fn string_token(text: &str, max: usize) -> Option<(&str, &str)> {
     None
 }
 
+/// Every character of `text` as a JSON `\uXXXX` escape. Built at run time so
+/// the escapes reach the frame as written.
+#[cfg(test)]
+pub(crate) fn escaped(text: &str) -> String {
+    text.chars()
+        .map(|c| format!("{}u{:04X}", '\\', u32::from(c)))
+        .collect()
+}
+
 /// The longest EOSE frame the tap parses. A real one is a subscription id of
 /// at most 64 characters and a few hint names.
 const MAX_EOSE_FRAME: usize = 1024;
@@ -448,35 +457,23 @@ fn read_eose(text: &str) -> Option<String> {
     Some(id.as_str().to_owned())
 }
 
-/// The longest a verb the tap reads can be on the wire: "EOSE" with every
-/// character escaped as `\uXXXX` is 24 bytes.
-const MAX_VERB_TOKEN: usize = 32;
+/// The longest verb token read, quotes excluded: the longest verb the SDK
+/// parses, "NEG-MSG" or "NEG-ERR", with every character escaped as `\uXXXX`
+/// is 42 bytes.
+const MAX_VERB_TOKEN: usize = 48;
 
 /// A frame's verb, its first element decoded as JSON decodes it (escapes
-/// included), when that is a string short enough to be one the tap reads.
+/// included), when that is a string short enough to be one the SDK parses.
 /// A raw control character in it is not JSON, so no verb is read. Reads only
 /// the frame's head, so it is cheap enough for every frame.
 pub(crate) fn head_verb(text: &str) -> Option<Cow<'_, str>> {
-    let token = text.trim_start().strip_prefix('[')?.trim_start();
-    let body = token.strip_prefix('"')?;
-    let mut escaped = false;
-    for (index, byte) in body.bytes().enumerate().take(MAX_VERB_TOKEN) {
-        match byte {
-            0..0x20 => return None,
-            b'"' if !escaped => {
-                let raw = &body[..index];
-                if !raw.contains('\\') {
-                    return Some(Cow::Borrowed(raw));
-                }
-                return serde_json::from_str::<String>(&token[..index + 2])
-                    .ok()
-                    .map(Cow::Owned);
-            }
-            b'\\' if !escaped => escaped = true,
-            _ => escaped = false,
-        }
+    let rest = text.trim_start().strip_prefix('[')?.trim_start();
+    let (token, _) = string_token(rest, MAX_VERB_TOKEN)?;
+    let raw = &token[1..token.len() - 1];
+    if !raw.contains('\\') {
+        return Some(Cow::Borrowed(raw));
     }
-    None
+    serde_json::from_str::<String>(token).ok().map(Cow::Owned)
 }
 
 type ConnectFuture<'a> = std::pin::Pin<
@@ -569,14 +566,6 @@ mod tests {
         ClientMessage::req(SubscriptionId::new(id), filters).as_json()
     }
 
-    /// Every character of `text` as a JSON `\uXXXX` escape. Built at run time
-    /// so the escapes reach the frame as written.
-    fn escaped(text: &str) -> String {
-        text.chars()
-            .map(|c| format!("{}u{:04X}", '\\', u32::from(c)))
-            .collect()
-    }
-
     /// "EOSE" with only its first character escaped.
     fn escaped_eose() -> String {
         format!("{}OSE", escaped("E"))
@@ -592,6 +581,10 @@ mod tests {
             (format!(r#"["{}","s"]"#, escaped_eose()), Some("EOSE")),
             (format!(r#"["{}","s"]"#, escaped("EOSE")), Some("EOSE")),
             (format!(r#"["{}","s"]"#, escaped("REQ")), Some("REQ")),
+            (
+                format!(r#"["{}","s"]"#, escaped("NEG-MSG")),
+                Some("NEG-MSG"),
+            ),
             (r#"["EOSEX","s"]"#.to_owned(), Some("EOSEX")),
             (r#"["E\"OSE","s"]"#.to_owned(), Some("E\"OSE")),
             (r#"["EVENT","EOSE"]"#.to_owned(), Some("EVENT")),
