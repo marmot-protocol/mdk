@@ -418,18 +418,7 @@ fn project_durable_record(
     account_id_hex: &str,
     record: AppMessageRecord,
     sender_display_name: Option<String>,
-    account_filter: Option<&str>,
-    group_filter: Option<&str>,
 ) -> Result<Option<AgentControlEvent>, AppError> {
-    if !inbound_filter_matches(
-        account_filter,
-        account_id_hex,
-        group_filter,
-        &record.group_id_hex,
-    ) {
-        return Ok(None);
-    }
-
     if record.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
         // Only locally synthesized group-system timeline rows represent the live
         // `GroupEvent::GroupStateChanged` signal. Ignore sent/received kind-1210 app events.
@@ -785,8 +774,6 @@ pub(crate) fn inbound_message_event_from_record_with_runtime(
     account_ref: &str,
     account_id_hex: &str,
     record: AppMessageRecord,
-    account_filter: Option<&str>,
-    group_filter: Option<&str>,
 ) -> Result<Option<AgentControlEvent>, AppError> {
     // Best-effort, like the live notice's name: the local directory's name for the sender.
     let sender_display_name = runtime.display_name_for_account_id(&record.sender);
@@ -796,8 +783,6 @@ pub(crate) fn inbound_message_event_from_record_with_runtime(
         account_id_hex,
         record,
         sender_display_name,
-        account_filter,
-        group_filter,
     )
 }
 

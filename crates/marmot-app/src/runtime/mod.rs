@@ -6083,6 +6083,19 @@ impl MarmotAppRuntime {
             .messages_after_insert_order(&account.label, query, after)
     }
 
+    /// The insert position of the newest stored row in the group, or across the account. See
+    /// [`MarmotApp::latest_message_insert_order`].
+    pub fn latest_message_insert_order(
+        &self,
+        account_ref: &str,
+        group_id_hex: Option<&str>,
+    ) -> Result<i64, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .latest_message_insert_order(&account.label, group_id_hex)
+    }
+
     pub fn message_by_id(
         &self,
         account_ref: &str,

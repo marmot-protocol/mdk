@@ -57,8 +57,10 @@ several files in the same crate); methods shared across those files are `pub(cra
   storage (mdk#3551): each subscription reads `messages_after_insert_order` from its own position per account, in
   pages of `INBOUND_PAGE_ROWS` with the scope's mark saved after each, re-reading every row just before projecting
   it. Live notices, catch-up passes and broadcast lag only wake that read; group invites and debug injections are
-  the only live deliveries. A subscription's first read starts at the scope's mark, or without one just before the
-  first row received since it began (or since an unreadable marks record was last written).
+  the only live deliveries. A subscription's first read starts at the scope's mark, or without one at the newest
+  row stored when it began (`MarmotAppRuntime::latest_message_insert_order`, read before it subscribes to events);
+  a lost marks record starts there too and sends `resync_required`, and a mark that cannot be saved stops the read
+  at the last saved one and sends `resync_required`.
 - `src/inbound_marks.rs` — `InboundMarks`, the delivery marks per subscription scope (every group, or one group),
   kept in the account directory beside the database whose positions they name; a mark only moves forward.
 - `src/invite_policy.rs` — background reconciliation of pending group invites against the welcomer allowlist

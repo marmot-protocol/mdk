@@ -3,7 +3,6 @@
 //! and broadcast lag only wake that read (mdk#3551).
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_control::{
     AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
@@ -31,22 +30,35 @@ use crate::validation::agent_control_request_type;
 /// message ids the plugin clients deduplicate against.
 pub(crate) const INBOUND_PAGE_ROWS: usize = 256;
 
-/// One subscription's read of storage: when it began, how many rows it reads per page, and how
-/// far it has read in each account.
+/// One subscription's read of storage: where each account it covered when it began stood, how
+/// many rows it reads per page, and how far it has read in each account.
 pub(crate) struct StoredRead {
-    subscribed_at: u64,
+    /// The newest stored position of each account the subscription covered when it began, read
+    /// before it subscribed to runtime events; `None` when that read failed.
+    starts: HashMap<String, Option<i64>>,
+    /// Whether the accounts could be listed then, so an account missing from `starts` was
+    /// created later.
+    listed: bool,
     page_rows: usize,
     positions: HashMap<String, i64>,
 }
 
+/// Where a scope's first read starts when it has no usable mark.
+enum Start {
+    /// This position: everything at or before it is history.
+    At(i64),
+    /// Unknown: the newest position now, and the client is told it may have missed rows.
+    Unknown,
+}
+
 impl StoredRead {
-    pub(crate) fn new(page_rows: usize) -> Self {
-        Self {
-            subscribed_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_secs()),
-            page_rows,
-            positions: HashMap::new(),
+    fn start(&self, account_label: &str) -> Start {
+        match self.starts.get(account_label) {
+            Some(Some(start)) => Start::At(*start),
+            Some(None) => Start::Unknown,
+            // An account created after the subscription began has no history.
+            None if self.listed => Start::At(0),
+            None => Start::Unknown,
         }
     }
 }
@@ -64,7 +76,14 @@ impl AgentConnector {
         R: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let mut read = StoredRead::new(INBOUND_PAGE_ROWS);
+        // Read where each account stands before subscribing to its events: a row stored after
+        // this read, even one received earlier and committed later, sorts after it and its
+        // notice wakes a read.
+        let mut read = self.stored_read(
+            account_id_hex.as_deref(),
+            group_id_hex.as_deref(),
+            INBOUND_PAGE_ROWS,
+        );
         let mut runtime_events = self.runtime.subscribe();
         let mut debug_events = self.debug_events.subscribe();
         let (mut catch_up_events, _catch_up_subscription) = self.inbound_catch_up.subscribe();
@@ -73,8 +92,7 @@ impl AgentConnector {
         write_control_frame(writer, &response).await?;
 
         // mdk#3551: hand over what was stored after this scope's mark while no subscriber was
-        // attached, such as a message that arrived during a gateway restart. The runtime
-        // receiver above was subscribed first, so every row stored later wakes another read.
+        // attached, such as a message that arrived during a gateway restart.
         self.deliver_stored_for_subscription(
             &request_id,
             account_id_hex.as_deref(),
@@ -242,6 +260,45 @@ impl AgentConnector {
         }
     }
 
+    /// The accounts a subscription covers: the one it names, or every local account.
+    fn inbound_accounts(
+        &self,
+        account_filter: Option<&str>,
+    ) -> Result<Vec<marmot_account::AccountSummary>, ConnectorError> {
+        Ok(match account_filter {
+            Some(account_id_hex) => vec![self.local_account_for_account_id(account_id_hex)?],
+            None => self.account_home.accounts()?,
+        })
+    }
+
+    /// A subscription's read of storage, starting where each covered account stands now.
+    pub(crate) fn stored_read(
+        &self,
+        account_filter: Option<&str>,
+        group_filter: Option<&str>,
+        page_rows: usize,
+    ) -> StoredRead {
+        let accounts = self.inbound_accounts(account_filter);
+        let listed = accounts.is_ok();
+        let starts = accounts
+            .unwrap_or_default()
+            .into_iter()
+            .map(|account| {
+                let start = self
+                    .runtime
+                    .latest_message_insert_order(&account.label, group_filter)
+                    .ok();
+                (account.label, start)
+            })
+            .collect();
+        StoredRead {
+            starts,
+            listed,
+            page_rows,
+            positions: HashMap::new(),
+        }
+    }
+
     /// Delivers what every account the subscription covers stored after its position. Returns
     /// whether storage could be read; when it could not, `resync_required` was sent.
     async fn deliver_stored_for_subscription<W>(
@@ -255,20 +312,20 @@ impl AgentConnector {
     where
         W: AsyncWrite + Unpin,
     {
-        let accounts = match account_filter {
-            Some(account_id_hex) => self
-                .local_account_for_account_id(account_id_hex)
-                .map(|account| vec![account]),
-            None => self.account_home.accounts().map_err(ConnectorError::from),
-        };
-        let accounts = match accounts {
+        let accounts = match self.inbound_accounts(account_filter) {
             Ok(accounts) => accounts,
             Err(err) => {
-                self.signal_stored_inbound_unread(
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "deliver_stored_for_subscription",
+                    error_code = err.privacy_safe_code(),
+                    "inbound accounts could not be listed"
+                );
+                self.signal_stored_inbound_gap(
                     request_id,
                     account_filter,
                     group_filter,
-                    &err,
+                    "stored_read_failed",
                     writer,
                 )
                 .await?;
@@ -293,12 +350,13 @@ impl AgentConnector {
 
     /// Delivers what an account stored after this subscription's position, page by page in
     /// storage order, saving the scope's mark after each page (mdk#3551). The first read of an
-    /// account starts at the scope's saved mark, or, without one, just before the first row
-    /// received since the subscription began (or since an unreadable mark record was written),
-    /// so history is not replayed and nothing that arrived meanwhile is skipped. A storage
-    /// failure leaves the position where it was, so the rows are read again on the next wake,
-    /// and sends `resync_required`. Returns whether storage could be read; only a failed write to
-    /// the client is an error.
+    /// account starts at the scope's saved mark, or, without one, at the newest row stored when
+    /// the subscription began, so history is not replayed and nothing stored since is skipped.
+    /// When the mark was lost, or that position is unknown, it starts at the newest row and sends
+    /// `resync_required`. A storage failure, or a mark that cannot be saved, stops the read at
+    /// the last saved position, so the rows are read again on the next wake, and sends
+    /// `resync_required`. Returns whether the read completed; only a failed write to the client
+    /// is an error.
     pub(crate) async fn deliver_stored_inbound<W>(
         &self,
         request_id: &Option<String>,
@@ -316,30 +374,50 @@ impl AgentConnector {
                 Some(&position) => position,
                 None => {
                     let start = match self.inbound_marks.get(account_label, group_filter) {
-                        Ok(InboundMark::After(mark)) => Ok(mark),
-                        Ok(InboundMark::ReceivedSince(since)) => self.position_received_since(
-                            account_label,
-                            group_filter,
-                            since.unwrap_or(read.subscribed_at),
-                            read.page_rows,
-                        ),
+                        Ok(InboundMark::After(mark)) => Ok((mark, false)),
+                        Ok(mark) => match read.start(account_label) {
+                            Start::At(start) => Ok((start, mark == InboundMark::Lost)),
+                            Start::Unknown => self
+                                .runtime
+                                .latest_message_insert_order(account_label, group_filter)
+                                .map(|newest| (newest, true))
+                                .map_err(ConnectorError::from),
+                        },
                         Err(err) => Err(err),
                     };
-                    match start {
+                    let (start, gap) = match start {
                         Ok(start) => start,
-                        Err(err) => break 'read Err(err),
+                        Err(err) => break 'read Err(("stored_read_failed", err)),
+                    };
+                    if let Err(err) = self
+                        .inbound_marks
+                        .advance(account_label, group_filter, start)
+                    {
+                        break 'read Err(("mark_save_failed", err));
                     }
+                    read.positions.insert(account_label.to_owned(), start);
+                    if gap {
+                        self.signal_stored_inbound_gap(
+                            request_id,
+                            Some(account_id_hex),
+                            group_filter,
+                            "inbound_mark_unknown",
+                            writer,
+                        )
+                        .await?;
+                    }
+                    start
                 }
             };
             loop {
                 let rows =
                     match self.stored_rows(account_label, group_filter, position, read.page_rows) {
                         Ok(rows) => rows,
-                        Err(err) => break 'read Err(err),
+                        Err(err) => break 'read Err(("stored_read_failed", err)),
                     };
                 let more = rows.len() >= read.page_rows;
                 let through = rows.last().map_or(position, |row| row.insert_order);
-                let mut page = StoredPage::new(account_label, account_id_hex, group_filter, rows);
+                let mut page = StoredPage::new(account_label, account_id_hex, rows);
                 loop {
                     match page.next_event(self) {
                         Ok(Some(event)) => {
@@ -347,24 +425,19 @@ impl AgentConnector {
                             write_control_frame(writer, &envelope).await?;
                         }
                         Ok(None) => break,
-                        Err(err) => break 'read Err(err),
+                        Err(err) => break 'read Err(("stored_read_failed", err)),
                     }
+                }
+                // Move on only past a saved page, so a later page never saves a mark beyond
+                // rows the client may not have.
+                if let Err(err) = self
+                    .inbound_marks
+                    .advance(account_label, group_filter, through)
+                {
+                    break 'read Err(("mark_save_failed", err));
                 }
                 position = through;
                 read.positions.insert(account_label.to_owned(), position);
-                if let Err(err) = self
-                    .inbound_marks
-                    .advance(account_label, group_filter, position)
-                {
-                    // Delivery already happened. A mark left behind only repeats those rows to
-                    // the next subscriber, which deduplicates by message id.
-                    tracing::warn!(
-                        target: "agent_connector",
-                        method = "deliver_stored_inbound",
-                        error_code = err.privacy_safe_code(),
-                        "failed to persist the inbound delivery mark"
-                    );
-                }
                 if !more {
                     break 'read Ok(());
                 }
@@ -372,12 +445,19 @@ impl AgentConnector {
         };
         match outcome {
             Ok(()) => Ok(true),
-            Err(err) => {
-                self.signal_stored_inbound_unread(
+            Err((reason, err)) => {
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "deliver_stored_inbound",
+                    reason,
+                    error_code = err.privacy_safe_code(),
+                    "stored inbound read stopped"
+                );
+                self.signal_stored_inbound_gap(
                     request_id,
                     Some(account_id_hex),
                     group_filter,
-                    &err,
+                    reason,
                     writer,
                 )
                 .await?;
@@ -386,13 +466,13 @@ impl AgentConnector {
         }
     }
 
-    /// Tells the client that stored rows could not be read, so it re-pages the timeline.
-    async fn signal_stored_inbound_unread<W>(
+    /// Tells the client it may have missed stored rows, so it re-pages the timeline.
+    async fn signal_stored_inbound_gap<W>(
         &self,
         request_id: &Option<String>,
         account_filter: Option<&str>,
         group_filter: Option<&str>,
-        err: &ConnectorError,
+        reason: &'static str,
         writer: &mut W,
     ) -> Result<(), ConnectorError>
     where
@@ -401,8 +481,8 @@ impl AgentConnector {
         tracing::warn!(
             target: "agent_connector",
             method = "deliver_stored_inbound",
-            error_code = err.privacy_safe_code(),
-            "stored inbound read failed; emitting resync_required"
+            reason,
+            "emitting resync_required"
         );
         ReconcileTelemetry::bump(&self.reconcile_telemetry.resync_required);
         let event = resync_required_event(account_filter, group_filter, 1);
@@ -411,32 +491,6 @@ impl AgentConnector {
             &AgentControlEnvelope::new(request_id.clone(), event),
         )
         .await
-    }
-
-    /// The position just before the first row in the scope the account received at or after
-    /// `since` (unix seconds), or after its last row when none was. A row received in the same
-    /// second as `since` counts as new: delivering it again is safer than skipping it.
-    pub(crate) fn position_received_since(
-        &self,
-        account_label: &str,
-        group_filter: Option<&str>,
-        since: u64,
-        page_rows: usize,
-    ) -> Result<i64, ConnectorError> {
-        let mut after = 0;
-        loop {
-            let rows = self.stored_rows(account_label, group_filter, after, page_rows)?;
-            let more = rows.len() >= page_rows;
-            for row in rows {
-                if row.received_at >= since {
-                    return Ok(after);
-                }
-                after = row.insert_order;
-            }
-            if !more {
-                return Ok(after);
-            }
-        }
     }
 
     /// A page of at most `page_rows` rows an account stored in the scope after `after`, in
@@ -484,7 +538,6 @@ fn runtime_event_account(
 pub(crate) struct StoredPage {
     account_label: String,
     account_id_hex: String,
-    group_filter: Option<String>,
     rows: std::vec::IntoIter<AppMessageRecord>,
 }
 
@@ -492,13 +545,11 @@ impl StoredPage {
     pub(crate) fn new(
         account_label: &str,
         account_id_hex: &str,
-        group_filter: Option<&str>,
         rows: Vec<AppMessageRecord>,
     ) -> Self {
         Self {
             account_label: account_label.to_owned(),
             account_id_hex: account_id_hex.to_owned(),
-            group_filter: group_filter.map(str::to_owned),
             rows: rows.into_iter(),
         }
     }
@@ -534,8 +585,6 @@ impl StoredPage {
                 &self.account_label,
                 &self.account_id_hex,
                 record,
-                Some(&self.account_id_hex),
-                self.group_filter.as_deref(),
             )? {
                 return Ok(Some(event));
             }

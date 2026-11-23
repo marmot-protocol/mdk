@@ -3781,6 +3781,22 @@ impl MarmotApp {
         self.read_visible_messages(label, query, Some(after))
     }
 
+    /// The insert position of the newest stored row in the group, or across the account; zero
+    /// when there is none. Rows [`MarmotApp::messages_after_insert_order`] returns after it were
+    /// all stored later, so a consumer that reads it before subscribing to events, then pages
+    /// from it, skips history and misses nothing stored meanwhile.
+    pub fn latest_message_insert_order(
+        &self,
+        label: &str,
+        group_id_hex: Option<&str>,
+    ) -> Result<i64, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .latest_app_message_insert_order(group_id_hex)?)
+    }
+
     fn read_visible_messages(
         &self,
         label: &str,

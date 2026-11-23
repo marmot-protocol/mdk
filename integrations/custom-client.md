@@ -277,7 +277,8 @@ The first reply is `{"type": "ack", ...}`. Every later line is an event with the
   subscription for an account and `group_id_hex` starts with what arrives after it. Each later one first delivers
   what was stored after the point earlier subscriptions with that `group_id_hex` reached for the account, so what
   arrives while none is connected is not lost. A subscription with `account_id_hex: null` shares those points with
-  the account's own subscriptions. A message can come again after a reconnect: deduplicate by `message_id_hex`.
+  the account's own subscriptions. If the daemon loses that point, or cannot save it, it sends `resync_required`.
+  A message can come again after a reconnect: deduplicate by `message_id_hex`.
   Reconnect when the connection closes, and after a `resync_required` event page `timeline_list` (`account_id_hex`,
   `group_id_hex`, optional `limit`) to fill the gap.
 - The daemon accepts at most 16 subscriptions at once and answers `server_busy` beyond that.

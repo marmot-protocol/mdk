@@ -1433,6 +1433,47 @@ fn visible_messages_page_after_insert_order() {
 }
 
 #[test]
+fn latest_insert_order_bounds_what_pages_after_it() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    assert_eq!(store.latest_app_message_insert_order(None).unwrap(), 0);
+    store
+        .record_app_event(&app_event("first", "aa", 30))
+        .unwrap();
+    store
+        .record_app_event(&app_event("other-group", "bb", 10))
+        .unwrap();
+    let latest_aa = store.latest_app_message_insert_order(Some("aa")).unwrap();
+    let latest = store.latest_app_message_insert_order(None).unwrap();
+    assert!(latest > latest_aa, "the other group's row was stored later");
+    assert_eq!(
+        store.latest_app_message_insert_order(Some("cc")).unwrap(),
+        0
+    );
+
+    // A row stored later sorts after the latest position, whatever its timestamps.
+    store
+        .record_app_event(&app_event("later", "aa", 5))
+        .unwrap();
+    let after = store
+        .visible_app_messages_after_insert_order(
+            StoredAppMessageQuery {
+                group_id_hex: Some("aa".into()),
+                kinds: None,
+                limit: None,
+            },
+            latest_aa,
+        )
+        .unwrap();
+    assert_eq!(
+        after
+            .iter()
+            .map(|row| row.message_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        ["later"]
+    );
+}
+
+#[test]
 fn app_messages_list_raw_events_and_prune_updates_timeline() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store

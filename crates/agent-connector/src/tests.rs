@@ -2097,11 +2097,12 @@ async fn connector_socket_subscribe_terminates_when_client_disconnects() {
 }
 
 /// mdk#3551: a message stored while no subscriber is attached (for example during a gateway
-/// restart) reaches the next subscriber exactly once, with its sender's name. What was stored
-/// before the first subscriber, and what an earlier subscriber already received, is not handed
-/// out. When the saved marks cannot be parsed, what arrived since they were written still is.
+/// restart) reaches the next subscriber exactly once, before what arrives live, with its
+/// sender's name. What was stored before the first subscriber, and what an earlier subscriber
+/// already received, is not handed out. When the saved marks cannot be parsed, the subscriber
+/// starts at the newest row and is told with `resync_required`.
 #[tokio::test]
-async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attached() {
+async fn subscribe_inbound_delivers_messages_stored_while_no_subscriber_was_attached() {
     storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -2132,205 +2133,162 @@ async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attac
         .expect("fixture group is created");
     accept_group_invite_retrying_busy(&setup_runtime, &human.account.account_id_hex, &group_id)
         .await;
+    setup_runtime.drain_in_flight_work().await.unwrap();
     setup_runtime.shutdown().await;
-
     let group_id_hex = hex::encode(group_id.as_slice());
-    let socket = dir.path().join("dev").join("wn-agent.sock");
-    let server = tokio::spawn(serve_socket(test_config(
+    let agent_id = agent.account.account_id_hex.as_str();
+    let connector = AgentConnector::open(test_config(
         dir.path(),
-        socket.clone(),
+        dir.path().join("dev").join("wn-agent.sock"),
         vec![relay_url],
         false,
         false,
-    )));
-    let human_says = |id: &'static str, text: &'static str| {
-        send_control_request(
-            &socket,
-            id,
-            AgentControlRequest::SendFinal {
-                account_id_hex: human.account.account_id_hex.clone(),
-                group_id_hex: group_id_hex.clone(),
-                text: text.to_owned(),
-                reply_to_message_id_hex: None,
-                idempotency_key: None,
-            },
-        )
-    };
-    let published = send_control_request(
-        &socket,
-        "req-human-profile",
-        AgentControlRequest::AccountPublishProfile {
-            account_id_hex: human.account.account_id_hex.clone(),
-            name: "Human".to_owned(),
-            display_name: None,
-            about: None,
-            picture: None,
-            nip05: None,
-            lud16: None,
-        },
-    )
-    .await;
-    assert!(
-        matches!(
-            published.payload,
-            AgentControlResponse::ProfilePublished { .. }
-        ),
-        "expected the human's profile to publish, got {:?}",
-        published.payload
-    );
-    // Sends as the human and waits until the agent account has stored the message.
-    let human_says_and_agent_stores = async |id: &'static str, text: &'static str| {
-        let sent = human_says(id, text).await;
-        let AgentControlResponse::FinalSent {
-            message_ids_hex, ..
-        } = sent.payload
-        else {
-            panic!("expected human final send, got {:?}", sent.payload);
-        };
-        for _ in 0..100 {
-            let read = send_control_request(
-                &socket,
-                "req-stored",
-                AgentControlRequest::TimelineMessageGet {
-                    account_id_hex: agent.account.account_id_hex.clone(),
-                    group_id_hex: group_id_hex.clone(),
-                    message_id_hex: message_ids_hex[0].clone(),
-                },
+    ))
+    .unwrap();
+    connector.runtime.catch_up_accounts().await.unwrap();
+    let human_name = connector
+        .runtime
+        .display_name_for_account_id(&human.account.account_id_hex);
+    assert!(human_name.is_some());
+
+    let human_says = async |text: &str| {
+        connector
+            .send_final_response(
+                &human.account.account_id_hex,
+                &group_id_hex,
+                text.to_owned(),
+                None,
+                None,
             )
-            .await;
-            if matches!(
-                read.payload,
-                AgentControlResponse::TimelineMessage {
-                    message: Some(_),
-                    ..
-                }
-            ) {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-        panic!("the agent account never stored {text:?}");
+            .await
+            .unwrap();
+    };
+    // Sends as the human and waits until the agent account has stored the message.
+    let human_says_and_agent_stores = async |text: &str| {
+        human_says(text).await;
+        assert!(
+            catch_up_until(&connector, agent_id, &group_id_hex, |stored| {
+                stored.iter().any(|message| message.plaintext == text)
+            })
+            .await,
+            "the agent account never stored {text:?}"
+        );
     };
     // Subscribes as the agent, reads until every `stored` text has arrived, then sends `live`
-    // and returns every inbound text read up to it. Every message names its sender.
-    let subscribe_and_read_through =
-        async |id: &'static str, stored: &[&'static str], live: &'static str| {
-            let stream = connect_with_retry(&socket).await;
-            let (read, mut write) = tokio::io::split(stream);
-            let mut read = BufReader::new(read);
-            let subscribe = AgentControlEnvelope::request(
-                Some(id.to_owned()),
-                AgentControlRequest::SubscribeInbound {
-                    account_id_hex: Some(agent.account.account_id_hex.clone()),
-                    group_id_hex: None,
-                },
-            );
-            write_frame(&mut write, &subscribe).await.unwrap();
+    // and reads until it arrives. Before closing, it lets the read save its mark past what it
+    // sent, as a client that stays connected a moment would. Returns the inbound texts and how
+    // many `resync_required` events came.
+    let subscribe = async |stored: &[&str], live: &str| {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let mut server_read = BufReader::new(server_read);
+        let stream = connector.stream_inbound_events(
+            Some("req-subscribe".to_owned()),
+            Some(agent_id.to_owned()),
+            None,
+            &mut server_read,
+            &mut server_write,
+        );
+        let client_side = async {
+            let mut client = BufReader::new(client);
             let ack: AgentControlEnvelope<AgentControlResponse> =
-                timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut read))
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
+                read_envelope(&mut client).await.unwrap().unwrap();
             assert_eq!(ack.payload, AgentControlResponse::Ack);
-            let mut texts = Vec::new();
-            let mut live_sent = false;
+            let (mut texts, mut resyncs, mut live_sent) = (Vec::<String>::new(), 0, false);
             while !texts.iter().any(|text| text == live) {
                 if !live_sent
                     && stored
                         .iter()
-                        .all(|text| texts.contains(&(*text).to_owned()))
+                        .all(|text| texts.iter().any(|seen| seen == text))
                 {
-                    human_says("req-live", live).await;
+                    human_says(live).await;
                     live_sent = true;
                 }
                 let event: AgentControlEnvelope<AgentControlEvent> =
-                    timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut read))
+                    timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut client))
                         .await
                         .expect("the subscriber receives the stored and the live messages")
                         .unwrap()
                         .unwrap();
-                if let AgentControlEvent::InboundMessage { message, .. } = event.payload {
-                    assert_eq!(
-                        message.sender.display_name.as_deref(),
-                        Some("Human"),
-                        "{:?} reaches the agent with its sender's name",
-                        message.text
-                    );
-                    texts.push(message.text);
+                match event.payload {
+                    AgentControlEvent::InboundMessage { message, .. } => {
+                        assert_eq!(
+                            message.sender.display_name, human_name,
+                            "{:?} reaches the agent with its sender's name",
+                            message.text
+                        );
+                        texts.push(message.text);
+                    }
+                    AgentControlEvent::ResyncRequired { .. } => resyncs += 1,
+                    _ => {}
                 }
             }
-            texts
+            let newest = connector
+                .runtime
+                .latest_message_insert_order(agent_id, None)
+                .unwrap();
+            while connector.inbound_marks.get(agent_id, None).unwrap() != InboundMark::After(newest)
+            {
+                tokio::task::yield_now().await;
+            }
+            (texts, resyncs)
         };
+        tokio::select! {
+            result = stream => panic!("the subscription ended early: {result:?}"),
+            read = client_side => read,
+        }
+    };
 
-    human_says_and_agent_stores("req-history", "history").await;
-    // Storage records arrival in whole seconds, and a row that arrived in the second the first
-    // subscription began counts as new to it.
-    sleep(Duration::from_millis(1_100)).await;
+    human_says_and_agent_stores("history").await;
     assert_eq!(
-        subscribe_and_read_through("req-first-subscribe", &[], "before the restart").await,
-        ["before the restart"],
+        subscribe(&[], "before the restart").await,
+        (vec!["before the restart".to_owned()], 0),
         "the first subscriber starts at the newest stored message"
     );
 
     // The agent runtime is away: the message is ingested and stored with nobody listening.
-    human_says_and_agent_stores("req-away", "while you were away").await;
+    human_says_and_agent_stores("while you were away").await;
     assert_eq!(
-        subscribe_and_read_through(
-            "req-second-subscribe",
-            &["while you were away"],
-            "after the restart"
-        )
-        .await,
-        ["while you were away", "after the restart"],
+        subscribe(&["while you were away"], "after the restart").await,
+        (
+            vec![
+                "while you were away".to_owned(),
+                "after the restart".to_owned()
+            ],
+            0
+        ),
         "the stored message is delivered once, and nothing the first subscriber had is repeated"
     );
 
-    // The saved marks become unreadable, then a message arrives while the agent is away.
-    sleep(Duration::from_millis(1_100)).await;
+    // The saved marks become unreadable while the agent is away. The next subscriber cannot know
+    // what it missed: it starts at the newest row and is told to re-page the timeline.
     let marks_file = AccountHome::open(dir.path())
         .account_dir(&agent.account.label)
         .join("agent-inbound-marks.json");
     std::fs::write(&marks_file, b"not json").unwrap();
-    human_says_and_agent_stores("req-lost", "while the marks were unreadable").await;
-    // Later than the second it arrived in, so only the marks' last write can make it undelivered.
-    sleep(Duration::from_millis(1_100)).await;
+    human_says_and_agent_stores("while the marks were unreadable").await;
     assert_eq!(
-        subscribe_and_read_through(
-            "req-third-subscribe",
-            &["while the marks were unreadable"],
-            "after the lost marks"
-        )
-        .await,
-        ["while the marks were unreadable", "after the lost marks"],
-        "what arrived since the marks were last written is delivered, and nothing older"
+        subscribe(&[], "after the lost marks").await,
+        (vec!["after the lost marks".to_owned()], 1),
+        "lost marks start at the newest row and say so"
     );
-
-    server.abort();
-    let _ = server.await;
 }
 
 /// mdk#3551: a scope's delivery mark outlives the connector, never moves back, keeps each
 /// subscription scope apart and is owner-only. It lives beside the account database, so wiping
 /// the account removes it. A record that cannot be read is left alone; one that cannot be parsed
-/// starts every scope it held from when it was last written, so its loss skips no backlog.
+/// is reported as lost, for every scope it held, until each scope saves a mark again.
 #[test]
 fn inbound_marks_persist_per_scope_and_go_with_the_account() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("agent").unwrap();
     let group = "bb".repeat(32);
-    let other_group = "cc".repeat(32);
     let marks = crate::inbound_marks::InboundMarks::new(home.clone());
-    assert_eq!(
-        marks.get("agent", None).unwrap(),
-        InboundMark::ReceivedSince(None),
-        "a scope that never had a subscriber starts when its first one does"
-    );
+    assert_eq!(marks.get("agent", None).unwrap(), InboundMark::Missing);
     marks.advance("agent", None, 7).unwrap();
     marks.advance("agent", None, 3).unwrap();
     marks.advance("agent", Some(&group), 2).unwrap();
-    marks.advance("agent", Some(&other_group), 4).unwrap();
 
     let reopened = crate::inbound_marks::InboundMarks::new(AccountHome::open(dir.path()));
     assert_eq!(reopened.get("agent", None).unwrap(), InboundMark::After(7));
@@ -2339,8 +2297,8 @@ fn inbound_marks_persist_per_scope_and_go_with_the_account() {
         InboundMark::After(2)
     );
     assert_eq!(
-        reopened.get("agent", Some(&"dd".repeat(32))).unwrap(),
-        InboundMark::ReceivedSince(None)
+        reopened.get("agent", Some(&"cc".repeat(32))).unwrap(),
+        InboundMark::Missing
     );
     let file = home.account_dir("agent").join("agent-inbound-marks.json");
     let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
@@ -2357,31 +2315,24 @@ fn inbound_marks_persist_per_scope_and_go_with_the_account() {
     assert_eq!(reopened.get("agent", None).unwrap(), InboundMark::After(7));
 
     std::fs::write(&file, b"not json").unwrap();
-    let written_at = std::fs::metadata(&file)
-        .unwrap()
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
     assert_eq!(
         reopened.get("agent", None).unwrap(),
-        InboundMark::ReceivedSince(Some(written_at)),
-        "lost marks are not a first run: what arrived since the record was written is undelivered"
+        InboundMark::Lost,
+        "lost marks are not a first run"
     );
     reopened.advance("agent", None, 9).unwrap();
     assert_eq!(reopened.get("agent", None).unwrap(), InboundMark::After(9));
     assert_eq!(
         reopened.get("agent", Some(&group)).unwrap(),
-        InboundMark::ReceivedSince(Some(written_at)),
-        "replacing the record keeps the other scopes' start"
+        InboundMark::Lost,
+        "replacing the record keeps the other scopes' loss"
     );
 
     home.remove_account("agent").unwrap();
     home.create_account("agent").unwrap();
     assert_eq!(
         reopened.get("agent", None).unwrap(),
-        InboundMark::ReceivedSince(None),
+        InboundMark::Missing,
         "a re-created account starts afresh"
     );
 }
@@ -4487,16 +4438,9 @@ async fn inbound_message_event_from_record_projects_group_system_row() {
     record.direction = "system".to_owned();
     record.kind = MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
 
-    let event = inbound_message_event_from_record_with_runtime(
-        &runtime,
-        "acct",
-        "acct",
-        record,
-        Some("acct"),
-        Some("bb"),
-    )
-    .unwrap()
-    .unwrap();
+    let event = inbound_message_event_from_record_with_runtime(&runtime, "acct", "acct", record)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         event,
         AgentControlEvent::GroupStateChanged {
@@ -4754,38 +4698,26 @@ fn safe_media_filename_strips_path_traversal() {
 }
 
 #[tokio::test]
-async fn inbound_message_event_from_record_skips_non_inbound_and_own_and_filtered() {
+async fn inbound_message_event_from_record_skips_non_inbound_and_own() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
-    let project = |record, account_filter, group_filter| {
-        inbound_message_event_from_record_with_runtime(
-            &runtime,
-            "acct",
-            "acct",
-            record,
-            account_filter,
-            group_filter,
-        )
-        .unwrap()
+    let project = |record| {
+        inbound_message_event_from_record_with_runtime(&runtime, "acct", "acct", record).unwrap()
     };
     // Outbound (own) messages are never re-delivered as inbound.
     let mut own = received_chat_record("aa", "bb", "acct", "mine");
     own.direction = "sent".to_owned();
-    assert!(project(own, None, None).is_none());
+    assert!(project(own).is_none());
 
     // A received message authored by the subscribed account itself is skipped (mirrors live).
     let self_authored = received_chat_record("aa", "bb", "acct", "loopback");
-    assert!(project(self_authored, None, None).is_none());
+    assert!(project(self_authored).is_none());
 
     // A group-system row that was received as an app message, rather than synthesized locally,
     // is not treated as a durable GroupStateChanged replay event.
     let mut received_system = received_chat_record("aa", "bb", "cc", "{}");
     received_system.kind = MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
-    assert!(project(received_system, None, None).is_none());
-
-    // A mismatched group filter excludes the message.
-    let other_group = received_chat_record("aa", "bb", "cc", "elsewhere");
-    assert!(project(other_group, Some("acct"), Some("zz")).is_none());
+    assert!(project(received_system).is_none());
     runtime.shutdown().await;
 }
 
@@ -4868,7 +4800,7 @@ fn replay_missed(
         let rows = connector.stored_rows(account_id_hex, group_filter, *position, page_rows)?;
         let more = rows.len() >= page_rows;
         *position = rows.last().map_or(*position, |row| row.insert_order);
-        let mut page = StoredPage::new(account_id_hex, account_id_hex, group_filter, rows);
+        let mut page = StoredPage::new(account_id_hex, account_id_hex, rows);
         while let Some(event) = page.next_event(connector)? {
             events.push(event);
         }
@@ -5229,7 +5161,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         )
         .unwrap();
     position = rows.last().map_or(position, |row| row.insert_order);
-    let mut missed = StoredPage::new(agent_id, agent_id, Some(&group_id_hex), rows);
+    let mut missed = StoredPage::new(agent_id, agent_id, rows);
     connector
         .runtime
         .delete_message(
@@ -5388,7 +5320,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             crate::inbound::INBOUND_PAGE_ROWS,
         )
         .unwrap();
-    let mut page = StoredPage::new(agent_id, agent_id, Some(&group_id_hex), rows);
+    let mut page = StoredPage::new(agent_id, agent_id, rows);
     connector
         .runtime
         .block_user(agent_id, &human.account.account_id_hex)
@@ -5410,7 +5342,10 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
 
 /// mdk#3551: a backlog longer than one page reaches the next subscriber in full and in storage
 /// order: the read pages on, saving the scope's mark after each page, instead of cutting the
-/// backlog off. Two-row pages stand in for the production page size.
+/// backlog off. A mark that cannot be saved stops the read where the last one was saved, so no
+/// later page saves past rows the client may not have, and the client is told. A row stored
+/// after a subscription began is delivered to it. Two-row pages stand in for the production
+/// page size.
 #[tokio::test]
 async fn stored_backlog_longer_than_a_page_reaches_the_next_subscriber_in_order() {
     storage_sqlite::relax_storage_for_test_process();
@@ -5455,30 +5390,34 @@ async fn stored_backlog_longer_than_a_page_reaches_the_next_subscriber_in_order(
     .unwrap();
     connector.runtime.catch_up_accounts().await.unwrap();
 
-    // A subscription's read of the agent's stored rows, returning the inbound texts it sends.
-    let read = async || {
-        let mut read = crate::inbound::StoredRead::new(2);
+    // Reads the agent's stored rows for a subscription, returning whether the read completed,
+    // the inbound texts it sent and how many `resync_required` events.
+    let deliver = async |read: &mut crate::inbound::StoredRead, group: Option<&str>| {
         let mut frames = Vec::new();
         let read_ok = connector
-            .deliver_stored_inbound(&None, agent_id, agent_id, None, &mut read, &mut frames)
+            .deliver_stored_inbound(&None, agent_id, agent_id, group, read, &mut frames)
             .await
             .unwrap();
-        assert!(read_ok);
         let mut frames = frames.as_slice();
-        let mut texts = Vec::new();
+        let (mut texts, mut resyncs) = (Vec::new(), 0);
         while let Some(event) = read_envelope::<_, AgentControlEvent>(&mut frames)
             .await
             .unwrap()
         {
-            if let AgentControlEvent::InboundMessage { message, .. } = event.payload {
-                texts.push(message.text);
+            match event.payload {
+                AgentControlEvent::InboundMessage { message, .. } => texts.push(message.text),
+                AgentControlEvent::ResyncRequired { .. } => resyncs += 1,
+                _ => {}
             }
         }
-        texts
+        (read_ok, texts, resyncs)
     };
-    // The first subscription only sets the account's mark.
-    sleep(Duration::from_millis(1_100)).await;
-    assert!(read().await.is_empty());
+    // The first subscription to every group only sets the account's mark.
+    let mut first = connector.stored_read(Some(agent_id), None, 2);
+    assert_eq!(deliver(&mut first, None).await, (true, Vec::new(), 0));
+    // A first subscription to the one group begins now, before the backlog is stored.
+    let group = Some(group_id_hex.as_str());
+    let mut group_first = connector.stored_read(Some(agent_id), group, 2);
 
     let backlog = (0..5)
         .map(|index| format!("backlog {index}"))
@@ -5505,41 +5444,40 @@ async fn stored_backlog_longer_than_a_page_reaches_the_next_subscriber_in_order(
         "the backlog did not arrive"
     );
 
-    assert_eq!(read().await, backlog);
-    let last = connector
-        .stored_rows(agent_id, None, 0, crate::inbound::INBOUND_PAGE_ROWS)
-        .unwrap()
-        .last()
-        .map(|row| row.insert_order)
+    // Its start was read before the backlog was stored, so all of it is new to it.
+    assert_eq!(
+        deliver(&mut group_first, group).await,
+        (true, backlog.clone(), 0)
+    );
+
+    // The next subscription to every group cannot save its mark after the first page: the read
+    // stops there and says so, and its next read resumes from the last saved mark.
+    let mut subscription = connector.stored_read(Some(agent_id), None, 2);
+    let saved = connector.inbound_marks.get(agent_id, None).unwrap();
+    let account_dir = connector.account_home.account_dir(agent_id);
+    std::fs::set_permissions(&account_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let failed = deliver(&mut subscription, None).await;
+    std::fs::set_permissions(&account_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(failed, (false, backlog[..2].to_vec(), 1));
+    assert_eq!(connector.inbound_marks.get(agent_id, None).unwrap(), saved);
+    assert_eq!(
+        deliver(&mut subscription, None).await,
+        (true, backlog.clone(), 0)
+    );
+    let newest = connector
+        .runtime
+        .latest_message_insert_order(agent_id, None)
         .unwrap();
     assert_eq!(
         connector.inbound_marks.get(agent_id, None).unwrap(),
-        InboundMark::After(last),
+        InboundMark::After(newest),
         "the mark is saved through the last page"
     );
-    assert!(read().await.is_empty(), "nothing is sent twice");
-
-    // A scope's first read starts just before the first row received since the subscription
-    // began, found by walking storage: rows stored while that walk runs were received later,
-    // so the start never passes one of them, and every row received earlier is history.
-    let rows = connector
-        .stored_rows(agent_id, None, 0, crate::inbound::INBOUND_PAGE_ROWS)
-        .unwrap();
-    let since = rows.last().unwrap().received_at;
-    let start = connector
-        .position_received_since(agent_id, None, since, 2)
-        .unwrap();
-    assert!(
-        rows.iter()
-            .filter(|row| row.insert_order <= start)
-            .all(|row| row.received_at < since),
-        "the start never passes a row received since the subscription began"
-    );
-    assert!(
-        rows.iter()
-            .take_while(|row| row.received_at < since)
-            .all(|row| row.insert_order <= start),
-        "the start passes every earlier row"
+    let mut next = connector.stored_read(Some(agent_id), None, 2);
+    assert_eq!(
+        deliver(&mut next, None).await,
+        (true, Vec::new(), 0),
+        "nothing is sent twice"
     );
 }
 

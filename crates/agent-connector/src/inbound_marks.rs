@@ -4,9 +4,8 @@
 //! handed, or passed over because it is not for the agent. Rows stored after it, for example
 //! while no subscriber was attached during a gateway restart, are delivered to the next
 //! subscriber of that scope. A scope is every group of the account, or one group when the
-//! subscription names it. Without a usable mark, the rows received from a point in time on are
-//! undelivered instead: from when the subscription began for a scope that never had one, and
-//! from when an unreadable record was last written, so its loss does not skip the backlog.
+//! subscription names it. A scope without a mark starts at the newest row stored when its
+//! subscription began; one whose record was lost starts there too, and its client is told so.
 //!
 //! The marks live in the account directory, beside the database whose positions they name, so
 //! wiping the account removes them with it and a re-imported identity starts afresh.
@@ -14,7 +13,6 @@
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
-use std::time::UNIX_EPOCH;
 
 use marmot_account::AccountHome;
 use serde::{Deserialize, Serialize};
@@ -28,9 +26,10 @@ const INBOUND_MARKS_FILE: &str = "agent-inbound-marks.json";
 pub(crate) enum InboundMark {
     /// The rows stored after this `insert_order`.
     After(i64),
-    /// The rows received at or after this time, in unix seconds; `None` for the time the
-    /// subscription began.
-    ReceivedSince(Option<u64>),
+    /// The scope never had a subscriber.
+    Missing,
+    /// The record holding the scope's mark could not be parsed: its position is unknown.
+    Lost,
 }
 
 #[derive(Clone)]
@@ -47,10 +46,10 @@ struct InboundMarksRecord {
     /// The marks of subscriptions scoped to one group, by group id hex.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     groups: BTreeMap<String, i64>,
-    /// When this record replaced an unreadable one, when that one was last written: a scope with
-    /// no mark here may have had one there, so its rows are undelivered from that time on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    lost_since: Option<u64>,
+    /// This record replaced one that could not be parsed: a scope with no mark here may have
+    /// had one there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    lost: bool,
 }
 
 impl InboundMarksRecord {
@@ -79,20 +78,21 @@ impl InboundMarks {
     ) -> Result<InboundMark, ConnectorError> {
         let _guard = crate::lock_recover(&self.lock);
         let Some(bytes) = self.read(account_label)? else {
-            return Ok(InboundMark::ReceivedSince(None));
+            return Ok(InboundMark::Missing);
         };
         let Ok(record) = serde_json::from_slice::<InboundMarksRecord>(&bytes) else {
             tracing::warn!(
                 target: "agent_connector",
                 method = "inbound_marks_get",
                 error_code = "invalid_inbound_marks_record",
-                "inbound delivery marks record is unreadable; delivering what arrived since it was written"
+                "inbound delivery marks record is unreadable"
             );
-            return Ok(InboundMark::ReceivedSince(self.written_at(account_label)));
+            return Ok(InboundMark::Lost);
         };
         Ok(match record.mark(group_id_hex) {
             Some(mark) => InboundMark::After(mark),
-            None => InboundMark::ReceivedSince(record.lost_since),
+            None if record.lost => InboundMark::Lost,
+            None => InboundMark::Missing,
         })
     }
 
@@ -107,14 +107,16 @@ impl InboundMarks {
         let _guard = crate::lock_recover(&self.lock);
         let mut record = match self.read(account_label)? {
             None => InboundMarksRecord::default(),
-            Some(bytes) => serde_json::from_slice::<InboundMarksRecord>(&bytes).unwrap_or_else(
-                // Replace an unreadable record, keeping when it was last written for its other
-                // scopes, as `get` does for this one.
-                |_| InboundMarksRecord {
-                    lost_since: self.written_at(account_label),
-                    ..InboundMarksRecord::default()
-                },
-            ),
+            // Replace a record that cannot be parsed, remembering for its other scopes that
+            // their marks were lost, as `get` reports for this one.
+            Some(bytes) => {
+                serde_json::from_slice::<InboundMarksRecord>(&bytes).unwrap_or_else(|_| {
+                    InboundMarksRecord {
+                        lost: true,
+                        ..InboundMarksRecord::default()
+                    }
+                })
+            }
         };
         if record
             .mark(group_id_hex)
@@ -149,14 +151,6 @@ impl InboundMarks {
         self.account_home
             .account_dir(account_label)
             .join(INBOUND_MARKS_FILE)
-    }
-
-    /// When the record was last written, in unix seconds.
-    fn written_at(&self, account_label: &str) -> Option<u64> {
-        let modified = std::fs::metadata(self.path(account_label))
-            .and_then(|metadata| metadata.modified())
-            .ok()?;
-        Some(modified.duration_since(UNIX_EPOCH).ok()?.as_secs())
     }
 
     fn read(&self, account_label: &str) -> Result<Option<Vec<u8>>, ConnectorError> {
