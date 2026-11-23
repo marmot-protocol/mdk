@@ -6,8 +6,10 @@
 //! Storage keeps the items and applies winners (`storage_sqlite`'s small-state
 //! module); `client::small_state` drives a pass and talks to the siblings.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId};
 
 use rand::{RngCore, rngs::OsRng};
 use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
@@ -369,34 +371,66 @@ pub(crate) fn decode_broadcast_request(content: &str) -> Result<(), AppError> {
 }
 
 /// Whether this device owes a broadcast at `now`, by its own clock, with the
-/// device group's tip epoch at `tip`: none has been made yet, a day has
+/// device group's tip epoch at `tip` and its roster `roster`: none has been
+/// made yet, the roster lists a device the last was not made for, a day has
 /// passed since the last, the tip has moved more than `window` epochs past
 /// the last one's, or a sibling asked and an hour has passed. A clock that
 /// went back before the last broadcast owes one too, so a wrong clock never
-/// holds broadcasts back. The only place that schedule is decided.
+/// holds broadcasts back. A new device is owed one at once: it holds
+/// nothing, and an Add of it to a chat waits for that chat's decision
+/// (mdk#3556). The only place that schedule is decided.
 pub(crate) fn broadcast_due(
     schedule: &SmallStateSchedule,
     now: u64,
     tip: u64,
     window: u64,
+    roster: &DeviceRosterV1,
 ) -> bool {
-    let Some(last) = schedule.last_broadcast else {
+    let Some(last) = &schedule.last_broadcast else {
         return true;
     };
     let Some(elapsed) = now.checked_sub(last.at) else {
         return true;
     };
-    elapsed >= BROADCAST_PERIOD_SECS
+    roster
+        .devices
+        .keys()
+        .any(|slot| !broadcast_reached(schedule, roster, slot))
+        || elapsed >= BROADCAST_PERIOD_SECS
         || tip > last.tip.saturating_add(window)
         || (schedule.answer_owed && elapsed >= ANSWER_INTERVAL_SECS)
 }
 
+/// Whether this device's last broadcast was made for the device in `slot`
+/// as `roster` lists it: the roster then listed that slot, linked at the
+/// same time, so a slot linked again is a new device.
+pub(crate) fn broadcast_reached(
+    schedule: &SmallStateSchedule,
+    roster: &DeviceRosterV1,
+    slot: &DeviceSlotId,
+) -> bool {
+    let (Some(last), Some(device)) = (&schedule.last_broadcast, roster.devices.get(slot)) else {
+        return false;
+    };
+    last.devices.get(slot) == Some(&device.linked_at)
+}
+
+/// The devices `roster` lists, each slot with its `linked_at`: what a
+/// broadcast begun now is made for.
+pub(crate) fn broadcast_devices(roster: &DeviceRosterV1) -> BTreeMap<DeviceSlotId, u64> {
+    roster
+        .devices
+        .iter()
+        .map(|(slot, device)| (*slot, device.linked_at))
+        .collect()
+}
+
 /// The second [`broadcast_due`] next owes a broadcast by time alone: at
 /// once before the first, a day after the last, or an hour after it while a
-/// sibling's request waits. The tip moving past the window is a device-group
-/// commit, which wakes maintenance itself (mdk#3265).
+/// sibling's request waits. The tip moving past the window and a new device
+/// are each a device-group commit, which wakes maintenance itself (mdk#3265).
 pub(crate) fn broadcast_next_at(schedule: &SmallStateSchedule) -> u64 {
-    let Some(last) = schedule.last_broadcast else {
+    let Some(last) = &schedule.last_broadcast else {
         return 0;
     };
     let period = if schedule.answer_owed {

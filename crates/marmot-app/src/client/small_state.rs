@@ -11,8 +11,10 @@
 //!
 //! Recovery is a broadcast of every item this device holds, as updates: at
 //! start, at least daily, whenever the device group's tip has moved past the
-//! app-payload window since the last one, and in answer to a sibling's
-//! broadcast request. Nothing tracks what a sibling holds.
+//! app-payload window since the last one, at once for a device the roster
+//! lists that the last one was not made for, and in answer to a sibling's
+//! broadcast request. Only which devices the last broadcast was made for is
+//! kept, not what each one holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,8 +25,9 @@ use storage_sqlite::{SmallStateItem, SmallStateItemName};
 use super::AppClient;
 use crate::small_state::{
     BROADCAST_REQUEST, KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE,
-    SmallStateMergeRule, broadcast_due, decode_broadcast_request, decode_invitation_decisions,
-    decode_small_state_update, encode_invitation_decision_updates, encode_small_state_update,
+    SmallStateMergeRule, broadcast_devices, broadcast_due, decode_broadcast_request,
+    decode_invitation_decisions, decode_small_state_update, encode_invitation_decision_updates,
+    encode_small_state_update,
 };
 use crate::{AppError, AppProjectionUpdate, ChatListUpdateTrigger, MarmotApp, unix_now_seconds};
 
@@ -128,7 +131,7 @@ impl AppClient {
         if !self.app.device_groups_enabled() {
             return Ok(());
         }
-        let Some(group_id) = self.trusted_device_group()? else {
+        let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Ok(());
         };
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
@@ -139,8 +142,8 @@ impl AppClient {
             return Ok(());
         };
         let window = CanonicalizationPolicy::default().app_message_past_epoch_limit;
-        if broadcast_due(&schedule, now, tip, window) {
-            storage.begin_small_state_broadcast(now, tip)?;
+        if broadcast_due(&schedule, now, tip, window, &roster) {
+            storage.begin_small_state_broadcast(now, tip, &broadcast_devices(&roster))?;
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "begin_small_state_broadcast_when_due",

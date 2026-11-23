@@ -194,7 +194,7 @@ pub struct SmallStateSync {
 }
 
 /// When this device last broadcast every item it holds, and what it owes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmallStateSchedule {
     /// When this device last broadcast, in seconds, and the device group's
     /// tip epoch then; `None` before its first broadcast.
@@ -205,11 +205,13 @@ pub struct SmallStateSchedule {
     pub answer_owed: bool,
 }
 
-/// One broadcast: when it began and the device group's tip epoch then.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One broadcast: when it began, the device group's tip epoch then, and the
+/// devices its roster listed then, each slot with its `linked_at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmallStateBroadcast {
     pub at: u64,
     pub tip: u64,
+    pub devices: BTreeMap<[u8; 32], u64>,
 }
 
 impl SqliteAppStorage {
@@ -238,8 +240,8 @@ impl SqliteAppStorage {
 
     /// This device's broadcast schedule; `None` before small state starts.
     pub fn small_state_schedule(&self) -> StorageResult<Option<SmallStateSchedule>> {
-        let row = self
-            .lock()?
+        let conn = self.lock()?;
+        let row = conn
             .query_row_cached(
                 "SELECT broadcast_at, broadcast_tip, request_owed, answer_owed
                  FROM small_state_sync WHERE id = 1",
@@ -260,6 +262,7 @@ impl SqliteAppStorage {
                 (Some(at), Some(tip)) => Some(SmallStateBroadcast {
                     at: i64_to_u64(at)?,
                     tip: i64_to_u64(tip)?,
+                    devices: broadcast_devices_tx(&conn)?,
                 }),
                 _ => None,
             };
@@ -272,11 +275,17 @@ impl SqliteAppStorage {
         .transpose()
     }
 
-    /// Begin a broadcast at `at`, with the device group's tip epoch at `tip`:
-    /// owe the siblings every item this device holds, with its version and
-    /// change id. It answers every request read before it. Does nothing
-    /// before [`Self::start_small_state`].
-    pub fn begin_small_state_broadcast(&self, at: u64, tip: u64) -> StorageResult<()> {
+    /// Begin a broadcast at `at`, with the device group's tip epoch at `tip`
+    /// and its roster listing `devices` (slot to `linked_at`): owe the
+    /// siblings every item this device holds, with its version and change
+    /// id. It answers every request read before it. Does nothing before
+    /// [`Self::start_small_state`].
+    pub fn begin_small_state_broadcast(
+        &self,
+        at: u64,
+        tip: u64,
+        devices: &BTreeMap<[u8; 32], u64>,
+    ) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let begun = conn
@@ -298,6 +307,16 @@ impl SqliteAppStorage {
                     [],
                 )
                 .storage()?;
+                conn.execute_cached("DELETE FROM small_state_broadcast_devices", [])
+                    .storage()?;
+                for (slot, linked_at) in devices {
+                    conn.execute_cached(
+                        "INSERT INTO small_state_broadcast_devices (slot, linked_at)
+                         VALUES (?1, ?2)",
+                        params![slot.as_slice(), u64_to_i64(*linked_at)?],
+                    )
+                    .storage()?;
+                }
             }
             Ok(())
         })
@@ -412,6 +431,26 @@ impl SqliteAppStorage {
             Ok(ordinary + invitations)
         })
     }
+}
+
+fn broadcast_devices_tx(conn: &Connection) -> StorageResult<BTreeMap<[u8; 32], u64>> {
+    let mut statement = conn
+        .prepare_cached("SELECT slot, linked_at FROM small_state_broadcast_devices")
+        .storage()?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })
+        .storage()?;
+    let mut devices = BTreeMap::new();
+    for row in rows {
+        let (slot, linked_at) = row.storage()?;
+        let slot = slot
+            .try_into()
+            .map_err(|_| StorageError::Backend("invalid broadcast device slot".into()))?;
+        devices.insert(slot, i64_to_u64(linked_at)?);
+    }
+    Ok(devices)
 }
 
 /// How [`small_state_pass_tx`] runs: `Apply` writes in the caller's writer

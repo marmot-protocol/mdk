@@ -1,4 +1,5 @@
 use super::*;
+use cgka_traits::app_components::DeviceEntryV1;
 use storage_sqlite::SmallStateBroadcast;
 
 fn versioned(chat: &str, value: SmallStateValue, version: u64, id: u8) -> SmallStateItem {
@@ -191,11 +192,29 @@ fn a_broadcast_request_is_exactly_its_version() {
 }
 
 #[test]
-fn a_broadcast_is_due_daily_past_the_window_and_an_hour_after_a_request() {
+fn a_broadcast_is_due_daily_past_the_window_for_a_new_device_and_an_hour_after_a_request() {
     const DAY: u64 = 24 * 60 * 60;
     const HOUR: u64 = 60 * 60;
+    let roster = |devices: &[([u8; 32], u64)]| DeviceRosterV1 {
+        devices: devices
+            .iter()
+            .map(|(slot, linked_at)| {
+                let entry = DeviceEntryV1 {
+                    linked_at: *linked_at,
+                    ..Default::default()
+                };
+                (*slot, entry)
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let phone_and_laptop = roster(&[([1; 32], 10), ([2; 32], 20)]);
     let schedule = |at, tip, answer_owed| SmallStateSchedule {
-        last_broadcast: Some(SmallStateBroadcast { at, tip }),
+        last_broadcast: Some(SmallStateBroadcast {
+            at,
+            tip,
+            devices: broadcast_devices(&phone_and_laptop),
+        }),
         request_owed: false,
         answer_owed,
     };
@@ -204,20 +223,37 @@ fn a_broadcast_is_due_daily_past_the_window_and_an_hour_after_a_request() {
         request_owed: true,
         answer_owed: false,
     };
-    assert!(broadcast_due(&first, 0, 0, 5));
+    assert!(broadcast_due(&first, 0, 0, 5, &phone_and_laptop));
 
     let at = 1_000_000;
     let quiet = schedule(at, 10, false);
-    assert!(!broadcast_due(&quiet, at, 10, 5));
-    assert!(!broadcast_due(&quiet, at + DAY - 1, 15, 5));
-    assert!(broadcast_due(&quiet, at + DAY, 10, 5));
-    assert!(broadcast_due(&quiet, at + 1, 16, 5));
+    let due = |schedule, now, tip| broadcast_due(schedule, now, tip, 5, &phone_and_laptop);
+    assert!(!due(&quiet, at, 10));
+    assert!(!due(&quiet, at + DAY - 1, 15));
+    assert!(due(&quiet, at + DAY, 10));
+    assert!(due(&quiet, at + 1, 16));
     // A clock set back before the last broadcast never holds one back.
-    assert!(broadcast_due(&quiet, at - 1, 10, 5));
+    assert!(due(&quiet, at - 1, 10));
 
     let asked = schedule(at, 10, true);
-    assert!(!broadcast_due(&asked, at + HOUR - 1, 10, 5));
-    assert!(broadcast_due(&asked, at + HOUR, 10, 5));
+    assert!(!due(&asked, at + HOUR - 1, 10));
+    assert!(due(&asked, at + HOUR, 10));
+
+    // A device the last broadcast was not made for is owed one at once,
+    // whether its slot is new or linked again; one that left is not.
+    for roster in [
+        roster(&[([1; 32], 10), ([2; 32], 20), ([3; 32], 30)]),
+        roster(&[([1; 32], 10), ([2; 32], 40)]),
+    ] {
+        assert!(broadcast_due(&asked, at + 1, 10, 5, &roster));
+    }
+    assert!(!broadcast_due(
+        &quiet,
+        at + 1,
+        10,
+        5,
+        &roster(&[([1; 32], 10)])
+    ));
 }
 
 #[test]

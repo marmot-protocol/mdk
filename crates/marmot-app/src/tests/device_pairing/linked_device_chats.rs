@@ -546,6 +546,64 @@ async fn a_recorded_acceptance_holds_every_new_device_until_it_is_sent() {
     }
 }
 
+/// A device linked soon after another still gets an accepted chat accepted
+/// (mdk#3556). Linking the laptop makes the phone and the laptop broadcast,
+/// so neither answers the tablet's broadcast request for an hour; the
+/// tablet showed the chat as Bob's invitation until then. The roster
+/// listing a device no broadcast reached makes one due at once, and the
+/// phone adds the tablet only once that broadcast sent the chat's decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_linked_soon_after_another_gets_an_accepted_chat_accepted() {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    let alice = phone
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let chat = bob
+        .create_group("accepted", &[&alice])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    phone.client.sync().await.unwrap();
+    phone.client.accept_group_invite(&chat).unwrap();
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    let mut tablet = another_alice_device(&relay, &phone).await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    passes(&relay, &mut [&mut phone, &mut laptop], 6).await;
+    assert!(
+        !laptop
+            .client
+            .state_group_record(&chat)
+            .expect("the laptop joined from the phone's sibling Welcome")
+            .pending_confirmation
+    );
+
+    link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    let mut seen = false;
+    for _ in 0..6 {
+        passes(&relay, &mut [&mut phone, &mut laptop, &mut tablet], 1).await;
+        if let Some(group) = tablet.client.state_group_record(&chat) {
+            seen = true;
+            assert!(
+                !group.pending_confirmation,
+                "the tablet showed an accepted chat as an invitation"
+            );
+        }
+    }
+    assert!(seen, "the tablet joined from the phone's sibling Welcome");
+}
+
 /// A real linked sender rebroadcasts a retained winning choice. It need not
 /// have this ordinary chat installed to authenticate its account's choice.
 async fn receive_account_choice(

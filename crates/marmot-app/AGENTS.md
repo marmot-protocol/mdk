@@ -624,8 +624,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   mutes from siblings, record no product outcome. Each chat a pass changes gets one chat-list update through `pending_projection_updates`. The merge rule's tie-break
   (`tie_break`), its placement of a new pin (`new_pin_index`) and the broadcast schedule (`broadcast_due`) are each one
   function; change them nowhere else. Recovery is a broadcast of every held item, with no stopping condition and
-  nothing tracked per sibling: at start, daily, when the device-group tip passes the app-payload window since the last
-  one, and an hour after the last when a sibling asked. Each maintenance pass then sends what is owed: updates split
+  nothing tracked per sibling but which roster devices (slot and `linked_at`) the last broadcast was made for: at start,
+  daily, when the device-group tip passes the app-payload window since the last one, at once when the roster lists a
+  device it was not made for, and an hour after the last when a sibling asked. A sibling Add (link pass or gap fill)
+  of a chat holding a decision waits until the last broadcast was made for that sibling and the chat's decision has
+  gone out since (`sibling_holds_decision`, mdk#3556), so the Welcome never reaches it ahead of the decision. Each maintenance pass then sends what is owed: updates split
   to fit 32,768 bytes, each page's items marked sent only after it went out (a duplicate is harmless, a loss is not),
   and a broadcast request when owed. Updates and requests are read from any member of the trusted device group, never
   through `ensure_sent_by`. A withdrawn update owes every held item again, whoever sent it, and a withdrawn broadcast

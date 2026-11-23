@@ -34,6 +34,9 @@
   `conversation_created_at` only when it has none. A chat a linked device or a restore stored after it began, with
   older history imported, no longer sorts at the time this device stored it (mdk#3580). Migration 0220 re-sorts the
   rows the old rule anchored at creation.
+- Migration 0222 adds `small_state_broadcast_devices`: the roster devices, slot and `linked_at`, that this device's
+  last small-state broadcast was made for. `begin_small_state_broadcast` takes them and `SmallStateBroadcast` returns
+  them as `devices`, so `SmallStateSchedule` and `SmallStateBroadcast` are no longer `Copy` (mdk#3556).
 
 ## 0.19.0 - 2026-11-22
 

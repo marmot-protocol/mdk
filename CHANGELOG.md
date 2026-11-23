@@ -12,6 +12,13 @@
 - Maintenance queues an MLS self-update as soon as it detects stale chat capabilities, instead of scheduling it up to
   five days out. The quiet period, contention jitter, and commit safety checks still apply.
 
+### Fixed
+
+- A device linked soon after another no longer shows the account's accepted chats as invitations, which a decline there
+  turned into a leave on every device (mdk#3556). Each device broadcasts its small state to a newly listed device at
+  once, and adds it to a chat only after that chat's invitation decision went out. The account database advances to
+  schema 222.
+
 ## 0.19.0 - 2026-11-22
 
 See the [release notes](docs/release/0.19.0.md) and the [0.18.0 → 0.19.0 upgrade guide](docs/integration/0.19.0.md).

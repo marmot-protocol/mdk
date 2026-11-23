@@ -45,6 +45,11 @@
 
 ### Fixed
 
+- A newly linked device no longer shows a chat the account already accepted as an invitation, with an "invited you"
+  notification, when every sibling broadcast its small state within the last hour (mdk#3556). A device whose trusted
+  roster lists a device its last broadcast was not made for broadcasts at once, and adds that device to a chat only
+  once the broadcast has sent the chat's invitation decision. A send that reaches no relay holds the Add for a later
+  pass instead of letting the Welcome go first.
 - An admin deleting their own chat message sends an author kind 5, so every client shows it as deleted by its author
   (`DeletionSource::Author`) rather than by an admin. Kind 4891 is for another account's content only.
 - A member removed from a chat, or who left it, and then added back gets a kind-1210 "member added" row naming who

@@ -321,7 +321,7 @@ async fn broadcasts_follow_their_schedule_and_withdrawals_owe_again() {
     let phone_app = devices.phone_app.clone();
     let storage = || phone_app.account_storage("alice").unwrap().app_storage();
     let phone = &mut devices.phone;
-    let (group, _) = phone.trusted_device_roster().unwrap().unwrap();
+    let (group, roster) = phone.trusted_device_roster().unwrap().unwrap();
     let tip = phone_app
         .account_storage("alice")
         .unwrap()
@@ -338,7 +338,11 @@ async fn broadcasts_follow_their_schedule_and_withdrawals_owe_again() {
     phone.begin_small_state_broadcast_when_due(now).unwrap();
     assert_eq!(
         schedule().last_broadcast,
-        Some(SmallStateBroadcast { at: now, tip })
+        Some(SmallStateBroadcast {
+            at: now,
+            tip,
+            devices: crate::small_state::broadcast_devices(&roster),
+        })
     );
     phone.begin_small_state_broadcast_when_due(now + 1).unwrap();
     assert_eq!(schedule().last_broadcast.unwrap().at, now);

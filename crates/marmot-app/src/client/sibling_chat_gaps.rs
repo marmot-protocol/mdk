@@ -1008,6 +1008,12 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat.clone(), 0);
                 break;
             }
+            // This target waits for the broadcast that sends it the
+            // chat's decision (mdk#3556).
+            if retire.is_empty() && !self.sibling_holds_decision(chat, &exchange.roster, slot)? {
+                self.sibling_chat_gaps.schedule(chat.clone(), 0);
+                continue;
+            }
             // Retiring unused leaves spends no KeyPackage, and the engine
             // refuses an Add while they hold the sibling's place.
             if retire.is_empty() {

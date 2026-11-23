@@ -2,6 +2,7 @@
 
 use super::AppClient;
 use crate::{AppError, AppGroupRecord, SelfMembership};
+use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId};
 use cgka_traits::engine::ForwardedInvitation;
 use cgka_traits::storage::{GroupStorage, LeaveRequestStorage};
 use cgka_traits::{EngineError, GroupId};
@@ -318,6 +319,41 @@ impl AppClient {
         }
         self.acceptances_recorded = true;
         Ok(true)
+    }
+
+    /// Whether `sibling` holds this device's decision for `chat`'s current
+    /// generation, so an Add of it there installs the chat as that decision
+    /// settles it, not as an invitation (mdk#3556): this device's last
+    /// broadcast was made for `sibling` as `roster` lists it, and the
+    /// decision has gone out since. A chat with no decision here has none to
+    /// wait for. Until then the caller leaves the Add to a later pass.
+    pub(super) fn sibling_holds_decision(
+        &self,
+        chat: &GroupId,
+        roster: &DeviceRosterV1,
+        sibling: &DeviceSlotId,
+    ) -> Result<bool, AppError> {
+        let account = self.app.account_storage(&self.state.label)?;
+        let Some(admission) = account.invitation_admission(chat)? else {
+            return Ok(true);
+        };
+        let storage = account.app_storage();
+        let chat_hex = hex::encode(chat.as_slice());
+        if storage
+            .invitation_decision(&chat_hex, &admission.generation)?
+            .is_none()
+        {
+            return Ok(true);
+        }
+        let Some(schedule) = storage.small_state_schedule()? else {
+            return Ok(false);
+        };
+        Ok(
+            crate::small_state::broadcast_reached(&schedule, roster, sibling)
+                && !storage.unsent_invitation_decisions()?.iter().any(|unsent| {
+                    unsent.group_id_hex == chat_hex && unsent.generation == admission.generation
+                }),
+        )
     }
 
     /// Send, once a sibling-Add scan has ended, the acceptances it recorded,
