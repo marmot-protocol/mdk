@@ -575,16 +575,9 @@ async fn live_messages_pass_history_a_relay_without_metadata_cannot_prove() {
         .unwrap()
         .operation
         .expect("eligible fixture members");
-    timeout(Duration::from_secs(30), async {
-        while accept_group_invite_retrying_busy(&receiver, &bob_id, &group)
-            .await
-            .is_err()
-        {
-            sleep(Duration::from_millis(250)).await;
-        }
-    })
-    .await
-    .expect("bob accepts the invite");
+    accept_group_invite_retrying_busy(&receiver, &bob_id, &group)
+        .await
+        .unwrap();
     sender
         .send_message(&alice_id, &group, b"first".to_vec())
         .await

@@ -277,8 +277,9 @@ async fn sweep_pages_a_strfry_relay_and_resolves_a_saturated_second() {
 /// Missing metadata leaves the relay's NIP-77 support unknown. A relay that
 /// refuses or ignores the negotiation then cannot prove the second, as one
 /// whose document omits NIP-77 cannot (mdk#3264); that refuses neither the
-/// underlying history REQ nor advances its cursor. Listed ids it withholds
-/// leave the second inconclusive: a later attempt may prove it.
+/// underlying history REQ nor advances its cursor. A relay that began
+/// reconciling and then stalled, or withheld ids it listed, leaves the second
+/// inconclusive: a later attempt may prove it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_without_relay_metadata_advances_only_after_reconciliation() {
     let fixture = Fixture::new().await;
@@ -314,6 +315,11 @@ async fn a_second_without_relay_metadata_advances_only_after_reconciliation() {
         );
         assert!(sink.slices.is_empty());
     }
+    // A relay that began reconciling and then stalled may still prove it.
+    fixture.limit.set_neg_fault(NegFault::StallAfterReply);
+    let stalled = run_sweep(request(range), &relay, &mut sink, &store, &cancel).await;
+    assert_eq!(stalled.end, SweepEnd::InconclusiveSecond { second: T0 });
+    assert!(sink.slices.is_empty());
 
     fixture.limit.set_neg_fault(NegFault::None);
     fixture.limit.withhold_id_fetch_events(1);

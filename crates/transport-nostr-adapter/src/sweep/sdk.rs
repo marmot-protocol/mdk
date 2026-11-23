@@ -132,6 +132,24 @@ impl SdkSweepRelay {
         }
     }
 
+    /// A relay that declined the NEG-OPEN itself. With no document, its
+    /// refusal or silence means it cannot prove the second, as a document
+    /// that omits NIP-77 says (mdk#3264); its REQ still answered. A rate limit
+    /// is waited out, and an `auth-required:` or `error:` refusal may pass on
+    /// a later attempt.
+    fn second_declined(&self, reason: Option<ClosedReason>) -> SecondReply {
+        use TransportEndpointRejectionCategory as Category;
+        match reason {
+            Some(reason) if self.caps.is_some() => SecondReply::Closed(reason),
+            None if self.caps.is_some() => SecondReply::Unreachable(UnreachableKind::TimedOut),
+            Some(reason) if reason.0 == Some(Category::RateLimited) => SecondReply::Closed(reason),
+            Some(ClosedReason(Some(Category::AuthRequired | Category::Error))) => {
+                SecondReply::Inconclusive
+            }
+            _ => SecondReply::Unproven,
+        }
+    }
+
     /// Refusal of an optional probe does not refuse the ordinary history
     /// request that just succeeded. An explicit rate limit still applies.
     fn second_refused(&self, reason: ClosedReason) -> SecondReply {
@@ -256,18 +274,11 @@ impl SweepRelay for SdkSweepRelay {
             .await
         {
             Ok(compared) => compared.remote,
-            // A relay with no document that refuses or ignores NIP-77 answers
-            // as one whose document omits it: it cannot prove this second
-            // (mdk#3264). Its REQ still answered, and a rate limit still waits.
-            Err(NegFailure::Closed(reason))
-                if self.caps.is_none()
-                    && reason.0 != Some(TransportEndpointRejectionCategory::RateLimited) =>
-            {
-                return SecondReply::Unproven;
-            }
-            Err(NegFailure::Closed(reason)) => return SecondReply::Closed(reason),
+            Err(NegFailure::Declined(reason)) => return self.second_declined(reason),
+            Err(NegFailure::Closed(reason)) => return self.second_refused(reason),
+            // A relay that stalls an unadvertised exchange still answered its REQ.
             Err(NegFailure::Unreachable(UnreachableKind::TimedOut)) if self.caps.is_none() => {
-                return SecondReply::Unproven;
+                return SecondReply::Inconclusive;
             }
             Err(NegFailure::Unreachable(kind)) => return SecondReply::Unreachable(kind),
             Err(NegFailure::Unproven) => return SecondReply::Unproven,
@@ -380,7 +391,10 @@ impl CompareRelay for SdkSweepRelay {
                 missing: compared.remote.into_iter().collect(),
                 relay_set: compared.relay_set,
             },
-            Err(NegFailure::Closed(reason)) => CompareReply::Closed(reason),
+            Err(NegFailure::Closed(reason) | NegFailure::Declined(Some(reason))) => {
+                CompareReply::Closed(reason)
+            }
+            Err(NegFailure::Declined(None)) => CompareReply::Unreachable(UnreachableKind::TimedOut),
             Err(NegFailure::Unreachable(kind)) => CompareReply::Unreachable(kind),
             // A comparison falls back to a sweep either way.
             Err(NegFailure::Unproven | NegFailure::Inconclusive) => CompareReply::Unsupported,
@@ -434,6 +448,9 @@ impl CompareRelay for SdkSweepRelay {
 /// Why a NIP-77 comparison failed.
 pub(crate) enum NegFailure {
     Closed(ClosedReason),
+    /// The relay answered the NEG-OPEN with NEG-ERR (`Some`), or not at all
+    /// (`None`), before any NEG-MSG: it never began reconciling.
+    Declined(Option<ClosedReason>),
     Unreachable(UnreachableKind),
     /// The relay said it lacks NIP-77: the second stays unproven.
     Unproven,
