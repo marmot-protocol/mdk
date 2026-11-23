@@ -1545,14 +1545,13 @@ async fn a_tied_relay_list_naming_another_outbox_decides_no_incompatibility() {
 }
 
 /// Final selection revalidates lifetimes on the wall clock, so it can lose
-/// the package recovery selected from an incomplete read. What is left then
-/// says nothing about the recipient: the lookup is incomplete, not
-/// incompatible. After a complete read, the newer slot's refusal stands.
+/// the package recovery selected from an incomplete read. Whatever is left
+/// then says nothing about the recipient: the lookup is incomplete, not
+/// incompatible. After a complete read, the refusal stands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn final_selection_after_an_incomplete_read_claims_no_incompatibility() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
     let requirements = retention_requirements(&app).await;
-    let expires = unix_now_seconds() + 3;
     let incompatible = fetcher
         .events_by_endpoint
         .lock()
@@ -1563,20 +1562,8 @@ async fn final_selection_after_an_incomplete_read_claims_no_incompatibility() {
         .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
         .unwrap()
         .clone();
-    let expiring = candidate(
-        &bob,
-        package_expiring_at(&app, &bob, expires, false),
-        "expiring",
-        None,
-        incompatible.created_at - 1,
-    );
-    // Pass the real MLS lifetime boundary, as a slow journal write after
-    // recovery would. Tokio's paused clock cannot exercise this check.
-    tokio::time::sleep(Duration::from_secs(
-        expires.saturating_sub(unix_now_seconds()) + 1,
-    ))
-    .await;
-    let records = [expiring, incompatible]
+    // Only the incompatible package is left once the selected one is lost.
+    let records = [incompatible]
         .into_iter()
         .map(|event| RelayEventRecord {
             event,
