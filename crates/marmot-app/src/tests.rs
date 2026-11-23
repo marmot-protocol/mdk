@@ -740,7 +740,11 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     pub(crate) reject_multi_author: std::sync::atomic::AtomicBool,
     key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
-    key_packages_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Events a relay returns only to multi-author reads.
+    events_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Every multi-author read stops before its end of stored events, as a
+    /// relay that closes a batch subscription early.
+    pub(crate) closed_multi_author_reads: std::sync::atomic::AtomicBool,
     pub(super) failing_single_author: std::sync::Mutex<Option<String>>,
     pub(crate) stalled_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
@@ -918,13 +922,12 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
             return Ok(Vec::new());
         }
         let single_author_only = self.key_packages_only_in_single_author.lock().unwrap();
-        let multi_author_only = self.key_packages_only_in_multi_author.lock().unwrap();
+        let multi_author_only = self.events_only_in_multi_author.lock().unwrap();
         let matches_query = |event: &NostrTransportEvent| {
             if event.kind == 5 && event.to_verified_nostr_event().is_err() {
                 return false;
             }
-            if event.kind == KIND_MARMOT_KEY_PACKAGE
-                && multi_author_only.contains(&event.id)
+            if multi_author_only.contains(&event.id)
                 && request.queries.iter().all(|query| query.authors.len() == 1)
             {
                 return false;
@@ -989,6 +992,11 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
                         .iter()
                         .any(|endpoint| endpoint.0 == *incomplete)
             });
+        let complete = complete
+            && !(self
+                .closed_multi_author_reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && request.queries.iter().any(|query| query.authors.len() > 1));
         let queries = request.queries.clone();
         let endpoints = request.endpoints.clone();
         let mut records = match self.fetch_directory_events(request).await {

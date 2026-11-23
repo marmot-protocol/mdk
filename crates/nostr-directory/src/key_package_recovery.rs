@@ -148,10 +148,11 @@ impl<R: DirectoryResources> Directory<R> {
                 )
                 .await
                 .map_err(DirectoryError::RelayDirectory)?;
-            observed.extend(outcome.records);
+            // Callers journal the primary read; journal only this reply.
             refreshed = self
-                .journal_and_refresh_fence(account, &observed, fence)
+                .journal_and_refresh_fence(account, &outcome.records, fence)
                 .await?;
+            observed.extend(outcome.records);
             package_coverage &= outcome.complete;
         }
         let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));

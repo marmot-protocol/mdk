@@ -30,7 +30,7 @@ use crate::published_records::{
     select_fenced_key_packages,
 };
 use crate::{AccountRelayListStatus, FetchedKeyPackage};
-use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome};
+use transport_nostr::DirectoryEventQuery;
 
 /// Maximum authors placed in one Nostr directory filter.
 pub(crate) const MEMBER_RESOLUTION_AUTHORS_PER_QUERY: usize = 32;
@@ -281,6 +281,9 @@ struct MemberTarget {
     relay_lists: AccountRelayListStatus,
     cached_relay_lists: AccountRelayListStatus,
     relay_records: Vec<transport_nostr::DirectoryRelayEventRecord>,
+    /// The relay-list records replies that completed returned. Only these
+    /// confirm the list a verdict rests on; the rest are route hints.
+    completed_relay_records: Vec<transport_nostr::DirectoryRelayEventRecord>,
     /// Outboxes of a served relay list that ties the remembered one on its
     /// timestamp but names other relays. KeyPackage reads include them.
     tied_relays: Vec<String>,
@@ -550,6 +553,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 relay_lists: relay_lists.clone(),
                 cached_relay_lists: relay_lists,
                 relay_records: Vec::new(),
+                completed_relay_records: Vec::new(),
                 tied_relays: Vec::new(),
             });
         }
@@ -979,17 +983,19 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     if members.len() == 1 || outcome.complete {
                         let reply = members
                             .into_iter()
-                            .map(|(index, _)| (index, endpoints.clone(), outcome.clone()))
+                            .map(|(index, _)| {
+                                (index, endpoints.clone(), outcome.clone(), Vec::new())
+                            })
                             .collect::<Vec<_>>();
                         return stream::iter(vec![Ok(reply)]).left_stream();
                     }
                     // CLOSED and other incomplete outcomes need the same
-                    // fallback as a rejected batch. Retain positive records
-                    // when the single-author retry is also incomplete.
+                    // fallback as a rejected batch. The batch's records stay
+                    // route hints beside the single-author retry's reply.
                     stream::iter(members.into_iter().map(move |(index, account_id)| {
                         let directory = directory.clone();
                         let endpoints = endpoints.clone();
-                        let mut records = outcome
+                        let hints = outcome
                             .records
                             .iter()
                             .filter(|record| record.event.pubkey == account_id)
@@ -1011,16 +1017,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 .fetch_directory_events_with_completion(endpoints.clone(), queries)
                                 .await
                                 .map_err(DirectoryError::RelayDirectory)?;
-                            records.extend(retry.records);
-                            Ok::<_, DirectoryError>(vec![(
-                                index,
-                                endpoints,
-                                DirectoryFetchOutcome {
-                                    records,
-                                    complete: retry.complete,
-                                    complete_endpoints: retry.complete_endpoints,
-                                },
-                            )])
+                            Ok::<_, DirectoryError>(vec![(index, endpoints, retry, hints)])
                         })
                     }))
                     .buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
@@ -1038,14 +1035,21 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         }
         drop(results);
         let mut progress = HopProgress::default();
-        for (index, endpoints, outcome) in received {
+        for (index, endpoints, outcome, hints) in received {
             let account_id = targets[index].account_id_hex.clone();
-            targets[index].relay_records.extend(
-                outcome
-                    .records
-                    .into_iter()
-                    .filter(|record| record.event.pubkey == account_id),
-            );
+            let records = outcome
+                .records
+                .into_iter()
+                .filter(|record| record.event.pubkey == account_id)
+                .collect::<Vec<_>>();
+            if outcome.complete {
+                targets[index]
+                    .completed_relay_records
+                    .extend(records.iter().cloned());
+            }
+            targets[index]
+                .relay_records
+                .extend(hints.into_iter().chain(records));
             targets[index].relay_lists = self.relay_lists_from_records(
                 &targets[index],
                 targets[index].relay_records.clone(),
@@ -1166,28 +1170,33 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             !invalid_outboxes.contains(index) && !outbox_hop.cleared.contains(index)
         }));
         let completed_outbox = outbox_hop.completed;
-        // A remembered list counts only when the relays served it in this
-        // lookup. On a timestamp tie the remembered list keeps its routes and
-        // the cache cannot tell which tied list is current, so the served
+        // A remembered list counts only when a completed reply in this lookup
+        // served it. On a timestamp tie the remembered list keeps its routes
+        // and the cache cannot tell which tied list is current, so the served
         // one's outboxes are read too but the tie decides nothing.
         let mut confirmed = HashSet::new();
         for &index in &needs_discovery {
             let target = &mut targets[index];
-            let served = fresh_relay_list_status_from_records(
-                &target.account_id_hex,
-                target.relay_records.clone(),
-                self.directory_freshness(),
-            )
-            .value
-            .nip65;
-            let listed = &target.relay_lists.nip65;
-            if served.created_at != listed.created_at {
-                continue;
-            }
-            if relay_identities(&served.relays) == relay_identities(&listed.relays) {
+            let newest = |records: &[transport_nostr::DirectoryRelayEventRecord]| {
+                let nip65 = fresh_relay_list_status_from_records(
+                    &target.account_id_hex,
+                    records.to_vec(),
+                    self.directory_freshness(),
+                )
+                .value
+                .nip65;
+                (nip65.created_at, nip65.relays)
+            };
+            let (served_at, served) = newest(&target.relay_records);
+            let completed = newest(&target.completed_relay_records);
+            let listed = (
+                target.relay_lists.nip65.created_at,
+                relay_identities(&target.relay_lists.nip65.relays),
+            );
+            if served_at == listed.0 && relay_identities(&served) != listed.1 {
+                target.tied_relays = served;
+            } else if (completed.0, relay_identities(&completed.1)) == listed {
                 confirmed.insert(index);
-            } else {
-                target.tied_relays = served.relays;
             }
         }
         let completed = completed_discovery
@@ -1420,14 +1429,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 .fetch_directory_events_with_completion(endpoints.clone(), queries)
                                 .await
                                 .map_err(DirectoryError::RelayDirectory)?;
+                            // The batch already journaled what it observed.
+                            let fence = directory
+                                .key_package_journal_fence(&target.account_id_hex, &fetched.records)
+                                .await?;
                             let mut records = fetched.records;
                             // This supplementary lookup must not discard a
                             // valid package observed in this call's batch.
                             // Never load a previously cached package here.
                             records.extend(observed_records);
-                            let fence = directory
-                                .key_package_journal_fence(&target.account_id_hex, &records)
-                                .await?;
                             let records = directory
                                 .recover_key_package_records(
                                     super::key_package_recovery::KeyPackageRecoveryRequest {
@@ -1443,9 +1453,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                     },
                                 )
                                 .await?;
-                            // Recheck the journal before admitting what recovery found.
+                            // Recovery journaled everything it read. Reread the
+                            // journal before admitting what it found.
                             let fence = directory
-                                .key_package_journal_fence(&target.account_id_hex, &records.records)
+                                .key_package_journal_fence(&target.account_id_hex, &[])
                                 .await?;
                             records.select(&target.account_id_hex, requirements, Some(&fence))
                         }

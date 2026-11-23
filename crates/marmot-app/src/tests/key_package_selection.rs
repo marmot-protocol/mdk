@@ -1060,7 +1060,7 @@ async fn per_author_refetch_preserves_slot_replacements_seen_in_batch() {
             .unwrap()
             .insert(old.id.clone());
         fetcher
-            .key_packages_only_in_multi_author
+            .events_only_in_multi_author
             .lock()
             .unwrap()
             .insert(replacement.id.clone());
@@ -1763,6 +1763,84 @@ async fn a_tied_relay_list_too_long_to_add_still_reads_the_remembered_outbox() {
             .map(|package| hex::encode(package.source.as_ref().unwrap().event_id.as_slice()))
             .collect::<Vec<_>>(),
         vec![compatible]
+    );
+    app.close_storage().unwrap();
+}
+
+/// A batch reply that stops early can still return the recipient's relay
+/// list. When the single-author retry and the outbox read then finish without
+/// it, no completed reply served that list, so the incompatible package on its
+/// outbox decides nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_list_only_an_unfinished_batch_returned_decides_nothing() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    app.account_home().create_account("alice").unwrap();
+    let requirements = retention_requirements(&app).await;
+    let (bob, carol) = (&accounts[0], &accounts[1]);
+    let limited = fresh_key_package_with_components(
+        &app,
+        bob,
+        false,
+        app.supported_app_component_ids()
+            .into_iter()
+            .filter(|id| *id != cgka_traits::app_components::GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+            .collect(),
+    )
+    .await;
+    let mut events = fetcher.events.lock().unwrap().clone();
+    events.retain(|event| {
+        event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != bob.account_id_hex
+    });
+    events.push(candidate(bob, limited, "limited", None, unix_now_seconds()));
+    let bob_relay_list = events
+        .iter()
+        .find(|event| event.kind == KIND_NIP65_RELAY_LIST && event.pubkey == bob.account_id_hex)
+        .unwrap()
+        .id
+        .clone();
+    // The outbox serves packages and inbox lists, never relay lists.
+    let outbox = events
+        .iter()
+        .filter(|event| event.kind != KIND_NIP65_RELAY_LIST)
+        .cloned()
+        .collect();
+    fetcher.events_by_endpoint.lock().unwrap().extend([
+        ("wss://directory.example".into(), events),
+        ("wss://shared.example".into(), outbox),
+    ]);
+    let directory = app.directory();
+    let resolve = || {
+        directory.resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone(), carol.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+    };
+    // Complete reads make the incompatible package the verdict.
+    let complete = resolve().await;
+    assert!(
+        matches!(complete, Err(DirectoryError::KeyPackageRequirements(_))),
+        "{:?}",
+        complete.err()
+    );
+
+    fetcher
+        .events_only_in_multi_author
+        .lock()
+        .unwrap()
+        .insert(bob_relay_list);
+    fetcher
+        .closed_multi_author_reads
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let unfinished = resolve().await;
+    assert!(
+        matches!(
+            &unfinished,
+            Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
+        ),
+        "{:?}",
+        unfinished.err()
     );
     app.close_storage().unwrap();
 }
