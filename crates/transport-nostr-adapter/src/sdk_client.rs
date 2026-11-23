@@ -2550,7 +2550,7 @@ impl NostrSdkRelayClient {
         let gossip = builder.gossip.clone();
         let authenticator_available = builder.authenticator.is_some();
         let eose_hints = Arc::new(EoseHints::default());
-        let finite_requests = FiniteRequests::new(authenticator_available);
+        let finite_requests = FiniteRequests::for_builder(&builder);
         let transport = HintTransport::new(
             Arc::new(finite_requests.transport(builder.websocket_transport.clone())),
             eose_hints.clone(),

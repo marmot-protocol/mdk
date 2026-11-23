@@ -254,10 +254,12 @@ for reconnect/backoff and relay status mechanics.
   registered: a relay keeps answering until it reads the CLOSE, and those frames must never reach the SDK. It never
   blocks or delays another frame. A frame whose verb or EVENT id it cannot read passes on and ends that connection's
   requests `InvalidMessage`. Each request's queue holds its byte budget plus one frame, so a slow caller never fails a
-  request that keeps to its budget. The collector applies the SDK's message and tag ceilings, expiry, the filter and
-  the event id and signature of the supplied bytes; an id and signature pair it verified before skips only the
-  signature check. A request the collector ends (EOSE, CLOSED, a budget) charges nothing past that frame; one something
-  else ends (cancellation, deadline, connection) charges every EVENT frame it was sent and did not read. An
+  request that keeps to its budget. The collector applies the SDK's message and tag ceilings, expiry, the filter,
+  the event id and signature of the supplied bytes, the client database's deletion check and the builder's admission
+  policy, none of which saves or notifies anything; an id and signature pair it verified before skips only the
+  signature check. It honours cancellation and its deadline between frames, mid-page included. A request the
+  collector ends (EOSE, CLOSED, a budget) charges nothing past that frame; one something else ends (cancellation,
+  deadline, connection) charges every EVENT frame it was sent and did not read. An
   `auth-required:` refusal is retried once under a new id after the client authenticates.
 - The client's wire tap (`src/sweep/hint_tap.rs`) counts, per REQ, the EVENT frames its relay sends before that
   REQ's EOSE, valid or not, on the connection the REQ went out on (`ReplyCounts`). `dispatch_sdk_notification` asks
