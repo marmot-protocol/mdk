@@ -219,9 +219,17 @@ fn publish_file(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHomeResult<
         match mode {
             #[cfg(windows)]
             FileMode::Private => {
+                use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
                 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
 
-                windows_move_for_commit(&temp_path, path, MOVEFILE_REPLACE_EXISTING)?;
+                match windows_move_for_commit(&temp_path, path, MOVEFILE_REPLACE_EXISTING) {
+                    // std can replace a delete-shared destination through
+                    // FileRenameInfoEx without moving the old name aside.
+                    Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                        fs::rename(&temp_path, path)?;
+                    }
+                    result => result?,
+                }
             }
             _ => replace_file(&temp_path, path)?,
         }
@@ -671,6 +679,21 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+
+    #[test]
+    fn private_replace_with_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(".account-setup.json");
+        write_private_bytes(&path, b"first journal").unwrap();
+        let mut reader = File::open(&path).unwrap();
+
+        write_private_bytes(&path, b"second journal").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"second journal");
+        let mut previous = Vec::new();
+        reader.read_to_end(&mut previous).unwrap();
+        assert_eq!(previous, b"first journal");
+    }
 
     #[test]
     fn private_replace_keeps_live() {
