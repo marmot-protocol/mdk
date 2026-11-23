@@ -100,7 +100,6 @@ def _home_channel_platform_name(home_channel: Any) -> Optional[str]:
 
 
 DEFAULT_SOCKET_HOME = "~/.marmot"
-TOOL_PROGRESS_MESSAGE_PREFIX = "marmot-tool-progress:"
 _PRESENCE_OWNER: ContextVar[Optional[object]] = ContextVar("marmot_presence_owner", default=None)
 
 _TURN_PARENT_MESSAGE_ID_HEX: ContextVar[Optional[str]] = ContextVar(
@@ -112,7 +111,6 @@ _TURN_PARENT_MESSAGE_ID_HEX: ContextVar[Optional[str]] = ContextVar(
 _APPROVAL_REPLY_CONTEXT: ContextVar[Optional[tuple[object, str]]] = ContextVar(
     "marmot_approval_reply_context", default=None,
 )
-TOOL_EVENT_PREFIX = "\x1fMARMOT_TOOL_EVENT:"
 # Bounded backoff (seconds) for durable send_final retries. One idempotency key
 # is reused across these attempts so a retry after a post-write timeout dedups at
 # the connector instead of double-posting. Mirrors OpenClaw dispatch ([100, 300]ms).
@@ -134,7 +132,6 @@ MAX_OUTBOUND_MEDIA_ATTACHMENTS = 10
 # beginning the upload.
 MAX_OUTBOUND_MEDIA_FILE_BYTES = 512 * 1024 * 1024 - 16
 MAX_OUTBOUND_MEDIA_BATCH_BYTES = 512 * 1024 * 1024 - 16
-MAX_TOOL_PROGRESS_MESSAGES = 512
 DEFAULT_RECONNECT_DELAY_MS = 1000
 DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000
 DEFAULT_INBOUND_DEDUPE_WINDOW = 2048
@@ -240,11 +237,6 @@ PROFILE_NAME_AFFIRM_REPLIES = {
     "go ahead",
 }
 MARMOT_ACCOUNT_ID_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
-LEGACY_TOOL_PROGRESS_RE = re.compile(
-    r'^\S+\s+(?P<tool>[A-Za-z0-9_.-]+)(?:\([^)]*\))?(?:(?::\s+"(?P<preview>.*)")|(?:\.\.\.))$',
-    re.DOTALL,
-)
-
 
 
 class _ResyncRequired(RuntimeError):
@@ -1504,8 +1496,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._inbound_queue = KeyedAsyncQueue(
             int(extra.get("inbound_queue_max_depth") or DEFAULT_INBOUND_QUEUE_MAX_DEPTH)
         )
-        self._tool_progress_events: OrderedDict[str, set[str]] = OrderedDict()
-        self._tool_progress_replies: Dict[str, Optional[str]] = {}
         self._presence = PresenceReactions(self, extra)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Client-side inbound dedupe: wn-agent can re-emit the same inbound
@@ -1865,8 +1855,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         await self._retry_ambient_outcomes()
         self._last_inbound_message_ids.clear()
         self._activation_cache.clear()
-        self._tool_progress_events.clear()
-        self._tool_progress_replies.clear()
         await self._inbound_spool_call(self._inbound_spool.close, graceful=True)
         self._inbound_dispatch_dispositions.clear()
         self._store_generation_enabled = False
@@ -1916,14 +1904,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 # unthreaded; invalid destination/account ids remain errors.
                 logger.debug("Marmot approval confirmation dropping invalid reply anchor")
                 reply_to = None
-        tool_events = _tool_events_from_progress_text(content)
-        if tool_events:
-            return await self._send_tool_progress_events(
-                chat_id,
-                tool_events,
-                reply_to_message_id_hex=_optional_hex(reply_to),
-            )
-
         if _delivery_routes_to_commentary_activity(metadata):
             return await self._send_commentary_activity(
                 chat_id,
@@ -1936,28 +1916,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             chat_id,
             content,
             reply_to_message_id_hex=_optional_hex(reply_to),
-        )
-
-    async def edit_message(
-        self,
-        chat_id: str,
-        message_id: str,
-        content: str,
-        *,
-        finalize: bool = False,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        self._capture_loop()
-        if not message_id.startswith(TOOL_PROGRESS_MESSAGE_PREFIX):
-            return SendResult(success=False, error="Marmot cannot edit durable messages")
-        chat_id = _normalize_hex(chat_id, "chat_id")
-        tool_events = _tool_events_from_progress_text(content)
-        if not tool_events:
-            return SendResult(success=True, message_id=message_id)
-        return await self._send_tool_progress_events(
-            chat_id,
-            tool_events,
-            message_id=message_id,
         )
 
     @property
@@ -2050,21 +2008,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         return super().render_message_event(event, sink)
 
     def format_tool_event(self, event: Any, *, mode: str = "all", preview_max_len: int = 40) -> Optional[str]:
-        tool_name = str(getattr(event, "tool_name", "") or "").strip()
-        if not tool_name:
-            return None
-        preview = getattr(event, "preview", None)
-        args = getattr(event, "args", None)
-        payload: Dict[str, Any] = {
-            "event_type": "tool_call",
-            "status": "started",
-            "name": tool_name,
-            "text": _tool_event_text(tool_name, preview),
-            "preview": str(preview) if preview is not None else None,
-            "details": {"args": args} if isinstance(args, dict) else None,
-            "sequence": getattr(event, "index", None),
-        }
-        return _encoded_tool_event({key: value for key, value in payload.items() if value is not None})
+        # Marmot does not render edit-based tool-progress bubbles; returning
+        # None tells Hermes's structured stream dispatcher to skip tool chrome.
+        return None
 
     async def _send_final_direct(
         self,
@@ -2553,74 +2499,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if not success:
             return {"success": False, "error": "Marmot unreact failed"}
         return {"success": True, "message_id": target_message_id}
-
-    async def _send_tool_progress_events(
-        self,
-        chat_id: str,
-        events: Iterable[Dict[str, Any]],
-        *,
-        reply_to_message_id_hex: Optional[str] = None,
-        message_id: Optional[str] = None,
-    ) -> SendResult:
-        message_id = message_id or _tool_progress_message_id()
-        seen = self._tool_progress_seen(message_id)
-        if reply_to_message_id_hex is not None or message_id not in self._tool_progress_replies:
-            self._tool_progress_replies[message_id] = reply_to_message_id_hex
-        else:
-            reply_to_message_id_hex = self._tool_progress_replies[message_id]
-        sent_message_ids = []
-        try:
-            account_id = await self._ensure_account_id()
-            for event in events:
-                key = json.dumps(event, sort_keys=True, separators=(",", ":"))
-                if key in seen:
-                    continue
-                response = await self.client.send_agent_operation_event(
-                    account_id,
-                    chat_id,
-                    event_type=str(event.get("event_type") or "tool_call"),
-                    status=str(event.get("status") or "started"),
-                    operation_id=event.get("operation_id"),
-                    run_id=event.get("run_id"),
-                    turn_id=event.get("turn_id"),
-                    name=event.get("name"),
-                    text=str(event.get("text") or ""),
-                    preview=event.get("preview"),
-                    details=event.get("details") if isinstance(event.get("details"), dict) else None,
-                    sequence=event.get("sequence"),
-                    ok=event.get("ok"),
-                    duration_ms=event.get("duration_ms"),
-                    reply_to_message_id_hex=reply_to_message_id_hex,
-                )
-                message_ids = tuple(response.get("message_ids_hex") or ())
-                if response.get("type") != "app_event_sent" or not message_ids:
-                    raise AgentControlError(
-                        "Marmot agent operation event send returned no message ids",
-                        code="unexpected_operation_event_response",
-                        retryable=True,
-                    )
-                seen.add(key)
-                sent_message_ids.extend(message_ids)
-            return SendResult(
-                success=True,
-                message_id=message_id,
-                raw_response={"type": "tool_progress_sent", "message_ids_hex": sent_message_ids},
-            )
-        except Exception as exc:
-            logger.debug("Marmot send_agent_operation_event failed: %s", exc)
-            return SendResult(success=False, message_id=message_id, error=str(exc), retryable=is_retryable(exc))
-
-    def _tool_progress_seen(self, message_id: str) -> set[str]:
-        seen = self._tool_progress_events.get(message_id)
-        if seen is None:
-            seen = set()
-            self._tool_progress_events[message_id] = seen
-        else:
-            self._tool_progress_events.move_to_end(message_id)
-        while len(self._tool_progress_events) > MAX_TOOL_PROGRESS_MESSAGES:
-            dropped_message_id, _ = self._tool_progress_events.popitem(last=False)
-            self._tool_progress_replies.pop(dropped_message_id, None)
-        return seen
 
     def _capture_loop(self) -> None:
         try:
@@ -4744,106 +4622,6 @@ def _config_bool(value: Any, *, default: bool) -> bool:
     if not text:
         return default
     return text not in {"0", "false", "no", "off", "disabled"}
-
-
-def _tool_progress_message_id() -> str:
-    return f"{TOOL_PROGRESS_MESSAGE_PREFIX}{uuid.uuid4().hex}"
-
-
-def _tool_event_text(tool_name: str, preview: Any = None) -> str:
-    if preview is None or str(preview).strip() == "":
-        return f"{tool_name} started"
-    return f"{tool_name}: {preview}"
-
-
-def _encoded_tool_event(event: Dict[str, Any]) -> str:
-    return TOOL_EVENT_PREFIX + json.dumps(event, sort_keys=True, separators=(",", ":"))
-
-
-def _tool_events_from_progress_text(content: str) -> list[Dict[str, Any]]:
-    events: list[Dict[str, Any]] = []
-    for block in _progress_blocks(content):
-        if block.startswith(TOOL_EVENT_PREFIX):
-            try:
-                event = json.loads(block[len(TOOL_EVENT_PREFIX):])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(event, dict):
-                events.append(_normalize_tool_event(event, fallback_text=block))
-            continue
-
-        event = _legacy_tool_event_from_progress_block(block)
-        if event is not None:
-            events.append(event)
-    return events
-
-
-def _progress_blocks(content: str) -> list[str]:
-    text = str(content or "").strip()
-    if not text:
-        return []
-    if TOOL_EVENT_PREFIX in text:
-        return [line.strip() for line in text.splitlines() if line.strip()]
-    return [block.strip() for block in text.split("\n") if block.strip()]
-
-
-def _legacy_tool_event_from_progress_block(block: str) -> Optional[Dict[str, Any]]:
-    match = LEGACY_TOOL_PROGRESS_RE.match(block)
-    if not match:
-        return None
-    tool_name = (match.group("tool") or "").strip()
-    if not tool_name:
-        return None
-    preview = match.group("preview")
-    return _normalize_tool_event(
-        {
-            "event_type": "tool_call",
-            "status": "started",
-            "name": tool_name,
-            "text": block,
-            "preview": preview,
-        },
-        fallback_text=block,
-    )
-
-
-def _normalize_tool_event(event: Dict[str, Any], *, fallback_text: str) -> Dict[str, Any]:
-    normalized = {
-        "event_type": str(event.get("event_type") or "tool_call"),
-        "status": str(event.get("status") or "started"),
-        "text": str(event.get("text") or fallback_text or ""),
-    }
-    name = str(event.get("name") or event.get("tool_name") or "").strip()
-    if name:
-        normalized["name"] = name
-    for field in ("operation_id", "run_id", "turn_id"):
-        value = str(event.get(field) or "").strip()
-        if value:
-            normalized[field] = value
-    preview = event.get("preview")
-    if preview is not None:
-        normalized["preview"] = str(preview)
-    details = event.get("details")
-    if isinstance(details, dict):
-        normalized["details"] = details
-    else:
-        args = event.get("args")
-        if isinstance(args, dict):
-            normalized["details"] = {"args": args}
-    for field in ("sequence", "duration_ms"):
-        if event.get(field) is not None:
-            try:
-                normalized[field] = int(event[field])
-            except (TypeError, ValueError):
-                pass
-    if "sequence" not in normalized and event.get("call_index") is not None:
-        try:
-            normalized["sequence"] = int(event["call_index"])
-        except (TypeError, ValueError):
-            pass
-    if event.get("ok") is not None:
-        normalized["ok"] = bool(event["ok"])
-    return normalized
 
 
 def _log_scheduled_activity_error(future) -> None:

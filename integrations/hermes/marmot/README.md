@@ -577,9 +577,11 @@ HERMES_MARMOT_BUSY_ACK_DETAIL=0 \
 just hermes-phone-test-up
 ```
 
-To deliberately test Hermes interim-message behavior in the phone app, opt back in. Tool progress stays off: WN Agent
-refuses tool-progress and agent-activity sends, so `HERMES_MARMOT_TOOL_PROGRESS=all` shows nothing on the phone, and
-neither does an interim message that Hermes marks as non-final commentary.
+To deliberately test Hermes interim-message behavior in the phone app, opt back in. Tool progress stays off: the Marmot
+adapter inherits `BasePlatformAdapter.edit_message` so Hermes skips edit-based tool-progress bubbles before calling
+`send()`, WN Agent also refuses the retired tool-progress and agent-activity requests, so
+`HERMES_MARMOT_TOOL_PROGRESS=all` shows nothing on the phone, and neither does an interim message that Hermes marks as
+non-final commentary.
 
 ```sh
 HERMES_MARMOT_INTERIM_MESSAGES=1 \

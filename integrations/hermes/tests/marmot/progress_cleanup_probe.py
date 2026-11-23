@@ -21,9 +21,8 @@ import os
 import sys
 import tempfile
 import threading
-import time
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 from unittest import mock
 
 
@@ -35,11 +34,8 @@ EXPLICIT_OPERATION_ID = "bb" * 32
 PROTOCOL = "marmot.agent-control.v2"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 HELPER_PATH = REPO_ROOT / "scripts" / "hermes_marmot_configure_gateway.py"
-TOOL_PROGRESS_PREFIX = "marmot-tool-progress:"
-PROBE_FINAL_TEXT = "probe-final-ok"
+PROBE_FINAL_TEXT = '>   accepted: "👀"\nHmm, checking...\nprobe-final-ok'
 SCHEDULED_WORK_TIMEOUT_S = 8.0
-PROGRESS_WAIT_TIMEOUT_S = 8.0
-PROGRESS_QUIET_S = 2.0
 UNIX_SOCKET_PATH_LIMIT = 100
 
 
@@ -62,43 +58,23 @@ def _hex_id(index: int) -> str:
 
 def _acknowledges_probe_final(text: Any) -> bool:
     raw = str(text or "")
-    if raw.strip() == PROBE_FINAL_TEXT:
-        return True
-    return any(line.strip() == PROBE_FINAL_TEXT for line in raw.splitlines())
-
-
-def _operation_key(attempt: dict[str, Any]) -> tuple[str, str, str]:
-    return (
-        str(attempt.get("name") or ""),
-        str(attempt.get("preview") or ""),
-        str(attempt.get("status") or ""),
-    )
+    return raw.strip() == PROBE_FINAL_TEXT
 
 
 class RecordingControlServer:
-    def __init__(
-        self,
-        socket_path: Path,
-        *,
-        fail_operation_after: int | None = None,
-    ):
+    def __init__(self, socket_path: Path):
         self.socket_path = socket_path
         self.server: asyncio.AbstractServer | None = None
         self.requests: list[str] = []
         self.operation_sends = 0
         self.final_sends = 0
+        self.final_texts: list[str] = []
         self.probe_final_acks = 0
         self.final_failures = 0
         self.wire_deletes = 0
-        self.durable_operation_ids: list[str] = []
         self.delete_targets: list[str] = []
-        self.operation_attempts: list[dict[str, Any]] = []
-        self.fail_operation_after = fail_operation_after
-        self._operation_seen = 0
-        self._operation_failures = 0
         self._next_id = 16
         self.fail_final = False
-        self._progress_event = threading.Event()
         self._state_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -218,39 +194,14 @@ class RecordingControlServer:
         with self._state_lock:
             self.requests.append(request_type)
             if request_type == "send_agent_operation_event":
-                self._operation_seen += 1
-                identity = {
-                    "name": str(request.get("name") or ""),
-                    "preview": str(request.get("preview") or ""),
-                    "status": str(request.get("status") or ""),
-                }
-                should_fail = (
-                    self.fail_operation_after is not None
-                    and self._operation_seen > self.fail_operation_after
-                    and self._operation_failures == 0
-                )
-                if should_fail:
-                    self._operation_failures += 1
-                    self.operation_attempts.append({**identity, "outcome": "failed"})
-                    self._progress_event.set()
-                    return {
-                        "marmot_agent_control": PROTOCOL,
-                        "id": request_id,
-                        "type": "error",
-                        "code": "temporary_unavailable",
-                        "retryable": True,
-                        "message": "injected operation-send failure",
-                    }
-                durable = self._alloc()
                 self.operation_sends += 1
-                self.durable_operation_ids.append(durable)
-                self.operation_attempts.append({**identity, "outcome": "accepted"})
-                self._progress_event.set()
                 return {
                     "marmot_agent_control": PROTOCOL,
                     "id": request_id,
-                    "type": "app_event_sent",
-                    "message_ids_hex": [durable],
+                    "type": "error",
+                    "code": "retired_agent_event",
+                    "retryable": False,
+                    "message": "retired_agent_event",
                 }
             if request_type == "send_final":
                 if self.fail_final:
@@ -263,7 +214,9 @@ class RecordingControlServer:
                         "message": "injected final-delivery failure",
                     }
                 self.final_sends += 1
-                if _acknowledges_probe_final(request.get("text")):
+                text = str(request.get("text") or "")
+                self.final_texts.append(text)
+                if _acknowledges_probe_final(text):
                     self.probe_final_acks += 1
                 return {
                     "marmot_agent_control": PROTOCOL,
@@ -303,70 +256,26 @@ class RecordingControlServer:
                 "type": "ack",
             }
 
-    def acknowledged_or_failed_operations(self) -> int:
-        with self._state_lock:
-            return self.operation_sends + self._operation_failures
-
-    def wait_until_idle(
-        self,
-        *,
-        min_operations: int,
-        quiet_s: float = PROGRESS_QUIET_S,
-        timeout: float = PROGRESS_WAIT_TIMEOUT_S,
-    ) -> None:
-        deadline = time.monotonic() + timeout
-        last_count = -1
-        last_change = time.monotonic()
-        while True:
-            count = self.acknowledged_or_failed_operations()
-            now = time.monotonic()
-            if count != last_count:
-                last_count = count
-                last_change = now
-            if count >= min_operations and (now - last_change) >= quiet_s:
-                return
-            remaining = deadline - now
-            if remaining <= 0:
-                raise AssertionError("progress operations did not settle before timeout")
-            self._progress_event.wait(timeout=min(0.05, remaining))
-            self._progress_event.clear()
-
 
 class DeterministicAIAgent:
     instances: list["DeterministicAIAgent"] = []
-    progress_server: ClassVar[RecordingControlServer | None] = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.tool_progress_callback = None
         self.is_interrupted = False
         self.fail_turn = bool(kwargs.pop("_fail_turn", False))
-        self.stagger_after_first = bool(kwargs.pop("_stagger_after_first", False))
         self.tool_names = list(
-            kwargs.pop("_tool_names", ("probe_alpha", "probe_beta", "probe_gamma"))
+            kwargs.pop("_tool_names", ("probe_alpha", "web_search", "probe_beta"))
         )
         self.last_result: dict[str, Any] | None = None
         self.created = True
         DeterministicAIAgent.instances.append(self)
 
-    def _wait_progress(self, *, min_operations: int, quiet_s: float) -> None:
-        server = type(self).progress_server
-        if server is None:
-            return
-        server.wait_until_idle(min_operations=min_operations, quiet_s=quiet_s)
-
     def run_conversation(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
         callback = self.tool_progress_callback
         if callback is not None:
-            if self.stagger_after_first and len(self.tool_names) >= 2:
-                first, *rest = self.tool_names
-                callback("tool.started", first, preview=f"{first}-preview", args={"q": first})
-                self._wait_progress(min_operations=1, quiet_s=PROGRESS_QUIET_S)
-                for name in rest:
-                    callback("tool.started", name, preview=f"{name}-preview", args={"q": name})
-            else:
-                for name in self.tool_names:
-                    callback("tool.started", name, preview=f"{name}-preview", args={"q": name})
-            self._wait_progress(min_operations=1, quiet_s=PROGRESS_QUIET_S)
+            for name in self.tool_names:
+                callback("tool.started", name, preview=f"{name}-preview", args={"q": name})
         if self.fail_turn:
             self.last_result = {
                 "final_response": "",
@@ -699,12 +608,11 @@ def _create_registered_adapter(platform_config):
     return adapter
 
 
-def _assert_fresh_progress_state(adapter) -> None:
-    if not hasattr(adapter, "_tool_progress_events"):
-        raise AssertionError("fresh adapter is missing _tool_progress_events")
-    events = adapter._tool_progress_events
-    if events is None or len(events) != 0:
-        raise AssertionError("fresh adapter reconstructed in-memory synthetic cleanup targets")
+def _assert_non_editable_adapter(adapter) -> None:
+    from gateway.platforms.base import BasePlatformAdapter
+
+    if type(adapter).edit_message is not BasePlatformAdapter.edit_message:
+        raise AssertionError("Marmot adapter must inherit BasePlatformAdapter.edit_message")
 
 
 def _assert_missing_delete_registration_fails() -> None:
@@ -859,8 +767,6 @@ async def _exercise_reconstructed_adapter(
     original_home = os.environ.get("HOME")
     original_hermes_home = os.environ.get("HERMES_HOME")
     original_load_gateway_config = None
-    previous_progress_server = DeterministicAIAgent.progress_server
-    DeterministicAIAgent.progress_server = fake
     runner = None
     try:
         _bind_home_env(hermes_home)
@@ -874,7 +780,7 @@ async def _exercise_reconstructed_adapter(
             socket_path=socket_path,
             agent_home=agent_home,
         )
-        _assert_fresh_progress_state(adapter)
+        _assert_non_editable_adapter(adapter)
         _wrap_delete(adapter, delete_attempts)
         DeterministicAIAgent.instances.clear()
 
@@ -903,14 +809,15 @@ async def _exercise_reconstructed_adapter(
             raise AssertionError("reconstructed adapter attempted automatic deletes")
         if fake.wire_deletes:
             raise AssertionError("reconstructed adapter issued automatic wire deletes")
-        if fake.operation_sends < 1:
-            raise AssertionError("reconstructed adapter turn produced no operation events")
+        if fake.operation_sends != 0:
+            raise AssertionError("reconstructed adapter emitted retired operation events")
+        if fake.final_sends != 1 or fake.probe_final_acks != 1:
+            raise AssertionError("reconstructed adapter did not deliver the verbatim final reply")
     finally:
         if original_load_gateway_config is not None:
             gateway_run._load_gateway_config = original_load_gateway_config
         await _stop_runner(runner)
         await fake.close()
-        DeterministicAIAgent.progress_server = previous_progress_server
         _restore_home_env(original_home, original_hermes_home)
 
 
@@ -920,12 +827,10 @@ async def _run_gateway_turn(
     adapter_module,
     grouping: str = "accumulate",
     tool_progress: str = "all",
-    fail_operation_after: int | None = None,
     fail_turn: bool = False,
     fail_final: bool = False,
     cleanup_override: bool | None = None,
     explicit_delete: bool = False,
-    stagger_after_first: bool = False,
 ) -> dict[str, Any]:
     helper = _load_helper()
     original_home = os.environ.get("HOME")
@@ -937,12 +842,10 @@ async def _run_gateway_turn(
             helper=helper,
             grouping=grouping,
             tool_progress=tool_progress,
-            fail_operation_after=fail_operation_after,
             fail_turn=fail_turn,
             fail_final=fail_final,
             cleanup_override=cleanup_override,
             explicit_delete=explicit_delete,
-            stagger_after_first=stagger_after_first,
         )
     finally:
         _restore_home_env(original_home, original_hermes_home)
@@ -955,12 +858,10 @@ async def _run_gateway_turn_body(
     helper,
     grouping: str,
     tool_progress: str,
-    fail_operation_after: int | None,
     fail_turn: bool,
     fail_final: bool,
     cleanup_override: bool | None,
     explicit_delete: bool,
-    stagger_after_first: bool,
 ) -> dict[str, Any]:
     registered_home = _registered_hermes_home()
     _bind_home_env(registered_home)
@@ -983,14 +884,12 @@ async def _run_gateway_turn_body(
         marmot_display["cleanup_progress"] = True
     (registered_home / "config.yaml").write_text(helper.dump_config(config), encoding="utf-8")
 
-    fake = RecordingControlServer(socket_path, fail_operation_after=fail_operation_after)
+    fake = RecordingControlServer(socket_path)
     fake.fail_final = fail_final
     await fake.start()
     original_load_gateway_config = None
     gateway_run = None
     runner = None
-    previous_progress_server = DeterministicAIAgent.progress_server
-    DeterministicAIAgent.progress_server = fake
     try:
         from gateway.config import Platform, load_gateway_config
         from gateway.display_config import resolve_display_setting
@@ -1018,6 +917,7 @@ async def _run_gateway_turn_body(
             agent_home=agent_home,
         )
         adapter = _create_registered_adapter(platform_config)
+        _assert_non_editable_adapter(adapter)
         delete_attempts: list[str] = []
         _wrap_delete(adapter, delete_attempts)
         callback_registrations: list[bool] = []
@@ -1044,7 +944,6 @@ async def _run_gateway_turn_body(
         DeterministicAIAgent.instances.clear()
         create_kwargs = {
             "_fail_turn": fail_turn,
-            "_stagger_after_first": stagger_after_first,
         }
 
         def agent_factory(*args, **kwargs):
@@ -1083,7 +982,6 @@ async def _run_gateway_turn_body(
                 except Exception:
                     pass
         await fake.close()
-        DeterministicAIAgent.progress_server = previous_progress_server
 
     agent_results = [
         inst.last_result for inst in DeterministicAIAgent.instances if inst.last_result is not None
@@ -1092,14 +990,12 @@ async def _run_gateway_turn_body(
     return {
         "resolved_cleanup": resolved_cleanup,
         "operation_sends": fake.operation_sends,
-        "operation_failures": fake._operation_failures,
-        "operation_attempts": list(fake.operation_attempts),
         "final_sends": fake.final_sends,
+        "final_texts": list(fake.final_texts),
         "probe_final_acks": fake.probe_final_acks,
         "final_failures": fake.final_failures,
         "wire_deletes": fake.wire_deletes,
         "delete_targets": list(fake.delete_targets),
-        "durable_operation_ids": list(fake.durable_operation_ids),
         "logical_send_ids": list(send_ids),
         "delete_attempts": list(delete_attempts),
         "request_types": list(fake.requests),
@@ -1107,7 +1003,6 @@ async def _run_gateway_turn_body(
         "agent_failed": agent_failed,
         "fail_turn_injected": fail_turn,
         "fail_final_injected": fail_final,
-        "fail_operation_injected": fail_operation_after is not None,
         "delivery_boundary_observed": delivery_boundary_observed,
         "scheduled_work_drained": scheduled_work_drained,
         "cleanup_callback_registered": bool(callback_registrations),
@@ -1120,30 +1015,22 @@ def _assert_no_automatic_deletes(result: dict[str, Any], *, label: str) -> None:
         raise AssertionError(f"{label}: automatic adapter delete attempts occurred")
     if result["wire_deletes"]:
         raise AssertionError(f"{label}: automatic wire deletes were issued")
-    if any(target in result["durable_operation_ids"] for target in result["delete_targets"]):
-        raise AssertionError(f"{label}: a kind-1202 durable id was targeted")
-    if any(target.startswith(TOOL_PROGRESS_PREFIX) for target in result["delete_targets"]):
-        raise AssertionError(f"{label}: a synthetic progress handle reached the wire")
 
 
-def _assert_retained_success(
+def _assert_progress_suppressed_and_final_delivered(
     result: dict[str, Any],
     *,
     label: str,
-    min_operations: int = 1,
+    expected_cleanup: bool = False,
 ) -> None:
-    if result["resolved_cleanup"] is not False:
-        raise AssertionError(f"{label}: installed cleanup did not resolve false")
-    if result["operation_sends"] < min_operations:
-        raise AssertionError(f"{label}: missing acknowledged operation events")
-    if not result["logical_send_ids"]:
-        raise AssertionError(f"{label}: produced no SendResult handles")
-    if not result["durable_operation_ids"]:
-        raise AssertionError(f"{label}: produced no durable event ids")
-    if result["final_sends"] < 1:
-        raise AssertionError(f"{label}: expected final delivery did not succeed")
-    if result["probe_final_acks"] < 1:
-        raise AssertionError(f"{label}: expected probe-final-ok acknowledgement was missing")
+    if result["resolved_cleanup"] is not expected_cleanup:
+        raise AssertionError(f"{label}: installed cleanup resolved unexpectedly")
+    if result["operation_sends"] != 0:
+        raise AssertionError(f"{label}: retired operation events were sent")
+    if result["final_sends"] != 1 or result["probe_final_acks"] != 1:
+        raise AssertionError(f"{label}: expected only the verbatim probe final reply")
+    if result["final_texts"] != [PROBE_FINAL_TEXT]:
+        raise AssertionError(f"{label}: durable sends did not match the verbatim final reply")
     if not result["delivery_boundary_observed"]:
         raise AssertionError(f"{label}: host delivery-finally boundary was not observed")
     if not result["scheduled_work_drained"]:
@@ -1151,59 +1038,20 @@ def _assert_retained_success(
     _assert_no_automatic_deletes(result, label=label)
 
 
-def _assert_failure_retention(
+def _assert_failure_suppressed(
     result: dict[str, Any],
     *,
     label: str,
 ) -> None:
     if result["resolved_cleanup"] is not False:
         raise AssertionError(f"{label}: installed cleanup did not resolve false")
-    if result["operation_sends"] < 1:
-        raise AssertionError(f"{label}: lost acknowledged progress before the injected failure")
+    if result["operation_sends"] != 0:
+        raise AssertionError(f"{label}: retired operation events were sent")
     if not result["delivery_boundary_observed"]:
         raise AssertionError(f"{label}: host delivery-finally boundary was not observed")
     if not result["scheduled_work_drained"]:
         raise AssertionError(f"{label}: scheduled post-delivery work was not drained")
     _assert_no_automatic_deletes(result, label=label)
-
-
-def _assert_partial_retry(result: dict[str, Any]) -> None:
-    _assert_failure_retention(result, label="retry")
-    attempts = result["operation_attempts"]
-    failed = [item for item in attempts if item["outcome"] == "failed"]
-    if not result["fail_operation_injected"] or not failed:
-        raise AssertionError("partial-send retry did not record an injected failure")
-    first_fail_idx = next(
-        index for index, item in enumerate(attempts) if item["outcome"] == "failed"
-    )
-    accepted_before = [
-        item for item in attempts[:first_fail_idx] if item["outcome"] == "accepted"
-    ]
-    if not accepted_before:
-        raise AssertionError("partial-send retry failed before any acknowledgement")
-    failed_key = _operation_key(attempts[first_fail_idx])
-    retried = [
-        item
-        for item in attempts[first_fail_idx + 1 :]
-        if item["outcome"] == "accepted" and _operation_key(item) == failed_key
-    ]
-    if not retried:
-        raise AssertionError("failed operation was not retried on the same logical surface")
-    accepted_key = _operation_key(accepted_before[0])
-    resent = [
-        item
-        for item in attempts[first_fail_idx:]
-        if item["outcome"] == "accepted" and _operation_key(item) == accepted_key
-    ]
-    if resent:
-        raise AssertionError("accepted operation was resent after the injected failure")
-    progress_ids = [
-        message_id
-        for message_id in result["logical_send_ids"]
-        if message_id.startswith(TOOL_PROGRESS_PREFIX)
-    ]
-    if len(set(progress_ids)) != 1:
-        raise AssertionError("partial-send retry used more than one logical progress surface")
 
 
 async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
@@ -1220,14 +1068,14 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         adapter_module=adapter_module,
         grouping="accumulate",
     )
-    _assert_retained_success(accumulate, label="accumulate")
+    _assert_progress_suppressed_and_final_delivered(accumulate, label="accumulate")
 
     separate = await _run_gateway_turn(
         hermes_home=hermes_home / "separate",
         adapter_module=adapter_module,
         grouping="separate",
     )
-    _assert_retained_success(separate, label="separate", min_operations=2)
+    _assert_progress_suppressed_and_final_delivered(separate, label="separate")
 
     control = await _run_gateway_turn(
         hermes_home=hermes_home / "control",
@@ -1235,22 +1083,11 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         grouping="separate",
         cleanup_override=True,
     )
-    if control["resolved_cleanup"] is not True:
-        raise AssertionError("positive-control cleanup did not resolve true")
-    if not control["cleanup_callback_registered"]:
-        raise AssertionError("positive-control never registered a post-delivery cleanup callback")
-    if not control["cleanup_callback_invoked"]:
-        raise AssertionError("positive-control cleanup callback was never invoked")
-    if not control["delivery_boundary_observed"]:
-        raise AssertionError("positive-control did not observe the host delivery-finally boundary")
-    if not control["scheduled_work_drained"]:
-        raise AssertionError("positive-control scheduled cleanup work was not drained")
-    if not control["delete_attempts"]:
-        raise AssertionError("positive-control cleanup never reached adapter.delete_message")
-    if control["wire_deletes"]:
-        raise AssertionError("positive-control cleanup sent synthetic handles on the wire")
-    if not any(handle.startswith(TOOL_PROGRESS_PREFIX) for handle in control["delete_attempts"]):
-        raise AssertionError("positive-control cleanup did not target returned logical ids")
+    _assert_progress_suppressed_and_final_delivered(
+        control,
+        label="control",
+        expected_cleanup=True,
+    )
 
     failed_turn = await _run_gateway_turn(
         hermes_home=hermes_home / "failed-turn",
@@ -1259,7 +1096,7 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
     )
     if not failed_turn["fail_turn_injected"] or not failed_turn["agent_failed"]:
         raise AssertionError("failed-turn host outcome was not a failed agent")
-    _assert_failure_retention(failed_turn, label="failed-turn")
+    _assert_failure_suppressed(failed_turn, label="failed-turn")
 
     failed_final = await _run_gateway_turn(
         hermes_home=hermes_home / "failed-final",
@@ -1272,16 +1109,7 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         raise AssertionError("failed-final unexpectedly acknowledged a final")
     if failed_final["agent_failed"]:
         raise AssertionError("failed-final unexpectedly marked the agent as failed")
-    _assert_failure_retention(failed_final, label="failed-final")
-
-    retry = await _run_gateway_turn(
-        hermes_home=hermes_home / "retry",
-        adapter_module=adapter_module,
-        grouping="accumulate",
-        fail_operation_after=1,
-        stagger_after_first=True,
-    )
-    _assert_partial_retry(retry)
+    _assert_failure_suppressed(failed_final, label="failed-final")
 
     restart_home = hermes_home / "restart"
     restart = await _run_gateway_turn(
@@ -1293,9 +1121,9 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         hermes_home=registered_home,
         helper=helper,
         agent_home=restart_home / "marmot-agent",
-        prior_durable_ids=list(restart["durable_operation_ids"]),
+        prior_durable_ids=list(restart["logical_send_ids"]),
     )
-    _assert_retained_success(restart, label="restart")
+    _assert_progress_suppressed_and_final_delivered(restart, label="restart")
 
     explicit = await _run_gateway_turn(
         hermes_home=hermes_home / "explicit",
@@ -1321,13 +1149,17 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
 
     return {
         "defaults_resolved_false": True,
-        "accumulate_operations": accumulate["operation_sends"],
-        "separate_operations": separate["operation_sends"],
-        "control_delete_attempts": len(control["delete_attempts"]),
-        "failed_turn_operations": failed_turn["operation_sends"],
-        "failed_final_operations": failed_final["operation_sends"],
-        "retry_operations": retry["operation_sends"],
-        "retry_failures": retry["operation_failures"],
+        "accumulate_finals": accumulate["final_sends"],
+        "separate_finals": separate["final_sends"],
+        "control_finals": control["final_sends"],
+        "operation_sends": (
+            accumulate["operation_sends"]
+            + separate["operation_sends"]
+            + control["operation_sends"]
+            + failed_turn["operation_sends"]
+            + failed_final["operation_sends"]
+            + restart["operation_sends"]
+        ),
         "explicit_deletes": explicit["wire_deletes"],
         "registration_fail_closed": True,
     }

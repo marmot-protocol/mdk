@@ -55,16 +55,31 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
                 probe._create_registered_adapter(object())
             probe._assert_missing_factory_fails()
 
-    def test_fresh_progress_state_fails_closed_when_attribute_missing(self):
-        with self.assertRaisesRegex(AssertionError, "missing _tool_progress_events"):
-            probe._assert_fresh_progress_state(object())
-        with self.assertRaisesRegex(AssertionError, "reconstructed"):
-            probe._assert_fresh_progress_state(types.SimpleNamespace(_tool_progress_events=None))
-        with self.assertRaisesRegex(AssertionError, "reconstructed"):
-            probe._assert_fresh_progress_state(
-                types.SimpleNamespace(_tool_progress_events={"keep": {"synthetic"}})
-            )
-        probe._assert_fresh_progress_state(types.SimpleNamespace(_tool_progress_events={}))
+    def test_non_editable_adapter_check_fails_when_edit_message_is_overridden(self):
+        class BasePlatformAdapter:
+            async def edit_message(self, *_args, **_kwargs):
+                return None
+
+        class InheritedAdapter(BasePlatformAdapter):
+            pass
+
+        class OverriddenAdapter(BasePlatformAdapter):
+            async def edit_message(self, *_args, **_kwargs):
+                return None
+
+        fake_base = types.ModuleType("gateway.platforms.base")
+        fake_base.BasePlatformAdapter = BasePlatformAdapter
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "gateway": types.ModuleType("gateway"),
+                "gateway.platforms": types.ModuleType("gateway.platforms"),
+                "gateway.platforms.base": fake_base,
+            },
+        ):
+            probe._assert_non_editable_adapter(InheritedAdapter())
+            with self.assertRaisesRegex(AssertionError, "inherit BasePlatformAdapter.edit_message"):
+                probe._assert_non_editable_adapter(OverriddenAdapter())
 
     def test_home_env_restored_after_success_and_exception(self):
         original_home = os.environ.get("HOME")
@@ -93,13 +108,6 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
         self.assertTrue(path.name.endswith(".sock"))
         self.assertIn(str(os.getpid()), path.name)
 
-    def test_wait_until_idle_fails_closed_on_timeout(self):
-        server = probe.RecordingControlServer(Path("/tmp/progress-cleanup-unused.sock"))
-        with self.assertRaisesRegex(AssertionError, "did not settle"):
-            server.wait_until_idle(min_operations=1, quiet_s=0.01, timeout=0.05)
-        server.operation_sends = 1
-        server.wait_until_idle(min_operations=1, quiet_s=0.01, timeout=0.2)
-
     def test_control_server_closes_loop_when_bind_fails(self):
         server = probe.RecordingControlServer(Path("/tmp/progress-cleanup-bind-fail.sock"))
         loop = asyncio.new_event_loop()
@@ -116,7 +124,7 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
         server.close_sync()
         self.assertTrue(loop.is_closed())
 
-    def test_probe_final_ack_tracks_expected_answer_only(self):
+    def test_probe_final_ack_tracks_exact_verbatim_answer_only(self):
         server = probe.RecordingControlServer(Path("/tmp/progress-cleanup-final.sock"))
         notice = server._response_for(
             {"id": "1", "type": "send_final", "text": "unrelated notice"},
@@ -131,39 +139,40 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
         )
         self.assertEqual(wrapped["type"], "final_sent")
         self.assertEqual(server.final_sends, 2)
-        self.assertEqual(server.probe_final_acks, 1)
+        self.assertEqual(server.probe_final_acks, 0)
         ack = server._response_for(
             {"id": "3", "type": "send_final", "text": probe.PROBE_FINAL_TEXT},
             "send_final",
         )
         self.assertEqual(ack["type"], "final_sent")
         self.assertEqual(server.final_sends, 3)
-        self.assertEqual(server.probe_final_acks, 2)
+        self.assertEqual(server.probe_final_acks, 1)
 
-    def test_acknowledges_probe_final_rejects_unrelated_text(self):
+    def test_acknowledges_probe_final_rejects_unrelated_or_wrapped_text(self):
         self.assertFalse(probe._acknowledges_probe_final("unrelated notice"))
         self.assertFalse(probe._acknowledges_probe_final(""))
+        self.assertFalse(probe._acknowledges_probe_final(f"prefix\n{probe.PROBE_FINAL_TEXT}"))
         self.assertTrue(probe._acknowledges_probe_final(f"  {probe.PROBE_FINAL_TEXT}  "))
-        self.assertTrue(probe._acknowledges_probe_final(f"prefix\n{probe.PROBE_FINAL_TEXT}"))
 
-    def test_retained_success_requires_probe_final_ack(self):
+    def test_progress_suppressed_assertion_requires_zero_operations_and_verbatim_final(self):
         result = {
             "resolved_cleanup": False,
-            "operation_sends": 3,
-            "logical_send_ids": ["marmot-tool-progress:1"],
-            "durable_operation_ids": ["aa" * 32],
-            "final_sends": 2,
+            "operation_sends": 0,
+            "final_sends": 1,
+            "final_texts": [probe.PROBE_FINAL_TEXT],
             "probe_final_acks": 0,
             "delivery_boundary_observed": True,
             "scheduled_work_drained": True,
             "delete_attempts": [],
             "wire_deletes": 0,
-            "delete_targets": [],
         }
-        with self.assertRaisesRegex(AssertionError, "probe-final-ok"):
-            probe._assert_retained_success(result, label="accumulate")
+        with self.assertRaisesRegex(AssertionError, "verbatim probe final reply"):
+            probe._assert_progress_suppressed_and_final_delivered(result, label="accumulate")
         result["probe_final_acks"] = 1
-        probe._assert_retained_success(result, label="accumulate")
+        probe._assert_progress_suppressed_and_final_delivered(result, label="accumulate")
+        result["operation_sends"] = 1
+        with self.assertRaisesRegex(AssertionError, "retired operation events"):
+            probe._assert_progress_suppressed_and_final_delivered(result, label="accumulate")
 
     def test_reconstructed_adapter_rejects_prior_durable_deletes(self):
         prior = ["cc" * 32]
@@ -185,7 +194,7 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
                 delete_targets=[prior[0]],
             )
 
-    def test_control_server_answers_blocking_client_without_caller_loop(self):
+    def test_control_server_rejects_retired_operation_request_and_tracks_count(self):
         with tempfile.TemporaryDirectory() as raw:
             socket_path = Path(raw) / "control.sock"
             server = probe.RecordingControlServer(socket_path)
@@ -202,9 +211,9 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
                         "status": "started",
                     },
                 )
-                self.assertEqual(response["type"], "app_event_sent")
+                self.assertEqual(response["type"], "error")
+                self.assertEqual(response["code"], "retired_agent_event")
                 self.assertEqual(server.operation_sends, 1)
-                self.assertEqual(len(server.durable_operation_ids), 1)
             finally:
                 server.close_sync()
 
@@ -220,23 +229,22 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
                         {
                             "marmot_agent_control": probe.PROTOCOL,
                             "id": "req-loop",
-                            "type": "send_agent_operation_event",
-                            "name": "probe_beta",
-                            "preview": "beta-preview",
-                            "status": "started",
+                            "type": "send_final",
+                            "text": probe.PROBE_FINAL_TEXT,
                         },
                     )
-                    server.wait_until_idle(min_operations=1, quiet_s=0.01, timeout=1.0)
                     return {
                         "type": response["type"],
-                        "operation_sends": server.operation_sends,
+                        "final_sends": server.final_sends,
+                        "probe_final_acks": server.probe_final_acks,
                     }
                 finally:
                     await server.close()
 
         observed = asyncio.run(scenario())
-        self.assertEqual(observed["type"], "app_event_sent")
-        self.assertEqual(observed["operation_sends"], 1)
+        self.assertEqual(observed["type"], "final_sent")
+        self.assertEqual(observed["final_sends"], 1)
+        self.assertEqual(observed["probe_final_acks"], 1)
 
     def test_apply_scenario_transport_overrides_loaded_extra(self):
         config = types.SimpleNamespace(enabled=False, extra={"socket_path": "/tmp/stale.sock"})
