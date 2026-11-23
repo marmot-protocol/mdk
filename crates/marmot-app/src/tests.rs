@@ -9801,10 +9801,10 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
     let requests = fetcher.requests.lock().unwrap();
     assert_eq!(
         requests.len(),
-        1,
-        "prewarmed routes should avoid repeating discovery"
+        3,
+        "a commit discovers routes again after a prewarm, then reads KeyPackages"
     );
-    key_package_read(&requests[0]);
+    key_package_read(&requests[2]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9950,7 +9950,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes() {
+async fn member_key_package_set_batches_shared_relay_and_rediscovers_after_prewarm() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(8, false).await;
     let members = accounts
         .iter()
@@ -10018,8 +10018,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        12,
-        "create reuses discovery routes but adds a package batch and eight single-author reads"
+        14,
+        "create repeats both discovery hops, then a package batch and eight single-author reads"
     );
 }
 
@@ -10100,8 +10100,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     );
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        5,
-        "create adds the package batch and two single-author reads, without relay discovery"
+        6,
+        "create repeats the single discovery hop, then the package batch and two single-author reads"
     );
 }
 

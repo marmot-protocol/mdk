@@ -1002,13 +1002,14 @@ async fn failed_single_author_refetch_preserves_only_usable_current_batch_packag
             let error = result
                 .err()
                 .expect("unusable batch material must not become a fallback");
-            // The prewarmed routes yield no usable package, so the lookup
-            // refreshes them. The refresh's single-author reads fail too, so
-            // even the malformed publication decides nothing.
-            assert!(
-                matches!(error, DirectoryError::DirectoryLookupIncomplete(_)),
-                "{batch_case}: {error:?}"
-            );
+            match batch_case {
+                "absent" | "incompatible" => assert!(matches!(
+                    error,
+                    DirectoryError::DirectoryLookupIncomplete(_)
+                )),
+                "malformed" => assert!(matches!(error, DirectoryError::InvalidKeyPackageEvent(_))),
+                _ => unreachable!(),
+            }
         }
     }
 }
@@ -1221,12 +1222,12 @@ async fn direct_start_requires_complete_discovery_for_incompatibility() {
     app.close_storage().unwrap();
 }
 
+/// A prewarm does not pin a recipient's routes: a start after the recipient
+/// moved outboxes discovers the new one on its first attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_start_refreshes_prewarmed_outbox_on_first_attempt() {
+async fn direct_start_after_prewarm_finds_a_moved_outbox() {
     let old_outbox = "wss://shared.example";
-    for (old_outbox_incomplete, old_outbox_page_full) in
-        [(false, false), (true, false), (false, true)]
-    {
+    for old_outbox_incomplete in [false, true] {
         let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
         app.directory()
             .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
@@ -1240,29 +1241,6 @@ async fn direct_start_refreshes_prewarmed_outbox_on_first_attempt() {
         } else {
             advertise_updated_direct_outbox(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
         }
-        if old_outbox_page_full {
-            let now = unix_now_seconds();
-            let deletions = (0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT)
-                .map(|index| {
-                    signed_deletion(
-                        &app,
-                        &bob,
-                        vec![
-                            slot_address(&bob, &format!("retired-{index}")),
-                            vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
-                        ],
-                        now - 100,
-                    )
-                })
-                .collect::<Vec<_>>();
-            fetcher
-                .events_by_endpoint
-                .lock()
-                .unwrap()
-                .get_mut(old_outbox)
-                .unwrap()
-                .extend(deletions);
-        }
         fetcher.requests.lock().unwrap().clear();
         let runtime = MarmotAppRuntime::new(app.clone());
         let created = runtime
@@ -1275,14 +1253,12 @@ async fn direct_start_refreshes_prewarmed_outbox_on_first_attempt() {
             )
             .await
             .unwrap_or_else(|error| {
-                panic!(
-                    "old outbox incomplete={old_outbox_incomplete}, page full={old_outbox_page_full}: {error}"
-                )
+                panic!("old outbox incomplete={old_outbox_incomplete}: {error}")
             });
         let groups = app.groups("alice").unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
-        if old_outbox_incomplete || old_outbox_page_full {
+        if old_outbox_incomplete {
             assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
                 request
                     .endpoints
@@ -1300,7 +1276,7 @@ async fn direct_start_refreshes_prewarmed_outbox_on_first_attempt() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prewarmed_direct_start_reports_incompatibility_on_first_attempt() {
+async fn direct_start_after_prewarm_reports_incompatibility_on_first_attempt() {
     let (_dir, app, bob, _fetcher) = direct_start_outbox_fixture().await;
     app.directory()
         .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
@@ -1334,8 +1310,9 @@ async fn prewarmed_direct_start_reports_incompatibility_on_first_attempt() {
     app.close_storage().unwrap();
 }
 
+/// A start after a prewarm still reads the recipient's relay lists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prewarmed_direct_start_with_compatible_keys_skips_relay_list_reads() {
+async fn direct_start_after_prewarm_reads_relay_lists() {
     let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     app.account_home().create_account("alice").unwrap();
     let bob = &accounts[0];
@@ -1358,12 +1335,9 @@ async fn prewarmed_direct_start_with_compatible_keys_skips_relay_list_reads() {
     let groups = app.groups("alice").unwrap();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
-    assert!(fetcher.requests.lock().unwrap().iter().all(|request| {
-        request.queries.iter().all(|query| {
-            !matches!(
-                query.kind,
-                KIND_NIP65_RELAY_LIST | KIND_MARMOT_INBOX_RELAY_LIST
-            )
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
+        request.queries.iter().any(|query| {
+            query.kind == KIND_NIP65_RELAY_LIST && query.authors.contains(&bob.account_id_hex)
         })
     }));
     runtime.shutdown().await;
@@ -1371,81 +1345,7 @@ async fn prewarmed_direct_start_with_compatible_keys_skips_relay_list_reads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refreshed_outbox_cannot_revive_an_older_key_package_for_the_same_slot() {
-    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
-    app.directory()
-        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
-        .await
-        .unwrap();
-    let compatible = fresh_key_package_for_account(&app, &bob, false).await;
-    {
-        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
-        let records = by_endpoint.get_mut("wss://directory.example").unwrap();
-        let incompatible = records
-            .iter()
-            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
-            .unwrap();
-        let stale = candidate(
-            &bob,
-            compatible,
-            incompatible.tag_value("d").unwrap(),
-            None,
-            incompatible.created_at - 1,
-        );
-        let outbox = records
-            .iter_mut()
-            .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
-            .unwrap();
-        *outbox = NostrTransportEvent::new_unsigned_at(
-            bob.account_id_hex.clone(),
-            KIND_NIP65_RELAY_LIST,
-            vec![vec![
-                "r".into(),
-                UPDATED_DIRECT_OUTBOX.into(),
-                "write".into(),
-            ]],
-            String::new(),
-            outbox.created_at + 1,
-        );
-        // The incompatible replacement is visible only on the old outbox.
-        records.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
-        let updated = by_endpoint.get_mut(UPDATED_DIRECT_OUTBOX).unwrap();
-        updated.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
-        updated.push(stale);
-    }
-    fetcher.requests.lock().unwrap().clear();
-    let runtime = MarmotAppRuntime::new(app.clone());
-    let error = runtime
-        .start_direct_conversation_with_options(
-            "alice",
-            &bob.account_id_hex,
-            crate::DirectConversationOptions {
-                disappearing_message_secs: 300,
-            },
-        )
-        .await
-        .unwrap_err();
-    // The refreshed outbox was used, but its only copy was superseded.
-    assert!(
-        matches!(error, AppError::MissingKeyPackage { .. }),
-        "{error}"
-    );
-    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
-        request
-            .endpoints
-            .iter()
-            .any(|endpoint| endpoint.0 == UPDATED_DIRECT_OUTBOX)
-            && request.queries.iter().any(|query| {
-                query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.contains(&bob.account_id_hex)
-            })
-    }));
-    assert!(app.groups("alice").unwrap().is_empty());
-    runtime.shutdown().await;
-    app.close_storage().unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn group_create_refreshes_incompatible_prewarmed_members_on_first_attempt() {
+async fn group_create_after_prewarm_decides_on_current_routes() {
     for status in [
         MemberResolutionStatus::IncompatibleKeyPackage,
         MemberResolutionStatus::Selected,
@@ -1498,10 +1398,10 @@ async fn group_create_refreshes_incompatible_prewarmed_members_on_first_attempt(
 }
 
 /// A recipient who moved outboxes and deleted every package on the old one
-/// leaves the prewarmed routes with nothing to select. The start refreshes
-/// them anyway and succeeds on its first attempt.
+/// leaves the prewarmed routes with nothing to select. The start discovers
+/// the new outbox and succeeds on its first attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_start_refreshes_a_prewarmed_outbox_left_without_packages() {
+async fn direct_start_after_prewarm_finds_packages_on_the_new_outbox() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
     app.directory()
         .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
@@ -1615,55 +1515,71 @@ async fn a_relay_list_naming_an_unread_outbox_decides_no_incompatibility() {
     app.close_storage().unwrap();
 }
 
-/// Under Partial, a member whose discovery stalls holds the first pass until
-/// its first-hop cut-off. A prewarmed member whose stale routes then find only
-/// an incompatible package still gets a discovery budget before the deadline,
-/// and the same lookup selects it from the outbox it moved to.
-#[test]
-fn partial_refresh_gets_its_own_discovery_budget() {
-    // Pauses the clock, which Tokio allows only on one thread.
-    run_composed_app_runtime_test_on_one_thread("refresh-budget", || async {
-        let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
-        app.directory()
-            .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
-            .await
+/// Relay lists published in the same second tie, and the remembered list
+/// keeps its routes on a tie. When the relays serve a tied list naming another
+/// outbox, this lookup has not read that outbox, so it decides no
+/// incompatibility.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tied_relay_list_naming_another_outbox_decides_no_incompatibility() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    // The first lookup remembers the list naming the old outbox.
+    let first = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await;
+    assert!(
+        matches!(first, Err(DirectoryError::KeyPackageRequirements(_))),
+        "{:?}",
+        first.err()
+    );
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let listed = by_endpoint
+            .get_mut("wss://directory.example")
+            .unwrap()
+            .iter_mut()
+            .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
             .unwrap();
-        advertise_updated_direct_outbox(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
-        let requirements = retention_requirements(&app).await;
-        let carol = nostr::prelude::Keys::generate().public_key().to_hex();
-        let stalled = carol.clone();
-        fetcher.never_answer(move |request| {
-            request.queries.iter().any(|query| {
-                query.kind == KIND_NIP65_RELAY_LIST && query.authors.contains(&stalled)
-            })
-        });
-        tokio::time::pause();
-        let resolved = app
-            .directory()
-            .resolve_compatible_member_key_packages(
-                vec![carol.clone(), bob.account_id_hex.clone()],
-                &requirements,
-                nostr_directory::MemberResolutionPurpose::Commit,
-                nostr_directory::MemberResolutionPolicy::Partial,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            resolved.member_outcomes,
-            vec![
-                MemberResolutionOutcome {
-                    account_id_hex: carol,
-                    status: MemberResolutionStatus::Incomplete,
-                    selected_device_count: 0,
-                },
-                MemberResolutionOutcome {
-                    account_id_hex: bob.account_id_hex.clone(),
-                    status: MemberResolutionStatus::Selected,
-                    selected_device_count: 1,
-                },
-            ]
+        *listed = NostrTransportEvent::new_unsigned_at(
+            bob.account_id_hex.clone(),
+            KIND_NIP65_RELAY_LIST,
+            vec![vec![
+                "r".into(),
+                UPDATED_DIRECT_OUTBOX.into(),
+                "write".into(),
+            ]],
+            String::new(),
+            listed.created_at,
         );
-    });
+        by_endpoint
+            .get_mut("wss://shared.example")
+            .unwrap()
+            .retain(|event| event.kind != KIND_NIP65_RELAY_LIST);
+    }
+    let result = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await;
+    assert!(
+        matches!(
+            &result,
+            Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
+        ),
+        "{:?}",
+        result.err()
+    );
+    app.close_storage().unwrap();
 }
 
 /// Final selection revalidates lifetimes on the wall clock, so it can lose

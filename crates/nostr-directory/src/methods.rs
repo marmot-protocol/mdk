@@ -624,8 +624,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 primary_complete: outcome.complete,
                 discovery: &discovery_relays,
                 requirements: None,
-                prior_evidence: None,
-                last_evidence: None,
                 cached_target,
                 wanted: 1,
             })

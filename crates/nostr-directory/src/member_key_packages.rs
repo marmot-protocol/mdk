@@ -11,7 +11,6 @@
 
 use crate::error::{DirectoryError, MissingKeyPackageReason};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cgka_engine::key_package::key_package_metadata;
@@ -26,9 +25,8 @@ use super::Directory;
 use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 use super::resources::DirectoryResources;
 use crate::published_records::{
-    KeyPackageRecoveryEvidence, MAX_KEY_PACKAGES_PER_ACCOUNT, fresh_relay_list_status_from_records,
-    key_package_queries, key_package_read_page_full, merge_relay_list_status,
-    select_key_packages_with_evidence,
+    MAX_KEY_PACKAGES_PER_ACCOUNT, fresh_relay_list_status_from_records, key_package_queries,
+    key_package_read_page_full, merge_relay_list_status, select_key_packages_from_records,
 };
 use crate::{AccountRelayListStatus, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome};
@@ -85,40 +83,17 @@ mod tests {
         assert!(cache.get(&format!("{:064x}", 0)).is_none());
 
         let newest = format!("{:064x}", MEMBER_PREWARM_CACHE_LIMIT);
-        cache.set_inserted_at(
-            &newest,
-            Instant::now() - MEMBER_PREWARM_CACHE_TTL - Duration::from_secs(1),
-        );
+        cache.entries.get_mut(&newest).unwrap().inserted_at =
+            Instant::now() - MEMBER_PREWARM_CACHE_TTL - Duration::from_secs(1);
         assert!(cache.get(&newest).is_none());
         assert!(!cache.order.contains(&newest));
-    }
-
-    #[test]
-    fn discarding_a_reused_prewarm_snapshot_preserves_its_replacement() {
-        let mut cache = MemberKeyPackagePrewarmCache::default();
-        let account = "01".repeat(32);
-        cache.insert(account.clone(), AccountRelayListStatus::empty());
-        let used = cache.snapshot(&account).unwrap();
-
-        let mut updated_routes = AccountRelayListStatus::empty();
-        updated_routes
-            .nip65
-            .relays
-            .push("wss://new-outbox.example".into());
-        cache.insert(account.clone(), updated_routes.clone());
-        cache.remove_if_current(&account, &used);
-        assert_eq!(cache.get(&account), Some(updated_routes));
-
-        let current = cache.snapshot(&account).unwrap();
-        cache.remove_if_current(&account, &current);
-        assert!(cache.snapshot(&account).is_none());
-        assert!(!cache.order.contains(&account));
     }
 
     /// A read queued behind one that answers at the cut-off never starts,
     /// however the stream is polled once the cut-off has passed.
     #[tokio::test(start_paused = true)]
     async fn no_read_starts_after_its_cut_off() {
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let cut_off = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -174,7 +149,7 @@ mod tests {
 
 #[derive(Default)]
 pub struct MemberKeyPackagePrewarmCache {
-    entries: HashMap<String, Arc<MemberKeyPackagePrewarmEntry>>,
+    entries: HashMap<String, MemberKeyPackagePrewarmEntry>,
     order: VecDeque<String>,
 }
 
@@ -191,34 +166,15 @@ impl MemberKeyPackagePrewarmCache {
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_inserted_at(&mut self, account_id_hex: &str, inserted_at: Instant) {
         if let Some(entry) = self.entries.get_mut(account_id_hex) {
-            Arc::make_mut(entry).inserted_at = inserted_at;
+            entry.inserted_at = inserted_at;
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn get(&mut self, account_id_hex: &str) -> Option<AccountRelayListStatus> {
-        self.snapshot(account_id_hex)
-            .map(|entry| entry.relay_lists.clone())
-    }
-
-    fn snapshot(&mut self, account_id_hex: &str) -> Option<Arc<MemberKeyPackagePrewarmEntry>> {
         self.remove_expired();
-        self.entries.get(account_id_hex).cloned()
-    }
-
-    fn remove_if_current(
-        &mut self,
-        account_id_hex: &str,
-        used: &Arc<MemberKeyPackagePrewarmEntry>,
-    ) {
-        if self
-            .entries
+        self.entries
             .get(account_id_hex)
-            .is_some_and(|current| Arc::ptr_eq(current, used))
-        {
-            self.entries.remove(account_id_hex);
-            self.order.retain(|existing| existing != account_id_hex);
-        }
+            .map(|entry| entry.relay_lists.clone())
     }
 
     /// Insert freshly discovered routes, never a package-refresh result.
@@ -228,10 +184,10 @@ impl MemberKeyPackagePrewarmCache {
         self.order.push_back(account_id_hex.clone());
         self.entries.insert(
             account_id_hex,
-            Arc::new(MemberKeyPackagePrewarmEntry {
+            MemberKeyPackagePrewarmEntry {
                 relay_lists,
                 inserted_at: Instant::now(),
-            }),
+            },
         );
         while self.entries.len() > MEMBER_PREWARM_CACHE_LIMIT {
             let Some(oldest) = self.order.pop_front() else {
@@ -355,38 +311,12 @@ struct PartialCutOffs {
 
 impl PartialCutOffs {
     fn after(started: tokio::time::Instant) -> Self {
-        Self::within(started, started + MEMBER_RESOLUTION_DEADLINE)
-    }
-
-    /// The cut-offs scaled to the time from `started` to `deadline`, so a
-    /// pass that starts late keeps each step's share of what is left.
-    fn within(started: tokio::time::Instant, deadline: tokio::time::Instant) -> Self {
-        let left = deadline.saturating_duration_since(started);
-        let share = |cut_off: Duration| {
-            started + left.mul_f64(cut_off.div_duration_f64(MEMBER_RESOLUTION_DEADLINE))
-        };
         Self {
-            first_hop: share(PARTIAL_FIRST_HOP_CUT_OFF),
-            outbox_hop: share(PARTIAL_OUTBOX_HOP_CUT_OFF),
-            key_package_batches: share(PARTIAL_KEY_PACKAGE_BATCH_CUT_OFF),
+            first_hop: started + PARTIAL_FIRST_HOP_CUT_OFF,
+            outbox_hop: started + PARTIAL_OUTBOX_HOP_CUT_OFF,
+            key_package_batches: started + PARTIAL_KEY_PACKAGE_BATCH_CUT_OFF,
         }
     }
-}
-
-struct MemberLookup<'a> {
-    purpose: MemberResolutionPurpose,
-    requirements: Option<&'a cgka_engine::key_package::KeyPackageRequirements>,
-    deadline: tokio::time::Instant,
-    cut_offs: Option<PartialCutOffs>,
-}
-
-#[derive(Default)]
-struct MemberLookupCoverage {
-    relay_lists_completed: HashSet<usize>,
-    relay_lists_unfinished: HashSet<usize>,
-    /// What each member's recovery last judged by, which a route refresh may
-    /// not contradict.
-    evidence: HashMap<usize, KeyPackageRecoveryEvidence>,
 }
 
 /// The stream's next item, or `None` once it ends or `cut_off` passes. An
@@ -432,7 +362,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     ///
     /// Account aliases are canonicalized and duplicate account ids collapse to
     /// their first input position. Each account yields every KeyPackage
-    /// [`select_key_packages_with_evidence`] selects, best first, from what its
+    /// [`select_key_packages_from_records`] selects, best first, from what its
     /// relays returned. Every device is sought, not guaranteed (mdk#2628,
     /// D12): packages a read returned are selected even when the read was
     /// incomplete, so a device whose package no relay returned is left out,
@@ -481,8 +411,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     /// A malformed current slot publication suppresses older packages here too;
     /// return an error rather than report readiness from superseded material.
     /// Every call fetches packages for a fresh readiness signal; hosts should
-    /// debounce composition changes. A later create call can reuse discovery routes,
-    /// but fetches KeyPackages again because prewarmed material may have been
+    /// debounce composition changes. Only a later prewarm reuses the discovered
+    /// routes: create and invite discover routes and fetch KeyPackages again,
+    /// because routes may have moved and prewarmed material may have been
     /// consumed in the meantime.
     pub async fn prewarm_group_member_key_packages(
         &self,
@@ -545,12 +476,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let result = self
             .resolve_member_key_packages_inner(
                 &member_refs,
-                MemberLookup {
-                    purpose,
-                    requirements,
-                    deadline,
-                    cut_offs,
-                },
+                purpose,
+                requirements,
+                deadline,
+                cut_offs,
                 policy,
             )
             .await;
@@ -573,10 +502,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     async fn resolve_member_key_packages_inner(
         &self,
         member_refs: &[String],
-        lookup: MemberLookup<'_>,
+        purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+        deadline: tokio::time::Instant,
+        cut_offs: Option<PartialCutOffs>,
         policy: MemberResolutionPolicy,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
-        let purpose = lookup.purpose;
         let directory_observation = self
             .resources
             .begin(
@@ -623,11 +554,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .collect::<Vec<Option<Result<Vec<KeyPackage>, DirectoryError>>>>();
         // Even a valid, unexpired cached package may have been consumed on
         // another device. Every purpose, including composition prewarm, must
-        // fetch current relay publications; only discovery routes are reused.
-        let mut reused_prewarmed_routes = HashMap::new();
+        // fetch current relay publications; only prewarm reuses discovery routes.
+        let mut reused_prewarmed_routes = HashSet::new();
         for (index, target) in targets.iter_mut().enumerate() {
-            // Recovery deliberately refreshes routes as well as packages.
-            if purpose == MemberResolutionPurpose::CommitFresh {
+            // A commit's verdicts need current routes, so it always discovers
+            // them; only composition prewarm reuses its own.
+            if purpose != MemberResolutionPurpose::Prewarm {
                 continue;
             }
             let prefetched = self
@@ -635,12 +567,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 .member_key_package_prewarm_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .snapshot(&target.account_id_hex);
-            if let Some(snapshot) = prefetched {
-                target.relay_lists = merge_relay_list_status(
-                    target.relay_lists.clone(),
-                    snapshot.relay_lists.clone(),
-                );
+                .get(&target.account_id_hex);
+            if let Some(relay_lists) = prefetched {
+                target.relay_lists =
+                    merge_relay_list_status(target.relay_lists.clone(), relay_lists);
+                target.cached_relay_lists = target.relay_lists.clone();
                 if !target.relay_lists.nip65.relays.is_empty()
                     && !self
                         .relay_plane
@@ -657,9 +588,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         )
                         .is_empty()
                 {
-                    reused_prewarmed_routes.insert(index, snapshot);
-                } else {
-                    target.cached_relay_lists = target.relay_lists.clone();
+                    reused_prewarmed_routes.insert(index);
                 }
             }
         }
@@ -667,91 +596,59 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         // Durable projections have unknown observation age and need a bounded
         // refresh. Process-local prewarm entries have an enforced TTL and were
         // already resolved through the outbox path during composition.
-        let members = (0..targets.len()).collect::<Vec<_>>();
-        let relay_list_unresolved = members
-            .iter()
-            .copied()
-            .filter(|index| !reused_prewarmed_routes.contains_key(index))
+        let relay_list_unresolved = (0..targets.len())
+            .filter(|index| !reused_prewarmed_routes.contains(index))
             .collect::<Vec<_>>();
-        let mut coverage = self
-            .resolve_member_lookup_pass(
-                &mut targets,
-                &relay_list_unresolved,
-                &members,
-                &mut outcomes,
-                &lookup,
-                &HashMap::new(),
+        // Unfinished relay lists cannot support any KeyPackage verdict.
+        let (relay_lists_completed, relay_lists_unfinished, finished) =
+            match tokio::time::timeout_at(
+                deadline,
+                self.resolve_missing_relay_lists(&mut targets, &relay_list_unresolved, cut_offs),
             )
-            .await?;
-
-        if purpose == MemberResolutionPurpose::Commit {
-            // Prewarmed routes that yield no usable package may be stale.
-            let refresh = members
-                .into_iter()
-                .filter(|index| {
-                    reused_prewarmed_routes.contains_key(index)
-                        && matches!(
-                            &outcomes[*index],
-                            Some(Err(error)) if recipient_resolution_status(error).is_some()
-                        )
-                })
-                .collect::<Vec<_>>();
-            if !refresh.is_empty() {
-                {
-                    let mut cache = self
-                        .state
-                        .member_key_package_prewarm_cache
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    for &index in &refresh {
-                        // A composition request may have replaced the hint
-                        // while the first pass was on the network.
-                        cache.remove_if_current(
-                            &targets[index].account_id_hex,
-                            &reused_prewarmed_routes[&index],
-                        );
-                        // Discover again from the durable baseline, without
-                        // letting an equal-timestamp prewarm hint win.
-                        targets[index].relay_lists = targets[index].cached_relay_lists.clone();
-                        outcomes[index] = None;
+            .await
+            {
+                Ok(resolution) => {
+                    let RelayListResolution {
+                        completed,
+                        errors,
+                        unfinished,
+                    } = resolution?;
+                    for (index, error) in errors {
+                        outcomes[index] = Some(Err(error));
                     }
-                }
-                // The first pass may have spent the time its Partial cut-offs
-                // set aside for discovery.
-                let refresh_lookup = MemberLookup {
-                    cut_offs: lookup.cut_offs.map(|_| {
-                        PartialCutOffs::within(tokio::time::Instant::now(), lookup.deadline)
-                    }),
-                    ..lookup
-                };
-                let refreshed = self
-                    .resolve_member_lookup_pass(
-                        &mut targets,
-                        &refresh,
-                        &refresh,
-                        &mut outcomes,
-                        &refresh_lookup,
-                        &coverage.evidence,
+                    let key_package_unresolved = (0..targets.len())
+                        .filter(|index| outcomes[*index].is_none())
+                        .collect::<Vec<_>>();
+                    let finished = match tokio::time::timeout_at(
+                        deadline,
+                        self.resolve_missing_key_packages(
+                            &targets,
+                            &key_package_unresolved,
+                            &mut outcomes,
+                            purpose,
+                            requirements,
+                            cut_offs.map(|cut_offs| cut_offs.key_package_batches),
+                        ),
                     )
-                    .await?;
-                for index in refresh {
-                    if !refreshed.relay_lists_completed.contains(&index)
-                        && matches!(
-                            &outcomes[index],
-                            Some(Err(error)) if recipient_resolution_status(error).is_some()
-                        )
+                    .await
                     {
-                        outcomes[index] = Some(Err(DirectoryError::DirectoryLookupIncomplete(
-                            targets[index].account_id_hex.clone(),
-                        )));
-                    }
+                        Ok(result) => {
+                            result?;
+                            true
+                        }
+                        Err(_) => false,
+                    };
+                    (completed, Some(unfinished), finished)
                 }
-                coverage
-                    .relay_lists_completed
-                    .extend(refreshed.relay_lists_completed);
-                coverage
-                    .relay_lists_unfinished
-                    .extend(refreshed.relay_lists_unfinished);
+                Err(_) => (HashSet::new(), None, false),
+            };
+        if !finished {
+            for (target, outcome) in targets.iter().zip(&mut outcomes) {
+                outcome.get_or_insert_with(|| {
+                    Err(DirectoryError::DirectoryLookupIncomplete(
+                        target.account_id_hex.clone(),
+                    ))
+                });
             }
         }
 
@@ -770,10 +667,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 continue;
             };
             // An incompatibility verdict needs current outbox discovery as
-            // well as complete KeyPackage reads. Reused routes are hints.
+            // well as complete KeyPackage reads.
             let result = match result {
                 Err(DirectoryError::KeyPackageRequirements(error))
-                    if !coverage.relay_lists_completed.contains(&index)
+                    if !relay_lists_completed.contains(&index)
                         && key_package_requirements_are_incompatible(&error) =>
                 {
                     Err(DirectoryError::DirectoryLookupIncomplete(
@@ -818,7 +715,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             // and so may a member a cut-off stopped.
             MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
                 for (index, target) in targets.iter().enumerate() {
-                    if coverage.relay_lists_unfinished.contains(&index) {
+                    if relay_lists_unfinished
+                        .as_ref()
+                        .is_none_or(|unfinished| unfinished.contains(&index))
+                    {
                         continue;
                     }
                     if !target.relay_lists.nip65.relays.is_empty()
@@ -843,7 +743,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     // Only completed discovery renews the route deadline.
                     // A usable package can arrive after an incomplete metadata
                     // hop retained an older durable inbox/outbox projection.
-                    if coverage.relay_lists_completed.contains(&index)
+                    if relay_lists_completed.contains(&index)
                         && matches!(outcomes[index], Some(Ok(_)))
                     {
                         cache.insert(target.account_id_hex.clone(), target.relay_lists.clone());
@@ -1154,20 +1054,13 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .filter(|index| !completed_discovery.contains(index))
             .collect::<HashSet<_>>();
 
-        // The safe outboxes a member's relay list names, less the directory
-        // relays a complete first hop already read.
-        let outboxes = |targets: &[MemberTarget], index: usize| {
+        // The safe outboxes a relay list names, less the directory relays a
+        // complete first hop already read.
+        let outboxes = |index: usize, relays: &[String]| {
             let mut outboxes = self
                 .relay_plane
                 .retain_safe_discovered_endpoints(
-                    targets[index]
-                        .relay_lists
-                        .nip65
-                        .relays
-                        .iter()
-                        .cloned()
-                        .map(TransportEndpoint)
-                        .collect(),
+                    relays.iter().cloned().map(TransportEndpoint).collect(),
                     "member inbox outbox discovery",
                 )
                 .into_iter()
@@ -1185,16 +1078,14 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             if unfinished.contains(&index) {
                 continue;
             }
-            let outbox_endpoints = outboxes(targets, index);
+            let outbox_endpoints = outboxes(index, &targets[index].relay_lists.nip65.relays);
             if !outbox_endpoints.is_empty() {
                 by_outboxes.entry(outbox_endpoints).or_default().push(index);
             }
         }
         let read_outboxes = by_outboxes
             .iter()
-            .flat_map(|(outboxes, indices)| {
-                indices.iter().map(move |index| (*index, outboxes.clone()))
-            })
+            .flat_map(|(read, indices)| indices.iter().map(move |index| (*index, read.clone())))
             .collect::<HashMap<_, _>>();
         let attempted_outbox = by_outboxes
             .values()
@@ -1232,14 +1123,29 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .iter()
             .copied()
             .filter(|index| {
+                let target = &targets[*index];
+                // On a timestamp tie the remembered list keeps its routes, but
+                // the relays may serve a tied list naming other outboxes.
+                let served = fresh_relay_list_status_from_records(
+                    &target.account_id_hex,
+                    target.relay_records.clone(),
+                    self.directory_freshness(),
+                )
+                .value
+                .nip65;
+                let tied = (served.created_at == target.relay_lists.nip65.created_at)
+                    .then_some(served.relays);
                 (!attempted_outbox.contains(index) || completed_outbox.contains(index))
-                    // A newer list found on an outbox can name outboxes this
-                    // lookup never read.
-                    && outboxes(targets, *index).iter().all(|outbox| {
-                        read_outboxes
-                            .get(index)
-                            .is_some_and(|read| read.contains(outbox))
-                    })
+                    // Every outbox a current list names must have been read: a
+                    // newer list found on an outbox can name others too.
+                    && std::iter::once(&target.relay_lists.nip65.relays)
+                        .chain(tied.as_ref())
+                        .flat_map(|relays| outboxes(*index, relays))
+                        .all(|outbox| {
+                            read_outboxes
+                                .get(index)
+                                .is_some_and(|read| read.contains(&outbox))
+                        })
             })
             .collect();
         let errors = needs_discovery
@@ -1281,82 +1187,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         })
     }
 
-    // Every pass shares the lookup's deadline, and `lookup` carries the pass's
-    // own Partial cut-offs. The refresh only clears the affected members'
-    // outcomes.
-    async fn resolve_member_lookup_pass(
-        &self,
-        targets: &mut [MemberTarget],
-        relay_list_members: &[usize],
-        package_candidates: &[usize],
-        outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
-        lookup: &MemberLookup<'_>,
-        prior_evidence: &HashMap<usize, KeyPackageRecoveryEvidence>,
-    ) -> Result<MemberLookupCoverage, DirectoryError> {
-        let mut coverage = MemberLookupCoverage {
-            // A cancelled metadata pass can leave discovery-only snapshots.
-            relay_lists_unfinished: package_candidates.iter().copied().collect(),
-            ..MemberLookupCoverage::default()
-        };
-        let result = started_before(
-            Some(lookup.deadline),
-            tokio::time::timeout_at(lookup.deadline, async {
-                let RelayListResolution {
-                    completed,
-                    errors,
-                    unfinished,
-                } = self
-                    .resolve_missing_relay_lists(targets, relay_list_members, lookup.cut_offs)
-                    .await?;
-                coverage.relay_lists_completed = completed;
-                coverage.relay_lists_unfinished = unfinished;
-                for (index, error) in errors {
-                    outcomes[index] = Some(Err(error));
-                }
-                let unresolved = package_candidates
-                    .iter()
-                    .copied()
-                    .filter(|index| outcomes[*index].is_none())
-                    .collect::<Vec<_>>();
-                self.resolve_missing_key_packages(
-                    targets,
-                    &unresolved,
-                    outcomes,
-                    lookup,
-                    prior_evidence,
-                    &mut coverage.evidence,
-                )
-                .await
-            }),
-        )
-        .await;
-        match result {
-            Some(Ok(result)) => result?,
-            _ => {
-                for &index in package_candidates {
-                    outcomes[index].get_or_insert_with(|| {
-                        Err(DirectoryError::DirectoryLookupIncomplete(
-                            targets[index].account_id_hex.clone(),
-                        ))
-                    });
-                }
-            }
-        }
-        Ok(coverage)
-    }
-
     async fn resolve_missing_key_packages(
         &self,
         targets: &[MemberTarget],
         unresolved: &[usize],
         outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
-        lookup: &MemberLookup<'_>,
-        prior_evidence: &HashMap<usize, KeyPackageRecoveryEvidence>,
-        evidence: &mut HashMap<usize, KeyPackageRecoveryEvidence>,
+        purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+        batch_cut_off: Option<tokio::time::Instant>,
     ) -> Result<(), DirectoryError> {
-        let purpose = lookup.purpose;
-        let requirements = lookup.requirements;
-        let batch_cut_off = lookup.cut_offs.map(|cut_offs| cut_offs.key_package_batches);
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
         for index in unresolved.iter().copied() {
@@ -1457,12 +1296,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             for index in indices {
                 let account_id = &targets[index].account_id_hex;
                 let account_records = records_by_author.remove(account_id).unwrap_or_default();
-                let selected = select_key_packages_with_evidence(
+                let selected = select_key_packages_from_records(
                     account_id,
                     &account_records,
                     self.directory_freshness(),
                     requirements,
-                    prior_evidence.get(&index),
                 )
                 .map(|selection| selection.value);
                 // Batch results prove no coverage; every absence or rejection
@@ -1539,8 +1377,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     let directory = directory.clone();
                     async move {
                         let queries = key_package_queries(vec![target.account_id_hex.clone()]);
-                        let mut last_evidence = None;
-                        let prior_evidence = prior_evidence.get(&index);
                         let result = async {
                             let fetched = directory
                                 .relay_plane
@@ -1564,8 +1400,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                         primary_complete: fetched.complete,
                                         discovery: &directory.directory_source_relays(&[]),
                                         requirements,
-                                        prior_evidence,
-                                        last_evidence: Some(&mut last_evidence),
                                         cached_target: None,
                                         wanted: MAX_KEY_PACKAGES_PER_ACCOUNT,
                                     },
@@ -1577,18 +1411,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                     &records.records,
                                 )
                                 .await?;
-                            records.select(&target.account_id_hex, requirements, prior_evidence)
+                            records.select(&target.account_id_hex, requirements)
                         }
                         .await;
-                        (index, result, last_evidence)
+                        (index, result)
                     }
                 });
         let mut fallback_results =
             stream::iter(work).buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY);
-        while let Some((index, result, last_evidence)) = fallback_results.next().await {
-            if let Some(last_evidence) = last_evidence {
-                evidence.insert(index, last_evidence);
-            }
+        while let Some((index, result)) = fallback_results.next().await {
             outcomes[index] = Some(result.and_then(|selected| {
                 self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)
             }));

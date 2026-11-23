@@ -46,6 +46,12 @@
   is its author, neither notify nor wake members (D-122), and never count as unread or raise the @-badge. Items in a
   thread keep their own alert rule.
 
+### Changed
+
+- Group creation, invites and direct-chat starts no longer reuse relay routes from
+  `prewarm_group_member_key_packages`; each discovers the members' current routes, so a prewarm no longer shortens
+  them. An `IncompatibleKeyPackage` verdict needs that discovery to complete.
+
 ### Fixed
 
 - A newly linked device no longer waits up to an hour for its siblings' small state, showing a chat the account already

@@ -246,8 +246,8 @@ pub fn push_unique_strings(values: &mut Vec<String>, candidates: impl IntoIterat
     }
 }
 
-/// Slot and deletion evidence that can reject a target but cannot supply one.
-#[derive(Clone)]
+/// Evidence from a complete supplementary lookup, used only to restrict the
+/// direct diagnostic API's existing future-record cache fallback.
 pub(crate) struct KeyPackageRecoveryEvidence {
     account: String,
     winners: Vec<NostrTransportEvent>,
@@ -284,15 +284,16 @@ impl KeyPackageRecoveryEvidence {
         self.allows_target(&KeyPackageRecoveryTarget::from_cached(cached))
     }
     pub(crate) fn allows_target(&self, target: &KeyPackageRecoveryTarget) -> bool {
-        self.allows_publication(&target.event_id, &target.slot, target.created_at)
-    }
-
-    fn allows_publication(&self, event_id: &str, slot: &str, created_at: u64) -> bool {
-        !package_is_deleted(&self.account, event_id, slot, created_at, &self.deletions)
-            && !self.winners.iter().any(|winner| {
-                winner.tag_value("d") == Some(slot)
-                    && newest_publication_first(winner, created_at, event_id).is_lt()
-            })
+        !package_is_deleted(
+            &self.account,
+            &target.event_id,
+            &target.slot,
+            target.created_at,
+            &self.deletions,
+        ) && !self.winners.iter().any(|winner| {
+            winner.tag_value("d") == Some(target.slot.as_str())
+                && newest_publication_first(winner, target.created_at, &target.event_id).is_lt()
+        })
     }
 }
 
@@ -601,28 +602,12 @@ pub fn select_key_packages_from_records(
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
 ) -> Result<KeyPackageSelection, DirectoryError> {
-    select_key_packages_with_evidence(account_id_hex, records, freshness, requirements, None)
-}
-
-pub(crate) fn select_key_packages_with_evidence(
-    account_id_hex: &str,
-    records: &[RelayEventRecord],
-    freshness: DirectoryFreshness,
-    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-    prior_evidence: Option<&KeyPackageRecoveryEvidence>,
-) -> Result<KeyPackageSelection, DirectoryError> {
     let SlotCandidates {
         mut candidates,
         newest_error,
         rejected_future,
         legacy_slots,
-    } = slot_candidates(
-        account_id_hex,
-        records,
-        freshness,
-        requirements,
-        prior_evidence,
-    );
+    } = slot_candidates(account_id_hex, records, freshness, requirements);
     if candidates.is_empty()
         && let Some(error) = newest_error
     {
@@ -673,7 +658,6 @@ fn slot_candidates(
     records: &[RelayEventRecord],
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-    prior_evidence: Option<&KeyPackageRecoveryEvidence>,
 ) -> SlotCandidates {
     let deletions = verified_deletions(account_id_hex, records);
     let mut records = records
@@ -703,9 +687,7 @@ fn slot_candidates(
             slot,
             record.event.created_at,
             &deletions,
-        ) || prior_evidence.is_some_and(|evidence| {
-            !evidence.allows_publication(&record.event.id, slot, record.event.created_at)
-        }) {
+        ) {
             continue;
         }
         let (fetched, metadata) = match key_package_and_metadata_from_borrowed_record(record) {
@@ -846,7 +828,7 @@ pub fn account_key_package_slots_from_records(
     });
     let complete = complete && !key_package_read_page_full(account, records);
     let reached = complete || records.iter().any(|record| record.event.pubkey == account);
-    let candidates = slot_candidates(account, records, freshness, None, None).candidates;
+    let candidates = slot_candidates(account, records, freshness, None).candidates;
     let current_slots = candidates
         .iter()
         .map(|candidate| candidate.fetched.key_package_id.clone())

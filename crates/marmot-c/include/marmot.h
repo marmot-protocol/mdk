@@ -11681,9 +11681,9 @@ MarmotStatus marmot_message_draft(const struct MarmotClient *client,
                                   struct MarmotMessageDraft **out);
 
 /**
- * Resolve and cache KeyPackages for prospective members ahead of a
- * group creation, so the create itself does not wait on the
- * network. Free with
+ * Check prospective members' KeyPackage readiness ahead of a group
+ * creation. The create still discovers routes and fetches
+ * KeyPackages from relays. Free with
  * `marmot_member_key_package_prewarm_summary_free`.
  *
  * # Safety

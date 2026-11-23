@@ -28,6 +28,9 @@
 
 - A member's `MemberResolutionStatusFfi::IncompatibleKeyPackage` now requires completed relay-list discovery
   and complete KeyPackage reads. If either is incomplete, the status is `MemberResolutionStatusFfi::Incomplete`.
+- Group creation, invites and direct-chat starts no longer reuse relay routes from
+  `prewarm_group_member_key_packages`; each discovers the members' current routes, so a prewarm no longer shortens
+  them.
 
 ### Fixed
 

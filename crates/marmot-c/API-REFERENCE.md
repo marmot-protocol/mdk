@@ -3714,7 +3714,7 @@ Pause the account's periodic maintenance loop.
 MarmotStatus marmot_prewarm_group_member_key_packages(const struct MarmotClient *client, const char *account_ref, const char *const *member_refs, uintptr_t member_refs_len, struct MarmotMemberKeyPackagePrewarmSummary **out);
 ```
 
-Resolve and cache KeyPackages for prospective members ahead of a group creation, so the create itself does not wait on the network. Free with `marmot_member_key_package_prewarm_summary_free`.
+Check prospective members' KeyPackage readiness ahead of a group creation. The create still discovers routes and fetches KeyPackages from relays. Free with `marmot_member_key_package_prewarm_summary_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotprewarm_group_member_key_packages) · [Header contract](include/marmot.h#L11695)
 

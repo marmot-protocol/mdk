@@ -252,6 +252,6 @@ impl<R: DirectoryResources> Directory<R> {
             cache_evidence: None,
             complete,
         }
-        .select(account_id_hex, Some(requirements), None)
+        .select(account_id_hex, Some(requirements))
     }
 }

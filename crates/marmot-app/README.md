@@ -351,8 +351,7 @@ with both accounts as founding admins.
 `DirectConversationOptions::disappearing_message_secs` is written into the founding MLS state and Welcome, as
 `AppCreateGroupOptions` does for generic creation, so the recipient joins with that duration and no retention commit
 follows. Options apply only when the call creates the group: reuse, retry, and same-account concurrent starts return the
-existing group with its founding duration and roles, whatever duration they propose. A new direct chat uses prewarmed relay
-routes when available and refreshes them within the same lookup if they yield no usable KeyPackage. A nonzero
+existing group with its founding duration and roles, whatever duration they propose. A nonzero
 duration requires the peer's KeyPackages to support message retention. When a lookup finds only KeyPackages incompatible with the chat's
 founding requirements, the start returns `AppError::IncompatibleKeyPackage` if relay-list discovery and KeyPackage reads
 both completed. Otherwise it returns `AppError::DirectoryLookupIncomplete`. Either refusal creates no chat. The lookup
@@ -417,7 +416,8 @@ Simulator app/process membership actions also use atomic resolution before mutat
   shortcut, and its published package must be reachable on relays. Relay freshness is not proof that the recipient still
   owns private material; it avoids authorizing from a stale local copy.
 - Hosts may prewarm the same bounded composition lookup without reserving packages or durably admitting strangers; the
-  final action reuses discovery routes but fetches packages again before the mutation validates them. Each prewarm call
+  final action discovers routes and fetches packages again before the mutation validates them; only a later prewarm
+  reuses the prewarmed routes. Each prewarm call
   requests a fresh readiness signal, so debounce roster changes. The process-local prewarm cache keeps only bounded
   relay metadata; only completed discovery and advertised-outbox metadata hops renew its freshness deadline, and a
   usable package returned after an incomplete metadata hop does not make previously cached routes fresh.
