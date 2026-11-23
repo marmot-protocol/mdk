@@ -16,9 +16,12 @@
 //! connection ends, the request ends `Disconnected`. A REQ the request retired
 //! before it went out never goes out.
 //!
-//! Each request's queue holds at most its byte budget plus one frame: a
-//! relay that keeps to the request never fills it, however slow the caller.
-//! A full queue ends the request as a byte-budget cut. Frames past the item
+//! Each request's queue holds at most its byte budget plus one frame. The
+//! queue counts whole frames as they came, envelope and padding included,
+//! while the budget counts serialized event JSON; one frame of room covers the
+//! envelopes of any page, so a relay that keeps to the request never fills it,
+//! however slow the caller. A full queue ends the request as a byte-budget
+//! cut. Frames past the item
 //! budget are dropped unparsed. A frame the wrapper cannot attribute to any
 //! request (one whose verb or EVENT id it cannot read) ends every request on
 //! its connection `InvalidMessage`, as it might have been one of theirs.
@@ -363,34 +366,41 @@ impl FiniteRequests {
         let subscription_id = SubscriptionId::new(&id);
         let req = ClientMessage::req(subscription_id.clone(), vec![filter.clone()]);
         let mut collector = Collector::new(filter, limits, &self.0, relay.url(), &subscription_id);
+        let mut deadline = std::pin::pin!(tokio::time::sleep_until(deadline));
         let queued = tokio::select! {
             biased;
             () = cancel.cancelled() => Err(FiniteEnd::Cancelled),
-            () = tokio::time::sleep_until(deadline) => Err(FiniteEnd::TimedOut),
+            () = &mut deadline => Err(FiniteEnd::TimedOut),
             queued = relay.send_msg(req).into_future() => queued.map_err(|_| FiniteEnd::SetupFailed),
         };
         // Whether the collector read the frame that ended the request. What
         // the relay sent past that frame is not read and not charged, as the
         // SDK's own requests discard it. A request something else ended (a
         // cancellation, its deadline, its connection) is charged for every
-        // EVENT frame it was sent and did not read, the rest of a batch it
-        // was reading included.
+        // EVENT frame it was sent and did not finish reading, the frame it was
+        // reading and the rest of its batch included. Each frame races the
+        // cancellation and the deadline, so neither waits on a slow admission
+        // check or a long page.
         let (end, read_to_end, rest) = match queued {
             Err(end) => (end, false, VecDeque::new()),
             Ok(()) => 'collect: loop {
                 match slot.take() {
                     Ok(mut frames) => {
                         while let Some(frame) = frames.pop_front() {
-                            if let Some(end) = collector.frame(&frame).await {
-                                break 'collect (end, true, frames);
+                            let read = tokio::select! {
+                                biased;
+                                () = cancel.cancelled() => Err(FiniteEnd::Cancelled),
+                                () = &mut deadline => Err(FiniteEnd::TimedOut),
+                                end = collector.frame(&frame) => Ok(end),
+                            };
+                            match read {
+                                Ok(Some(end)) => break 'collect (end, true, frames),
+                                Ok(None) => tokio::task::coop::consume_budget().await,
+                                Err(end) => {
+                                    frames.push_front(frame);
+                                    break 'collect (end, false, frames);
+                                }
                             }
-                            if cancel.is_cancelled() {
-                                break 'collect (FiniteEnd::Cancelled, false, frames);
-                            }
-                            if Instant::now() >= deadline {
-                                break 'collect (FiniteEnd::TimedOut, false, frames);
-                            }
-                            tokio::task::coop::consume_budget().await;
                         }
                     }
                     Err(Some(end)) => break (end, false, VecDeque::new()),
@@ -398,7 +408,7 @@ impl FiniteRequests {
                         tokio::select! {
                             biased;
                             () = cancel.cancelled() => break (FiniteEnd::Cancelled, false, VecDeque::new()),
-                            () = tokio::time::sleep_until(deadline) => break (FiniteEnd::TimedOut, false, VecDeque::new()),
+                            () = &mut deadline => break (FiniteEnd::TimedOut, false, VecDeque::new()),
                             () = slot.ready.notified() => {}
                         }
                     }
@@ -1373,23 +1383,38 @@ mod tests {
             history
         );
 
-        // Nothing of the request reaches the SDK afterwards either.
-        while let Ok(Some(notification)) =
-            tokio::time::timeout(Duration::from_millis(200), notifications.next()).await
-        {
-            if let ClientNotification::Message { message, .. } = notification {
-                assert!(!message.as_json().contains(ID_PREFIX), "{message:?}");
+        // Nothing of the request reaches the SDK afterwards either. The relay
+        // answers one connection's frames in order, so every frame it sent
+        // for the request, up to its CLOSE, comes before a later REQ's EOSE.
+        let barrier = client
+            .subscribe(Filter::new().kind(Kind::Metadata).limit(0))
+            .await
+            .unwrap()
+            .value;
+        loop {
+            match notifications.next().await.expect("notifications ended") {
+                ClientNotification::Message { message, .. } => {
+                    assert!(!message.as_json().contains(ID_PREFIX), "{message:?}");
+                    if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(id) if **id == barrier)
+                    {
+                        break;
+                    }
+                }
+                ClientNotification::Event { event, .. } => {
+                    assert!(!history.contains(&event.id), "history reached the SDK");
+                }
+                _ => {}
             }
         }
         client.shutdown().await;
     }
 
-    /// Cancels `0` when it admits its first event: a cancellation that lands
-    /// while the collector is part-way through a page.
+    /// Signals `0` when asked to admit an event, and never answers: an
+    /// admission check that stalls part-way through a page.
     #[derive(Debug)]
-    struct CancelOnFirst(CancellationToken);
+    struct Stalled(Arc<Notify>);
 
-    impl AdmitPolicy for CancelOnFirst {
+    impl AdmitPolicy for Stalled {
         fn admit_event<'a>(
             &'a self,
             _: &'a RelayUrl,
@@ -1397,14 +1422,15 @@ mod tests {
             _: &'a Event,
         ) -> Pin<Box<dyn Future<Output = Result<AdmitStatus, nostr_sdk::error::Error>> + Send + 'a>>
         {
-            self.0.cancel();
-            Box::pin(async { Ok(AdmitStatus::Success) })
+            self.0.notify_one();
+            Box::pin(futures::future::pending())
         }
     }
 
-    /// A cancellation stops a request between frames, even part-way through a
-    /// page already queued, and charges every EVENT frame it was sent and did
-    /// not read, so a sweep cut mid-page still meters the page.
+    /// A cancellation stops a request at once, even part-way through a page
+    /// and while an admission check is still pending, and charges every EVENT
+    /// frame it was sent and did not finish reading, so a sweep cut mid-page
+    /// still meters the page.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancellation_mid_page_charges_the_unread_frames() {
         let relay = LocalRelay::builder().build();
@@ -1417,9 +1443,9 @@ mod tests {
             page_bytes += event.as_json().len() as u64;
             relay.add_event(event).await.unwrap();
         }
-        let cancel = CancellationToken::new();
-        let builder = crate::network_proxy::nostr_builder(Ok(None))
-            .admit_policy(CancelOnFirst(cancel.clone()));
+        let started = Arc::new(Notify::new());
+        let builder =
+            crate::network_proxy::nostr_builder(Ok(None)).admit_policy(Stalled(started.clone()));
         let finite = FiniteRequests::for_builder(&builder);
         let transport = finite.transport(builder.websocket_transport.clone());
         let client = builder.websocket_transport(transport).build();
@@ -1429,33 +1455,30 @@ mod tests {
             .await
             .unwrap();
         let sdk_relay = client.relay(&url).await.unwrap().unwrap();
+        let cancel = CancellationToken::new();
         let filter = Filter::new().kind(Kind::TextNote);
         let mut fetch =
             std::pin::pin!(finite.fetch(&sdk_relay, filter, limits(1_000, 1 << 24), &cancel));
-        assert!(futures::poll!(fetch.as_mut()).is_pending());
-        // Wait, without reading, until the whole page and its EOSE are queued.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let queued = finite
-                    .0
-                    .slots()
-                    .iter()
-                    .map(|slot| slot.lock().frames.len())
-                    .sum::<usize>();
-                if queued == 301 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::select! {
+            reply = &mut fetch => panic!("ended before its first admission: {reply:?}"),
+            () = started.notified() => {}
+        }
+        // The collector is stuck on the first event; wait for the rest of the
+        // page to reach the request behind it.
+        let slot = finite.0.slots().pop().expect("the request is registered");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while slot.lock().event_frames < 300 {
+                slot.ready.notified().await;
             }
         })
         .await
         .expect("the page is queued");
+        cancel.cancel();
         let reply = fetch.await;
         assert_eq!(reply.end, FiniteEnd::Cancelled);
-        assert_eq!(reply.raw_items, 1, "stopped after the first frame");
         assert!(
             reply.fetched_bytes >= page_bytes,
-            "every queued frame is charged: {} < {page_bytes}",
+            "every frame sent is charged: {} < {page_bytes}",
             reply.fetched_bytes
         );
         client.shutdown().await;
