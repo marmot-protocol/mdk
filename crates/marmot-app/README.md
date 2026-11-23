@@ -355,7 +355,10 @@ existing group with its founding duration and roles, whatever duration they prop
 routes when available and refreshes them within the same lookup if they yield no usable KeyPackage. A nonzero
 duration requires the peer's KeyPackages to support message retention. When a lookup finds only KeyPackages incompatible with the chat's
 founding requirements, the start returns `AppError::IncompatibleKeyPackage` if relay-list discovery and KeyPackage reads
-both completed. Otherwise it returns `AppError::DirectoryLookupIncomplete`. Either refusal creates no chat.
+both completed. Otherwise it returns `AppError::DirectoryLookupIncomplete`. Either refusal creates no chat. The lookup
+is bounded: discovery reads the peer's relay lists on the configured directory relays and on every outbox the newest
+list names, and KeyPackage reads cover those outboxes plus at most eight more configured directory relays. A
+compatible KeyPackage published only elsewhere is not seen.
 `start_direct_conversation` is the same call with default options, which leave disappearing messages disabled.
 
 There is no immutable cross-client DM provenance, so MDK cannot prove legacy groups eligible for automatic admin repair.
