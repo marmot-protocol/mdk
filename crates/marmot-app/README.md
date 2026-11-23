@@ -828,11 +828,12 @@ but deliberately leaves out two kinds of timeline rows, so a chat's imported str
   timeline marks them as authenticated group state. A new device never processed the commits before it joined, so
   it cannot vouch for them, and MDK does not present a sibling's account of them as authenticated.
 - **Deleted and admin-removed messages.** The deletion erased the message's content, so no placeholder can be
-  checked against the message's id. The deletion itself is imported, so the content never reappears if the message
-  arrives later.
+  checked against the message's id. An author's kind 5 or an admin's kind 4891 is imported with the history, so it
+  still hides the message if the original arrives later. A legacy kind 5 that removed another author's message is not
+  honored on the new device.
 
-A backup leaves out the same two kinds of rows. Changes made after the device joined show as usual. To explain the gap, a host can say
-that group changes and deleted messages from before this device was linked are not shown.
+A backup leaves out the same two kinds of rows. Changes made after the device joined show as usual. To explain the
+gap, a host can say that group changes and deleted messages from before this device was linked are not shown.
 
 `MarmotAppRuntime::chat_history_imports(account_ref)` lists each held chat whose history is `Receiving` (a delivery
 waits to be imported; `retrying` once an attempt to get its bundle failed) or `Imported` (the latest import's source and time).

@@ -5025,7 +5025,10 @@ impl AppClient {
         let (restored, readded) =
             cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
                 // A sibling's Welcome (this account's own) names no adder at
-                // the epoch the add happened, so it records none.
+                // the epoch the add happened, so it records none. A Welcome
+                // cannot tell an account add from a later add of another of
+                // its devices: a device invited directly after its sibling
+                // rejoined also records the add, at its own epoch.
                 let readded = match event {
                     cgka_traits::engine::GroupEvent::GroupJoined {
                         welcomer: Some(welcomer),
@@ -5061,8 +5064,9 @@ impl AppClient {
     }
 
     /// The kind-1210 row for `welcomer` adding this account at the epoch the
-    /// joined copy starts at, the epoch the adder's row names. None when the
-    /// engine holds no record of that epoch.
+    /// joined copy starts at, the epoch the adder's row names, shown at the
+    /// Welcome's creation time when the engine kept it. None when the engine
+    /// holds no record of that epoch.
     fn record_readded_system_row(
         &self,
         storage: &storage_sqlite::SqliteAccountStorage,
@@ -5070,12 +5074,16 @@ impl AppClient {
         welcomer: &cgka_traits::MemberId,
         self_id: &cgka_traits::MemberId,
     ) -> Result<Option<crate::AppProjectionUpdate>, AppError> {
-        let epoch = match cgka_traits::storage::GroupStorage::get_group(storage, group_id) {
-            Ok(group) if group.local_copy_install_epoch.0 != 0 => group.local_copy_install_epoch,
+        let group = match cgka_traits::storage::GroupStorage::get_group(storage, group_id) {
+            Ok(group) if group.local_copy_install_epoch.0 != 0 => group,
             Ok(_) | Err(cgka_traits::StorageError::NotFound) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let recorded_at = unix_now_seconds();
+        let epoch = group.local_copy_install_epoch;
+        let received_at = unix_now_seconds();
+        let recorded_at = group
+            .local_copy_welcome_created_at
+            .map_or(received_at, |created_at| created_at.0);
         let Ok(projection) = super::projection::build_group_system_projection(
             group_id,
             epoch.0,
@@ -5089,7 +5097,7 @@ impl AppClient {
             return Ok(None);
         };
         self.app
-            .record_account_app_event_at(&self.state.label, &projection, recorded_at)
+            .record_account_app_event_at(&self.state.label, &projection, received_at)
             .map(Some)
     }
 
