@@ -361,8 +361,9 @@ pub struct ChatListRow {
     pub last_read_timeline_at: Option<u64>,
     /// Immutable local observation time for the conversation's creation.
     pub conversation_created_at: u64,
-    /// Durable user-visible activity anchor: the latest message or read
-    /// position, or `conversation_created_at` while the chat has neither.
+    /// Durable user-visible activity anchor: the latest message, read
+    /// position or retained floor of pruned messages, or
+    /// `conversation_created_at` while the chat has none of them.
     /// Projection maintenance never advances this value.
     pub activity_sort_at: u64,
     /// Wall-clock time of the last projection write for this row. Every

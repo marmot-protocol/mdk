@@ -22,8 +22,8 @@
 
 - A chat's `activity_sort_at` is its latest message, read position or retained floor, and falls back to
   `conversation_created_at` only when it has none. A chat a linked device or a restore stored after it began, with
-  older history imported, no longer sorts at the time this device stored it (mdk#3580). Rows written by the old rule
-  are rebuilt on the next chat-list check.
+  older history imported, no longer sorts at the time this device stored it (mdk#3580). Migration 0220 re-sorts the
+  rows the old rule anchored at creation.
 
 ## 0.19.0 - 2026-11-22
 

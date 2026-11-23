@@ -5313,6 +5313,8 @@ fn imported_history_outranks_a_later_local_creation_anchor() {
     // Pruning the history leaves its retained floor, not the creation anchor.
     app.secure_prune_app_events_before(GROUP, 21, LOCAL, &no_mentions)
         .unwrap();
+    assert_eq!(order(&app), expected);
+    assert_projection_complete(&app, "the prune writes the rebuild rule");
     app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
     assert_eq!(order(&app), expected);
     assert_projection_complete(&app, "a pruned chat keeps its retained floor");
