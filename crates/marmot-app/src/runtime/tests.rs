@@ -3712,6 +3712,73 @@ async fn removal_refuses_direct_sync() {
     runtime.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_reset_keeps_outbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let credentials = tempfile::tempdir().unwrap();
+    let home = AccountHome::open_with_secret_store(
+        dir.path(),
+        Arc::new(marmot_account::LocalFileSecretStore::new(
+            credentials.path(),
+        )),
+    );
+    let keys = nostr::prelude::Keys::generate();
+    let secret = zeroize::Zeroizing::new(keys.secret_key().to_secret_hex());
+    let account = home.import_nostr_account(&secret).unwrap();
+    let app = MarmotApp::with_relays_and_account_home(
+        dir.path(),
+        vec!["wss://setup.example".into()],
+        home.clone(),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let runtime = app.runtime();
+    let client = open_runtime_local_test_client(&app, &runtime, &account.label).await;
+    let report = stage_pending_report(&app, &account.label).await;
+    let pending = home
+        .begin_account_setup_with(
+            &account,
+            AccountSetupKind::LegacyReset,
+            AccountSetupPhase::CompensationPending,
+        )
+        .unwrap();
+
+    let result = runtime
+        .recover_incomplete_account_setup(
+            AccountSetupRequest {
+                import_nsec: Some(secret.clone()),
+                ..AccountSetupRequest::default()
+            },
+            true,
+        )
+        .await;
+    assert!(matches!(result, Err(AppError::AccountSessionBusy)));
+    assert_eq!(home.account(&account.label).unwrap(), account);
+    assert_eq!(
+        home.account_setup_state(&account.label).unwrap(),
+        Some(pending)
+    );
+    assert_eq!(
+        app.account_storage(&account.label)
+            .unwrap()
+            .app_storage()
+            .pending_moderation_reports(1)
+            .unwrap(),
+        vec![report]
+    );
+
+    drop(client);
+    runtime
+        .reset_incomplete_account_setup(&secret, true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        home.account(&account.label),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    assert!(!app.account_dir(&account.label).try_exists().unwrap());
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn compensation_waits_for_open() {
     let dir = tempfile::tempdir().unwrap();
