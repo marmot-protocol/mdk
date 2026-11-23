@@ -988,6 +988,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     account: account_id_hex,
                     searched: &source_relays,
                     observed: outcome.records,
+                    hints: Vec::new(),
                     primary_complete: outcome.complete,
                     // Availability needs only the primary coverage evidence. Candidate
                     // deletion proofs belong to member invitation, not this projection.

@@ -2,6 +2,7 @@
 
 use crate::error::DirectoryError;
 use crate::member_key_packages::key_package_requirements_are_incompatible;
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 
 use cgka_engine::key_package::KeyPackageRequirements;
@@ -17,6 +18,7 @@ use crate::published_records::{
 };
 use crate::{DirectoryFreshness, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome, DirectoryRelayEventRecord};
+use transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
 
 const RECOVERY_ENDPOINT_LIMIT: usize = 8;
 /// How many revoked candidates recovery replaces before it reports the lookup
@@ -63,6 +65,11 @@ pub(super) struct KeyPackageRecoveryRequest<'a> {
     pub(super) account: &'a str,
     pub(super) searched: &'a [TransportEndpoint],
     pub(super) observed: Vec<DirectoryRelayEventRecord>,
+    /// What an earlier read in this lookup returned. Its packages can be used
+    /// and its replacements and deletions count, but a relay may since have
+    /// withdrawn a package, so one no completed read served again decides
+    /// nothing.
+    pub(super) hints: Vec<DirectoryRelayEventRecord>,
     pub(super) primary_complete: bool,
     pub(super) discovery: &'a [TransportEndpoint],
     pub(super) requirements: Option<&'a KeyPackageRequirements>,
@@ -85,6 +92,7 @@ impl<R: DirectoryResources> Directory<R> {
             account,
             searched,
             mut observed,
+            hints,
             primary_complete,
             discovery,
             requirements,
@@ -92,6 +100,13 @@ impl<R: DirectoryResources> Directory<R> {
             cached_target,
             wanted,
         } = request;
+        // What completed reads served.
+        let mut served = if primary_complete {
+            observed.clone()
+        } else {
+            Vec::new()
+        };
+        observed.extend(hints.iter().cloned());
         // A full page of KeyPackages or deletion requests hides what lies
         // past it; recovery's targeted reads cannot show that either.
         if key_package_read_page_full(account, &observed) {
@@ -130,8 +145,10 @@ impl<R: DirectoryResources> Directory<R> {
                 records: observed,
                 cache_evidence: None,
                 // Losing this package decides nothing if a supplementary
-                // read was skipped.
-                complete: primary_complete && supplementary.is_empty(),
+                // read was skipped or an earlier read's package went unserved.
+                complete: primary_complete
+                    && supplementary.is_empty()
+                    && !unserved_hint(account, &hints, &served),
             });
         }
         let mut package_coverage = primary_complete;
@@ -152,9 +169,13 @@ impl<R: DirectoryResources> Directory<R> {
             refreshed = self
                 .journal_and_refresh_fence(account, &outcome.records, fence)
                 .await?;
+            if outcome.complete {
+                served.extend(outcome.records.iter().cloned());
+            }
             observed.extend(outcome.records);
             package_coverage &= outcome.complete;
         }
+        let verdict_coverage = package_coverage && !unserved_hint(account, &hints, &served);
         let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));
         // Deletion requests read with the KeyPackages count from the start; a
         // later scoped read that misses one never revives what it covers.
@@ -194,7 +215,7 @@ impl<R: DirectoryResources> Directory<R> {
                         refreshed.as_ref().or(fence),
                     ) {
                         Err(DirectoryError::KeyPackageRequirements(error))
-                            if !package_coverage
+                            if !verdict_coverage
                                 && key_package_requirements_are_incompatible(&error) =>
                         {
                             return Err(recovery_incomplete(account));
@@ -347,6 +368,27 @@ fn proven_records(
         // Proving a candidate requires complete KeyPackage coverage.
         complete: true,
     }
+}
+
+/// Whether some package in `hints` has no completed read serving it or a
+/// publication that replaces it in its slot.
+fn unserved_hint(
+    account: &str,
+    hints: &[DirectoryRelayEventRecord],
+    served: &[DirectoryRelayEventRecord],
+) -> bool {
+    let package = |record: &&DirectoryRelayEventRecord| {
+        record.event.kind == KIND_MARMOT_KEY_PACKAGE && record.event.pubkey == account
+    };
+    // A newer publication replaces a slot, and the lower event id wins a tie.
+    let rank = |record: &DirectoryRelayEventRecord| {
+        (record.event.created_at, Reverse(record.event.id.clone()))
+    };
+    hints.iter().filter(package).any(|hint| {
+        !served.iter().filter(package).any(|record| {
+            record.event.tag_value("d") == hint.event.tag_value("d") && rank(record) >= rank(hint)
+        })
+    })
 }
 
 fn distinct_recovery_routes<'a>(

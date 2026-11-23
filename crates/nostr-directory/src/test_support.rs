@@ -253,6 +253,7 @@ impl<R: DirectoryResources> Directory<R> {
                 account: account_id_hex,
                 searched: &[],
                 observed,
+                hints: Vec::new(),
                 primary_complete,
                 discovery: &discovery,
                 requirements: Some(requirements),

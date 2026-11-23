@@ -813,8 +813,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         &self,
         target: &MemberTarget,
         defaults: &[TransportEndpoint],
-        context: &str,
     ) -> Result<Vec<TransportEndpoint>, String> {
+        let context = "member KeyPackage batch fetch";
         let safe = |relays: &[String]| {
             self.relay_plane.retain_safe_discovered_endpoints(
                 relays.iter().cloned().map(TransportEndpoint).collect(),
@@ -1280,11 +1280,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
         for index in unresolved.iter().copied() {
-            let mut endpoints = match self.member_key_package_routes(
-                &targets[index],
-                &defaults,
-                "member KeyPackage batch fetch",
-            ) {
+            let mut endpoints = match self.member_key_package_routes(&targets[index], &defaults) {
                 Ok(endpoints) => endpoints,
                 Err(_) => {
                     outcomes[index] = Some(Err(DirectoryError::DirectoryLookupIncomplete(
@@ -1328,11 +1324,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 started_before(batch_cut_off, async move {
                     let result = directory
                         .relay_plane
-                        .fetch_directory_events_with_completion(endpoints, queries)
+                        .fetch_directory_events_with_completion(endpoints.clone(), queries)
                         .await
                         .map(|outcome| outcome.records)
                         .map_err(DirectoryError::RelayDirectory);
-                    (indices, result)
+                    (indices, endpoints, result)
                 })
             });
         // Record each outcome as it arrives: when the shared deadline cancels
@@ -1342,9 +1338,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .buffer_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
             .filter_map(future::ready);
 
-        // Members whose batch read could not decide them, with what it saw.
+        // Members whose batch read could not decide them, with its routes and
+        // what it saw.
         let mut fallback_records = BTreeMap::new();
-        while let Some((indices, result)) = next_before(&mut batches, batch_cut_off).await {
+        while let Some((indices, endpoints, result)) =
+            next_before(&mut batches, batch_cut_off).await
+        {
             let records = result?;
             let multiple_authors = indices.len() > 1;
             let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
@@ -1395,7 +1394,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     // too, and recovery reports it incomplete. Keep observed slot replacements
                     // when combining the refetch.
                     _ => {
-                        fallback_records.insert(index, account_records);
+                        fallback_records.insert(index, (endpoints.clone(), account_records));
                     }
                 }
             }
@@ -1413,19 +1412,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             }
         }
 
+        // The single-author read uses the routes the batch admitted.
         let fallback_specs = fallback_records
             .into_iter()
-            .filter_map(|(index, observed_records)| {
-                let target = targets[index].clone();
-                // The batch already admitted these same routes.
-                let endpoints = self
-                    .member_key_package_routes(
-                        &target,
-                        &defaults,
-                        "member KeyPackage fallback fetch",
-                    )
-                    .ok()?;
-                (!endpoints.is_empty()).then_some((index, target, endpoints, observed_records))
+            .map(|(index, (endpoints, observed_records))| {
+                (index, targets[index].clone(), endpoints, observed_records)
             })
             .collect::<Vec<_>>();
         let directory = self.clone();
@@ -1446,17 +1437,16 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             let fence = directory
                                 .key_package_journal_fence(&target.account_id_hex, &fetched.records)
                                 .await?;
-                            let mut records = fetched.records;
-                            // This supplementary lookup must not discard a
-                            // valid package observed in this call's batch.
-                            // Never load a previously cached package here.
-                            records.extend(observed_records);
                             let records = directory
                                 .recover_key_package_records(
                                     super::key_package_recovery::KeyPackageRecoveryRequest {
                                         account: &target.account_id_hex,
                                         searched: &endpoints,
-                                        observed: records,
+                                        observed: fetched.records,
+                                        // This lookup must not discard a valid
+                                        // package the batch observed. Never
+                                        // load a previously cached package here.
+                                        hints: observed_records,
                                         primary_complete: fetched.complete,
                                         discovery: &directory.directory_source_relays(&[]),
                                         requirements,

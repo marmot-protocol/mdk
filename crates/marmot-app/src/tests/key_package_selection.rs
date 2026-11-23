@@ -1911,12 +1911,12 @@ async fn a_tied_relay_list_too_long_to_add_still_reads_the_remembered_outbox() {
     app.close_storage().unwrap();
 }
 
-/// A batch reply that stops early can still return the recipient's relay
-/// list. When the single-author retry and the outbox read then finish without
-/// it, no completed reply served that list, so the incompatible package on its
-/// outbox decides nothing.
+/// A batch reply that stops early can still return the recipient's relay list
+/// or package. When the single-author retry and the later reads then finish
+/// without it, no completed read served it, so it supports no incompatibility
+/// verdict. A retry that serves both again lets the verdict stand.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_relay_list_only_an_unfinished_batch_returned_decides_nothing() {
+async fn what_only_an_unfinished_batch_returned_decides_nothing() {
     let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
     app.account_home().create_account("alice").unwrap();
     let requirements = retention_requirements(&app).await;
@@ -1935,7 +1935,9 @@ async fn a_relay_list_only_an_unfinished_batch_returned_decides_nothing() {
     events.retain(|event| {
         event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != bob.account_id_hex
     });
-    events.push(candidate(bob, limited, "limited", None, unix_now_seconds()));
+    let bob_package = candidate(bob, limited, "limited", None, unix_now_seconds());
+    let bob_package_id = bob_package.id.clone();
+    events.push(bob_package);
     let bob_relay_list = events
         .iter()
         .find(|event| event.kind == KIND_NIP65_RELAY_LIST && event.pubkey == bob.account_id_hex)
@@ -1969,23 +1971,30 @@ async fn a_relay_list_only_an_unfinished_batch_returned_decides_nothing() {
         complete.err()
     );
 
-    fetcher
-        .events_only_in_multi_author
-        .lock()
-        .unwrap()
-        .insert(bob_relay_list);
+    // Batches that stop early alone decide nothing: the retries serve the
+    // list and the package again.
     fetcher
         .closed_multi_author_reads
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let unfinished = resolve().await;
+    let retried = resolve().await;
     assert!(
-        matches!(
-            &unfinished,
-            Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
-        ),
+        matches!(retried, Err(DirectoryError::KeyPackageRequirements(_))),
         "{:?}",
-        unfinished.err()
+        retried.err()
     );
+
+    for unserved in [bob_relay_list, bob_package_id] {
+        *fetcher.events_only_in_multi_author.lock().unwrap() = [unserved].into();
+        let unfinished = resolve().await;
+        assert!(
+            matches!(
+                &unfinished,
+                Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
+            ),
+            "{:?}",
+            unfinished.err()
+        );
+    }
     app.close_storage().unwrap();
 }
 
