@@ -12206,6 +12206,27 @@ MarmotStatus marmot_send_thread_message(const struct MarmotClient *client,
                                         struct MarmotSendSummary **out);
 
 /**
+ * Durably admit a thread message under `marmot_send_thread_message`'s rules.
+ * Returns local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
+ *
+ * # Safety
+ * `client` must be live, strings must be valid NUL-terminated UTF-8, and `out` must be writable.
+ * `attachments` and `tags` must point to the specified number of valid caller-owned entries.
+ * Each tag row must hold its stated number of valid string pointers. NULL is allowed for empty arrays.
+ */
+MarmotStatus marmot_submit_thread_message(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *group_id_hex,
+                                          const char *parent_message_id,
+                                          const char *text,
+                                          const struct MarmotMediaAttachmentReference *attachments,
+                                          uintptr_t attachments_len,
+                                          const struct MarmotStringArray *tags,
+                                          uintptr_t tags_len,
+                                          const char *client_token,
+                                          struct MarmotLocalSendAcceptance **out);
+
+/**
  * React with a custom emoji image. `attachments` (already uploaded)
  * become `imeta` tags on the kind-7 and `tags` name them, e.g. NIP-30
  * `["emoji", shortcode, url]` for `emoji` == `:shortcode:`. imeta rows
@@ -12565,6 +12586,43 @@ MarmotStatus marmot_send_tagged_text(const struct MarmotClient *client,
                                      uintptr_t tags_len,
                                      const char *content,
                                      struct MarmotSendSummary **out);
+
+/**
+ * Durably admit kind-9 text with application tags under `marmot_send_tagged_text`'s rules.
+ * Returns local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
+ *
+ * # Safety
+ * `client` must be live, strings must be valid NUL-terminated UTF-8, and `out` must be writable.
+ * `tags` must hold `tags_len` valid rows, each with its stated number of valid string pointers.
+ * NULL is allowed for empty arrays.
+ */
+MarmotStatus marmot_submit_tagged_text(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *group_id_hex,
+                                       const char *text,
+                                       const struct MarmotStringArray *tags,
+                                       uintptr_t tags_len,
+                                       const char *client_token,
+                                       struct MarmotLocalSendAcceptance **out);
+
+/**
+ * Durably admit a kind-9 reply with application tags. MDK owns the reply's `e` and `q` tags.
+ * Returns local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
+ *
+ * # Safety
+ * `client` must be live, strings must be valid NUL-terminated UTF-8, and `out` must be writable.
+ * `tags` must hold `tags_len` valid rows, each with its stated number of valid string pointers.
+ * NULL is allowed for empty arrays.
+ */
+MarmotStatus marmot_submit_tagged_reply(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *group_id_hex,
+                                        const char *target_message_id,
+                                        const char *text,
+                                        const struct MarmotStringArray *tags,
+                                        uintptr_t tags_len,
+                                        const char *client_token,
+                                        struct MarmotLocalSendAcceptance **out);
 
 /**
  * Send a custom application event into the group. `tags` is a flat
@@ -13330,6 +13388,26 @@ MarmotStatus marmot_send_tagged_sticker(const struct MarmotClient *client,
                                         const struct MarmotStringArray *tags,
                                         uintptr_t tags_len,
                                         struct MarmotSendSummary **out);
+
+/**
+ * Durably admit an authorized pack sticker under `marmot_send_tagged_sticker`'s rules.
+ * Returns local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
+ *
+ * # Safety
+ * `client` must be live, strings must be valid NUL-terminated UTF-8, and `out` must be writable.
+ * `tags` must hold `tags_len` valid rows, each with its stated number of valid string pointers.
+ * NULL is allowed for empty arrays.
+ */
+MarmotStatus marmot_submit_tagged_sticker(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *group_id_hex,
+                                          const char *pack_coordinate,
+                                          const char *shortcode,
+                                          const char *plaintext_sha256,
+                                          const struct MarmotStringArray *tags,
+                                          uintptr_t tags_len,
+                                          const char *client_token,
+                                          struct MarmotLocalSendAcceptance **out);
 
 /**
  *

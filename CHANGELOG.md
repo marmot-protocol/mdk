@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- C and MarmotKit can durably submit tagged text, inline replies, NIP-22 thread messages with attachments, and pack
+  stickers. Retrying the same accepted request with its original client token after restart returns the original ID.
+
 ## 0.19.0 - 2026-11-22
 
 See the [release notes](docs/release/0.19.0.md) and the [0.18.0 → 0.19.0 upgrade guide](docs/integration/0.19.0.md).

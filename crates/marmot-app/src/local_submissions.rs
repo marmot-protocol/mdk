@@ -91,6 +91,12 @@ pub(crate) fn retained_event(
     Ok((event, payload.to_vec()))
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) enum LocalTypedSend {
+    Thread { parent_message_id: String },
+    Sticker(crate::AppStickerRef),
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct LocalMessageRequest {
     pub content: String,
@@ -104,6 +110,8 @@ pub(crate) struct LocalMessageRequest {
     /// An app-defined event kind (`send_custom_event`'s rules) instead of chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_kind: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed: Option<LocalTypedSend>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,16 +135,30 @@ impl LocalMessageRequest {
         Ok((retained.request, retained.edit_of_client_token))
     }
 
-    fn encode_retained(&self, edit_of_client_token: Option<&str>) -> Result<String, AppError> {
+    fn encode_retained(self, edit_of_client_token: Option<String>) -> Result<String, AppError> {
         serde_json::to_string(&RetainedLocalRequest {
             version: 1,
-            request: self.clone(),
-            edit_of_client_token: edit_of_client_token.map(str::to_owned),
+            request: self,
+            edit_of_client_token,
         })
         .map_err(|_| AppError::InvalidAppMessagePayload("invalid local submission request".into()))
     }
     pub(crate) fn intent(&self) -> AppMessageIntent {
-        if let Some(kind) = self.custom_kind {
+        if let Some(typed) = &self.typed {
+            match typed {
+                LocalTypedSend::Thread { parent_message_id } => AppMessageIntent::ThreadMessage {
+                    parent_message_id: parent_message_id.clone(),
+                    content: self.content.clone(),
+                    attachments: self.attachments.clone(),
+                    message_tags: self.tags.clone(),
+                    placement: None,
+                },
+                LocalTypedSend::Sticker(sticker_ref) => AppMessageIntent::Sticker {
+                    sticker_ref: sticker_ref.clone(),
+                    message_tags: self.tags.clone(),
+                },
+            }
+        } else if let Some(kind) = self.custom_kind {
             AppMessageIntent::Custom {
                 kind,
                 tags: self.tags.clone(),
@@ -426,7 +448,7 @@ impl MarmotApp {
                 None => None,
             };
             let mut event_created_at = created_at;
-            let intent = if let Some(original_token) = &edit_of_client_token {
+            let mut intent = if let Some(original_token) = &edit_of_client_token {
                 let original = storage
                     .app_storage()
                     .local_submission(&group_hex, original_token)?
@@ -487,6 +509,23 @@ impl MarmotApp {
             } else {
                 request.intent()
             };
+            match &mut intent {
+                AppMessageIntent::ThreadMessage {
+                    parent_message_id,
+                    placement,
+                    ..
+                } => {
+                    *placement = Some(crate::thread_placement::thread_placement(
+                        &storage.app_storage(),
+                        &group_hex,
+                        parent_message_id,
+                    )?);
+                }
+                AppMessageIntent::Sticker { sticker_ref, .. } => {
+                    Self::authorize_sticker_ref(&storage.app_storage(), sticker_ref)?;
+                }
+                _ => {}
+            }
             let media_reply = (!request.attachments.is_empty())
                 .then_some(request.reply_to.as_deref())
                 .flatten();
@@ -526,7 +565,7 @@ impl MarmotApp {
                 request_hash: request_hash.clone(),
                 payload_hash: Sha256::digest(&payload).to_vec(),
                 payload: Some(payload),
-                request_json: Some(request.encode_retained(edit_of_client_token.as_deref())?),
+                request_json: Some(request.encode_retained(edit_of_client_token)?),
                 state: 0,
                 outcome_json: None,
             };

@@ -3947,7 +3947,7 @@ async fn app_runtime_custom_events_roundtrip_and_filter_by_kind() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tagged_poll_sticker_peer() {
     let dir = tempfile::tempdir().unwrap();
-    let (_relay, app, url) = mock_app(&dir).await;
+    let (_relay, gate, app, url) = durable_send_relay(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
@@ -4110,24 +4110,83 @@ async fn tagged_poll_sticker_peer() {
         .await
         .unwrap();
     app.fetch_sticker_pack(a, &coordinate).await.unwrap();
-    let sent = runtime
-        .send_tagged_sticker(
-            a,
-            &group,
-            marmot_app::AppStickerRef {
-                pack_coordinate: coordinate,
-                shortcode: "wave".into(),
-                plaintext_sha256: hash,
-            },
-            tags.clone(),
-        )
+    let sticker = marmot_app::AppStickerRef {
+        pack_coordinate: coordinate,
+        shortcode: "wave".into(),
+        plaintext_sha256: hash,
+    };
+    let unauthorized_token = "unauthorized-sticker-token";
+    assert!(matches!(
+        runtime
+            .submit_tagged_sticker(
+                a,
+                &group,
+                marmot_app::AppStickerRef {
+                    plaintext_sha256: "22".repeat(32),
+                    ..sticker.clone()
+                },
+                tags.clone(),
+                unauthorized_token.into(),
+            )
+            .await,
+        Err(AppError::StickerNotFound)
+    ));
+    assert!(
+        runtime
+            .local_send_status(a, &group, unauthorized_token)
+            .unwrap()
+            .is_none()
+    );
+
+    let token = "durable-sticker-token";
+    gate.arm(1);
+    runtime
+        .submit_text(a, &group, "hold the send worker".into(), "blocker".into())
         .await
         .unwrap();
-    let sticker_id = &sent.message_ids[0];
-    wait_for_timeline_update(&mut bob_timeline, |update| {
-        matches!(update, marmot_app::RuntimeTimelineMessageUpdate::Projection(projection)
-            if projection.update.timeline_messages.iter().any(|row| row.message_id_hex == *sticker_id))
-    }).await;
+    timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
+        .await
+        .unwrap();
+    let sent = timeout(
+        Duration::from_secs(5),
+        runtime.submit_tagged_sticker(a, &group, sticker.clone(), tags.clone(), token.into()),
+    )
+    .await
+    .expect("sticker admission waited for relay publication")
+    .unwrap();
+    assert_eq!(sent.client_token, token);
+    assert_eq!(
+        runtime.local_send_status(a, &group, token).unwrap(),
+        Some(marmot_app::LocalSendStatus::Queued)
+    );
+    let sticker_id = &sent.message_id_hex;
+    assert!(
+        runtime
+            .timeline_message(b, &group_hex, sticker_id)
+            .unwrap()
+            .is_none()
+    );
+    drop(bob_timeline);
+    runtime.shutdown_and_close().await.unwrap();
+    gate.release();
+
+    let runtime = MarmotAppRuntime::new(durable_send_app(&dir, url));
+    let mut events = runtime.subscribe();
+    assert_eq!(
+        runtime.local_send_status(a, &group, token).unwrap(),
+        Some(marmot_app::LocalSendStatus::Queued)
+    );
+    runtime.start().await.unwrap();
+    let replay = runtime
+        .submit_tagged_sticker(a, &group, sticker.clone(), tags.clone(), token.into())
+        .await
+        .unwrap();
+    assert_eq!(replay, sent);
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::MessageReceived(m)
+            if &m.account_id_hex == b && m.message.message_id_hex == *sticker_id)
+    })
+    .await;
     let peer = runtime
         .timeline_message(b, &group_hex, sticker_id)
         .unwrap()
@@ -4141,13 +4200,112 @@ async fn tagged_poll_sticker_peer() {
     );
     assert_eq!(peer.reply_preview.unwrap().plaintext, "Choose a drink");
     assert_eq!(
-        marmot_app::sticker_ref_from_tags(peer.kind, &peer.tags)
-            .unwrap()
-            .shortcode,
-        "wave"
+        marmot_app::sticker_ref_from_tags(peer.kind, &peer.tags),
+        Some(sticker.clone())
     );
-    drop(bob_timeline);
+    assert_durable_send_conflict(
+        runtime
+            .submit_tagged_sticker(a, &group, sticker.clone(), vec![], token.into())
+            .await
+            .unwrap_err(),
+    );
+    assert_durable_send_conflict(
+        runtime
+            .submit_tagged_sticker(
+                a,
+                &group,
+                marmot_app::AppStickerRef {
+                    plaintext_sha256: "22".repeat(32),
+                    ..sticker
+                },
+                tags,
+                token.into(),
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_sender_only_token(&runtime, a, b, &group_hex, &sent);
     runtime.shutdown_and_close().await.unwrap();
+}
+
+async fn durable_send_relay(
+    dir: &tempfile::TempDir,
+) -> (TestRelay, BlockNextGroupMessages, MarmotApp, String) {
+    storage_sqlite::relax_storage_for_test_process();
+    let gate = BlockNextGroupMessages::new();
+    let (relay, url) = limited_relay::relay_publishing_with(
+        RelayBuilder::default().write_policy(gate.clone()),
+        Some(500),
+    )
+    .await;
+    let app = durable_send_app(dir, url.clone());
+    (relay, gate, app, url)
+}
+
+fn durable_send_app(dir: &tempfile::TempDir, url: String) -> MarmotApp {
+    MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_allow_loopback_blob_endpoints(true),
+    )
+}
+
+fn assert_durable_send_conflict(error: AppError) {
+    assert!(
+        matches!(&error, AppError::InvalidAppMessagePayload(detail) if detail.contains("another submission")),
+        "unexpected replay error: {error:?}"
+    );
+}
+
+fn assert_sender_only_token(
+    runtime: &MarmotAppRuntime,
+    sender: &str,
+    peer: &str,
+    group: &str,
+    send: &marmot_app::LocalSendAcceptance,
+) {
+    let rows = runtime
+        .timeline_messages_with_query(
+            sender,
+            TimelineMessageQuery {
+                group_id_hex: Some(group.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .messages;
+    let sent = rows
+        .iter()
+        .find(|row| row.message_id_hex == send.message_id_hex)
+        .expect("accepted message is in the sender's timeline");
+    assert_eq!(
+        sent.client_token.as_deref(),
+        Some(send.client_token.as_str())
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.kind == sent.kind
+                && row.plaintext == sent.plaintext
+                && row.tags == sent.tags)
+            .count(),
+        1,
+        "replay must not add a second copy"
+    );
+    let peer = runtime
+        .timeline_message(peer, group, &send.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert!(peer.client_token.is_none());
+    assert!(!peer.plaintext.contains(&send.client_token));
+    assert!(
+        !peer
+            .tags
+            .iter()
+            .flatten()
+            .any(|field| field.contains(&send.client_token))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10122,7 +10280,7 @@ async fn new_groups_omit_the_retired_agent_text_stream_component() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tagged_upload_and_text_reach_peer() {
     let dir = tempfile::tempdir().unwrap();
-    let (_relay, app, url) = mock_app(&dir).await;
+    let (_relay, gate, app, url) = durable_send_relay(&dir).await;
     let blossom = mock_blossom().await;
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
@@ -10193,11 +10351,18 @@ async fn tagged_upload_and_text_reach_peer() {
         .unwrap();
     assert_eq!(downloaded.plaintext, plaintext);
     let effects = vec![vec!["effect".into(), "party".into()]];
+    let text_token = "durable-tagged-text-token";
     let sent = runtime
-        .send_tagged_text(a, &group, "with an effect".into(), effects.clone())
+        .submit_tagged_text(
+            a,
+            &group,
+            "with an effect".into(),
+            effects.clone(),
+            text_token.into(),
+        )
         .await
         .unwrap();
-    let id = &sent.message_ids[0];
+    let id = &sent.message_id_hex;
     wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == b && &m.message.message_id_hex == id)).await;
     let received = app
         .message_by_id(&bob.label, &hex::encode(group.as_slice()), id)
@@ -10205,7 +10370,192 @@ async fn tagged_upload_and_text_reach_peer() {
         .unwrap();
     assert_eq!(received.plaintext, "with an effect");
     assert!(received.tags.contains(&effects[0]));
-    runtime.shutdown().await;
+
+    Box::pin(async {
+        let group_hex = hex::encode(group.as_slice());
+        let root = &reply.message_ids[0];
+        let parent = runtime
+            .send_thread_message(a, &group, root, "thread parent".into(), vec![], vec![])
+            .await
+            .unwrap()
+            .message_ids
+            .remove(0);
+        let upload = runtime
+            .upload_media(
+                a,
+                &group,
+                MediaUploadRequest {
+                    message_tags: vec![],
+                    attachments: ["first.txt", "second.txt"]
+                        .into_iter()
+                        .map(|file_name| MediaUploadAttachmentRequest {
+                            file_name: file_name.into(),
+                            media_type: "text/plain".into(),
+                            plaintext: file_name.as_bytes().to_vec(),
+                            dim: None,
+                            thumbhash: None,
+                        })
+                        .collect(),
+                    caption: None,
+                    send: false,
+                    blossom_server: Some(blossom.url.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let attachments = upload
+            .attachments
+            .into_iter()
+            .map(|a| a.reference)
+            .rev()
+            .collect::<Vec<_>>();
+        let app_tag = vec!["effect".into(), "thread sparkle".into()];
+        let thread_token = "durable-thread-token";
+        gate.arm(1);
+        let thread = timeout(
+            Duration::from_secs(5),
+            runtime.submit_thread_message(
+                a,
+                &group,
+                parent.clone(),
+                "nested with attachments".into(),
+                attachments.clone(),
+                vec![app_tag.clone()],
+                thread_token.into(),
+            ),
+        )
+        .await
+        .expect("thread admission waited for relay publication")
+        .unwrap();
+        assert_eq!(thread.client_token, thread_token);
+        timeout(Duration::from_secs(5), gate.wait_for_blocked(1)).await.unwrap();
+        let peer_before_release = runtime.timeline_message(b, &group_hex, &thread.message_id_hex).unwrap();
+        gate.release();
+        assert!(peer_before_release.is_none());
+        wait_for_event(&mut events, |event| {
+            matches!(event, MarmotAppEvent::MessageReceived(m)
+                if &m.account_id_hex == b && m.message.message_id_hex == thread.message_id_hex)
+        })
+        .await;
+        let peer = runtime
+            .timeline_message(b, &group_hex, &thread.message_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.kind, cgka_traits::NIP22_COMMENT_KIND);
+        assert_eq!(peer.plaintext, "nested with attachments");
+        assert_eq!(tag_value(&peer.tags, "E"), Some(root.as_str()));
+        assert_eq!(tag_value(&peer.tags, "e"), Some(parent.as_str()));
+        let placement = peer.thread.unwrap();
+        assert_eq!(placement.root_message_id_hex, *root);
+        assert_eq!(placement.parent_message_id_hex, parent);
+        assert!(peer.tags.contains(&app_tag));
+        let filenames = peer
+            .tags
+            .iter()
+            .filter(|tag| tag.first().is_some_and(|name| name == "imeta"))
+            .map(|tag| {
+                tag.iter().find_map(|field| field.strip_prefix("filename ")).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(filenames, ["second.txt", "first.txt"]);
+
+        let reply_token = "durable-reply-token";
+        let tagged_reply = runtime
+            .submit_tagged_reply(
+                a,
+                &group,
+                thread.message_id_hex.clone(),
+                "inline reply".into(),
+                vec![app_tag.clone()],
+                reply_token.into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tagged_reply.client_token, reply_token);
+        wait_for_event(&mut events, |event| {
+            matches!(event, MarmotAppEvent::MessageReceived(m)
+                if &m.account_id_hex == b && m.message.message_id_hex == tagged_reply.message_id_hex)
+        })
+        .await;
+        let peer = runtime
+            .timeline_message(b, &group_hex, &tagged_reply.message_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.kind, MARMOT_APP_EVENT_KIND_CHAT);
+        assert_eq!(peer.plaintext, "inline reply");
+        assert!(peer.thread.is_none());
+        assert_eq!(tag_value(&peer.tags, "e"), Some(thread.message_id_hex.as_str()));
+        assert_eq!(tag_value(&peer.tags, "q"), Some(thread.message_id_hex.as_str()));
+        assert!(peer.tags.contains(&app_tag));
+
+        let upload_epoch = attachments[0].source_epoch;
+        let rename = runtime
+            .update_group_profile(a, &group, Some("advanced after thread upload".into()), None)
+            .await
+            .unwrap();
+        assert!(rename.published > 0);
+        runtime.shutdown_and_close().await.unwrap();
+        let runtime = MarmotAppRuntime::new(durable_send_app(&dir, url));
+        let current_epoch = runtime.group_mls_state(a, &group).await.unwrap().epoch;
+        assert!(current_epoch > upload_epoch);
+        let stale_token = "stale-thread-token";
+        let stale = runtime
+            .submit_thread_message(
+                a,
+                &group,
+                parent.clone(),
+                "new thread with old attachments".into(),
+                attachments.clone(),
+                vec![],
+                stale_token.into(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(stale, AppError::MediaReferenceStaleEpoch {
+            source_epoch, current_epoch: rejected_epoch,
+        } if (source_epoch, rejected_epoch) == (upload_epoch, current_epoch)), "unexpected stale media error: {stale:?}");
+        assert!(runtime.local_send_status(a, &group, stale_token).unwrap().is_none());
+
+        let thread_retry = |parent, attachments| {
+            runtime.submit_thread_message(
+                a,
+                &group,
+                parent,
+                "nested with attachments".into(),
+                attachments,
+                vec![app_tag.clone()],
+                thread_token.into(),
+            )
+        };
+        assert_eq!(thread_retry(parent.clone(), attachments.clone()).await.unwrap(), thread);
+        assert_durable_send_conflict(
+            thread_retry(root.clone(), attachments.clone()).await.unwrap_err(),
+        );
+        assert_durable_send_conflict(
+            thread_retry(parent, attachments.into_iter().rev().collect()).await.unwrap_err(),
+        );
+        let reply_retry = |target: String| {
+            runtime.submit_tagged_reply(
+                a,
+                &group,
+                target,
+                "inline reply".into(),
+                vec![app_tag.clone()],
+                reply_token.into(),
+            )
+        };
+        assert_eq!(reply_retry(thread.message_id_hex.clone()).await.unwrap(), tagged_reply);
+        assert_durable_send_conflict(reply_retry(root.clone()).await.unwrap_err());
+        let replay = runtime
+            .submit_tagged_text(a, &group, "with an effect".into(), effects, text_token.into())
+            .await
+            .unwrap();
+        assert_eq!(replay, sent);
+        for send in [&thread, &tagged_reply, &sent] {
+            assert_sender_only_token(&runtime, a, b, &group_hex, send);
+        }
+        runtime.shutdown_and_close().await.unwrap();
+    }).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

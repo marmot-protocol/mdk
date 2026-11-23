@@ -19,6 +19,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - `MarmotAgentItem` and `MarmotAgentItemState`: the latest version of a kind-1201 agent item on its timeline row.
 - `marmot_send_custom_event_with_client_token`: durable token admission of a custom application event, such as an
   answer or a control for an agent (kind 1202).
+- `marmot_submit_tagged_text`, `marmot_submit_tagged_reply`, `marmot_submit_thread_message`, and
+  `marmot_submit_tagged_sticker` return durable local acceptance before relay publication.
 
 ## [0.19.0] - 2026-11-22
 

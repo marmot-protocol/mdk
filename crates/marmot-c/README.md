@@ -388,6 +388,12 @@ acceptance), rather than relay completion. Free their results with
 `marmot_local_send_acceptance_free`, `marmot_media_upload_submission_free`, or
 `marmot_local_send_status_free`. The nullable timeline `client_token` is owned by
 its row and released by the row's existing deep-free.
+
+`marmot_submit_tagged_text`, `marmot_submit_tagged_reply`,
+`marmot_submit_thread_message`, and `marmot_submit_tagged_sticker` also return
+`MarmotLocalSendAcceptance`. Tag and attachment arrays and sticker reference
+strings are borrowed for the call.
+
 Since 0.11.0, `marmot_edit_local_message_with_client_token` provides
 durable revisions of pending text or replies. Each revision needs a new edit token;
 the C call returns local acceptance and uses the same status and free functions.

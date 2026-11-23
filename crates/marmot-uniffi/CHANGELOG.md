@@ -15,6 +15,8 @@
   unreadable item, such as the old shape.
 - `send_custom_event_with_client_token`: durable token admission of an app-defined event, such as an answer or a
   control for an agent (kind 1202), so a retry after a restart does not send it twice.
+- `submit_tagged_text`, `submit_tagged_reply`, `submit_thread_message`, and `submit_tagged_sticker` return durable
+  local acceptance before relay publication.
 
 ### Fixed
 

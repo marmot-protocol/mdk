@@ -23,6 +23,7 @@
 
 ### Added
 
+- `submit_thread_message` and `submit_tagged_sticker` accept a client token and return before relay publication.
 - A later version of an agent item is a kind-1009 edit carrying the whole item with a higher `v`, sent crash-safely
   with `submit_tagged_edit_for_local_send` on the item's token. The row keeps the highest version, ignores an older
   one that arrives late, applies an edit that arrived before its item, and is not marked edited.

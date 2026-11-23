@@ -100,6 +100,101 @@ impl Marmot {
             .into())
     }
 
+    /// Durably admit kind-9 text with application tags under [`Marmot::send_tagged_text`]'s rules.
+    pub async fn submit_tagged_text(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        text: String,
+        tags: Vec<Vec<String>>,
+        client_token: String,
+    ) -> Result<LocalSendAcceptanceFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .submit_tagged_text(
+                &account_ref,
+                &group_id_from_hex(&group_id_hex)?,
+                text,
+                tags,
+                client_token,
+            )
+            .await?
+            .into())
+    }
+
+    /// Durably admit a kind-9 reply with application tags. MDK owns the reply's `e` and `q` tags.
+    pub async fn submit_tagged_reply(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target_message_id: String,
+        text: String,
+        tags: Vec<Vec<String>>,
+        client_token: String,
+    ) -> Result<LocalSendAcceptanceFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .submit_tagged_reply(
+                &account_ref,
+                &group_id_from_hex(&group_id_hex)?,
+                target_message_id,
+                text,
+                tags,
+                client_token,
+            )
+            .await?
+            .into())
+    }
+
+    /// Durably admit a NIP-22 thread message using [`Marmot::send_thread_message`]'s input rules.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_thread_message(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        parent_message_id: String,
+        text: String,
+        attachments: Vec<MediaAttachmentReferenceFfi>,
+        tags: Vec<Vec<String>>,
+        client_token: String,
+    ) -> Result<LocalSendAcceptanceFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .submit_thread_message(
+                &account_ref,
+                &group_id_from_hex(&group_id_hex)?,
+                parent_message_id,
+                text,
+                attachments.into_iter().map(Into::into).collect(),
+                tags,
+                client_token,
+            )
+            .await?
+            .into())
+    }
+
+    /// Durably admit an authorized pack sticker with context tags under [`Marmot::send_tagged_sticker`]'s rules.
+    pub async fn submit_tagged_sticker(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        sticker_ref: StickerRefFfi,
+        tags: Vec<Vec<String>>,
+        client_token: String,
+    ) -> Result<LocalSendAcceptanceFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .submit_tagged_sticker(
+                &account_ref,
+                &group_id_from_hex(&group_id_hex)?,
+                sticker_ref.into(),
+                tags,
+                client_token,
+            )
+            .await?
+            .into())
+    }
+
     /// Durably admit an app-defined event under [`Marmot::send_custom_event`]'s
     /// rules, such as an answer or a control for an agent (kind 1202). The
     /// same token after a restart returns the same event and sends nothing.

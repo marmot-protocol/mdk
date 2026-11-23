@@ -2191,6 +2191,57 @@ pub unsafe extern "C" fn marmot_send_thread_message(
     })
 }
 
+/// Durably admit a thread message under `marmot_send_thread_message`'s rules.
+/// Returns local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
+///
+/// # Safety
+/// `client` must be live, strings must be valid NUL-terminated UTF-8, and `out` must be writable.
+/// `attachments` and `tags` must point to the specified number of valid caller-owned entries.
+/// Each tag row must hold its stated number of valid string pointers. NULL is allowed for empty arrays.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_submit_thread_message(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    parent_message_id: *const c_char,
+    text: *const c_char,
+    attachments: *const MarmotMediaAttachmentReference,
+    attachments_len: usize,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    client_token: *const c_char,
+    out: *mut *mut MarmotLocalSendAcceptance,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let parent_message_id = try_arg!(unsafe { required_str(parent_message_id) });
+        let text = try_arg!(unsafe { required_str(text) });
+        let client_token = try_arg!(unsafe { required_str(client_token) });
+        let attachments =
+            try_arg!(unsafe { struct_array(attachments, attachments_len, |a| a.to_ffi()) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.submit_thread_message(
+                    account_ref,
+                    group_id_hex,
+                    parent_message_id,
+                    text,
+                    attachments,
+                    tags,
+                    client_token,
+                )),
+                out,
+            )
+        }
+    })
+}
+
 /// React with a custom emoji image. `attachments` (already uploaded)
 /// become `imeta` tags on the kind-7 and `tags` name them, e.g. NIP-30
 /// `["emoji", shortcode, url]` for `emoji` == `:shortcode:`. imeta rows
@@ -3010,6 +3061,95 @@ pub unsafe extern "C" fn marmot_send_tagged_text(
                     group_id_hex,
                     content,
                     tags,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Durably admit kind-9 text with application tags under `marmot_send_tagged_text`'s rules.
+/// Returns local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
+///
+/// # Safety
+/// `client` must be live, strings must be valid NUL-terminated UTF-8, and `out` must be writable.
+/// `tags` must hold `tags_len` valid rows, each with its stated number of valid string pointers.
+/// NULL is allowed for empty arrays.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_submit_tagged_text(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    text: *const c_char,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    client_token: *const c_char,
+    out: *mut *mut MarmotLocalSendAcceptance,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let text = try_arg!(unsafe { required_str(text) });
+        let client_token = try_arg!(unsafe { required_str(client_token) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.submit_tagged_text(
+                    account_ref,
+                    group_id_hex,
+                    text,
+                    tags,
+                    client_token,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Durably admit a kind-9 reply with application tags. MDK owns the reply's `e` and `q` tags.
+/// Returns local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
+///
+/// # Safety
+/// `client` must be live, strings must be valid NUL-terminated UTF-8, and `out` must be writable.
+/// `tags` must hold `tags_len` valid rows, each with its stated number of valid string pointers.
+/// NULL is allowed for empty arrays.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_submit_tagged_reply(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    target_message_id: *const c_char,
+    text: *const c_char,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    client_token: *const c_char,
+    out: *mut *mut MarmotLocalSendAcceptance,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let target_message_id = try_arg!(unsafe { required_str(target_message_id) });
+        let text = try_arg!(unsafe { required_str(text) });
+        let client_token = try_arg!(unsafe { required_str(client_token) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.submit_tagged_reply(
+                    account_ref,
+                    group_id_hex,
+                    target_message_id,
+                    text,
+                    tags,
+                    client_token,
                 )),
                 out,
             )
@@ -4217,6 +4357,55 @@ pub unsafe extern "C" fn marmot_send_tagged_sticker(
                     group_id_hex,
                     sticker_ref,
                     tags,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Durably admit an authorized pack sticker under `marmot_send_tagged_sticker`'s rules.
+/// Returns local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
+///
+/// # Safety
+/// `client` must be live, strings must be valid NUL-terminated UTF-8, and `out` must be writable.
+/// `tags` must hold `tags_len` valid rows, each with its stated number of valid string pointers.
+/// NULL is allowed for empty arrays.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_submit_tagged_sticker(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    pack_coordinate: *const c_char,
+    shortcode: *const c_char,
+    plaintext_sha256: *const c_char,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    client_token: *const c_char,
+    out: *mut *mut MarmotLocalSendAcceptance,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let sticker_ref = marmot_uniffi::StickerRefFfi {
+            pack_coordinate: try_arg!(unsafe { required_str(pack_coordinate) }),
+            shortcode: try_arg!(unsafe { required_str(shortcode) }),
+            plaintext_sha256: try_arg!(unsafe { required_str(plaintext_sha256) }),
+        };
+        let client_token = try_arg!(unsafe { required_str(client_token) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.submit_tagged_sticker(
+                    account_ref,
+                    group_id_hex,
+                    sticker_ref,
+                    tags,
+                    client_token,
                 )),
                 out,
             )
