@@ -4652,8 +4652,9 @@ async fn run_startup_hydration_pipeline(
         }
         // Surface this batch's recovery events (PendingCommitRecovered,
         // hydration quarantines, restored leave requests) exactly as a live
-        // drain would, so the projection updates incrementally.
-        if let Ok(summary) = client.drain_pending_session_events().await {
+        // drain would, so the projection updates incrementally. Retained
+        // sends wait for the drain after transport activation (mdk#3367).
+        if let Ok(summary) = client.drain_hydrated_session_events().await {
             publish_app_runtime_summary_with_v5(
                 client,
                 events,
