@@ -53,11 +53,12 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/messaging.rs` — final-message sends, the group-system event handler, and debug send
   recording/inject helpers (`DebugFinalSendStore`). `connection.rs` refuses the retired agent activity and agent
   operation requests (`retired_agent_event`).
-- `src/inbound.rs` — `SubscribeInbound` drain loop. On subscribe, after each live message or group-state notice,
-  and after broadcast lag, it delivers what each covered account stored after the scope's durable mark, paging
-  `messages_after_insert_order` and re-reading each row just before projecting it, so a message stored while no
-  subscriber was attached reaches the next one (mdk#3551). The first subscriber of a scope starts at the newest
-  stored row.
+- `src/inbound.rs` — `SubscribeInbound` drain loop. Messages and group-state changes reach a subscriber only from
+  storage (mdk#3551): each subscription reads `messages_after_insert_order` from its own position per account, in
+  pages of `INBOUND_PAGE_ROWS` with the scope's mark saved after each, re-reading every row just before projecting
+  it. Live notices, catch-up passes and broadcast lag only wake that read; group invites and debug injections are
+  the only live deliveries. A subscription's first read starts at the scope's mark, or without one just before the
+  first row received since it began (or since an unreadable marks record was last written).
 - `src/inbound_marks.rs` — `InboundMarks`, the delivery marks per subscription scope (every group, or one group),
   kept in the account directory beside the database whose positions they name; a mark only moves forward.
 - `src/invite_policy.rs` — background reconciliation of pending group invites against the welcomer allowlist
@@ -83,8 +84,8 @@ several files in the same crate); methods shared across those files are `pub(cra
   expires). `acquire_strict` binds a key to its first fingerprint for media sends.
 - `src/media_temp.rs` — TTL sweep of decrypted inbound media temp dirs under
   `$TMPDIR/marmot-media/`.
-- `src/event_projection.rs` — runtime/debug event → control event projection, the `DeliveredInboundCursor`, and the
-  `InboundCatchUpDriver`. The driver's scheduled passes are an adaptive safety net (base
+- `src/event_projection.rs` — stored-row, group-invite and debug event → control event projection, the
+  `DeliveredInboundCursor` for debug-injected messages, and the `InboundCatchUpDriver`. The driver's scheduled passes are an adaptive safety net (base
   `INBOUND_CATCH_UP_BASE_INTERVAL`, doubling to `INBOUND_CATCH_UP_MAX_INTERVAL` while the runtime is quiet):
   steady-state delivery is push-driven by each account worker, so qualifying runtime activity (anything but
   `AccountError`, which a failing pass could self-emit) resets the net and wakes a backed-off pass, never faster

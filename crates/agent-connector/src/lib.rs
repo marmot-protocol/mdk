@@ -115,9 +115,8 @@ pub(crate) const MEDIA_TEMP_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) use agent_control::{
     MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES, MAX_MEDIA_UPLOAD_ATTACHMENTS, MAX_MEDIA_UPLOAD_BATCH_BYTES,
 };
-/// Capacity of the per-subscription delivered-inbound-id cursor used to dedup storage-backed
-/// replay after broadcast lag. Comfortably larger than the runtime broadcast channel depth
-/// (1024) so every message that could be re-queried after a single overflow is still tracked.
+/// Capacity of the per-subscription cursor of debug-injected inbound message ids already
+/// delivered.
 pub(crate) const DELIVERED_INBOUND_CURSOR_CAPACITY: usize = 4096;
 pub(crate) const MAX_PROFILE_NAME_CHARS: usize = 80;
 /// Longest value the connector accepts for one optional kind-0 field (`about`,

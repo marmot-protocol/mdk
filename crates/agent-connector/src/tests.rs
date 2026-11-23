@@ -8,17 +8,15 @@ use agent_control::{
     AgentControlResponse, AgentControlSendMaintenanceDisposition, decode_frame, encode_frame,
     read_envelope, write_frame,
 };
+use cgka_traits::GroupId;
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
-    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
-    MarmotAppEvent as MarmotInnerEvent,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MarmotAppEvent as MarmotInnerEvent,
 };
-use cgka_traits::engine::{GroupEvent, GroupStateChange};
-use cgka_traits::{EpochId, GroupId};
 use marmot_account::AccountHome;
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AppError, MarmotApp, MarmotAppEvent,
-    MarmotAppRuntime, ReceivedMessage, RuntimeMessageReceived, UserProfileMetadata,
+    MarmotAppRuntime, UserProfileMetadata,
 };
 use nostr_relay_builder::MockRelay;
 use std::collections::HashSet;
@@ -33,10 +31,11 @@ use crate::account::{GroupAdminChange, ProfileUpdateFields};
 use crate::allowlist::{AllowlistRecord, AllowlistStore};
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpDriver, control_event_from_debug_event,
-    control_event_from_runtime_event_with_runtime, inbound_message_event_from_record_with_runtime,
-    media_refs_from_tags, message_mentions_account, reply_target_from_tags,
-    runtime_replay_dedup_key,
+    inbound_message_event_from_record_with_runtime, media_refs_from_tags, message_mentions_account,
+    reply_target_from_tags,
 };
+use crate::inbound::StoredPage;
+use crate::inbound_marks::InboundMark;
 use crate::{
     AgentConnector, AgentConnectorConfig, bind_connector_socket, bind_connector_socket_with_mode,
     serve_socket,
@@ -396,131 +395,6 @@ pub(crate) fn test_config(
     // production keeps this off (see `allow_loopback_relays`).
     config.allow_loopback_relays = true;
     config
-}
-
-fn received_message(
-    kind: u64,
-    plaintext: impl Into<String>,
-    tags: Vec<Vec<String>>,
-) -> ReceivedMessage {
-    ReceivedMessage {
-        authority: None,
-        message_id_hex: "33".repeat(32),
-        source_message_id_hex: "44".repeat(32),
-        sender: "bb".repeat(32),
-        sender_display_name: None,
-        group_id: cgka_traits::GroupId::new(vec![0x22; 32]),
-        source_epoch: 7,
-        retention: None,
-        plaintext: plaintext.into(),
-        kind,
-        tags,
-        recorded_at: 42,
-        received_at: 84,
-    }
-}
-
-#[tokio::test]
-async fn control_event_requires_a_durable_row_for_received_messages() {
-    storage_sqlite::relax_storage_for_test_process();
-    let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("agent")
-        .unwrap();
-    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
-    let agent_account_id_hex = "aa".repeat(32);
-    for kind in [
-        MARMOT_APP_EVENT_KIND_CHAT,
-        MARMOT_APP_EVENT_KIND_DELETE,
-        MARMOT_APP_EVENT_KIND_REACTION,
-        MARMOT_APP_EVENT_KIND_EDIT,
-    ] {
-        let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
-            account_id_hex: agent_account_id_hex.clone(),
-            account_label: "agent".to_owned(),
-            message: received_message(kind, "untrusted live plaintext", Vec::new()),
-        });
-
-        assert_eq!(
-            control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap(),
-            None,
-            "kind {kind} without a durable row must not fall back to live plaintext"
-        );
-    }
-    runtime.shutdown().await;
-}
-
-#[tokio::test]
-async fn control_event_projects_group_rename_as_group_state_changed() {
-    let dir = tempfile::tempdir().unwrap();
-    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
-    // A GroupRenamed change projects to a coarse `group_renamed` control event
-    // carrying the new group display name in `detail`. Privacy: member/admin
-    // changes carry NO detail (the subject member's pubkey is never surfaced).
-    let agent_account_id_hex = "aa".repeat(32);
-    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
-        account_id_hex: agent_account_id_hex.clone(),
-        account_label: "agent".to_owned(),
-        event: GroupEvent::GroupStateChanged {
-            group_id: GroupId::new(vec![0x22; 32]),
-            epoch: EpochId(3),
-            actor: None,
-            change: GroupStateChange::GroupRenamed {
-                name: "Team".to_owned(),
-                previous_name: None,
-            },
-            origin_commit_id: None,
-        },
-    });
-
-    let expected_occurrence = runtime_replay_dedup_key(&event);
-    let Some(AgentControlEvent::GroupStateChanged {
-        account_id_hex,
-        group_id_hex,
-        event_id_hex,
-        change,
-        detail,
-    }) = control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap()
-    else {
-        panic!("expected a group state change to project to GroupStateChanged");
-    };
-    assert_eq!(account_id_hex, agent_account_id_hex);
-    assert_eq!(group_id_hex, "22".repeat(32));
-    assert_eq!(change, "group_renamed");
-    assert_eq!(detail, Some("Team".to_owned()));
-    assert_eq!(event_id_hex.as_ref().map(String::len), Some(64));
-    assert_eq!(event_id_hex, expected_occurrence);
-    runtime.shutdown().await;
-}
-
-#[tokio::test]
-async fn control_event_group_state_change_member_add_carries_no_member_detail() {
-    let dir = tempfile::tempdir().unwrap();
-    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
-    // A member add must NOT surface the subject member's pubkey: the projection
-    // collapses to a coarse change kind with `detail == None`.
-    let agent_account_id_hex = "aa".repeat(32);
-    let member = cgka_traits::MemberId::new(vec![0x99; 32]);
-    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
-        account_id_hex: agent_account_id_hex,
-        account_label: "agent".to_owned(),
-        event: GroupEvent::GroupStateChanged {
-            group_id: GroupId::new(vec![0x22; 32]),
-            epoch: EpochId(4),
-            actor: None,
-            change: GroupStateChange::MemberAdded { member },
-            origin_commit_id: None,
-        },
-    });
-
-    let Some(AgentControlEvent::GroupStateChanged { change, detail, .. }) =
-        control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap()
-    else {
-        panic!("expected a member add to project to GroupStateChanged");
-    };
-    assert_eq!(change, "member_added");
-    assert_eq!(detail, None, "member pubkey must never be surfaced");
-    runtime.shutdown().await;
 }
 
 #[test]
@@ -2223,8 +2097,9 @@ async fn connector_socket_subscribe_terminates_when_client_disconnects() {
 }
 
 /// mdk#3551: a message stored while no subscriber is attached (for example during a gateway
-/// restart) reaches the next subscriber exactly once. What was stored before the first
-/// subscriber, and what an earlier subscriber already received, is not handed out.
+/// restart) reaches the next subscriber exactly once, with its sender's name. What was stored
+/// before the first subscriber, and what an earlier subscriber already received, is not handed
+/// out. When the saved marks cannot be parsed, what arrived since they were written still is.
 #[tokio::test]
 async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attached() {
     storage_sqlite::relax_storage_for_test_process();
@@ -2281,6 +2156,28 @@ async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attac
             },
         )
     };
+    let published = send_control_request(
+        &socket,
+        "req-human-profile",
+        AgentControlRequest::AccountPublishProfile {
+            account_id_hex: human.account.account_id_hex.clone(),
+            name: "Human".to_owned(),
+            display_name: None,
+            about: None,
+            picture: None,
+            nip05: None,
+            lud16: None,
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            published.payload,
+            AgentControlResponse::ProfilePublished { .. }
+        ),
+        "expected the human's profile to publish, got {:?}",
+        published.payload
+    );
     // Sends as the human and waits until the agent account has stored the message.
     let human_says_and_agent_stores = async |id: &'static str, text: &'static str| {
         let sent = human_says(id, text).await;
@@ -2315,7 +2212,7 @@ async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attac
         panic!("the agent account never stored {text:?}");
     };
     // Subscribes as the agent, reads until every `stored` text has arrived, then sends `live`
-    // and returns every inbound text read up to it.
+    // and returns every inbound text read up to it. Every message names its sender.
     let subscribe_and_read_through =
         async |id: &'static str, stored: &[&'static str], live: &'static str| {
             let stream = connect_with_retry(&socket).await;
@@ -2354,6 +2251,12 @@ async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attac
                         .unwrap()
                         .unwrap();
                 if let AgentControlEvent::InboundMessage { message, .. } = event.payload {
+                    assert_eq!(
+                        message.sender.display_name.as_deref(),
+                        Some("Human"),
+                        "{:?} reaches the agent with its sender's name",
+                        message.text
+                    );
                     texts.push(message.text);
                 }
             }
@@ -2361,6 +2264,9 @@ async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attac
         };
 
     human_says_and_agent_stores("req-history", "history").await;
+    // Storage records arrival in whole seconds, and a row that arrived in the second the first
+    // subscription began counts as new to it.
+    sleep(Duration::from_millis(1_100)).await;
     assert_eq!(
         subscribe_and_read_through("req-first-subscribe", &[], "before the restart").await,
         ["before the restart"],
@@ -2380,32 +2286,62 @@ async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attac
         "the stored message is delivered once, and nothing the first subscriber had is repeated"
     );
 
+    // The saved marks become unreadable, then a message arrives while the agent is away.
+    sleep(Duration::from_millis(1_100)).await;
+    let marks_file = AccountHome::open(dir.path())
+        .account_dir(&agent.account.label)
+        .join("agent-inbound-marks.json");
+    std::fs::write(&marks_file, b"not json").unwrap();
+    human_says_and_agent_stores("req-lost", "while the marks were unreadable").await;
+    // Later than the second it arrived in, so only the marks' last write can make it undelivered.
+    sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(
+        subscribe_and_read_through(
+            "req-third-subscribe",
+            &["while the marks were unreadable"],
+            "after the lost marks"
+        )
+        .await,
+        ["while the marks were unreadable", "after the lost marks"],
+        "what arrived since the marks were last written is delivered, and nothing older"
+    );
+
     server.abort();
     let _ = server.await;
 }
 
 /// mdk#3551: a scope's delivery mark outlives the connector, never moves back, keeps each
 /// subscription scope apart and is owner-only. It lives beside the account database, so wiping
-/// the account removes it, and an unreadable record is reported rather than taken as a first
-/// subscription.
+/// the account removes it. A record that cannot be read is left alone; one that cannot be parsed
+/// starts every scope it held from when it was last written, so its loss skips no backlog.
 #[test]
 fn inbound_marks_persist_per_scope_and_go_with_the_account() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("agent").unwrap();
     let group = "bb".repeat(32);
+    let other_group = "cc".repeat(32);
     let marks = crate::inbound_marks::InboundMarks::new(home.clone());
-    assert_eq!(marks.get("agent", None).unwrap(), None);
+    assert_eq!(
+        marks.get("agent", None).unwrap(),
+        InboundMark::ReceivedSince(None),
+        "a scope that never had a subscriber starts when its first one does"
+    );
     marks.advance("agent", None, 7).unwrap();
     marks.advance("agent", None, 3).unwrap();
     marks.advance("agent", Some(&group), 2).unwrap();
+    marks.advance("agent", Some(&other_group), 4).unwrap();
 
     let reopened = crate::inbound_marks::InboundMarks::new(AccountHome::open(dir.path()));
-    assert_eq!(reopened.get("agent", None).unwrap(), Some(7));
-    assert_eq!(reopened.get("agent", Some(&group)).unwrap(), Some(2));
-    assert_eq!(reopened.get("agent", Some(&"cc".repeat(32))).unwrap(), None);
+    assert_eq!(reopened.get("agent", None).unwrap(), InboundMark::After(7));
+    assert_eq!(
+        reopened.get("agent", Some(&group)).unwrap(),
+        InboundMark::After(2)
+    );
+    assert_eq!(
+        reopened.get("agent", Some(&"dd".repeat(32))).unwrap(),
+        InboundMark::ReceivedSince(None)
+    );
     let file = home.account_dir("agent").join("agent-inbound-marks.json");
     let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
     assert_eq!(
@@ -2413,19 +2349,39 @@ fn inbound_marks_persist_per_scope_and_go_with_the_account() {
         "the marks name groups, so only the owner reads them"
     );
 
+    // A read error changes nothing: the mark is still there once the file can be read again.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(reopened.get("agent", None).is_err());
+    assert!(reopened.advance("agent", None, 99).is_err());
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(reopened.get("agent", None).unwrap(), InboundMark::After(7));
+
     std::fs::write(&file, b"not json").unwrap();
-    assert!(
-        reopened.get("agent", None).is_err(),
-        "lost marks are not a first run"
+    let written_at = std::fs::metadata(&file)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(
+        reopened.get("agent", None).unwrap(),
+        InboundMark::ReceivedSince(Some(written_at)),
+        "lost marks are not a first run: what arrived since the record was written is undelivered"
     );
     reopened.advance("agent", None, 9).unwrap();
-    assert_eq!(reopened.get("agent", None).unwrap(), Some(9));
+    assert_eq!(reopened.get("agent", None).unwrap(), InboundMark::After(9));
+    assert_eq!(
+        reopened.get("agent", Some(&group)).unwrap(),
+        InboundMark::ReceivedSince(Some(written_at)),
+        "replacing the record keeps the other scopes' start"
+    );
 
     home.remove_account("agent").unwrap();
     home.create_account("agent").unwrap();
     assert_eq!(
         reopened.get("agent", None).unwrap(),
-        None,
+        InboundMark::ReceivedSince(None),
         "a re-created account starts afresh"
     );
 }
@@ -4555,76 +4511,6 @@ async fn inbound_message_event_from_record_projects_group_system_row() {
 }
 
 #[test]
-fn runtime_replay_dedup_key_covers_thread_messages_like_chat() {
-    // Live delivery records a thread message's row id so a later replay does
-    // not hand the agent the same message twice; other kind-1111 events stay
-    // outside the feed.
-    let update = |tags: Vec<Vec<String>>| {
-        MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
-            account_id_hex: "aa".repeat(32),
-            account_label: "agent".to_owned(),
-            message: received_message(cgka_traits::NIP22_COMMENT_KIND, "in thread", tags),
-        })
-    };
-    let parent = vec![
-        vec!["e".to_owned(), "cc".repeat(32)],
-        vec!["k".to_owned(), "9".to_owned()],
-    ];
-    assert_eq!(
-        runtime_replay_dedup_key(&update(parent)),
-        Some("33".repeat(32))
-    );
-    assert_eq!(
-        runtime_replay_dedup_key(&update(vec![vec!["k".to_owned(), "9".to_owned()]])),
-        None
-    );
-}
-
-#[test]
-fn runtime_replay_dedup_key_matches_group_system_storage_row_id() {
-    // The live GroupStateChanged event and the synthesized storage row must share the same
-    // replay cursor id, otherwise replay after later lag would duplicate already-delivered state.
-    assert_runtime_replay_dedup_key_matches_group_rename(None);
-}
-
-#[test]
-fn runtime_replay_dedup_key_matches_group_system_storage_row_id_with_old_name() {
-    // `previous_name` is rendered as `data.old_name`, which participates in the
-    // canonical row id. Live delivery and replay must therefore agree when it is
-    // populated, not only when it is absent.
-    assert_runtime_replay_dedup_key_matches_group_rename(Some("Old Team"));
-}
-
-fn assert_runtime_replay_dedup_key_matches_group_rename(previous_name: Option<&str>) {
-    let group_id = GroupId::new(vec![0x22; 32]);
-    let actor = cgka_traits::MemberId::new(vec![0xbb; 32]);
-    let change = GroupStateChange::GroupRenamed {
-        name: "Team".to_owned(),
-        previous_name: previous_name.map(str::to_owned),
-    };
-    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
-        account_id_hex: "acct".to_owned(),
-        account_label: "agent".to_owned(),
-        event: GroupEvent::GroupStateChanged {
-            group_id: group_id.clone(),
-            epoch: EpochId(3),
-            actor: Some(actor.clone()),
-            change: change.clone(),
-            origin_commit_id: None,
-        },
-    });
-
-    let expected =
-        cgka_traits::app_event::group_system_canonical_id(&group_id, 3, Some(&actor), &change)
-            .unwrap();
-
-    assert_eq!(
-        runtime_replay_dedup_key(&event).as_deref(),
-        Some(expected.as_str())
-    );
-}
-
-#[test]
 fn inbound_message_event_from_record_extracts_mention_and_reply() {
     // A `p`-tag for the receiving account marks a mention; the first `e`-tag is
     // the reply target. Both let a channel gate/thread without re-parsing tags.
@@ -4968,19 +4854,28 @@ fn deletes(stored: &[AppMessageRecord], target: &str) -> bool {
     })
 }
 
-/// Drain the account's stored rows the way the inbound stream does, one projection per row.
+/// Read the account's stored rows from `position` the way the inbound stream does, page by page
+/// with one projection per row, moving `position` past every row read.
 fn replay_missed(
     connector: &AgentConnector,
     account_id_hex: &str,
     group_filter: Option<&str>,
-    delivered: &mut DeliveredInboundCursor,
+    position: &mut i64,
 ) -> Result<Vec<AgentControlEvent>, crate::error::ConnectorError> {
-    let mut missed = connector.stored_page(account_id_hex, account_id_hex, group_filter, 0)?;
     let mut events = Vec::new();
-    while let Some(event) = missed.next_event(connector, delivered)? {
-        events.push(event);
+    loop {
+        let page_rows = crate::inbound::INBOUND_PAGE_ROWS;
+        let rows = connector.stored_rows(account_id_hex, group_filter, *position, page_rows)?;
+        let more = rows.len() >= page_rows;
+        *position = rows.last().map_or(*position, |row| row.insert_order);
+        let mut page = StoredPage::new(account_id_hex, account_id_hex, group_filter, rows);
+        while let Some(event) = page.next_event(connector)? {
+            events.push(event);
+        }
+        if !more {
+            return Ok(events);
+        }
     }
-    Ok(events)
 }
 
 #[tokio::test]
@@ -5063,12 +4958,12 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     );
 
     // First replay surfaces the missed inbound message as an InboundMessage event.
-    let mut delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
+    let mut position = 0;
     let replayed = replay_missed(
         &connector,
         &agent.account.account_id_hex,
         Some(&group_id_hex),
-        &mut delivered,
+        &mut position,
     )
     .unwrap();
     // Replay emits exactly the InboundMessage the live path emits.
@@ -5081,6 +4976,11 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         )
         .unwrap()
         .expect("the agent stored the missed message");
+    // A stored message names its sender as the local directory does, like a live notice.
+    let human_name = connector
+        .runtime
+        .display_name_for_account_id(&human.account.account_id_hex);
+    assert!(human_name.is_some());
     let expected = AgentControlEvent::InboundMessage {
         account_id_hex: agent.account.account_id_hex.clone(),
         group_id_hex: group_id_hex.clone(),
@@ -5088,7 +4988,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             message_id_hex: target_message_id_hex.clone(),
             sender: agent_control::AgentControlActor {
                 account_id_hex: human.account.account_id_hex.clone(),
-                display_name: None,
+                display_name: human_name,
                 is_self: false,
             },
             text: "missed while lagging".to_owned(),
@@ -5199,7 +5099,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         &connector,
         &agent.account.account_id_hex,
         Some(&group_id_hex),
-        &mut delivered,
+        &mut position,
     )
     .unwrap();
     assert!(
@@ -5283,7 +5183,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         &connector,
         &agent.account.account_id_hex,
         Some(&group_id_hex),
-        &mut delivered,
+        &mut position,
     )
     .unwrap();
     assert!(
@@ -5320,9 +5220,16 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         .await,
         "both replies did not arrive"
     );
-    let mut missed = connector
-        .stored_page(agent_id, agent_id, Some(&group_id_hex), 0)
+    let rows = connector
+        .stored_rows(
+            agent_id,
+            Some(&group_id_hex),
+            position,
+            crate::inbound::INBOUND_PAGE_ROWS,
+        )
         .unwrap();
+    position = rows.last().map_or(position, |row| row.insert_order);
+    let mut missed = StoredPage::new(agent_id, agent_id, Some(&group_id_hex), rows);
     connector
         .runtime
         .delete_message(
@@ -5344,7 +5251,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         "the mid-replay deletion did not arrive"
     );
     let mut in_flight = Vec::new();
-    while let Some(event) = missed.next_event(&connector, &mut delivered).unwrap() {
+    while let Some(event) = missed.next_event(&connector).unwrap() {
         in_flight.push(event);
     }
     let inbound_ids: Vec<_> = in_flight
@@ -5362,7 +5269,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         &connector,
         &agent.account.account_id_hex,
         Some(&group_id_hex),
-        &mut delivered,
+        &mut position,
     )
     .unwrap();
     assert!(
@@ -5430,12 +5337,12 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     )
     .await;
 
-    let mut human_delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
+    let mut human_position = 0;
     let rejected = replay_missed(
         &connector,
         &human.account.account_id_hex,
         Some(&group_id_hex),
-        &mut human_delivered,
+        &mut human_position,
     )
     .unwrap();
     assert!(
@@ -5473,16 +5380,22 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         .await,
         "the reply did not arrive"
     );
-    let mut page = connector
-        .stored_page(agent_id, agent_id, Some(&group_id_hex), 0)
+    let rows = connector
+        .stored_rows(
+            agent_id,
+            Some(&group_id_hex),
+            position,
+            crate::inbound::INBOUND_PAGE_ROWS,
+        )
         .unwrap();
+    let mut page = StoredPage::new(agent_id, agent_id, Some(&group_id_hex), rows);
     connector
         .runtime
         .block_user(agent_id, &human.account.account_id_hex)
         .await
         .unwrap();
     let mut in_flight = Vec::new();
-    while let Some(event) = page.next_event(&connector, &mut delivered).unwrap() {
+    while let Some(event) = page.next_event(&connector).unwrap() {
         in_flight.push(event);
     }
     assert!(
@@ -5492,6 +5405,141 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
                 if message.message_id_hex == hidden_id_hex
         )),
         "a row hidden after the page was read must not reach the agent: {in_flight:?}"
+    );
+}
+
+/// mdk#3551: a backlog longer than one page reaches the next subscriber in full and in storage
+/// order: the read pages on, saving the scope's mark after each page, instead of cutting the
+/// backlog off. Two-row pages stand in for the production page size.
+#[tokio::test]
+async fn stored_backlog_longer_than_a_page_reaches_the_next_subscriber_in_order() {
+    storage_sqlite::relax_storage_for_test_process();
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent backlog",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
+    setup_runtime.drain_in_flight_work().await.unwrap();
+    setup_runtime.shutdown().await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let agent_id = agent.account.account_id_hex.as_str();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    connector.runtime.catch_up_accounts().await.unwrap();
+
+    // A subscription's read of the agent's stored rows, returning the inbound texts it sends.
+    let read = async || {
+        let mut read = crate::inbound::StoredRead::new(2);
+        let mut frames = Vec::new();
+        let read_ok = connector
+            .deliver_stored_inbound(&None, agent_id, agent_id, None, &mut read, &mut frames)
+            .await
+            .unwrap();
+        assert!(read_ok);
+        let mut frames = frames.as_slice();
+        let mut texts = Vec::new();
+        while let Some(event) = read_envelope::<_, AgentControlEvent>(&mut frames)
+            .await
+            .unwrap()
+        {
+            if let AgentControlEvent::InboundMessage { message, .. } = event.payload {
+                texts.push(message.text);
+            }
+        }
+        texts
+    };
+    // The first subscription only sets the account's mark.
+    sleep(Duration::from_millis(1_100)).await;
+    assert!(read().await.is_empty());
+
+    let backlog = (0..5)
+        .map(|index| format!("backlog {index}"))
+        .collect::<Vec<_>>();
+    for text in &backlog {
+        connector
+            .send_final_response(
+                &human.account.account_id_hex,
+                &group_id_hex,
+                text.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        catch_up_until(&connector, agent_id, &group_id_hex, |stored| {
+            stored
+                .iter()
+                .any(|message| message.plaintext == backlog[backlog.len() - 1])
+        })
+        .await,
+        "the backlog did not arrive"
+    );
+
+    assert_eq!(read().await, backlog);
+    let last = connector
+        .stored_rows(agent_id, None, 0, crate::inbound::INBOUND_PAGE_ROWS)
+        .unwrap()
+        .last()
+        .map(|row| row.insert_order)
+        .unwrap();
+    assert_eq!(
+        connector.inbound_marks.get(agent_id, None).unwrap(),
+        InboundMark::After(last),
+        "the mark is saved through the last page"
+    );
+    assert!(read().await.is_empty(), "nothing is sent twice");
+
+    // A scope's first read starts just before the first row received since the subscription
+    // began, found by walking storage: rows stored while that walk runs were received later,
+    // so the start never passes one of them, and every row received earlier is history.
+    let rows = connector
+        .stored_rows(agent_id, None, 0, crate::inbound::INBOUND_PAGE_ROWS)
+        .unwrap();
+    let since = rows.last().unwrap().received_at;
+    let start = connector
+        .position_received_since(agent_id, None, since, 2)
+        .unwrap();
+    assert!(
+        rows.iter()
+            .filter(|row| row.insert_order <= start)
+            .all(|row| row.received_at < since),
+        "the start never passes a row received since the subscription began"
+    );
+    assert!(
+        rows.iter()
+            .take_while(|row| row.received_at < since)
+            .all(|row| row.insert_order <= start),
+        "the start passes every earlier row"
     );
 }
 
