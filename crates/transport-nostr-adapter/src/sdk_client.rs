@@ -528,60 +528,17 @@ impl NostrSdkRelayHealth {
     }
 }
 
-fn acquisition_filter(request: &NostrAcquisitionRequest) -> Result<Filter, NostrAcquisitionError> {
-    Ok(match &request.scope {
-        // A one-id REQ asks for at most one event, which no relay's limit can
-        // cut (mdk#2332). A batch carries no limit: a relay that clamps an
-        // explicit limit below the batch would drop some of its ids.
-        NostrAcquisitionScope::KnownEventIds(ids) => {
-            let filter = Filter::new().ids(ids.iter().copied().map(EventId::from_byte_array));
-            if ids.len() == 1 {
-                filter.limit(1)
-            } else {
-                filter
-            }
-        }
-        NostrAcquisitionScope::AccountInboxWindow { since, until } => {
-            let recipient = PublicKey::from_slice(request.account_id.as_slice())
-                .map_err(|_| NostrAcquisitionError::InvalidRequest)?;
-            Filter::new()
-                .kind(Kind::GiftWrap)
-                .pubkey(recipient)
-                .since(NostrTimestamp::from_secs(*since))
-                .until(NostrTimestamp::from_secs(*until))
-        }
-        NostrAcquisitionScope::GroupWindow {
-            transport_group_id,
-            since,
-            until,
-            newest,
-        } => {
-            let filter = Filter::new()
-                .kind(Kind::MlsGroupMessage)
-                .custom_tags(
-                    SingleLetterTag::from_char('h').expect("h is a valid single-letter tag"),
-                    [hex::encode(transport_group_id)],
-                )
-                .since(NostrTimestamp::from_secs(*since))
-                .until(NostrTimestamp::from_secs(*until));
-            match newest {
-                Some(newest) => filter.limit(*newest),
-                None => filter,
-            }
-        }
-        NostrAcquisitionScope::GroupsWindow {
-            transport_group_ids,
-            since,
-            until,
-        } => Filter::new()
-            .kind(Kind::MlsGroupMessage)
-            .custom_tags(
-                SingleLetterTag::from_char('h').expect("h is a valid single-letter tag"),
-                transport_group_ids.iter().map(hex::encode),
-            )
-            .since(NostrTimestamp::from_secs(*since))
-            .until(NostrTimestamp::from_secs(*until)),
-    })
+fn acquisition_filter(request: &NostrAcquisitionRequest) -> Filter {
+    let NostrAcquisitionScope::KnownEventIds(ids) = &request.scope;
+    let filter = Filter::new().ids(ids.iter().copied().map(EventId::from_byte_array));
+    // A one-id REQ asks for at most one event, which no relay's limit can cut
+    // (mdk#2332). A batch carries no limit: a relay that clamps an explicit
+    // limit below the batch would drop some of its ids.
+    if ids.len() == 1 {
+        filter.limit(1)
+    } else {
+        filter
+    }
 }
 
 fn project_acquisition(
@@ -627,7 +584,6 @@ fn project_acquisition(
         end,
         stats: NostrAcquisitionStats {
             raw_received_items: outcome.raw_received_items,
-            oldest_raw_created_at: outcome.oldest_raw_created_at.map(|at| at.as_secs()),
             received_items: outcome.received_items,
             serialized_event_bytes: outcome.received_event_bytes,
             duplicates: outcome.duplicates,
@@ -5853,7 +5809,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
     ) -> Result<NostrAcquisitionResult, NostrAcquisitionError> {
         request.validate()?;
         let deadline = tokio::time::Instant::now() + request.limits.max_duration;
-        let filter = acquisition_filter(&request)?;
+        let filter = acquisition_filter(&request);
         let endpoints = request
             .endpoints
             .iter()
@@ -6972,9 +6928,9 @@ mod tests {
             1,
             4_096,
         );
-        assert_eq!(acquisition_filter(&one).unwrap().limit, Some(1));
+        assert_eq!(acquisition_filter(&one).limit, Some(1));
         let batch = acquisition_request(account_id, endpoint, vec![[1; 32], [2; 32]], 2, 4_096);
-        let filter = acquisition_filter(&batch).unwrap();
+        let filter = acquisition_filter(&batch);
         assert_eq!(filter.limit, None);
         assert_eq!(filter.ids.map(|ids| ids.len()), Some(2));
     }
@@ -8519,24 +8475,21 @@ mod tests {
 
         let route = [0xD4; 32];
         let mut expected = HashSet::new();
+        let mut ids = Vec::new();
         for index in 0..256 {
             let event = stored_group_event(&route, 5_000 + index);
             expected.insert(event.id.to_hex());
+            ids.push(event.id.to_bytes());
             relay.add_event(event).await.unwrap();
         }
         let expected = expected.iter().map(String::as_str).collect::<HashSet<_>>();
         let request = NostrAcquisitionRequest {
             account_id: account,
-            scope: NostrAcquisitionScope::GroupWindow {
-                transport_group_id: route,
-                since: 0,
-                until: 10_000,
-                newest: None,
-            },
+            scope: NostrAcquisitionScope::KnownEventIds(ids),
             endpoints: vec![endpoint],
             limits: NostrAcquisitionLimits {
                 max_endpoints: 1,
-                max_requested_event_ids: 1,
+                max_requested_event_ids: 256,
                 max_received_items_per_endpoint: 512,
                 max_serialized_event_bytes_per_endpoint: 1024 * 1024,
                 max_duration: Duration::from_secs(10),

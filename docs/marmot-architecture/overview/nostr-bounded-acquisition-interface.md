@@ -31,14 +31,10 @@ The production `NostrSdkRelayClient` implements both operations.
 
 ## Request
 
-The request's `account_id` selects the authentication context and inbox recipient. `NostrAcquisitionScope` is one of:
-
-- `KnownEventIds`: reacquire explicit event IDs. A one-ID REQ carries `limit` 1; a batch carries none, because a
-  relay that clamps an explicit limit below the batch would drop IDs. This cannot discover unknown history.
-- `AccountInboxWindow { since, until }`: kind 1059 filtered by the account's `p` tag.
-- `GroupWindow { transport_group_id, since, until }`: kind 445 filtered by the exact 32-byte `h` tag.
-
-Both time bounds are inclusive, and a window is never issued as an unfiltered time REQ.
+The request's `account_id` selects the authentication context. Its `NostrAcquisitionScope` is
+`KnownEventIds`: reacquire explicit event IDs. A one-ID REQ carries `limit` 1; a batch carries none, because a relay
+that clamps an explicit limit below the batch would drop IDs. This cannot discover unknown history; the time-sliced
+sweep owns window reads.
 
 The caller keeps its own recovery identifiers across the await and pairs them with the owned result when it hands
 events to the worker. The transport does not echo or validate durable recovery
@@ -57,7 +53,7 @@ identifiers.
 | `max_duration` | One elapsed deadline for the whole call. |
 
 Validation runs before any I/O. It rejects an empty endpoint list, empty or duplicate endpoints, more endpoints than
-`max_endpoints`, zero budgets, empty, repeated or oversized explicit-ID filters, and reversed time windows. It does not
+`max_endpoints`, zero budgets, empty, repeated or oversized explicit-ID filters. It does not
 impose upper ceilings on caller-chosen item, byte, duration or concurrency budgets; deployment-wide ceilings belong to
 the caller.
 
