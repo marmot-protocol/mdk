@@ -6765,7 +6765,10 @@ pub(crate) async fn neg_sync_dry_run(
         NostrReconciliationFailure::LocalError => NegFailure::Local,
         // Only the relay's own word that it lacks NIP-77 leaves the second
         // unproven; with a protocol error kept apart above, that is what
-        // remains of this class.
+        // remains of this class: the SDK's "negentropy not supported" NOTICE
+        // (`bad msg` with `unknown cmd`, `negentropy` or `NEG-`). With no
+        // document it releases a held group as well (mdk#3264): such a relay
+        // can never prove the second.
         NostrReconciliationFailure::NegentropyUnsupported => NegFailure::Unproven,
         // No NIP-77 sync ends in these. Any that did proved nothing this
         // time, and a later attempt may complete it.

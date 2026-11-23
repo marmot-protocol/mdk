@@ -305,8 +305,9 @@ async fn a_second_without_relay_metadata_advances_only_after_reconciliation() {
     assert_eq!(published.end, SweepEnd::SaturatedSecond { second: T0 });
     assert_eq!(fixture.limit.stats().neg_opens, 0);
 
-    // A refused NEG-OPEN, or the `unknown cmd` NOTICE a relay without NIP-77
-    // sends, answers that the relay cannot prove the second.
+    // A refused NEG-OPEN, or a NOTICE the SDK reads as "negentropy not
+    // supported" (here strfry's `unknown cmd`), answers that the relay cannot
+    // prove the second.
     for fault in [NegFault::ErrOnOpen, NegFault::UnknownCmdOnOpen] {
         fixture.limit.set_neg_fault(fault);
         let refused = run_sweep(request(range), &relay, &mut sink, &store, &cancel).await;

@@ -1046,8 +1046,10 @@ second it owes because its relay cannot prove it under the caps the relay publis
 no NIP-77 proof; migration 0151 records that second), would stop on the same second if asked
 again while those caps stand. A relay whose document was never read saturates the same way once
 the relay itself answers that it cannot prove that second (mdk#3264): a NEG-ERR to the NEG-OPEN
-before any NIP-77 reply, its `unknown cmd` NOTICE, or more ids for the second than one exchange
-lists. The second stays owed, and newer live frames no longer wait about 15 minutes for the unit to break. A
+before any NIP-77 reply, a NOTICE the SDK reads as "negentropy not supported" (`bad msg` with
+`unknown cmd`, `negentropy` or `NEG-`), or more ids for the second than one exchange lists. A
+relay with no document that cannot take NIP-77 messages can never prove that second, so holding
+newer frames behind it buys nothing. The second stays owed, and newer live frames no longer wait about 15 minutes for the unit to break. A
 `rate-limited:` refusal is waited out, and an `auth-required:` or `error:` one, silence, or a
 failure after the relay began reconciling is inconclusive: a relay that ignores the NEG-OPEN still
 holds them until the unit breaks. It pursues again once
