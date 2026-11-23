@@ -15,6 +15,7 @@ mod event_projection;
 mod group_profile_tool;
 mod identity;
 mod inbound;
+mod inbound_marks;
 mod invite_policy;
 mod maintenance;
 mod media_roots;
@@ -229,6 +230,8 @@ pub struct AgentConnector {
     pub(crate) app: MarmotApp,
     pub(crate) runtime: MarmotAppRuntime,
     pub(crate) inbound_catch_up: InboundCatchUpDriver,
+    /// Durable per-scope inbound delivery marks (mdk#3551).
+    pub(crate) inbound_marks: inbound_marks::InboundMarks,
     /// Aggregate counters for the background reconciliation loops (mdk#1380).
     pub(crate) reconcile_telemetry: std::sync::Arc<reconcile_telemetry::ReconcileTelemetry>,
     /// Test-only fault-injection hooks for the invite-policy worker (absent
@@ -291,6 +294,7 @@ impl AgentConnector {
             app,
             runtime,
             inbound_catch_up,
+            inbound_marks: inbound_marks::InboundMarks::new(&config.home),
             reconcile_telemetry,
             #[cfg(test)]
             test_hooks: std::sync::Arc::new(test_support::ConnectorTestHooks::default()),

@@ -1,10 +1,12 @@
-//! Inbound subscription drain loop and storage-backed replay after broadcast lag.
+//! Inbound subscription drain loop, delivery of what was stored after a scope's durable mark,
+//! and storage-backed replay after broadcast lag.
 
 use agent_control::{
     AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
     AgentControlResponse, read_envelope,
 };
-use marmot_app::AppMessageQuery;
+use marmot_account::AccountSummary;
+use marmot_app::{AppMessageQuery, AppMessageRecord, MarmotAppEvent};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::broadcast;
 
@@ -40,6 +42,42 @@ impl AgentConnector {
         let response = AgentControlEnvelope::new(request_id.clone(), AgentControlResponse::Ack);
         write_control_frame(writer, &response).await?;
 
+        // Tracks the durable storage row ids already delivered on this subscription so a
+        // storage-backed replay after broadcast lag re-delivers only genuinely-missed
+        // events (never re-flooding the agent with facts it already handled, and never
+        // double-delivering one that raced live delivery). Bounded so a long-lived
+        // subscription cannot grow this set without limit; the queue evicts the oldest ids.
+        let mut delivered = DeliveredInboundCursor::new(DELIVERED_INBOUND_CURSOR_CAPACITY);
+
+        // mdk#3551: hand over what was stored after this scope's mark while no subscriber was
+        // attached, such as a message that arrived during a gateway restart. The runtime
+        // receiver above was subscribed first, so nothing stored after this read is missed.
+        match self.inbound_accounts(account_id_hex.as_deref()) {
+            Ok(accounts) => {
+                for account in accounts {
+                    self.deliver_stored_inbound(
+                        &request_id,
+                        &account.label,
+                        &account.account_id_hex,
+                        group_id_hex.as_deref(),
+                        &mut delivered,
+                        writer,
+                    )
+                    .await?;
+                }
+            }
+            Err(err) => {
+                self.signal_stored_inbound_unread(
+                    &request_id,
+                    account_id_hex.as_deref(),
+                    group_id_hex.as_deref(),
+                    &err,
+                    writer,
+                )
+                .await?;
+            }
+        }
+
         // Request the initial catch-up without blocking this drain loop. catch_up_accounts() can
         // block for as long as an account's startup keeps progressing, up to
         // APP_RUNTIME_ACCOUNT_READY_WAIT after it stalls, and can itself emit many runtime
@@ -54,14 +92,23 @@ impl AgentConnector {
         });
         let mut initial_catch_up_pending = true;
 
-        // Tracks the durable storage row ids already delivered on this subscription so a
-        // storage-backed replay after broadcast lag re-delivers only genuinely-missed
-        // events (never re-flooding the agent with facts it already handled, and never
-        // double-delivering one that raced live delivery). Bounded so a long-lived
-        // subscription cannot grow this set without limit; the queue evicts the oldest ids.
-        let mut delivered = DeliveredInboundCursor::new(DELIVERED_INBOUND_CURSOR_CAPACITY);
-
+        // The account of the last live message or group-state notice this subscription covers.
+        // The notice wakes a read of what that account stored after its mark: MDK may store a
+        // row before announcing it, or announce rows out of storage order, so the mark moves
+        // only through what storage holds, never from the notice itself.
+        let mut stored_account: Option<(String, String)> = None;
         loop {
+            if let Some((account_label, account_id_hex)) = stored_account.take() {
+                self.deliver_stored_inbound(
+                    &request_id,
+                    &account_label,
+                    &account_id_hex,
+                    group_id_hex.as_deref(),
+                    &mut delivered,
+                    writer,
+                )
+                .await?;
+            }
             let event = tokio::select! {
                 catch_up_result = &mut initial_catch_up, if initial_catch_up_pending => {
                     initial_catch_up_pending = false;
@@ -108,6 +155,10 @@ impl AgentConnector {
                     match event {
                         Ok(event) => {
                             let replay_id = runtime_replay_dedup_key(&event);
+                            if replay_id.is_some() {
+                                stored_account =
+                                    runtime_event_account(&event, account_id_hex.as_deref());
+                            }
                             match control_event_from_runtime_event_with_runtime(
                                 &self.runtime,
                                 event,
@@ -301,6 +352,183 @@ impl AgentConnector {
         }
     }
 
+    /// The accounts a subscription covers: the one it names, or every local account.
+    fn inbound_accounts(
+        &self,
+        account_filter: Option<&str>,
+    ) -> Result<Vec<AccountSummary>, ConnectorError> {
+        Ok(match account_filter {
+            Some(account_id_hex) => vec![self.local_account_for_account_id(account_id_hex)?],
+            None => self.account_home.accounts()?,
+        })
+    }
+
+    /// Delivers what `account` stored after this scope's durable mark and this subscription has
+    /// not sent yet, then moves the mark past every row read (mdk#3551). The first subscriber of
+    /// a scope starts at the newest stored row, so history is never replayed as new messages. A
+    /// backlog larger than the replay window is signalled with `resync_required` instead of a
+    /// partial replay, like broadcast lag. A storage failure leaves the mark where it was, so the
+    /// rows are read again on the next notice or subscription. Only a failed write to the client
+    /// is returned as an error.
+    async fn deliver_stored_inbound<W>(
+        &self,
+        request_id: &Option<String>,
+        account_label: &str,
+        account_id_hex: &str,
+        group_filter: Option<&str>,
+        delivered: &mut DeliveredInboundCursor,
+        writer: &mut W,
+    ) -> Result<(), ConnectorError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let read_through = match self.stored_inbound(account_label, account_id_hex, group_filter) {
+            Ok(StoredInbound::Start { newest }) => Ok(newest),
+            Ok(StoredInbound::Rows { mut rows, through }) => loop {
+                match rows.next_event(self, delivered) {
+                    Ok(Some(event)) => {
+                        let envelope = AgentControlEnvelope::new(request_id.clone(), event);
+                        write_control_frame(writer, &envelope).await?;
+                    }
+                    Ok(None) => break Ok(through),
+                    Err(err) => break Err(err),
+                }
+            },
+            Ok(StoredInbound::Overflow { newest, rows }) => {
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "deliver_stored_inbound",
+                    stored_rows = rows,
+                    replay_window = DELIVERED_INBOUND_CURSOR_CAPACITY,
+                    "stored inbound backlog exceeded the replay window; emitting resync_required"
+                );
+                ReconcileTelemetry::bump(&self.reconcile_telemetry.resync_required);
+                let event = resync_required_event(Some(account_id_hex), group_filter, rows as u64);
+                write_control_frame(
+                    writer,
+                    &AgentControlEnvelope::new(request_id.clone(), event),
+                )
+                .await?;
+                Ok(newest)
+            }
+            Err(err) => Err(err),
+        };
+        match read_through {
+            Ok(insert_order) => {
+                if let Err(err) =
+                    self.inbound_marks
+                        .advance(account_id_hex, group_filter, insert_order)
+                {
+                    // Delivery already happened. A mark left behind only repeats those rows to
+                    // the next subscriber, which deduplicates by message id.
+                    tracing::warn!(
+                        target: "agent_connector",
+                        method = "deliver_stored_inbound",
+                        error_code = err.privacy_safe_code(),
+                        "failed to persist the inbound delivery mark"
+                    );
+                }
+                Ok(())
+            }
+            Err(err) => {
+                self.signal_stored_inbound_unread(
+                    request_id,
+                    Some(account_id_hex),
+                    group_filter,
+                    &err,
+                    writer,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Tells the client that stored rows could not be read, so it re-pages the timeline.
+    async fn signal_stored_inbound_unread<W>(
+        &self,
+        request_id: &Option<String>,
+        account_filter: Option<&str>,
+        group_filter: Option<&str>,
+        err: &ConnectorError,
+        writer: &mut W,
+    ) -> Result<(), ConnectorError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        tracing::warn!(
+            target: "agent_connector",
+            method = "deliver_stored_inbound",
+            error_code = err.privacy_safe_code(),
+            "stored inbound read failed; emitting resync_required"
+        );
+        ReconcileTelemetry::bump(&self.reconcile_telemetry.resync_required);
+        let event = resync_required_event(account_filter, group_filter, 1);
+        write_control_frame(
+            writer,
+            &AgentControlEnvelope::new(request_id.clone(), event),
+        )
+        .await
+    }
+
+    /// Reads what `account` stored after this scope's mark, in storage order.
+    fn stored_inbound(
+        &self,
+        account_label: &str,
+        account_id_hex: &str,
+        group_filter: Option<&str>,
+    ) -> Result<StoredInbound, ConnectorError> {
+        let page = |after: i64| -> Result<Vec<AppMessageRecord>, ConnectorError> {
+            let query = AppMessageQuery {
+                group_id_hex: group_filter.map(str::to_owned),
+                kinds: None,
+                limit: Some(DELIVERED_INBOUND_CURSOR_CAPACITY + 1),
+            };
+            Ok(self
+                .runtime
+                .messages_after_insert_order(account_label, query, after)?)
+        };
+        // Pages on to the newest stored row, counting the rows passed.
+        let newest_after = |mut after: i64| -> Result<(i64, usize), ConnectorError> {
+            let mut rows = 0;
+            loop {
+                let page = page(after)?;
+                let Some(last) = page.last() else {
+                    return Ok((after, rows));
+                };
+                after = last.insert_order;
+                rows += page.len();
+                if page.len() <= DELIVERED_INBOUND_CURSOR_CAPACITY {
+                    return Ok((after, rows));
+                }
+            }
+        };
+        let Some(mark) = self.inbound_marks.get(account_id_hex, group_filter)? else {
+            let (newest, _) = newest_after(0)?;
+            return Ok(StoredInbound::Start { newest });
+        };
+        let rows = page(mark)?;
+        let through = rows.last().map_or(mark, |row| row.insert_order);
+        if rows.len() > DELIVERED_INBOUND_CURSOR_CAPACITY {
+            let (newest, more) = newest_after(through)?;
+            return Ok(StoredInbound::Overflow {
+                newest,
+                rows: rows.len() + more,
+            });
+        }
+        let rows = rows
+            .into_iter()
+            .map(|row| (account_label.to_owned(), account_id_hex.to_owned(), row))
+            .collect::<Vec<_>>();
+        Ok(StoredInbound::Rows {
+            rows: MissedInbound {
+                account_filter: Some(account_id_hex.to_owned()),
+                group_filter: group_filter.map(str::to_owned),
+                rows: rows.into_iter(),
+            },
+            through,
+        })
+    }
+
     /// Recover control events that were dropped from the broadcast channel by re-reading durable
     /// per-account storage. Returns the rows this subscription's filters cover and `delivered`
     /// has not recorded; [`MissedInbound::next_event`] projects them one at a time. This is how a
@@ -315,10 +543,7 @@ impl AgentConnector {
     ) -> Result<MissedInbound, ConnectorError> {
         // Replay for the filtered account, or for every local account on an unscoped
         // subscription (mirroring the live path, which emits for all local accounts).
-        let accounts = match account_filter {
-            Some(account_id_hex) => vec![self.local_account_for_account_id(account_id_hex)?],
-            None => self.account_home.accounts()?,
-        };
+        let accounts = self.inbound_accounts(account_filter)?;
         let mut rows = Vec::new();
         for account in accounts {
             // #609/#747: bound the replay to the newest `DELIVERED_INBOUND_CURSOR_CAPACITY`
@@ -356,6 +581,33 @@ impl AgentConnector {
             rows: rows.into_iter(),
         })
     }
+}
+
+/// What an account stored after a scope's mark.
+enum StoredInbound {
+    /// The scope had no mark: everything stored up to `newest` is history.
+    Start { newest: i64 },
+    /// The rows to deliver, and the position of the last row read.
+    Rows { rows: MissedInbound, through: i64 },
+    /// More rows than the replay window, up to `newest`.
+    Overflow { newest: i64, rows: usize },
+}
+
+/// The account of a live message or group-state notice that `account_filter` covers.
+fn runtime_event_account(
+    event: &MarmotAppEvent,
+    account_filter: Option<&str>,
+) -> Option<(String, String)> {
+    let (account_label, account_id_hex) = match event {
+        MarmotAppEvent::MessageReceived(update) => (&update.account_label, &update.account_id_hex),
+        MarmotAppEvent::GroupEvent(group_event) => {
+            (&group_event.account_label, &group_event.account_id_hex)
+        }
+        _ => return None,
+    };
+    account_filter
+        .is_none_or(|filter| filter == account_id_hex)
+        .then(|| (account_label.clone(), account_id_hex.clone()))
 }
 
 /// Stored rows a lagged subscription missed, still unprojected. Each row is projected only when

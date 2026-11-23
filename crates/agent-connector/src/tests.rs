@@ -2222,6 +2222,175 @@ async fn connector_socket_subscribe_terminates_when_client_disconnects() {
         .unwrap();
 }
 
+/// mdk#3551: a message stored while no subscriber is attached (for example during a gateway
+/// restart) reaches the next subscriber exactly once. What was stored before the first
+/// subscriber, and what an earlier subscriber already received, is not handed out.
+#[tokio::test]
+async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attached() {
+    storage_sqlite::relax_storage_for_test_process();
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent restart window",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
+    accept_group_invite_retrying_busy(&setup_runtime, &human.account.account_id_hex, &group_id)
+        .await;
+    setup_runtime.shutdown().await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let server = tokio::spawn(serve_socket(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    )));
+    let human_says = |id: &'static str, text: &'static str| {
+        send_control_request(
+            &socket,
+            id,
+            AgentControlRequest::SendFinal {
+                account_id_hex: human.account.account_id_hex.clone(),
+                group_id_hex: group_id_hex.clone(),
+                text: text.to_owned(),
+                reply_to_message_id_hex: None,
+                idempotency_key: None,
+            },
+        )
+    };
+    // Sends as the human and waits until the agent account has stored the message.
+    let human_says_and_agent_stores = async |id: &'static str, text: &'static str| {
+        let sent = human_says(id, text).await;
+        let AgentControlResponse::FinalSent {
+            message_ids_hex, ..
+        } = sent.payload
+        else {
+            panic!("expected human final send, got {:?}", sent.payload);
+        };
+        for _ in 0..100 {
+            let read = send_control_request(
+                &socket,
+                "req-stored",
+                AgentControlRequest::TimelineMessageGet {
+                    account_id_hex: agent.account.account_id_hex.clone(),
+                    group_id_hex: group_id_hex.clone(),
+                    message_id_hex: message_ids_hex[0].clone(),
+                },
+            )
+            .await;
+            if matches!(
+                read.payload,
+                AgentControlResponse::TimelineMessage {
+                    message: Some(_),
+                    ..
+                }
+            ) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the agent account never stored {text:?}");
+    };
+    // Subscribes as the agent, then sends `live` and returns the inbound texts read up to it.
+    let subscribe_and_read_through = async |id: &'static str, live: &'static str| {
+        let stream = connect_with_retry(&socket).await;
+        let (read, mut write) = tokio::io::split(stream);
+        let mut read = BufReader::new(read);
+        let subscribe = AgentControlEnvelope::request(
+            Some(id.to_owned()),
+            AgentControlRequest::SubscribeInbound {
+                account_id_hex: Some(agent.account.account_id_hex.clone()),
+                group_id_hex: None,
+            },
+        );
+        write_frame(&mut write, &subscribe).await.unwrap();
+        let ack: AgentControlEnvelope<AgentControlResponse> =
+            timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut read))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(ack.payload, AgentControlResponse::Ack);
+        human_says("req-live", live).await;
+        let mut texts = Vec::new();
+        while !texts.iter().any(|text| text == live) {
+            let event: AgentControlEnvelope<AgentControlEvent> =
+                timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut read))
+                    .await
+                    .expect("the subscriber receives the live message")
+                    .unwrap()
+                    .unwrap();
+            if let AgentControlEvent::InboundMessage { message, .. } = event.payload {
+                texts.push(message.text);
+            }
+        }
+        texts
+    };
+
+    human_says_and_agent_stores("req-history", "history").await;
+    assert_eq!(
+        subscribe_and_read_through("req-first-subscribe", "before the restart").await,
+        ["before the restart"],
+        "the first subscriber starts at the newest stored message"
+    );
+
+    // The agent runtime is away: the message is ingested and stored with nobody listening.
+    human_says_and_agent_stores("req-away", "while you were away").await;
+    assert_eq!(
+        subscribe_and_read_through("req-second-subscribe", "after the restart").await,
+        ["while you were away", "after the restart"],
+        "the stored message is delivered once, and nothing the first subscriber had is repeated"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+/// mdk#3551: a scope's delivery mark outlives the connector, never moves back, and each
+/// subscription scope keeps its own.
+#[test]
+fn inbound_marks_persist_per_scope_and_only_move_forward() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = "aa".repeat(32);
+    let group = "bb".repeat(32);
+    let marks = crate::inbound_marks::InboundMarks::new(dir.path());
+    assert_eq!(marks.get(&account, None).unwrap(), None);
+    marks.advance(&account, None, 7).unwrap();
+    marks.advance(&account, None, 3).unwrap();
+    marks.advance(&account, Some(&group), 2).unwrap();
+
+    let reopened = crate::inbound_marks::InboundMarks::new(dir.path());
+    assert_eq!(reopened.get(&account, None).unwrap(), Some(7));
+    assert_eq!(reopened.get(&account, Some(&group)).unwrap(), Some(2));
+    assert_eq!(
+        reopened.get(&account, Some(&"cc".repeat(32))).unwrap(),
+        None
+    );
+}
+
 #[tokio::test]
 async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
     let dir = tempfile::tempdir().unwrap();

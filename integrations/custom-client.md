@@ -273,9 +273,11 @@ The first reply is `{"type": "ack", ...}`. Every later line is an event with the
 - The agent's own messages are not delivered back to it.
 - Other event types include `message_edited`, `message_deleted`, `reaction_added`, `reaction_removed`,
   `group_state_changed` and `group_invite`. Ignore types you do not handle.
-- The stream carries what arrives while you are connected. Deduplicate by `message_id_hex`, reconnect when the
-  connection closes, and after a reconnect or a `resync_required` event, page `timeline_list` (`account_id_hex`,
-  `group_id_hex`, optional `limit`) to fill the gap.
+- The first subscription for an `account_id_hex` and `group_id_hex` pair starts with what arrives after it. Each
+  later subscription with the same pair first delivers what was stored while none was connected, then what arrives.
+  A message can come again after a reconnect: deduplicate by `message_id_hex`. Reconnect when the connection closes,
+  and after a `resync_required` event page `timeline_list` (`account_id_hex`, `group_id_hex`, optional `limit`) to
+  fill the gap.
 - The daemon accepts at most 16 subscriptions at once and answers `server_busy` beyond that.
 
 ## Check a full round trip
