@@ -6591,16 +6591,47 @@ async fn sync_watching_neg_cap(
 }
 
 /// A failed NIP-77 sync: its reconciliation class, whether the SDK reported a
-/// protocol error, and whether the relay sent any NEG-MSG first. A malformed
+/// protocol error, and whether the relay may have answered. A malformed
 /// exchange is not the relay saying it lacks NIP-77, and a later attempt may
 /// complete it.
 struct NegSyncError {
     failure: NostrReconciliationFailure,
     malformed: bool,
-    /// The relay began reconciling, so a later failure is not a refusal of
-    /// NIP-77. Another NEG session on the same relay may set it too, which
-    /// only keeps a refusal from counting as one.
+    /// The relay sent a NEG-MSG, or its connection changed or notifications
+    /// were missed, so a failure may not be its refusal of NIP-77. Another
+    /// NEG session on the same relay may set it too, which only keeps a
+    /// refusal from counting as one.
     answered: bool,
+}
+
+/// What a NIP-77 sync's relay notifications showed.
+#[derive(Default)]
+struct NegWatch {
+    cap_notice: bool,
+    answered: bool,
+}
+
+impl NegWatch {
+    fn observe(&mut self, update: NotificationUpdate<RelayNotification>) {
+        let NotificationUpdate::Notification(notification) = update else {
+            // A reply may have gone unseen.
+            self.answered = true;
+            return;
+        };
+        self.cap_notice |= is_neg_cap_notice(&notification);
+        self.answered |= match &notification {
+            RelayNotification::Message { message } => {
+                matches!(message.as_ref(), RelayMessage::NegMsg { .. })
+            }
+            // The connection may not have carried a reply.
+            RelayNotification::RelayStatus { .. } => true,
+            _ => false,
+        };
+    }
+
+    fn settled(&self) -> bool {
+        self.cap_notice && self.answered
+    }
 }
 
 impl From<NostrReconciliationFailure> for NegSyncError {
@@ -6634,36 +6665,29 @@ async fn sync_watching_neg_cap_detailed(
     // The SDK exposes no completion handle for that task; unlike success, this
     // does not guarantee NEG-CLOSE reaches the socket queue before credit reuse.
     // Subscribe before the NEG-OPEN goes out, so the answer cannot be missed.
-    let mut notifications = relay.notifications();
+    let mut notifications = relay.notifications_with_gaps();
     let sync = relay.sync(filter).items(items).opts(options).into_future();
     tokio::pin!(sync);
-    let mut cap_notice = false;
-    let mut answered = false;
+    let mut watch = NegWatch::default();
     let result = loop {
         tokio::select! {
             result = &mut sync => break result,
-            Some(notification) = notifications.next(), if !(cap_notice && answered) => {
-                cap_notice |= is_neg_cap_notice(&notification);
-                answered |= is_neg_msg(&notification);
-            }
+            Some(update) = notifications.next(), if !watch.settled() => watch.observe(update),
         }
     };
     // The failure and a message already queued can be ready in the same wake.
     if result.is_err() {
-        while !(cap_notice && answered) {
+        while !watch.settled() {
             match futures::FutureExt::now_or_never(notifications.next()) {
-                Some(Some(notification)) => {
-                    cap_notice |= is_neg_cap_notice(&notification);
-                    answered |= is_neg_msg(&notification);
-                }
+                Some(Some(update)) => watch.observe(update),
                 _ => break,
             }
         }
     }
     result.map_err(|error| NegSyncError {
-        failure: sync_failure(&error, cap_notice),
+        failure: sync_failure(&error, watch.cap_notice),
         malformed: matches!(error.kind(), SdkErrorKind::Protocol),
-        answered,
+        answered: watch.answered,
     })
 }
 
@@ -6758,14 +6782,6 @@ pub(crate) async fn neg_sync_dry_run(
         | NostrReconciliationFailure::Withheld
         | NostrReconciliationFailure::PassLimit => NegFailure::Inconclusive,
     })
-}
-
-fn is_neg_msg(notification: &nostr_sdk::relay::RelayNotification) -> bool {
-    matches!(
-        notification,
-        nostr_sdk::relay::RelayNotification::Message { message }
-            if matches!(message.as_ref(), RelayMessage::NegMsg { .. })
-    )
 }
 
 fn is_neg_cap_notice(notification: &nostr_sdk::relay::RelayNotification) -> bool {

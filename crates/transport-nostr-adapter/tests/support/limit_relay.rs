@@ -71,6 +71,8 @@ pub enum NegFault {
     None,
     /// Answer every NEG-OPEN with NEG-ERR (session not created).
     ErrOnOpen,
+    /// As [`NegFault::ErrOnOpen`], with this reason.
+    ErrOnOpenWith(&'static str),
     /// Swallow every NEG-OPEN: the session is open on the relay, but nothing
     /// answers it (exercises the client's first-reply timeout).
     SilentOpen,
@@ -950,7 +952,11 @@ fn inspect_client_frame(
                             .then(|| serde_json::json!(["NEG-CLOSE", id]).to_string()),
                     }
                 }
-                None if fault == NegFault::ErrOnOpen => {
+                None if matches!(fault, NegFault::ErrOnOpen | NegFault::ErrOnOpenWith(_)) => {
+                    let reason = match fault {
+                        NegFault::ErrOnOpenWith(reason) => reason,
+                        _ => "blocked: injected refusal",
+                    };
                     *shared
                         .stats
                         .neg_rejections
@@ -958,8 +964,7 @@ fn inspect_client_frame(
                         .or_default() += 1;
                     shared.refresh(connection);
                     Verdict::Refuse {
-                        reply: serde_json::json!(["NEG-ERR", id, "blocked: injected refusal"])
-                            .to_string(),
+                        reply: serde_json::json!(["NEG-ERR", id, reason]).to_string(),
                         upstream: replaced
                             .then(|| serde_json::json!(["NEG-CLOSE", id]).to_string()),
                     }

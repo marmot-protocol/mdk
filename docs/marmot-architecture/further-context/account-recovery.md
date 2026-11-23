@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-11-18
+updated: 2026-11-23
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 

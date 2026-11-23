@@ -315,10 +315,38 @@ async fn a_second_without_relay_metadata_advances_only_after_reconciliation() {
         );
         assert!(sink.slices.is_empty());
     }
-    // A relay that began reconciling and then stalled may still prove it.
-    fixture.limit.set_neg_fault(NegFault::StallAfterReply);
-    let stalled = run_sweep(request(range), &relay, &mut sink, &store, &cancel).await;
-    assert_eq!(stalled.end, SweepEnd::InconclusiveSecond { second: T0 });
+    // A relay that may serve it after AUTH, that failed generically, or that
+    // began reconciling and then stalled may still prove it.
+    for fault in [
+        NegFault::ErrOnOpenWith("auth-required: injected"),
+        NegFault::ErrOnOpenWith("error: injected"),
+        NegFault::StallAfterReply,
+    ] {
+        fixture.limit.set_neg_fault(fault);
+        let retried = run_sweep(request(range), &relay, &mut sink, &store, &cancel).await;
+        assert_eq!(
+            retried.end,
+            SweepEnd::InconclusiveSecond { second: T0 },
+            "{fault:?}"
+        );
+        assert!(sink.slices.is_empty());
+    }
+    // Nor is silence over a connection that dropped after the NEG-OPEN.
+    fixture.limit.set_neg_fault(NegFault::SilentOpen);
+    let opens = fixture.limit.stats().neg_opens;
+    let (dropped, ()) = tokio::join!(
+        run_sweep(request(range), &relay, &mut sink, &store, &cancel),
+        async {
+            assert!(
+                fixture
+                    .limit
+                    .wait_for(Duration::from_secs(10), |stats| stats.neg_opens > opens)
+                    .await
+            );
+            fixture.limit.drop_all_connections();
+        }
+    );
+    assert_ne!(dropped.end, SweepEnd::SaturatedSecond { second: T0 });
     assert!(sink.slices.is_empty());
 
     fixture.limit.set_neg_fault(NegFault::None);
