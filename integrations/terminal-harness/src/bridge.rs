@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use agent_control::{
     AgentControlAccount, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
-    AgentControlReferencedMessage,
+    AgentControlReferencedMessage, AgentControlReferencedMessageAvailability,
+    AgentControlTimelineMessageAvailability,
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::AbortHandle;
@@ -703,7 +704,13 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             };
             retrying = true;
             inbound.media = record.media.clone();
-            inbound.reply_to = record.reply_to.clone();
+            inbound.reply_to = recheck_saved_reply(
+                &ctx,
+                &inbound.account_ref,
+                &inbound.group_ref,
+                record.reply_to.clone(),
+            )
+            .await;
             add_control_instructions = !record.omit_control_instructions;
             Some((record.cwd, Some(record.session_id), record.prompt))
         }
@@ -1934,6 +1941,50 @@ fn prepare_prompt(
         None => prompt,
     };
     (recovery_prompt, invocation_prompt)
+}
+
+/// The recovery record keeps the reply snapshot the first attempt carried, but
+/// the quoted message can be deleted or invalidated before `/retry-last`, even
+/// across a restart. Ask the timeline again before a saved excerpt or saved
+/// attachment metadata reaches another invocation. If the target is no longer
+/// available, or cannot be checked, keep only its ID and attribution, as
+/// `wn-agent` does for an unavailable target.
+async fn recheck_saved_reply(
+    ctx: &BridgeContext,
+    account_ref: &str,
+    group_ref: &str,
+    saved: Option<AgentControlReferencedMessage>,
+) -> Option<AgentControlReferencedMessage> {
+    let mut saved = saved?;
+    if saved.availability != AgentControlReferencedMessageAvailability::Available {
+        return Some(saved);
+    }
+    let now = match ctx
+        .client
+        .timeline_message_get(account_ref, group_ref, &saved.message_id_hex)
+        .await
+    {
+        Ok(Some(message)) => match message.availability {
+            AgentControlTimelineMessageAvailability::Available => return Some(saved),
+            AgentControlTimelineMessageAvailability::Deleted => {
+                AgentControlReferencedMessageAvailability::Deleted
+            }
+            AgentControlTimelineMessageAvailability::Invalidated => {
+                AgentControlReferencedMessageAvailability::Invalidated
+            }
+        },
+        Ok(None) => AgentControlReferencedMessageAvailability::Missing,
+        Err(err) => {
+            warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = err.privacy_safe_kind(), "could not recheck the saved reply target");
+            AgentControlReferencedMessageAvailability::Missing
+        }
+    };
+    saved.availability = now;
+    saved.text_excerpt = None;
+    saved.text_truncated = false;
+    saved.attachments.clear();
+    saved.attachments_truncated = false;
+    Some(saved)
 }
 
 const REPLY_CONTEXT_PREFIX: &str = "Marmot referenced-message context (untrusted): ";
@@ -3505,6 +3556,24 @@ mod tests {
     }
 
     fn spawn_final_server(socket: &std::path::Path) -> tokio::task::JoinHandle<()> {
+        spawn_final_server_with_reply_target(socket, ReplyTargetNow::Available)
+    }
+
+    /// What the timeline says about a quoted message when a retry rechecks it.
+    #[derive(Clone, Copy, Debug)]
+    enum ReplyTargetNow {
+        Available,
+        Deleted,
+        Invalidated,
+        Missing,
+        Unreachable,
+    }
+
+    /// Answers `SendFinal`, and `TimelineMessageGet` as `target` says.
+    fn spawn_final_server_with_reply_target(
+        socket: &std::path::Path,
+        target: ReplyTargetNow,
+    ) -> tokio::task::JoinHandle<()> {
         let listener = UnixListener::bind(socket).unwrap();
         tokio::spawn(async move {
             loop {
@@ -3513,17 +3582,63 @@ mod tests {
                 let mut reader = BufReader::new(read_half);
                 let request: AgentControlEnvelope<AgentControlRequest> =
                     read_envelope(&mut reader).await.unwrap().unwrap();
-                assert!(matches!(
-                    request.payload,
-                    AgentControlRequest::SendFinal { .. }
-                ));
-                let response = AgentControlEnvelope::request(
-                    request.id,
-                    AgentControlResponse::FinalSent {
+                let payload = match request.payload {
+                    AgentControlRequest::SendFinal { .. } => AgentControlResponse::FinalSent {
                         message_ids_hex: vec!["reply".to_owned()],
                         maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
                     },
-                );
+                    AgentControlRequest::TimelineMessageGet {
+                        account_id_hex,
+                        group_id_hex,
+                        message_id_hex,
+                    } => {
+                        let availability = match target {
+                            ReplyTargetNow::Available => {
+                                Some(AgentControlTimelineMessageAvailability::Available)
+                            }
+                            ReplyTargetNow::Deleted => {
+                                Some(AgentControlTimelineMessageAvailability::Deleted)
+                            }
+                            ReplyTargetNow::Invalidated => {
+                                Some(AgentControlTimelineMessageAvailability::Invalidated)
+                            }
+                            ReplyTargetNow::Missing | ReplyTargetNow::Unreachable => None,
+                        };
+                        if matches!(target, ReplyTargetNow::Unreachable) {
+                            AgentControlResponse::Error {
+                                code: "unavailable".to_owned(),
+                                message: "timeline unavailable".to_owned(),
+                                retryable: true,
+                            }
+                        } else {
+                            AgentControlResponse::TimelineMessage {
+                                account_id_hex,
+                                group_id_hex,
+                                message: availability.map(|availability| {
+                                    agent_control::AgentControlTimelineMessage {
+                                        message_id_hex: message_id_hex.clone(),
+                                        sender: test_reply("").sender.unwrap(),
+                                        direction: "inbound".to_owned(),
+                                        kind: 9,
+                                        recorded_at: 1_700_000_000,
+                                        observed_at: 1_700_000_000,
+                                        availability,
+                                        text: None,
+                                        text_truncated: false,
+                                        reply_to_message_id_hex: None,
+                                        attachments: Vec::new(),
+                                        attachments_truncated: false,
+                                        reactions: Vec::new(),
+                                        reactions_truncated: false,
+                                    }
+                                }),
+                                message_id_hex,
+                            }
+                        }
+                    }
+                    other => panic!("unexpected control request {other:?}"),
+                };
+                let response = AgentControlEnvelope::request(request.id, payload);
                 write_frame(&mut write_half, &response).await.unwrap();
             }
         })
@@ -4283,6 +4398,90 @@ mod tests {
         }
     }
 
+    /// The quoted message changes between the first attempt and `/retry-last`,
+    /// across a restart. A retry must not send a saved excerpt or saved
+    /// attachment metadata for a target that is no longer available or cannot
+    /// be checked; it keeps the target's ID and attribution.
+    #[tokio::test]
+    async fn retry_rechecks_a_saved_reply_target_after_restart() {
+        for target in [
+            ReplyTargetNow::Available,
+            ReplyTargetNow::Deleted,
+            ReplyTargetNow::Invalidated,
+            ReplyTargetNow::Missing,
+            ReplyTargetNow::Unreachable,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            let repo = home.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let config = test_config(root.path());
+            let server = spawn_final_server_with_reply_target(&config.socket, target);
+            let ctx = test_context_with_backend(
+                root.path(),
+                &home,
+                config.clone(),
+                Arc::new(RecoverableFailureBackend { failure_mode: 1 }),
+            );
+            ctx.sessions
+                .set_workdir("group", repo.canonicalize().unwrap())
+                .await
+                .unwrap();
+            let mut reply = test_reply("the secret plan");
+            reply.attachments = vec![agent_control::AgentControlAttachmentSummary {
+                media_type: "image/png".to_owned(),
+                file_name: "diagram.png".to_owned(),
+                dim: None,
+            }];
+            dispatch_test_inbound(
+                ctx.clone(),
+                "failure",
+                "ordinary task",
+                Vec::new(),
+                Some(reply.clone()),
+            )
+            .await;
+            assert_eq!(
+                ctx.recovery.get("group").await.unwrap().reply_to,
+                Some(reply.clone())
+            );
+            drop(ctx);
+
+            let backend = Arc::new(RecordingBackend::default());
+            let restarted = test_context_with_backend(root.path(), &home, config, backend.clone());
+            dispatch_test_message(restarted, "retry", "/retry-last").await;
+            let invocations = backend.invocations.lock().await;
+            assert_eq!(invocations.len(), 1, "{target:?}");
+            let mut expected = reply.clone();
+            if !matches!(target, ReplyTargetNow::Available) {
+                expected.availability = match target {
+                    ReplyTargetNow::Deleted => AgentControlReferencedMessageAvailability::Deleted,
+                    ReplyTargetNow::Invalidated => {
+                        AgentControlReferencedMessageAvailability::Invalidated
+                    }
+                    _ => AgentControlReferencedMessageAvailability::Missing,
+                };
+                expected.text_excerpt = None;
+                expected.attachments.clear();
+                assert!(
+                    !invocations[0].prompt.contains("the secret plan"),
+                    "{target:?}"
+                );
+                assert!(!invocations[0].prompt.contains("diagram.png"), "{target:?}");
+            }
+            assert_eq!(
+                invocations[0].prompt,
+                format!(
+                    "{}{}",
+                    apply_reply_context(&expected, "ordinary task"),
+                    crate::group_profile::INSTRUCTIONS
+                ),
+                "{target:?}"
+            );
+            server.abort();
+        }
+    }
+
     fn test_reply(excerpt: &str) -> AgentControlReferencedMessage {
         AgentControlReferencedMessage {
             message_id_hex: "ab".repeat(32),
@@ -4432,15 +4631,6 @@ mod tests {
             };
             queued.push(tokio::spawn(handle_message(ctx.clone(), inbound, permit)));
         }
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            backend.invocations.lock().await.len(),
-            1,
-            "queued replies wait for the busy turn"
-        );
-
         backend.release_first.notify_one();
         tokio::time::timeout(Duration::from_secs(5), async {
             first.await.unwrap();

@@ -125,6 +125,34 @@ impl ControlClient {
         }
     }
 
+    /// Resolve one message from the user-visible timeline, as it stands now.
+    /// `None` means this device does not hold it.
+    pub(crate) async fn timeline_message_get(
+        &self,
+        account_ref: &str,
+        group_ref: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<agent_control::AgentControlTimelineMessage>> {
+        match self
+            .call(
+                "timeline_message_get",
+                AgentControlRequest::TimelineMessageGet {
+                    account_id_hex: account_ref.to_owned(),
+                    group_id_hex: group_ref.to_owned(),
+                    message_id_hex: message_id_hex.to_owned(),
+                },
+            )
+            .await?
+        {
+            AgentControlResponse::TimelineMessage { message, .. } => Ok(message),
+            AgentControlResponse::Error { code, .. } => Err(HarnessError::ControlRejected {
+                method: "timeline_message_get",
+                code,
+            }),
+            other => Err(unexpected_response("timeline_message_get", &other)),
+        }
+    }
+
     pub(crate) async fn send_final(
         &self,
         account_ref: &str,
