@@ -361,8 +361,10 @@ pub struct ChatListRow {
     pub last_read_timeline_at: Option<u64>,
     /// Immutable local observation time for the conversation's creation.
     pub conversation_created_at: u64,
-    /// Durable user-visible activity anchor. Projection maintenance never
-    /// advances this value.
+    /// Durable user-visible activity anchor: the latest message, read
+    /// position or retained floor of pruned messages, or
+    /// `conversation_created_at` while the chat has none of them.
+    /// Projection maintenance never advances this value.
     pub activity_sort_at: u64,
     /// Wall-clock time of the last projection write for this row. Every
     /// rebuild re-stamps it, even when the derived content is unchanged,
@@ -1598,16 +1600,15 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.message_id_hex = row.last_message_id_hex
                      ), 'not_applicable')
-                   OR row.activity_sort_at IS NOT MAX(
+                   OR row.activity_sort_at IS NOT COALESCE(NULLIF(MAX(
                         row.retained_activity_sort_at,
                         COALESCE(row.last_message_timeline_at, 0),
                         COALESCE((
                             SELECT read_state.last_read_timeline_at
                             FROM conversation_read_state AS read_state
                             WHERE read_state.group_id_hex = ag.group_id_hex
-                        ), 0),
-                        ag.conversation_created_at
-                     )
+                        ), 0)
+                     ), 0), ag.conversation_created_at)
                    OR row.accepted_activity_insert_order < {accepted_high_water}
              )"
         ),
@@ -1672,7 +1673,11 @@ fn write_chat_list_row_for_group_tx(
     let accepted_activity_insert_order =
         latest_accepted_activity_insert_order_tx(tx, &group.group_id_hex)?.unwrap_or(0);
     let read_state = read_state_tx(tx, &group.group_id_hex)?;
-    let activity_sort_at = latest_message
+    // The chat's latest activity, 0 when it has none. Creation orders only a
+    // chat with no activity: a device that stores a chat after it began (a
+    // sibling's copy, a restore) anchors creation after the history it then
+    // imports (mdk#3580).
+    let activity = latest_message
         .map(|message| message.timeline_at)
         .into_iter()
         .chain(
@@ -1680,7 +1685,7 @@ fn write_chat_list_row_for_group_tx(
                 .as_ref()
                 .and_then(|state| state.last_read_timeline_at),
         )
-        .fold(group.conversation_created_at, u64::max);
+        .fold(0, u64::max);
     let now = unix_now_seconds();
     tx.execute_cached(
         "INSERT INTO chat_list_rows (
@@ -1700,7 +1705,7 @@ fn write_chat_list_row_for_group_tx(
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, 0, ?29, ?30, ?31, ?32
+            ?21, ?22, ?23, ?24, ?25, ?26, ?27, COALESCE(NULLIF(?28, 0), ?27), 0, ?29, ?30, ?31, ?32
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -1729,9 +1734,9 @@ fn write_chat_list_row_for_group_tx(
             last_read_message_id_hex = excluded.last_read_message_id_hex,
             last_read_timeline_at = excluded.last_read_timeline_at,
             conversation_created_at = excluded.conversation_created_at,
-            activity_sort_at = MAX(
-                excluded.activity_sort_at,
-                chat_list_rows.retained_activity_sort_at
+            activity_sort_at = COALESCE(
+                NULLIF(MAX(?28, chat_list_rows.retained_activity_sort_at), 0),
+                excluded.conversation_created_at
             ),
             retained_activity_sort_at = chat_list_rows.retained_activity_sort_at,
             accepted_activity_insert_order = MAX(
@@ -1802,7 +1807,7 @@ fn write_chat_list_row_for_group_tx(
                     .and_then(|state| state.last_read_timeline_at)
             )?,
             u64_to_i64(group.conversation_created_at)?,
-            u64_to_i64(activity_sort_at)?,
+            u64_to_i64(activity)?,
             accepted_activity_insert_order,
             u64_to_i64(now)?,
             group.self_membership.as_str(),

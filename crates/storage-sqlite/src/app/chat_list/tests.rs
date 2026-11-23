@@ -5241,6 +5241,85 @@ fn retention_scan_lets_imported_rows_expire_on_time() {
     }
 }
 
+/// mdk#3580: a device that stores a chat after it began (a sibling's copy,
+/// a restore) anchors its creation at that moment, after all the history it
+/// then imports. Creation orders only a chat with no activity; one with
+/// messages sorts by its latest message, on every write path, and rows the
+/// old rule wrote are rebuilt.
+#[test]
+fn imported_history_outranks_a_later_local_creation_anchor() {
+    let named = |id: &str| StoredAccountGroup {
+        group_id_hex: id.to_owned(),
+        ..group()
+    };
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups: vec![group(), named("22"), named("33")],
+            ..StoredAccountState::default()
+        },
+        256,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE account_groups SET conversation_created_at = CASE group_id_hex
+                 WHEN ?1 THEN 1000 WHEN '22' THEN 2000 ELSE 1500 END",
+            params![GROUP],
+        )
+        .unwrap();
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    for (group_id, at) in [(GROUP, 20), ("22", 10)] {
+        let id = format!("old-{group_id}");
+        app.import_app_events(group_id, &SOURCE_SLOT, &[imported(&id, 1, at, None)], 3000)
+            .unwrap();
+        let row = app
+            .refresh_chat_list_row_for_messages(LOCAL, group_id, &[id], &no_mentions)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.activity_sort_at, at);
+    }
+    let order = |app: &SqliteAppStorage| {
+        app.chat_list_rows(ChatListQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.group_id_hex, row.activity_sort_at))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![
+        ("33".to_owned(), 1500),
+        (GROUP.to_owned(), 20),
+        ("22".to_owned(), 10),
+    ];
+    assert_eq!(order(&app), expected);
+    assert_projection_complete(&app, "incremental writes match the rebuild rule");
+
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE chat_list_rows SET activity_sort_at = 1000 WHERE group_id_hex = ?1",
+            params![GROUP],
+        )
+        .unwrap();
+    app.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_eq!(order(&app), expected);
+
+    // Pruning the history leaves its retained floor, not the creation anchor.
+    app.secure_prune_app_events_before(GROUP, 21, LOCAL, &no_mentions)
+        .unwrap();
+    assert_eq!(order(&app), expected);
+    assert_projection_complete(&app, "the prune writes the rebuild rule");
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_eq!(order(&app), expected);
+    assert_projection_complete(&app, "a pruned chat keeps its retained floor");
+}
+
 /// Debug output never carries avatar key material.
 #[test]
 fn debug_output_hides_avatar_keys() {

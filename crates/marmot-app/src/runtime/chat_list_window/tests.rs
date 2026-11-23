@@ -858,6 +858,8 @@ async fn closing_storage_directly_terminates_an_idle_window() {
 async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision() {
     let f = Fixture::new(20);
     let sender = nostr::prelude::Keys::generate().public_key().to_hex();
+    // Newer than the fixture's empty chats, so the row stays in the window.
+    let now = crate::notifications::unix_now_seconds();
     f.store
         .app_storage()
         .record_app_event(&storage_sqlite::StoredAppEvent {
@@ -870,8 +872,8 @@ async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision()
             plaintext: "Preview".into(),
             kind: 9,
             tags: vec![],
-            recorded_at: 100,
-            received_at: 100,
+            recorded_at: now,
+            received_at: now,
             origin_commit_id: None,
             moderation_grant: false,
         })
