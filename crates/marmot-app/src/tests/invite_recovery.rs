@@ -604,7 +604,9 @@ async fn resolution_deadline_names_the_member_whose_lookup_did_not_finish() {
             .map(|_| ())
     });
     entered.notified().await;
-    tokio::time::advance(Duration::from_secs(51)).await;
+    // Let the paused clock reach the deadline on its own, so the finished
+    // member's pending journal work completes first.
+    tokio::time::sleep(Duration::from_secs(51)).await;
     let error = task.await.unwrap().unwrap_err();
     assert!(
         matches!(&error, DirectoryError::DirectoryLookupIncomplete(id) if *id == accounts[0].account_id_hex),

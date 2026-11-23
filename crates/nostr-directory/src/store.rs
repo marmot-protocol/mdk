@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 #[cfg(any(test, feature = "test-support"))]
 use storage_sqlite::PublicDirectoryUserRecord;
-use storage_sqlite::SqliteSharedStorage;
+use storage_sqlite::{PublicKeyPackageEvidenceSnapshot, SqliteSharedStorage};
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
@@ -142,6 +142,70 @@ impl<R: DirectoryResources> Directory<R> {
         records: &[RelayEventRecord],
         evidence_scope: DeletionEvidenceScope,
     ) -> Result<(), DirectoryError> {
+        let (replacements, barriers) =
+            self.key_package_journal_entries(account_id_hex, records, evidence_scope);
+        if replacements.is_empty() && barriers.is_empty() {
+            return Ok(());
+        }
+        let directory = self.clone();
+        blocking_directory_task(move || {
+            directory.put_key_package_journal_entries(replacements, barriers)
+        })
+        .await
+    }
+
+    /// Journals what a KeyPackage read returned for an account, then reads
+    /// back every replacement and deletion the journal knows for it, in one
+    /// blocking step, so evidence another lookup recorded meanwhile counts.
+    pub(super) async fn journal_and_read_key_package_evidence(
+        &self,
+        account_id_hex: &str,
+        records: &[RelayEventRecord],
+    ) -> Result<PublicKeyPackageEvidenceSnapshot, DirectoryError> {
+        let (replacements, barriers) = self.key_package_journal_entries(
+            account_id_hex,
+            records,
+            DeletionEvidenceScope::KeyPackageQuery,
+        );
+        let directory = self.clone();
+        let account = account_id_hex.to_owned();
+        blocking_directory_task(move || {
+            directory.put_key_package_journal_entries(replacements, barriers)?;
+            Ok(directory
+                .resources
+                .shared_storage()?
+                .key_package_evidence_snapshot(&account)?)
+        })
+        .await
+    }
+
+    fn put_key_package_journal_entries(
+        &self,
+        replacements: Vec<storage_sqlite::PublicKeyPackageReplacementRecord>,
+        barriers: Vec<storage_sqlite::PublicKeyPackageBarrierRecord>,
+    ) -> Result<(), DirectoryError> {
+        if replacements.is_empty() && barriers.is_empty() {
+            return Ok(());
+        }
+        let shared = self.resources.shared_storage()?;
+        for replacement in replacements {
+            shared.put_public_key_package_replacement(&replacement)?;
+        }
+        for barrier in barriers {
+            shared.put_public_key_package_barrier(&barrier)?;
+        }
+        Ok(())
+    }
+
+    fn key_package_journal_entries(
+        &self,
+        account_id_hex: &str,
+        records: &[RelayEventRecord],
+        evidence_scope: DeletionEvidenceScope,
+    ) -> (
+        Vec<storage_sqlite::PublicKeyPackageReplacementRecord>,
+        Vec<storage_sqlite::PublicKeyPackageBarrierRecord>,
+    ) {
         let freshness = self.directory_freshness();
         let replacements = records
             .iter()
@@ -173,21 +237,7 @@ impl<R: DirectoryResources> Directory<R> {
                 barrier
             })
             .collect::<Vec<_>>();
-        if replacements.is_empty() && barriers.is_empty() {
-            return Ok(());
-        }
-        let directory = self.clone();
-        blocking_directory_task(move || {
-            let shared = directory.resources.shared_storage()?;
-            for replacement in replacements {
-                shared.put_public_key_package_replacement(&replacement)?;
-            }
-            for barrier in barriers {
-                shared.put_public_key_package_barrier(&barrier)?;
-            }
-            Ok(())
-        })
-        .await
+        (replacements, barriers)
     }
 
     pub fn local_accounts_by_id(

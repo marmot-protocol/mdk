@@ -1652,12 +1652,45 @@ async fn a_tied_relay_list_is_read_but_decides_nothing() {
     );
 
     tie_directory_relay_list(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
-    let compatible = fetcher.events_by_endpoint.lock().unwrap()[UPDATED_DIRECT_OUTBOX]
-        .iter()
-        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
-        .unwrap()
-        .id
-        .clone();
+    let compatible = {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let incompatible = by_endpoint["wss://shared.example"]
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap()
+            .clone();
+        let new_outbox = by_endpoint.get_mut(UPDATED_DIRECT_OUTBOX).unwrap();
+        let position = new_outbox
+            .iter()
+            .position(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap();
+        std::mem::replace(&mut new_outbox[position], incompatible)
+    };
+    // With only incompatible packages on both outboxes, the tie decides nothing.
+    let unresolved = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await;
+    assert!(
+        matches!(
+            &unresolved,
+            Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
+        ),
+        "{:?}",
+        unresolved.err()
+    );
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let new_outbox = by_endpoint.get_mut(UPDATED_DIRECT_OUTBOX).unwrap();
+        new_outbox.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        new_outbox.push(compatible.clone());
+    }
+    let compatible = compatible.id;
     let resolved = app
         .directory()
         .resolve_compatible_member_key_packages(
@@ -1752,6 +1785,50 @@ async fn direct_start_reads_a_prewarmed_outbox_when_discovery_fails() {
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
     runtime.shutdown().await;
+    app.close_storage().unwrap();
+}
+
+/// A deletion another lookup journals while this one waits on a slow relay
+/// still bars the package that relay then returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deletion_journaled_during_the_read_bars_the_package() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let package = fetcher.events_by_endpoint.lock().unwrap()["wss://shared.example"]
+        .iter()
+        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .clone();
+    let (entered, release) = fetcher.hold_fetches();
+    let lookup = {
+        let app = app.clone();
+        let bob = bob.account_id_hex.clone();
+        tokio::spawn(async move {
+            app.directory()
+                .resolve_member_key_packages(&[bob.as_str()])
+                .await
+                .map(|_| ())
+        })
+    };
+    entered.notified().await;
+    let now = unix_now_seconds();
+    app.shared_storage()
+        .unwrap()
+        .put_public_key_package_barrier(&storage_sqlite::PublicKeyPackageBarrierRecord {
+            account_id_hex: bob.account_id_hex.clone(),
+            key_package_id: package.tag_value("d").unwrap().to_owned(),
+            event_id_hex: "ab".repeat(32),
+            deleted_event_id: Some(package.id.clone()),
+            event_created_at: now,
+            observed_at: now,
+            kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
+        })
+        .unwrap();
+    release.notify_one();
+    let result = lookup.await.unwrap();
+    assert!(
+        matches!(result, Err(DirectoryError::MissingKeyPackage { .. })),
+        "{result:?}"
+    );
     app.close_storage().unwrap();
 }
 

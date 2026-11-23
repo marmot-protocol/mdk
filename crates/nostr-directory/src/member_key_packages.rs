@@ -9,7 +9,7 @@
 //! bundle. Unsupported batch queries fall back to bounded single-author relay
 //! requests.
 
-use crate::error::{DirectoryError, MissingKeyPackageReason, blocking_directory_task};
+use crate::error::{DirectoryError, MissingKeyPackageReason};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -554,11 +554,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             });
         }
 
-        let fences = if targets.is_empty() {
-            Vec::new()
-        } else {
-            self.key_package_journal_fences(&targets).await?
-        };
         let mut outcomes = (0..targets.len())
             .map(|_| None)
             .collect::<Vec<Option<Result<Vec<KeyPackage>, DirectoryError>>>>();
@@ -639,7 +634,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             purpose,
                             requirements,
                             cut_offs.map(|cut_offs| cut_offs.key_package_batches),
-                            &fences,
                         ),
                     )
                     .await
@@ -807,32 +801,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         })
     }
 
-    /// What the shared journal knew about each target's replacements and
-    /// deletions, read once before any network step. This lookup's own reads
-    /// are fenced by selection itself.
-    async fn key_package_journal_fences(
+    /// Journals what a read returned for an account, then fences selection
+    /// with every replacement and deletion the journal now knows, including
+    /// evidence other lookups recorded while this one was on the network.
+    async fn key_package_journal_fence(
         &self,
-        targets: &[MemberTarget],
-    ) -> Result<Vec<KeyPackageJournalFence>, DirectoryError> {
-        let directory = self.clone();
-        let accounts = targets
-            .iter()
-            .map(|target| target.account_id_hex.clone())
-            .collect::<Vec<_>>();
-        let snapshots = blocking_directory_task(move || {
-            let shared = directory.resources.shared_storage()?;
-            accounts
-                .iter()
-                .map(|account| Ok(shared.key_package_evidence_snapshot(account)?))
-                .collect::<Result<Vec<_>, DirectoryError>>()
-        })
-        .await?;
-        let now = self.directory_freshness().now;
-        let future_skew_secs = self.config.max_future_skew.as_secs();
-        Ok(snapshots
-            .into_iter()
-            .map(|snapshot| KeyPackageJournalFence::new(snapshot, now, future_skew_secs))
-            .collect())
+        account_id_hex: &str,
+        records: &[transport_nostr::DirectoryRelayEventRecord],
+    ) -> Result<KeyPackageJournalFence, DirectoryError> {
+        Ok(KeyPackageJournalFence::new(
+            self.journal_and_read_key_package_evidence(account_id_hex, records)
+                .await?,
+        ))
     }
 
     /// Revalidate one account's selection on the real clock, best first. A
@@ -1247,7 +1227,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         batch_cut_off: Option<tokio::time::Instant>,
-        fences: &[KeyPackageJournalFence],
     ) -> Result<(), DirectoryError> {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
@@ -1340,22 +1319,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .or_default()
                     .push(record);
             }
-            for index in &indices {
-                let account_id = &targets[*index].account_id_hex;
-                if let Some(records) = records_by_author.get(account_id) {
-                    self.journal_key_package_records(account_id, records)
-                        .await?;
-                }
-            }
             for index in indices {
                 let account_id = &targets[index].account_id_hex;
                 let account_records = records_by_author.remove(account_id).unwrap_or_default();
+                let fence = self
+                    .key_package_journal_fence(account_id, &account_records)
+                    .await?;
                 let selected = select_fenced_key_packages(
                     account_id,
                     &account_records,
                     self.directory_freshness(),
                     requirements,
-                    Some(&fences[index]),
+                    Some(&fence),
                 )
                 .map(|selection| selection.value);
                 // Batch results prove no coverage; every absence or rejection
@@ -1444,10 +1419,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             // valid package observed in this call's batch.
                             // Never load a previously cached package here.
                             records.extend(observed_records);
-                            directory
-                                .journal_key_package_records(&target.account_id_hex, &records)
+                            let fence = directory
+                                .key_package_journal_fence(&target.account_id_hex, &records)
                                 .await?;
-                            let fence = &fences[index];
                             let records = directory
                                 .recover_key_package_records(
                                     super::key_package_recovery::KeyPackageRecoveryRequest {
@@ -1457,19 +1431,17 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                         primary_complete: fetched.complete,
                                         discovery: &directory.directory_source_relays(&[]),
                                         requirements,
-                                        fence: Some(fence),
+                                        fence: Some(&fence),
                                         cached_target: None,
                                         wanted: MAX_KEY_PACKAGES_PER_ACCOUNT,
                                     },
                                 )
                                 .await?;
-                            directory
-                                .journal_key_package_records(
-                                    &target.account_id_hex,
-                                    &records.records,
-                                )
+                            // Recheck the journal before admitting what recovery found.
+                            let fence = directory
+                                .key_package_journal_fence(&target.account_id_hex, &records.records)
                                 .await?;
-                            records.select(&target.account_id_hex, requirements, Some(fence))
+                            records.select(&target.account_id_hex, requirements, Some(&fence))
                         }
                         .await;
                         (index, result)

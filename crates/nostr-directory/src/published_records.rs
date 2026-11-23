@@ -579,52 +579,32 @@ struct RankedKeyPackage {
     key_package_ref: Vec<u8>,
 }
 
-/// What the shared KeyPackage journal knows about an account's slots and
-/// deletions. Selection applies it to every candidate, so a relay that no
-/// longer serves a replacement or deletion cannot revive what it barred.
+/// What the shared KeyPackage journal knows about an account's slot
+/// replacements and deletions. Selection applies it to every candidate, so a
+/// relay that no longer serves a replacement or deletion cannot revive what it
+/// barred. Eviction markers only say evidence is missing, so they bar nothing.
 pub(crate) struct KeyPackageJournalFence {
-    snapshot: PublicKeyPackageEvidenceSnapshot,
-    now: u64,
-    future_skew_secs: u64,
+    replacements: Vec<PublicKeyPackageReplacementRecord>,
+    barriers: Vec<PublicKeyPackageBarrierRecord>,
 }
 
 impl KeyPackageJournalFence {
-    pub(crate) fn new(
-        snapshot: PublicKeyPackageEvidenceSnapshot,
-        now: u64,
-        future_skew_secs: u64,
-    ) -> Self {
+    pub(crate) fn new(snapshot: PublicKeyPackageEvidenceSnapshot) -> Self {
         Self {
-            snapshot,
-            now,
-            future_skew_secs,
+            replacements: snapshot.replacements,
+            barriers: snapshot.barriers,
         }
     }
 
     fn allows(&self, event_id: &str, slot: &str, created_at: u64) -> bool {
-        let snapshot = &self.snapshot;
-        let watermark_allows = |barrier: &PublicKeyPackageBarrierRecord| {
-            watermark_allows(
-                event_id,
-                created_at,
-                self.now,
-                self.future_skew_secs,
-                barrier,
-            )
-        };
-        snapshot.barriers.iter().all(|barrier| {
+        self.barriers.iter().all(|barrier| {
             (barrier.deleted_event_id.is_none() && barrier.key_package_id != slot)
                 || barrier_allows(event_id, created_at, barrier)
-        }) && snapshot.watermark.as_ref().is_none_or(watermark_allows)
-            && snapshot
-                .global_eviction
-                .as_ref()
-                .is_none_or(watermark_allows)
-            && snapshot
-                .replacements
-                .iter()
-                .filter(|replacement| replacement.key_package_id == slot)
-                .all(|replacement| replacement_allows(event_id, created_at, replacement))
+        }) && self
+            .replacements
+            .iter()
+            .filter(|replacement| replacement.key_package_id == slot)
+            .all(|replacement| replacement_allows(event_id, created_at, replacement))
     }
 }
 
