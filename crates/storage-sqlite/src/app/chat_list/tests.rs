@@ -3124,6 +3124,8 @@ fn thread_messages_are_chat_activity() {
         arrive(&store, words("agent-words", at + 3, Some(REMOTE), true)),
         (2, 1)
     );
+    // It is still the chat's latest activity.
+    assert_eq!(summary(&store), (Some("agent-words".into()), at + 3, 2, 1));
     assert_eq!(
         arrive(
             &store,

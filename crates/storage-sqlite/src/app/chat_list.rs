@@ -1176,10 +1176,9 @@ fn dirty_unread_messages_are_covered_tx(
 /// projects kind-1210 group-system rows into preview, activity, and unread state
 /// (#822). Version 3 materializes per-message unread membership so incremental
 /// refreshes do not rescan the unread window. Version 5 counts NIP-22 thread
-/// messages as chat activity. Version 6 leaves an agent's own words in its
-/// subagent thread out of unread state. The persisted column keeps its legacy `mention_counts_version` name
+/// messages as chat activity. The persisted column keeps its legacy `mention_counts_version` name
 /// for schema compatibility, but now gates the complete derived-row contract.
-const CHAT_LIST_PROJECTION_VERSION: i64 = 6;
+const CHAT_LIST_PROJECTION_VERSION: i64 = 5;
 
 const CHAT_LIST_GROUP_ACTIVITY_TYPES: [&str; 5] = [
     GROUP_SYSTEM_TYPE_MEMBER_ADDED,

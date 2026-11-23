@@ -27,6 +27,10 @@ pub(crate) fn register_agent_thread_functions(conn: &rusqlite::Connection) -> ru
             let (Ok(kind), Ok(sender)) = (u64::try_from(kind), std::str::from_utf8(sender)) else {
                 return Ok(false);
             };
+            // Only a thread message can be one; skip decoding every chat's tags.
+            if kind != cgka_traits::NIP22_COMMENT_KIND {
+                return Ok(false);
+            }
             let tags = serde_json::from_slice::<Vec<Vec<String>>>(tags).unwrap_or_default();
             Ok(cgka_traits::is_agent_own_thread_comment(
                 kind, &tags, sender,
