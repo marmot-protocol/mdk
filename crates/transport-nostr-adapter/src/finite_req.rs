@@ -29,7 +29,8 @@
 //! of theirs.
 //!
 //! The collector applies the checks the SDK applies to subscription input: the
-//! SDK's message and tag ceilings, expiry, the event id and signature of the
+//! client's relay limits on frame size, event size and tags (a frame never
+//! past nostr-sdk's default 5 MiB, the queue's ceiling), expiry, the event id and signature of the
 //! bytes supplied, the database's id-level deletion check and the client's
 //! admission policy. It also drops an event outside the request's filter. A
 //! pair of id and signature it already verified skips only the signature
@@ -53,9 +54,9 @@ use nostr::message::relay::RelayMessage;
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     AdmitPolicy, AdmitStatus, ClientBuilder, ClientMessage, DatabaseEventStatus, Event, EventId,
-    Filter, Kind, NostrDatabase, Relay, RelayUrl, Signature, SubscriptionId, Url,
+    Filter, NostrDatabase, Relay, RelayUrl, Signature, SubscriptionId, Url,
 };
-use nostr_sdk::relay::RelayNotification;
+use nostr_sdk::relay::{RelayEventLimits, RelayNotification};
 use nostr_sdk::transport::websocket::{WebSocketSink, WebSocketStream, WebSocketTransport};
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -68,13 +69,10 @@ use crate::sweep::hint_tap::{head_verb, second_string};
 /// adapter makes starts with `~`.
 pub(crate) const ID_PREFIX: &str = "~f";
 
-/// The largest frame a request takes: nostr-sdk's default message ceiling,
-/// which the SDK applies to subscription input before parsing it.
+/// The largest frame any request takes, whatever the client's message limit:
+/// nostr-sdk's default message ceiling. Each request's queue holds one such
+/// frame past its byte budget.
 const MAX_FRAME_BYTES: usize = 5 * 1024 * 1024;
-
-/// nostr-sdk's default tag ceilings for subscription input.
-const MAX_TAGS: usize = 2_000;
-const MAX_CONTACT_LIST_TAGS: usize = 10_000;
 
 /// Id and signature pairs the client remembers as verified. A duplicate
 /// copy, from another relay or an overlapping request, then costs one hash
@@ -116,7 +114,7 @@ pub(crate) enum FiniteEnd {
 }
 
 /// What one request read.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct FiniteReply {
     /// Distinct valid events within the budgets, in the order they came.
     pub(crate) events: Vec<Event>,
@@ -143,7 +141,35 @@ pub(crate) struct FiniteReply {
 }
 
 impl FiniteReply {
-    fn ended(end: FiniteEnd) -> Self {
+    /// This refused attempt's reply, continued by the retry after it: one
+    /// reply, with the first attempt's events kept and its counts carried.
+    fn then(mut self, retry: Self) -> Self {
+        let kept = self
+            .events
+            .iter()
+            .map(|event| event.id)
+            .collect::<HashSet<_>>();
+        for event in retry.events {
+            if kept.contains(&event.id) {
+                self.duplicates += 1;
+            } else {
+                self.kept_event_bytes += event.as_json().len();
+                self.events.push(event);
+            }
+        }
+        Self {
+            raw_items: self.raw_items + retry.raw_items,
+            received_items: self.received_items + retry.received_items,
+            duplicates: self.duplicates + retry.duplicates,
+            event_bytes: self.event_bytes + retry.event_bytes,
+            fetched_bytes: self.fetched_bytes + retry.fetched_bytes,
+            more: retry.more,
+            end: retry.end,
+            ..self
+        }
+    }
+
+    pub(crate) fn ended(end: FiniteEnd) -> Self {
         Self {
             events: Vec::new(),
             raw_items: 0,
@@ -178,6 +204,10 @@ struct Registry {
     /// consults them for subscription input.
     policy: Option<Arc<dyn AdmitPolicy>>,
     database: Arc<dyn NostrDatabase>,
+    /// The client's relay limits on a frame and on an event, which the SDK
+    /// applies to subscription input before admitting it.
+    max_frame: usize,
+    event_limits: RelayEventLimits,
     next_id: AtomicU64,
     next_connection: AtomicU64,
     requests: Mutex<HashMap<String, Arc<Slot>>>,
@@ -212,6 +242,7 @@ struct Slot {
     /// The relay URL as the transport connects to it.
     relay: String,
     max_items: usize,
+    max_frame: usize,
     queue_bytes: usize,
     state: Mutex<SlotState>,
     ready: Notify,
@@ -259,7 +290,7 @@ impl Slot {
             }
             return;
         }
-        if bytes > MAX_FRAME_BYTES {
+        if bytes > self.max_frame {
             state.end = Some(FiniteEnd::InvalidMessage);
         } else if event && state.event_frames > self.max_items {
             // The collector stops at the first frame over the budget.
@@ -307,11 +338,23 @@ impl FiniteRequests {
             can_authenticate: builder.authenticator.is_some(),
             policy: builder.admit_policy.clone(),
             database: builder.database.clone(),
+            max_frame: builder
+                .relay_limits
+                .messages
+                .max_size
+                .map_or(MAX_FRAME_BYTES, |max| (max as usize).min(MAX_FRAME_BYTES)),
+            event_limits: builder.relay_limits.events.clone(),
             next_id: AtomicU64::new(0),
             next_connection: AtomicU64::new(0),
             requests: Mutex::default(),
             verified: Mutex::default(),
         }))
+    }
+
+    /// How many requests this client has sent.
+    #[cfg(test)]
+    pub(crate) fn sent(&self) -> u64 {
+        self.0.next_id.load(Ordering::Relaxed)
     }
 
     /// `transport`, with this client's finite requests' replies taken off it.
@@ -324,8 +367,8 @@ impl FiniteRequests {
 
     /// Ask `relay` for `filter`'s events until its EOSE, within `limits`. A
     /// relay that requires NIP-42 authentication is asked once more under a
-    /// new id after the client authenticates; the reply is the retry's, with
-    /// the refused attempt's bytes still charged.
+    /// new id after the client authenticates, within what the refused attempt
+    /// left of `limits`; the reply carries both attempts' events and counts.
     pub(crate) async fn fetch(
         &self,
         relay: &Relay,
@@ -349,9 +392,14 @@ impl FiniteRequests {
         if !authenticated(notifications, deadline, cancel).await {
             return first;
         }
-        let mut retry = self.request(relay, &filter, limits, deadline, cancel).await;
-        retry.fetched_bytes += first.fetched_bytes;
-        retry
+        // The retry spends what the refused attempt left of the budget.
+        let left = FiniteLimits {
+            max_items: limits.max_items.saturating_sub(first.raw_items),
+            max_event_bytes: limits.max_event_bytes.saturating_sub(first.event_bytes),
+            ..limits
+        };
+        let retry = self.request(relay, &filter, left, deadline, cancel).await;
+        first.then(retry)
     }
 
     async fn request(
@@ -372,7 +420,8 @@ impl FiniteRequests {
         let slot = Arc::new(Slot {
             relay: <&Url>::from(relay.url()).as_str().to_owned(),
             max_items: limits.max_items,
-            queue_bytes: limits.max_event_bytes.saturating_add(MAX_FRAME_BYTES),
+            max_frame: self.0.max_frame,
+            queue_bytes: limits.max_event_bytes.saturating_add(self.0.max_frame),
             state: Mutex::default(),
             ready: Notify::new(),
         });
@@ -625,11 +674,11 @@ impl<'a> Collector<'a> {
 
     async fn event(&mut self, event: Event, frame_bytes: usize) -> Option<FiniteEnd> {
         self.raw_items += 1;
-        if !(self.checked(&event) && self.admitted(&event).await) {
+        let bytes = event.as_json().len();
+        if !(self.checked(&event, bytes) && self.admitted(&event).await) {
             self.fetched_bytes += frame_bytes as u64;
             return (self.raw_items > self.limits.max_items).then_some(FiniteEnd::ItemLimit);
         }
-        let bytes = event.as_json().len();
         self.received_items += 1;
         self.fetched_bytes += bytes as u64;
         self.event_bytes = self.event_bytes.saturating_add(bytes);
@@ -648,14 +697,15 @@ impl<'a> Collector<'a> {
         None
     }
 
-    /// The SDK's own checks of an event's shape and authenticity.
-    fn checked(&self, event: &Event) -> bool {
-        let max_tags = if event.kind == Kind::ContactList {
-            MAX_CONTACT_LIST_TAGS
-        } else {
-            MAX_TAGS
-        };
-        if event.tags.len() > max_tags
+    /// The SDK's own checks of an event's size, shape and authenticity.
+    fn checked(&self, event: &Event, bytes: usize) -> bool {
+        let limits = &self.registry.event_limits;
+        if limits
+            .get_max_size(&event.kind)
+            .is_some_and(|max| bytes > max as usize)
+            || limits
+                .get_max_num_tags(&event.kind)
+                .is_some_and(|max| event.tags.len() > usize::from(max))
             || event.is_expired()
             || !self.filter.match_event(event, MATCH)
             || !event.verify_id()
@@ -955,7 +1005,7 @@ impl Drop for Diverted {
 mod tests {
     use std::time::Duration;
 
-    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Tag, Timestamp};
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
     use nostr_sdk::authenticator::SignerAuthenticator;
     use nostr_sdk::local_relay::{LocalRelay, LocalRelayBuilderNip42};
     use nostr_sdk::prelude::{Client, ClientNotification, RelayUrl};
@@ -1031,8 +1081,9 @@ mod tests {
         let off_filter = EventBuilder::new(Kind::Metadata, "{}")
             .finalize(&keys)
             .unwrap();
+        // One tag past the SDK's default ceiling.
         let crowded = EventBuilder::new(Kind::TextNote, "crowded")
-            .tags((0..=MAX_TAGS).map(|n| Tag::parse(["x", &n.to_string()]).unwrap()))
+            .tags((0..=2_000).map(|n| Tag::parse(["x", &n.to_string()]).unwrap()))
             .finalize(&keys)
             .unwrap();
         // Another event's valid signature on this one's id and content.
@@ -1122,7 +1173,7 @@ mod tests {
         let filter = Filter::new().kind(Kind::TextNote);
         let (relay, id) = (relay_url(), SubscriptionId::new("~f0"));
         let collector = Collector::new(&filter, limits(10, 1 << 20), &finite.0, &relay, &id);
-        assert!(collector.checked(&good));
+        assert!(collector.checked(&good, good.as_json().len()));
         assert!(
             finite
                 .0
@@ -1133,11 +1184,11 @@ mod tests {
         );
         let mut tampered = good.clone();
         tampered.content = "tampered".to_owned();
-        assert!(!collector.checked(&tampered));
+        assert!(!collector.checked(&tampered, tampered.as_json().len()));
         let mut resigned = good.clone();
         resigned.sig = note(&keys, "other").sig;
         assert!(
-            !collector.checked(&resigned),
+            !collector.checked(&resigned, resigned.as_json().len()),
             "an unverified pair is checked"
         );
     }
@@ -1235,6 +1286,7 @@ mod tests {
         let slot = Arc::new(Slot {
             relay: RELAY.to_owned(),
             max_items: limits.max_items,
+            max_frame: MAX_FRAME_BYTES,
             queue_bytes: limits.max_event_bytes.saturating_add(MAX_FRAME_BYTES),
             state: Mutex::default(),
             ready: Notify::new(),
@@ -1713,6 +1765,111 @@ mod tests {
         // included.
         assert_eq!(reply.fetched_bytes, page_bytes);
         client.shutdown().await;
+    }
+
+    /// A refusal partway through a page keeps that page: the retry's reply
+    /// continues the refused attempt's, within what it left of the budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_after_authentication_continues_the_refused_page() {
+        let keys = Keys::generate();
+        let [a, b] = ["a", "b"].map(|content| note(&keys, content));
+        for (max_items, end, kept) in [
+            (10, FiniteEnd::Eose, vec![a.clone(), b.clone()]),
+            (1, FiniteEnd::ItemLimit, vec![a.clone()]),
+        ] {
+            let (url, server) = refusing_relay(a.clone(), b.clone()).await;
+            let (finite, client) = client_on(Some(Keys::generate()), &url).await;
+            let relay = client.relay(&url).await.unwrap().unwrap();
+            let reply = finite
+                .fetch(
+                    &relay,
+                    Filter::new().kind(Kind::TextNote),
+                    limits(max_items, 1 << 20),
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(reply.end, end, "budget {max_items}");
+            assert_eq!(reply.events, kept, "budget {max_items}");
+            assert_eq!(reply.raw_items, 2, "budget {max_items}");
+            client.shutdown().await;
+            server.abort();
+        }
+    }
+
+    /// A relay that answers its first REQ with `first` and an
+    /// `auth-required` refusal, authenticates the client, and answers the
+    /// next REQ with `second` and EOSE.
+    async fn refusing_relay(
+        first: Event,
+        second: Event,
+    ) -> (RelayUrl, tokio::task::JoinHandle<()>) {
+        use tokio_tungstenite::tungstenite::Message as Ws;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut reqs = 0;
+            while let Some(Ok(message)) = socket.next().await {
+                let Ws::Text(text) = message else {
+                    continue;
+                };
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                let replies = match (frame[0].as_str(), frame[1].as_str()) {
+                    (Some("REQ"), Some(id)) => {
+                        reqs += 1;
+                        if reqs == 1 {
+                            vec![
+                                serde_json::json!(["EVENT", id, first]),
+                                serde_json::json!(["CLOSED", id, "auth-required: sign in"]),
+                                serde_json::json!(["AUTH", "challenge"]),
+                            ]
+                        } else {
+                            vec![
+                                serde_json::json!(["EVENT", id, second]),
+                                serde_json::json!(["EOSE", id]),
+                            ]
+                        }
+                    }
+                    (Some("AUTH"), _) => {
+                        vec![serde_json::json!(["OK", frame[1]["id"], true, ""])]
+                    }
+                    _ => Vec::new(),
+                };
+                for reply in replies {
+                    socket
+                        .send(Ws::Text(reply.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        (url, server)
+    }
+
+    /// The client's own relay limits apply, as the SDK applies them to its
+    /// subscriptions.
+    #[tokio::test]
+    async fn the_clients_relay_limits_apply() {
+        let keys = Keys::generate();
+        let small = note(&keys, "small");
+        let large = note(&keys, &"x".repeat(1_000));
+        let mut relay_limits = nostr_sdk::relay::RelayLimits::default();
+        relay_limits.events.max_size = Some(500);
+        let finite = FiniteRequests::for_builder(
+            &crate::network_proxy::nostr_builder(Ok(None)).relay_limits(relay_limits),
+        );
+        let reply = collect_with(
+            &finite,
+            &Filter::new().kind(Kind::TextNote),
+            limits(10, 1 << 20),
+            &[event_frame(&small), event_frame(&large), eose("")],
+        )
+        .await;
+        assert_eq!(reply.end, FiniteEnd::Eose);
+        assert_eq!(reply.events, vec![small]);
+        assert_eq!(reply.raw_items, 2);
     }
 
     /// A relay that requires NIP-42 for reads is asked again, under a new id,

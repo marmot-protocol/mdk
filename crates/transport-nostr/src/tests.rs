@@ -6898,7 +6898,7 @@ async fn publish_allows_independent_account_registration() {
     let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
     let first = Arc::new(Keys::generate());
     let account = MemberId::new(first.public_key().to_bytes().to_vec());
-    let fallback = NostrSdkRelayClient::from_builder(NostrSdkClient::builder());
+    let fallback = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
     fallback.client().shutdown().await;
     let adapter = plane.account_adapter(account.clone(), Arc::new(fallback.clone()));
     plane

@@ -5899,14 +5899,33 @@ impl NostrRelayClient for NostrSdkRelayClient {
         if remaining.is_zero() {
             return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Deadline));
         }
-        let limits = FiniteLimits {
-            max_items: request.limits.max_received_items_per_endpoint,
-            max_event_bytes: request.limits.max_serialized_event_bytes_per_endpoint,
-            timeout: remaining.mul_f32(0.9).max(Duration::from_millis(1)),
-        };
-        let replies = futures::future::join_all(endpoints.iter().map(|url| async {
+        let fetch_deadline =
+            tokio::time::Instant::now() + remaining.mul_f32(0.9).max(Duration::from_millis(1));
+        // Spellings of one relay share its pool entry, and so one request.
+        let mut relays = Vec::<&RelayUrl>::new();
+        let asked = endpoints
+            .iter()
+            .map(|url| {
+                relays
+                    .iter()
+                    .position(|relay| *relay == url)
+                    .unwrap_or_else(|| {
+                        relays.push(url);
+                        relays.len() - 1
+                    })
+            })
+            .collect::<Vec<_>>();
+        let replies = futures::future::join_all(relays.iter().map(|url| async {
+            let Ok(relay) = timeout_at(fetch_deadline, self.client.relay(*url)).await else {
+                return Some(FiniteReply::ended(FiniteEnd::TimedOut));
+            };
             // An endpoint missing from the pool failed registration.
-            let relay = self.client.relay(url.clone()).await.ok().flatten()?;
+            let relay = relay.ok().flatten()?;
+            let limits = FiniteLimits {
+                max_items: request.limits.max_received_items_per_endpoint,
+                max_event_bytes: request.limits.max_serialized_event_bytes_per_endpoint,
+                timeout: fetch_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            };
             Some(
                 finite
                     .fetch(&relay, filter.clone(), limits, &cancellation)
@@ -5918,8 +5937,8 @@ impl NostrRelayClient for NostrSdkRelayClient {
             endpoints: request
                 .endpoints
                 .into_iter()
-                .zip(replies)
-                .map(|(endpoint, reply)| project_acquisition(endpoint, reply))
+                .zip(asked)
+                .map(|(endpoint, relay)| project_acquisition(endpoint, replies[relay].clone()))
                 .collect(),
         })
     }
@@ -6933,6 +6952,45 @@ mod tests {
             Err(NostrAcquisitionError::Unsupported)
         );
         assert!(sdk.client.relays().await.is_empty());
+    }
+
+    /// Two spellings of one relay share its pool entry, so they share one
+    /// request and its reply.
+    #[tokio::test]
+    async fn spellings_of_one_relay_share_one_request() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "shared")
+            .finalize(&keys)
+            .unwrap();
+        relay.add_event(event.clone()).await.unwrap();
+        let sdk = NostrSdkRelayClient::from_builder(crate::network_proxy::nostr_builder(Ok(None)));
+        let spelled = url.to_string();
+        let other = match spelled.strip_suffix('/') {
+            Some(bare) => bare.to_owned(),
+            None => format!("{spelled}/"),
+        };
+        let mut request = acquisition_request(
+            MemberId::new(keys.public_key().to_bytes().to_vec()),
+            url,
+            vec![event.id.to_bytes()],
+            4,
+            100_000,
+        );
+        request.endpoints.push(TransportEndpoint(other));
+        request.limits.max_endpoints = 2;
+        let report = sdk
+            .acquire_history(request, NostrAcquisitionCancellation::new())
+            .await
+            .unwrap();
+        assert_eq!(report.endpoints.len(), 2);
+        for endpoint in &report.endpoints {
+            assert_eq!(endpoint.end, NostrAcquisitionEnd::RequestPolicySatisfied);
+            assert_eq!(endpoint.events.len(), 1);
+        }
+        assert_eq!(sdk.finite_requests.as_ref().unwrap().sent(), 1);
+        relay.shutdown();
     }
 
     /// A relay's refusal keeps its kind: a machine-readable prefix rejects,
