@@ -135,6 +135,10 @@ impl<R: DirectoryResources> Directory<R> {
             });
         }
         let mut package_coverage = primary_complete;
+        // The caller's fence predates every read below. Each selection after
+        // a read uses a journal snapshot taken after it, so a replacement or
+        // deletion another lookup recorded meanwhile still counts.
+        let mut refreshed = None;
         if !supplementary.is_empty() {
             let outcome = self
                 .relay_plane
@@ -145,7 +149,9 @@ impl<R: DirectoryResources> Directory<R> {
                 .await
                 .map_err(DirectoryError::RelayDirectory)?;
             observed.extend(outcome.records);
-            self.journal_key_package_records(account, &observed).await?;
+            refreshed = self
+                .journal_and_refresh_fence(account, &observed, fence)
+                .await?;
             package_coverage &= outcome.complete;
         }
         let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));
@@ -184,7 +190,7 @@ impl<R: DirectoryResources> Directory<R> {
                         &records,
                         freshness,
                         requirements,
-                        fence,
+                        refreshed.as_ref().or(fence),
                     ) {
                         Err(DirectoryError::KeyPackageRequirements(error))
                             if !package_coverage
@@ -273,6 +279,8 @@ impl<R: DirectoryResources> Directory<R> {
             if revoked {
                 revocations += 1;
                 targets = None;
+                // The deletion read already journaled what it found.
+                refreshed = self.journal_and_refresh_fence(account, &[], fence).await?;
                 continue;
             }
             if !deletion_coverage {
@@ -280,6 +288,24 @@ impl<R: DirectoryResources> Directory<R> {
             }
             proven.insert(target.event_id);
         }
+    }
+
+    /// Journals `records`, then rereads the account's fence when the caller
+    /// supplied one.
+    async fn journal_and_refresh_fence(
+        &self,
+        account: &str,
+        records: &[DirectoryRelayEventRecord],
+        fence: Option<&KeyPackageJournalFence>,
+    ) -> Result<Option<KeyPackageJournalFence>, DirectoryError> {
+        if fence.is_none() {
+            self.journal_key_package_records(account, records).await?;
+            return Ok(None);
+        }
+        Ok(Some(KeyPackageJournalFence::new(
+            self.journal_and_read_key_package_evidence(account, records)
+                .await?,
+        )))
     }
 
     async fn record_recovery_deletion_outcome(

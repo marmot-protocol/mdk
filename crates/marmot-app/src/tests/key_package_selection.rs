@@ -1712,6 +1712,61 @@ async fn a_tied_relay_list_is_read_but_decides_nothing() {
     app.close_storage().unwrap();
 }
 
+/// A tied relay list can name enough relays to push the recipient's routes
+/// past the admission limit. The tie only adds reads, so the remembered outbox
+/// is still read and its compatible package is used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tied_relay_list_too_long_to_add_still_reads_the_remembered_outbox() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let directory = app.directory();
+    let resolve = || {
+        directory.resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+    };
+    // The first lookup remembers the list naming the old outbox.
+    let first = resolve().await;
+    assert!(
+        matches!(first, Err(DirectoryError::KeyPackageRequirements(_))),
+        "{:?}",
+        first.err()
+    );
+    let tied = (0..16)
+        .map(|relay| format!("wss://tied-{relay}.example"))
+        .collect::<Vec<_>>();
+    tie_directory_relay_list(
+        &fetcher,
+        &bob,
+        &tied.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let compatible = {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let compatible = by_endpoint[UPDATED_DIRECT_OUTBOX]
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap()
+            .clone();
+        let old_outbox = by_endpoint.get_mut("wss://shared.example").unwrap();
+        old_outbox.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        old_outbox.push(compatible.clone());
+        compatible.id
+    };
+    let resolved = resolve().await.unwrap();
+    assert_eq!(
+        resolved
+            .key_packages
+            .iter()
+            .map(|package| hex::encode(package.source.as_ref().unwrap().event_id.as_slice()))
+            .collect::<Vec<_>>(),
+        vec![compatible]
+    );
+    app.close_storage().unwrap();
+}
+
 /// When every relay-list read completes but none returns a list, the lookup
 /// cannot confirm the remembered one, so the remembered outbox's incompatible
 /// packages decide nothing.
@@ -1809,6 +1864,73 @@ async fn a_deletion_journaled_during_the_read_bars_the_package() {
                 .map(|_| ())
         })
     };
+    entered.notified().await;
+    let now = unix_now_seconds();
+    app.shared_storage()
+        .unwrap()
+        .put_public_key_package_barrier(&storage_sqlite::PublicKeyPackageBarrierRecord {
+            account_id_hex: bob.account_id_hex.clone(),
+            key_package_id: package.tag_value("d").unwrap().to_owned(),
+            event_id_hex: "ab".repeat(32),
+            deleted_event_id: Some(package.id.clone()),
+            event_created_at: now,
+            observed_at: now,
+            kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
+        })
+        .unwrap();
+    release.notify_one();
+    let result = lookup.await.unwrap();
+    assert!(
+        matches!(result, Err(DirectoryError::MissingKeyPackage { .. })),
+        "{result:?}"
+    );
+    app.close_storage().unwrap();
+}
+
+/// Recovery's supplementary read finds only an incompatible package, which
+/// another lookup journals as deleted while that read is in flight. The newer
+/// journal evidence bars the package, so the recipient has none rather than
+/// an incompatible one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deletion_journaled_during_the_supplementary_read_bars_the_package() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let package = {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        by_endpoint
+            .get_mut("wss://shared.example")
+            .unwrap()
+            .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        by_endpoint["wss://directory.example"]
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap()
+            .clone()
+    };
+    let (mut entered, mut release) = fetcher.hold_fetches();
+    let lookup = {
+        let app = app.clone();
+        let bob = bob.account_id_hex.clone();
+        tokio::spawn(async move {
+            app.directory()
+                .resolve_compatible_member_key_packages(
+                    vec![bob],
+                    &requirements,
+                    nostr_directory::MemberResolutionPurpose::Commit,
+                    nostr_directory::MemberResolutionPolicy::Atomic,
+                )
+                .await
+                .map(|_| ())
+        })
+    };
+    // The batch and single-author reads of the outbox find nothing, so
+    // recovery's read of the directory relay is the third KeyPackage read.
+    for _ in 0..2 {
+        entered.notified().await;
+        let next = fetcher.hold_fetches();
+        release.notify_one();
+        (entered, release) = next;
+    }
     entered.notified().await;
     let now = unix_now_seconds();
     app.shared_storage()

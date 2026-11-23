@@ -801,6 +801,33 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         })
     }
 
+    /// A member's listed KeyPackage routes plus any tied relays, admitted
+    /// together. Tied relays only add reads: when they push the routes past
+    /// the admission limit, the listed routes are read alone.
+    fn member_key_package_routes(
+        &self,
+        target: &MemberTarget,
+        context: &str,
+    ) -> Result<Vec<TransportEndpoint>, String> {
+        let admit = |tied: &[String]| {
+            let endpoints = self.relay_plane.retain_safe_discovered_endpoints(
+                target
+                    .relay_lists
+                    .nip65
+                    .relays
+                    .iter()
+                    .chain(tied)
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect(),
+                context,
+            );
+            self.relay_plane
+                .sanitize_relay_endpoints(endpoints, "member KeyPackage route admission")
+        };
+        admit(&target.tied_relays).or_else(|_| admit(&[]))
+    }
+
     /// Journals what a read returned for an account, then fences selection
     /// with every replacement and deletion the journal now knows, including
     /// evidence other lookups recorded while this one was on the network.
@@ -1231,21 +1258,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
         for index in unresolved.iter().copied() {
-            let endpoints = self.relay_plane.retain_safe_discovered_endpoints(
-                targets[index]
-                    .relay_lists
-                    .nip65
-                    .relays
-                    .iter()
-                    .chain(&targets[index].tied_relays)
-                    .cloned()
-                    .map(TransportEndpoint)
-                    .collect(),
-                "member KeyPackage batch fetch",
-            );
             let mut endpoints = match self
-                .relay_plane
-                .sanitize_relay_endpoints(endpoints, "member KeyPackage route admission")
+                .member_key_package_routes(&targets[index], "member KeyPackage batch fetch")
             {
                 Ok(endpoints) => endpoints,
                 Err(_) => {
@@ -1382,18 +1396,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .into_iter()
             .filter_map(|(index, observed_records)| {
                 let target = targets[index].clone();
-                let mut endpoints = self.relay_plane.retain_safe_discovered_endpoints(
-                    target
-                        .relay_lists
-                        .nip65
-                        .relays
-                        .iter()
-                        .chain(&target.tied_relays)
-                        .cloned()
-                        .map(TransportEndpoint)
-                        .collect(),
-                    "member KeyPackage fallback fetch",
-                );
+                // The batch already admitted these same routes.
+                let mut endpoints = self
+                    .member_key_package_routes(&target, "member KeyPackage fallback fetch")
+                    .ok()?;
                 if endpoints.is_empty() {
                     endpoints.clone_from(&defaults);
                 }
