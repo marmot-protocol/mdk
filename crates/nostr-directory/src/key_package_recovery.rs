@@ -1,6 +1,7 @@
 //! Bounded discovery recovery; a relay copy is not proof of private-key possession.
 
 use crate::error::DirectoryError;
+use crate::member_key_packages::key_package_requirements_are_incompatible;
 use std::collections::BTreeSet;
 
 use cgka_engine::key_package::KeyPackageRequirements;
@@ -141,15 +142,22 @@ impl<R: DirectoryResources> Directory<R> {
                         &deletions,
                         freshness,
                     );
-                    // A known validation error precedes an incomplete negative
-                    // lookup; it never authorizes returning an unproven
-                    // usable package.
-                    let selection = select_key_packages_from_records(
+                    // A compatibility refusal describes the recipient's
+                    // available packages and requires complete coverage.
+                    let selection = match select_key_packages_from_records(
                         account,
                         &records,
                         freshness,
                         requirements,
-                    )?;
+                    ) {
+                        Err(DirectoryError::KeyPackageRequirements(error))
+                            if !package_coverage
+                                && key_package_requirements_are_incompatible(&error) =>
+                        {
+                            return Err(recovery_incomplete(account));
+                        }
+                        result => result?,
+                    };
                     let mut selected = selection
                         .value
                         .iter()

@@ -1003,17 +1003,11 @@ async fn failed_single_author_refetch_preserves_only_usable_current_batch_packag
                 .err()
                 .expect("unusable batch material must not become a fallback");
             match batch_case {
-                "absent" => assert!(matches!(
+                "absent" | "incompatible" => assert!(matches!(
                     error,
                     DirectoryError::DirectoryLookupIncomplete(_)
                 )),
                 "malformed" => assert!(matches!(error, DirectoryError::InvalidKeyPackageEvent(_))),
-                "incompatible" => assert!(matches!(
-                    error,
-                    DirectoryError::KeyPackageRequirements(
-                        cgka_traits::EngineError::MissingRequiredCapabilities { .. }
-                    )
-                )),
                 _ => unreachable!(),
             }
         }
@@ -1099,14 +1093,24 @@ async fn direct_start_rejects_a_retention_incompatible_recipient_without_creatin
     }
 
     let runtime = MarmotAppRuntime::new(app.clone());
+    let options = crate::DirectConversationOptions {
+        disappearing_message_secs: 300,
+    };
+    *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://directory.example".into());
     let error = runtime
-        .start_direct_conversation_with_options(
-            "alice",
-            &bob.account_id_hex,
-            crate::DirectConversationOptions {
-                disappearing_message_secs: 300,
-            },
-        )
+        .start_direct_conversation_with_options("alice", &bob.account_id_hex, options)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::DirectoryLookupIncomplete(account) if account == &bob.account_id_hex),
+        "{error}"
+    );
+    assert!(app.groups("alice").unwrap().is_empty());
+
+    *fetcher.incomplete_endpoint.lock().unwrap() = None;
+    let error = runtime
+        .start_direct_conversation_with_options("alice", &bob.account_id_hex, options)
         .await
         .unwrap_err();
     assert!(

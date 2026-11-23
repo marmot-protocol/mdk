@@ -22,9 +22,9 @@
 - `TimelineUpdateTrigger::AgentActivity` becomes `AgentItem`, and `AgentOperation` is removed: a kind 1202 has no
   timeline row.
 - `TimelineMessageRecord::canonical_order_key` gains the agent item `seq` before the message id.
-- `AppError` gains `IncompatibleKeyPackage(Box<EngineError>)`. When a new direct chat requires message retention and the
-  recipient's available KeyPackages are all incompatible, `start_direct_conversation_with_options` returns this variant
-  in place of `AppError::Session`. Handle it in exhaustive matches. `as_engine_error` still exposes the cause (#3604).
+- `AppError` gains `IncompatibleKeyPackage(Box<EngineError>)`. When a complete lookup finds only KeyPackages incompatible
+  with a new direct chat's founding requirements, the start returns this variant in place of `AppError::Session`.
+  Handle it in exhaustive matches. `as_engine_error` still exposes the cause (#3604).
 
 ### Added
 
