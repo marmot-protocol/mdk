@@ -805,31 +805,33 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         })
     }
 
-    /// A member's listed KeyPackage routes plus any tied relays, admitted
-    /// together. Tied relays only add reads: when they push the routes past
-    /// the admission limit, the listed routes are read alone.
+    /// A member's listed KeyPackage routes, or `defaults` when the list names
+    /// none, plus any tied relays, admitted together. Tied relays only add
+    /// reads: when they push the routes past the admission limit, the primary
+    /// routes are read alone.
     fn member_key_package_routes(
         &self,
         target: &MemberTarget,
+        defaults: &[TransportEndpoint],
         context: &str,
     ) -> Result<Vec<TransportEndpoint>, String> {
-        let admit = |tied: &[String]| {
-            let endpoints = self.relay_plane.retain_safe_discovered_endpoints(
-                target
-                    .relay_lists
-                    .nip65
-                    .relays
-                    .iter()
-                    .chain(tied)
-                    .cloned()
-                    .map(TransportEndpoint)
-                    .collect(),
+        let safe = |relays: &[String]| {
+            self.relay_plane.retain_safe_discovered_endpoints(
+                relays.iter().cloned().map(TransportEndpoint).collect(),
                 context,
-            );
-            self.relay_plane
-                .sanitize_relay_endpoints(endpoints, "member KeyPackage route admission")
+            )
         };
-        admit(&target.tied_relays).or_else(|_| admit(&[]))
+        let mut primary = safe(&target.relay_lists.nip65.relays);
+        if primary.is_empty() {
+            primary = defaults.to_vec();
+        }
+        let admit = |tied: Vec<TransportEndpoint>| {
+            self.relay_plane.sanitize_relay_endpoints(
+                primary.iter().cloned().chain(tied).collect(),
+                "member KeyPackage route admission",
+            )
+        };
+        admit(safe(&target.tied_relays)).or_else(|_| admit(Vec::new()))
     }
 
     /// Journals what a read returned for an account, then fences selection
@@ -1198,13 +1200,14 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             let served = same_second(&target.completed_relay_records)
                 .iter()
                 .any(|relays| relay_identities(relays) == listed);
-            let tied = same_second(&target.relay_records)
+            // A conflicting list with no write relays adds no routes, but it
+            // is still a tie.
+            let conflicting = same_second(&target.relay_records)
                 .into_iter()
                 .filter(|relays| relay_identities(relays) != listed)
-                .flatten()
                 .collect::<Vec<_>>();
-            if !tied.is_empty() {
-                target.tied_relays = tied;
+            if !conflicting.is_empty() {
+                target.tied_relays = conflicting.into_iter().flatten().collect();
             } else if served {
                 confirmed.insert(index);
             }
@@ -1277,9 +1280,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
         for index in unresolved.iter().copied() {
-            let mut endpoints = match self
-                .member_key_package_routes(&targets[index], "member KeyPackage batch fetch")
-            {
+            let mut endpoints = match self.member_key_package_routes(
+                &targets[index],
+                &defaults,
+                "member KeyPackage batch fetch",
+            ) {
                 Ok(endpoints) => endpoints,
                 Err(_) => {
                     outcomes[index] = Some(Err(DirectoryError::DirectoryLookupIncomplete(
@@ -1288,9 +1293,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     continue;
                 }
             };
-            if endpoints.is_empty() {
-                endpoints.clone_from(&defaults);
-            }
             endpoints.sort();
             endpoints.dedup();
             if endpoints.is_empty() {
@@ -1416,12 +1418,13 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .filter_map(|(index, observed_records)| {
                 let target = targets[index].clone();
                 // The batch already admitted these same routes.
-                let mut endpoints = self
-                    .member_key_package_routes(&target, "member KeyPackage fallback fetch")
+                let endpoints = self
+                    .member_key_package_routes(
+                        &target,
+                        &defaults,
+                        "member KeyPackage fallback fetch",
+                    )
                     .ok()?;
-                if endpoints.is_empty() {
-                    endpoints.clone_from(&defaults);
-                }
                 (!endpoints.is_empty()).then_some((index, target, endpoints, observed_records))
             })
             .collect::<Vec<_>>();

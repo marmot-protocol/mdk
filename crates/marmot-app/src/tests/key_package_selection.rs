@@ -1712,46 +1712,129 @@ async fn a_tied_relay_list_is_read_but_decides_nothing() {
     app.close_storage().unwrap();
 }
 
+/// A same-second relay list on `endpoint` whose event id sorts after
+/// `listed`'s, so `listed` wins the tie, naming `relay` with `marker`.
+fn losing_relay_list(
+    listed: &NostrTransportEvent,
+    relay: &str,
+    marker: &str,
+) -> NostrTransportEvent {
+    (0..)
+        .map(|nonce| {
+            NostrTransportEvent::new_unsigned_at(
+                listed.pubkey.clone(),
+                KIND_NIP65_RELAY_LIST,
+                vec![vec!["r".into(), relay.into(), marker.into()]],
+                nonce.to_string(),
+                listed.created_at,
+            )
+        })
+        .find(|event| event.id > listed.id)
+        .unwrap()
+}
+
 /// Two relays can serve different relay lists published in the same second.
 /// The lower event id wins the list, but the other list is a tie all the
-/// same: its outbox is read, and the compatible package there is used.
+/// same. Its outbox is read and a compatible package there is used. A tied
+/// list naming only a read relay adds no outbox, yet it still blocks a
+/// verdict on the remembered outbox's incompatible package.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_losing_same_second_relay_list_is_still_read() {
+async fn a_losing_same_second_relay_list_is_still_a_tie() {
+    for marker in ["write", "read"] {
+        let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+        let requirements = retention_requirements(&app).await;
+        let compatible = {
+            let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+            let listed = by_endpoint["wss://directory.example"]
+                .iter()
+                .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
+                .unwrap()
+                .clone();
+            let old_outbox = by_endpoint.get_mut("wss://shared.example").unwrap();
+            old_outbox.retain(|event| event.kind != KIND_NIP65_RELAY_LIST);
+            old_outbox.push(losing_relay_list(&listed, UPDATED_DIRECT_OUTBOX, marker));
+            by_endpoint[UPDATED_DIRECT_OUTBOX]
+                .iter()
+                .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let result = app
+            .directory()
+            .resolve_compatible_member_key_packages(
+                vec![bob.account_id_hex.clone()],
+                &requirements,
+                nostr_directory::MemberResolutionPurpose::Commit,
+                nostr_directory::MemberResolutionPolicy::Atomic,
+            )
+            .await;
+        if marker == "write" {
+            assert_eq!(
+                result
+                    .unwrap()
+                    .key_packages
+                    .iter()
+                    .map(|package| hex::encode(
+                        package.source.as_ref().unwrap().event_id.as_slice()
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![compatible]
+            );
+        } else {
+            assert!(
+                matches!(
+                    &result,
+                    Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
+                ),
+                "{:?}",
+                result.err()
+            );
+        }
+        app.close_storage().unwrap();
+    }
+}
+
+/// When the winning relay list names no outbox, the configured directory
+/// relays stay among the KeyPackage routes. A tied list's outbox only adds to
+/// them, so its unfinished read cannot hide a compatible package on the
+/// directory relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tied_outbox_does_not_displace_the_directory_relays() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
     let requirements = retention_requirements(&app).await;
     let compatible = {
         let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
-        let listed = by_endpoint["wss://directory.example"]
-            .iter()
-            .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
-            .unwrap()
-            .clone();
-        let losing = (0..)
-            .map(|nonce| {
-                NostrTransportEvent::new_unsigned_at(
-                    bob.account_id_hex.clone(),
-                    KIND_NIP65_RELAY_LIST,
-                    vec![vec![
-                        "r".into(),
-                        UPDATED_DIRECT_OUTBOX.into(),
-                        "write".into(),
-                    ]],
-                    nonce.to_string(),
-                    listed.created_at,
-                )
-            })
-            .find(|event| event.id > listed.id)
-            .unwrap();
-        let old_outbox = by_endpoint.get_mut("wss://shared.example").unwrap();
-        old_outbox.retain(|event| event.kind != KIND_NIP65_RELAY_LIST);
-        old_outbox.push(losing);
-        by_endpoint[UPDATED_DIRECT_OUTBOX]
+        let compatible = by_endpoint[UPDATED_DIRECT_OUTBOX]
             .iter()
             .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
             .unwrap()
-            .id
-            .clone()
+            .clone();
+        let directory = by_endpoint.get_mut("wss://directory.example").unwrap();
+        let position = directory
+            .iter()
+            .position(|event| event.kind == KIND_NIP65_RELAY_LIST)
+            .unwrap();
+        let read_only = NostrTransportEvent::new_unsigned_at(
+            bob.account_id_hex.clone(),
+            KIND_NIP65_RELAY_LIST,
+            vec![vec![
+                "r".into(),
+                "wss://shared.example".into(),
+                "read".into(),
+            ]],
+            String::new(),
+            directory[position].created_at,
+        );
+        let tied = losing_relay_list(&read_only, "wss://offline.example", "write");
+        directory[position] = read_only;
+        directory.push(tied);
+        directory.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        directory.push(compatible.clone());
+        compatible.id
     };
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://offline.example".into());
+    *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
     let resolved = app
         .directory()
         .resolve_compatible_member_key_packages(
