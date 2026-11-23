@@ -301,6 +301,44 @@ async fn the_approving_device_adds_a_new_device_to_its_chats() {
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 0);
 }
 
+/// A maintenance run can come between the laptop's first commit reaching
+/// the phone and the pairing drive that makes the link: it finds no device
+/// to add and clears the device-group event that would have run it again.
+/// Making the link owes the post-link pass itself, so the phone adds the
+/// laptop at its next retry rather than at an unrelated event or its hourly
+/// heartbeat (mdk#3628).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn making_a_link_after_a_maintenance_run_owes_the_post_link_pass() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    chats(&mut phone, 1).await;
+    let slot = choose_link(&relay, &mut phone, &mut laptop).await;
+    laptop.op(DeviceLinkOp::ConfirmMatch).await;
+    laptop.step(&relay).await; // phone's confirm in, laptop's out
+    phone.step(&relay).await; // laptop's confirm in: the commit
+    let joined = laptop.step(&relay).await; // the Welcome, and its first commit
+    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+    let group = laptop.client.trusted_device_group().unwrap().unwrap();
+
+    // The laptop's first commit arrives, and maintenance runs before the
+    // pairing drive reads it.
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    phone.client.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Pending
+    );
+    phone.op(DeviceLinkOp::Read).await;
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Linked
+    );
+
+    assert!(
+        phone.client.device_group_due(&[]).unwrap().owed,
+        "a link just made owes the pass that adds the new device to chats"
+    );
+}
+
 /// A chat reaches a newly linked laptop as it stands on the phone that adds
 /// it (mdk#3546): one the phone founded or accepted arrives confirmed, and
 /// an invitation still unanswered there arrives pending, from the account

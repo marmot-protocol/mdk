@@ -1642,8 +1642,15 @@ impl AppClient {
                 continue;
             }
             self.end_link_prompt(&link, outcome, now);
-            if outcome == DeviceLinkOutcome::Failed {
-                self.unlink_failed_device(&link, &own_slot, true).await;
+            match outcome {
+                // The post-link pass adds the new device to chats; a
+                // maintenance run before this decision found nothing to add
+                // and cleared the event that would have run it (mdk#3628).
+                DeviceLinkOutcome::Linked => self.device_group_work_changed = true,
+                DeviceLinkOutcome::Failed => {
+                    self.unlink_failed_device(&link, &own_slot, true).await;
+                }
+                DeviceLinkOutcome::Pending => {}
             }
         }
         self.device_pairing
