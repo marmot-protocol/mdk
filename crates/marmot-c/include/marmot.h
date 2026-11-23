@@ -2575,8 +2575,7 @@ typedef struct MarmotRelayFailure {
 } MarmotRelayFailure;
 
 /**
- * Completion means sign-out teardown with the account and data kept, or wipe
- * directory detachment. It confirms neither vault erasure nor reclaimed space.
+ * Local cleanup result inside a sign-out/wipe outcome.
  */
 typedef struct MarmotLocalCleanupReport {
   bool completed;
