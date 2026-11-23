@@ -3411,6 +3411,7 @@ async fn app_runtime_ignores_invalid_legacy_json_cache_when_publishing() {
         .path()
         .join("key-packages")
         .join(format!("{}.json", created.account.label));
+    std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
     std::fs::write(
         &cache_path,
         serde_json::json!({
