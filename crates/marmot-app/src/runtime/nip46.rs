@@ -221,12 +221,24 @@ impl MarmotAppRuntime {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(&account.account_id_hex)?;
         let account_id = account.account_id_hex.clone();
-        let target = self.accounts.nip46_erase_target(account);
-        let accounts = self.accounts.clone();
-        blocking_app_task(move || {
-            accounts.erase_nip46_target(target, Nip46Removal::IncludingOrphaned)
-        })
-        .await?;
+        if !account.external_signing {
+            // Setup compensation can restore the public role before vault
+            // deletion succeeds. Retry only cleanup that Home recorded.
+            let app = self.accounts.app.clone();
+            blocking_app_task(move || {
+                app.account_home()
+                    .remove_nip46_session(&account.label, Nip46Removal::Recorded)
+                    .map_err(|_| Nip46Error::Storage.into())
+            })
+            .await?;
+        } else {
+            let target = self.accounts.nip46_erase_target(account);
+            let accounts = self.accounts.clone();
+            blocking_app_task(move || {
+                accounts.erase_nip46_target(target, Nip46Removal::IncludingOrphaned)
+            })
+            .await?;
+        }
         self.accounts.reconcile_nip46_cleanup(&account_id).await
     }
 

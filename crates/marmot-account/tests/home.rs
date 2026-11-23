@@ -302,6 +302,69 @@ fn generated_setup_context_is_absent_until_written() {
 }
 
 #[test]
+fn setup_cleanup_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let (account, initial) = home.create_nostr_account_for_setup().unwrap();
+    let context = home
+        .account_dir(&account.label)
+        .join(".account-setup-context.json");
+    std::fs::create_dir(&context).unwrap();
+
+    home.complete_account_setup(&account.label, &initial)
+        .unwrap();
+    assert!(home.account_setup_state(&account.label).unwrap().is_none());
+    assert_eq!(home.account(&account.label).unwrap(), account);
+    assert!(matches!(
+        home.begin_account_setup_with(&account, initial.kind, initial.phase),
+        Err(AccountHomeError::Io(_))
+    ));
+    assert!(home.account_setup_state(&account.label).unwrap().is_none());
+
+    std::fs::remove_dir(&context).unwrap();
+    std::fs::write(&context, b"previous request").unwrap();
+    drop(home);
+    let home = AccountHome::open(dir.path());
+    assert_eq!(
+        home.account_setup_context(&account.label)
+            .unwrap()
+            .as_deref(),
+        Some(b"previous request".as_slice())
+    );
+    // This test owns its temporary root exclusively, as a leased host does.
+    home.resume_wipe_cleanup().unwrap();
+    assert!(
+        home.account_setup_context(&account.label)
+            .unwrap()
+            .is_none()
+    );
+
+    let fresh = home
+        .begin_account_setup_with(&account, initial.kind, initial.phase)
+        .unwrap();
+    home.set_account_setup_context(&account.label, b"fresh request")
+        .unwrap();
+    home.resume_wipe_cleanup().unwrap();
+    assert_eq!(
+        home.account_setup_context(&account.label)
+            .unwrap()
+            .as_deref(),
+        Some(b"fresh request".as_slice())
+    );
+    home.complete_account_setup(&account.label, &fresh).unwrap();
+    std::fs::write(&context, b"another old request").unwrap();
+    let replacement = home
+        .begin_account_setup_with(&account, initial.kind, initial.phase)
+        .unwrap();
+    assert_ne!(replacement.attempt_id, fresh.attempt_id);
+    assert!(
+        home.account_setup_context(&account.label)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn generated_setup_context_write_requires_a_setup_journal() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -565,6 +628,93 @@ fn promotion_retires_old_pair() {
             replacement.secret_key()
         );
     }
+}
+
+#[test]
+fn restored_public_wipe_retires() {
+    for restored_before_restart in [false, true] {
+        for vault_refuses in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(MemorySecretStore::default());
+            let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+            let id = nostr::prelude::Keys::generate().public_key().to_hex();
+            let public = home.add_public_account(&id).unwrap();
+            let (_, setup) = home.add_external_signer_for_setup(&id, None).unwrap();
+            let setup = setup.unwrap();
+            let database = home
+                .external_database_secret(&id, ExternalSecretMode::Create)
+                .unwrap();
+            let credential = format!(".external-sqlcipher/{id}");
+            let pending = home.start_setup_compensation(&id, &setup).unwrap().unwrap();
+            if restored_before_restart {
+                // Older builds could restore the role without recording the
+                // database credential's independent ownership.
+                std::fs::write(
+                    home.account_dir(&id).join("account.json"),
+                    serde_json::to_vec(&public).unwrap(),
+                )
+                .unwrap();
+                std::fs::remove_file(home.account_dir(&id).join(".external-sqlcipher-owner.json"))
+                    .unwrap();
+            }
+            drop(home);
+            let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+            home.finish_setup_compensation(&id, &pending).unwrap();
+            assert_eq!(home.account(&id).unwrap(), public);
+            assert_eq!(
+                store.keys.lock().unwrap()[&credential],
+                hex::encode(*database)
+            );
+
+            store.fail_remove.store(vault_refuses, Ordering::SeqCst);
+            home.remove_account(&id).unwrap();
+            assert!(matches!(
+                home.account(&id),
+                Err(AccountHomeError::UnknownAccount(_))
+            ));
+            let mut tombstones = std::fs::read_dir(dir.path().join(".wipe-tombstones")).unwrap();
+            if vault_refuses {
+                let tombstone = tombstones.next().unwrap().unwrap().path();
+                let owner: String = serde_json::from_slice(
+                    &std::fs::read(tombstone.join(".external-sqlcipher-owner.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(owner, id);
+                home.resume_wipe_cleanup().unwrap();
+                assert_eq!(
+                    store.keys.lock().unwrap()[&credential],
+                    hex::encode(*database)
+                );
+                assert!(tombstone.join("account.json").exists());
+                assert!(tombstone.join(".external-sqlcipher-owner.json").exists());
+            } else {
+                assert!(!store.keys.lock().unwrap().contains_key(&credential));
+                assert!(tombstones.next().is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn public_wipe_skips_vault() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let id = nostr::prelude::Keys::generate().public_key().to_hex();
+    home.add_public_account(&id).unwrap();
+    store.fail_lookup.store(true, Ordering::SeqCst);
+    store.fail_remove.store(true, Ordering::SeqCst);
+    home.remove_account(&id).unwrap();
+    assert!(matches!(
+        home.account(&id),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    assert!(
+        std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
@@ -2340,6 +2490,7 @@ fn legacy_reset_keeps_raw_key() {
         .unwrap()
     };
     let pending = claim(&home, &account);
+    assert_eq!(claim(&home, &account), pending);
     assert_eq!(pending.origin, AccountSetupOrigin::LegacyUnknown);
     assert!(!pending.reused_account_id_credential);
     assert_eq!(
@@ -2354,6 +2505,7 @@ fn legacy_reset_keeps_raw_key() {
     drop(home);
 
     let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    assert_eq!(claim(&home, &account), pending);
     home.reset_legacy_setup(&account.label, &pending).unwrap();
     assert!(matches!(
         home.account(&account.label),
@@ -2380,6 +2532,46 @@ fn legacy_reset_keeps_raw_key() {
         home.load_signing_keys(&account.label).unwrap().secret_key(),
         keys.secret_key()
     );
+}
+
+#[test]
+fn file_reset_preserves_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account().unwrap();
+    let live = home.account_dir(&account.label);
+    let secret = std::fs::read(live.join("secret.json")).unwrap();
+    let pending = AccountSetupState {
+        account_id_hex: account.account_id_hex.clone(),
+        attempt_id: Some("legacy-reset-capture".into()),
+        origin: AccountSetupOrigin::LegacyUnknown,
+        reused_account_id_credential: false,
+        kind: AccountSetupKind::LegacyReset,
+        phase: AccountSetupPhase::CompensationPending,
+    };
+    assert!(matches!(
+        home.begin_account_setup_with(&account, pending.kind, pending.phase),
+        Err(AccountHomeError::AccountSetupConflict)
+    ));
+    assert!(home.account_setup_state(&account.label).unwrap().is_none());
+
+    // An intent written by an older build must be refused at commit too.
+    std::fs::write(
+        live.join(".account-setup.json"),
+        serde_json::to_vec(&pending).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        home.reset_legacy_setup(&account.label, &pending),
+        Err(AccountHomeError::AccountSetupConflict)
+    ));
+    assert_eq!(home.account(&account.label).unwrap(), account);
+    assert_eq!(std::fs::read(live.join("secret.json")).unwrap(), secret);
+    assert_eq!(
+        home.account_setup_state(&account.label).unwrap(),
+        Some(pending)
+    );
+    assert!(!dir.path().join(".wipe-tombstones").exists());
 }
 
 #[test]

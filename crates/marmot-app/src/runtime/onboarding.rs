@@ -1685,7 +1685,8 @@ impl AccountSetup<'_> {
         let _state = state.lock().unwrap_or_else(|p| p.into_inner());
         self.require_live_onboarding_attempt(checkpoint)?;
         let home = self.app().account_home();
-        // Clean up only the journal captured by the ready checkpoint.
+        // Commit only the journal captured by the ready checkpoint. Home owns
+        // the retry of any context cleanup left after that commit.
         if let Some(setup) = checkpoint.setup_attempt.as_ref()
             && home
                 .account_setup_state(&checkpoint.snapshot.account_id_hex)?

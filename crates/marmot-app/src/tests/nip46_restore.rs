@@ -1373,14 +1373,19 @@ async fn nip46_post_commit_failure() {
     session.connect_async().await.unwrap();
     *peer.completion_fault.lock().unwrap() = Some(home.clone());
     let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
-    runtime
+    let adopted = runtime
         .nip46_login(session.clone(), endpoints(), endpoints(), Vec::new())
         .await
-        .unwrap_err();
+        .unwrap();
     let id = peer.user.public_key().to_hex();
+    assert_eq!(adopted.account_id_hex, id);
     let account = home.account(&id).unwrap();
     assert!(!account.signed_out);
     assert!(home.account_setup_state(&id).unwrap().is_none());
+    assert_eq!(
+        runtime.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::NetworkReady
+    );
     assert_eq!(
         home.load_nip46_session(&id)
             .unwrap()
@@ -1390,11 +1395,15 @@ async fn nip46_post_commit_failure() {
         communication_key
     );
     session.ping_async().await.unwrap();
-    std::fs::remove_dir(
-        home.account_dir(&account.label)
-            .join(".account-setup-context.json"),
-    )
-    .unwrap();
+    let context = home
+        .account_dir(&account.label)
+        .join(".account-setup-context.json");
+    assert!(context.is_dir());
+    std::fs::remove_dir(&context).unwrap();
+    std::fs::write(&context, b"retained completion metadata").unwrap();
+    // This app still owns the exclusive root lease while cleanup retries.
+    home.resume_wipe_cleanup().unwrap();
+    assert!(!context.exists());
     assert_eq!(
         runtime
             .nip46_login(session, endpoints(), endpoints(), Vec::new())
@@ -1443,6 +1452,66 @@ impl AccountSecretStore for RemovalFailureStore {
         }
         Ok(())
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_remove_from_public() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(RemovalFailureStore {
+        inner: LocalFileSecretStore::new(dir.path()),
+        refuse: AtomicBool::new(true),
+        native_removed: tokio::sync::Notify::new(),
+    });
+    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let public = home
+        .add_public_account(&Keys::generate().public_key().to_hex())
+        .unwrap();
+    let (_, setup) = home
+        .add_external_signer_for_setup(&public.label, None)
+        .unwrap();
+    let client = Keys::generate();
+    let permissions = Nip46Session::permissions();
+    home.store_nip46_session(
+        &public.label,
+        &client,
+        &Nip46SessionRecord {
+            version: 1,
+            user_public_key: public.account_id_hex.clone(),
+            remote_signer_public_key: Keys::generate().public_key().to_hex(),
+            client_public_key: client.public_key().to_hex(),
+            relays: vec!["wss://signer-relay.example".into()],
+            name: "Deletion retry".into(),
+            permission_version: permissions.version,
+            permissions: permissions.grants,
+        },
+    )
+    .unwrap();
+    let pending = home
+        .start_setup_compensation(&public.label, &setup.unwrap())
+        .unwrap()
+        .unwrap();
+    home.finish_setup_compensation(&public.label, &pending)
+        .unwrap();
+    assert_eq!(home.account(&public.label).unwrap(), public);
+    let credential = format!(".nip46-client/{}", public.label);
+    assert!(store.has_secret_for_label(&credential).unwrap());
+
+    let runtime =
+        MarmotApp::with_relays_and_account_home(dir.path(), vec![], home.clone()).runtime();
+    assert!(matches!(
+        runtime.nip46_remove(&public.label).await,
+        Err(AppError::Nip46(Nip46Error::Storage))
+    ));
+    assert!(store.has_secret_for_label(&credential).unwrap());
+    store.refuse.store(false, Ordering::SeqCst);
+    runtime.nip46_remove(&public.label).await.unwrap();
+    assert!(!store.has_secret_for_label(&credential).unwrap());
+    store.refuse.store(true, Ordering::SeqCst);
+    runtime.nip46_remove(&public.label).await.unwrap();
+    assert_eq!(home.account(&public.label).unwrap(), public);
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

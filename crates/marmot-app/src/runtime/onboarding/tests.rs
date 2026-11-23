@@ -402,15 +402,20 @@ async fn onboarding_legacy_import_rejects_before_reactivating_the_identity() {
     let home = runtime.accounts().app.account_home();
     let before = home.set_account_signed_out(&id, true).unwrap();
     let checkpoint = home.account_onboarding(&id).unwrap();
-    let result = runtime
-        .create_or_import_account(AccountSetupRequest {
-            import_nsec: Some(Zeroizing::new(keys.secret_key().to_bech32().unwrap())),
-            ..AccountSetupRequest::default()
-        })
-        .await;
-    assert!(matches!(result, Err(AppError::OnboardingRequired)));
-    assert_eq!(home.account(&id).unwrap(), before);
-    assert_eq!(home.account_onboarding(&id).unwrap(), checkpoint);
+    for secret in [
+        keys.secret_key().to_bech32().unwrap(),
+        keys.secret_key().to_secret_hex(),
+    ] {
+        let result = runtime
+            .create_or_import_account(AccountSetupRequest {
+                import_nsec: Some(Zeroizing::new(secret)),
+                ..AccountSetupRequest::default()
+            })
+            .await;
+        assert!(matches!(result, Err(AppError::OnboardingRequired)));
+        assert_eq!(home.account(&id).unwrap(), before);
+        assert_eq!(home.account_onboarding(&id).unwrap(), checkpoint);
+    }
     assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -5404,7 +5409,7 @@ async fn ready_onboarding_can_be_cancelled_before_open_chats() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn committed_removal_drops_the_update_channel_and_a_failed_one_keeps_it() {
-    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let (dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
     let mut subscription = manager.account_setup().subscribe_onboarding(&id).unwrap();
     let has_channel = || {
@@ -5416,6 +5421,32 @@ async fn committed_removal_drops_the_update_channel_and_a_failed_one_keeps_it() 
             .contains_key(&id)
     };
     assert!(has_channel());
+    let app = manager.app_for_test();
+    let account = manager.resolve(&id).unwrap();
+    let package = Box::pin(crate::tests::fresh_key_package_for_account(
+        app, &account, true,
+    ))
+    .await;
+    let legacy = dir.path().join("key-packages");
+    fs_private::create_dir_all_private(&legacy).unwrap();
+    let record = legacy.join(format!("{id}.json"));
+    let marker = legacy.join(format!("{id}.capability-refresh-v1-replacement-pending"));
+    let scan = legacy.join(format!("{id}.capability-refresh-v1-relay-scan-complete"));
+    let slot = serde_json::to_vec(&crate::KeyPackageRecord {
+        account_label: id.clone(),
+        account_id_hex: id.clone(),
+        key_package_id: "legacy-slot".into(),
+        key_package_ref_hex: crate::key_package_metadata(&package)
+            .unwrap()
+            .key_package_ref_hex,
+        key_package_event_id: "22".repeat(32),
+        published_at: 1,
+        key_package_hex: hex::encode(package.bytes()),
+    })
+    .unwrap();
+    fs_private::write_private(&record, &slot).unwrap();
+    fs_private::write_private(&marker, b"pending\n").unwrap();
+    fs_private::write_private(&scan, b"scanned\n").unwrap();
     // The tombstone namespace is a file, so the account directory cannot move
     // into it: the removal fails before its commit point.
     let obstruction = manager
@@ -5426,6 +5457,18 @@ async fn committed_removal_drops_the_update_channel_and_a_failed_one_keeps_it() 
     fs_private::write_private(&obstruction, b"synthetic pre-commit failure").unwrap();
     assert!(manager.remove_account(&id).await.is_err());
     assert!(manager.resolve(&id).is_ok());
+    let live_record = app.key_package_record_path(&id);
+    let live_marker = app.key_package_cutover_replacement_pending_path(&id);
+    let live_scan = app.key_package_artifact_path(&id, crate::KEY_PACKAGE_CUTOVER_SCANNED);
+    assert_eq!(std::fs::read(&live_record).unwrap(), slot);
+    assert_eq!(
+        app.reusable_key_package_slot_id(&id, &id)
+            .unwrap()
+            .as_deref(),
+        Some("legacy-slot")
+    );
+    assert_eq!(std::fs::read(&live_marker).unwrap(), b"pending\n");
+    assert_eq!(std::fs::read(&live_scan).unwrap(), b"scanned\n");
     assert!(has_channel());
     let mut c = manager
         .setup_records()
@@ -5439,6 +5482,9 @@ async fn committed_removal_drops_the_update_channel_and_a_failed_one_keeps_it() 
     );
     std::fs::remove_file(&obstruction).unwrap();
     manager.remove_account(&id).await.unwrap();
+    for path in [record, marker, scan, live_record, live_marker, live_scan] {
+        assert!(!path.exists());
+    }
     assert!(!has_channel());
     assert!(subscription.recv().await.is_none());
     runtime.shutdown_and_close().await.unwrap();
@@ -6347,6 +6393,43 @@ fn mark_ready(c: &mut OnboardingCheckpoint) {
     for step in c.snapshot.steps.clone() {
         c.set(step.step, OnboardingStatus::Passed, vec![]);
     }
+}
+
+fn obstruct_setup_context(home: &AccountHome, label: &str) -> std::path::PathBuf {
+    let path = home.account_dir(label).join(".account-setup-context.json");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    path
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onboarding_with_cleanup_debt() {
+    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let home = manager.app.account_home();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    mark_ready(&mut c);
+    c.setup_cleanup_pending = true;
+    home.set_account_setup_phase(
+        &id,
+        c.setup_attempt.as_ref().unwrap(),
+        AccountSetupPhase::KeyPackagePublicationConfirmed,
+    )
+    .unwrap();
+    home.set_account_setup_context(&id, b"onboarding context")
+        .unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
+    let context = obstruct_setup_context(&home, &id);
+
+    let result = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert!(result.ready);
+    assert_eq!(home.account_setup_state(&id).unwrap(), None);
+    assert!(context.is_dir());
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9098,6 +9181,8 @@ async fn concurrent_creates_coalesce() {
         *secrets.written.lock(),
         vec![original[0].account_id_hex.clone()]
     );
+    let home = runtime.accounts.app.account_home();
+    let context = obstruct_setup_context(&home, &original[0].label);
     network.block_publish.store(false, Ordering::SeqCst);
     network.release_publish.notify_waiters();
     let (first, second) = timeout(Duration::from_secs(30), async {
@@ -9113,6 +9198,8 @@ async fn concurrent_creates_coalesce() {
     assert_network_setup(&runtime, &network, &second);
     assert_eq!(first.relay_lists, second.relay_lists);
     assert_eq!(first.key_package_bytes, second.key_package_bytes);
+    assert_eq!(home.account_setup_state(&original[0].label).unwrap(), None);
+    assert!(context.is_dir());
     assert_eq!(
         runtime.accounts.app.account_home().accounts().unwrap(),
         original

@@ -8115,11 +8115,25 @@ fn durable_incomplete_setup_can_provision_slot_after_database_creation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_ambiguous_setup_requires_consent_before_reset() {
     let directory = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(directory.path());
     let keys = nostr::prelude::Keys::generate();
+    if keyring_core::get_default_store().is_none() {
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+    }
+    let store = Arc::new(
+        marmot_account::KeychainSecretStore::new(format!(
+            "com.marmot.test.legacy-reset-{}",
+            keys.public_key().to_hex(),
+        ))
+        .unwrap(),
+    );
+    let home = AccountHome::open_with_secret_store(directory.path(), store.clone());
     let secret = keys.secret_key().to_secret_hex();
     let account = home.import_nostr_account(&secret).unwrap();
-    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let app = MarmotApp::with_relays_and_account_home(
+        directory.path(),
+        vec!["wss://relay.example".into()],
+        home.clone(),
+    );
 
     account_database_from_an_older_build(&app, &account.label);
     app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
@@ -8159,6 +8173,12 @@ async fn legacy_ambiguous_setup_requires_consent_before_reset() {
         Err(AccountHomeError::UnknownAccount(_))
     ));
     assert!(!app.key_package_cutover_replacement_pending(&account.label));
+    assert_eq!(
+        marmot_account::AccountSecretStore::load_secret(store.as_ref(), &account)
+            .unwrap()
+            .public_key(),
+        keys.public_key()
+    );
 
     let retried = home.import_nostr_account_idempotent(&secret).unwrap();
     assert_eq!(retried.account().account_id_hex, account.account_id_hex);
@@ -8208,7 +8228,8 @@ async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
     assert!(!app.key_package_record_path(&account.label).exists());
 
     let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
-    app.open_account(&account.label, &relay_plane, false)
+    let session = app.acquire_account_session(&account.label).unwrap();
+    app.open_account(&account, session, &relay_plane, false)
         .unwrap();
     assert!(app.key_package_cutover_replacement_pending(&account.label));
     assert!(

@@ -3632,6 +3632,41 @@ async fn cancelled_startup_is_reaped() {
     runtime.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removal_refuses_direct_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://setup.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let home = app.account_home();
+    let account = home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let runtime = app.runtime();
+    let (reached, proceed) = install_local_open_gate(&app, "alice");
+    let sync = tokio::spawn({
+        let app = app.clone();
+        async move { Box::pin(app.sync_account("alice")).await }
+    });
+    wait_for_test_signal(reached, "direct sync session open").await;
+    let removal = runtime.accounts().remove_account("alice").await;
+    let other = runtime.accounts().remove_account("bob").await;
+    let live = home.account("alice");
+    proceed.send(()).unwrap();
+    assert!(matches!(removal, Err(AppError::AccountSessionBusy)));
+    other.unwrap();
+    assert!(matches!(
+        home.account("bob"),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    assert_eq!(live.unwrap(), account);
+    let _pass = sync.await.unwrap().expect("direct sync still opens");
+    runtime.accounts().remove_account("alice").await.unwrap();
+    assert!(matches!(
+        home.account("alice"),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn compensation_waits_for_open() {
     let dir = tempfile::tempdir().unwrap();

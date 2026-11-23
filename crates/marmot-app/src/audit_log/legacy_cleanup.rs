@@ -214,7 +214,7 @@ mod classifier_tests {
 mod tests {
     use super::*;
     use crate::{AppError, MarmotApp, MarmotAppConfig, MarmotRootRuntimeLease};
-    use marmot_account::AccountHome;
+    use marmot_account::{AccountHome, AccountHomeError};
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     const ENGINE: &str = "0123456789abcdef0123456789abcdef";
@@ -315,7 +315,13 @@ mod tests {
             fs::write(&nested_target, b"EXTERNAL_ACCOUNT_BYTES").unwrap();
             let accounts = root.path().join(container);
             symlink(external.path(), &accounts).unwrap();
-            drop(open_app(root.path()).unwrap());
+            assert!(matches!(
+                open_app(root.path()),
+                Err(AppError::AccountHome(AccountHomeError::Io(error)))
+                    if error.kind() == io::ErrorKind::NotADirectory
+            ));
+            let _lease = MarmotRootRuntimeLease::try_acquire(root.path()).unwrap();
+            cleanup_legacy_audit_logs(root.path());
             assert_eq!(fs::read(&target).unwrap(), b"EXTERNAL_BYTES");
             assert_eq!(fs::read(&nested_target).unwrap(), b"EXTERNAL_ACCOUNT_BYTES");
             fs::remove_file(&accounts).unwrap();
@@ -324,8 +330,9 @@ mod tests {
             let real_account = accounts.join("real-account");
             fs::create_dir(&real_account).unwrap();
             symlink(&target, real_account.join(&name)).unwrap();
-            drop(open_app(root.path()).unwrap());
+            cleanup_legacy_audit_logs(root.path());
             assert_eq!(fs::read(target).unwrap(), b"EXTERNAL_BYTES");
+            assert_eq!(fs::read(nested_target).unwrap(), b"EXTERNAL_ACCOUNT_BYTES");
             assert!(
                 fs::symlink_metadata(real_account.join(name))
                     .unwrap()
@@ -365,7 +372,8 @@ mod tests {
         fs::create_dir_all(&remnant).unwrap();
         let old = remnant.join(format!("audit-{ENGINE}-v3.jsonl"));
         fs::write(&old, b"OLD").unwrap();
-        drop(open_app(root.path()).unwrap());
+        let _lease = MarmotRootRuntimeLease::try_acquire(root.path()).unwrap();
+        cleanup_legacy_audit_logs(root.path());
         assert!(!old.exists());
         assert_eq!(fs::read(&accounts).unwrap(), b"UNEXPECTED_CONTAINER_FILE");
         fs::remove_file(&accounts).unwrap();
@@ -409,14 +417,12 @@ mod tests {
         );
         home.create_account("alice").unwrap();
         let account = home.account_dir("alice");
-        let old = format!("audit-{ENGINE}-v2.jsonl");
-        let v4 = format!("audit-{ENGINE}-v4.jsonl");
-        for name in [&old, &v4, "audit-key-reveal.jsonl"] {
-            fs::write(account.join(name), b"PRESERVED_UNTIL_CLEANUP").unwrap();
-        }
-        // Exercise the real rename-to-tombstone path. A credential-store error
-        // after the rename leaves the removed account's files outside accounts/.
-        assert!(home.remove_account("alice").is_err());
+        // A vault refusal after detachment retains a real wipe tombstone.
+        home.remove_account("alice").unwrap();
+        assert!(matches!(
+            home.account("alice"),
+            Err(AccountHomeError::UnknownAccount(_))
+        ));
         let remnant = fs::read_dir(root.path().join(".wipe-tombstones"))
             .unwrap()
             .next()
@@ -424,8 +430,16 @@ mod tests {
             .unwrap()
             .path();
         assert!(!account.exists());
-        assert!(remnant.join(&old).exists());
-        drop(open_app(root.path()).unwrap());
+        // Model audit files left by an interruption before the payload purge.
+        // Exercise the audit scanner independently: Home may purge everything
+        // in a detached payload on startup, but the scanner may not.
+        let old = format!("audit-{ENGINE}-v2.jsonl");
+        let v4 = format!("audit-{ENGINE}-v4.jsonl");
+        for name in [&old, &v4, "audit-key-reveal.jsonl"] {
+            fs::write(remnant.join(name), b"PRESERVED_UNTIL_CLEANUP").unwrap();
+        }
+        let lease = MarmotRootRuntimeLease::try_acquire(root.path()).unwrap();
+        cleanup_legacy_audit_logs(root.path());
         assert!(!remnant.join(old).exists());
         for name in [&v4, "audit-key-reveal.jsonl"] {
             assert_eq!(
@@ -433,6 +447,27 @@ mod tests {
                 b"PRESERVED_UNTIL_CLEANUP"
             );
         }
+        let healthy = home.create_account("bob").unwrap();
+        drop(lease);
+        let blocked = remnant.join("secret.json");
+        fs::create_dir(&blocked).unwrap();
+        let app = open_app(root.path()).unwrap();
+        assert_eq!(app.account_home().account("bob").unwrap(), healthy);
+        assert_eq!(
+            app.account_home()
+                .load_signing_keys("bob")
+                .unwrap()
+                .public_key()
+                .to_hex(),
+            healthy.account_id_hex
+        );
+        assert!(blocked.is_dir());
+        assert!(!remnant.join(&v4).exists());
+        drop(app);
+        fs::remove_dir(&blocked).unwrap();
+        fs::write(&blocked, b"DETACHED_BYTES").unwrap();
+        drop(open_app(root.path()).unwrap());
+        assert!(!blocked.exists());
     }
 
     #[test]

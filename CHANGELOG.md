@@ -9,7 +9,7 @@
   Replace import rollback and external signer reversion with `start_setup_compensation` and
   `finish_setup_compensation`. Use an explicit `LegacyReset` attempt with `reset_legacy_setup` for an
   incomplete account that has no journal. Other accounts with unknown setup provenance are not eligible
-  for compensation.
+  for compensation. File-backed legacy reset is refused before mutation to preserve its raw signing key.
 - `AccountHome` constructors no longer remove leftover wipe directories. `MarmotApp` replays local file
   cleanup under its root runtime lease. Lower-level hosts call `resume_wipe_cleanup` while holding
   exclusive root ownership; native cleanup records remain pending.
@@ -19,13 +19,20 @@
 - Destructive sign-out and rollback commit local account removal before deleting vault credentials.
   A vault failure leaves cleanup pending without restoring the removed account. Rolling back a public
   account's signer setup keeps its data. Windows replaces setup journals without removing the live name.
-  `local_cleanup.completed` reports committed local removal, not vault credential erasure.
+  Wipe `local_cleanup.completed` reports committed local removal, not vault credential erasure; ordinary
+  sign-out completion reports teardown with the account retained. Direct sessions drain before removal,
+  and KeyPackage recovery files remain available until local commit.
 - Explicit setup retries finish pending compensation before generated creation, import, sign-in,
   or interactive onboarding.
   Fresh generated retries use the caller's request and refuse unreadable account catalogs. Binding
   rollback errors preserve actionable publish, storage, and NIP-46 categories. Cancelled external-signer
   onboarding can resume ordinary sign-in without replacing its captured attempt. NIP-46 rollback
   preserves later reconnects and restores the previous host signer even when the cleanup claim fails.
+  Account-picker sign-in refuses pending compensation without clearing the signed-out marker. Hex-secret
+  imports use their derived public identity for admission; binding rollback errors retain cleanup details.
+- Setup completion remains committed when context cleanup fails. Leased reopen retries leftover context
+  and detached payloads without blocking unrelated accounts on individual cleanup failures. Restored
+  public accounts retain database-credential ownership for a later wipe and explicit NIP-46 cleanup.
 
 ## 0.19.0 - 2026-11-22
 

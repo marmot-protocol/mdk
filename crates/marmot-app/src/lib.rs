@@ -501,7 +501,10 @@ pub(crate) use storage_sqlite::LOCAL_PUBLISH_FAILED_REASON;
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const SHARED_DB_FILE: &str = "shared.sqlite3";
 const SESSION_DB_FILE: &str = "session.sqlite";
-const KEY_PACKAGE_DIR: &str = "key-packages";
+const LEGACY_KEY_PACKAGE_DIR: &str = "key-packages";
+const KEY_PACKAGE_RECORD: &str = "json";
+const KEY_PACKAGE_CUTOVER_PENDING: &str = "capability-refresh-v1-replacement-pending";
+const KEY_PACKAGE_CUTOVER_SCANNED: &str = "capability-refresh-v1-relay-scan-complete";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
@@ -2217,6 +2220,8 @@ impl MarmotApp {
                 )));
             }
         }
+        // Home defers recoverable cleanup of individual detached payloads. A
+        // root-level error still prevents safe startup.
         account_home.resume_wipe_cleanup()?;
         audit_log::cleanup_legacy_audit_logs(&root);
         let app =
@@ -2373,10 +2378,11 @@ impl MarmotApp {
             ));
         }
         let label = account.label;
+        let account_id = account.account_id_hex;
         let relay_plane_for_open = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
-            .map(|lifecycle| lifecycle.begin_account_open(&account.account_id_hex))
+            .map(|lifecycle| lifecycle.begin_account_open(&account_id))
             .transpose()?;
         // Only a starting worker records stage spans; other opens pass `None`.
         let enter_stage = |progress: Option<&AccountStartupProgress>, stage| {
@@ -2391,22 +2397,42 @@ impl MarmotApp {
         let open;
         (open, _open_permit) = blocking_app_task(move || {
             let open_permit = permit;
-            if app
-                .account_home()
-                .account_setup_state(&label)?
-                .is_some_and(|setup| {
-                    setup.phase == marmot_account::AccountSetupPhase::CompensationPending
-                })
-            {
-                return Err(AppError::AccountSetupRetryRequired);
+            let session_guard = app.acquire_account_session(&label);
+            let account = app.account_home().account(&label)?;
+            if account.account_id_hex != account_id {
+                return Err(marmot_account::AccountHomeError::UnknownAccount(account_id).into());
             }
+            if account.unlinked {
+                return Err(marmot_account::AccountHomeError::AccountUnlinked(label).into());
+            }
+            let check_setup = || {
+                if app
+                    .account_home()
+                    .account_setup_state(&label)?
+                    .is_some_and(|setup| {
+                        setup.phase == marmot_account::AccountSetupPhase::CompensationPending
+                    })
+                {
+                    return Err(AppError::AccountSetupRetryRequired);
+                }
+                Ok(())
+            };
+            check_setup()?;
+            let session_guard = session_guard?;
             enter_stage(
                 blocking_progress.as_ref(),
                 AccountStartupStage::AccountState,
             );
             app.ensure_account_state(&label)?;
             enter_stage(blocking_progress.as_ref(), AccountStartupStage::SessionOpen);
-            let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
+            let open = check_setup().and_then(|()| {
+                app.open_account(
+                    &account,
+                    session_guard,
+                    &relay_plane_for_open,
+                    defer_group_hydration,
+                )
+            });
             #[cfg(test)]
             app.local_open_gates
                 .wait(&label, AccountStartupStage::SessionOpen);
@@ -5435,25 +5461,13 @@ impl MarmotApp {
 
     fn open_account(
         &self,
-        label: &str,
+        account: &AccountSummary,
+        session_guard: AppAccountSessionGuard,
         relay_plane: &MarmotRelayPlane,
         defer_group_hydration: bool,
     ) -> Result<OpenAppAccount, AppError> {
-        let account = self.account_home().account(label)?;
-        if self
-            .account_home()
-            .account_setup_state(&account.label)?
-            .is_some_and(|setup| {
-                setup.phase == marmot_account::AccountSetupPhase::CompensationPending
-            })
-        {
-            return Err(AppError::AccountSetupRetryRequired);
-        }
-        // Account refs may be labels, hex pubkeys, or npubs. Ownership is keyed
-        // by the canonical stored label so aliases cannot open a second engine.
         let label = account.label.as_str();
         self.refuse_device_group_without_support(label)?;
-        let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
         let recovery_storage = self.account_storage(label)?;
         // Retain the local cursor guard until fallible conversion/import runs
@@ -5469,7 +5483,7 @@ impl MarmotApp {
                     )?
                     .is_empty()
         };
-        let signer = self.account_signer_for_summary(&account)?;
+        let signer = self.account_signer_for_summary(account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
         let peeler = NostrMlsPeeler::new().with_welcome_signer_arc(nostr_signer.clone());
@@ -5922,15 +5936,25 @@ impl MarmotApp {
     }
 
     fn key_package_cutover_replacement_pending_path(&self, label: &str) -> PathBuf {
-        self.key_package_cache_dir()
-            .join(KEY_PACKAGE_DIR)
-            .join(format!("{label}.capability-refresh-v1-replacement-pending"))
+        self.key_package_artifact_path(label, KEY_PACKAGE_CUTOVER_PENDING)
     }
 
-    fn key_package_cutover_scan_complete_path(&self, label: &str) -> PathBuf {
-        self.key_package_cache_dir()
-            .join(KEY_PACKAGE_DIR)
-            .join(format!("{label}.capability-refresh-v1-relay-scan-complete"))
+    fn key_package_artifact_path(&self, label: &str, suffix: &str) -> PathBuf {
+        let local = self
+            .account_dir(label)
+            .join(format!("key-package.{suffix}"));
+        if matches!(fs::symlink_metadata(&local), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            let legacy = self
+                .root
+                .join(LEGACY_KEY_PACKAGE_DIR)
+                .join(format!("{label}.{suffix}"));
+            if !matches!(fs::symlink_metadata(&legacy), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return legacy;
+            }
+        }
+        local
     }
 
     fn key_package_cutover_replacement_pending(&self, label: &str) -> bool {
@@ -5978,19 +6002,48 @@ impl MarmotApp {
         }
     }
 
-    /// Remove compatibility artifacts that live outside the account directory.
-    /// Account-home deletion cannot otherwise make setup rollback complete.
-    fn remove_account_key_package_artifacts(&self, label: &str) -> Result<(), AppError> {
-        for path in [
-            self.key_package_record_path(label),
-            self.key_package_cutover_replacement_pending_path(label),
-            self.key_package_cutover_scan_complete_path(label),
+    // The caller excludes session and setup writers. Move legacy files into
+    // the live directory before Home detaches it. If either move fails,
+    // readers still find each artifact in its new or old location.
+    fn stage_key_package_artifacts(&self, label: &str) -> Result<(), AppError> {
+        use std::io::{Error, ErrorKind};
+
+        let legacy = self.root.join(LEGACY_KEY_PACKAGE_DIR);
+        match fs::symlink_metadata(&legacy) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(Error::from(ErrorKind::NotADirectory).into()),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let local = self.account_dir(label);
+        let accounts = local.parent().expect("account directory has a parent");
+        if !fs::symlink_metadata(accounts)?.is_dir() || !fs::symlink_metadata(&local)?.is_dir() {
+            return Err(Error::from(ErrorKind::NotADirectory).into());
+        }
+        for suffix in [
+            KEY_PACKAGE_RECORD,
+            KEY_PACKAGE_CUTOVER_PENDING,
+            KEY_PACKAGE_CUTOVER_SCANNED,
         ] {
-            match fs::remove_file(path) {
-                Ok(()) => {}
+            let from = legacy.join(format!("{label}.{suffix}"));
+            let to = local.join(format!("key-package.{suffix}"));
+            match fs::symlink_metadata(&from) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => return Err(Error::from(ErrorKind::InvalidData).into()),
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+            match fs::symlink_metadata(&to) {
+                Ok(_) => return Err(Error::from(ErrorKind::AlreadyExists).into()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+            fs::rename(from, to)?;
+        }
+        #[cfg(unix)]
+        {
+            fs::File::open(&local)?.sync_all()?;
+            fs::File::open(&legacy)?.sync_all()?;
         }
         Ok(())
     }
@@ -6398,9 +6451,7 @@ impl MarmotApp {
     }
 
     fn key_package_record_path(&self, label: &str) -> PathBuf {
-        self.key_package_cache_dir()
-            .join(KEY_PACKAGE_DIR)
-            .join(format!("{label}.json"))
+        self.key_package_artifact_path(label, KEY_PACKAGE_RECORD)
     }
 
     fn reusable_key_package_slot_id(
@@ -8253,10 +8304,6 @@ impl MarmotApp {
             .cloned()
             .map(TransportEndpoint)
             .collect()
-    }
-
-    fn key_package_cache_dir(&self) -> PathBuf {
-        self.root.clone()
     }
 
     /// Whether `storage` is still the account's current cached handle:

@@ -28,6 +28,8 @@ const NIP46_REMOVING_FILE: &str = ".nip46-session-removing.json";
 const MAX_NIP46_RECORD_BYTES: u64 = 128 * 1024;
 const ACCOUNT_SETUP_STATE_FILE: &str = ".account-setup.json";
 const ACCOUNT_SETUP_CONTEXT_FILE: &str = ".account-setup-context.json";
+const DATABASE_OWNER_FILE: &str = ".external-sqlcipher-owner.json";
+const MAX_DATABASE_OWNER_BYTES: u64 = 256;
 /// Per-account NIP-49 KEY_SECURITY_BYTE status record. Records only a status
 /// byte, never key material, so it is written with public file permissions.
 const ACCOUNT_KEY_SECURITY_FILE: &str = "key-security.json";
@@ -729,6 +731,19 @@ impl AccountHome {
         {
             return Err(AccountHomeError::AccountSetupConflict);
         }
+        if kind == AccountSetupKind::LegacyReset {
+            self.check_legacy_reset_key(account)?;
+            if let Some(existing) = self.read_setup_for_account(account)? {
+                if existing.kind == kind
+                    && existing.phase == phase
+                    && existing.origin == AccountSetupOrigin::LegacyUnknown
+                    && existing.attempt_id.is_some()
+                {
+                    return Ok(existing);
+                }
+                return Err(AccountHomeError::AccountSetupConflict);
+            }
+        }
         let state = AccountSetupState::new(account, kind, phase, AccountSetupOrigin::LegacyUnknown);
         self.start_setup_state(&account.label, &state)?;
         Ok(state)
@@ -738,6 +753,9 @@ impl AccountHome {
         if self.raw_account_setup_state(label)?.is_some() {
             return Err(AccountHomeError::AccountSetupConflict);
         }
+        // A completed attempt may retain context after a failed unlink. Never
+        // attach those saved requests to a replacement attempt.
+        self.clear_setup_context(label)?;
         self.write_account_setup_state(label, state)
     }
 
@@ -834,9 +852,16 @@ impl AccountHome {
         // Completion commits before opaque context cleanup. A later cleanup
         // failure must not revert a published account to incomplete setup.
         fs::remove_file(self.account_setup_state_path(&account.label))?;
-        self.clear_setup_context(&account.label)?;
-        #[cfg(unix)]
-        fs::File::open(self.account_dir(&account.label))?.sync_all()?;
+        // Sync the journal commit even if the context unlink fails.
+        let cleanup = self
+            .clear_setup_context(&account.label)
+            .and(sync_directory(&self.account_dir(&account.label)).map_err(Into::into));
+        if cleanup.is_err() {
+            // Context without a journal is durable cleanup intent. Leased
+            // reopen retries it; a fresh attempt must clear it before admission.
+            tracing::warn!(target: TRACE_TARGET, method = "complete_account_setup",
+                "setup committed; context cleanup remains pending");
+        }
         Ok(())
     }
 
@@ -900,6 +925,7 @@ impl AccountHome {
                 {
                     return Err(AccountHomeError::AccountSetupConflict);
                 }
+                self.ensure_database_owner(&account)?;
                 if account.external_signing {
                     account.external_signing = original.external_signing;
                     publish_private_json(self.account_record_path(&account.label), &account)?;
@@ -1121,6 +1147,7 @@ impl AccountHome {
     }
 
     /// Commit an explicit legacy reset without deleting its raw signing key.
+    /// A file-backed key cannot be detached into wipe payload and is refused.
     pub fn reset_legacy_setup(
         &self,
         account_ref: &str,
@@ -1136,7 +1163,16 @@ impl AccountHome {
         {
             return Err(AccountHomeError::AccountSetupConflict);
         }
+        self.check_legacy_reset_key(&account)?;
         self.remove_account_inner(&account, true)
+    }
+
+    fn check_legacy_reset_key(&self, account: &AccountSummary) -> AccountHomeResult<()> {
+        match fs::symlink_metadata(self.account_dir(&account.label).join(ACCOUNT_SECRET_FILE)) {
+            Ok(_) => Err(AccountHomeError::AccountSetupConflict),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn add_public_account(&self, public_key: &str) -> AccountHomeResult<AccountSummary> {
@@ -1376,6 +1412,7 @@ impl AccountHome {
             return Err(AccountHomeError::InvalidSecretKey);
         }
         let credential = external_database_credential(&account);
+        self.ensure_database_owner(&account)?;
         let legacy_path = self
             .account_dir(&account.label)
             .join(EXTERNAL_SQLCIPHER_SECRET_FILE);
@@ -1427,6 +1464,20 @@ impl AccountHome {
             .try_into()
             .map_err(|_| AccountHomeError::InvalidSecretKey)?;
         Ok(Zeroizing::new(secret))
+    }
+
+    fn ensure_database_owner(&self, account: &AccountSummary) -> AccountHomeResult<()> {
+        let path = self.account_dir(&account.label).join(DATABASE_OWNER_FILE);
+        match read_private_json_bounded::<String>(&path, MAX_DATABASE_OWNER_BYTES) {
+            Ok(owner) if owner == account.account_id_hex => Ok(()),
+            Ok(_) => Err(AccountHomeError::AccountIdMismatch),
+            Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Intent precedes credential creation and survives public-role
+                // restoration; the current role is not credential ownership.
+                write_private_json(path, &account.account_id_hex)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Store a verified remote-signing session without storing its key in metadata.
@@ -1772,13 +1823,24 @@ impl AccountHome {
                     Ok(())
                 }
             });
-        let database = if account.external_signing {
+        let recorded_database = match read_private_json_bounded::<String>(
+            &tombstone.join(DATABASE_OWNER_FILE),
+            MAX_DATABASE_OWNER_BYTES,
+        ) {
+            Ok(owner) if owner == account.account_id_hex => true,
+            Ok(_) => return Err(AccountHomeError::AccountIdMismatch),
+            Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        let database = if account.external_signing || recorded_database {
             self.secret_store
                 .remove_secret(&external_database_credential(account))
         } else {
             Ok(())
         };
-        let signing = if !preserve_account_id_credential {
+        let signing = if account.local_signing && !preserve_account_id_credential {
             self.secret_shared_with_twin(account).and_then(|shared| {
                 if shared {
                     Ok(())
@@ -1794,7 +1856,11 @@ impl AccountHome {
 
         // Remove the identifying record last. Until all cleanup succeeds, the
         // account, setup and NIP-46 records describe the pending tombstone.
-        for name in [ACCOUNT_SETUP_STATE_FILE, ACCOUNT_RECORD_FILE] {
+        for name in [
+            DATABASE_OWNER_FILE,
+            ACCOUNT_SETUP_STATE_FILE,
+            ACCOUNT_RECORD_FILE,
+        ] {
             match fs::remove_file(tombstone.join(name)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1806,8 +1872,8 @@ impl AccountHome {
         Ok(())
     }
 
-    /// Resume deletion of detached account files. The caller must hold
-    /// exclusive ownership of the root across independent opens.
+    /// Resume detached-file and completed-setup context cleanup. The caller
+    /// must hold exclusive ownership of the root across independent opens.
     ///
     /// No raw vault deletions are replayed: the current provider may not own
     /// the original credentials. The detached cleanup records are retained.
@@ -1817,36 +1883,77 @@ impl AccountHome {
         match fs::symlink_metadata(&root) {
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => return Err(std::io::Error::from(std::io::ErrorKind::NotADirectory).into()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.resume_completed_contexts();
+            }
             Err(error) => return Err(error.into()),
         }
-        let mut result = Ok(());
-        let entries = match fs::read_dir(root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
         let mut synced = false;
-        for entry in entries {
-            let cleaned = (|| -> AccountHomeResult<()> {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    if !synced {
-                        self.sync_wipe_rename()?;
-                        synced = true;
-                    }
-                    let tombstone = entry.path();
-                    Self::purge_wipe_payload(&tombstone)?;
-                    sync_directory(&tombstone)?;
-                }
-                Ok(())
-            })();
-            if !matches!(&cleaned, Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
-            {
-                result = result.and(cleaned);
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            // Invalid rename parents are structural failures, not deferred
+            // payload cleanup. Never scrub before their commit is synced.
+            if !synced {
+                self.sync_wipe_rename()?;
+                synced = true;
+            }
+            let tombstone = entry.path();
+            let cleanup = Self::purge_wipe_payload(&tombstone)
+                .and_then(|()| sync_directory(&tombstone).map_err(Into::into));
+            if cleanup.is_err() {
+                // Identifying records remain in this detached directory, so
+                // the next leased recovery can retry without touching a live account.
+                tracing::warn!(target: TRACE_TARGET, method = "resume_wipe_cleanup",
+                    "detached payload cleanup remains pending");
             }
         }
-        result
+        self.resume_completed_contexts()
+    }
+
+    fn resume_completed_contexts(&self) -> AccountHomeResult<()> {
+        let accounts = self.accounts_dir();
+        match fs::symlink_metadata(&accounts) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(std::io::Error::from(std::io::ErrorKind::NotADirectory).into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        for entry in fs::read_dir(accounts)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(label) = name.to_str() else {
+                continue;
+            };
+            if validate_account_label(label).is_err() {
+                continue;
+            }
+            let cleanup = (|| -> AccountHomeResult<()> {
+                match fs::symlink_metadata(self.account_setup_context_path(label)) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
+                match fs::symlink_metadata(self.account_setup_state_path(label)) {
+                    Ok(_) => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                self.clear_setup_context(label)?;
+                sync_directory(&self.account_dir(label))?;
+                Ok(())
+            })();
+            if cleanup.is_err() {
+                tracing::warn!(target: TRACE_TARGET, method = "resume_wipe_cleanup",
+                    "completed setup context remains pending");
+            }
+        }
+        Ok(())
     }
 
     fn sync_wipe_rename(&self) -> AccountHomeResult<()> {
@@ -1858,9 +1965,12 @@ impl AccountHome {
             &self.root
         };
         sync_directory(root)?;
-        match sync_directory(&self.accounts_dir()) {
+        let accounts = self.accounts_dir();
+        match fs::symlink_metadata(&accounts) {
+            Ok(metadata) if metadata.is_dir() => sync_directory(&accounts)?,
+            Ok(_) => return Err(std::io::Error::from(std::io::ErrorKind::NotADirectory).into()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            synced => synced?,
+            Err(error) => return Err(error.into()),
         }
         sync_directory(&tombstones)?;
         Ok(())
@@ -1886,6 +1996,7 @@ impl AccountHome {
                     Some(
                         ACCOUNT_RECORD_FILE
                             | ACCOUNT_SETUP_STATE_FILE
+                            | DATABASE_OWNER_FILE
                             | NIP46_SESSION_FILE
                             | NIP46_REMOVING_FILE
                             | ACCOUNT_SECRET_FILE

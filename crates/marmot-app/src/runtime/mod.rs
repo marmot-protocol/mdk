@@ -1113,8 +1113,8 @@ pub struct WipeOutcome {
     pub key_packages_deleted: u32,
     /// KeyPackage slot deletion failures. Best-effort.
     pub key_package_failures: Vec<RelayFailure>,
-    /// Whether the local cleanup stage (MLS DB, media cache, SQL account row,
-    /// secret-store nsec, ephemeral relay/subscription state) completed.
+    /// Whether teardown and account-directory detachment completed. Completion
+    /// confirms local removal, not vault erasure or detached-byte reclamation.
     pub local_cleanup: LocalCleanupReport,
     /// Chats this device did not leave itself because another of the
     /// account's devices takes it out of them: it signed out through its
@@ -1153,13 +1153,14 @@ pub struct RelayFailure {
     pub reason: String,
 }
 
-/// Local-removal result. Runtime teardown precedes the atomic removal of the
-/// live account namespace. Completion does not confirm vault erasure or
-/// reclamation of detached bytes; failed cleanup retains a durable tombstone.
+/// Operation-specific local cleanup result. Sign-out completion means teardown
+/// finished with the account retained. Wipe completion means teardown and
+/// account-directory detachment finished. Neither confirms vault erasure or
+/// reclamation of detached bytes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalCleanupReport {
-    /// Whether local removal finished. When `false`, `reason` carries the
-    /// teardown or removal failure summary.
+    /// Whether the operation's local cleanup finished. When `false`, `reason`
+    /// carries the teardown or removal failure summary.
     pub completed: bool,
     /// Failure summary when `completed` is `false`. Privacy-safe.
     pub reason: Option<String>,
@@ -1209,10 +1210,9 @@ pub struct SignOutOutcome {
     /// blocks local cleanup. No durable remote-deletion retry is implied by
     /// this outcome.
     pub key_package_failures: Vec<RelayFailure>,
-    /// Result of the always-run local teardown (worker shutdown, subscription
-    /// deactivation, in-memory cache eviction). Unlike a wipe this never
-    /// deletes on-disk state, so `completed` is `true` whenever the teardown
-    /// ran; `reason` carries a privacy-safe summary on the rare failure.
+    /// Whether worker shutdown, subscription deactivation, and in-memory cache
+    /// eviction finished. The account and its on-disk state are retained.
+    /// Completion confirms neither vault erasure nor detached-byte reclamation.
     pub local_cleanup: LocalCleanupReport,
 }
 
@@ -7511,18 +7511,36 @@ impl AccountManager {
         let _audit_export_mutation =
             blocking_app_task(move || Ok(audit_export.mutate_account(&account_id))).await?;
         let _teardown = self.quiesce_account_worker(account).await?;
+        // Direct clients do not have a runtime open permit. Claim the same
+        // session slot for removal, so an open either wins first or is refused
+        // before it touches storage.
+        let _session = self.app.acquire_account_session(&account.label)?;
         let detached = {
             let gate = self.shared.local_submission_gate(&account.account_id_hex);
             let _admission = gate.lock().await;
+            let home = self.app.account_home();
+            if let Some(expected) =
+                setup.filter(|state| state.kind == AccountSetupKind::LegacyReset)
+            {
+                if home.account_setup_state(&account.label)?.as_ref() != Some(expected) {
+                    return Err(AccountHomeError::AccountSetupConflict.into());
+                }
+                let checked = home.begin_account_setup_with(
+                    account,
+                    AccountSetupKind::LegacyReset,
+                    AccountSetupPhase::CompensationPending,
+                )?;
+                if checked != *expected {
+                    return Err(AccountHomeError::AccountSetupConflict.into());
+                }
+            }
             self.app.drop_account_caches(&account.label);
             if !matches!(
                 setup.map(|state| &state.origin),
                 Some(AccountSetupOrigin::PromotedPublic { .. })
             ) {
-                self.app
-                    .remove_account_key_package_artifacts(&account.label)?;
+                self.app.stage_key_package_artifacts(&account.label)?;
             }
-            let home = self.app.account_home();
             match setup {
                 Some(expected) if expected.kind == AccountSetupKind::LegacyReset => {
                     home.reset_legacy_setup(&account.label, expected)?;
@@ -7621,7 +7639,8 @@ impl AccountManager {
     /// caller must present the matching nsec and explicitly acknowledge that
     /// resetting can orphan such an unknown publication. The credential is
     /// retained so the next `create_or_import_account` reuses it rather than
-    /// creating a duplicate keychain entry.
+    /// creating a duplicate keychain entry. A file-backed key in the account
+    /// directory cannot be retained by this reset, so the reset is refused.
     pub async fn reset_incomplete_account_setup(
         &self,
         nsec: &str,
@@ -7652,16 +7671,16 @@ impl AccountManager {
             return Err(AppError::IdentityKeyMismatch);
         }
         let home = self.app.account_home();
-        let pending = match home.account_setup_state(&account.label)? {
-            Some(pending)
-                if pending.kind == AccountSetupKind::LegacyReset
-                    && pending.phase == AccountSetupPhase::CompensationPending
-                    && pending.origin == AccountSetupOrigin::LegacyUnknown
-                    && pending.attempt_id.is_some() =>
-            {
-                pending
+        match home.account_setup_state(&account.label)? {
+            Some(pending) => {
+                if pending.kind != AccountSetupKind::LegacyReset
+                    || pending.phase != AccountSetupPhase::CompensationPending
+                    || pending.origin != AccountSetupOrigin::LegacyUnknown
+                    || pending.attempt_id.is_none()
+                {
+                    return Err(AppError::AccountSetupRetryRequired);
+                }
             }
-            Some(_) => return Err(AppError::AccountSetupRetryRequired),
             None => {
                 if !self
                     .app
@@ -7676,13 +7695,13 @@ impl AccountManager {
                 {
                     return Err(AppError::AccountSetupKeyPackageRecoveryAvailable);
                 }
-                home.begin_account_setup_with(
-                    &account,
-                    AccountSetupKind::LegacyReset,
-                    AccountSetupPhase::CompensationPending,
-                )?
             }
-        };
+        }
+        let pending = home.begin_account_setup_with(
+            &account,
+            AccountSetupKind::LegacyReset,
+            AccountSetupPhase::CompensationPending,
+        )?;
         // Pending closes normal startup before any teardown await. Report
         // draining must run outside the global worker transaction.
         drop(_worker_transaction);
@@ -8841,25 +8860,21 @@ impl AccountManager {
                 let creates_new_private_key =
                     request.identity.is_none() && request.import_nsec.is_none();
                 let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
-                if let Some(nsec) = request.import_nsec.as_deref()
-                    && self.legacy_incomplete_account_for_import(nsec)?
-                {
-                    return Err(AppError::AccountSetupRecoveryRequired);
-                }
-                let identity_key: Option<&str> = request
-                    .import_nsec
-                    .as_ref()
-                    .map(|value| value.as_str())
-                    .or(request.identity.as_deref());
-                let account_id = identity_key
-                    .map(|identity| {
-                        if crate::is_nostr_secret(identity) {
-                            AccountHome::account_id_for_secret(identity)
-                        } else {
-                            AccountHome::account_id_for_public_key(identity)
-                        }
-                    })
-                    .transpose()?;
+                let account_id = if let Some(secret) = request.import_nsec.as_deref() {
+                    Some(AccountHome::account_id_for_secret(secret)?)
+                } else {
+                    request
+                        .identity
+                        .as_deref()
+                        .map(|identity| {
+                            if crate::is_nostr_secret(identity) {
+                                AccountHome::account_id_for_secret(identity)
+                            } else {
+                                AccountHome::account_id_for_public_key(identity)
+                            }
+                        })
+                        .transpose()?
+                };
                 let _transaction = if let Some(account_id) = account_id.as_deref() {
                     self.account_setup()
                         .resume_pending_setup(account_id)
@@ -8874,6 +8889,11 @@ impl AccountManager {
                     None
                 };
                 let (mut account, setup) = if let Some(account_id) = account_id.as_deref() {
+                    if imports_private_key
+                        && self.legacy_incomplete_account_for_import(account_id)?
+                    {
+                        return Err(AppError::AccountSetupRecoveryRequired);
+                    }
                     match self.app.account_home().account(account_id) {
                         Ok(account) => {
                             refuse_unlinked(&account)?;
@@ -9066,6 +9086,8 @@ impl AccountManager {
                 }
                 self.retry_and_reconcile_for_account(&account.account_id_hex)
                     .await?;
+                // Home returns success once the journal is committed. Any
+                // remaining context cleanup does not affect network readiness.
                 if let Some(setup) = setup.as_ref() {
                     self.app
                         .account_home()
@@ -9292,8 +9314,8 @@ impl AccountManager {
                         }
                         self.retry_and_reconcile_for_account(&account.account_id_hex)
                             .await?;
-                        // Journal cleanup may remove its first file before failing.
-                        // A network-ready account and signer are already committed.
+                        // The network-ready account and signer are already active.
+                        // A journal failure here must not roll back that activation.
                         readiness = AccountSetupReadiness::NetworkReady;
                         if let Some(setup) = setup_attempt.as_ref() {
                             home.complete_account_setup(&account.label, setup)?;
@@ -9970,9 +9992,8 @@ impl AccountManager {
             .map(|key_package| key_package.bytes().len()))
     }
 
-    fn legacy_incomplete_account_for_import(&self, nsec: &str) -> Result<bool, AppError> {
-        let account_id = AccountHome::account_id_for_secret(nsec)?;
-        let account = match self.app.account_home().account(&account_id) {
+    fn legacy_incomplete_account_for_import(&self, account_id: &str) -> Result<bool, AppError> {
+        let account = match self.app.account_home().account(account_id) {
             Ok(account) if account.local_signing && !account.signed_out => account,
             Ok(_) | Err(AccountHomeError::UnknownAccount(_)) => return Ok(false),
             Err(err) => return Err(err.into()),
