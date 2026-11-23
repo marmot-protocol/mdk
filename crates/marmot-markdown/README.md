@@ -1,7 +1,7 @@
 # marmot-markdown
 
 CommonMark and Nostr-aware display parser for Marmot app messages. It turns plaintext message content into a typed,
-serde-friendly AST that CLI, TUI, and mobile renderers draw from. It does not define wire format, persistence, or CGKA
+serde-friendly AST that CLI and mobile renderers draw from. It does not define wire format, persistence, or CGKA
 engine behavior.
 
 The parser is implemented in Odin. Rust provides the existing AST types, serde support and a private native bridge.

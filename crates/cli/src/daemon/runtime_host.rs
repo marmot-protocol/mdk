@@ -761,7 +761,7 @@ pub(crate) fn runtime_activity_report_from_summary(
 /// Builds the diagnostic string recorded for a runtime account error.
 ///
 /// Privacy: the result is persisted into `DaemonRuntimeActivityReport.errors`
-/// and exposed via `wn daemon status --json` / the TUI, so it must never carry
+/// and exposed via `wn daemon status --json`, so it must never carry
 /// the account id or label — only the upstream (already id-free) error message.
 pub(crate) fn account_error_activity_message(error: &marmot_app::RuntimeAccountError) -> String {
     format!("app runtime account error: {}", error.message)

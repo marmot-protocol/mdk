@@ -1177,7 +1177,7 @@ fn account_error_activity_message_excludes_account_identity() {
     );
 
     // The recorded string is stored verbatim into the report exposed via
-    // `wn daemon status --json` / the TUI, so the privacy guarantee carries
+    // `wn daemon status --json`, so the privacy guarantee carries
     // through to the surfaced `errors` field.
     let state = Arc::new(Mutex::new(DaemonState {
         pid: 0,

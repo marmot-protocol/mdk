@@ -1,13 +1,12 @@
 # AGENTS.md - cli
 
-Command-line app (`wn`), background daemon (`wnd`), and terminal UI (`wn tui`) for the White Noise/Marmot stack. Cargo
-package `wn-cli`. The user manual (commands, flags, JSON fields, TUI keys) is [`README.md`](README.md); keep it current
-rather than restating it here.
+Command-line app (`wn`) and background daemon (`wnd`) for the White Noise/Marmot stack. Cargo package `wn-cli`. The
+user manual (commands, flags, JSON fields) is [`README.md`](README.md); keep it current rather than restating it here.
 
 ## Scope
 
 - Keep `wn` product-facing. Do not add smoke-test-only commands here.
-- Keep `wn`, `wnd`, and `wn tui` on the real account/session/transport path through `marmot-account` and
+- Keep `wn` and `wnd` on the real account/session/transport path through `marmot-account` and
   `marmot-app`.
 - Use relay-backed test support for local coverage. Prefer `nostr-relay-builder::MockRelay` in crate tests and Docker
   local relays for true CLI/daemon end-to-end checks.
@@ -22,11 +21,11 @@ rather than restating it here.
   Whitenoise-shaped command has no real backing behavior yet, return an explicit `unsupported_command` JSON error
   instead of faking success.
 - Keep command output useful for humans by default and stable JSON when `--json` is passed.
-- Treat JSON response shapes as TUI, daemon, and script inputs. Change them deliberately.
+- Treat JSON response shapes as daemon and script inputs. Change them deliberately.
 - Keep the README user-facing and current, and verify documented commands and flags against `src/args.rs` (or
   `wn <command> --help`). Prefer installed `wn` examples; use `cargo run -p wn-cli --bin wn` only when documenting
   source-checkout work.
-- Keep `CHANGELOG.md` current for user-facing CLI, daemon, TUI, JSON, install, or packaging changes. Use the
+- Keep `CHANGELOG.md` current for user-facing CLI, daemon, JSON, install, or packaging changes. Use the
   `Unreleased` section until a version is tagged.
 - Keep local development installable with `cargo install --path crates/cli --locked --bins`.
 - Treat the namespaced Homebrew tap `marmot-protocol/tap` as the preferred public packaging path unless product
@@ -64,9 +63,9 @@ behavior and JSON fields are documented in the README; the rules below are the o
 - Reaction, delete, retry, encrypted media, and admin/member management JSON shapes: keep them aligned with the
   `Unreleased` changelog entries when changing them.
 - Other namespaces: `chats`, `follows`, `profile`, `relays`, `settings`, `users`, `notifications`, `debug`,
-  `usage-diagnostics`, `tui`.
+  `usage-diagnostics`.
 - `devices` (list and start/status/confirm-match/approve/cancel) uses the existing daemon-owned runtime and refuses
-  local execution. Device groups are on unless `WN_DEVICE_GROUPS=0` reaches `wnd` (and the TUI, for Leave). Do not add a CLI pairing store. Other account commands
+  local execution. Device groups are on unless `WN_DEVICE_GROUPS=0` reaches `wnd`. Do not add a CLI pairing store. Other account commands
   retain one-shot worker behavior; the documented dev-testing limit requires a persistent matching daemon and explicit
   `--socket`/`WN_SOCKET` selection to prevent fallback. A one-shot worker can answer a pending request and lose its
   unconfirmed session on exit. Both user confirmations remain separate. Core owns authentication, roster state and
@@ -84,34 +83,16 @@ behavior and JSON fields are documented in the README; the rules below are the o
 - `wn daemon start` should spawn `wnd` with the selected home, socket, secret store, keychain service, and
   daemon-configured relay defaults. Keep `wn daemon start` and direct `wnd` setup flags aligned, including
   `--data-dir`, `--logs-dir`, `--discovery-relays`, and `--default-account-relays`.
-- Normal commands may forward to `wnd` when a socket exists for the selected home. Daemon control commands and TUI
-  startup handle daemon access directly. Resolve caller-relative file inputs and output destinations in the client
+- Normal commands may forward to `wnd` when a socket exists for the selected home. Daemon control commands handle daemon
+  access directly. Resolve caller-relative file inputs and output destinations in the client
   (`resolve_relative_paths`) before forwarding: the daemon's working directory is unrelated to the caller's.
 - Runtime subscriptions should keep local signing accounts current; explicit catch-up remains a diagnostic/repair path.
-- Keep daemon status JSON useful for the TUI: running state, pid, socket, log path, last runtime activity summary,
+- Keep daemon status JSON useful for scripts: running state, pid, socket, log path, last runtime activity summary,
   and relay health.
-- Keep daemon streaming output newline-delimited and typed. Current user-facing subscription feeds are
-  `messages subscribe`, `messages timeline subscribe`, `chats subscribe`, `chats subscribe-archived`, and
-  `groups subscribe-state`.
-
-## TUI Guidance
-
-- Keep `wn tui` as a Ratatui shell over `wn --json`. It should add navigation and slash commands without becoming a
-  second app runtime.
-- Keep account onboarding on top of `wn create-identity` and `wn login`; redact `nsec` import input before rendering it in the composer.
-- Keep daemon controls on top of `wn daemon start|stop|status`; live refresh should observe daemon state and avoid
-  interrupting active composer input.
-- Keep chat and group management on top of real CLI commands. `/chat new` is the TUI spelling for chat creation; do not
-  reintroduce `/new` as a hidden compatibility alias.
-- Keep member commands direct: `/members add`, `/members remove`, and `/members list` operate on the selected chat.
-  Do not add a hidden in-memory member draft or a `/members clear` command.
-- Do not fake image messages in the TUI by sending file paths, plaintext placeholders, or raw bytes through
-  `message send`. Add an image command only when it uses the real encrypted-media/blob upload path.
-
-For TUI async tests, establish that the child entered and use an explicit release; assert that the UI action
-completed before release. A reload-negative test must make a wrong reload eligible and observable and wait for an
-effect-queue fence. Preserve any empty-chat-list dispatch edge before adding the matching chat row needed to expose
-a wrong reload.
+- Keep daemon streaming output newline-delimited and typed. The current user-facing subscription feeds are
+  `messages subscribe` and `chats subscribe`. `messages timeline subscribe`, `chats subscribe-archived`,
+  `groups subscribe-state`, and `notifications subscribe` are deprecated (they served the removed TUI): keep them
+  working, add nothing to them, and remove them in a later change rather than piecemeal.
 
 ## Key files
 
@@ -128,7 +109,7 @@ a wrong reload.
   from the lib dispatch, from the `daemon` module, or across namespaces are `pub(crate)`.
 - `src/main.rs` / `src/bin/wnd.rs`: thin `wn` and `wnd` binary entrypoints.
 - `src/secret.rs`: zeroizing stdin nsec import with redacted diagnostics.
-- `src/terminal.rs`: terminal-safe rendering of untrusted human-facing text (TUI and non-JSON output).
+- `src/terminal.rs`: terminal-safe rendering of untrusted human-facing text (non-JSON output).
 - `src/args.rs`: clap argument/command enums (`Cli`, `Command`, and the per-namespace `*Command` types).
 - `src/error.rs`: `WnError` and the `--json` error rendering.
 - `src/daemon/`: `wnd` runtime, socket-backed execution, subscription workers; calls
@@ -138,12 +119,6 @@ a wrong reload.
   construction + subscription matching), `subscriptions` (the streaming `handle_*_subscription` handlers),
   `runtime_host` (app-runtime reconciliation, event bridge, hosted command dispatch), and `lifecycle`
   (start/stop/status, pid/log/socket files). `tests.rs` holds the daemon unit tests.
-- `src/tui/`: Ratatui shell over the `wn --json` surface. `mod.rs` keeps the `run_tui` entry plus shared constants
-  and re-exports the submodules: `model` (row/view/state types, JSON parsers, pure helpers), `view` (`TuiApp` draw
-  methods + Ratatui line/style helpers), `slash` (slash-command parsing), `client` (`WnClient` subprocess wrapper,
-  subscription readers, and the `wn`/subscription-driving `TuiApp` methods), `app` (`TuiApp` state plus the
-  event loop, key handling, and selection methods), and `media` (inbound-media capability detection and the off-loop
-  download/decode worker). `tests.rs` holds the TUI unit tests.
 - `tests/cli.rs`: end-to-end CLI/daemon integration tests asserting real `wn`/`wnd` behavior and JSON shapes.
 
 ## Verification

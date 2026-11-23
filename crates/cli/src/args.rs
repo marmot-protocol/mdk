@@ -138,23 +138,6 @@ pub(crate) enum MaintenancePolicySetting {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum Command {
-    #[command(about = "Open the interactive terminal UI")]
-    Tui {
-        #[arg(
-            long,
-            value_name = "URLS",
-            value_delimiter = ',',
-            help = "Comma-separated discovery relays forwarded to daemon start and account setup on first run"
-        )]
-        discovery_relays: Vec<String>,
-        #[arg(
-            long,
-            value_name = "URLS",
-            value_delimiter = ',',
-            help = "Comma-separated default account relays forwarded to daemon start and account setup on first run"
-        )]
-        default_account_relays: Vec<String>,
-    },
     #[command(about = "Link and list this account's devices (requires wnd)")]
     Devices {
         #[command(subcommand)]
@@ -465,7 +448,7 @@ pub(crate) enum ChatsCommand {
     ListArchived,
     #[command(
         name = "subscribe-archived",
-        about = "Subscribe to live archived-chat updates through the daemon"
+        about = "Deprecated: subscribe to live archived-chat updates through the daemon"
     )]
     SubscribeArchived,
     #[command(about = "Mute local notifications for a chat")]
@@ -1005,7 +988,7 @@ pub(crate) enum GroupsCommand {
     RunMaintenance,
     #[command(
         name = "subscribe-state",
-        about = "Subscribe to live group-state updates through the daemon"
+        about = "Deprecated: subscribe to live group-state updates through the daemon"
     )]
     SubscribeState {
         #[arg(help = "Group id to watch")]
@@ -1228,7 +1211,9 @@ pub(crate) enum MessageTimelineCommand {
         #[arg(long, help = "Maximum number of results to return")]
         limit: Option<usize>,
     },
-    #[command(about = "Subscribe to live materialized timeline updates through the daemon")]
+    #[command(
+        about = "Deprecated: subscribe to live materialized timeline updates through the daemon"
+    )]
     Subscribe {
         #[arg(help = "Group id to watch; omit to watch all local groups")]
         group: Option<String>,
@@ -1318,11 +1303,6 @@ pub(crate) enum RelaysCommand {
 pub(crate) enum SettingsCommand {
     #[command(about = "Show local CLI settings")]
     Show,
-    #[command(about = "Set the local TUI theme")]
-    Theme {
-        #[arg(help = "Theme mode such as system, light, or dark")]
-        mode: String,
-    },
     #[command(about = "Set the local UI language")]
     Language {
         #[arg(help = "Language tag such as en")]
@@ -1353,7 +1333,7 @@ pub(crate) enum UsersCommand {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum NotificationsCommand {
-    #[command(about = "Subscribe to notification updates")]
+    #[command(about = "Deprecated: subscribe to notification updates")]
     Subscribe,
 }
 

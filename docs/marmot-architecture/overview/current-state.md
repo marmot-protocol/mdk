@@ -252,7 +252,7 @@ another group.
 This workspace is the Marmot Development Kit (MDK). Release `0.9.0` unifies every workspace crate under one version
 cohort above the previous `0.8.0` MDK layout (`mdk-core`, `mdk-sqlite-storage`, and related crates). The current
 crate tree under `crates/` is the production-shaped replacement: OpenMLS-backed engine, SQLCipher storage, Nostr
-transports, multi-account app runtime, CLI/daemon/TUI, agent connector stack, UniFFI bindings, and conformance tooling.
+transports, multi-account app runtime, CLI/daemon, agent connector stack, UniFFI bindings, and conformance tooling.
 The app runtime exposes an explicit prepared founding-image path: image validation/encryption and durable staging,
 idempotent Blossom upload, and canonical group creation are separate host-visible operations. The final create uses
 uploaded founding metadata and performs no media transfer; the older all-in-one founding-image API keeps its existing
@@ -318,8 +318,8 @@ This repository now has the main engine candidate:
   ledger and future-version refusal; installation-wide `shared.sqlite3` now has its own independent
   `shared_schema_migrations` history with transactional adoption of recognized unversioned layouts. See
   [App SQLite Storage Boundaries](../further-context/app-sqlite-storage-boundaries.md).
-- `crates/cli` — first real CLI, daemon, and TUI surface over `marmot-app`. It is intentionally product-facing rather
-  than a lab harness, and its JSON envelope is shaped for daemon/TUI/testing callers.
+- `crates/cli` — first real CLI and daemon surface over `marmot-app`. It is intentionally product-facing rather than a
+  lab harness, and its JSON envelope is shaped for daemon, script, and testing callers.
 - `crates/storage-sqlite` — SQLCipher-backed SQLite storage for Marmot and custom OpenMLS state, with Rust migrations
   for schema/data evolution. Tests and the simulator use its in-memory SQLite mode by default.
 - `crates/transport-nostr-adapter` — Nostr transport adapter core for account activation, group subscription sync,

@@ -1,6 +1,6 @@
 //! Terminal-safe rendering for untrusted human-facing CLI text.
 //!
-//! Shared by TUI render sites and non-JSON CLI/daemon writers. Machine-readable
+//! Shared by non-JSON CLI/daemon writers. Machine-readable
 //! `--json` and IPC serialization stay lossless.
 
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};

@@ -144,34 +144,6 @@ relay-down:
 relay-logs:
     docker compose logs -f
 
-tui-reset:
-    ./scripts/reset_tui_dev.sh
-
-# Open the dev TUI as a `just tui-reset` account, by display name or npub/hex.
-tui name="Alice":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    selector="$(target/debug/wn --home dev/data --json account list \
-        | jq -r --arg name "{{name}}" \
-            'first(.result.accounts[] | select((.display_name // .profile.display_name // .profile.name // "") == $name) | .account_id) // $name')"
-    exec target/debug/wn --home dev/data --account "$selector" tui
-
-# TUI on production relays in a disposable home. Rebuilds, restarts the drive daemon on the fresh
-# build with these relays, then opens the TUI; `c` creates the account on first run.
-tui-prod relays="wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build -p wn-cli --bins
-    if target/debug/wn --home ~/.wn-tui-drive --json daemon status | jq -e '.result.running == true' >/dev/null; then
-        target/debug/wn --home ~/.wn-tui-drive daemon stop
-    fi
-    target/debug/wn --home ~/.wn-tui-drive --secret-store file daemon start \
-        --discovery-relays "{{relays}},wss://purplepag.es" \
-        --default-account-relays "{{relays}}"
-    exec target/debug/wn --home ~/.wn-tui-drive --secret-store file tui \
-        --discovery-relays "{{relays}},wss://purplepag.es" \
-        --default-account-relays "{{relays}}"
-
 hermes-dev-setup args="":
     ./scripts/hermes_marmot_dev_setup.sh {{args}}
 

@@ -47,7 +47,7 @@ See the [automatic rejoin contract](../../docs/marmot-architecture/invitation-re
 for device authorization, durable retries and the limits of history recovery.
 
 The runtime exposes account status, group listing/showing, message listing, and snapshot-plus-live subscription APIs,
-so CLI, TUI, and native surfaces never open the databases directly.
+so CLI and native surfaces never open the databases directly.
 
 **Startup.** `MarmotAppRuntime::start()` returns at local readiness: persisted account sessions are hydrated and
 worker-routed local reads are available. Relay activation, group-subscription registration, shared-directory
@@ -215,7 +215,7 @@ and publication gate.
   publication, never delay account readiness, and are cancelled on runtime shutdown or account removal.
 - Import flows can check whether those lists already exist before writing local account state. The same status API can
   fetch relay-list events from supplied bootstrap relays and store discovered user relay/KeyPackage data for
-  deterministic CLI/TUI development.
+  deterministic CLI development.
 - A KeyPackage publish or rotation never replaces lists the identity already published. When the cached lists are
   incomplete (an identity imported offline, or a kind `10002` with read relays only), it first reads the published
   lists from the app's relays and the outboxes they advertise, and adopts what it finds. It publishes the app's relays

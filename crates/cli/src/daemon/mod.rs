@@ -65,7 +65,7 @@ const DAEMON_SOCKET_MODE: u32 = 0o600;
 /// local control, but a runaway or looping client must not be able to grow
 /// the per-connection task set (and the subscriptions those tasks hold)
 /// without bound; over-cap connections are closed at accept time. Generous
-/// relative to real CLI/TUI use (a handful of subscriptions plus one-shot
+/// relative to real CLI use (a handful of subscriptions plus one-shot
 /// commands).
 const MAX_DAEMON_CONNECTIONS: usize = 256;
 /// Long-lived streaming requests have a separate ceiling so they cannot

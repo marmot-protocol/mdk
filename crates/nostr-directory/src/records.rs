@@ -838,10 +838,9 @@ mod tests {
     use super::*;
 
     /// The `matched_field` / `match_quality` wire strings are a published
-    /// contract: `wn users search --json` emits them and the TUI parses them
-    /// back (`cli/src/tui/model.rs`). They must survive any change to how the
-    /// two are modelled in Rust, so pin the serialized form rather than the
-    /// in-memory type.
+    /// contract: `wn users search --json` emits them and scripts parse them
+    /// back. They must survive any change to how the two are modelled in
+    /// Rust, so pin the serialized form rather than the in-memory type.
     #[test]
     fn search_result_serializes_match_attribution_as_snake_case_strings() {
         let result = UserDirectorySearchResult {
@@ -870,7 +869,7 @@ mod tests {
     }
 
     /// Every wire spelling the CLI has ever emitted must still parse, in both
-    /// directions — a rename here would silently break an installed TUI.
+    /// directions — a rename here would silently break an installed client.
     #[test]
     fn every_match_attribution_spelling_round_trips() {
         for (field, wire) in [
