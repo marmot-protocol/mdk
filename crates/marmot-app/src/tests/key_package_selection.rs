@@ -1124,6 +1124,7 @@ async fn direct_start_outbox_fixture() -> (
 fn advertise_updated_direct_outbox(
     fetcher: &MemberResolutionDirectoryFetcher,
     bob: &AccountSummary,
+    write_relays: &[&str],
 ) {
     let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
     let records = by_endpoint.get_mut("wss://directory.example").unwrap();
@@ -1134,11 +1135,10 @@ fn advertise_updated_direct_outbox(
     *outbox = NostrTransportEvent::new_unsigned_at(
         bob.account_id_hex.clone(),
         KIND_NIP65_RELAY_LIST,
-        vec![vec![
-            "r".into(),
-            UPDATED_DIRECT_OUTBOX.into(),
-            "write".into(),
-        ]],
+        write_relays
+            .iter()
+            .map(|relay| vec!["r".into(), (*relay).into(), "write".into()])
+            .collect(),
         String::new(),
         outbox.created_at + 1,
     );
@@ -1163,7 +1163,7 @@ async fn direct_start_retries_after_incomplete_outbox_discovery() {
     );
     assert!(app.groups("alice").unwrap().is_empty());
 
-    advertise_updated_direct_outbox(&fetcher, &bob);
+    advertise_updated_direct_outbox(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
     *fetcher.incomplete_endpoint.lock().unwrap() = None;
     let created = runtime
         .start_direct_conversation_with_options("alice", &bob.account_id_hex, options)
@@ -1214,31 +1214,63 @@ async fn direct_start_requires_complete_discovery_for_incompatibility() {
     ));
     assert!(app.groups("alice").unwrap().is_empty());
 
-    // A prewarm snapshot can also miss a later outbox publication.
-    app.directory()
-        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
-        .await
-        .unwrap();
-    advertise_updated_direct_outbox(&fetcher, &bob);
-    let error = runtime
-        .start_direct_conversation_with_options("alice", &bob.account_id_hex, options)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&error, AppError::DirectoryLookupIncomplete(account) if account == &bob.account_id_hex),
-        "{error}"
-    );
-    assert!(app.groups("alice").unwrap().is_empty());
-
-    let created = runtime
-        .start_direct_conversation_with_options("alice", &bob.account_id_hex, options)
-        .await
-        .unwrap();
-    let groups = app.groups("alice").unwrap();
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
     runtime.shutdown().await;
+    {
+        let client = app.client("alice").await.unwrap();
+        assert!(client.runtime.live_group_ids().unwrap().is_empty());
+    }
     app.close_storage().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_start_refreshes_prewarmed_outbox_on_first_attempt() {
+    let old_outbox = "wss://shared.example";
+    for old_outbox_incomplete in [false, true] {
+        let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+        app.directory()
+            .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        if old_outbox_incomplete {
+            // The recipient keeps the old outbox alongside the new one.
+            advertise_updated_direct_outbox(&fetcher, &bob, &[old_outbox, UPDATED_DIRECT_OUTBOX]);
+            *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
+            *fetcher.incomplete_endpoint.lock().unwrap() = Some(old_outbox.into());
+        } else {
+            advertise_updated_direct_outbox(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
+        }
+        fetcher.requests.lock().unwrap().clear();
+        let runtime = MarmotAppRuntime::new(app.clone());
+        let created = runtime
+            .start_direct_conversation_with_options(
+                "alice",
+                &bob.account_id_hex,
+                crate::DirectConversationOptions {
+                    disappearing_message_secs: 300,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("old outbox incomplete={old_outbox_incomplete}: {error}")
+            });
+        let groups = app.groups("alice").unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
+        if old_outbox_incomplete {
+            assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
+                request
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.0 == old_outbox)
+                    && request.queries.iter().any(|query| {
+                        query.kind == KIND_MARMOT_KEY_PACKAGE
+                            && query.authors.contains(&bob.account_id_hex)
+                    })
+            }));
+        }
+        runtime.shutdown().await;
+        app.close_storage().unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

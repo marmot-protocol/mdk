@@ -6174,7 +6174,7 @@ fn account_worker_command_future<'a>(
         AccountWorkerCommand::CreateGroup {
             queued_at,
             request,
-            mut options,
+            options,
             respond,
         } => Box::pin(async move {
             let create_unit = unit.enter(WorkerUnit::InviteOrCreate);
@@ -6184,12 +6184,37 @@ fn account_worker_command_future<'a>(
                 queued_at.elapsed(),
                 true,
             );
-            let (name, members, prepared_image_upload_id) = match request {
+            let result = match request {
                 GroupCreationRequest::Group {
                     name,
                     members,
                     prepared_image_upload_id,
-                } => (name, members, prepared_image_upload_id),
+                } => {
+                    let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
+                    match prepared_image_upload_id {
+                        None => {
+                            client
+                                .create_group_with_options_and_telemetry(
+                                    &name,
+                                    &member_refs,
+                                    options,
+                                    &telemetry,
+                                )
+                                .await
+                        }
+                        Some(upload_id) => {
+                            client
+                                .create_group_with_prepared_initial_image_and_telemetry(
+                                    &name,
+                                    &member_refs,
+                                    options,
+                                    &upload_id,
+                                    &telemetry,
+                                )
+                                .await
+                        }
+                    }
+                }
                 GroupCreationRequest::Direct {
                     peer_account_id_hex,
                 } => {
@@ -6240,30 +6265,10 @@ fn account_worker_command_future<'a>(
                         }
                         Ok(None) => {}
                     }
-                    options.initial_admins = vec![peer_account_id_hex.clone()];
-                    options.member_resolution = nostr_directory::MemberResolutionPolicy::Atomic;
-                    (String::new(), vec![peer_account_id_hex], None)
-                }
-            };
-            let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-            let result = match prepared_image_upload_id {
-                None => {
                     client
-                        .create_group_with_options_and_telemetry(
-                            &name,
-                            &member_refs,
+                        .create_direct_group_with_telemetry(
+                            &peer_account_id_hex,
                             options,
-                            &telemetry,
-                        )
-                        .await
-                }
-                Some(upload_id) => {
-                    client
-                        .create_group_with_prepared_initial_image_and_telemetry(
-                            &name,
-                            &member_refs,
-                            options,
-                            &upload_id,
                             &telemetry,
                         )
                         .await

@@ -63,6 +63,7 @@ use crate::{
 };
 use marmot_observability::AppPerformanceOperation;
 use marmot_observability::PerformanceRecorder;
+use nostr_directory::MemberResolutionPurpose;
 
 const PREPARED_MEMBER_REPORT_VERSION: u8 = 1;
 
@@ -2240,7 +2241,13 @@ impl AppClient {
         options: AppCreateGroupOptions,
     ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         let created = self
-            .create_group_with_options_and_optional_telemetry(name, member_refs, options, None)
+            .create_group_with_options_and_optional_telemetry(
+                name,
+                member_refs,
+                options,
+                MemberResolutionPurpose::Commit,
+                None,
+            )
             .await?;
         // The chat stands either way: an undelivered Welcome stays owed.
         if created.operation.is_some() {
@@ -2263,6 +2270,25 @@ impl AppClient {
             name,
             member_refs,
             options,
+            MemberResolutionPurpose::Commit,
+            Some(telemetry),
+        )
+        .await
+    }
+
+    pub(crate) async fn create_direct_group_with_telemetry(
+        &mut self,
+        peer: &str,
+        mut options: AppCreateGroupOptions,
+        telemetry: &PerformanceRecorder,
+    ) -> Result<crate::GroupMemberResult<CanonicalCreatedGroup>, AppError> {
+        options.initial_admins = vec![peer.to_owned()];
+        options.member_resolution = nostr_directory::MemberResolutionPolicy::Atomic;
+        self.create_group_with_options_and_optional_telemetry(
+            "",
+            &[peer],
+            options,
+            MemberResolutionPurpose::CommitFresh,
             Some(telemetry),
         )
         .await
@@ -2376,16 +2402,17 @@ impl AppClient {
         &mut self,
         name: &str,
         member_refs: &[&str],
-        options: AppCreateGroupOptions,
+        mut options: AppCreateGroupOptions,
+        purpose: MemberResolutionPurpose,
         telemetry: Option<&PerformanceRecorder>,
     ) -> Result<crate::GroupMemberResult<CanonicalCreatedGroup>, AppError> {
-        let mut options = options;
         let initial_image = options.initial_image.take();
-        self.create_group_with_initial_source_and_optional_telemetry(
+        self.create_group_from_inputs(
             name,
             member_refs,
             options,
             initial_image.map(InitialGroupImageSource::Inline),
+            purpose,
             telemetry,
         )
         .await
@@ -2402,6 +2429,26 @@ impl AppClient {
         member_refs: &[&str],
         options: AppCreateGroupOptions,
         initial_image: Option<InitialGroupImageSource>,
+        telemetry: Option<&PerformanceRecorder>,
+    ) -> Result<crate::GroupMemberResult<CanonicalCreatedGroup>, AppError> {
+        self.create_group_from_inputs(
+            name,
+            member_refs,
+            options,
+            initial_image,
+            MemberResolutionPurpose::Commit,
+            telemetry,
+        )
+        .await
+    }
+
+    async fn create_group_from_inputs(
+        &mut self,
+        name: &str,
+        member_refs: &[&str],
+        options: AppCreateGroupOptions,
+        initial_image: Option<InitialGroupImageSource>,
+        purpose: MemberResolutionPurpose,
         telemetry: Option<&PerformanceRecorder>,
     ) -> Result<crate::GroupMemberResult<CanonicalCreatedGroup>, AppError> {
         let AppCreateGroupOptions {
@@ -2482,7 +2529,7 @@ impl AppClient {
                     .map(|member_ref| (*member_ref).to_owned())
                     .collect(),
                 &requirements,
-                nostr_directory::MemberResolutionPurpose::Commit,
+                purpose,
                 member_resolution,
             )
             .await;
