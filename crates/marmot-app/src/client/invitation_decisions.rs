@@ -338,22 +338,15 @@ impl AppClient {
             return Ok(true);
         };
         let storage = account.app_storage();
-        let chat_hex = hex::encode(chat.as_slice());
-        if storage
-            .invitation_decision(&chat_hex, &admission.generation)?
-            .is_none()
-        {
+        let Some(unsent) = storage
+            .invitation_decision_unsent(&hex::encode(chat.as_slice()), &admission.generation)?
+        else {
             return Ok(true);
-        }
+        };
         let Some(schedule) = storage.small_state_schedule()? else {
             return Ok(false);
         };
-        Ok(
-            crate::small_state::broadcast_reached(&schedule, roster, sibling)
-                && !storage.unsent_invitation_decisions()?.iter().any(|unsent| {
-                    unsent.group_id_hex == chat_hex && unsent.generation == admission.generation
-                }),
-        )
+        Ok(!unsent && crate::small_state::broadcast_reached(&schedule, roster, sibling))
     }
 
     /// Send, once a sibling-Add scan has ended, the acceptances it recorded,

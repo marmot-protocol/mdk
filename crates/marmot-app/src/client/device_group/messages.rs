@@ -266,7 +266,9 @@ impl AppClient {
                     result => result,
                 }
             }
-            KIND_SMALL_STATE_UPDATE => self.receive_small_state_update(group_id, &message.content),
+            KIND_SMALL_STATE_UPDATE => {
+                self.receive_small_state_update(group_id, epoch.0, &message.content)
+            }
             KIND_SMALL_STATE_BROADCAST_REQUEST => {
                 self.receive_small_state_broadcast_request(group_id, &message.content)
             }

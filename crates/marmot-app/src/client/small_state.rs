@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cgka_traits::GroupId;
+use cgka_traits::{GroupId, MessageId};
 use marmot_session::CanonicalizationPolicy;
 use storage_sqlite::{SmallStateItem, SmallStateItemName};
 
@@ -77,16 +77,8 @@ impl AppClient {
             return Ok(());
         };
         let mut sent = 0;
-        for (content, carried) in encode_small_state_update(&storage.unsent_small_state_items()?) {
-            if !self
-                .send_device_group_message(&group_id, KIND_SMALL_STATE_UPDATE, content)
-                .await?
-            {
-                return Ok(());
-            }
-            storage.mark_small_state_sent(&carried)?;
-            sent += 1;
-        }
+        // Invitation decisions first: a sibling Add waits on them (mdk#3556),
+        // and a page of other items no relay takes must not hold them back.
         for (content, carried) in
             encode_invitation_decision_updates(&storage.unsent_invitation_decisions()?)
         {
@@ -97,6 +89,16 @@ impl AppClient {
                 return Ok(());
             }
             storage.mark_invitation_decisions_sent(&carried)?;
+            sent += 1;
+        }
+        for (content, carried) in encode_small_state_update(&storage.unsent_small_state_items()?) {
+            if !self
+                .send_device_group_message(&group_id, KIND_SMALL_STATE_UPDATE, content)
+                .await?
+            {
+                return Ok(());
+            }
+            storage.mark_small_state_sent(&carried)?;
             sent += 1;
         }
         let requested = schedule.request_owed
@@ -292,23 +294,31 @@ impl AppClient {
         Ok(())
     }
 
-    /// Merge an update's items, from any device of the trusted device group:
-    /// membership is the authentication, so no sender is read.
+    /// Merge an update's items, sent at `epoch` of the device group, from
+    /// any device of the trusted device group: membership is the
+    /// authentication, so no sender is read.
     pub(crate) fn receive_small_state_update(
         &mut self,
         group_id: &GroupId,
+        epoch: u64,
         content: &str,
     ) -> Result<(), AppError> {
         self.ensure_small_state_group(group_id)?;
         let items = decode_small_state_update(content)?;
         let invitations = decode_invitation_decisions(content)?;
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        // An update from before this device's last broadcast began did not
+        // reach a device that joined since, and that broadcast did not carry
+        // what it brings: a winning decision from it is owed again, as a
+        // sibling Add waits on it (mdk#3556).
+        let older_than_broadcast = storage
+            .small_state_schedule()?
+            .and_then(|schedule| schedule.last_broadcast)
+            .is_some_and(|last| epoch < last.tip);
         // A sibling's winning decision is applied on the worker's next turn,
         // not at the next maintenance pass (mdk#3566).
-        self.invitation_decisions_changed |= self
-            .app
-            .account_storage(&self.state.label)?
-            .app_storage()
-            .merge_invitation_decisions(&invitations)?;
+        self.invitation_decisions_changed |=
+            storage.merge_invitation_decisions(&invitations, older_than_broadcast)?;
         self.sync_small_state(&items)
     }
 
@@ -349,6 +359,39 @@ impl AppClient {
                 }
             }
             KIND_SMALL_STATE_BROADCAST_REQUEST => storage.owe_small_state_broadcast_request()?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A small-state message this device sent reached no one, after its send
+    /// counted it as sent because it was queued or unresolved: owe what it
+    /// carried again, since a sibling Add waits on a decision marked sent
+    /// (mdk#3556). Which items it carried is not kept, so every item is owed,
+    /// as for a withdrawal. It goes out at the next maintenance pass, as an
+    /// update that reached no relay does, never on the next turn: with no
+    /// relay up, that would retry at once, again and again. Any other message,
+    /// or one in a device group this device no longer trusts, is not small
+    /// state's.
+    pub(crate) fn small_state_send_failed(
+        &mut self,
+        group_id: &GroupId,
+        message_id: &MessageId,
+    ) -> Result<(), AppError> {
+        if self.ensure_small_state_group(group_id).is_err() {
+            return Ok(());
+        }
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        match storage.device_group_message_kind(
+            &hex::encode(group_id.as_slice()),
+            &hex::encode(message_id.as_slice()),
+        )? {
+            Some(KIND_SMALL_STATE_UPDATE) => {
+                storage.owe_all_small_state_items()?;
+            }
+            Some(KIND_SMALL_STATE_BROADCAST_REQUEST) => {
+                storage.owe_small_state_broadcast_request()?
+            }
             _ => {}
         }
         Ok(())

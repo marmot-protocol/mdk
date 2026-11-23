@@ -110,10 +110,13 @@ impl SqliteAppStorage {
     }
 
     /// A remote winner is durable before presentation or Leave effects. It is not a local action.
-    /// Returns whether any value won, and so owes application work.
+    /// With `owe_winners`, each winner is also owed to the siblings, as a
+    /// value this device must send itself. Returns whether any value won,
+    /// and so owes application work.
     pub fn merge_invitation_decisions(
         &self,
         decisions: &[InvitationDecision],
+        owe_winners: bool,
     ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
@@ -121,12 +124,29 @@ impl SqliteAppStorage {
             for decision in decisions.iter().filter(|item| item.is_valid()) {
                 let prior = held(&conn, &decision.group_id_hex, &decision.generation)?;
                 if prior.as_ref().is_none_or(|prior| decision.wins_over(prior)) {
-                    put(&conn, decision, false)?;
+                    put(&conn, decision, owe_winners)?;
                     won = true;
                 }
             }
             Ok(won)
         })
+    }
+
+    /// Whether the decision held for `chat` and `generation` is still owed
+    /// to the siblings; `None` when none is held.
+    pub fn invitation_decision_unsent(
+        &self,
+        chat: &str,
+        generation: &[u8; 32],
+    ) -> StorageResult<Option<bool>> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT unsent FROM invitation_decisions WHERE group_id_hex = ?1 AND generation = ?2",
+                params![chat, generation.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()
     }
 
     pub fn unsent_invitation_decisions(&self) -> StorageResult<Vec<InvitationDecision>> {
@@ -263,7 +283,7 @@ mod tests {
             ..decline.clone()
         };
         storage
-            .merge_invitation_decisions(std::slice::from_ref(&accepted))
+            .merge_invitation_decisions(std::slice::from_ref(&accepted), false)
             .unwrap();
         assert!(
             !storage.invitation_decision_work().unwrap()[0].decline_owed,
@@ -274,7 +294,7 @@ mod tests {
             ..accepted.clone()
         };
         storage
-            .merge_invitation_decisions(&[tied_decline.clone(), accepted])
+            .merge_invitation_decisions(&[tied_decline.clone(), accepted], false)
             .unwrap();
         assert_eq!(
             storage.invitation_decision("0102", &[1; 32]).unwrap(),
@@ -307,7 +327,7 @@ mod tests {
             ..decline
         };
         storage
-            .merge_invitation_decisions(std::slice::from_ref(&maximum))
+            .merge_invitation_decisions(std::slice::from_ref(&maximum), false)
             .unwrap();
         storage.mark_invitation_decision_applied(&maximum).unwrap();
         storage.lock().unwrap().execute_batch("CREATE TRIGGER refuse_max_write BEFORE UPDATE ON invitation_decisions BEGIN SELECT RAISE(ABORT, 'maximum must stay unchanged'); END").unwrap();
@@ -338,7 +358,7 @@ mod tests {
             ..maximum
         };
         storage
-            .merge_invitation_decisions(std::slice::from_ref(&maximum_decline))
+            .merge_invitation_decisions(std::slice::from_ref(&maximum_decline), false)
             .unwrap();
         storage
             .invitation_decline_handed_off("0102", &[1; 32])

@@ -613,6 +613,17 @@ async fn a_device_linked_soon_after_another_gets_an_accepted_chat_accepted() {
 /// reach the device ahead of the decision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_owed_decision_holds_its_chats_add_until_it_goes_out() {
+    owed_decision_case(false).await;
+}
+
+/// The same hold applies to a gap fill, as by a sibling filling in for an
+/// approver that stopped adding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owed_decision_holds_its_chats_gap_fill_until_it_goes_out() {
+    owed_decision_case(true).await;
+}
+
+async fn owed_decision_case(gap_fill: bool) {
     let (relay, [mut phone]) = alice_devices::<1>().await;
     let alice = phone
         .app
@@ -639,6 +650,15 @@ async fn an_owed_decision_holds_its_chats_add_until_it_goes_out() {
     let mut laptop = another_alice_device(&relay, &phone).await;
     link(&relay, &mut phone, &mut laptop, "Laptop").await;
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    if gap_fill {
+        // The link is past the approver's burst, so only gap filling adds.
+        account_database(&phone.app)
+            .execute(
+                "UPDATE device_links SET decided_at = decided_at - ?1",
+                [i64::try_from(LINK_CHAT_ADD_SECS).unwrap()],
+            )
+            .unwrap();
+    }
     phone
         .app
         .account_storage("alice")
@@ -646,17 +666,24 @@ async fn an_owed_decision_holds_its_chats_add_until_it_goes_out() {
         .app_storage()
         .owe_all_small_state_items()
         .unwrap();
-    phone
-        .client
-        .add_linked_devices_to_chats(&[], &mut Default::default())
-        .await;
+    let add = async |phone: &mut Device| {
+        if gap_fill {
+            phone
+                .client
+                .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+                .await;
+        } else {
+            phone
+                .client
+                .add_linked_devices_to_chats(&[], &mut Default::default())
+                .await;
+        }
+    };
+    add(&mut phone).await;
     assert_eq!(taken_from(&phone, &laptop), 0);
 
     phone.client.drive_small_state().await;
-    phone
-        .client
-        .add_linked_devices_to_chats(&[], &mut Default::default())
-        .await;
+    add(&mut phone).await;
     assert_eq!(taken_from(&phone, &laptop), 1);
     passes(&relay, &mut [&mut laptop, &mut phone], 4).await;
     assert!(
