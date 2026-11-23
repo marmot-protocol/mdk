@@ -91,9 +91,6 @@
       "sleep": 4,
       "short_timeout": 2
     },
-    "crates/cli/src/tui/tests.rs": {
-      "sleep": 8
-    },
     "crates/cli/tests/cli.rs": {
       "sleep": 22
     },

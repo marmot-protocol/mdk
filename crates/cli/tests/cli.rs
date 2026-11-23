@@ -2462,9 +2462,7 @@ fn whitenoise_parity_commands_have_real_or_explicit_contracts() {
     run_json(home.path(), &["--account", &bob, "keys", "publish"]);
 
     let settings = run_json(home.path(), &["settings", "show"]);
-    assert_eq!(settings["theme"], "system");
-    let settings = run_json(home.path(), &["settings", "theme", "dark"]);
-    assert_eq!(settings["theme"], "dark");
+    assert_eq!(settings["language"], "system");
     let settings = run_json(home.path(), &["settings", "language", "en"]);
     assert_eq!(settings["language"], "en");
     #[cfg(unix)]
@@ -2970,9 +2968,8 @@ fn users_search_finds_a_followed_stranger_whose_profile_only_lives_on_the_relay(
     let users = found["users"].as_array().expect("users array");
     assert_eq!(users.len(), 1, "expected exactly Bob: {found}");
 
-    // Every field here is read by the TUI's `parse_user_search_results`
-    // (crates/cli/src/tui/model.rs), which shells out to this command. The row
-    // shape is a contract, not an implementation detail.
+    // Scripts read every field here. The row shape is a contract, not an
+    // implementation detail.
     let row = &users[0];
     assert_eq!(row["account_id_hex"], bob);
     assert_eq!(row["radius"], 1);
@@ -2989,7 +2986,7 @@ fn users_search_finds_a_followed_stranger_whose_profile_only_lives_on_the_relay(
         row["profile"]["name"]
             .as_str()
             .is_some_and(|name| !name.is_empty()),
-        "row must carry a display name for the TUI to render: {row}"
+        "row must carry a renderable display name: {row}"
     );
 }
 
@@ -5024,7 +5021,7 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
     let initial_chat = &initial["result"]["chat"];
     assert_eq!(initial_chat["profile"]["name"], "general");
     // The streamed chat row carries the same additive projection keys as
-    // `chats list`, so a TUI can bootstrap unread badges from either feed.
+    // `chats list`, so a client can bootstrap unread badges from either feed.
     assert_eq!(initial_chat["unread_count"], 0);
     assert_eq!(initial_chat["has_unread"], false);
     assert!(initial_chat["last_message"].is_null());

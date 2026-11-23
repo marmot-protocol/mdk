@@ -80,7 +80,7 @@ Use `wn [--json] usage-diagnostics show|enable|disable` or
 `wn-agent usage-diagnostics show|enable|disable [--home PATH] [--json]` for local
 controls. Active `wnd` owns its changes. `wn-agent` exposes a separate owner-only
 local management socket; its agent-control credentials and remote messages cannot
-accept this permission. Standalone `wn`/TUI collectors are silent. Frozen-cursor
+accept this permission. Standalone `wn` collectors are silent. Frozen-cursor
 notification runtimes are always silent. The local controls report the
 saved permission separately from current exporter readiness. A standalone process
 can inspect a saved grant without loading the daemon's destination or registry;

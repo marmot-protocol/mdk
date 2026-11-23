@@ -2,14 +2,14 @@
 title: "App Core Boundary"
 created: 2026-05-15
 updated: 2026-11-14
-tags: [marmot, app-core, android, swift, cli, tui]
+tags: [marmot, app-core, android, swift, cli]
 status: overview
 ---
 
 # App Core Boundary
 
 MDK is the shared product runtime for White Noise Android, iOS, macOS and the
-`wn` CLI/TUI. Host apps render its state and integrate platform services.
+`wn` CLI. Host apps render its state and integrate platform services.
 Shared product policy and protocol state must remain behind the app-core API.
 
 ## Host-app boundary
@@ -52,7 +52,7 @@ use. It runs the Nostr relay plane, `crates/transport-nostr`, as a shared servic
 crate-private writer, `AppClient`, owned by that account's worker; see
 [Marmot App Runtime Shape](marmot-app-runtime.md#shape).
 
-`crates/cli` owns commands and output. Its JSON envelope is intentionally stable enough for a future TUI or harness, but
+`crates/cli` owns commands and output. Its JSON envelope is intentionally stable enough for scripts and harnesses, but
 Swift and other host apps should prefer app-core bindings over shelling out to the CLI.
 
 ## Stable App Concepts
@@ -109,7 +109,7 @@ member list should reflect the post-removal group state, but the group is not au
 Archiving is a local user decision. An archived group can be hidden from normal lists while remaining available by id for
 history, members, and messages.
 
-## Native Host and TUI Integration
+## Native Host Integration
 
 Android and Apple apps should use the `marmot-app` runtime bindings rather than the CLI text layer:
 

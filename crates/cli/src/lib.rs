@@ -21,7 +21,6 @@ pub mod daemon;
 mod error;
 mod secret;
 mod terminal;
-pub mod tui;
 
 pub(crate) use terminal::{terminal_safe_json_display, terminal_safe_text};
 
@@ -204,10 +203,6 @@ where
 async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNsec>) -> CliOutput {
     if let Command::Daemon { command } = cli.command.clone() {
         return daemon::run_daemon_command(cli, command).await;
-    }
-
-    if matches!(cli.command, Command::Tui { .. }) {
-        return tui::run_tui(cli).await;
     }
 
     // File inputs and output destinations mean the caller's files. A forwarded
@@ -694,10 +689,6 @@ async fn execute_inner(
             plain: "daemon command is handled by wn".to_owned(),
             json: json!({"handled": "client"}),
         }),
-        Command::Tui { .. } => Ok(CommandOutput {
-            plain: "tui command is handled by wn".to_owned(),
-            json: json!({"handled": "client"}),
-        }),
         Command::Sync => {
             let account = resolve_account(&account_home, account_flag)?;
             ensure_local_signing(&account)?;
@@ -937,7 +928,7 @@ pub(crate) fn group_json(group: AppGroupRecord) -> Value {
         "profile": group.profile,
         // Presence, hash, and type only. The full component carries the avatar
         // decryption key, the Blossom upload secret, and key-bearing `data_hex`;
-        // none of the CLI, TUI, or daemon consumers need them (mdk#1253).
+        // none of the CLI or daemon consumers need them (mdk#1253).
         "image": crate::commands::groups::group_image_summary_json(&group.image),
         "avatar_url": group.avatar_url,
         "admin_policy": group.admin_policy,
@@ -2854,8 +2845,8 @@ mod tests {
 
     // `chats subscribe` / `chats subscribe-archived` without a daemon must surface
     // a chat-specific message, not the messages-namespace text, while keeping the
-    // shared `daemon_required` JSON code and repair hint so the TUI/scripts that
-    // branch on `code` keep working.
+    // shared `daemon_required` JSON code and repair hint so scripts that branch
+    // on `code` keep working.
     #[test]
     fn chats_subscribe_requires_daemon_renders_chat_specific_message() {
         let chats = super::wn_error_json(&WnError::ChatsSubscribeRequiresDaemon);

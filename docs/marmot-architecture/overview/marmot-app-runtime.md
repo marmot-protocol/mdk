@@ -2,14 +2,14 @@
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
 updated: 2026-11-21
-tags: [marmot, overview, app-runtime, daemon, tui]
+tags: [marmot, overview, app-runtime, daemon]
 status: implemented-first-slice
 ---
 
 # Marmot App Runtime Shape
 
 `marmot-app` is the runtime boundary for client applications. A daemon or native app opens a `MarmotApp` over its
-account home, starts a `MarmotAppRuntime` from it, and sends the runtime intents; the TUI is a client of the daemon.
+account home, starts a `MarmotAppRuntime` from it, and sends the runtime intents.
 The runtime owns accounts, shared directory state, relay subscriptions, projections, and typed event streams.
 
 The lower crates already point in this direction. `cgka-engine` owns convergence and engine state. `marmot-session` owns
@@ -277,9 +277,9 @@ daemon's stronger request-buffer erasure while leaving versioning, authorization
 semantics protocol-owned. See [Local Daemon Protocol Boundaries](../further-context/local-daemon-protocol-boundaries.md)
 for the full comparison and consolidation constraints.
 
-## CLI And TUI Boundary
+## CLI Boundary
 
-`wn` and the TUI should be thin clients of the daemon/runtime:
+`wn` should be a thin client of the daemon/runtime:
 
 - command calls become runtime intents;
 - subscription calls attach to runtime broadcast streams;
@@ -316,7 +316,6 @@ The first slice now proves the architecture without filling in every product sur
 8. The relay plane applies bounded replay lookback, relay endpoint parsing/deduplication, shared directory discovery
    fetch coalescing, and redacted relay-health reporting.
 9. Daemon status reports `last_runtime_activity` instead of modeling the daemon as a background sync loop.
-10. The TUI remains a daemon client.
 
 The acceptance test should create Alice and Bob, create a group, receive Bob's group join, and send and receive a normal
 message without calling `wn sync` or publishing keys manually.
@@ -348,4 +347,4 @@ The remaining work is narrower than the original refactor, but still real:
 - `crates/transport-nostr`: the shared Nostr relay plane.
 - `crates/transport-nostr-adapter`: reusable Nostr transport adapter and SDK bridge.
 - `crates/transport-nostr-peeler`: Nostr event peeling and wrapping.
-- `crates/cli`: daemon host, CLI client, and TUI client.
+- `crates/cli`: daemon host and CLI client.

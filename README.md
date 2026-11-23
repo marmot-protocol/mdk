@@ -27,7 +27,7 @@ holds the implementation, its architecture notes, conformance tests, formal mode
 | --- | --- |
 | Talk to Hermes, OpenClaw, Claude Code, Codex, OpenCode, Pi, or Goose from White Noise | [White Noise + Agents quickstart](integrations/README.md) |
 | Write your own bot or client against `wn-agent` | [Build your own client](integrations/custom-client.md) |
-| Use White Noise from a terminal (CLI, daemon, TUI) | [`wn` guide](crates/cli/README.md) |
+| Use White Noise from a terminal (CLI, daemon) | [`wn` guide](crates/cli/README.md) |
 | Integrate MDK into an iOS, macOS, or Android app | [MarmotKit integration guide](crates/marmot-uniffi/README.md) |
 | Integrate from C or another raw-FFI host | [C ABI guide](crates/marmot-c/README.md) |
 | Upgrade an app to a new MDK release | [Version upgrade guides](docs/integration/README.md) |
@@ -61,15 +61,15 @@ encrypted chat. For how connectors share one machine, identities, and allowlists
 
 ## The `wn` command-line app
 
-`wn` manages accounts, relays, KeyPackages, chats, groups, and messages, and includes a terminal UI (`wn tui`). `wnd`
-is the background daemon that keeps accounts synced and serves the CLI and TUI. Install both from a checkout:
+`wn` manages accounts, relays, KeyPackages, chats, groups, and messages. `wnd` is the background daemon that keeps
+accounts synced and serves the CLI. Install both from a checkout:
 
 ```sh
 cargo install --path crates/cli --locked --bins
 ```
 
 The [`wn` guide](crates/cli/README.md) covers configuration, a two-account quick start against local relays, the full
-command map, the daemon, the TUI, and JSON output for scripting.
+command map, the daemon, and JSON output for scripting.
 Every build can [link and list account devices](crates/cli/README.md#device-linking) through `wn devices` and a
 persistent `wnd`.
 The explicit `wn devices link reset --confirm` action discards only the local hidden device-group copy before fresh
@@ -98,7 +98,7 @@ MDK separates the protocol engine from storage, transport, and application conce
 and reasoned about on its own:
 
 ```text
- apps (MarmotKit / C)    wn CLI · wnd · TUI    wn-agent ──► agent runtimes
+ apps (MarmotKit / C)    wn CLI · wnd          wn-agent ──► agent runtimes
             └────────────────┬─────┴──────────────┘
                      marmot-app        multi-account runtime, projections
                      marmot-session    account-device runtime over one encrypted session
@@ -159,7 +159,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | Bindings | [`marmot-uniffi`](crates/marmot-uniffi/README.md) | MarmotKit: Swift and Kotlin bindings; [native-host test recipe](crates/marmot-uniffi/NATIVE-HOST-TESTS.md) |
 | | [`marmot-uniffi-macros`](crates/marmot-uniffi-macros/README.md) | Runs MarmotKit's async exports on its own Tokio runtime |
 | | [`marmot-c`](crates/marmot-c/README.md) | C ABI bindings |
-| Front ends | [`cli`](crates/cli/README.md) (`wn-cli`) | `wn`, `wnd`, and `wn tui` |
+| Front ends | [`cli`](crates/cli/README.md) (`wn-cli`) | `wn` and `wnd` |
 | Agents | [`agent-connector`](crates/agent-connector/README.md) | The `wn-agent` connector daemon and its `doctor` setup check |
 | | [`agent-control`](crates/agent-control/README.md) | Agent control protocol messages and framing |
 | | [`integrations/`](integrations/README.md) | Per-runtime plugins and terminal harnesses |
@@ -196,7 +196,7 @@ The FHS shell provides Clang, pkg-config, nextest, cargo-audit, cargo-llvm-cov,
 cbindgen, valgrind, Python with uv, Tamarin, Java for TLC and rustup.
 Rustup reads the toolchain and required components from
 [`rust-toolchain.toml`](rust-toolchain.toml). Cargo keeps its usual `target/`
-output directory so the TUI recipes find the binaries they build.
+output directory.
 The packages are pinned by [`flake.lock`](flake.lock); no global `nix-ld`
 configuration is required.
 

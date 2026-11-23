@@ -12,7 +12,7 @@ artifact that changed.
 Current tracks:
 
 - Whole-workspace releases use tags like `v0.9.0`. These identify a versioned source snapshot of the protocol draft,
-  Rust workspace, CLI, daemon, TUI, app runtime, storage, transports, agent crates, and binding source crate. MDK
+  Rust workspace, CLI, daemon, app runtime, storage, transports, agent crates, and binding source crate. MDK
   `0.9.0` is the unifying workspace bump above the previous `0.8.0` release.
 - WN Agent releases use tags like `wn-agent-v0.9.0`. These publish the `wn-agent` connector binary plus adapter and
   harness install assets, including Hermes, OpenClaw, and OpenCode.
@@ -39,8 +39,8 @@ on each other through workspace paths. Treat Git tags and GitHub Releases as the
 
 ## Version Rules
 
-Use the root `Cargo.toml` workspace version as the release version for the Rust workspace, WN Agent, CLI, daemon, TUI,
-app runtime, and generated bindings:
+Use the root `Cargo.toml` workspace version as the release version for the Rust workspace, WN Agent, CLI, daemon, app
+runtime, and generated bindings:
 
 ```toml
 [workspace.package]
@@ -95,7 +95,7 @@ Use a new version when public behavior changes. That includes:
 
 - UniFFI records, enums, object methods, async methods, or error variants;
 - app runtime behavior that iOS or Android depends on;
-- WN Agent, CLI, daemon, or TUI commands and JSON output;
+- WN Agent, CLI, or daemon commands and JSON output;
 - agent-control protocol, adapter/plugin contract, installer, or config behavior;
 - protocol, transport, storage, or vector changes that downstream users need to pin.
 

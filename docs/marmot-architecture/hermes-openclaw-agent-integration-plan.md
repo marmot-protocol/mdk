@@ -9,7 +9,7 @@ status: working-plan
 # Hermes And OpenClaw Agent Integration Plan
 
 This note describes how MDK/Marmot can host a server-side agent account that appears in the iOS, Android, CLI,
-daemon, and TUI surfaces as a normal Marmot member.
+and daemon surfaces as a normal Marmot member.
 
 The first target is NousResearch Hermes Agent. The second target is OpenClaw. The shared shape is a headless Rust
 connector that owns Marmot account state, MLS group state, and durable encrypted sends. Hermes and OpenClaw get small

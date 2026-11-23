@@ -9791,7 +9791,7 @@ fn setup_key_package_priority(
 
 /// Build a [`RuntimeAccountError`] message from a static prefix and the
 /// error's privacy-safe kind. These messages leave the runtime: the CLI daemon
-/// persists them into `wn daemon status --json` and the TUI, and host apps may
+/// persists them into `wn daemon status --json`, and host apps may
 /// log them. Never interpolate the raw error — `AppError::Transport` Display
 /// can embed relay URLs, which the privacy invariant forbids surfacing.
 fn account_error_message(prefix: &str, err: &AppError) -> String {

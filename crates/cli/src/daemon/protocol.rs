@@ -110,8 +110,7 @@ pub struct DaemonStatus {
     pub last_runtime_activity: Option<DaemonRuntimeActivityReport>,
     pub relay_health: Option<marmot_app::RelayPlaneHealth>,
     /// Whether this daemon runs with device groups on (`WN_DEVICE_GROUPS`),
-    /// so clients such as the TUI follow the daemon's setting, not their
-    /// own. A daemon from before this field reads as false.
+    /// so clients follow the daemon's setting, not their own. A daemon from before this field reads as false.
     #[serde(default)]
     pub device_groups: bool,
 }

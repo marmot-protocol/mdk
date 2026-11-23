@@ -1,12 +1,12 @@
 # wn
 
 `wn` is the command-line app for the White Noise/Marmot stack. It manages Nostr-keyed accounts, relay lists,
-KeyPackages, chats, groups, messages, media, live runtime subscriptions, and a terminal UI. Use it to drive Marmot from
-a shell or script, or interactively with `wn tui`.
+KeyPackages, chats, groups, messages, media, and live runtime subscriptions. Use it to drive Marmot from a shell or
+script.
 
 The crate (source `crates/cli`, Cargo package `wn-cli`) builds two binaries:
 
-- `wn`: the user-facing CLI and TUI entrypoint.
+- `wn`: the user-facing CLI.
 - `wnd`: the background daemon used by `wn daemon start`.
 
 `wn` uses `marmot-account` for account homes and secret storage, and `marmot-app` for the runtime bridge, transport
@@ -28,7 +28,6 @@ setup, group and message projection, and Nostr directory refresh.
   - [Directory, profile, relays, and settings](#directory-profile-relays-and-settings)
   - [Sync](#sync)
 - [Daemon](#daemon)
-- [TUI](#tui)
 - [JSON output](#json-output)
 - [Packaging](#packaging)
 - [Changelog](#changelog)
@@ -70,9 +69,8 @@ Global options can be passed as flags or environment variables:
 - `--socket <path>` or `WN_SOCKET`: daemon socket. The default is `$WN_HOME/dev/wnd.sock`.
 - `--secret-store keychain|file` or `WN_SECRET_STORE`: signing-key backend.
 - `--keychain-service <name>` or `WN_KEYCHAIN_SERVICE`: keychain service name.
-- `--json`: return a stable JSON envelope for scripts, the TUI, and daemon forwarding.
-- `WN_RELAY`: fallback relay URL for commands that need one when no relay flag is given (the TUI also uses it to
-  auto-start the daemon).
+- `--json`: return a stable JSON envelope for scripts and daemon forwarding.
+- `WN_RELAY`: fallback relay URL for commands that need one when no relay flag is given.
 
 Without `WN_HOME`, the home is the platform user data directory:
 
@@ -193,7 +191,7 @@ wn --account <npub-or-hex> chats list --include-archived
 wn --account <npub-or-hex> chats list-archived
 wn --account <npub-or-hex> chats show <group-hex>
 wn --account <npub-or-hex> chats subscribe
-wn --account <npub-or-hex> chats subscribe-archived
+wn --account <npub-or-hex> chats subscribe-archived   # deprecated
 wn --account <npub-or-hex> chats archive <group-hex>
 wn --account <npub-or-hex> chats unarchive <group-hex>
 wn --account <npub-or-hex> chats mute <group-hex> 1h
@@ -277,7 +275,7 @@ wn --account <npub-or-hex> groups maintenance-policy [--set enabled|disabled]
 wn --account <npub-or-hex> groups pause-maintenance
 wn --account <npub-or-hex> groups resume-maintenance
 wn --account <npub-or-hex> groups run-maintenance
-wn --account <npub-or-hex> groups subscribe-state <group-hex>
+wn --account <npub-or-hex> groups subscribe-state <group-hex>   # deprecated
 ```
 
 The hidden legacy `group` namespace keeps `create`, `members`, `invite` (with `--admin`), `remove`, `update`, and
@@ -353,12 +351,11 @@ per-member `member_actions`). Leave hints use the shared core capability selecto
 rechecks current authority. `can_leave` is false for unaccepted invitations and unrecoverable groups.
 Leave demotes an eligible nonlast admin account itself before its ordinary departure, so
 `requires_self_demote_before_leave` is false: the last active admin account is refused before a new shared invitation
-choice or departure publication, TUI `L` confirms and invokes the same command, and a committed demotion remains if a
-later departure fails. With `WN_DEVICE_GROUPS=0` (see [device linking](#device-linking)) the flag is instead true for an
-admin, including an admin invitee: `groups leave` and `groups decline` refuse an admin with `admin_policy` before
-anything is written or published, until `groups self-demote`; the last admin promotes another account first, and TUI `L`
-shows an admin why it cannot leave yet instead of confirming. An admitted Leave can still be settling; success is not proof every device
-departed.
+choice or departure publication, and a committed demotion remains if a later departure fails. With
+`WN_DEVICE_GROUPS=0` (see [device linking](#device-linking)) the flag is instead true for an admin, including an admin
+invitee: `groups leave` and `groups decline` refuse an admin with `admin_policy` before anything is written or
+published, until `groups self-demote`; the last admin promotes another account first. An admitted Leave can still be
+settling; success is not proof every device departed.
 
 **Retention.** `groups retention <group-hex>` shows the disappearing-message policy (`disappearing_message_secs`,
 `enabled`, and the full `message_retention` component). `--set <duration>` publishes a component update: a bare integer
@@ -445,7 +442,7 @@ wn --account <npub-or-hex> messages timeline list <group-hex> --limit 20
 wn --account <npub-or-hex> messages timeline search <query> --group <group-hex> --limit 20
 wn --account <npub-or-hex> messages timeline search "" --sender <npub-or-hex> --since <unix-seconds> --until <unix-seconds> --attachment-type image
 wn --account <npub-or-hex> messages timeline search <query> --before <timeline-at> --before-message-id <message-id> --cursor-group-id <group-hex>
-wn --account <npub-or-hex> messages timeline subscribe <group-hex>
+wn --account <npub-or-hex> messages timeline subscribe <group-hex>   # deprecated
 ```
 
 **Replies.** `messages send --reply-to <message-id>` sends the text as a reply, using the same wire format other Marmot
@@ -519,7 +516,9 @@ it. A row with `invalidation_status` set is not delivered, even when it keeps it
 
 **Subscriptions.** `messages subscribe`, `messages timeline subscribe`, `chats subscribe`, `chats subscribe-archived`,
 `groups subscribe-state`, and `notifications subscribe` require `wnd`. With `--json` they print newline-delimited
-responses with a typed `result.type`:
+responses with a typed `result.type`. `messages timeline subscribe`, `chats subscribe-archived`,
+`groups subscribe-state`, and `notifications subscribe` are deprecated: they served the removed terminal UI and will be
+removed in a future release.
 
 | `result.type` | Meaning |
 | --- | --- |
@@ -597,9 +596,8 @@ wn --account <npub-or-hex> relays remove <relay-url> --type inbox
 wn users show <npub-or-hex>
 wn users search <query> --radius 0..2
 wn settings show
-wn settings theme dark
 wn settings language en
-wn notifications subscribe
+wn notifications subscribe   # deprecated
 wn --account <npub-or-hex> debug health
 wn debug relay-control-state
 wn relay-stats
@@ -613,7 +611,7 @@ wn usage-diagnostics disable
   MDK reads no more than that from one list.
 - `users search` searches your follow graph; `--radius START..END` defaults to `0..1` (0 is you, 1 who you follow, 2
   follows-of-follows).
-- `notifications subscribe` streams daemon-backed local notification updates as JSON lines.
+- `notifications subscribe` (deprecated) streams daemon-backed local notification updates as JSON lines.
 - `relay-stats` prints device-local relay telemetry: aggregate lifecycle counters, cross-relay arrival spread,
   per-relay first-deliverer and first-event/EOSE timing, and redacted relay health. It reads the live `wnd` runtime
   when a daemon socket exists. Per-relay rows use opaque device-local indices, never relay URLs.
@@ -634,8 +632,8 @@ and should not need it.
 ## Device linking
 
 Device groups are on by default in every `wn`/`wnd` build, with production settlement/retry timing. Export
-`WN_DEVICE_GROUPS=0` (or `false`, `off`, `no`) for both `wn` and `wnd` (the daemon owns the runtime, and the TUI reads
-it for Leave) to turn them off. A debug build needs the repository's existing [debug-binary stack requirement](../../README.md#development)
+`WN_DEVICE_GROUPS=0` (or `false`, `off`, `no`) for both `wn` and `wnd` (the daemon owns the runtime) to turn them off.
+A debug build needs the repository's existing [debug-binary stack requirement](../../README.md#development)
 when running `wn`/`wnd` directly:
 
 ```sh
@@ -771,8 +769,8 @@ wn daemon stop
 - `wn daemon stop` prints `daemon stopped` only once the daemon process has exited. The daemon answers the request
   before it shuts down its runtime, which can wait on relays; if it is still running 30 seconds later, the command
   fails with `daemon_stop_timeout` and names its pid, and leaves it to finish shutting down.
-- When a daemon socket exists for a home, normal `wn --home <path> ...` commands are forwarded to it. `wn daemon status`,
-  `wn daemon stop`, and `wn tui` handle daemon access directly. Use `--socket` or `WN_SOCKET` to target a specific
+- When a daemon socket exists for a home, normal `wn --home <path> ...` commands are forwarded to it. `wn daemon status`
+  and `wn daemon stop` handle daemon access directly. Use `--socket` or `WN_SOCKET` to target a specific
   daemon.
 - `wnd` answers on its socket as soon as it binds it, before it has opened its accounts, which the runtime allows 45
   seconds. Meanwhile `wn daemon status` prints `daemon starting` (`"starting": true` in `--json`), `wn daemon stop`
@@ -830,207 +828,10 @@ wn --account "$ALICE" messages send "$GROUP" "hello bob"
 
 Terminal 1 should print the typed `message` line in real time.
 
-## TUI
-
-`wn tui` is a Ratatui interface over the real `wn --json` command surface. Its main view is chat-first: the chat list on
-the left, the materialized message timeline on the right (reactions, reply context, deletion tombstones, and inline
-images), the composer below, and a hints bar plus status bar at the bottom.
-
-```sh
-wn tui
-```
-
-### Startup and the daemon
-
-Startup routes by local account count: none opens the login menu (create an identity or log in with an nsec), exactly
-one enters the main view, and several open an account picker. An explicit `--account` (or `WN_ACCOUNT`) that resolves to
-a loaded account enters the main view directly. Press `A` from the chat list, or use `/account`, `/login`, and
-`/create-identity`, to switch accounts later.
-
-Creating an identity and starting the daemon both need relays. On first run, pass them to `wn tui` and they are
-forwarded to the daemon-start and account-setup child commands:
-
-```sh
-wn tui \
-  --discovery-relays wss://relay.discovery.example \
-  --default-account-relays wss://relay.one.example,wss://relay.two.example
-```
-
-- When a daemon is running for the same home, TUI child commands use its socket and the TUI attaches to daemon-backed
-  subscriptions for live message, chat, and group-state changes. The status bar shows daemon state.
-- When no daemon is running at launch, the TUI auto-starts one (as `/daemon start` would) if it has a relay source: the
-  flags above, a global `--relay`, or `WN_RELAY`. The status line shows `starting daemon...` and then the outcome.
-  Without a relay source no start is attempted, a status notice says so, and the TUI continues degraded; restart it
-  with relay flags (or `WN_RELAY`).
-- The TUI never stops the daemon when it quits, because other `wn` commands share it. Stop it with `/daemon stop` or
-  `wn daemon stop`.
-- Without a daemon, off-screen unread badges and previews update only on `/refresh` or when you re-open the chat. Badges
-  and the unread total survive restarts either way, since they come from the runtime's durable `chats list` projection.
-
-User-initiated commands (send, reply, react/unreact, delete, open chat, user search, group detail, invites) and ambient
-chat-list re-reads run on a background worker, so a `wn` round-trip never freezes input. They show in-flight feedback
-(`sending...`, `loading chat...`, `searching...`), mutations keep their submission order, and a load for a target you
-have already moved past is dropped. Modal or rare flows (login, logout, daemon start/stop, popup submits) stay
-synchronous.
-
-### Keys
-
-Login screen:
-
-- Menu (no accounts): `c` create an identity, `l` log in with an nsec, `q` quit.
-- Account picker: `j`/`k` or arrows move; `Enter` selects; `c` create; `l` nsec login; `Esc` returns to the main view
-  when one is active; `q` quit.
-- Nsec entry: the nsec is rendered masked; `Enter` submits it over stdin; `Esc` cancels.
-
-Main view:
-
-- `Tab`/`BackTab`: cycle the chat list, messages, and composer.
-- Chat list: `j`/`k` or arrows move the selection and, after ~150 ms of quiet, preview the highlighted chat in the
-  message pane while focus stays on the list. The messages-pane title names the loaded chat, and the composer sends to
-  it. `Enter` opens the chat and focuses messages. Opening or previewing a chat marks it read (`chats mark-read`).
-  Rows show an unread badge (bold name plus `(N)`) and a last-message preview, ordered by last activity. `g` group
-  detail, `s` user search, `p` profile, `h` relay health, `I` pending invites, `A` account picker. A group invite shows
-  as a status notice prompting `I`. Background refreshes never move the highlight.
-- Messages: `j`/`k` or arrows move; `PageUp`/`PageDown` page; `G`/`End` jump to newest (and pin to the bottom);
-  `g`/`Home` jump to oldest. Scrolling past the oldest loaded message loads the previous page. `i` or `Enter` focuses
-  the composer. On the selected message:
-  - `r` prefills `/react ` (`Enter` sends the default `+`; type an emoji first to customize);
-  - `u` removes your reaction immediately;
-  - `d` prefills `/delete` for your own message (`Enter` confirms);
-  - `R` prefills `/reply ` and shows the reply target on the status line;
-  - `o` opens the downloaded image full-size.
-
-  Prefills are skipped when the composer already holds a draft. While a prefill is armed, the hints line says what
-  `Enter` will do and to which message.
-- Composer: `Left`/`Right`/`Home`/`End` move the cursor; `Backspace`/`Delete` remove a character; `Enter` submits.
-  There is no keyboard newline (multi-line content arrives only by paste). The composer grows with its content up to
-  8 rows.
-- `Esc`: clears an armed `/react`, `/reply`, or `/delete` prefill; a hand-typed draft is left intact. With nothing armed
-  it steps back (composer → messages → chats). With a popup open, it closes the popup.
-- `Ctrl-U`: clears the whole composer, whatever it holds (also the masked nsec field).
-- `?`: help popup.
-- `q`: quit, from the chat list or messages pane and only while the composer is empty. In the composer it is a literal
-  `q`. `Ctrl-C` always quits.
-
-Popups are modal and capture every key. Text-entry popups submit on `Enter` (when non-empty) and cancel on `Esc`;
-confirm popups take `y`/`Enter` or `n`/`Esc`; list pickers move with `j`/`k` and close on `Esc`; help, info, and error
-cards close on any key.
-
-`/react` accepts exactly one emoji (one grapheme cluster carrying a non-ASCII scalar, including ZWJ families, skin
-tones, flags, and keycaps) or the NIP-25 `+`/`-` sentinels. Anything else, including prose and non-Latin or accented
-words, is refused with a status-line error so typed text is never published as a reaction. This guard lives in the TUI;
-the `messages react` CLI command stays protocol-faithful.
-
-### Inbound media
-
-Image attachments render inline as cell-exact half-block previews (downscaled with Lanczos3) on any image-capable
-terminal. Half-blocks are ordinary colored cells bounded to the reserved block, so an image never overdraws a neighbor
-or leaves artifacts when scrolling. Each image is downloaded and decoded in the background; its placeholder moves
-through `[img name]` → `[downloading name...]` → `[loading name...]` → the image, or `[name failed: err]`. Terminals
-without image support keep `[img name]`, and non-image attachments show `[file name]`.
-
-The `o` viewer uses the terminal's native pixel protocol when the startup query found one (iTerm2's own protocol in
-iTerm2), falling back to half-blocks; closing it forces a full repaint. Viewer pixels live in a small in-memory pool
-(oldest evicted first). Each image is decrypted into a private `tui-media-cache/` directory under the TUI home, decoded
-into memory, and the decrypted file is removed immediately, so no decrypted media stays at rest. Leftovers from a
-crashed session are swept at startup.
-
-### Screens
-
-- **Group detail** (`g`): members with admin badges and a `(you)` marker, relay hints, name, and description. `j`/`k`
-  move the member selection; `a` searches for someone to add; `A` adds by npub/hex (`groups add-members`); `x` removes
-  the selected member; `P` promotes them to admin; `R` renames the group; `L` opens Leave confirmation for admins and
-  non-admins; `I` opens invites. Leave runs `groups leave`: core demotes an eligible nonlast admin and refuses the last
-  active admin, who must promote another account first. On success the TUI returns to the chat list, though departure
-  can still be settling. `Esc` returns to the main view.
-- **Invites** (`I`): pending invites from `groups invites`. `a` or `Enter` accepts and opens the chat, `d` declines,
-  `Esc` closes. The picker stays open until no invites remain; with none it shows an info card.
-- **User search** (`s`, or `/users [query]`): a one-shot `users search` over your follow graph (default radius `0..1`).
-  In query focus, type and press `Enter`; in list focus, `j`/`k` move, `Enter` shows the profile card (`users show`),
-  `c` starts a new chat (`group create`), `a` adds them to a chat via a group picker and confirm popup, `f` follows and
-  `x` unfollows (rows you already follow are badged `[following]`), `i` returns to the query, and `Esc` goes back. Rows
-  show the name, a shortened npub, and `matched_field · match_quality · radius`. Opened from group detail with `a`, the
-  screen targets that group: `a` skips the chat picker, `Esc` returns to group detail, and the detail reloads after the
-  add.
-- **Message search** (`/search [query]`): searches the chat loaded in the messages pane (`messages timeline search`),
-  capped at 100 hits (a full page shows `100+`; refine the query). Same two-state focus as user search. Matches are
-  newest first, shown as `[HH:MM] sender` plus the text. `Enter` jumps to the message if it is inside the loaded
-  history (one contiguous run ending at the newest, 100 rows per page up to 1000). An older match reports
-  `that message is older than the loaded history; press g to page back first`; page back with `g`/PageUp and search
-  again.
-- **Profile** (`p`): your name, display name, about, picture URL (as text; no avatar is fetched), nip05, lud16, npub,
-  and follows. `Enter` on a field edits and publishes only that field (`profile update --<field>`); `f` follows a user
-  by npub/hex; `x` unfollows the selected follow. There is no nsec export anywhere. `Esc` goes back.
-- **Relay health** (`h`): a redacted, device-local dashboard from `relay-stats` (from the live `wnd` runtime when a
-  socket exists, otherwise a fresh in-process read). It shows connection health, lifecycle counters, cross-relay
-  delivery spread (p50/p99 from fixed-bucket histograms, with `n/a` and `>Nms` overflow), subscription first-event/EOSE
-  timing, and per-relay rows keyed by an opaque device-local index. No relay URLs appear. `r` refreshes, `j`/`k` and
-  PageUp/PageDown scroll, `Esc` goes back.
-- **Diagnostics** (`/diagnostics`): toggles a group MLS/component diagnostics panel between the messages pane and the
-  composer. Hidden by default.
-
-### Slash commands
-
-```text
-/help
-/refresh
-/diagnostics
-/account <npub-or-hex>
-/create-identity
-/login <nsec-or-npub>
-/logout
-/daemon status
-/daemon start
-/daemon stop
-/chat new <name> [member-npub-or-hex ...]
-/chat rename <name>
-/chat describe <description>
-/chat archive
-/chat unarchive
-/chat mute <duration>
-/chat unmute
-/chat archived [on|off]
-/members add <npub-or-hex> [...]
-/members remove <npub-or-hex> [...]
-/members list
-/react [emoji]
-/unreact
-/delete
-/reply <text>
-/retry <event-id>
-/image <file-path> [caption]
-/keys fetch <npub-or-hex>
-/keys rotate
-/name <display-name>
-/profile name <display-name>
-/users [query]
-/search [query]
-/quit
-```
-
-- `/logout` acts on the selected account and is always confirmed, showing the account npub and stating plainly that
-  local data (and, for a local-signing account, the signing key) will be deleted. A local-signing logout is
-  irreversible, so it requires typing the literal word `logout` and pressing `Enter`; an empty or mismatched entry keeps
-  the popup open and `Esc` cancels. A public-only account uses the lighter `y`/`Enter` confirm. If the removed account
-  was the last one, the TUI returns to the login menu.
-- `/login <nsec>` redacts the secret in the composer and pipes it to the child `wn` over stdin, never argv.
-- `/chat archived` shows archived chats so they can be selected and unarchived; `/chat archived off` returns to the
-  visible list. `/members` commands operate on the selected chat.
-- `/react`, `/unreact`, `/delete`, and `/reply <text>` act on the selected message and call the real `messages`
-  commands; they error to the status line when no message is selected (`/delete` also when it is not yours). `/reply`
-  runs `messages send --group <loaded-group> --reply-to <selected-message-id> <text>`. Results fold into the existing
-  timeline row without a reload.
-- `/retry <event-id>` takes an id rather than acting on the selected message, because timeline rows do not carry
-  per-message failed-send state.
-- `/image` uses the real encrypted media path (`wn media upload <group> <file> --send`) with the optional caption as
-  message text.
-- There is no `/sync`; the TUI rejects it because live updates come from subscriptions. Use `wn sync` outside the TUI
-  as a diagnostic/repair escape hatch.
-
 ## JSON output
 
 Pass `--json` for machine-readable output. Success responses wrap command data in a stable result envelope. Errors use
-snake_case `error.code` values and include repair fields when the CLI can name the next command. The TUI and daemon both
+snake_case `error.code` values and include repair fields when the CLI can name the next command. Scripts and the daemon
 depend on the JSON shape, so treat response changes as API changes.
 
 ## Packaging

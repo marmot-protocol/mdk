@@ -63,7 +63,7 @@ Written to be readable in 5 minutes each, shareable as a package.
 
 - **Doc:** [`overview/marmot-app-runtime.md`](./overview/marmot-app-runtime.md)
   - **What it covers:** The implemented first slice of the multi-account `marmot-app` runtime, its shared Nostr relay
-    plane, and the daemon, CLI, TUI boundary.
+    plane, and the daemon and CLI boundary.
 
 - **Doc:** [`overview/thread-messages.md`](./overview/thread-messages.md)
   - **What it covers:** The client contract for inline replies (kind 9) and NIP-22 thread messages (kind 1111): wire

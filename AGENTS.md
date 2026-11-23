@@ -45,7 +45,7 @@ before adding behavior or bindings.
 | App runtime UniFFI bindings | `crates/marmot-uniffi/AGENTS.md` |
 | UniFFI async-export runtime macro | `crates/marmot-uniffi-macros/AGENTS.md` |
 | App runtime C ABI bindings | `crates/marmot-c/AGENTS.md` |
-| CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
+| CLI / daemon surface | `crates/cli/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` (`src/`, `tests/`, `vectors/` have their own) |
 | Container/VM convergence campaigns | `crates/convergence-campaign-runner/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |

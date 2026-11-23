@@ -9,14 +9,12 @@ use crate::{CommandOutput, SettingsCommand, WnError, write_private_file};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CliSettings {
-    theme: String,
     language: String,
 }
 
 impl Default for CliSettings {
     fn default() -> Self {
         Self {
-            theme: "system".to_owned(),
             language: "system".to_owned(),
         }
     }
@@ -29,19 +27,14 @@ pub(crate) fn settings_command(
     let mut settings = read_settings(home)?;
     match command {
         SettingsCommand::Show => {}
-        SettingsCommand::Theme { mode } => {
-            settings.theme = mode;
-            write_settings(home, &settings)?;
-        }
         SettingsCommand::Language { lang } => {
             settings.language = lang;
             write_settings(home, &settings)?;
         }
     }
     Ok(CommandOutput {
-        plain: format!("theme={} language={}", settings.theme, settings.language),
+        plain: format!("language={}", settings.language),
         json: json!({
-            "theme": settings.theme,
             "language": settings.language,
         }),
     })

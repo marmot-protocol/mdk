@@ -16,7 +16,21 @@ versioning through the workspace version in the root `Cargo.toml`.
 - WN Agent refuses `send_agent_activity` and `send_agent_operation_event` with `retired_agent_event` and publishes
   nothing: MDK no longer builds the old shape of kinds 1201 and 1202.
 - `wn messages timeline list` carries a kind-1201 row's parsed `agent_item` in `--json`, and shows an item MDK cannot
-  read, such as the old shape, as `[unreadable agent item]` instead of its payload; `wn tui` does the same.
+  read, such as the old shape, as `[unreadable agent item]` instead of its payload.
+
+### Deprecated
+
+- `wn messages timeline subscribe`, `wn chats subscribe-archived`, `wn groups subscribe-state` and
+  `wn notifications subscribe` served the terminal UI. They still work unchanged and will be removed in a future
+  release.
+
+### Removed
+
+- The terminal UI is gone: `wn tui` no longer exists. This is a breaking change for anyone who used it; every chat,
+  group and message action it offered is a `wn` command. A home the TUI ran in may keep a `tui-media-cache/`
+  directory, which can be deleted.
+- `wn settings theme` is removed. It was meant for the TUI, which never read it. `wn settings show` no longer prints a
+  `theme` field, and a `theme` value in an existing `settings.json` is ignored.
 
 ## [0.19.0] - 2026-11-22
 

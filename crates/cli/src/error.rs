@@ -606,7 +606,7 @@ fn app_error_json(err: &AppError) -> Value {
         }),
         // Terminal for outbound work and not an engine bug: without this arm
         // a removed sender's refusal renders as the catch-all `command_failed`,
-        // which scripts and the TUI cannot distinguish from a transient fault.
+        // which scripts cannot distinguish from a transient fault.
         AppError::GroupRemoved(group_id) => json!({
             "code": "group_removed",
             "message": err.to_string(),

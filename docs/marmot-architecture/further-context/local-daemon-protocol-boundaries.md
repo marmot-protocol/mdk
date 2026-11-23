@@ -15,7 +15,7 @@ inbound messages, but they serve different consumers and are not wire-compatible
 
 | Property | `wnd` CLI daemon protocol | `wn-agent` agent-control protocol |
 | --- | --- | --- |
-| Consumer | MDK's own CLI and TUI | Local agent integrations |
+| Consumer | MDK's own CLI | Local agent integrations |
 | Wire model | Internal `DaemonRequest` variants carrying the CLI command shape | Stable, typed request/response/event DTOs inside `marmot.agent-control.v2` envelopes |
 | Correlation and versioning | No request id or explicit protocol version | Optional correlation id, an explicit protocol label, and request-id idempotency for stream begin |
 | Authorization | Owner-only socket plus same-UID peer checks | Same-UID peer checks by default, or an explicitly configured full-control bearer token |
