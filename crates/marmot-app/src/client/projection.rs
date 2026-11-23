@@ -1420,7 +1420,7 @@ fn parse_image_component(bytes: Option<Vec<u8>>) -> AppGroupImageInput {
 /// collide on the partial unique source index); instead `origin_commit_id`
 /// links the row back to the commit that produced it, so losing-branch fork
 /// recovery can invalidate every row derived from a rolled-back commit (1:N).
-fn build_group_system_projection(
+pub(crate) fn build_group_system_projection(
     group_id: &cgka_traits::types::GroupId,
     epoch: u64,
     actor: Option<&cgka_traits::types::MemberId>,

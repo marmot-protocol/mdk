@@ -1191,7 +1191,8 @@ and chat-list previews expose `deletionSource: DeletionSourceFfi`:
 
 - `Author`: the selected accepted deletion is an author-authorized kind 5.
 - `Admin`: the selected accepted deletion is kind 4891, authorized by authenticated
-  source-state evidence. This includes an admin removing their own message.
+  source-state evidence. An admin's own deletion is an author kind 5 (`Author`); only an older
+  client's self-removal arrives as `Admin`.
 - `Unknown`: no classified deletion evidence is available, including older projected tombstones
   and legacy kind-5 removals of another author's content.
 

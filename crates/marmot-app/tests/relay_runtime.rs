@@ -9601,6 +9601,99 @@ async fn relay_app_runtime_synthesizes_system_row_for_own_invite() {
     );
 }
 
+/// A member removed and invited back joins from the Welcome and never reads
+/// the commit that re-added it, so its timeline records the add itself: the
+/// same row, under the same id, that the adder's timeline holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readded_member_timeline_records_who_added_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_id = home.create_account("alice").unwrap().account_id_hex;
+    let bob_id = home.create_account("bob").unwrap().account_id_hex;
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("readd row", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_id_hex = hex::encode(group_id.as_slice());
+    bob.sync().await.unwrap();
+    let membership = |app: &MarmotApp| {
+        app.group("bob", &group_id_hex)
+            .unwrap()
+            .unwrap()
+            .self_membership
+    };
+    let member_added_rows = |account: &str| {
+        app.timeline_messages_with_query(
+            account,
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .filter_map(|message| {
+            let event = message.group_system?;
+            (event.system_type == "member_added"
+                && event.subject_account_id_hex.as_deref() == Some(bob_id.as_str()))
+            .then_some((message.message_id_hex, event))
+        })
+        .collect::<Vec<_>>()
+    };
+
+    alice.remove_members(&group_id, &["bob"]).await.unwrap();
+    timeout(Duration::from_secs(20), async {
+        while membership(&app) != SelfMembership::Removed {
+            bob.sync().await.unwrap();
+            bob.retry_group_convergence(&group_id).await.unwrap();
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("bob observes his removal: {:?}", membership(&app)));
+    assert!(
+        member_added_rows("bob").is_empty(),
+        "a first join records no add of its own"
+    );
+
+    bob.publish_key_package().await.unwrap();
+    alice.invite_members(&group_id, &["bob"]).await.unwrap();
+    timeout(Duration::from_secs(20), async {
+        while membership(&app) != SelfMembership::Member {
+            bob.sync().await.unwrap();
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("bob rejoins from the Welcome");
+    bob.sync().await.unwrap();
+
+    let bob_rows = member_added_rows("bob");
+    assert_eq!(bob_rows.len(), 1, "one add row for bob; got {bob_rows:?}");
+    let (bob_row_id, event) = &bob_rows[0];
+    assert_eq!(
+        event.actor_account_id_hex.as_deref(),
+        Some(alice_id.as_str())
+    );
+    // Hosts render membership rows only as authenticated group state.
+    assert_eq!(
+        event.provenance,
+        marmot_app::GroupSystemEventProvenance::AuthenticatedGroupState
+    );
+    let alice_rows = member_added_rows("alice");
+    assert!(
+        alice_rows.iter().any(|(id, _)| id == bob_row_id),
+        "bob's row is the adder's row; bob holds {bob_rows:?}, alice holds {alice_rows:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_app_runtime_synthesizes_system_row_for_retention_change() {
     let dir = tempfile::tempdir().unwrap();
@@ -9927,12 +10020,9 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         .await
         .unwrap();
     let deletion = bob.sync().await.unwrap();
-    // An eligible admin removes their own chat through kind 4891 too.
-    assert_eq!(
-        deletion.messages[0].plaintext,
-        r#"{"v":1,"action":"remove"}"#
-    );
-    assert_eq!(deletion.messages[0].kind, 4891);
+    // An admin retracts their own chat as its author, with kind 5.
+    assert_eq!(deletion.messages[0].plaintext, "");
+    assert_eq!(deletion.messages[0].kind, 5);
     assert_eq!(
         tag_value(&deletion.messages[0].tags, "e"),
         Some(target_message_id.as_str())
@@ -18708,7 +18798,8 @@ async fn encrypted_reports_and_individual_dismissals_do_not_create_chat_rows() {
         assert!(row.deleted && row.plaintext.is_empty());
         assert_eq!(row.deletion_source, marmot_app::DeletionSource::Author);
     }
-    // Admin removal is independent of reports and also applies to their own chat.
+    // Admin removal is independent of reports. An admin's own chat is still
+    // retracted as its author, so every client shows the author's deletion.
     let unreported = bob.send(&group, b"unreported").await.unwrap();
     alice.sync().await.unwrap();
     let own = alice.send(&group, b"admin message").await.unwrap();
@@ -18727,25 +18818,36 @@ async fn encrypted_reports_and_individual_dismissals_do_not_create_chat_rows() {
         assert!(!row.deleted);
         assert_eq!(row.deletion_source, marmot_app::DeletionSource::Unknown);
     }
-    for id in [target, &unreported.message_ids[0], &own.message_ids[0]] {
+    for (id, kind) in [
+        (target, 4891),
+        (&unreported.message_ids[0], 4891),
+        (&own.message_ids[0], 5),
+    ] {
         let removed = alice.delete_message(&group, id).await.unwrap();
         assert_eq!(
             app.message_by_id("alice", &group_hex, &removed.message_ids[0])
                 .unwrap()
                 .unwrap()
                 .kind,
-            4891
+            kind
         );
     }
     bob.sync().await.unwrap();
     for account in ["alice", "bob"] {
-        for id in [target, &unreported.message_ids[0], &own.message_ids[0]] {
+        for (id, source) in [
+            (target, marmot_app::DeletionSource::Admin),
+            (
+                &unreported.message_ids[0],
+                marmot_app::DeletionSource::Admin,
+            ),
+            (&own.message_ids[0], marmot_app::DeletionSource::Author),
+        ] {
             let message = runtime
                 .timeline_message(account, &group_hex, id)
                 .unwrap()
                 .unwrap();
             assert!(message.deleted && message.plaintext.is_empty());
-            assert_eq!(message.deletion_source, marmot_app::DeletionSource::Admin);
+            assert_eq!(message.deletion_source, source);
         }
         let reports = runtime
             .content_reports(account, &group, Some(target), None, 10)

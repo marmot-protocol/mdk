@@ -4503,16 +4503,16 @@ fn messages_react_unreact_and_delete_are_typed_app_messages() {
             target_message_id,
         ],
     );
-    // An eligible admin removes their own chat through kind 4891 too.
+    // An admin retracts their own chat as its author, with kind 5.
     let delete_sync =
-        sync_until_message_with_kind(home.path(), test_relay_url(), &bob, 4891, target_message_id);
-    let delete = first_message_with_kind_and_target(&delete_sync, 4891, target_message_id)
+        sync_until_message_with_kind(home.path(), test_relay_url(), &bob, 5, target_message_id);
+    let delete = first_message_with_kind_and_target(&delete_sync, 5, target_message_id)
         .expect("delete message");
-    assert_eq!(delete["plaintext"], r#"{"v":1,"action":"remove"}"#);
+    assert_eq!(delete["plaintext"], "");
     assert_eq!(message_e_tag(delete), Some(target_message_id));
 
-    // A non-admin's own chat still uses author-only kind 5, independently of
-    // the kind-5 reaction retraction above and the admin's removal path.
+    // A non-admin's own chat uses author-only kind 5 too, independently of
+    // the kind-5 reaction retraction above.
     let own = run_json(
         home.path(),
         &[

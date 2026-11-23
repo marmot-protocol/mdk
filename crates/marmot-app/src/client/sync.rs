@@ -4935,7 +4935,7 @@ impl AppClient {
         self.note_own_member_add(event);
         self.invalidate_terminal_pending_sends(event, summary, cleanup)?;
         if let Some(group_id) = self_arrival_group(event) {
-            routes_dirty |= self.restore_joined_self_membership(group_id)?;
+            routes_dirty |= self.restore_joined_self_membership(event, group_id, summary)?;
         }
         Ok(routes_dirty)
     }
@@ -5008,14 +5008,57 @@ impl AppClient {
     }
 
     /// An explicit create/Welcome arrival also clears the departed copy's archive flag.
-    fn restore_joined_self_membership(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
-        let restored = self
-            .app
-            .account_storage(&self.state.label)?
-            .app_storage()
-            .restore_group_self_membership(&hex::encode(group_id.as_slice()))?;
+    ///
+    /// A Welcome back into a chat the account was removed from or left also
+    /// records the other member's add of the account, the row the adder's own
+    /// copy shows. It commits with the restore, so a replayed Welcome, which
+    /// finds the account a member again, adds no second row.
+    fn restore_joined_self_membership(
+        &mut self,
+        event: &cgka_traits::engine::GroupEvent,
+        group_id: &GroupId,
+        summary: &mut SyncSummary,
+    ) -> Result<bool, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let self_id = self.runtime.self_id();
+        let storage = self.app.account_storage(&self.state.label)?;
+        let (restored, readded) =
+            cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+                // A sibling's Welcome is this account's own; the invitation
+                // that re-admitted the sibling's copy names who added it.
+                let adder = match event {
+                    cgka_traits::engine::GroupEvent::GroupJoined {
+                        welcomer: Some(welcomer),
+                        forwarded,
+                        ..
+                    } if *welcomer == self_id => forwarded
+                        .inviter
+                        .map(|inviter| cgka_traits::MemberId::new(inviter.to_vec())),
+                    cgka_traits::engine::GroupEvent::GroupJoined {
+                        welcomer: Some(welcomer),
+                        ..
+                    } => Some(welcomer.clone()),
+                    _ => None,
+                };
+                let readded = match adder {
+                    Some(adder)
+                        if adder != self_id
+                            && matches!(
+                                storage.app_storage().group_self_membership(&group_id_hex)?,
+                                Some(SelfMembership::Removed | SelfMembership::Left)
+                            ) =>
+                    {
+                        self.record_readded_system_row(storage, group_id, &adder, &self_id)?
+                    }
+                    _ => None,
+                };
+                let restored = storage
+                    .app_storage()
+                    .restore_group_self_membership(&group_id_hex)?;
+                Ok::<_, AppError>((restored, readded))
+            })?;
+        summary.projection_updates.extend(readded);
         if restored {
-            let group_id_hex = hex::encode(group_id.as_slice());
             if let Some(group) = self
                 .state
                 .groups
@@ -5027,6 +5070,39 @@ impl AppClient {
             self.finish_membership_restoration(group_id);
         }
         Ok(restored)
+    }
+
+    /// The kind-1210 row for `welcomer` adding this account at the epoch the
+    /// joined copy starts at, the epoch the adder's row names. None when the
+    /// engine holds no record of that epoch.
+    fn record_readded_system_row(
+        &self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        group_id: &GroupId,
+        welcomer: &cgka_traits::MemberId,
+        self_id: &cgka_traits::MemberId,
+    ) -> Result<Option<crate::AppProjectionUpdate>, AppError> {
+        let epoch = match cgka_traits::storage::GroupStorage::get_group(storage, group_id) {
+            Ok(group) if group.local_copy_install_epoch.0 != 0 => group.local_copy_install_epoch,
+            Ok(_) | Err(cgka_traits::StorageError::NotFound) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let recorded_at = unix_now_seconds();
+        let Ok(projection) = super::projection::build_group_system_projection(
+            group_id,
+            epoch.0,
+            Some(welcomer),
+            &cgka_traits::engine::GroupStateChange::MemberAdded {
+                member: self_id.clone(),
+            },
+            recorded_at,
+            None,
+        ) else {
+            return Ok(None);
+        };
+        self.app
+            .record_account_app_event_at(&self.state.label, &projection, recorded_at)
+            .map(Some)
     }
 
     /// Keep the worker's next save consistent with the durable membership write.
