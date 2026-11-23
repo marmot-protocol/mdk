@@ -491,7 +491,9 @@ controls (kind 1202) are accepted in the shape the marmot-app README's agent eve
 takes a JSON array of strings and is repeatable; a malformed tag fails with `invalid_event_tag`. Custom events project as
 standalone rows with their own kind and tags and never fold onto a target message. `messages list` and
 `messages subscribe` accept repeatable `--kind <KIND>` filters and return every kind without one. On the subscribe feed
-a custom event arrives as type `message`; on the timeline feed its change trigger is `CustomEvent`.
+a custom event arrives as type `message`; on the timeline feed its change trigger is `CustomEvent`. Agent items and
+answers are the exception: a 1202 has no timeline row, and a 1201 is one row per item whose first event arrives under the
+`AgentItem` trigger and whose later versions arrive under `MessageEditedOrReprojected`.
 
 **Timeline.** `messages timeline list|search|subscribe` read the materialized timeline, which interleaves messages,
 media, and group system rows. Group lists and subscriptions use canonical conversation order.
