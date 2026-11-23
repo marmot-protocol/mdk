@@ -3411,6 +3411,15 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
 ) -> StorageResult<BTreeSet<String>> {
     let mut ids = BTreeSet::new();
     let mut reply_preview_targets = BTreeSet::new();
+    // An event that is no agent item, arriving with the id of an item shown
+    // from its edits, shows those edits named no item: the row goes.
+    if kind != MARMOT_APP_EVENT_KIND_AGENT_ITEM {
+        ids.extend(agent_item_rows_tx(
+            tx,
+            group_id_hex,
+            [message_id_hex.to_owned()],
+        )?);
+    }
     match kind {
         MARMOT_APP_EVENT_KIND_CHAT
         | MARMOT_APP_EVENT_KIND_AGENT_ITEM

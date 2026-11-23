@@ -117,12 +117,20 @@ pub(super) fn held_agent_item_row<'a>(
 }
 
 /// The edit a held item's row is built from: the earliest readable agent-item
-/// edit naming `target` alone that its sender has not deleted.
+/// edit naming `target` alone that its sender has not deleted. `target` must
+/// be an event id, since an answer to the item names it.
 pub(super) fn held_agent_item_anchor<'a>(
     target: &str,
     edits: impl Iterator<Item = &'a RawAppEvent>,
     deleted: &HashSet<String>,
 ) -> Option<&'a RawAppEvent> {
+    let event_id = target.len() == 64
+        && target
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !event_id {
+        return None;
+    }
     edits
         .filter(|e| {
             e.kind == MARMOT_APP_EVENT_KIND_EDIT
