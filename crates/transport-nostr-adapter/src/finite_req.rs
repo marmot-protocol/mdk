@@ -591,8 +591,10 @@ impl<'a> Collector<'a> {
         match message {
             RelayMessage::Event { event, .. } => self.event(event.into_owned(), text.len()).await,
             RelayMessage::EndOfStoredEvents(_) => {
-                self.more =
-                    serde_json::from_str::<Value>(text).is_ok_and(|frame| says_more(frame.get(2)));
+                // An EOSE the SDK takes but serde_json cannot read whole (a
+                // trailing number out of range) may say `more`: it does.
+                self.more = serde_json::from_str::<Value>(text)
+                    .map_or(true, |frame| says_more(frame.get(2)));
                 Some(FiniteEnd::Eose)
             }
             RelayMessage::Closed { message, .. } => Some(FiniteEnd::Closed(message.into_owned())),
@@ -1180,6 +1182,13 @@ mod tests {
         assert!(reply.more);
         let reply = collect(&filter, limits(1, 1), &[eose(r#",["finish"]"#)]).await;
         assert!(!reply.more);
+        // The SDK takes this EOSE, skipping what follows the hints; its hints
+        // are unread, so they may say `more`.
+        let unread = eose(r#",["finish"],1e400"#);
+        assert!(RelayMessage::from_json(unread.as_str()).is_ok());
+        let reply = collect(&filter, limits(1, 1), &[unread]).await;
+        assert_eq!(reply.end, FiniteEnd::Eose);
+        assert!(reply.more);
         let closed =
             RelayMessage::closed(SubscriptionId::new("~f0"), "rate-limited: slow").as_json();
         let reply = collect(&filter, limits(1, 1), &[closed]).await;

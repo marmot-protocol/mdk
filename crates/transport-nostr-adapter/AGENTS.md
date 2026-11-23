@@ -244,7 +244,8 @@ for reconnect/backoff and relay status mechanics.
   ends `SaturatedWindow`. Certify oldest first, so a cut proves the prefix below the oldest unfetched difference.
   A relay without NIP-77 or a refused comparison proves nothing and ends the call; never read it as an empty set.
 - No NIP-67 hint proves a slice; only counting does. `more` splits, and `finish` is never read: hints reach the sweep
-  only off the wire, where a misread `finish` would skip history while a misread `more` only costs requests. Do not
+  only off the wire, where a misread `finish` would skip history while a misread `more` only costs requests, so an
+  EOSE the SDK takes whose hints cannot be read counts as `more`. Do not
   add a hint-based `SliceProof` until nostr-sdk surfaces hints itself.
 - Every `SdkSweepRelay` REQ is a finite request (`src/finite_req.rs`), which `NostrSdkRelayClient::from_builder`
   installs under the builder's transport; a client built with `new` cannot make one, and its sweep relays read as
