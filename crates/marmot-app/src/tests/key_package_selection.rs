@@ -1914,7 +1914,8 @@ async fn a_tied_relay_list_too_long_to_add_still_reads_the_remembered_outbox() {
 /// A batch reply that stops early can still return the recipient's relay list
 /// or package. When the single-author retry and the later reads then finish
 /// without it, no completed read served it, so it supports no incompatibility
-/// verdict. A retry that serves both again lets the verdict stand.
+/// verdict. A replacement dated past the allowed clock skew confirms nothing
+/// either. A retry that serves both again lets the verdict stand.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn what_only_an_unfinished_batch_returned_decides_nothing() {
     let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
@@ -1983,8 +1984,29 @@ async fn what_only_an_unfinished_batch_returned_decides_nothing() {
         retried.err()
     );
 
-    for unserved in [bob_relay_list, bob_package_id] {
+    let future_replacement = candidate(
+        bob,
+        fresh_key_package_for_account(&app, bob, false).await,
+        "limited",
+        None,
+        unix_now_seconds() + 24 * 60 * 60,
+    );
+    for (unserved, replacement) in [
+        (bob_relay_list, None),
+        (bob_package_id.clone(), None),
+        (bob_package_id, Some(future_replacement)),
+    ] {
         *fetcher.events_only_in_multi_author.lock().unwrap() = [unserved].into();
+        if let Some(replacement) = replacement {
+            fetcher
+                .key_packages_only_in_single_author
+                .lock()
+                .unwrap()
+                .insert(replacement.id.clone());
+            for events in fetcher.events_by_endpoint.lock().unwrap().values_mut() {
+                events.push(replacement.clone());
+            }
+        }
         let unfinished = resolve().await;
         assert!(
             matches!(

@@ -2,7 +2,7 @@
 
 use crate::error::DirectoryError;
 use crate::member_key_packages::key_package_requirements_are_incompatible;
-use std::cmp::Reverse;
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use cgka_engine::key_package::KeyPackageRequirements;
@@ -13,8 +13,8 @@ use super::Directory;
 use super::resources::DirectoryResources;
 use crate::published_records::{
     KeyPackageJournalFence, KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget,
-    key_package_queries, key_package_read_page_full, select_fenced_key_packages,
-    without_revoked_slot_winners,
+    key_package_queries, key_package_read_page_full, newest_publication_first,
+    select_fenced_key_packages, without_revoked_slot_winners,
 };
 use crate::{DirectoryFreshness, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome, DirectoryRelayEventRecord};
@@ -100,8 +100,8 @@ impl<R: DirectoryResources> Directory<R> {
             cached_target,
             wanted,
         } = request;
-        // What completed reads served.
-        let mut served = if primary_complete {
+        // What completed reads served, which only hints need.
+        let mut served = if primary_complete && !hints.is_empty() {
             observed.clone()
         } else {
             Vec::new()
@@ -148,7 +148,7 @@ impl<R: DirectoryResources> Directory<R> {
                 // read was skipped or an earlier read's package went unserved.
                 complete: primary_complete
                     && supplementary.is_empty()
-                    && !unserved_hint(account, &hints, &served),
+                    && !unserved_hint(account, &hints, &served, freshness),
             });
         }
         let mut package_coverage = primary_complete;
@@ -169,13 +169,14 @@ impl<R: DirectoryResources> Directory<R> {
             refreshed = self
                 .journal_and_refresh_fence(account, &outcome.records, fence)
                 .await?;
-            if outcome.complete {
+            if outcome.complete && !hints.is_empty() {
                 served.extend(outcome.records.iter().cloned());
             }
             observed.extend(outcome.records);
             package_coverage &= outcome.complete;
         }
-        let verdict_coverage = package_coverage && !unserved_hint(account, &hints, &served);
+        let verdict_coverage =
+            package_coverage && !unserved_hint(account, &hints, &served, freshness);
         let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));
         // Deletion requests read with the KeyPackages count from the start; a
         // later scoped read that misses one never revives what it covers.
@@ -370,23 +371,30 @@ fn proven_records(
     }
 }
 
-/// Whether some package in `hints` has no completed read serving it or a
-/// publication that replaces it in its slot.
+/// Whether some package in `hints` that selection could admit has no
+/// completed read serving it or a publication that replaces it in its slot.
+/// Confirmation uses selection's freshness boundary and slot order.
 fn unserved_hint(
     account: &str,
     hints: &[DirectoryRelayEventRecord],
     served: &[DirectoryRelayEventRecord],
+    freshness: DirectoryFreshness,
 ) -> bool {
     let package = |record: &&DirectoryRelayEventRecord| {
-        record.event.kind == KIND_MARMOT_KEY_PACKAGE && record.event.pubkey == account
-    };
-    // A newer publication replaces a slot, and the lower event id wins a tie.
-    let rank = |record: &DirectoryRelayEventRecord| {
-        (record.event.created_at, Reverse(record.event.id.clone()))
+        record.event.kind == KIND_MARMOT_KEY_PACKAGE
+            && record.event.pubkey == account
+            && freshness.accepts(record)
     };
     hints.iter().filter(package).any(|hint| {
+        let slot = hint.event.tag_value("d").unwrap_or_default();
         !served.iter().filter(package).any(|record| {
-            record.event.tag_value("d") == hint.event.tag_value("d") && rank(record) >= rank(hint)
+            // A package without a slot is replaced by nothing else.
+            if slot.is_empty() {
+                return record.event.id == hint.event.id;
+            }
+            record.event.tag_value("d") == Some(slot)
+                && newest_publication_first(&record.event, hint.event.created_at, &hint.event.id)
+                    != Ordering::Greater
         })
     })
 }

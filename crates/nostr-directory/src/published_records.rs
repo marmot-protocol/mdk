@@ -303,7 +303,7 @@ impl KeyPackageRecoveryEvidence {
 
 /// Slot order: the later `created_at` first and, on a tie, the lower event id,
 /// which NIP-01 keeps as the slot's current publication.
-fn newest_publication_first(
+pub(crate) fn newest_publication_first(
     event: &NostrTransportEvent,
     created_at: u64,
     event_id: &str,
