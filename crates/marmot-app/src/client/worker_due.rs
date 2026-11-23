@@ -287,9 +287,9 @@ impl AppClient {
     ///
     /// Owed with no time: an invitation decision changed or held, and with a
     /// trusted device group device-group work stored unsent or undone, a
-    /// sibling added to a chat, a device-group event, a small-state edit or
-    /// a pass's failure since the last run. Each retries 15 s after the last
-    /// run.
+    /// sibling added to a chat, a device-group event, a link this device
+    /// made, a small-state edit or a pass's failure since the last run. Each
+    /// retries 15 s after the last run.
     ///
     /// `held` is each live group whose self-update an epoch gap holds, with
     /// the second that hold ends: a held device group sends no heartbeat

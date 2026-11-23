@@ -1800,8 +1800,8 @@ async fn run_app_runtime_account_worker(
     let mut maintenance_paused = client.runtime.maintenance_is_paused();
     // When session maintenance next has work is re-read once after anything
     // that may have moved it: a command that can change state, a receive, a
-    // convergence pass, a recovery turn, a scheduled recovery, post-join or
-    // KeyPackage catch-up, or a maintenance run (mdk#3265).
+    // convergence pass, a recovery turn, a scheduled recovery, post-join,
+    // KeyPackage catch-up or pairing drive, or a maintenance run (mdk#3265).
     let mut maintenance_due_dirty = true;
     let mut maintenance_last_run: Option<MaintenanceRun> = None;
     // The wall second the current plan aims at, for the watchdog.
@@ -3248,6 +3248,9 @@ async fn run_app_runtime_account_worker(
                 }
                 if schedule.due(schedule::Job::DevicePairing, now, now_wall) {
                     // Pairing timers, KeyPackage retries and link settlement.
+                    // A link made here owes device-group maintenance
+                    // (mdk#3628).
+                    maintenance_due_dirty = true;
                     client.drive_device_pairing().await;
                     if client.device_unlinked() {
                         // Nothing more goes out; the next turn stops the worker.
