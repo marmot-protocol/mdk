@@ -1557,6 +1557,64 @@ async fn retention_requirements(
         .unwrap()
 }
 
+/// An outbox can hold a newer relay list than the directory, naming an outbox
+/// the lookup never read for relay lists. Finding only incompatible packages
+/// there does not cover the recipient's current outboxes, so the lookup is
+/// incomplete rather than a verdict about the recipient.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_list_naming_an_unread_outbox_decides_no_incompatibility() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let directory = &by_endpoint["wss://directory.example"];
+        let listed = directory
+            .iter()
+            .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
+            .unwrap()
+            .created_at;
+        let incompatible = directory
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap()
+            .clone();
+        let old_outbox = by_endpoint.get_mut("wss://shared.example").unwrap();
+        old_outbox.retain(|event| event.kind != KIND_NIP65_RELAY_LIST);
+        old_outbox.push(NostrTransportEvent::new_unsigned_at(
+            bob.account_id_hex.clone(),
+            KIND_NIP65_RELAY_LIST,
+            vec![vec![
+                "r".into(),
+                UPDATED_DIRECT_OUTBOX.into(),
+                "write".into(),
+            ]],
+            String::new(),
+            listed + 1,
+        ));
+        let new_outbox = by_endpoint.get_mut(UPDATED_DIRECT_OUTBOX).unwrap();
+        new_outbox.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        new_outbox.push(incompatible);
+    }
+    let result = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await;
+    assert!(
+        matches!(
+            &result,
+            Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
+        ),
+        "{:?}",
+        result.err()
+    );
+    app.close_storage().unwrap();
+}
+
 /// Under Partial, a member whose discovery stalls holds the first pass until
 /// its first-hop cut-off. A prewarmed member whose stale routes then find only
 /// an incompatible package still gets a discovery budget before the deadline,

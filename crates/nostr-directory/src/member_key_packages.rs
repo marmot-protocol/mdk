@@ -1154,6 +1154,30 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .filter(|index| !completed_discovery.contains(index))
             .collect::<HashSet<_>>();
 
+        // The safe outboxes a member's relay list names, less the directory
+        // relays a complete first hop already read.
+        let outboxes = |targets: &[MemberTarget], index: usize| {
+            let mut outboxes = self
+                .relay_plane
+                .retain_safe_discovered_endpoints(
+                    targets[index]
+                        .relay_lists
+                        .nip65
+                        .relays
+                        .iter()
+                        .cloned()
+                        .map(TransportEndpoint)
+                        .collect(),
+                    "member inbox outbox discovery",
+                )
+                .into_iter()
+                .filter(|endpoint| {
+                    !completed_discovery.contains(&index) || !endpoints.contains(endpoint)
+                })
+                .collect::<Vec<_>>();
+            outboxes.sort();
+            outboxes
+        };
         // Group the same safe outbox sets before querying. This remains pure:
         // only commit-purpose resolution persists the observed metadata.
         let mut by_outboxes = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
@@ -1161,28 +1185,17 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             if unfinished.contains(&index) {
                 continue;
             }
-            let outbox_endpoints = self.relay_plane.retain_safe_discovered_endpoints(
-                targets[index]
-                    .relay_lists
-                    .nip65
-                    .relays
-                    .iter()
-                    .cloned()
-                    .map(TransportEndpoint)
-                    .collect(),
-                "member inbox outbox discovery",
-            );
-            let mut outbox_endpoints = outbox_endpoints
-                .into_iter()
-                .filter(|endpoint| {
-                    !completed_discovery.contains(&index) || !endpoints.contains(endpoint)
-                })
-                .collect::<Vec<_>>();
-            outbox_endpoints.sort();
+            let outbox_endpoints = outboxes(targets, index);
             if !outbox_endpoints.is_empty() {
                 by_outboxes.entry(outbox_endpoints).or_default().push(index);
             }
         }
+        let read_outboxes = by_outboxes
+            .iter()
+            .flat_map(|(outboxes, indices)| {
+                indices.iter().map(move |index| (*index, outboxes.clone()))
+            })
+            .collect::<HashMap<_, _>>();
         let attempted_outbox = by_outboxes
             .values()
             .flatten()
@@ -1218,7 +1231,16 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let completed = completed_discovery
             .iter()
             .copied()
-            .filter(|index| !attempted_outbox.contains(index) || completed_outbox.contains(index))
+            .filter(|index| {
+                (!attempted_outbox.contains(index) || completed_outbox.contains(index))
+                    // A newer list found on an outbox can name outboxes this
+                    // lookup never read.
+                    && outboxes(targets, *index).iter().all(|outbox| {
+                        read_outboxes
+                            .get(index)
+                            .is_some_and(|read| read.contains(outbox))
+                    })
+            })
             .collect();
         let errors = needs_discovery
             .into_iter()
