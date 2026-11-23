@@ -1002,14 +1002,13 @@ async fn failed_single_author_refetch_preserves_only_usable_current_batch_packag
             let error = result
                 .err()
                 .expect("unusable batch material must not become a fallback");
-            match batch_case {
-                "absent" | "incompatible" => assert!(matches!(
-                    error,
-                    DirectoryError::DirectoryLookupIncomplete(_)
-                )),
-                "malformed" => assert!(matches!(error, DirectoryError::InvalidKeyPackageEvent(_))),
-                _ => unreachable!(),
-            }
+            // The prewarmed routes yield no usable package, so the lookup
+            // refreshes them. The refresh's single-author reads fail too, so
+            // even the malformed publication decides nothing.
+            assert!(
+                matches!(error, DirectoryError::DirectoryLookupIncomplete(_)),
+                "{batch_case}: {error:?}"
+            );
         }
     }
 }
@@ -1496,6 +1495,187 @@ async fn group_create_refreshes_incompatible_prewarmed_members_on_first_attempt(
         runtime.shutdown().await;
         app.close_storage().unwrap();
     }
+}
+
+/// A recipient who moved outboxes and deleted every package on the old one
+/// leaves the prewarmed routes with nothing to select. The start refreshes
+/// them anyway and succeeds on its first attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_start_refreshes_a_prewarmed_outbox_left_without_packages() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    app.directory()
+        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    advertise_updated_direct_outbox(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
+    for relay in ["wss://directory.example", "wss://shared.example"] {
+        fetcher
+            .events_by_endpoint
+            .lock()
+            .unwrap()
+            .get_mut(relay)
+            .unwrap()
+            .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    }
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let created = runtime
+        .start_direct_conversation_with_options(
+            "alice",
+            &bob.account_id_hex,
+            crate::DirectConversationOptions {
+                disappearing_message_secs: 300,
+            },
+        )
+        .await
+        .unwrap();
+    let groups = app.groups("alice").unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
+    runtime.shutdown().await;
+    app.close_storage().unwrap();
+}
+
+/// Requirements for a new chat with a five-minute message timer.
+async fn retention_requirements(
+    app: &MarmotApp,
+) -> cgka_engine::key_package::KeyPackageRequirements {
+    client_on_app_relay_plane(app, "alice")
+        .await
+        .runtime
+        .create_key_package_requirements(&cgka_traits::engine::CreateGroupRequest {
+            name: "retention".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: vec![
+                crate::AppGroupMessageRetentionComponent::new(300)
+                    .to_app_component_data()
+                    .unwrap(),
+            ],
+            initial_admins: Vec::new(),
+        })
+        .unwrap()
+}
+
+/// Under Partial, a member whose discovery stalls holds the first pass until
+/// its first-hop cut-off. A prewarmed member whose stale routes then find only
+/// an incompatible package still gets a discovery budget before the deadline,
+/// and the same lookup selects it from the outbox it moved to.
+#[test]
+fn partial_refresh_gets_its_own_discovery_budget() {
+    // Pauses the clock, which Tokio allows only on one thread.
+    run_composed_app_runtime_test_on_one_thread("refresh-budget", || async {
+        let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+        app.directory()
+            .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        advertise_updated_direct_outbox(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
+        let requirements = retention_requirements(&app).await;
+        let carol = nostr::prelude::Keys::generate().public_key().to_hex();
+        let stalled = carol.clone();
+        fetcher.never_answer(move |request| {
+            request.queries.iter().any(|query| {
+                query.kind == KIND_NIP65_RELAY_LIST && query.authors.contains(&stalled)
+            })
+        });
+        tokio::time::pause();
+        let resolved = app
+            .directory()
+            .resolve_compatible_member_key_packages(
+                vec![carol.clone(), bob.account_id_hex.clone()],
+                &requirements,
+                nostr_directory::MemberResolutionPurpose::Commit,
+                nostr_directory::MemberResolutionPolicy::Partial,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.member_outcomes,
+            vec![
+                MemberResolutionOutcome {
+                    account_id_hex: carol,
+                    status: MemberResolutionStatus::Incomplete,
+                    selected_device_count: 0,
+                },
+                MemberResolutionOutcome {
+                    account_id_hex: bob.account_id_hex.clone(),
+                    status: MemberResolutionStatus::Selected,
+                    selected_device_count: 1,
+                },
+            ]
+        );
+    });
+}
+
+/// Final selection revalidates lifetimes on the wall clock, so it can lose
+/// the package recovery selected from an incomplete read. What is left then
+/// says nothing about the recipient: the lookup is incomplete, not
+/// incompatible. After a complete read, the newer slot's refusal stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_selection_after_an_incomplete_read_claims_no_incompatibility() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let expires = unix_now_seconds() + 3;
+    let incompatible = fetcher
+        .events_by_endpoint
+        .lock()
+        .unwrap()
+        .get("wss://directory.example")
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .clone();
+    let expiring = candidate(
+        &bob,
+        package_expiring_at(&app, &bob, expires, false),
+        "expiring",
+        None,
+        incompatible.created_at - 1,
+    );
+    // Pass the real MLS lifetime boundary, as a slow journal write after
+    // recovery would. Tokio's paused clock cannot exercise this check.
+    tokio::time::sleep(Duration::from_secs(
+        expires.saturating_sub(unix_now_seconds()) + 1,
+    ))
+    .await;
+    let records = [expiring, incompatible]
+        .into_iter()
+        .map(|event| RelayEventRecord {
+            event,
+            endpoints: vec![],
+        })
+        .collect::<Vec<_>>();
+    for complete in [false, true] {
+        let selected = app.directory().select_recovered_key_packages_for_test(
+            &bob.account_id_hex,
+            records.clone(),
+            &requirements,
+            complete,
+        );
+        if complete {
+            assert!(
+                matches!(
+                    selected,
+                    Err(DirectoryError::KeyPackageRequirements(
+                        cgka_traits::EngineError::MissingRequiredCapabilities { .. }
+                    ))
+                ),
+                "{selected:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    &selected,
+                    Err(DirectoryError::DirectoryLookupIncomplete(account))
+                        if account == &bob.account_id_hex
+                ),
+                "{selected:?}"
+            );
+        }
+    }
+    app.close_storage().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

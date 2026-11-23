@@ -625,7 +625,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 discovery: &discovery_relays,
                 requirements: None,
                 prior_evidence: None,
-                incompatible_evidence: None,
+                last_evidence: None,
                 cached_target,
                 wanted: 1,
             })

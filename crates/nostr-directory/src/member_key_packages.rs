@@ -355,10 +355,20 @@ struct PartialCutOffs {
 
 impl PartialCutOffs {
     fn after(started: tokio::time::Instant) -> Self {
+        Self::within(started, started + MEMBER_RESOLUTION_DEADLINE)
+    }
+
+    /// The cut-offs scaled to the time from `started` to `deadline`, so a
+    /// pass that starts late keeps each step's share of what is left.
+    fn within(started: tokio::time::Instant, deadline: tokio::time::Instant) -> Self {
+        let left = deadline.saturating_duration_since(started);
+        let share = |cut_off: Duration| {
+            started + left.mul_f64(cut_off.div_duration_f64(MEMBER_RESOLUTION_DEADLINE))
+        };
         Self {
-            first_hop: started + PARTIAL_FIRST_HOP_CUT_OFF,
-            outbox_hop: started + PARTIAL_OUTBOX_HOP_CUT_OFF,
-            key_package_batches: started + PARTIAL_KEY_PACKAGE_BATCH_CUT_OFF,
+            first_hop: share(PARTIAL_FIRST_HOP_CUT_OFF),
+            outbox_hop: share(PARTIAL_OUTBOX_HOP_CUT_OFF),
+            key_package_batches: share(PARTIAL_KEY_PACKAGE_BATCH_CUT_OFF),
         }
     }
 }
@@ -374,7 +384,9 @@ struct MemberLookup<'a> {
 struct MemberLookupCoverage {
     relay_lists_completed: HashSet<usize>,
     relay_lists_unfinished: HashSet<usize>,
-    incompatible_evidence: HashMap<usize, KeyPackageRecoveryEvidence>,
+    /// What each member's recovery last judged by, which a route refresh may
+    /// not contradict.
+    evidence: HashMap<usize, KeyPackageRecoveryEvidence>,
 }
 
 /// The stream's next item, or `None` once it ends or `cut_off` passes. An
@@ -673,11 +685,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .await?;
 
         if purpose == MemberResolutionPurpose::Commit {
+            // Prewarmed routes that yield no usable package may be stale.
             let refresh = members
                 .into_iter()
                 .filter(|index| {
                     reused_prewarmed_routes.contains_key(index)
-                        && coverage.incompatible_evidence.contains_key(index)
+                        && matches!(
+                            &outcomes[*index],
+                            Some(Err(error)) if recipient_resolution_status(error).is_some()
+                        )
                 })
                 .collect::<Vec<_>>();
             if !refresh.is_empty() {
@@ -700,14 +716,22 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         outcomes[index] = None;
                     }
                 }
+                // The first pass may have spent the time its Partial cut-offs
+                // set aside for discovery.
+                let refresh_lookup = MemberLookup {
+                    cut_offs: lookup.cut_offs.map(|_| {
+                        PartialCutOffs::within(tokio::time::Instant::now(), lookup.deadline)
+                    }),
+                    ..lookup
+                };
                 let refreshed = self
                     .resolve_member_lookup_pass(
                         &mut targets,
                         &refresh,
                         &refresh,
                         &mut outcomes,
-                        &lookup,
-                        &coverage.incompatible_evidence,
+                        &refresh_lookup,
+                        &coverage.evidence,
                     )
                     .await?;
                 for index in refresh {
@@ -1235,8 +1259,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         })
     }
 
-    // Reuse the original deadline and Partial cut-offs for each pass. The
-    // refresh only clears the affected members' outcomes.
+    // Every pass shares the lookup's deadline, and `lookup` carries the pass's
+    // own Partial cut-offs. The refresh only clears the affected members'
+    // outcomes.
     async fn resolve_member_lookup_pass(
         &self,
         targets: &mut [MemberTarget],
@@ -1277,7 +1302,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     outcomes,
                     lookup,
                     prior_evidence,
-                    &mut coverage.incompatible_evidence,
+                    &mut coverage.evidence,
                 )
                 .await
             }),
@@ -1305,7 +1330,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
         lookup: &MemberLookup<'_>,
         prior_evidence: &HashMap<usize, KeyPackageRecoveryEvidence>,
-        incompatible_evidence: &mut HashMap<usize, KeyPackageRecoveryEvidence>,
+        evidence: &mut HashMap<usize, KeyPackageRecoveryEvidence>,
     ) -> Result<(), DirectoryError> {
         let purpose = lookup.purpose;
         let requirements = lookup.requirements;
@@ -1492,7 +1517,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     let directory = directory.clone();
                     async move {
                         let queries = key_package_queries(vec![target.account_id_hex.clone()]);
-                        let mut observed_incompatibility = None;
+                        let mut last_evidence = None;
                         let prior_evidence = prior_evidence.get(&index);
                         let result = async {
                             let fetched = directory
@@ -1518,7 +1543,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                         discovery: &directory.directory_source_relays(&[]),
                                         requirements,
                                         prior_evidence,
-                                        incompatible_evidence: Some(&mut observed_incompatibility),
+                                        last_evidence: Some(&mut last_evidence),
                                         cached_target: None,
                                         wanted: MAX_KEY_PACKAGES_PER_ACCOUNT,
                                     },
@@ -1530,27 +1555,17 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                     &records.records,
                                 )
                                 .await?;
-                            select_key_packages_with_evidence(
-                                &target.account_id_hex,
-                                &records.records,
-                                records.freshness,
-                                requirements,
-                                prior_evidence,
-                            )?
-                            // Recovery returned: an empty selection is a
-                            // complete negative, while a non-empty one may
-                            // still leave out a device (D12).
-                            .into_value_or_missing(&target.account_id_hex)
+                            records.select(&target.account_id_hex, requirements, prior_evidence)
                         }
                         .await;
-                        (index, result, observed_incompatibility)
+                        (index, result, last_evidence)
                     }
                 });
         let mut fallback_results =
             stream::iter(work).buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY);
-        while let Some((index, result, observed_incompatibility)) = fallback_results.next().await {
-            if let Some(evidence) = observed_incompatibility {
-                incompatible_evidence.insert(index, evidence);
+        while let Some((index, result, last_evidence)) = fallback_results.next().await {
+            if let Some(last_evidence) = last_evidence {
+                evidence.insert(index, last_evidence);
             }
             outcomes[index] = Some(result.and_then(|selected| {
                 self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)

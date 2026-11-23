@@ -10,11 +10,11 @@ use nostr_sdk::prelude::RelayUrl;
 
 use super::Directory;
 use super::resources::DirectoryResources;
-use crate::DirectoryFreshness;
 use crate::published_records::{
     KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, key_package_queries,
     key_package_read_page_full, select_key_packages_with_evidence, without_revoked_slot_winners,
 };
+use crate::{DirectoryFreshness, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome, DirectoryRelayEventRecord};
 
 const RECOVERY_ENDPOINT_LIMIT: usize = 8;
@@ -28,6 +28,34 @@ pub(super) struct RecoveredKeyPackageRecords {
     pub(super) freshness: DirectoryFreshness,
     pub(super) records: Vec<DirectoryRelayEventRecord>,
     pub(super) cache_evidence: Option<KeyPackageRecoveryEvidence>,
+    /// Every KeyPackage read behind `records` completed.
+    pub(super) complete: bool,
+}
+
+impl RecoveredKeyPackageRecords {
+    /// The final selection, which revalidates each package on the wall clock.
+    /// A non-empty selection may still leave out a device (D12). After a
+    /// complete read, an empty one or a refusal is the verdict.
+    pub(super) fn select(
+        &self,
+        account: &str,
+        requirements: Option<&KeyPackageRequirements>,
+        prior_evidence: Option<&KeyPackageRecoveryEvidence>,
+    ) -> Result<Vec<FetchedKeyPackage>, DirectoryError> {
+        match select_key_packages_with_evidence(
+            account,
+            &self.records,
+            self.freshness,
+            requirements,
+            prior_evidence,
+        ) {
+            Ok(selection) if !selection.value.is_empty() => Ok(selection.value),
+            // Losing an incomplete read's package to revalidation says
+            // nothing about what the recipient published.
+            _ if !self.complete => Err(recovery_incomplete(account)),
+            selection => selection?.into_value_or_missing(account),
+        }
+    }
 }
 
 pub(super) struct KeyPackageRecoveryRequest<'a> {
@@ -38,8 +66,9 @@ pub(super) struct KeyPackageRecoveryRequest<'a> {
     pub(super) discovery: &'a [TransportEndpoint],
     pub(super) requirements: Option<&'a KeyPackageRequirements>,
     pub(super) prior_evidence: Option<&'a KeyPackageRecoveryEvidence>,
-    /// Retain the supersession and deletion barriers for a possible refresh.
-    pub(super) incompatible_evidence: Option<&'a mut Option<KeyPackageRecoveryEvidence>>,
+    /// Receives the slot winners and deletions recovery last judged by, so a
+    /// later refresh of the account's routes cannot revive what they bar.
+    pub(super) last_evidence: Option<&'a mut Option<KeyPackageRecoveryEvidence>>,
     /// Public metadata only. Membership callers must never nominate a cache.
     pub(super) cached_target: Option<KeyPackageRecoveryTarget>,
     /// How many of the best-ranked selected candidates to prove undeleted.
@@ -61,27 +90,19 @@ impl<R: DirectoryResources> Directory<R> {
             discovery,
             requirements,
             prior_evidence,
-            incompatible_evidence,
+            mut last_evidence,
             cached_target,
             wanted,
         } = request;
         let freshness = self.directory_freshness();
-        // A full page cannot confirm coverage, but observed incompatibility
-        // can still justify looking for current routes during this lookup.
+        if let Some(last) = last_evidence.as_deref_mut() {
+            *last = Some(
+                without_revoked_slot_winners(account, observed.clone(), &observed, freshness).1,
+            );
+        }
+        // A full page of KeyPackages or deletion requests hides what lies
+        // past it; recovery's targeted reads cannot show that either.
         if key_package_read_page_full(account, &observed) {
-            if let Some(capture) = incompatible_evidence
-                && matches!(
-                    select_key_packages_with_evidence(
-                        account, &observed, freshness, requirements, prior_evidence,
-                    ),
-                    Err(DirectoryError::KeyPackageRequirements(error))
-                        if key_package_requirements_are_incompatible(&error)
-                )
-            {
-                let (_, evidence) =
-                    without_revoked_slot_winners(account, observed.clone(), &observed, freshness);
-                *capture = Some(evidence);
-            }
             return Err(recovery_incomplete(account));
         }
         // What the read found is used even when the read was incomplete:
@@ -99,6 +120,7 @@ impl<R: DirectoryResources> Directory<R> {
                 freshness,
                 records: observed,
                 cache_evidence: None,
+                complete: primary_complete,
             });
         }
         // Primary routes already crossed the maintained 16-endpoint admission
@@ -166,6 +188,9 @@ impl<R: DirectoryResources> Directory<R> {
                         &deletions,
                         freshness,
                     );
+                    if let Some(last) = last_evidence.as_deref_mut() {
+                        *last = Some(evidence.clone());
+                    }
                     // A compatibility refusal describes the recipient's
                     // available packages and requires complete coverage.
                     let selection = match select_key_packages_with_evidence(
@@ -176,16 +201,10 @@ impl<R: DirectoryResources> Directory<R> {
                         prior_evidence,
                     ) {
                         Err(DirectoryError::KeyPackageRequirements(error))
-                            if key_package_requirements_are_incompatible(&error) =>
+                            if !package_coverage
+                                && key_package_requirements_are_incompatible(&error) =>
                         {
-                            if let Some(observed) = incompatible_evidence {
-                                *observed = Some(evidence);
-                            }
-                            return Err(if package_coverage {
-                                DirectoryError::KeyPackageRequirements(error)
-                            } else {
-                                recovery_incomplete(account)
-                            });
+                            return Err(recovery_incomplete(account));
                         }
                         result => result?,
                     };
@@ -211,6 +230,7 @@ impl<R: DirectoryResources> Directory<R> {
                             freshness,
                             records,
                             cache_evidence: Some(evidence),
+                            complete: true,
                         });
                     }
                     targets.insert(selected)
@@ -311,6 +331,8 @@ fn proven_records(
         freshness,
         records,
         cache_evidence: Some(evidence),
+        // Proving a candidate requires complete KeyPackage coverage.
+        complete: true,
     }
 }
 

@@ -7,10 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use cgka_traits::TransportEndpoint;
 use rusqlite::OptionalExtension;
-use transport_nostr::{DirectorySyncPlan, MarmotRelayPlane};
+use transport_nostr::{DirectoryRelayEventRecord, DirectorySyncPlan, MarmotRelayPlane};
 
+use crate::FetchedKeyPackage;
 use crate::cache::{DirectoryCache, DirectorySearchGraphRecord};
 use crate::error::DirectoryError;
+use crate::key_package_recovery::RecoveredKeyPackageRecords;
 use crate::member_key_packages::{
     MemberKeyPackagePrewarmCache, MemberResolutionPurpose, ResolvedMemberKeyPackages,
 };
@@ -233,5 +235,23 @@ impl<R: DirectoryResources> Directory<R> {
 
     pub fn empty_directory_record_for_test(&self, account_id_hex: &str) -> UserDirectoryRecord {
         self.empty_directory_record(account_id_hex)
+    }
+
+    /// The member lookup's final selection over records recovery returned.
+    /// `complete` says whether every KeyPackage read behind them completed.
+    pub fn select_recovered_key_packages_for_test(
+        &self,
+        account_id_hex: &str,
+        records: Vec<DirectoryRelayEventRecord>,
+        requirements: &cgka_engine::key_package::KeyPackageRequirements,
+        complete: bool,
+    ) -> Result<Vec<FetchedKeyPackage>, DirectoryError> {
+        RecoveredKeyPackageRecords {
+            freshness: self.directory_freshness(),
+            records,
+            cache_evidence: None,
+            complete,
+        }
+        .select(account_id_hex, Some(requirements), None)
     }
 }

@@ -994,7 +994,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     discovery: &[],
                     requirements: None,
                     prior_evidence: None,
-                    incompatible_evidence: None,
+                    last_evidence: None,
                     cached_target: None,
                     wanted: 0,
                 })

@@ -247,6 +247,7 @@ pub fn push_unique_strings(values: &mut Vec<String>, candidates: impl IntoIterat
 }
 
 /// Slot and deletion evidence that can reject a target but cannot supply one.
+#[derive(Clone)]
 pub(crate) struct KeyPackageRecoveryEvidence {
     account: String,
     winners: Vec<NostrTransportEvent>,
