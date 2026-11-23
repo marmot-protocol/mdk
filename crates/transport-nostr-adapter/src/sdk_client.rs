@@ -543,7 +543,7 @@ fn acquisition_filter(request: &NostrAcquisitionRequest) -> Filter {
 
 fn project_acquisition(
     endpoint: TransportEndpoint,
-    reply: Option<FiniteReply>,
+    reply: Option<&FiniteReply>,
 ) -> NostrAcquisitionEndpoint {
     let Some(reply) = reply else {
         return NostrAcquisitionEndpoint {
@@ -3088,6 +3088,13 @@ impl NostrSdkRelayClient {
                 deadline,
             ))
             .await;
+        }
+        // A comparison fetches what it finds missing with finite requests, so
+        // a client without them refuses before any relay I/O or cursor write.
+        if self.finite_requests.is_none() {
+            return Err(TransportAdapterError::Subscription(
+                "reconciliation requires a client built with from_builder".to_owned(),
+            ));
         }
         let mut plan = Self::plan_subscription(&subscription)?;
         // Startup compares the gap below the subscription floor; explicit
@@ -5899,8 +5906,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
         if remaining.is_zero() {
             return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Deadline));
         }
-        let fetch_deadline =
-            tokio::time::Instant::now() + remaining.mul_f32(0.9).max(Duration::from_millis(1));
+        let fetch_deadline = deadline - remaining.mul_f32(0.1);
         // Spellings of one relay share its pool entry, and so one request.
         let mut relays = Vec::<&RelayUrl>::new();
         let asked = endpoints
@@ -5938,7 +5944,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
                 .endpoints
                 .into_iter()
                 .zip(asked)
-                .map(|(endpoint, relay)| project_acquisition(endpoint, replies[relay].clone()))
+                .map(|(endpoint, relay)| project_acquisition(endpoint, replies[relay].as_ref()))
                 .collect(),
         })
     }
@@ -6954,6 +6960,37 @@ mod tests {
         assert!(sdk.client.relays().await.is_empty());
     }
 
+    /// A comparison on a client without finite requests could not fetch what
+    /// it finds missing, so it refuses before any relay I/O or cursor write.
+    #[tokio::test]
+    async fn an_opaque_client_cannot_reconcile() {
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let subscription = NostrSubscription::AccountInbox {
+            account_id: MemberId::new(vec![7; 32]),
+            endpoints: vec![TransportEndpoint("wss://ids.example".to_owned())],
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL,
+        };
+        let progress = TestReconciliationProgress::default();
+        *progress.cursor.lock().unwrap() = Some([1; 32]);
+        let result = sdk
+            .reconcile_subscription(
+                subscription,
+                &[],
+                0,
+                1,
+                &progress,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(TransportAdapterError::Subscription(_))
+        ));
+        assert!(sdk.client.relays().await.is_empty());
+        assert_eq!(*progress.cursor.lock().unwrap(), Some([1; 32]));
+    }
+
     /// Two spellings of one relay share its pool entry, so they share one
     /// request and its reply.
     #[tokio::test]
@@ -7026,12 +7063,12 @@ mod tests {
         ] {
             let projected = project_acquisition(
                 endpoint.clone(),
-                Some(reply(FiniteEnd::Closed(reason.to_owned()))),
+                Some(&reply(FiniteEnd::Closed(reason.to_owned()))),
             );
             assert_eq!(projected.end, end, "{reason:?}");
         }
         assert_eq!(
-            project_acquisition(endpoint.clone(), Some(reply(FiniteEnd::Eose))).end,
+            project_acquisition(endpoint.clone(), Some(&reply(FiniteEnd::Eose))).end,
             NostrAcquisitionEnd::RequestPolicySatisfied
         );
         assert_eq!(

@@ -70,8 +70,8 @@ use crate::sweep::hint_tap::{head_verb, second_string};
 pub(crate) const ID_PREFIX: &str = "~f";
 
 /// The largest frame any request takes, whatever the client's message limit:
-/// nostr-sdk's default message ceiling. Each request's queue holds one such
-/// frame past its byte budget.
+/// nostr-sdk's default message ceiling. Each request's queue holds this much
+/// past its byte budget, however low the client's own message limit.
 const MAX_FRAME_BYTES: usize = 5 * 1024 * 1024;
 
 /// Id and signature pairs the client remembers as verified. A duplicate
@@ -417,14 +417,9 @@ impl FiniteRequests {
             "{ID_PREFIX}{:x}",
             self.0.next_id.fetch_add(1, Ordering::Relaxed)
         );
-        let slot = Arc::new(Slot {
-            relay: <&Url>::from(relay.url()).as_str().to_owned(),
-            max_items: limits.max_items,
-            max_frame: self.0.max_frame,
-            queue_bytes: limits.max_event_bytes.saturating_add(self.0.max_frame),
-            state: Mutex::default(),
-            ready: Notify::new(),
-        });
+        let slot = self
+            .0
+            .new_slot(<&Url>::from(relay.url()).as_str().to_owned(), limits);
         let registered = Registered::new(&self.0, id.clone(), slot.clone(), relay.clone());
         let subscription_id = SubscriptionId::new(&id);
         let req = ClientMessage::req(subscription_id.clone(), vec![filter.clone()]);
@@ -816,6 +811,18 @@ fn classify(text: &str) -> Inbound {
 }
 
 impl Registry {
+    /// A new request's slot for `relay`, within `limits`.
+    fn new_slot(&self, relay: String, limits: FiniteLimits) -> Arc<Slot> {
+        Arc::new(Slot {
+            relay,
+            max_items: limits.max_items,
+            max_frame: self.max_frame,
+            queue_bytes: limits.max_event_bytes.saturating_add(MAX_FRAME_BYTES),
+            state: Mutex::default(),
+            ready: Notify::new(),
+        })
+    }
+
     fn slot(&self, id: &str) -> Option<Arc<Slot>> {
         self.requests
             .lock()
@@ -1283,14 +1290,7 @@ mod tests {
     /// A request registered under `id` for [`RELAY`], as `fetch` registers
     /// one before queuing its REQ.
     fn register(registry: &Registry, id: &str, limits: FiniteLimits) -> Arc<Slot> {
-        let slot = Arc::new(Slot {
-            relay: RELAY.to_owned(),
-            max_items: limits.max_items,
-            max_frame: MAX_FRAME_BYTES,
-            queue_bytes: limits.max_event_bytes.saturating_add(MAX_FRAME_BYTES),
-            state: Mutex::default(),
-            ready: Notify::new(),
-        });
+        let slot = registry.new_slot(RELAY.to_owned(), limits);
         registry
             .requests
             .lock()
@@ -1575,6 +1575,31 @@ mod tests {
         }
         assert_eq!(queued(&slot), page.len());
         assert_eq!(slot.lock().end, None);
+    }
+
+    /// A low message limit refuses a frame over it, and leaves a page within
+    /// its event budget the queue's whole room for envelopes.
+    #[test]
+    fn a_low_message_limit_bounds_frames_not_the_queue() {
+        let mut relay_limits = nostr_sdk::relay::RelayLimits::default();
+        relay_limits.messages.max_size = Some(500);
+        let registry = FiniteRequests::for_builder(
+            &crate::network_proxy::nostr_builder(Ok(None)).relay_limits(relay_limits),
+        )
+        .0;
+        let keys = Keys::generate();
+        let page: Vec<Event> = (0..100).map(|n| note(&keys, &n.to_string())).collect();
+        let budget = page.iter().map(|event| event.as_json().len()).sum();
+        let slot = register(&registry, "~f1", limits(page.len(), budget));
+        assert!(registry.sending(RELAY, 1, &req("~f1")));
+        for event in &page {
+            let frame = RelayMessage::event(SubscriptionId::new("~f1"), event.clone()).as_json();
+            registry.received(1, format!("{frame}  "));
+        }
+        assert_eq!(queued(&slot), page.len());
+        assert_eq!(slot.lock().end, None);
+        registry.received(1, format!(r#"["EVENT","~f1","{}"]"#, "x".repeat(500)));
+        assert_eq!(slot.lock().end, Some(FiniteEnd::InvalidMessage));
     }
 
     /// A client connected to `url` with finite requests installed, as
