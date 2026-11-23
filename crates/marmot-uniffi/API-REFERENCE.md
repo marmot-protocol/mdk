@@ -1763,7 +1763,7 @@ Delete a saved composer draft. This is a no-op when no draft exists.
 pub async fn prewarm_group_member_key_packages( &self, account_ref: String, member_refs: Vec<String>, ) -> Result<MemberKeyPackagePrewarmSummaryFfi, MarmotKitError>
 ```
 
-Resolve the current composition roster before Create is tapped. The result is aggregate-only; no package is reserved or consumed, and the later create call revalidates cached packages before MLS mutation.
+Resolve the current composition roster before Create is tapped. The result is aggregate-only; no package is reserved or consumed, and the later create call discovers routes and fetches packages again.
 
 [Source](src/commands/group.rs#L422)
 

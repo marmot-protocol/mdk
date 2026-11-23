@@ -10,7 +10,7 @@
 //! requests.
 
 use crate::error::{DirectoryError, MissingKeyPackageReason};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cgka_engine::key_package::key_package_metadata;
@@ -1124,8 +1124,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .copied()
             .filter(|index| {
                 let target = &targets[*index];
-                // On a timestamp tie the remembered list keeps its routes, but
-                // the relays may serve a tied list naming other outboxes.
+                let listed = &target.relay_lists.nip65;
                 let served = fresh_relay_list_status_from_records(
                     &target.account_id_hex,
                     target.relay_records.clone(),
@@ -1133,19 +1132,20 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 )
                 .value
                 .nip65;
-                let tied = (served.created_at == target.relay_lists.nip65.created_at)
-                    .then_some(served.relays);
+                // On a timestamp tie the remembered list keeps its routes, and
+                // the cache cannot tell which tied list is current.
+                let conflicting_tie = served.created_at == listed.created_at
+                    && served.relays.iter().collect::<BTreeSet<_>>()
+                        != listed.relays.iter().collect::<BTreeSet<_>>();
                 (!attempted_outbox.contains(index) || completed_outbox.contains(index))
-                    // Every outbox a current list names must have been read: a
-                    // newer list found on an outbox can name others too.
-                    && std::iter::once(&target.relay_lists.nip65.relays)
-                        .chain(tied.as_ref())
-                        .flat_map(|relays| outboxes(*index, relays))
-                        .all(|outbox| {
-                            read_outboxes
-                                .get(index)
-                                .is_some_and(|read| read.contains(&outbox))
-                        })
+                    && !conflicting_tie
+                    // A newer list found on an outbox can name outboxes this
+                    // lookup never read.
+                    && outboxes(*index, &listed.relays).iter().all(|outbox| {
+                        read_outboxes
+                            .get(index)
+                            .is_some_and(|read| read.contains(outbox))
+                    })
             })
             .collect();
         let errors = needs_discovery

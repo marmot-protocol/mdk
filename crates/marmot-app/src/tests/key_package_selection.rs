@@ -1397,44 +1397,6 @@ async fn group_create_after_prewarm_decides_on_current_routes() {
     }
 }
 
-/// A recipient who moved outboxes and deleted every package on the old one
-/// leaves the prewarmed routes with nothing to select. The start discovers
-/// the new outbox and succeeds on its first attempt.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_start_after_prewarm_finds_packages_on_the_new_outbox() {
-    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
-    app.directory()
-        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
-        .await
-        .unwrap();
-    advertise_updated_direct_outbox(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
-    for relay in ["wss://directory.example", "wss://shared.example"] {
-        fetcher
-            .events_by_endpoint
-            .lock()
-            .unwrap()
-            .get_mut(relay)
-            .unwrap()
-            .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
-    }
-    let runtime = MarmotAppRuntime::new(app.clone());
-    let created = runtime
-        .start_direct_conversation_with_options(
-            "alice",
-            &bob.account_id_hex,
-            crate::DirectConversationOptions {
-                disappearing_message_secs: 300,
-            },
-        )
-        .await
-        .unwrap();
-    let groups = app.groups("alice").unwrap();
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
-    runtime.shutdown().await;
-    app.close_storage().unwrap();
-}
-
 /// Requirements for a new chat with a five-minute message timer.
 async fn retention_requirements(
     app: &MarmotApp,

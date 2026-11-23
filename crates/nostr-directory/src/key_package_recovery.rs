@@ -97,7 +97,9 @@ impl<R: DirectoryResources> Directory<R> {
                 freshness,
                 records: observed,
                 cache_evidence: None,
-                complete: primary_complete,
+                // The supplementary reads were skipped, so losing this
+                // package decides nothing.
+                complete: false,
             });
         }
         // Primary routes already crossed the maintained 16-endpoint admission
