@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run Tamarin batch proofs with a narrow crash-only retry for GHC RTS <<loop>>."""
 
-import argparse
+from __future__ import annotations
+
 import re
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import sys
 # single-retry workaround once CI upgrades to a GHC 9.12.5+ release binary.
 MAX_ATTEMPTS = 2
 SUMMARY_MARKER = "summary of summaries:"
-SUMMARY_LINE_RE = re.compile(r"^summary of summaries:", re.M)
+SUMMARY_LINE_RE = re.compile("^" + re.escape(SUMMARY_MARKER), re.M)
 LOOP_CRASH_RE = re.compile(r"^tamarin-prover: <<loop>>$", re.M)
 
 
@@ -26,20 +27,13 @@ def is_ghc_loop_crash(status: int | None, output: str) -> bool:
     )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tamarin", default="tamarin-prover")
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--derivcheck-timeout", default="60")
-    args = parser.parse_args()
-
-    command = [
-        args.tamarin,
-        args.model,
-        "--prove",
-        "--quit-on-warning",
-        f"--derivcheck-timeout={args.derivcheck_timeout}",
-    ]
+def main(argv: list[str] | None = None) -> int:
+    command = list(sys.argv[1:] if argv is None else argv)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        print("usage: prove_tamarin.py -- <tamarin-command> [args...]", file=sys.stderr)
+        return 2
 
     status = 0
     output = ""
@@ -54,6 +48,7 @@ def main() -> int:
         status = completed.returncode
         output = completed.stdout
         if attempt < MAX_ATTEMPTS and is_ghc_loop_crash(status, output):
+            sys.stderr.write(output)
             print(
                 "warning: tamarin-prover aborted with GHC RTS <<loop>> before summary; "
                 f"retrying once (attempt {attempt}/{MAX_ATTEMPTS}, mdk#3033, tamarin-prover#973, GHC#26324)",

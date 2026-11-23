@@ -76,20 +76,23 @@ def check(tamarin, model, folder, name, expected, timeout):
         "--derivcheck-timeout=60",
     ]
     start = time.monotonic()
+    deadline = start + timeout
     timed_out = False
     termination = None
     status = None
     text = ""
+    attempt = 0
     log = folder / "prover.log"
     for attempt in range(1, MAX_ATTEMPTS + 1):
         timed_out = False
         termination = None
+        remaining = max(0.0, deadline - time.monotonic())
         with log.open("w") as output:
             process = subprocess.Popen(
                 command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True
             )
             try:
-                status = process.wait(timeout=timeout)
+                status = process.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 termination = "SIGTERM"
@@ -112,8 +115,13 @@ def check(tamarin, model, folder, name, expected, timeout):
                         status = None
         text = log.read_text(errors="replace")
         # Narrow crash-only retry for GHC 9.6.7 RTS <<loop>> abort before any summary
-        # (mdk#3033, tamarin-prover#973, GHC#26324).
-        if not timed_out and attempt < MAX_ATTEMPTS and is_ghc_loop_crash(status, text):
+        # (mdk#3033, tamarin-prover#973, GHC#26324), bounded by the check deadline.
+        if (
+            not timed_out
+            and attempt < MAX_ATTEMPTS
+            and is_ghc_loop_crash(status, text)
+            and deadline - time.monotonic() > 0
+        ):
             print(
                 "warning: tamarin-prover aborted with GHC RTS <<loop>> before summary; "
                 f"retrying once (attempt {attempt}/{MAX_ATTEMPTS}, mdk#3033, tamarin-prover#973, GHC#26324)",
@@ -136,6 +144,7 @@ def check(tamarin, model, folder, name, expected, timeout):
         passed = passed and outcomes.keys() == expected.keys()
     result = {
         "command": command,
+        "attempts": attempt,
         "exit": status,
         "timed_out": timed_out,
         "termination": termination,
