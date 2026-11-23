@@ -7707,7 +7707,7 @@ impl AccountManager {
             .fence_generated_teardown(self, &account.account_id_hex)
             .await;
         let _preparation = self.setup.fence_generated_removal(&fence).await;
-        let (_report_fence, _) = self.fence_moderation_reports(&account.label).await;
+        let _report_fence = self.app.fence_report_work(&account.label).await;
         let _worker_transaction = self.worker_transactions.lock().await;
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve_original(&account)?;
@@ -7735,9 +7735,9 @@ impl AccountManager {
     ///
     /// Dropping the in-memory caches is harmless when the directory is kept: a
     /// later sign-in simply re-warms them from the unchanged on-disk database.
-    /// Fence `account_ref`'s moderation reports for a teardown. An unknown
-    /// account has none; the teardown reports that itself.
-    async fn fence_moderation_reports(
+    /// Fence and purge reports for sign-out, not account detachment. An
+    /// unknown account has none; the teardown reports that itself.
+    async fn fence_sign_out_reports(
         &self,
         account_ref: &str,
     ) -> (
@@ -7791,7 +7791,7 @@ impl AccountManager {
         // before the global lock: the purge may open account storage. A failed
         // purge does not stop the sign-out, but it is reported: reports left on
         // disk would be retried at the next sign-in.
-        let (_report_fence, report_purge) = self.fence_moderation_reports(account_ref).await;
+        let (_report_fence, report_purge) = self.fence_sign_out_reports(account_ref).await;
         let _generated_setup_fence = self.fence_generated_setup(account_ref).await?;
         let lock_wait = self
             .shared

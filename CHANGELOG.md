@@ -36,8 +36,9 @@
   and detached payloads without blocking unrelated accounts on individual cleanup failures. Restored
   public accounts retain database-credential cleanup intent for a later wipe and explicit NIP-46 cleanup.
   Completion is logical after journal removal; a failed directory sync does not guarantee power-loss durability.
-- Refused busy-account removal keeps queued moderation reports. Lower-level removal validates the
-  accounts container before moving the account; inventory reads follow relocated legacy KeyPackage records.
+- Refused busy-account removal and legacy reset keep queued moderation reports, including delegated
+  setup recovery. Lower-level removal validates the accounts container before moving the account;
+  inventory reads follow relocated legacy KeyPackage records.
 
 ## 0.19.0 - 2026-11-22
 

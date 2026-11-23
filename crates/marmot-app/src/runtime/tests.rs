@@ -3632,17 +3632,13 @@ async fn cancelled_startup_is_reaped() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn removal_refuses_direct_sync() {
+async fn stage_pending_report(
+    app: &MarmotApp,
+    label: &str,
+) -> storage_sqlite::ModerationReportOutboxEntry {
     use storage_sqlite::{ModerationReportOutboxEntry, ModerationReportOutboxOutcome};
 
-    let dir = tempfile::tempdir().unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://setup.example")
-        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    let home = app.account_home();
-    let account = home.create_account("alice").unwrap();
-    home.create_account("bob").unwrap();
-    let signer = home.load_signing_keys("alice").unwrap();
+    let signer = app.account_home().load_signing_keys(label).unwrap();
     let recipient = nostr::prelude::Keys::generate().public_key();
     let rumor = crate::moderation_reports::moderation_report_rumor(
         signer.public_key(),
@@ -3665,11 +3661,23 @@ async fn removal_refuses_direct_sync() {
         created_at_ms: u64::try_from(crate::notifications::unix_now_ms()).unwrap(),
         attempts: 1,
     };
-    app.account_storage("alice")
+    app.account_storage(label)
         .unwrap()
         .app_storage()
         .stage_moderation_report(&report)
         .unwrap();
+    report
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removal_refuses_direct_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://setup.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let home = app.account_home();
+    let account = home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let report = stage_pending_report(&app, "alice").await;
     let runtime = app.runtime();
     let (reached, proceed) = install_local_open_gate(&app, "alice");
     let sync = tokio::spawn({
