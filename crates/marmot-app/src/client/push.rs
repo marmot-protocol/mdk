@@ -1234,11 +1234,11 @@ impl AppClient {
 
 /// Whether sending this encoded event wakes the group's members. A chat
 /// message, a poll or a thread message does, except the agent's remarks
-/// during a turn (D-078). An agent item, or a new version of one, does only
-/// while it needs a person or when its turn failed (D-024). Nothing else does.
-/// Read from the event itself, so a send and its resumption after a restart
-/// decide alike.
-pub(crate) fn event_wakes_members(kind: u64, tags: &[Vec<String>]) -> bool {
+/// during a turn (D-078) and its words in a thread under one of its own items
+/// (D-122). An agent item, or a new version of one, does only while it needs a
+/// person or when its turn failed (D-024). Nothing else does. Read from the
+/// event itself, so a send and its resumption after a restart decide alike.
+pub(crate) fn event_wakes_members(kind: u64, tags: &[Vec<String>], sender_hex: &str) -> bool {
     use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
     use cgka_traits::app_event::{
         MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_EDIT,
@@ -1250,6 +1250,9 @@ pub(crate) fn event_wakes_members(kind: u64, tags: &[Vec<String>]) -> bool {
         MARMOT_APP_EVENT_KIND_AGENT_ITEM | MARMOT_APP_EVENT_KIND_EDIT => {
             cgka_traits::AgentItem::from_tags(tags).is_ok_and(|item| item.alerts())
         }
-        _ => cgka_traits::thread_message_parent(kind, tags).is_some(),
+        _ => {
+            cgka_traits::thread_message_parent(kind, tags).is_some()
+                && !cgka_traits::is_agent_own_thread_comment(kind, tags, sender_hex)
+        }
     }
 }

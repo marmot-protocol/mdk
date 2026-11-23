@@ -381,8 +381,9 @@ async fn push_batch_scaling() {
 /// The sent event decides the wake, the same on a send and on its resumption
 /// after a restart. A thread message wakes members, also when sent through the
 /// custom-event path as White Noise Linux does; other custom kinds do not. The agent's remarks during a turn wake nobody, however they
-/// are sent, and an agent item or a new version of one wakes members only
-/// while it needs a person or when its turn failed.
+/// are sent, nor do its words in a thread under its own item. An agent item or
+/// a new version of one wakes members only while it needs a person or when its
+/// turn failed.
 #[test]
 fn the_sent_event_decides_whether_members_wake() {
     use crate::client::push::event_wakes_members;
@@ -396,7 +397,7 @@ fn the_sent_event_decides_whether_members_wake() {
     };
     let wakes = |intent: AppMessageIntent| {
         let event = build_inner_event(&intent, &"aa".repeat(32), 1).unwrap();
-        event_wakes_members(event.kind, &event.tags)
+        event_wakes_members(event.kind, &event.tags, &event.pubkey)
     };
     let target = "bb".repeat(32);
     let commentary = vec![tag(&["phase", "commentary"])];
@@ -463,6 +464,23 @@ fn the_sent_event_decides_whether_members_wake() {
     }
     assert!(!event_wakes_members(
         MARMOT_APP_EVENT_KIND_EDIT,
-        &[tag(&["e", &target])]
+        &[tag(&["e", &target])],
+        &"aa".repeat(32),
     ));
+
+    // The agent's words in a thread under its own item wake nobody; a
+    // comment under someone else's item does.
+    let comment_under = |author: &str| AppMessageIntent::Custom {
+        kind: cgka_traits::NIP22_COMMENT_KIND,
+        tags: vec![
+            tag(&["E", &target, "", author]),
+            tag(&["K", "1201"]),
+            tag(&["P", author]),
+            tag(&["e", &target, "", author]),
+            tag(&["k", "1201"]),
+        ],
+        content: "Found the fixtures".to_owned(),
+    };
+    assert!(!wakes(comment_under(&"aa".repeat(32))));
+    assert!(wakes(comment_under(&"cc".repeat(32))));
 }

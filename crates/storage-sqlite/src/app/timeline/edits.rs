@@ -1,6 +1,16 @@
 //! One accepted-edit resolver for incremental projection, repair and history.
 use super::*;
 use crate::SqliteAppStorage;
+use cgka_traits::agent_events::AGENT_ITEM_THREAD_ROOT_TAG;
+
+/// NIP-22's tags that place an agent item in a thread: `E`/`K`/`P` name the
+/// root, `e`/`k`/`p` the immediate parent (marmot-agents D-121).
+const AGENT_ITEM_THREAD_TAGS: [&str; 6] = ["E", "K", "P", "e", "k", "p"];
+
+fn is_agent_item_thread_tag(tag: &[String]) -> bool {
+    tag.first()
+        .is_some_and(|name| AGENT_ITEM_THREAD_TAGS.contains(&name.as_str()))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineEditSummary {
@@ -157,11 +167,30 @@ pub(super) fn apply(row: &mut TimelineRow, versions: &[AcceptedEdit]) {
     if let Some((_, tags)) = &latest.agent_item {
         // A later version of an agent item replaces its content and tags. It
         // is the item changing state, not a correction, so the row is not
-        // marked edited.
-        row.tags.clone_from(tags);
-        row.reply_to_message_id_hex = cgka_traits::AgentItem::from_tags(tags)
-            .ok()
-            .and_then(|item| item.started_by_message_id_hex);
+        // marked edited. An item never moves: one in a thread keeps the thread
+        // tags of its first event, since an edit cannot carry the parent's
+        // `e`, and one outside a thread cannot join one through an edit's `E`.
+        let in_thread = cgka_traits::thread_root_tag(&row.tags).is_some();
+        let placement = row
+            .tags
+            .iter()
+            .filter(|tag| in_thread && is_agent_item_thread_tag(tag))
+            .cloned()
+            .collect::<Vec<_>>();
+        row.tags = tags
+            .iter()
+            .filter(|tag| {
+                if in_thread {
+                    !is_agent_item_thread_tag(tag)
+                } else {
+                    tag.first()
+                        .is_none_or(|name| name != AGENT_ITEM_THREAD_ROOT_TAG)
+                }
+            })
+            .cloned()
+            .chain(placement)
+            .collect();
+        row.reply_to_message_id_hex = cgka_traits::agent_item_reply_target(&row.tags);
         return;
     }
     row.edit = Some(TimelineEditSummary {

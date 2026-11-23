@@ -44,7 +44,7 @@ what lives here is in [`README.md`](README.md#what-lives-in-here).
 | `src/app_event.rs` | Typed `MarmotAppEvent` application-message event and sender-validation errors. |
 | `src/capabilities.rs` | Capability/feature negotiation types and requirement levels. |
 | `src/group_context.rs` | `GroupContextSnapshot` group-context view. |
-| `src/agent_events.rs` | Agent items (kind 1201) and answers and controls (kind 1202): tag names, the 64 KB limit, the parsers MDK interprets (version, state, type, `seq`, `settles`, agent, action) and the alert rule. Every other tag passes through unread. |
+| `src/agent_events.rs` | Agent items (kind 1201) and answers and controls (kind 1202): tag names, the 64 KB limit, the parsers MDK interprets (version, state, type, `seq`, `settles`, agent, action), an item's NIP-22 thread tags, and the alert rule with the agent's silent thread comments. Every other tag passes through unread. |
 | `src/agent_text_stream.rs` | The retired agent text stream component (`0x8006`): state codec, validation, role bits, features and capabilities, kept so existing groups that require it keep working. |
 | `src/convergence_pass.rs` | Durable state for one bounded convergence pass. |
 | `src/maintenance.rs` | Durable maintenance and publication-recovery value types. |

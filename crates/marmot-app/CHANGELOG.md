@@ -29,6 +29,12 @@
 - `TimelineMessageRecord::agent_item` holds the parsed latest version of an agent item, and `timeline_order_seq` the
   first event's `seq`, which orders a turn's rows within one second. `AgentItem`, `AgentItemState`, `AgentRequest`
   and the agent kind constants are re-exported.
+- Agent items join threads for subagents (marmot-agents D-121): a kind 1201 may carry NIP-22's `E`/`K`/`P` (root)
+  and `e`/`k`/`p` (parent), and `submit_custom_event` and `send_custom_event` take its `e` only beside an `E`. An edit
+  of an item still carries no `e` but its target's. A thread message answering an item in a thread names that item's
+  root and the item as its parent.
+- The agent's own words in a thread under one of its items, a kind 1111 with an `E` whose `K` is 1201 and whose `P`
+  is its author, neither notify nor wake members (D-122). Items in a thread keep their own alert rule.
 
 ### Fixed
 

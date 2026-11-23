@@ -243,8 +243,9 @@ pub struct TimelineReplyPreviewFfi {
 }
 
 /// A row's place in a NIP-22 thread: set for every thread message (kind
-/// 1111), and for a chat, sticker or poll that joined a thread. A client
-/// without a thread view ignores it and quotes `reply_to_message_id_hex`.
+/// 1111), and for a chat, sticker, poll or agent item (kind 1201) that joined
+/// a thread. A client without a thread view ignores it and quotes
+/// `reply_to_message_id_hex`.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct TimelineThreadRefFfi {
     /// The message the thread hangs from.
@@ -483,7 +484,8 @@ pub struct TimelineMessageRecordFfi {
     /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
     /// What a client without a thread view quotes: the inline-reply target,
-    /// or a thread message's parent.
+    /// a thread message's parent, or an agent item's `started_by`, else its
+    /// thread parent.
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreviewFfi>,
     /// Where this row sits in a NIP-22 thread; `None` outside threads.

@@ -12,6 +12,9 @@
 
 - Kind-1009 edits apply to kind-1201 agent items: the highest `v` replaces the row's content and tags, an older
   version is ignored, and the row is not marked edited. Agent items have no edit history.
+- A kind-1201 agent item with an `E` tag is placed in that thread, under the parent its `e` names or else the root,
+  and `reply_to_message_id_hex` is that parent unless the item names a `started_by`. An edit keeps the thread tags
+  of the item's first event, whatever thread tags it carries.
 
 ## 0.19.0 - 2026-11-22
 

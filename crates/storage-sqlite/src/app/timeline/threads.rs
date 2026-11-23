@@ -10,7 +10,10 @@ use crate::SqliteResultExt;
 use crate::base::connection::CachedSql;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::storage::StorageResult;
-use cgka_traits::{MARMOT_APP_EVENT_KIND_POLL, NIP22_COMMENT_KIND, thread_root_tag};
+use cgka_traits::{
+    MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_POLL, NIP22_COMMENT_KIND,
+    agent_item_thread_parent, thread_root_tag,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 
@@ -44,7 +47,9 @@ pub(super) fn thread_ref(
     // Rule out rows that cannot be in a thread before reading stored tags.
     let may_join = match row.kind {
         NIP22_COMMENT_KIND => row.reply_to_message_id_hex.is_some(),
-        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL => true,
+        MARMOT_APP_EVENT_KIND_CHAT
+        | MARMOT_APP_EVENT_KIND_POLL
+        | MARMOT_APP_EVENT_KIND_AGENT_ITEM => true,
         _ => false,
     };
     if !may_join {
@@ -80,7 +85,9 @@ struct OwnThread<'a> {
 
 /// What a row's own fields say about its thread: a thread message always has
 /// a parent; a chat, sticker or poll joins a thread only by naming its root
-/// with `E`, and answers its reply target or else that root.
+/// with `E`, and answers its reply target or else that root. An agent item
+/// joins with `E` too, and answers the parent its `e` names or else the root
+/// (marmot-agents D-121); its reply target is a turn's starting message.
 fn own_thread<'a>(
     kind: u64,
     tags: &'a [Vec<String>],
@@ -99,6 +106,10 @@ fn own_thread<'a>(
                 parent: reply_to_message_id_hex.unwrap_or(root),
             })
         }
+        MARMOT_APP_EVENT_KIND_AGENT_ITEM => Some(OwnThread {
+            named_root,
+            parent: agent_item_thread_parent(tags)?,
+        }),
         _ => None,
     }
 }

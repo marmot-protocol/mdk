@@ -11,6 +11,13 @@
 //! named by `started_by`, not `e`, so that an edit of the item, which carries
 //! every tag of the item, still has exactly one `e` tag naming its target.
 //!
+//! An item in a subagent's thread (marmot-agents D-121) carries NIP-22's tags
+//! as NIP-22 defines them: `E`/`K`/`P` name the thread root, the top-level
+//! subagent's `task` item, and `e`/`k`/`p` the immediate parent. Only a first
+//! event carries the parent's `e`. An edit carries no `e` but its target's and
+//! may repeat `E`/`K`/`P`; MDK keeps an item in the thread its first event
+//! names, since an item never moves.
+//!
 //! The parsers here are what MDK interprets: the version, state, title,
 //! harness, item id, `seq`, the item type from `fields`, session, turn,
 //! `started_by` and `settles` of an item; the agent, item and action of a
@@ -77,7 +84,7 @@ pub enum AgentEventError {
     Repeated(&'static str),
     #[error("agent event has an invalid {0} tag")]
     Invalid(&'static str),
-    #[error("an agent item names an edit target; use started_by for the turn's message")]
+    #[error("an agent item names an `e` outside a thread; use started_by for the turn's message")]
     EventReference,
     #[error("agent event is larger than {AGENT_EVENT_MAX_BYTES} bytes")]
     TooLarge,
@@ -270,16 +277,63 @@ pub fn is_agent_commentary(tags: &[Vec<String>]) -> bool {
     })
 }
 
-/// Check an agent item a program sends: readable, with no `e` tag (an edit's
-/// target is MDK's to place).
+/// On an item in a thread: the thread root, the top-level subagent's `task`
+/// item (NIP-22's `E`).
+pub const AGENT_ITEM_THREAD_ROOT_TAG: &str = "E";
+
+/// The parent of an agent item in a thread: the item its `e` tag names, or
+/// else the thread root its `E` names. `None` for an item outside a thread.
+pub fn agent_item_thread_parent(tags: &[Vec<String>]) -> Option<&str> {
+    let root = crate::thread_root_tag(tags)?;
+    Some(values(tags, AGENT_REQUEST_ITEM_TAG).next().unwrap_or(root))
+}
+
+/// What a client without a thread view quotes above an agent item: the chat
+/// message that started its turn, else the parent of an item in a thread. An
+/// unreadable item names nothing.
+pub fn agent_item_reply_target(tags: &[Vec<String>]) -> Option<String> {
+    let item = AgentItem::from_tags(tags).ok()?;
+    item.started_by_message_id_hex
+        .or_else(|| agent_item_thread_parent(tags).map(str::to_owned))
+}
+
+/// Check an agent item's first event a program sends: readable, with at most
+/// one thread root `E` naming an event, and with an `e` tag only as the parent
+/// of an item in a thread, once, beside that `E`. Any other `e` would read as
+/// an edit's target, which is MDK's to place.
 pub fn validate_agent_item_tags(tags: &[Vec<String>]) -> Result<AgentItem, AgentEventError> {
-    if tags.iter().any(|tag| {
-        tag.first()
-            .is_some_and(|name| name == AGENT_REQUEST_ITEM_TAG)
-    }) {
+    let root = single(tags, AGENT_ITEM_THREAD_ROOT_TAG)?
+        .map(|root| event_id(root, AGENT_ITEM_THREAD_ROOT_TAG))
+        .transpose()?;
+    if let Some(parent) = single(tags, AGENT_REQUEST_ITEM_TAG)? {
+        if root.is_none() {
+            return Err(AgentEventError::EventReference);
+        }
+        event_id(parent, AGENT_REQUEST_ITEM_TAG)?;
+    }
+    AgentItem::from_tags(tags)
+}
+
+/// Check the item an edit carries: readable, with no `e` tag, since the edit's
+/// own `e` names its target. It may repeat its first event's `E`/`K`/`P`.
+pub fn validate_agent_item_edit_tags(tags: &[Vec<String>]) -> Result<AgentItem, AgentEventError> {
+    if values(tags, AGENT_REQUEST_ITEM_TAG).next().is_some() {
         return Err(AgentEventError::EventReference);
     }
     AgentItem::from_tags(tags)
+}
+
+/// Whether a thread message is an agent's own words in a thread whose root is
+/// one of its agent items: a comment naming its root with `E`, whose `K` is
+/// 1201 and whose `P` is its author. It does not alert or wake anyone (marmot-agents D-122). Read from
+/// the comment's own tags, so it also holds where the root is not stored, and
+/// a sender can only silence its own message with it.
+pub fn is_agent_own_thread_comment(kind: u64, tags: &[Vec<String>], sender_hex: &str) -> bool {
+    let value = |name: &'static str| values(tags, name).next();
+    crate::thread_message_parent(kind, tags).is_some()
+        && crate::thread_root_tag(tags).is_some()
+        && value("K").and_then(|kind| kind.parse().ok()) == Some(MARMOT_APP_EVENT_KIND_AGENT_ITEM)
+        && value("P").is_some_and(|author| author.eq_ignore_ascii_case(sender_hex))
 }
 
 fn values<'a>(tags: &'a [Vec<String>], name: &'a str) -> impl Iterator<Item = &'a str> {
@@ -473,6 +527,18 @@ mod tests {
         );
     }
 
+    fn thread_tags(root: char, parent: char) -> Vec<Vec<String>> {
+        let agent = id('9');
+        vec![
+            tag(&["E", &id(root), "", &agent]),
+            tag(&["K", "1201"]),
+            tag(&["P", &agent]),
+            tag(&["e", &id(parent), "", &agent]),
+            tag(&["k", "1201"]),
+            tag(&["p", &agent]),
+        ]
+    }
+
     #[test]
     fn a_program_cannot_name_an_edit_target_on_an_item() {
         let mut tags = item_tags("turn", "running");
@@ -481,6 +547,108 @@ mod tests {
             validate_agent_item_tags(&tags),
             Err(AgentEventError::EventReference)
         );
+        assert_eq!(
+            validate_agent_item_edit_tags(&tags),
+            Err(AgentEventError::EventReference)
+        );
+    }
+
+    #[test]
+    fn an_item_in_a_thread_names_its_parent_with_e_on_its_first_event_only() {
+        let mut first = item_tags("tool", "running");
+        first.retain(|tag| tag[0] != "started_by");
+        first.extend(thread_tags('d', 'f'));
+        assert!(validate_agent_item_tags(&first).is_ok());
+        assert_eq!(agent_item_thread_parent(&first), Some(id('f').as_str()));
+        assert_eq!(agent_item_reply_target(&first), Some(id('f')));
+        // A turn's starting message stays what it quotes.
+        let mut turn = item_tags("turn", "running");
+        turn.extend(thread_tags('d', 'f'));
+        assert_eq!(agent_item_reply_target(&turn), Some(id('a')));
+
+        let mut twice = first.clone();
+        twice.push(tag(&["e", &id('1')]));
+        assert_eq!(
+            validate_agent_item_tags(&twice),
+            Err(AgentEventError::Repeated("e"))
+        );
+        // The root must name an event too, with or without a parent.
+        for bad_root in [
+            vec![tag(&["E", ""])],
+            vec![tag(&["E", "root"]), tag(&["e", &id('f')])],
+        ] {
+            let mut tags = item_tags("tool", "running");
+            tags.extend(bad_root);
+            assert_eq!(
+                validate_agent_item_tags(&tags),
+                Err(AgentEventError::Invalid("E"))
+            );
+        }
+        // An item with a root and no parent answers the root.
+        let mut root_only = item_tags("tool", "running");
+        root_only.retain(|tag| tag[0] != "started_by");
+        root_only.push(tag(&["E", &id('d')]));
+        assert!(validate_agent_item_tags(&root_only).is_ok());
+        assert_eq!(agent_item_reply_target(&root_only), Some(id('d')));
+        let mut bad_parent = item_tags("tool", "running");
+        bad_parent.extend(thread_tags('d', 'f'));
+        bad_parent.retain(|tag| tag[0] != "e");
+        bad_parent.push(tag(&["e", "not-an-id"]));
+        assert_eq!(
+            validate_agent_item_tags(&bad_parent),
+            Err(AgentEventError::Invalid("e"))
+        );
+
+        // An edit names its target with `e`, so it carries the root alone.
+        let mut edit = item_tags("tool", "done");
+        edit.extend(thread_tags('d', 'f').into_iter().take(3));
+        assert!(validate_agent_item_edit_tags(&edit).is_ok());
+        assert!(validate_agent_item_edit_tags(&first).is_err());
+    }
+
+    #[test]
+    fn only_an_agents_comment_under_its_own_item_is_its_own_thread_comment() {
+        let agent = id('9');
+        let comment = |root_kind: &str, root_author: &str| {
+            vec![
+                tag(&["E", &id('d'), "", root_author]),
+                tag(&["K", root_kind]),
+                tag(&["P", root_author]),
+                tag(&["e", &id('d'), "", root_author]),
+                tag(&["k", root_kind]),
+            ]
+        };
+        assert!(is_agent_own_thread_comment(
+            1111,
+            &comment("1201", &agent),
+            &agent
+        ));
+        assert!(is_agent_own_thread_comment(
+            1111,
+            &comment("1201", &agent.to_uppercase()),
+            &agent
+        ));
+        // A person's comment in the agent's thread, a comment under a chat
+        // message, and a chat message joining the thread all alert.
+        assert!(!is_agent_own_thread_comment(
+            1111,
+            &comment("1201", &agent),
+            &id('8')
+        ));
+        assert!(!is_agent_own_thread_comment(
+            1111,
+            &comment("9", &agent),
+            &agent
+        ));
+        assert!(!is_agent_own_thread_comment(
+            9,
+            &comment("1201", &agent),
+            &agent
+        ));
+        // Without `E` the root is found by walking parents, and may be chat.
+        let mut rootless = comment("1201", &agent);
+        rootless.remove(0);
+        assert!(!is_agent_own_thread_comment(1111, &rootless, &agent));
     }
 
     #[test]
