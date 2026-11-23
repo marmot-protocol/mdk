@@ -43,7 +43,9 @@ To cancel an unpublished attempt, call `start_setup_compensation` before stoppin
 starting the account. An old journal without recorded ownership can resume setup but cannot authorize compensation.
 
 Explicit legacy reset preserves a native-vault signing key. If a local `secret.json` would enter the wipe payload,
-reset is refused before changing the account or moving its files. The file-backed account and key stay intact.
+reset returns `AccountSetupConflict` before changing the account or moving its files. The file-backed account and
+key stay intact; retrying reset cannot recover this backend. Back up the signing key before wiping the account,
+then import the backed-up key. Wipe also removes the account's local data.
 
 Completion commits when the setup journal is removed. Failed context cleanup does not make that account incomplete
 again: the remaining private context is cleanup intent. A fresh attempt must clear it before admission. Public-role
@@ -53,7 +55,7 @@ Opening an `AccountHome` does not remove leftover wipe directories. `MarmotApp` 
 acquiring the root runtime lease. Lower-level hosts can call `resume_wipe_cleanup` under that exclusive lease;
 replay retries completed setup context and detached payload cleanup, retains native cleanup records, and never removes
 native credentials. A failed payload cleanup remains pending without blocking unrelated accounts. Invalid root
-containers or rename-parent sync failures still reject startup; replay never follows a container symlink.
+containers or rename-parent sync failures reject startup; replay refuses container symlinks.
 
 ## What it does not do
 

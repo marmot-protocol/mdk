@@ -13,6 +13,8 @@
 - `AccountHome` constructors no longer remove leftover wipe directories. `MarmotApp` replays local file
   cleanup under its root runtime lease. Lower-level hosts call `resume_wipe_cleanup` while holding
   exclusive root ownership; native cleanup records remain pending.
+  Leased startup now refuses symlinked or non-directory `accounts` and `.wipe-tombstones` paths;
+  use real directories for both containers.
 
 ### Fixed
 
