@@ -48,9 +48,9 @@
 
 ### Changed
 
-- Group creation, invites and direct-chat starts no longer reuse relay routes from
-  `prewarm_group_member_key_packages`; each discovers the members' current routes, so a prewarm no longer shortens
-  them. An `IncompatibleKeyPackage` verdict needs that discovery to complete.
+- Group creation, invites and direct-chat starts always discover the members' current relay routes after
+  `prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm no longer
+  skips discovery. An `IncompatibleKeyPackage` verdict needs that discovery to complete.
 
 ### Fixed
 

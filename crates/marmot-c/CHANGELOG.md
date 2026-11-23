@@ -29,9 +29,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - A member's `MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPATIBLE_KEY_PACKAGE` now requires completed relay-list discovery
   and complete KeyPackage reads. If either is incomplete, the status is `MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPLETE`.
-- Group creation, invites and direct-chat starts no longer reuse relay routes from
-  `marmot_prewarm_group_member_key_packages`; each discovers the members' current routes, so a prewarm no longer
-  shortens them.
+- Group creation, invites and direct-chat starts always discover the members' current relay routes after
+  `marmot_prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm
+  no longer skips discovery.
 
 ## [0.19.0] - 2026-11-22
 

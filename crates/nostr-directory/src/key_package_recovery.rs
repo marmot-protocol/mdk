@@ -11,8 +11,9 @@ use nostr_sdk::prelude::RelayUrl;
 use super::Directory;
 use super::resources::DirectoryResources;
 use crate::published_records::{
-    KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, key_package_queries,
-    key_package_read_page_full, select_key_packages_from_records, without_revoked_slot_winners,
+    KeyPackageJournalFence, KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget,
+    key_package_queries, key_package_read_page_full, select_fenced_key_packages,
+    without_revoked_slot_winners,
 };
 use crate::{DirectoryFreshness, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome, DirectoryRelayEventRecord};
@@ -40,9 +41,15 @@ impl RecoveredKeyPackageRecords {
         &self,
         account: &str,
         requirements: Option<&KeyPackageRequirements>,
+        fence: Option<&KeyPackageJournalFence>,
     ) -> Result<Vec<FetchedKeyPackage>, DirectoryError> {
-        match select_key_packages_from_records(account, &self.records, self.freshness, requirements)
-        {
+        match select_fenced_key_packages(
+            account,
+            &self.records,
+            self.freshness,
+            requirements,
+            fence,
+        ) {
             Ok(selection) if !selection.value.is_empty() => Ok(selection.value),
             // Losing an incomplete read's package to revalidation says
             // nothing about what the recipient published.
@@ -59,6 +66,8 @@ pub(super) struct KeyPackageRecoveryRequest<'a> {
     pub(super) primary_complete: bool,
     pub(super) discovery: &'a [TransportEndpoint],
     pub(super) requirements: Option<&'a KeyPackageRequirements>,
+    /// Replacements and deletions the journal already knows.
+    pub(super) fence: Option<&'a KeyPackageJournalFence>,
     /// Public metadata only. Membership callers must never nominate a cache.
     pub(super) cached_target: Option<KeyPackageRecoveryTarget>,
     /// How many of the best-ranked selected candidates to prove undeleted.
@@ -79,6 +88,7 @@ impl<R: DirectoryResources> Directory<R> {
             primary_complete,
             discovery,
             requirements,
+            fence,
             cached_target,
             wanted,
         } = request;
@@ -86,21 +96,6 @@ impl<R: DirectoryResources> Directory<R> {
         // past it; recovery's targeted reads cannot show that either.
         if key_package_read_page_full(account, &observed) {
             return Err(recovery_incomplete(account));
-        }
-        let freshness = self.directory_freshness();
-        // What the read found is used even when the read was incomplete:
-        // every device is sought, not guaranteed (mdk#2628, D12).
-        if select_key_packages_from_records(account, &observed, freshness, requirements)
-            .is_ok_and(|selection| !selection.value.is_empty())
-        {
-            return Ok(RecoveredKeyPackageRecords {
-                freshness,
-                records: observed,
-                cache_evidence: None,
-                // The supplementary reads were skipped, so losing this
-                // package decides nothing.
-                complete: false,
-            });
         }
         // Primary routes already crossed the maintained 16-endpoint admission
         // gate. Recovery only adds eight distinct safe configured routes.
@@ -124,6 +119,21 @@ impl<R: DirectoryResources> Directory<R> {
             })
             .take(RECOVERY_ENDPOINT_LIMIT)
             .collect::<Vec<_>>();
+        let freshness = self.directory_freshness();
+        // What the read found is used even when the read was incomplete:
+        // every device is sought, not guaranteed (mdk#2628, D12).
+        if select_fenced_key_packages(account, &observed, freshness, requirements, fence)
+            .is_ok_and(|selection| !selection.value.is_empty())
+        {
+            return Ok(RecoveredKeyPackageRecords {
+                freshness,
+                records: observed,
+                cache_evidence: None,
+                // Losing this package decides nothing if a supplementary
+                // read was skipped.
+                complete: primary_complete && supplementary.is_empty(),
+            });
+        }
         let mut package_coverage = primary_complete;
         if !supplementary.is_empty() {
             let outcome = self
@@ -169,11 +179,12 @@ impl<R: DirectoryResources> Directory<R> {
                     );
                     // A compatibility refusal describes the recipient's
                     // available packages and requires complete coverage.
-                    let selection = match select_key_packages_from_records(
+                    let selection = match select_fenced_key_packages(
                         account,
                         &records,
                         freshness,
                         requirements,
+                        fence,
                     ) {
                         Err(DirectoryError::KeyPackageRequirements(error))
                             if !package_coverage

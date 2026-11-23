@@ -820,13 +820,27 @@ async fn invite_recovery_group_preflight_keeps_failed_roster_unchanged_and_allow
     let after = client.group_mls_state(&group).unwrap();
     assert_eq!(after.member_count, before.member_count);
     assert_eq!(after.epoch, before.epoch);
+    // A known deletion stays a deletion even if a relay stops serving it, so
+    // the retry needs a package the member publishes again.
+    let republished = member_resolution_key_package_event(
+        member,
+        fresh_key_package_for_account(&app, member, false).await,
+    );
+    let mut tags = republished.tags;
+    tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = "republished".into();
     fetcher
         .events_by_endpoint
         .lock()
         .unwrap()
         .get_mut(OUTBOX)
         .unwrap()
-        .retain(|event| event.kind != 5);
+        .push(NostrTransportEvent::new_unsigned_at(
+            republished.pubkey,
+            republished.kind,
+            tags,
+            republished.content,
+            republished.created_at,
+        ));
     client
         .invite_members(&group, &[&member.account_id_hex])
         .await

@@ -310,10 +310,14 @@ async fn member_recovery_journals_malformed_replacement() {
         .retain(|event| event.id != replacement.id);
     app.drop_account_caches(&owner.label);
 
-    app.directory()
-        .prewarm_group_member_key_packages(&[accounts[0].account_id_hex.as_str()])
-        .await
-        .unwrap();
+    // The journal remembers the newer malformed publication, so the older
+    // package it superseded is no longer offered either.
+    assert!(matches!(
+        app.directory()
+            .prewarm_group_member_key_packages(&[accounts[0].account_id_hex.as_str()])
+            .await,
+        Err(nostr_directory::error::DirectoryError::MissingKeyPackage { .. })
+    ));
     let page = app
         .directory()
         .follow_availability_page(

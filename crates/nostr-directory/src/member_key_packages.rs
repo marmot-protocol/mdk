@@ -9,7 +9,7 @@
 //! bundle. Unsupported batch queries fall back to bounded single-author relay
 //! requests.
 
-use crate::error::{DirectoryError, MissingKeyPackageReason};
+use crate::error::{DirectoryError, MissingKeyPackageReason, blocking_directory_task};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,15 +18,16 @@ use cgka_traits::TransportEndpoint;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::group::ProtocolProfile;
 use futures::{Stream, StreamExt, future, stream};
-use nostr_sdk::prelude::PublicKey;
+use nostr_sdk::prelude::{PublicKey, RelayUrl};
 use transport_nostr_adapter::{KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST};
 
 use super::Directory;
 use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 use super::resources::DirectoryResources;
 use crate::published_records::{
-    MAX_KEY_PACKAGES_PER_ACCOUNT, fresh_relay_list_status_from_records, key_package_queries,
-    key_package_read_page_full, merge_relay_list_status, select_key_packages_from_records,
+    KeyPackageJournalFence, MAX_KEY_PACKAGES_PER_ACCOUNT, fresh_relay_list_status_from_records,
+    key_package_queries, key_package_read_page_full, merge_relay_list_status,
+    select_fenced_key_packages,
 };
 use crate::{AccountRelayListStatus, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome};
@@ -280,6 +281,9 @@ struct MemberTarget {
     relay_lists: AccountRelayListStatus,
     cached_relay_lists: AccountRelayListStatus,
     relay_records: Vec<transport_nostr::DirectoryRelayEventRecord>,
+    /// Outboxes of a served relay list that ties the remembered one on its
+    /// timestamp but names other relays. KeyPackage reads include them.
+    tied_relays: Vec<String>,
 }
 
 #[derive(Default)]
@@ -411,10 +415,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     /// A malformed current slot publication suppresses older packages here too;
     /// return an error rather than report readiness from superseded material.
     /// Every call fetches packages for a fresh readiness signal; hosts should
-    /// debounce composition changes. Only a later prewarm reuses the discovered
-    /// routes: create and invite discover routes and fetch KeyPackages again,
-    /// because routes may have moved and prewarmed material may have been
-    /// consumed in the meantime.
+    /// debounce composition changes. A later prewarm reuses the discovered
+    /// routes. Create and invite take them only as hints: they still discover
+    /// routes and fetch KeyPackages again, because routes may have moved and
+    /// prewarmed material may have been consumed in the meantime.
     pub async fn prewarm_group_member_key_packages(
         &self,
         member_refs: &[&str],
@@ -546,20 +550,26 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 relay_lists: relay_lists.clone(),
                 cached_relay_lists: relay_lists,
                 relay_records: Vec::new(),
+                tied_relays: Vec::new(),
             });
         }
 
+        let fences = if targets.is_empty() {
+            Vec::new()
+        } else {
+            self.key_package_journal_fences(&targets).await?
+        };
         let mut outcomes = (0..targets.len())
             .map(|_| None)
             .collect::<Vec<Option<Result<Vec<KeyPackage>, DirectoryError>>>>();
         // Even a valid, unexpired cached package may have been consumed on
         // another device. Every purpose, including composition prewarm, must
-        // fetch current relay publications; only prewarm reuses discovery routes.
+        // fetch current relay publications. A commit takes prewarmed routes
+        // only as hints and still discovers; only prewarm skips discovery.
         let mut reused_prewarmed_routes = HashSet::new();
         for (index, target) in targets.iter_mut().enumerate() {
-            // A commit's verdicts need current routes, so it always discovers
-            // them; only composition prewarm reuses its own.
-            if purpose != MemberResolutionPurpose::Prewarm {
+            // Recovery deliberately refreshes routes as well as packages.
+            if purpose == MemberResolutionPurpose::CommitFresh {
                 continue;
             }
             let prefetched = self
@@ -587,6 +597,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             "member prewarm inbox readiness",
                         )
                         .is_empty()
+                    && purpose == MemberResolutionPurpose::Prewarm
                 {
                     reused_prewarmed_routes.insert(index);
                 }
@@ -628,6 +639,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             purpose,
                             requirements,
                             cut_offs.map(|cut_offs| cut_offs.key_package_batches),
+                            &fences,
                         ),
                     )
                     .await
@@ -793,6 +805,34 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 unique_members,
             },
         })
+    }
+
+    /// What the shared journal knew about each target's replacements and
+    /// deletions, read once before any network step. This lookup's own reads
+    /// are fenced by selection itself.
+    async fn key_package_journal_fences(
+        &self,
+        targets: &[MemberTarget],
+    ) -> Result<Vec<KeyPackageJournalFence>, DirectoryError> {
+        let directory = self.clone();
+        let accounts = targets
+            .iter()
+            .map(|target| target.account_id_hex.clone())
+            .collect::<Vec<_>>();
+        let snapshots = blocking_directory_task(move || {
+            let shared = directory.resources.shared_storage()?;
+            accounts
+                .iter()
+                .map(|account| Ok(shared.key_package_evidence_snapshot(account)?))
+                .collect::<Result<Vec<_>, DirectoryError>>()
+        })
+        .await?;
+        let now = self.directory_freshness().now;
+        let future_skew_secs = self.config.max_future_skew.as_secs();
+        Ok(snapshots
+            .into_iter()
+            .map(|snapshot| KeyPackageJournalFence::new(snapshot, now, future_skew_secs))
+            .collect())
     }
 
     /// Revalidate one account's selection on the real clock, best first. A
@@ -1119,33 +1159,45 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             !invalid_outboxes.contains(index) && !outbox_hop.cleared.contains(index)
         }));
         let completed_outbox = outbox_hop.completed;
+        // A remembered list counts only when the relays served it in this
+        // lookup. On a timestamp tie the remembered list keeps its routes and
+        // the cache cannot tell which tied list is current, so the served
+        // one's outboxes are read too but the tie decides nothing.
+        let mut confirmed = HashSet::new();
+        for &index in &needs_discovery {
+            let target = &mut targets[index];
+            let served = fresh_relay_list_status_from_records(
+                &target.account_id_hex,
+                target.relay_records.clone(),
+                self.directory_freshness(),
+            )
+            .value
+            .nip65;
+            let listed = &target.relay_lists.nip65;
+            if served.created_at != listed.created_at {
+                continue;
+            }
+            if relay_identities(&served.relays) == relay_identities(&listed.relays) {
+                confirmed.insert(index);
+            } else {
+                target.tied_relays = served.relays;
+            }
+        }
         let completed = completed_discovery
             .iter()
             .copied()
             .filter(|index| {
-                let target = &targets[*index];
-                let listed = &target.relay_lists.nip65;
-                let served = fresh_relay_list_status_from_records(
-                    &target.account_id_hex,
-                    target.relay_records.clone(),
-                    self.directory_freshness(),
-                )
-                .value
-                .nip65;
-                // On a timestamp tie the remembered list keeps its routes, and
-                // the cache cannot tell which tied list is current.
-                let conflicting_tie = served.created_at == listed.created_at
-                    && served.relays.iter().collect::<BTreeSet<_>>()
-                        != listed.relays.iter().collect::<BTreeSet<_>>();
                 (!attempted_outbox.contains(index) || completed_outbox.contains(index))
-                    && !conflicting_tie
+                    && confirmed.contains(index)
                     // A newer list found on an outbox can name outboxes this
                     // lookup never read.
-                    && outboxes(*index, &listed.relays).iter().all(|outbox| {
-                        read_outboxes
-                            .get(index)
-                            .is_some_and(|read| read.contains(outbox))
-                    })
+                    && outboxes(*index, &targets[*index].relay_lists.nip65.relays)
+                        .iter()
+                        .all(|outbox| {
+                            read_outboxes
+                                .get(index)
+                                .is_some_and(|read| read.contains(outbox))
+                        })
             })
             .collect();
         let errors = needs_discovery
@@ -1195,6 +1247,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         batch_cut_off: Option<tokio::time::Instant>,
+        fences: &[KeyPackageJournalFence],
     ) -> Result<(), DirectoryError> {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
@@ -1205,6 +1258,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .nip65
                     .relays
                     .iter()
+                    .chain(&targets[index].tied_relays)
                     .cloned()
                     .map(TransportEndpoint)
                     .collect(),
@@ -1296,11 +1350,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             for index in indices {
                 let account_id = &targets[index].account_id_hex;
                 let account_records = records_by_author.remove(account_id).unwrap_or_default();
-                let selected = select_key_packages_from_records(
+                let selected = select_fenced_key_packages(
                     account_id,
                     &account_records,
                     self.directory_freshness(),
                     requirements,
+                    Some(&fences[index]),
                 )
                 .map(|selection| selection.value);
                 // Batch results prove no coverage; every absence or rejection
@@ -1358,6 +1413,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         .nip65
                         .relays
                         .iter()
+                        .chain(&target.tied_relays)
                         .cloned()
                         .map(TransportEndpoint)
                         .collect(),
@@ -1391,6 +1447,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             directory
                                 .journal_key_package_records(&target.account_id_hex, &records)
                                 .await?;
+                            let fence = &fences[index];
                             let records = directory
                                 .recover_key_package_records(
                                     super::key_package_recovery::KeyPackageRecoveryRequest {
@@ -1400,6 +1457,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                         primary_complete: fetched.complete,
                                         discovery: &directory.directory_source_relays(&[]),
                                         requirements,
+                                        fence: Some(fence),
                                         cached_target: None,
                                         wanted: MAX_KEY_PACKAGES_PER_ACCOUNT,
                                     },
@@ -1411,7 +1469,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                     &records.records,
                                 )
                                 .await?;
-                            records.select(&target.account_id_hex, requirements)
+                            records.select(&target.account_id_hex, requirements, Some(fence))
                         }
                         .await;
                         (index, result)
@@ -1426,6 +1484,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         }
         Ok(())
     }
+}
+
+/// The relays a list names, compared as relays: an optional trailing slash
+/// does not make two lists differ.
+fn relay_identities(relays: &[String]) -> BTreeSet<RelayUrl> {
+    relays
+        .iter()
+        .filter_map(|relay| RelayUrl::parse(relay).ok())
+        .collect()
 }
 
 /// Whether a recipient's KeyPackage failed a group compatibility requirement.

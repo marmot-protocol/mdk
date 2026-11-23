@@ -13,7 +13,7 @@ use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
 use rusqlite::params;
 use storage_sqlite::{
-    PublicKeyPackageBarrierKind, PublicKeyPackageBarrierRecord, PublicKeyPackageEvidenceSnapshot,
+    PublicKeyPackageBarrierRecord, PublicKeyPackageEvidenceSnapshot,
     PublicKeyPackageReplacementRecord, SqliteSharedStorage,
 };
 
@@ -24,8 +24,8 @@ use super::error::{DirectoryError, MissingKeyPackageReason, blocking_directory_t
 use super::key_package_recovery::KeyPackageRecoveryRequest;
 use super::observer::DirectoryObserver;
 use super::published_records::{
-    KEY_PACKAGE_FRESHNESS, key_package_queries, key_package_read_page_full,
-    select_key_packages_from_records,
+    KEY_PACKAGE_FRESHNESS, barrier_allows, key_package_queries, key_package_read_page_full,
+    replacement_allows, select_key_packages_from_records, watermark_allows,
 };
 use super::resources::{DirectoryAccount, DirectoryResources};
 use super::{Directory, DirectoryKeyPackage, FetchedKeyPackage};
@@ -993,6 +993,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     // deletion proofs belong to member invitation, not this projection.
                     discovery: &[],
                     requirements: None,
+                    fence: None,
                     cached_target: None,
                     wanted: 0,
                 })
@@ -1226,71 +1227,10 @@ fn error_is_host_failure(error: &DirectoryError) -> bool {
     )
 }
 
-fn replacement_allows(
-    event_id: &str,
-    created_at: u64,
-    replacement: &PublicKeyPackageReplacementRecord,
-) -> bool {
-    event_id == replacement.event_id_hex
-        || created_at > replacement.event_created_at
-        || (created_at == replacement.event_created_at
-            && event_id < replacement.event_id_hex.as_str())
-}
-
-fn barrier_allows(
-    event_id: &str,
-    created_at: u64,
-    barrier: &PublicKeyPackageBarrierRecord,
-) -> bool {
-    match barrier.kind {
-        PublicKeyPackageBarrierKind::Replacement => {
-            event_id == barrier.event_id_hex
-                || created_at > barrier.event_created_at
-                || (created_at == barrier.event_created_at
-                    && event_id < barrier.event_id_hex.as_str())
-        }
-        PublicKeyPackageBarrierKind::Deletion => {
-            if barrier
-                .deleted_event_id
-                .as_deref()
-                .is_some_and(|deleted| deleted.eq_ignore_ascii_case(event_id))
-            {
-                return false;
-            }
-            if barrier.deleted_event_id.is_some() {
-                return true;
-            }
-            created_at > barrier.event_created_at
-        }
-        PublicKeyPackageBarrierKind::ExactDeletion => created_at > barrier.observed_at,
-    }
-}
-
-fn watermark_allows(
-    event_id: &str,
-    created_at: u64,
-    now: u64,
-    future_skew_secs: u64,
-    barrier: &PublicKeyPackageBarrierRecord,
-) -> bool {
-    if barrier
-        .observed_at
-        .saturating_add(KEY_PACKAGE_FRESHNESS.as_secs())
-        .saturating_add(future_skew_secs)
-        <= now
-    {
-        return true;
-    }
-    if barrier.kind == PublicKeyPackageBarrierKind::ExactDeletion {
-        return created_at > barrier.observed_at.saturating_add(future_skew_secs);
-    }
-    barrier_allows(event_id, created_at, barrier)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use storage_sqlite::SqlCipherKey;
+    use storage_sqlite::{PublicKeyPackageBarrierKind, SqlCipherKey};
 
     fn account_id(value: u8) -> String {
         format!("{value:064x}")

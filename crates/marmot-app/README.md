@@ -416,8 +416,8 @@ Simulator app/process membership actions also use atomic resolution before mutat
   shortcut, and its published package must be reachable on relays. Relay freshness is not proof that the recipient still
   owns private material; it avoids authorizing from a stale local copy.
 - Hosts may prewarm the same bounded composition lookup without reserving packages or durably admitting strangers; the
-  final action discovers routes and fetches packages again before the mutation validates them; only a later prewarm
-  reuses the prewarmed routes. Each prewarm call
+  final action still discovers routes, reads unexpired prewarmed outboxes only as hints, and fetches packages again
+  before the mutation validates them; only a later prewarm skips discovery. Each prewarm call
   requests a fresh readiness signal, so debounce roster changes. The process-local prewarm cache keeps only bounded
   relay metadata; only completed discovery and advertised-outbox metadata hops renew its freshness deadline, and a
   usable package returned after an incomplete metadata hop does not make previously cached routes fresh.

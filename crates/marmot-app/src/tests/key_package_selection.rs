@@ -100,6 +100,24 @@ fn signed_deletion(
     NostrTransportEvent::from_nostr_event(&event).unwrap()
 }
 
+/// `event` signed by `account`, as relays serve real publications.
+fn signed(
+    app: &MarmotApp,
+    account: &AccountSummary,
+    event: NostrTransportEvent,
+) -> NostrTransportEvent {
+    let signed = EventBuilder::new(Kind::from(event.kind as u16), event.content)
+        .tags(event.tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+        .custom_created_at(NostrTimestamp::from_secs(event.created_at))
+        .finalize(
+            &app.account_home()
+                .load_signing_keys(&account.label)
+                .unwrap(),
+        )
+        .unwrap();
+    NostrTransportEvent::from_nostr_event(&signed).unwrap()
+}
+
 fn slot_address(account: &AccountSummary, slot: &str) -> Vec<String> {
     vec![
         "a".into(),
@@ -1477,12 +1495,128 @@ async fn a_relay_list_naming_an_unread_outbox_decides_no_incompatibility() {
     app.close_storage().unwrap();
 }
 
-/// Relay lists published in the same second tie, and the remembered list
-/// keeps its routes on a tie. When the relays serve a tied list naming another
-/// outbox, this lookup has not read that outbox, so it decides no
-/// incompatibility.
+/// Prewarm reads the old outbox and journals a slot's newest publication.
+/// When the recipient moves outboxes and the new one serves only an older copy
+/// of that slot, the journal still bars it, so no chat is created.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_tied_relay_list_naming_another_outbox_decides_no_incompatibility() {
+async fn a_moved_outbox_cannot_revive_a_package_prewarm_saw_replaced() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    // The journal records only signed publications.
+    for relays in fetcher.events_by_endpoint.lock().unwrap().values_mut() {
+        for event in relays
+            .iter_mut()
+            .filter(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        {
+            *event = signed(&app, &bob, event.clone());
+        }
+    }
+    app.directory()
+        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let compatible = fresh_key_package_for_account(&app, &bob, false).await;
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let records = by_endpoint.get_mut("wss://directory.example").unwrap();
+        let incompatible = records
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap();
+        let stale = candidate(
+            &bob,
+            compatible,
+            incompatible.tag_value("d").unwrap(),
+            None,
+            incompatible.created_at - 1,
+        );
+        let outbox = records
+            .iter_mut()
+            .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
+            .unwrap();
+        *outbox = NostrTransportEvent::new_unsigned_at(
+            bob.account_id_hex.clone(),
+            KIND_NIP65_RELAY_LIST,
+            vec![vec![
+                "r".into(),
+                UPDATED_DIRECT_OUTBOX.into(),
+                "write".into(),
+            ]],
+            String::new(),
+            outbox.created_at + 1,
+        );
+        // The incompatible replacement is visible only on the old outbox.
+        records.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        let updated = by_endpoint.get_mut(UPDATED_DIRECT_OUTBOX).unwrap();
+        updated.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        updated.push(stale);
+    }
+    fetcher.requests.lock().unwrap().clear();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let error = runtime
+        .start_direct_conversation_with_options(
+            "alice",
+            &bob.account_id_hex,
+            crate::DirectConversationOptions {
+                disappearing_message_secs: 300,
+            },
+        )
+        .await
+        .unwrap_err();
+    // The new outbox was read, but its only copy was superseded.
+    assert!(
+        matches!(error, AppError::MissingKeyPackage { .. }),
+        "{error}"
+    );
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
+        request
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.0 == UPDATED_DIRECT_OUTBOX)
+            && request.queries.iter().any(|query| {
+                query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.contains(&bob.account_id_hex)
+            })
+    }));
+    assert!(app.groups("alice").unwrap().is_empty());
+    runtime.shutdown().await;
+    app.close_storage().unwrap();
+}
+
+/// Points the directory's relay list for `bob` at `relays`, keeping its
+/// timestamp, and drops the old outbox's own copy of the list.
+fn tie_directory_relay_list(
+    fetcher: &MemberResolutionDirectoryFetcher,
+    bob: &AccountSummary,
+    relays: &[&str],
+) {
+    let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+    let listed = by_endpoint
+        .get_mut("wss://directory.example")
+        .unwrap()
+        .iter_mut()
+        .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
+        .unwrap();
+    *listed = NostrTransportEvent::new_unsigned_at(
+        bob.account_id_hex.clone(),
+        KIND_NIP65_RELAY_LIST,
+        relays
+            .iter()
+            .map(|relay| vec!["r".into(), (*relay).into(), "write".into()])
+            .collect(),
+        String::new(),
+        listed.created_at,
+    );
+    by_endpoint
+        .get_mut("wss://shared.example")
+        .unwrap()
+        .retain(|event| event.kind != KIND_NIP65_RELAY_LIST);
+}
+
+/// Relay lists published in the same second tie, and the remembered list
+/// keeps its routes on a tie. The same relay spelled with a trailing slash is
+/// no conflict, so the verdict stands. A tied list naming another outbox is
+/// read too: its compatible package is used, and the tie alone decides nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tied_relay_list_is_read_but_decides_nothing() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
     let requirements = retention_requirements(&app).await;
     // The first lookup remembers the list naming the old outbox.
@@ -1500,29 +1634,74 @@ async fn a_tied_relay_list_naming_another_outbox_decides_no_incompatibility() {
         "{:?}",
         first.err()
     );
-    {
-        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
-        let listed = by_endpoint
-            .get_mut("wss://directory.example")
-            .unwrap()
-            .iter_mut()
-            .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
-            .unwrap();
-        *listed = NostrTransportEvent::new_unsigned_at(
-            bob.account_id_hex.clone(),
-            KIND_NIP65_RELAY_LIST,
-            vec![vec![
-                "r".into(),
-                UPDATED_DIRECT_OUTBOX.into(),
-                "write".into(),
-            ]],
-            String::new(),
-            listed.created_at,
-        );
-        by_endpoint
-            .get_mut("wss://shared.example")
-            .unwrap()
-            .retain(|event| event.kind != KIND_NIP65_RELAY_LIST);
+
+    tie_directory_relay_list(&fetcher, &bob, &["wss://shared.example/"]);
+    let same_relay = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await;
+    assert!(
+        matches!(same_relay, Err(DirectoryError::KeyPackageRequirements(_))),
+        "{:?}",
+        same_relay.err()
+    );
+
+    tie_directory_relay_list(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
+    let compatible = fetcher.events_by_endpoint.lock().unwrap()[UPDATED_DIRECT_OUTBOX]
+        .iter()
+        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .id
+        .clone();
+    let resolved = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved
+            .key_packages
+            .iter()
+            .map(|package| hex::encode(package.source.as_ref().unwrap().event_id.as_slice()))
+            .collect::<Vec<_>>(),
+        vec![compatible]
+    );
+    app.close_storage().unwrap();
+}
+
+/// When every relay-list read completes but none returns a list, the lookup
+/// cannot confirm the remembered one, so the remembered outbox's incompatible
+/// packages decide nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unconfirmed_remembered_relay_list_decides_no_incompatibility() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let first = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await;
+    assert!(
+        matches!(first, Err(DirectoryError::KeyPackageRequirements(_))),
+        "{:?}",
+        first.err()
+    );
+    for relays in fetcher.events_by_endpoint.lock().unwrap().values_mut() {
+        relays.retain(|event| event.kind != KIND_NIP65_RELAY_LIST);
     }
     let result = app
         .directory()
@@ -1544,57 +1723,91 @@ async fn a_tied_relay_list_naming_another_outbox_decides_no_incompatibility() {
     app.close_storage().unwrap();
 }
 
-/// Final selection revalidates lifetimes on the wall clock, so it can lose
-/// the package recovery selected from an incomplete read. Whatever is left
-/// then says nothing about the recipient: the lookup is incomplete, not
-/// incompatible. After a complete read, the refusal stands.
+/// A prewarm can hold the only known route to a recipient's outbox. When the
+/// directory relays stop serving relay lists before the start, the start still
+/// reads that outbox for a fresh package.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn final_selection_after_an_incomplete_read_claims_no_incompatibility() {
+async fn direct_start_reads_a_prewarmed_outbox_when_discovery_fails() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
-    let requirements = retention_requirements(&app).await;
-    let incompatible = fetcher
+    fetcher
         .events_by_endpoint
         .lock()
         .unwrap()
-        .get("wss://directory.example")
+        .get_mut("wss://directory.example")
         .unwrap()
-        .iter()
-        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
-        .unwrap()
-        .clone();
-    // Only the incompatible package is left once the selected one is lost.
-    let records = [incompatible]
-        .into_iter()
-        .map(|event| RelayEventRecord {
-            event,
-            endpoints: vec![],
-        })
-        .collect::<Vec<_>>();
-    for complete in [false, true] {
-        let selected = app.directory().select_recovered_key_packages_for_test(
-            &bob.account_id_hex,
-            records.clone(),
-            &requirements,
-            complete,
-        );
-        if complete {
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    app.directory()
+        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    *fetcher.failing_endpoint.lock().unwrap() = Some("wss://directory.example".into());
+    *fetcher.failing_endpoint_kind.lock().unwrap() = Some(KIND_NIP65_RELAY_LIST);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    // Without a message timer, the old outbox's package is compatible.
+    let created = runtime
+        .start_direct_conversation("alice", &bob.account_id_hex)
+        .await
+        .unwrap();
+    let groups = app.groups("alice").unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
+    runtime.shutdown().await;
+    app.close_storage().unwrap();
+}
+
+/// Recovery returns a package from its first read without reading the
+/// supplementary relays. If final selection then loses that package, as
+/// wall-clock revalidation can, the incompatibility left behind is a verdict
+/// only when no supplementary relay was skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_early_package_decides_only_when_no_relay_was_skipped() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let observed = {
+        let by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        [UPDATED_DIRECT_OUTBOX, "wss://directory.example"]
+            .map(|relay| RelayEventRecord {
+                event: by_endpoint[relay]
+                    .iter()
+                    .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+                    .unwrap()
+                    .clone(),
+                endpoints: vec![],
+            })
+            .to_vec()
+    };
+    for skipped in [None, Some("wss://directory.example")] {
+        let result = app
+            .directory()
+            .recover_then_lose_selection_for_test(
+                &bob.account_id_hex,
+                observed.clone(),
+                true,
+                skipped
+                    .map(|relay| TransportEndpoint(relay.into()))
+                    .into_iter()
+                    .collect(),
+                &requirements,
+            )
+            .await;
+        if skipped.is_none() {
             assert!(
                 matches!(
-                    selected,
+                    result,
                     Err(DirectoryError::KeyPackageRequirements(
                         cgka_traits::EngineError::MissingRequiredCapabilities { .. }
                     ))
                 ),
-                "{selected:?}"
+                "{result:?}"
             );
         } else {
             assert!(
                 matches!(
-                    &selected,
+                    &result,
                     Err(DirectoryError::DirectoryLookupIncomplete(account))
                         if account == &bob.account_id_hex
                 ),
-                "{selected:?}"
+                "{result:?}"
             );
         }
     }

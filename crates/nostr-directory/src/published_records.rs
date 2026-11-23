@@ -27,6 +27,10 @@ use transport_nostr_peeler::NostrTransportEvent;
 use super::unix_now_seconds;
 use crate::error::{DirectoryError, MissingKeyPackageReason};
 use crate::{DirectoryKeyPackage, UserDirectoryRecord};
+use storage_sqlite::{
+    PublicKeyPackageBarrierKind, PublicKeyPackageBarrierRecord, PublicKeyPackageEvidenceSnapshot,
+    PublicKeyPackageReplacementRecord,
+};
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -575,6 +579,55 @@ struct RankedKeyPackage {
     key_package_ref: Vec<u8>,
 }
 
+/// What the shared KeyPackage journal knows about an account's slots and
+/// deletions. Selection applies it to every candidate, so a relay that no
+/// longer serves a replacement or deletion cannot revive what it barred.
+pub(crate) struct KeyPackageJournalFence {
+    snapshot: PublicKeyPackageEvidenceSnapshot,
+    now: u64,
+    future_skew_secs: u64,
+}
+
+impl KeyPackageJournalFence {
+    pub(crate) fn new(
+        snapshot: PublicKeyPackageEvidenceSnapshot,
+        now: u64,
+        future_skew_secs: u64,
+    ) -> Self {
+        Self {
+            snapshot,
+            now,
+            future_skew_secs,
+        }
+    }
+
+    fn allows(&self, event_id: &str, slot: &str, created_at: u64) -> bool {
+        let snapshot = &self.snapshot;
+        let watermark_allows = |barrier: &PublicKeyPackageBarrierRecord| {
+            watermark_allows(
+                event_id,
+                created_at,
+                self.now,
+                self.future_skew_secs,
+                barrier,
+            )
+        };
+        snapshot.barriers.iter().all(|barrier| {
+            (barrier.deleted_event_id.is_none() && barrier.key_package_id != slot)
+                || barrier_allows(event_id, created_at, barrier)
+        }) && snapshot.watermark.as_ref().is_none_or(watermark_allows)
+            && snapshot
+                .global_eviction
+                .as_ref()
+                .is_none_or(watermark_allows)
+            && snapshot
+                .replacements
+                .iter()
+                .filter(|replacement| replacement.key_package_id == slot)
+                .all(|replacement| replacement_allows(event_id, created_at, replacement))
+    }
+}
+
 /// Select the account's KeyPackages to add (`foundation/key-packages.md`,
 /// "Selection and lifecycle"; `transports/nostr.md`, "KeyPackage
 /// publication" and "Slot deletion").
@@ -602,12 +655,24 @@ pub fn select_key_packages_from_records(
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
 ) -> Result<KeyPackageSelection, DirectoryError> {
+    select_fenced_key_packages(account_id_hex, records, freshness, requirements, None)
+}
+
+/// [`select_key_packages_from_records`], skipping every publication `fence`
+/// knows was replaced or deleted.
+pub(crate) fn select_fenced_key_packages(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    fence: Option<&KeyPackageJournalFence>,
+) -> Result<KeyPackageSelection, DirectoryError> {
     let SlotCandidates {
         mut candidates,
         newest_error,
         rejected_future,
         legacy_slots,
-    } = slot_candidates(account_id_hex, records, freshness, requirements);
+    } = slot_candidates(account_id_hex, records, freshness, requirements, fence);
     if candidates.is_empty()
         && let Some(error) = newest_error
     {
@@ -658,6 +723,7 @@ fn slot_candidates(
     records: &[RelayEventRecord],
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    fence: Option<&KeyPackageJournalFence>,
 ) -> SlotCandidates {
     let deletions = verified_deletions(account_id_hex, records);
     let mut records = records
@@ -687,7 +753,9 @@ fn slot_candidates(
             slot,
             record.event.created_at,
             &deletions,
-        ) {
+        ) || fence
+            .is_some_and(|fence| !fence.allows(&record.event.id, slot, record.event.created_at))
+        {
             continue;
         }
         let (fetched, metadata) = match key_package_and_metadata_from_borrowed_record(record) {
@@ -828,7 +896,7 @@ pub fn account_key_package_slots_from_records(
     });
     let complete = complete && !key_package_read_page_full(account, records);
     let reached = complete || records.iter().any(|record| record.event.pubkey == account);
-    let candidates = slot_candidates(account, records, freshness, None).candidates;
+    let candidates = slot_candidates(account, records, freshness, None, None).candidates;
     let current_slots = candidates
         .iter()
         .map(|candidate| candidate.fetched.key_package_id.clone())
@@ -1241,4 +1309,65 @@ pub fn require_multi_value_key_package_tag_matches(
 
 pub(crate) fn is_zero_u64(value: &u64) -> bool {
     *value == 0
+}
+
+pub(crate) fn replacement_allows(
+    event_id: &str,
+    created_at: u64,
+    replacement: &PublicKeyPackageReplacementRecord,
+) -> bool {
+    event_id == replacement.event_id_hex
+        || created_at > replacement.event_created_at
+        || (created_at == replacement.event_created_at
+            && event_id < replacement.event_id_hex.as_str())
+}
+
+pub(crate) fn barrier_allows(
+    event_id: &str,
+    created_at: u64,
+    barrier: &PublicKeyPackageBarrierRecord,
+) -> bool {
+    match barrier.kind {
+        PublicKeyPackageBarrierKind::Replacement => {
+            event_id == barrier.event_id_hex
+                || created_at > barrier.event_created_at
+                || (created_at == barrier.event_created_at
+                    && event_id < barrier.event_id_hex.as_str())
+        }
+        PublicKeyPackageBarrierKind::Deletion => {
+            if barrier
+                .deleted_event_id
+                .as_deref()
+                .is_some_and(|deleted| deleted.eq_ignore_ascii_case(event_id))
+            {
+                return false;
+            }
+            if barrier.deleted_event_id.is_some() {
+                return true;
+            }
+            created_at > barrier.event_created_at
+        }
+        PublicKeyPackageBarrierKind::ExactDeletion => created_at > barrier.observed_at,
+    }
+}
+
+pub(crate) fn watermark_allows(
+    event_id: &str,
+    created_at: u64,
+    now: u64,
+    future_skew_secs: u64,
+    barrier: &PublicKeyPackageBarrierRecord,
+) -> bool {
+    if barrier
+        .observed_at
+        .saturating_add(KEY_PACKAGE_FRESHNESS.as_secs())
+        .saturating_add(future_skew_secs)
+        <= now
+    {
+        return true;
+    }
+    if barrier.kind == PublicKeyPackageBarrierKind::ExactDeletion {
+        return created_at > barrier.observed_at.saturating_add(future_skew_secs);
+    }
+    barrier_allows(event_id, created_at, barrier)
 }
