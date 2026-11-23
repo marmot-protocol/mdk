@@ -5009,10 +5009,10 @@ impl AppClient {
 
     /// An explicit create/Welcome arrival also clears the departed copy's archive flag.
     ///
-    /// A Welcome back into a chat the account was removed from or left also
-    /// records the other member's add of the account, the row the adder's own
-    /// copy shows. It commits with the restore, so a replayed Welcome, which
-    /// finds the account a member again, adds no second row.
+    /// Another member's Welcome back into a chat the account was removed from
+    /// or left also records that member's add of the account, the row the
+    /// adder's own copy shows. It commits with the restore, so a replayed
+    /// Welcome, which finds the account a member again, adds no second row.
     fn restore_joined_self_membership(
         &mut self,
         event: &cgka_traits::engine::GroupEvent,
@@ -5024,31 +5024,19 @@ impl AppClient {
         let storage = self.app.account_storage(&self.state.label)?;
         let (restored, readded) =
             cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
-                // A sibling's Welcome is this account's own; the invitation
-                // that re-admitted the sibling's copy names who added it.
-                let adder = match event {
-                    cgka_traits::engine::GroupEvent::GroupJoined {
-                        welcomer: Some(welcomer),
-                        forwarded,
-                        ..
-                    } if *welcomer == self_id => forwarded
-                        .inviter
-                        .map(|inviter| cgka_traits::MemberId::new(inviter.to_vec())),
+                // A sibling's Welcome (this account's own) names no adder at
+                // the epoch the add happened, so it records none.
+                let readded = match event {
                     cgka_traits::engine::GroupEvent::GroupJoined {
                         welcomer: Some(welcomer),
                         ..
-                    } => Some(welcomer.clone()),
-                    _ => None,
-                };
-                let readded = match adder {
-                    Some(adder)
-                        if adder != self_id
-                            && matches!(
-                                storage.app_storage().group_self_membership(&group_id_hex)?,
-                                Some(SelfMembership::Removed | SelfMembership::Left)
-                            ) =>
+                    } if *welcomer != self_id
+                        && matches!(
+                            storage.app_storage().group_self_membership(&group_id_hex)?,
+                            Some(SelfMembership::Removed | SelfMembership::Left)
+                        ) =>
                     {
-                        self.record_readded_system_row(storage, group_id, &adder, &self_id)?
+                        self.record_readded_system_row(storage, group_id, welcomer, &self_id)?
                     }
                     _ => None,
                 };

@@ -831,7 +831,7 @@ but deliberately leaves out two kinds of timeline rows, so a chat's imported str
   checked against the message's id. The deletion itself is imported, so the content never reappears if the message
   arrives later.
 
-Backups carry the same rows. Changes made after the device joined show as usual. To explain the gap, a host can say
+A backup leaves out the same two kinds of rows. Changes made after the device joined show as usual. To explain the gap, a host can say
 that group changes and deleted messages from before this device was linked are not shown.
 
 `MarmotAppRuntime::chat_history_imports(account_ref)` lists each held chat whose history is `Receiving` (a delivery

@@ -16,6 +16,11 @@
 - `send_custom_event_with_client_token`: durable token admission of an app-defined event, such as an answer or a
   control for an agent (kind 1202), so a retry after a restart does not send it twice.
 
+### Fixed
+
+- An admin's own message deletion now reports `deletionSource: Author`, and a member added back to a chat after being
+  removed or leaving gets a "member added" `groupSystem` row naming who added them.
+
 ## 0.19.0 - 2026-11-22
 
 ### Breaking changes

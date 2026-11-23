@@ -6826,6 +6826,33 @@ async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
     runtime.shutdown().await;
 }
 
+/// The account's timeline rows recording `subject_id_hex` being added to the
+/// group, with their row ids.
+fn member_added_rows(
+    app: &MarmotApp,
+    account: &str,
+    group_id_hex: &str,
+    subject_id_hex: &str,
+) -> Vec<(String, storage_sqlite::GroupSystemEventProjection)> {
+    app.timeline_messages_with_query(
+        account,
+        TimelineMessageQuery {
+            group_id_hex: Some(group_id_hex.to_owned()),
+            ..TimelineMessageQuery::default()
+        },
+    )
+    .unwrap()
+    .messages
+    .into_iter()
+    .filter_map(|message| {
+        let event = message.group_system?;
+        (event.system_type == "member_added"
+            && event.subject_account_id_hex.as_deref() == Some(subject_id_hex))
+        .then_some((message.message_id_hex, event))
+    })
+    .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
     let dir = tempfile::tempdir().unwrap();
@@ -6841,6 +6868,7 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
     let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
+    let alice_label = alice.account.label.clone();
     let bob_label = bob.account.label.clone();
     let mut events = runtime.subscribe();
 
@@ -6923,6 +6951,10 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
         "authoritative removal leaves no pending invite to accept"
     );
     assert!(removed.archived);
+    assert!(
+        member_added_rows(&app, &bob_label, &group_id_hex, &bob_id).is_empty(),
+        "a first join records no add of the joiner"
+    );
     let removed_bytes = serde_json::to_vec(&removed).unwrap();
     let mut stale_accept_events = runtime.subscribe();
 
@@ -7009,6 +7041,26 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
             .any(|group| group.group_id_hex == group_id_hex),
         "the re-added group should be visible instead of stuck in the removed state"
     );
+    // Bob joins from the Welcome and never reads the commit that re-added him,
+    // so his timeline records the add itself: alice's row, under its id.
+    let bob_rows = member_added_rows(&app, &bob_label, &group_id_hex, &bob_id);
+    assert_eq!(bob_rows.len(), 1, "one add row for bob; got {bob_rows:?}");
+    let (readded_row_id, readded_row) = &bob_rows[0];
+    assert_eq!(
+        readded_row.actor_account_id_hex.as_deref(),
+        Some(alice_id.as_str())
+    );
+    // Hosts render membership rows only as authenticated group state.
+    assert_eq!(
+        readded_row.provenance,
+        marmot_app::GroupSystemEventProvenance::AuthenticatedGroupState
+    );
+    let alice_rows = member_added_rows(&app, &alice_label, &group_id_hex, &bob_id);
+    assert!(
+        alice_rows.iter().any(|(id, _)| id == readded_row_id),
+        "bob's row is the adder's row; alice holds {alice_rows:?}"
+    );
+    let readded_row_id = readded_row_id.clone();
     let bob_members = runtime.group_members(&bob_id, &group_id).await.unwrap();
     assert!(
         bob_members
@@ -7053,6 +7105,15 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
         .await
         .expect("accepted re-invite must survive account-worker restart");
     assert_eq!(restarted.self_membership, SelfMembership::Member);
+    let restarted_rows = member_added_rows(&app, &bob_label, &group_id_hex, &bob_id);
+    assert_eq!(
+        restarted_rows
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        [readded_row_id.as_str()],
+        "a restart adds no second add row"
+    );
     let restarted_projection = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
     assert!(!restarted_projection.pending_confirmation);
     assert!(!restarted_projection.archived);
@@ -9598,99 +9659,6 @@ async fn relay_app_runtime_synthesizes_system_row_for_own_invite() {
         has_added_row,
         "alice's own invite should synthesize a member_added row; got {:?}",
         alice_timeline.messages
-    );
-}
-
-/// A member removed and invited back joins from the Welcome and never reads
-/// the commit that re-added it, so its timeline records the add itself: the
-/// same row, under the same id, that the adder's timeline holds.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn readded_member_timeline_records_who_added_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    let alice_id = home.create_account("alice").unwrap().account_id_hex;
-    let bob_id = home.create_account("bob").unwrap().account_id_hex;
-    let (_relay, app, _url) = mock_app(&dir).await;
-    let mut bob = app.client("bob").await.unwrap();
-    bob.publish_key_package().await.unwrap();
-    let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice
-        .create_group("readd row", &["bob"])
-        .await
-        .unwrap()
-        .operation
-        .expect("eligible fixture members");
-    let group_id_hex = hex::encode(group_id.as_slice());
-    bob.sync().await.unwrap();
-    let membership = |app: &MarmotApp| {
-        app.group("bob", &group_id_hex)
-            .unwrap()
-            .unwrap()
-            .self_membership
-    };
-    let member_added_rows = |account: &str| {
-        app.timeline_messages_with_query(
-            account,
-            TimelineMessageQuery {
-                group_id_hex: Some(group_id_hex.clone()),
-                ..TimelineMessageQuery::default()
-            },
-        )
-        .unwrap()
-        .messages
-        .into_iter()
-        .filter_map(|message| {
-            let event = message.group_system?;
-            (event.system_type == "member_added"
-                && event.subject_account_id_hex.as_deref() == Some(bob_id.as_str()))
-            .then_some((message.message_id_hex, event))
-        })
-        .collect::<Vec<_>>()
-    };
-
-    alice.remove_members(&group_id, &["bob"]).await.unwrap();
-    timeout(Duration::from_secs(20), async {
-        while membership(&app) != SelfMembership::Removed {
-            bob.sync().await.unwrap();
-            bob.retry_group_convergence(&group_id).await.unwrap();
-            sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("bob observes his removal: {:?}", membership(&app)));
-    assert!(
-        member_added_rows("bob").is_empty(),
-        "a first join records no add of its own"
-    );
-
-    bob.publish_key_package().await.unwrap();
-    alice.invite_members(&group_id, &["bob"]).await.unwrap();
-    timeout(Duration::from_secs(20), async {
-        while membership(&app) != SelfMembership::Member {
-            bob.sync().await.unwrap();
-            sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("bob rejoins from the Welcome");
-    bob.sync().await.unwrap();
-
-    let bob_rows = member_added_rows("bob");
-    assert_eq!(bob_rows.len(), 1, "one add row for bob; got {bob_rows:?}");
-    let (bob_row_id, event) = &bob_rows[0];
-    assert_eq!(
-        event.actor_account_id_hex.as_deref(),
-        Some(alice_id.as_str())
-    );
-    // Hosts render membership rows only as authenticated group state.
-    assert_eq!(
-        event.provenance,
-        marmot_app::GroupSystemEventProvenance::AuthenticatedGroupState
-    );
-    let alice_rows = member_added_rows("alice");
-    assert!(
-        alice_rows.iter().any(|(id, _)| id == bob_row_id),
-        "bob's row is the adder's row; bob holds {bob_rows:?}, alice holds {alice_rows:?}"
     );
 }
 
