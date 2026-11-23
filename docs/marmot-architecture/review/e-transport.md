@@ -1,7 +1,7 @@
 ---
 title: "Review Pass 1 — E: Transport Plane"
 created: 2026-10-15
-updated: 2026-10-15
+updated: 2026-11-23
 tags: [marmot, architecture, review, pass-1, transport, nostr, large-groups]
 status: draft for discussion
 ---
@@ -20,7 +20,7 @@ marks claims reasoned from code but not traced at runtime.
   strfry relays at about 56 members, and the White Noise relays' 2 MiB limit at about 1,917. A group of thousands
   cannot be joined by Welcome today, even on our own relays.
 - **From about 81 members, Welcomes need NIP-44's extended length format.** NIP-44 v2 uses a 6-byte length prefix for
-  plaintexts of 65,536 bytes or more. The pinned rust-nostr fork implements it, but libraries that implement only the
+  plaintexts of 65,536 bytes or more. The pinned upstream `nostr` implements it, but libraries that implement only the
   older 2-byte format cannot handle these Welcomes. Whether other Marmot implementations support it is unverified.
 - **Commits are not the near-term problem on our relays.** They grow about 109 bytes per member in the worst case, so
   they stay under 2 MiB until about 19,000 members. On 64 KiB public relays they would fail from about 586 members, but
@@ -90,9 +90,9 @@ Where the bytes come from:
   of 1,000 publishes about 52 MB per relay.
 
 **NIP-44 length format.** NIP-44 v2 encodes plaintexts of 65,536 bytes or more with a 6-byte length prefix (two zero
-bytes and a `u32`), up to 2³²−1 bytes. The pinned fork
-([`erskingardner/rust-nostr@a9c7a64`](https://github.com/erskingardner/rust-nostr/tree/a9c7a6423d104c603de6ea8244265ea17f0f9d89))
-implements this (`nostr/src/nips/nip44/v2.rs:26-29`, `:98-110` in the fork). Older implementations cap plaintext just
+bytes and a `u32`), up to 2³²−1 bytes. The pinned upstream revision
+([`nostrdevkit/nostr@4904ffb8`](https://github.com/nostrdevkit/nostr/tree/4904ffb85f60178375a1dda659a61793f36f03b8))
+implements this (`nostr/src/nips/nip44/v2.rs`). Older implementations cap plaintext just
 below 64 KiB: upstream `nostr` 0.44.8 could not wrap a 64-member Welcome at all
 ([#1638](https://github.com/marmot-protocol/mdk/issues/1638)). A gift wrap's plaintext needs the extended format from
 about 81 members for one invitee, 69 for ten, and 11 for fifty. Clients whose NIP-44 library predates the extended

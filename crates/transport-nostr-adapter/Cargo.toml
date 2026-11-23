@@ -36,6 +36,6 @@ transport-nostr-peeler.workspace = true
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
-nostr-memory = { git = "https://github.com/erskingardner/rust-nostr", rev = "e93cc06b5624f06c21ecd8111a124176eb0c7589" }
+nostr-memory = { git = "https://github.com/nostrdevkit/nostr", rev = "4904ffb85f60178375a1dda659a61793f36f03b8" }
 nostr-relay-builder.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }

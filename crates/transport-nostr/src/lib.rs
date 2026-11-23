@@ -16,7 +16,6 @@ use cgka_traits::{
     TransportPublishRequest, TransportReadBack,
 };
 use futures::{FutureExt, Stream, StreamExt, stream::FuturesUnordered};
-use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, ClientNotification, Filter, Kind, PublicKey, RelayMessage, RelayUrl,
     SingleLetterTag, SubscriptionId, Timestamp as NostrTimestamp,
@@ -26,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at};
+use transport_nostr_adapter::NotificationUpdate;
 use transport_nostr_adapter::{
     AccountSubscriptionEose, AccountSubscriptionInput, NostrAcquisitionCancellation,
     NostrAcquisitionError, NostrAcquisitionRequest, NostrAcquisitionResult,
@@ -2486,7 +2486,7 @@ impl MarmotRelayPlane {
                     .send(DirectoryRelayPlaneEvent::RecoveryRequired);
             }
             *forwarder = Some(spawn_directory_notification_forwarder(
-                client.notifications_with_gaps(),
+                Box::pin(transport_nostr_adapter::with_gaps(client.notifications())),
                 self.inner.transport.directory_events.clone(),
                 self.inner.directory.clone(),
             ));

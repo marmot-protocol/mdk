@@ -15,7 +15,7 @@ struct Transport {
 impl Transport {
     fn new(proxy: Option<Arc<network_proxy::ProxyConfig>>) -> Self {
         let client = network_proxy::nostr_builder(Ok(proxy)).build();
-        let notifications = client.notifications();
+        let notifications = Box::pin(client.notifications());
         Self {
             client,
             notifications,
@@ -113,7 +113,7 @@ impl Transport {
         let deadline = tokio::time::Instant::now() + RELAY_READY_WAIT;
         while !awaiting.is_empty() {
             match tokio::time::timeout_at(deadline, self.notifications.next()).await {
-                Ok(Some(ClientNotification::Message { relay_url, message })) if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(received) if received.as_ref() == &id) =>
+                Ok(Some(ClientNotification::Message { relay_url, message })) if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents { subscription_id: received, .. } if received.as_ref() == &id) =>
                 {
                     awaiting.remove(&relay_url);
                 }

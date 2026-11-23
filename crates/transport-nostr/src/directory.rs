@@ -5,7 +5,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
-use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, Event, EventId, Filter, Kind, PublicKey, RelayMessage,
     RelayNotification, RelayStatus, RelayUrl, SingleLetterTag, SubscribeAutoCloseOptions,
@@ -15,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+use transport_nostr_adapter::NotificationUpdate;
 use transport_nostr_adapter::{
     FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests, KIND_MARMOT_KEY_PACKAGE,
     NostrAcquisitionCancellation as CancellationToken, RELAY_REPLAY_PAGE_LIMIT,
@@ -1120,7 +1120,9 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         // EOSE window below is the relay's answer time alone.
         match timeout(
             DIRECTORY_RELAY_CONNECT_WAIT,
-            client.try_connect_relay(url.clone(), DIRECTORY_RELAY_CONNECT_WAIT),
+            client
+                .try_connect_relay(url.clone())
+                .timeout(DIRECTORY_RELAY_CONNECT_WAIT),
         )
         .await
         {
@@ -1282,7 +1284,7 @@ async fn strict_fetch_endpoint(
     }
 
     let max_records = queries.iter().map(|query| query.limit).sum::<usize>();
-    let mut notifications = relay.notifications_with_gaps();
+    let mut notifications = transport_nostr_adapter::with_gaps(relay.notifications());
     let mut records = Vec::new();
     let mut seen_event_ids = HashSet::new();
     // Every subscription this connection has carried. The wire counter sees
@@ -1320,124 +1322,119 @@ async fn strict_fetch_endpoint(
         // fills this chunk's queries toward their limits. Only the returned
         // records are deduplicated across chunks.
         let mut chunk_event_ids = HashSet::new();
-        let chunk_complete =
-            timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
-                loop {
-                    let received = match notifications.next().await {
-                        Some(NotificationUpdate::Notification(RelayNotification::Event {
+        let chunk_complete = timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
+            loop {
+                let received = match notifications.next().await {
+                    Some(NotificationUpdate::Notification(RelayNotification::Event {
+                        subscription_id: received_id,
+                        event,
+                    })) if received_id == subscription_id => Some((*event, false)),
+                    Some(NotificationUpdate::Notification(RelayNotification::Message {
+                        message,
+                    })) => match *message {
+                        RelayMessage::Event {
                             subscription_id: received_id,
                             event,
-                        })) if received_id == subscription_id => Some((*event, false)),
-                        Some(NotificationUpdate::Notification(RelayNotification::Message {
-                            message,
-                        })) => match *message {
-                            RelayMessage::Event {
-                                subscription_id: received_id,
-                                event,
-                            } if received_id.as_ref() == &subscription_id => {
-                                admitted_messages += 1;
-                                Some((event.into_owned(), false))
-                            }
-                            RelayMessage::Event {
-                                subscription_id: received_id,
-                                event,
-                            } if issued.contains(received_id.as_ref()) => {
-                                admitted_messages += 1;
-                                Some((event.into_owned(), true))
-                            }
-                            RelayMessage::EndOfStoredEvents(received_id)
-                                if received_id.as_ref() == &subscription_id =>
-                            {
-                                // A filter that reaches its limit cannot establish absence,
-                                // and neither can one that reaches the page a relay
-                                // silently clamps every REQ to. A frame discarded before
-                                // notifications cannot establish negative coverage, even
-                                // after EOSE.
-                                break wire.event_count() == admitted_messages
-                                    && queries.iter().zip(&query_counts).all(|(query, count)| {
-                                        *count < query.limit.min(RELAY_REPLAY_PAGE_LIMIT)
-                                    });
-                            }
-                            RelayMessage::Closed {
-                                subscription_id: received_id,
-                                ..
-                            } if received_id.as_ref() == &subscription_id => break false,
-                            _ => None,
-                        },
-                        Some(NotificationUpdate::Notification(
-                            RelayNotification::AuthenticationFailed,
-                        )) => {
-                            break false;
+                        } if received_id.as_ref() == &subscription_id => {
+                            admitted_messages += 1;
+                            Some((event.into_owned(), false))
                         }
-                        Some(NotificationUpdate::Notification(
-                            RelayNotification::RelayStatus {
-                                status:
-                                    RelayStatus::Disconnected
-                                    | RelayStatus::Terminated
-                                    | RelayStatus::Banned,
-                            },
-                        )) => {
-                            break false;
+                        RelayMessage::Event {
+                            subscription_id: received_id,
+                            event,
+                        } if issued.contains(received_id.as_ref()) => {
+                            admitted_messages += 1;
+                            Some((event.into_owned(), true))
                         }
-                        // Lag may have dropped an inbox EVENT immediately before
-                        // EOSE. Continuing cannot establish absence safely.
-                        Some(NotificationUpdate::Lagged { .. }) | None => break false,
-                        _ => None,
-                    };
-                    if let Some((event, late)) = received {
-                        if event.verify().is_err() {
-                            continue;
-                        }
-                        let Ok(event) = NostrTransportEvent::from_nostr_event(&event) else {
-                            continue;
-                        };
-                        if late {
-                            // An earlier chunk's subscription, after that chunk
-                            // settled: keep the record, but it says nothing about
-                            // this chunk's queries.
-                            if all_queries.iter().any(|query| query.matches(&event))
-                                && records.len() < max_records
-                                && seen_event_ids.insert(event.id.clone())
-                            {
-                                records.push(DirectoryRelayEventRecord {
-                                    endpoints: vec![endpoint.clone()],
-                                    event,
+                        RelayMessage::EndOfStoredEvents {
+                            subscription_id: received_id,
+                            ..
+                        } if received_id.as_ref() == &subscription_id => {
+                            // A filter that reaches its limit cannot establish absence,
+                            // and neither can one that reaches the page a relay
+                            // silently clamps every REQ to. A frame discarded before
+                            // notifications cannot establish negative coverage, even
+                            // after EOSE.
+                            break wire.event_count() == admitted_messages
+                                && queries.iter().zip(&query_counts).all(|(query, count)| {
+                                    *count < query.limit.min(RELAY_REPLAY_PAGE_LIMIT)
                                 });
-                            }
-                            continue;
                         }
-                        if !queries.iter().any(|query| query.matches(&event)) {
-                            // A filter-ignoring relay cannot establish a complete empty
-                            // scoped deletion result by filling its page with other posts.
-                            if queries.iter().any(|query| query.reference.is_some()) {
-                                break false;
-                            }
-                            continue;
-                        }
-                        if !chunk_event_ids.insert(event.id.clone()) {
-                            continue;
-                        }
-                        for (query, count) in queries.iter().zip(&mut query_counts) {
-                            if query.matches(&event) {
-                                *count += 1;
-                            }
-                        }
-                        if !seen_event_ids.insert(event.id.clone()) {
-                            continue;
-                        }
-                        if records.len() < max_records {
+                        RelayMessage::Closed {
+                            subscription_id: received_id,
+                            ..
+                        } if received_id.as_ref() == &subscription_id => break false,
+                        _ => None,
+                    },
+                    Some(NotificationUpdate::Notification(
+                        RelayNotification::AuthenticationFailed,
+                    )) => {
+                        break false;
+                    }
+                    Some(NotificationUpdate::Notification(RelayNotification::RelayStatus {
+                        status: RelayStatus::Disconnected | RelayStatus::Idle | RelayStatus::Banned,
+                    })) => {
+                        break false;
+                    }
+                    // Lag may have dropped an inbox EVENT immediately before
+                    // EOSE. Continuing cannot establish absence safely.
+                    Some(NotificationUpdate::Lagged { .. }) | None => break false,
+                    _ => None,
+                };
+                if let Some((event, late)) = received {
+                    if event.verify().is_err() {
+                        continue;
+                    }
+                    let Ok(event) = NostrTransportEvent::from_nostr_event(&event) else {
+                        continue;
+                    };
+                    if late {
+                        // An earlier chunk's subscription, after that chunk
+                        // settled: keep the record, but it says nothing about
+                        // this chunk's queries.
+                        if all_queries.iter().any(|query| query.matches(&event))
+                            && records.len() < max_records
+                            && seen_event_ids.insert(event.id.clone())
+                        {
                             records.push(DirectoryRelayEventRecord {
                                 endpoints: vec![endpoint.clone()],
                                 event,
                             });
-                        } else {
+                        }
+                        continue;
+                    }
+                    if !queries.iter().any(|query| query.matches(&event)) {
+                        // A filter-ignoring relay cannot establish a complete empty
+                        // scoped deletion result by filling its page with other posts.
+                        if queries.iter().any(|query| query.reference.is_some()) {
                             break false;
                         }
+                        continue;
+                    }
+                    if !chunk_event_ids.insert(event.id.clone()) {
+                        continue;
+                    }
+                    for (query, count) in queries.iter().zip(&mut query_counts) {
+                        if query.matches(&event) {
+                            *count += 1;
+                        }
+                    }
+                    if !seen_event_ids.insert(event.id.clone()) {
+                        continue;
+                    }
+                    if records.len() < max_records {
+                        records.push(DirectoryRelayEventRecord {
+                            endpoints: vec![endpoint.clone()],
+                            event,
+                        });
+                    } else {
+                        break false;
                     }
                 }
-            })
-            .await
-            .unwrap_or(false);
+            }
+        })
+        .await
+        .unwrap_or(false);
         let _ = relay.unsubscribe(&subscription_id).await;
         // Later chunks still run: their records are usable even when this
         // chunk cannot establish absence.

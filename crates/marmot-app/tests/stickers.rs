@@ -10,7 +10,9 @@
 //! - Pack reads also reach the runtime's configured relays; the installed list
 //!   still publishes only to the account's relays.
 //! - Emoji set reads use the same relays as pack reads.
-
+// These tests read a relay's stored events with nostr-sdk's `fetch_events`,
+// which upstream deprecates in favour of `stream_events`.
+#![allow(deprecated)]
 // Test fixtures dial local relays directly; the proxy policy is crate-private.
 #![allow(clippy::disallowed_methods)]
 

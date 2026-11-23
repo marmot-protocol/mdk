@@ -243,10 +243,9 @@ for reconnect/backoff and relay status mechanics.
   withheld id, a filled set or a cut leaves its window unproven, and a window that cannot shrink below one second
   ends `SaturatedWindow`. Certify oldest first, so a cut proves the prefix below the oldest unfetched difference.
   A relay without NIP-77 or a refused comparison proves nothing and ends the call; never read it as an empty set.
-- No NIP-67 hint proves a slice; only counting does. `more` splits, and `finish` is never read: hints reach the sweep
-  only off the wire, where a misread `finish` would skip history while a misread `more` only costs requests, so an
-  EOSE the SDK takes whose hints cannot be read counts as `more`. Do not
-  add a hint-based `SliceProof` until nostr-sdk surfaces hints itself.
+- No NIP-67 hint proves a slice; only counting does. `more` splits, and `finish` is never read: a misread `finish`
+  would skip history while a misread `more` only costs requests. The collector takes hints from nostr-sdk's typed
+  EOSE (`RelayMessage::EndOfStoredEvents { hints }`). Do not add a hint-based `SliceProof`.
 - Every `SdkSweepRelay` REQ and every `acquire_history` request is a finite request (`src/finite_req.rs`), which
   `NostrSdkRelayClient::from_builder` installs under the builder's transport; a client built with `new` cannot make
   one: its sweep relays read as unreachable and `acquire_history` returns `Unsupported`. A finite request's id starts with `ID_PREFIX`, which no SDK or adapter id does. Its REQ goes out through

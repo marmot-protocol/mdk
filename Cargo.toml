@@ -109,9 +109,9 @@ zeroize = "1"
 # in the lockfile through nostr's NIP-06 support.
 bip39 = { version = "2.2.2", default-features = false, features = ["std", "zeroize"] }
 keyring-core = "1"
-nostr = { git = "https://github.com/erskingardner/rust-nostr", rev = "e93cc06b5624f06c21ecd8111a124176eb0c7589", default-features = false, features = ["std", "rand", "os-rng", "nip04", "nip49", "nip59"] }
-nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "e93cc06b5624f06c21ecd8111a124176eb0c7589", features = ["local-relay"] }
-nostr-gossip = { git = "https://github.com/erskingardner/rust-nostr", rev = "e93cc06b5624f06c21ecd8111a124176eb0c7589" }
+nostr = { git = "https://github.com/nostrdevkit/nostr", rev = "4904ffb85f60178375a1dda659a61793f36f03b8", default-features = false, features = ["std", "rand", "os-rng", "nip04", "nip49", "nip59"] }
+nostr-sdk = { git = "https://github.com/nostrdevkit/nostr", rev = "4904ffb85f60178375a1dda659a61793f36f03b8", features = ["local-relay"] }
+nostr-gossip = { git = "https://github.com/nostrdevkit/nostr", rev = "4904ffb85f60178375a1dda659a61793f36f03b8" }
 nostr-relay-builder = "0.44"
 # OTLP export (behind the marmot-app `otlp-export` feature): map pre-aggregated
 # relay telemetry straight to the OTLP protobuf and POST it over the existing

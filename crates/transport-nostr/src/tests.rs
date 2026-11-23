@@ -747,9 +747,7 @@ async fn busy_notification_worker_absorbs_rebuild_replay_without_loss() {
         .sender
         .send(RelayPoolNotification::Message {
             relay_url,
-            message: Box::new(RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
-                subscription_id,
-            ))),
+            message: Box::new(RelayMessage::eose(subscription_id)),
         })
         .expect("supervisor has an active receiver");
 
@@ -5378,7 +5376,8 @@ async fn directory_endpoint_change_retries_a_batch_left_pending_by_partial_failu
     let relay_url = RelayUrl::parse(&new_url).unwrap();
     writer.add_relay(relay_url.clone()).await.unwrap();
     writer
-        .try_connect_relay(relay_url.clone(), Duration::from_secs(5))
+        .try_connect_relay(relay_url.clone())
+        .timeout(Duration::from_secs(5))
         .await
         .unwrap();
     let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"bob"}"#)
@@ -6009,9 +6008,7 @@ async fn supervised_notification_lag_delivers_later_inbound_exactly_once() {
     .expect("the resumed consumer stages the exact later ciphertext");
     source.send(RelayPoolNotification::Message {
         relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
-        message: Box::new(RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
-            SubscriptionId::new(group_subscription),
-        ))),
+        message: Box::new(RelayMessage::eose(SubscriptionId::new(group_subscription))),
     });
     let first_delivery = timeout(Duration::from_secs(1), adapter.receive())
         .await

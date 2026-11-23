@@ -47,18 +47,18 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::NotificationUpdate;
 use async_wsocket::Message;
 use futures::{SinkExt, Stream, StreamExt, stream};
 use nostr::filter::MatchEventOptions;
 use nostr::message::relay::RelayMessage;
-use nostr_sdk::NotificationUpdate;
+use nostr::nips::nip67::EoseHint;
 use nostr_sdk::prelude::{
     AdmitPolicy, AdmitStatus, ClientBuilder, ClientMessage, DatabaseEventStatus, Event, EventId,
     Filter, NostrDatabase, Relay, RelayUrl, Signature, SubscriptionId, Url,
 };
 use nostr_sdk::relay::{RelayEventLimits, RelayNotification};
 use nostr_sdk::transport::websocket::{WebSocketSink, WebSocketStream, WebSocketTransport};
-use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -390,7 +390,7 @@ impl FiniteRequests {
     pub fn watch_auth(&self, relay: &Relay) -> Option<AuthWatch> {
         self.0
             .can_authenticate
-            .then(|| AuthWatch(relay.notifications_with_gaps()))
+            .then(|| AuthWatch(Box::pin(crate::with_gaps(relay.notifications()))))
     }
 
     /// Ask `relay` for `filter`'s events until its EOSE, within `limits`. A
@@ -717,11 +717,8 @@ impl<'a> Collector<'a> {
         };
         match message {
             RelayMessage::Event { event, .. } => self.event(event.into_owned(), text.len()).await,
-            RelayMessage::EndOfStoredEvents(_) => {
-                // An EOSE the SDK takes but serde_json cannot read whole (a
-                // trailing number out of range) may say `more`: it does.
-                self.more = serde_json::from_str::<Value>(json)
-                    .map_or(true, |frame| says_more(frame.get(2)));
+            RelayMessage::EndOfStoredEvents { hints, .. } => {
+                self.more = hints.is_some_and(|hints| hints.contains(&EoseHint::More));
                 Some(FiniteEnd::Eose)
             }
             RelayMessage::Closed { message, .. } => Some(FiniteEnd::Closed(message.into_owned())),
@@ -842,14 +839,6 @@ impl<'a> Collector<'a> {
             end,
         }
     }
-}
-
-/// Whether NIP-67's third EOSE element names `more`. No other name, `finish`
-/// included, changes what a caller does.
-fn says_more(hints: Option<&Value>) -> bool {
-    hints
-        .and_then(Value::as_array)
-        .is_some_and(|names| names.iter().any(|name| name.as_str() == Some("more")))
 }
 
 /// How the wrapper reads a frame the relay sent.
@@ -1369,13 +1358,18 @@ mod tests {
         assert!(reply.more);
         let reply = collect(&filter, limits(1, 1), &[eose(r#",["finish"]"#)]).await;
         assert!(!reply.more);
-        // The SDK takes this EOSE, skipping what follows the hints; its hints
-        // are unread, so they may say `more`.
-        let unread = eose(r#",["finish"],1e400"#);
-        assert!(RelayMessage::from_json(unread.as_str()).is_ok());
-        let reply = collect(&filter, limits(1, 1), &[unread]).await;
-        assert_eq!(reply.end, FiniteEnd::Eose);
-        assert!(reply.more);
+        // The hints are the SDK's own reading of the frame, whatever follows
+        // them.
+        for (hints, more) in [
+            (r#",["finish"],1e400"#, false),
+            (r#",["more"],1e400"#, true),
+        ] {
+            let frame = eose(hints);
+            assert!(RelayMessage::from_json(frame.as_str()).is_ok());
+            let reply = collect(&filter, limits(1, 1), &[frame]).await;
+            assert_eq!(reply.end, FiniteEnd::Eose);
+            assert_eq!(reply.more, more, "{hints}");
+        }
         let closed =
             RelayMessage::closed(SubscriptionId::new("~f0"), "rate-limited: slow").as_json();
         let reply = collect(&filter, limits(1, 1), &[closed]).await;
@@ -1545,7 +1539,10 @@ mod tests {
                 Ok(RelayMessage::Event {
                     subscription_id, ..
                 }) => assert!(agrees(true, subscription_id.as_str()), "{frame:?}"),
-                Ok(RelayMessage::EndOfStoredEvents(id)) => {
+                Ok(RelayMessage::EndOfStoredEvents {
+                    subscription_id: id,
+                    ..
+                }) => {
                     assert!(agrees(false, id.as_str()), "{frame:?}");
                 }
                 Ok(RelayMessage::Closed {
@@ -1734,7 +1731,8 @@ mod tests {
         let client = builder.websocket_transport(transport).build();
         client.add_relay(url).await.unwrap();
         client
-            .try_connect_relay(url, Duration::from_secs(5))
+            .try_connect_relay(url)
+            .timeout(Duration::from_secs(5))
             .await
             .unwrap();
         (finite, client)
@@ -1820,7 +1818,7 @@ mod tests {
                 match notifications.next().await.expect("notifications ended") {
                 ClientNotification::Message { message, .. } => {
                     assert!(!message.as_json().contains(ID_PREFIX), "{message:?}");
-                    if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(id) if **id == barrier)
+                    if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents { subscription_id: id, .. } if **id == barrier)
                     {
                         break;
                     }
@@ -1880,7 +1878,8 @@ mod tests {
         let client = builder.websocket_transport(transport).build();
         client.add_relay(&url).await.unwrap();
         client
-            .try_connect_relay(&url, Duration::from_secs(5))
+            .try_connect_relay(&url)
+            .timeout(Duration::from_secs(5))
             .await
             .unwrap();
         let sdk_relay = client.relay(&url).await.unwrap().unwrap();
@@ -1959,7 +1958,7 @@ mod tests {
                 let Ws::Text(text) = message else {
                     continue;
                 };
-                let frame: Value = serde_json::from_str(&text).unwrap();
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
                 let replies = match (frame[0].as_str(), frame[1].as_str()) {
                     (Some("REQ"), Some(id)) => {
                         reqs += 1;

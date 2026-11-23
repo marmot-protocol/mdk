@@ -1,3 +1,6 @@
+// These tests read a relay's stored events with nostr-sdk's `fetch_events`,
+// which upstream deprecates in favour of `stream_events`.
+#![allow(deprecated)]
 use crate::*;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;

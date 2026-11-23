@@ -116,7 +116,8 @@ async fn socks5_pins_dns_fail_closed() {
             relays.add_relay(&relay).await.unwrap();
             assert!(
                 relays
-                    .try_connect_relay(&relay, Duration::from_secs(5))
+                    .try_connect_relay(&relay)
+                    .timeout(Duration::from_secs(5))
                     .await
                     .is_err()
             );
@@ -151,7 +152,8 @@ async fn socks5_pins_dns_fail_closed() {
         };
         relays.add_relay(&relay).await.unwrap();
         let connection = relays
-            .try_connect_relay(&relay, Duration::from_secs(5))
+            .try_connect_relay(&relay)
+            .timeout(Duration::from_secs(5))
             .await;
         assert_eq!(connection.is_err(), mode == "rejected");
         relays.shutdown().await;
@@ -169,7 +171,8 @@ async fn socks5_pins_dns_fail_closed() {
         relays.add_relay(&relay).await.unwrap();
         assert!(
             relays
-                .try_connect_relay(&relay, Duration::from_secs(5))
+                .try_connect_relay(&relay)
+                .timeout(Duration::from_secs(5))
                 .await
                 .is_err()
         );
