@@ -13,7 +13,7 @@ use super::resources::DirectoryResources;
 use crate::DirectoryFreshness;
 use crate::published_records::{
     KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, key_package_queries,
-    key_package_read_page_full, select_key_packages_from_records, without_revoked_slot_winners,
+    key_package_read_page_full, select_key_packages_with_evidence, without_revoked_slot_winners,
 };
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome, DirectoryRelayEventRecord};
 
@@ -37,6 +37,9 @@ pub(super) struct KeyPackageRecoveryRequest<'a> {
     pub(super) primary_complete: bool,
     pub(super) discovery: &'a [TransportEndpoint],
     pub(super) requirements: Option<&'a KeyPackageRequirements>,
+    pub(super) prior_evidence: Option<&'a KeyPackageRecoveryEvidence>,
+    /// Retain the supersession and deletion barriers for a possible refresh.
+    pub(super) incompatible_evidence: Option<&'a mut Option<KeyPackageRecoveryEvidence>>,
     /// Public metadata only. Membership callers must never nominate a cache.
     pub(super) cached_target: Option<KeyPackageRecoveryTarget>,
     /// How many of the best-ranked selected candidates to prove undeleted.
@@ -57,19 +60,40 @@ impl<R: DirectoryResources> Directory<R> {
             primary_complete,
             discovery,
             requirements,
+            prior_evidence,
+            incompatible_evidence,
             cached_target,
             wanted,
         } = request;
-        // A full page of KeyPackages or deletion requests hides what lies
-        // past it; recovery's targeted reads cannot show that either.
+        let freshness = self.directory_freshness();
+        // A full page cannot confirm coverage, but observed incompatibility
+        // can still justify looking for current routes during this lookup.
         if key_package_read_page_full(account, &observed) {
+            if let Some(capture) = incompatible_evidence
+                && matches!(
+                    select_key_packages_with_evidence(
+                        account, &observed, freshness, requirements, prior_evidence,
+                    ),
+                    Err(DirectoryError::KeyPackageRequirements(error))
+                        if key_package_requirements_are_incompatible(&error)
+                )
+            {
+                let (_, evidence) =
+                    without_revoked_slot_winners(account, observed.clone(), &observed, freshness);
+                *capture = Some(evidence);
+            }
             return Err(recovery_incomplete(account));
         }
-        let freshness = self.directory_freshness();
         // What the read found is used even when the read was incomplete:
         // every device is sought, not guaranteed (mdk#2628, D12).
-        if select_key_packages_from_records(account, &observed, freshness, requirements)
-            .is_ok_and(|selection| !selection.value.is_empty())
+        if select_key_packages_with_evidence(
+            account,
+            &observed,
+            freshness,
+            requirements,
+            prior_evidence,
+        )
+        .is_ok_and(|selection| !selection.value.is_empty())
         {
             return Ok(RecoveredKeyPackageRecords {
                 freshness,
@@ -144,17 +168,24 @@ impl<R: DirectoryResources> Directory<R> {
                     );
                     // A compatibility refusal describes the recipient's
                     // available packages and requires complete coverage.
-                    let selection = match select_key_packages_from_records(
+                    let selection = match select_key_packages_with_evidence(
                         account,
                         &records,
                         freshness,
                         requirements,
+                        prior_evidence,
                     ) {
                         Err(DirectoryError::KeyPackageRequirements(error))
-                            if !package_coverage
-                                && key_package_requirements_are_incompatible(&error) =>
+                            if key_package_requirements_are_incompatible(&error) =>
                         {
-                            return Err(recovery_incomplete(account));
+                            if let Some(observed) = incompatible_evidence {
+                                *observed = Some(evidence);
+                            }
+                            return Err(if package_coverage {
+                                DirectoryError::KeyPackageRequirements(error)
+                            } else {
+                                recovery_incomplete(account)
+                            });
                         }
                         result => result?,
                     };

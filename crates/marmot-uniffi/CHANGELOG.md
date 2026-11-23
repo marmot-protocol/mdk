@@ -24,6 +24,11 @@
 - `submit_tagged_text`, `submit_tagged_reply`, `submit_thread_message`, and `submit_tagged_sticker` return durable
   local acceptance before relay publication.
 
+### Changed
+
+- A member's `MemberResolutionStatusFfi::IncompatibleKeyPackage` now requires completed relay-list discovery
+  and complete KeyPackage reads. If either is incomplete, the status is `MemberResolutionStatusFfi::Incomplete`.
+
 ### Fixed
 
 - An admin's own message deletion now reports `deletionSource: Author`, and a member added back to a chat after being

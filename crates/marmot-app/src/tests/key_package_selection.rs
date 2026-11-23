@@ -1225,7 +1225,9 @@ async fn direct_start_requires_complete_discovery_for_incompatibility() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_start_refreshes_prewarmed_outbox_on_first_attempt() {
     let old_outbox = "wss://shared.example";
-    for old_outbox_incomplete in [false, true] {
+    for (old_outbox_incomplete, old_outbox_page_full) in
+        [(false, false), (true, false), (false, true)]
+    {
         let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
         app.directory()
             .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
@@ -1239,6 +1241,29 @@ async fn direct_start_refreshes_prewarmed_outbox_on_first_attempt() {
         } else {
             advertise_updated_direct_outbox(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
         }
+        if old_outbox_page_full {
+            let now = unix_now_seconds();
+            let deletions = (0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT)
+                .map(|index| {
+                    signed_deletion(
+                        &app,
+                        &bob,
+                        vec![
+                            slot_address(&bob, &format!("retired-{index}")),
+                            vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+                        ],
+                        now - 100,
+                    )
+                })
+                .collect::<Vec<_>>();
+            fetcher
+                .events_by_endpoint
+                .lock()
+                .unwrap()
+                .get_mut(old_outbox)
+                .unwrap()
+                .extend(deletions);
+        }
         fetcher.requests.lock().unwrap().clear();
         let runtime = MarmotAppRuntime::new(app.clone());
         let created = runtime
@@ -1251,12 +1276,14 @@ async fn direct_start_refreshes_prewarmed_outbox_on_first_attempt() {
             )
             .await
             .unwrap_or_else(|error| {
-                panic!("old outbox incomplete={old_outbox_incomplete}: {error}")
+                panic!(
+                    "old outbox incomplete={old_outbox_incomplete}, page full={old_outbox_page_full}: {error}"
+                )
             });
         let groups = app.groups("alice").unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
-        if old_outbox_incomplete {
+        if old_outbox_incomplete || old_outbox_page_full {
             assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
                 request
                     .endpoints
@@ -1268,6 +1295,204 @@ async fn direct_start_refreshes_prewarmed_outbox_on_first_attempt() {
                     })
             }));
         }
+        runtime.shutdown().await;
+        app.close_storage().unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prewarmed_direct_start_reports_incompatibility_on_first_attempt() {
+    let (_dir, app, bob, _fetcher) = direct_start_outbox_fixture().await;
+    app.directory()
+        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let error = runtime
+        .start_direct_conversation_with_options(
+            "alice",
+            &bob.account_id_hex,
+            crate::DirectConversationOptions {
+                disappearing_message_secs: 300,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::IncompatibleKeyPackage(_)),
+        "{error}"
+    );
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::MissingRequiredCapabilities { .. })
+    ));
+    assert!(app.groups("alice").unwrap().is_empty());
+    runtime.shutdown().await;
+    {
+        let client = app.client("alice").await.unwrap();
+        assert!(client.runtime.live_group_ids().unwrap().is_empty());
+    }
+    app.close_storage().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prewarmed_direct_start_with_compatible_keys_skips_relay_list_reads() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    app.account_home().create_account("alice").unwrap();
+    let bob = &accounts[0];
+    app.directory()
+        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    fetcher.requests.lock().unwrap().clear();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let created = runtime
+        .start_direct_conversation_with_options(
+            "alice",
+            &bob.account_id_hex,
+            crate::DirectConversationOptions {
+                disappearing_message_secs: 300,
+            },
+        )
+        .await
+        .unwrap();
+    let groups = app.groups("alice").unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
+    assert!(fetcher.requests.lock().unwrap().iter().all(|request| {
+        request.queries.iter().all(|query| {
+            !matches!(
+                query.kind,
+                KIND_NIP65_RELAY_LIST | KIND_MARMOT_INBOX_RELAY_LIST
+            )
+        })
+    }));
+    runtime.shutdown().await;
+    app.close_storage().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refreshed_outbox_cannot_revive_an_older_key_package_for_the_same_slot() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    app.directory()
+        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let compatible = fresh_key_package_for_account(&app, &bob, false).await;
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let records = by_endpoint.get_mut("wss://directory.example").unwrap();
+        let incompatible = records
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap();
+        let stale = candidate(
+            &bob,
+            compatible,
+            incompatible.tag_value("d").unwrap(),
+            None,
+            incompatible.created_at - 1,
+        );
+        let outbox = records
+            .iter_mut()
+            .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
+            .unwrap();
+        *outbox = NostrTransportEvent::new_unsigned_at(
+            bob.account_id_hex.clone(),
+            KIND_NIP65_RELAY_LIST,
+            vec![vec![
+                "r".into(),
+                UPDATED_DIRECT_OUTBOX.into(),
+                "write".into(),
+            ]],
+            String::new(),
+            outbox.created_at + 1,
+        );
+        // The incompatible replacement is visible only on the old outbox.
+        records.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        let updated = by_endpoint.get_mut(UPDATED_DIRECT_OUTBOX).unwrap();
+        updated.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        updated.push(stale);
+    }
+    fetcher.requests.lock().unwrap().clear();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let error = runtime
+        .start_direct_conversation_with_options(
+            "alice",
+            &bob.account_id_hex,
+            crate::DirectConversationOptions {
+                disappearing_message_secs: 300,
+            },
+        )
+        .await
+        .unwrap_err();
+    // The refreshed outbox was used, but its only copy was superseded.
+    assert!(
+        matches!(error, AppError::MissingKeyPackage { .. }),
+        "{error}"
+    );
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
+        request
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.0 == UPDATED_DIRECT_OUTBOX)
+            && request.queries.iter().any(|query| {
+                query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.contains(&bob.account_id_hex)
+            })
+    }));
+    assert!(app.groups("alice").unwrap().is_empty());
+    runtime.shutdown().await;
+    app.close_storage().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_create_refreshes_incompatible_prewarmed_members_on_first_attempt() {
+    for status in [
+        MemberResolutionStatus::IncompatibleKeyPackage,
+        MemberResolutionStatus::Selected,
+        MemberResolutionStatus::Incomplete,
+    ] {
+        let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+        app.directory()
+            .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        let selected = status == MemberResolutionStatus::Selected;
+        if selected {
+            advertise_updated_direct_outbox(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
+        }
+        if status == MemberResolutionStatus::Incomplete {
+            *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_NIP65_RELAY_LIST);
+            *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://directory.example".into());
+        }
+        fetcher.requests.lock().unwrap().clear();
+        let runtime = MarmotAppRuntime::new(app.clone());
+        let result = runtime
+            .create_group_with_options_detailed(
+                "alice",
+                "Group",
+                std::slice::from_ref(&bob.account_id_hex),
+                crate::AppCreateGroupOptions {
+                    disappearing_message_secs: 300,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.operation.is_some(), selected, "{status:?}");
+        assert_eq!(
+            result.member_outcomes,
+            vec![MemberResolutionOutcome {
+                account_id_hex: bob.account_id_hex.clone(),
+                status,
+                selected_device_count: if selected { 1 } else { 0 },
+            }]
+        );
+        assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
+            request.queries.iter().any(|query| {
+                query.kind == KIND_NIP65_RELAY_LIST && query.authors.contains(&bob.account_id_hex)
+            })
+        }));
         runtime.shutdown().await;
         app.close_storage().unwrap();
     }

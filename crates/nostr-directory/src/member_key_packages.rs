@@ -26,8 +26,9 @@ use super::Directory;
 use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 use super::resources::DirectoryResources;
 use crate::published_records::{
-    MAX_KEY_PACKAGES_PER_ACCOUNT, fresh_relay_list_status_from_records, key_package_queries,
-    key_package_read_page_full, merge_relay_list_status, select_key_packages_from_records,
+    KeyPackageRecoveryEvidence, MAX_KEY_PACKAGES_PER_ACCOUNT, fresh_relay_list_status_from_records,
+    key_package_queries, key_package_read_page_full, merge_relay_list_status,
+    select_key_packages_with_evidence,
 };
 use crate::{AccountRelayListStatus, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome};
@@ -362,6 +363,20 @@ impl PartialCutOffs {
     }
 }
 
+struct MemberLookup<'a> {
+    purpose: MemberResolutionPurpose,
+    requirements: Option<&'a cgka_engine::key_package::KeyPackageRequirements>,
+    deadline: tokio::time::Instant,
+    cut_offs: Option<PartialCutOffs>,
+}
+
+#[derive(Default)]
+struct MemberLookupCoverage {
+    relay_lists_completed: HashSet<usize>,
+    relay_lists_unfinished: HashSet<usize>,
+    incompatible_evidence: HashMap<usize, KeyPackageRecoveryEvidence>,
+}
+
 /// The stream's next item, or `None` once it ends or `cut_off` passes. An
 /// item already waiting at the cut-off is still taken: its read had started
 /// before the cut-off, and no read starts after it ([`started_before`]).
@@ -405,7 +420,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     ///
     /// Account aliases are canonicalized and duplicate account ids collapse to
     /// their first input position. Each account yields every KeyPackage
-    /// [`select_key_packages_from_records`] selects, best first, from what its
+    /// [`select_key_packages_with_evidence`] selects, best first, from what its
     /// relays returned. Every device is sought, not guaranteed (mdk#2628,
     /// D12): packages a read returned are selected even when the read was
     /// incomplete, so a device whose package no relay returned is left out,
@@ -518,10 +533,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let result = self
             .resolve_member_key_packages_inner(
                 &member_refs,
-                purpose,
-                requirements,
-                deadline,
-                cut_offs,
+                MemberLookup {
+                    purpose,
+                    requirements,
+                    deadline,
+                    cut_offs,
+                },
                 policy,
             )
             .await;
@@ -544,12 +561,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     async fn resolve_member_key_packages_inner(
         &self,
         member_refs: &[String],
-        purpose: MemberResolutionPurpose,
-        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-        deadline: tokio::time::Instant,
-        cut_offs: Option<PartialCutOffs>,
+        lookup: MemberLookup<'_>,
         policy: MemberResolutionPolicy,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
+        let purpose = lookup.purpose;
         let directory_observation = self
             .resources
             .begin(
@@ -614,7 +629,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     target.relay_lists.clone(),
                     snapshot.relay_lists.clone(),
                 );
-                target.cached_relay_lists = target.relay_lists.clone();
                 if !target.relay_lists.nip65.relays.is_empty()
                     && !self
                         .relay_plane
@@ -632,6 +646,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         .is_empty()
                 {
                     reused_prewarmed_routes.insert(index, snapshot);
+                } else {
+                    target.cached_relay_lists = target.relay_lists.clone();
                 }
             }
         }
@@ -639,59 +655,79 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         // Durable projections have unknown observation age and need a bounded
         // refresh. Process-local prewarm entries have an enforced TTL and were
         // already resolved through the outbox path during composition.
-        let relay_list_unresolved = (0..targets.len())
+        let members = (0..targets.len()).collect::<Vec<_>>();
+        let relay_list_unresolved = members
+            .iter()
+            .copied()
             .filter(|index| !reused_prewarmed_routes.contains_key(index))
             .collect::<Vec<_>>();
-        // Unfinished relay lists cannot support any KeyPackage verdict.
-        let (relay_lists_completed, relay_lists_unfinished, finished) =
-            match tokio::time::timeout_at(
-                deadline,
-                self.resolve_missing_relay_lists(&mut targets, &relay_list_unresolved, cut_offs),
+        let mut coverage = self
+            .resolve_member_lookup_pass(
+                &mut targets,
+                &relay_list_unresolved,
+                &members,
+                &mut outcomes,
+                &lookup,
+                &HashMap::new(),
             )
-            .await
-            {
-                Ok(resolution) => {
-                    let RelayListResolution {
-                        completed,
-                        errors,
-                        unfinished,
-                    } = resolution?;
-                    for (index, error) in errors {
-                        outcomes[index] = Some(Err(error));
+            .await?;
+
+        if purpose == MemberResolutionPurpose::Commit {
+            let refresh = members
+                .into_iter()
+                .filter(|index| {
+                    reused_prewarmed_routes.contains_key(index)
+                        && coverage.incompatible_evidence.contains_key(index)
+                })
+                .collect::<Vec<_>>();
+            if !refresh.is_empty() {
+                {
+                    let mut cache = self
+                        .state
+                        .member_key_package_prewarm_cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for &index in &refresh {
+                        // A composition request may have replaced the hint
+                        // while the first pass was on the network.
+                        cache.remove_if_current(
+                            &targets[index].account_id_hex,
+                            &reused_prewarmed_routes[&index],
+                        );
+                        // Discover again from the durable baseline, without
+                        // letting an equal-timestamp prewarm hint win.
+                        targets[index].relay_lists = targets[index].cached_relay_lists.clone();
+                        outcomes[index] = None;
                     }
-                    let key_package_unresolved = (0..targets.len())
-                        .filter(|index| outcomes[*index].is_none())
-                        .collect::<Vec<_>>();
-                    let finished = match tokio::time::timeout_at(
-                        deadline,
-                        self.resolve_missing_key_packages(
-                            &targets,
-                            &key_package_unresolved,
-                            &mut outcomes,
-                            purpose,
-                            requirements,
-                            cut_offs.map(|cut_offs| cut_offs.key_package_batches),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            result?;
-                            true
-                        }
-                        Err(_) => false,
-                    };
-                    (completed, Some(unfinished), finished)
                 }
-                Err(_) => (HashSet::new(), None, false),
-            };
-        if !finished {
-            for (target, outcome) in targets.iter().zip(&mut outcomes) {
-                outcome.get_or_insert_with(|| {
-                    Err(DirectoryError::DirectoryLookupIncomplete(
-                        target.account_id_hex.clone(),
-                    ))
-                });
+                let refreshed = self
+                    .resolve_member_lookup_pass(
+                        &mut targets,
+                        &refresh,
+                        &refresh,
+                        &mut outcomes,
+                        &lookup,
+                        &coverage.incompatible_evidence,
+                    )
+                    .await?;
+                for index in refresh {
+                    if !refreshed.relay_lists_completed.contains(&index)
+                        && matches!(
+                            &outcomes[index],
+                            Some(Err(error)) if recipient_resolution_status(error).is_some()
+                        )
+                    {
+                        outcomes[index] = Some(Err(DirectoryError::DirectoryLookupIncomplete(
+                            targets[index].account_id_hex.clone(),
+                        )));
+                    }
+                }
+                coverage
+                    .relay_lists_completed
+                    .extend(refreshed.relay_lists_completed);
+                coverage
+                    .relay_lists_unfinished
+                    .extend(refreshed.relay_lists_unfinished);
             }
         }
 
@@ -713,16 +749,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             // well as complete KeyPackage reads. Reused routes are hints.
             let result = match result {
                 Err(DirectoryError::KeyPackageRequirements(error))
-                    if !relay_lists_completed.contains(&index)
+                    if !coverage.relay_lists_completed.contains(&index)
                         && key_package_requirements_are_incompatible(&error) =>
                 {
-                    if let Some(snapshot) = reused_prewarmed_routes.get(&index) {
-                        self.state
-                            .member_key_package_prewarm_cache
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .remove_if_current(&target.account_id_hex, snapshot);
-                    }
                     Err(DirectoryError::DirectoryLookupIncomplete(
                         target.account_id_hex.clone(),
                     ))
@@ -765,10 +794,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             // and so may a member a cut-off stopped.
             MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
                 for (index, target) in targets.iter().enumerate() {
-                    if relay_lists_unfinished
-                        .as_ref()
-                        .is_none_or(|unfinished| unfinished.contains(&index))
-                    {
+                    if coverage.relay_lists_unfinished.contains(&index) {
                         continue;
                     }
                     if !target.relay_lists.nip65.relays.is_empty()
@@ -793,7 +819,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     // Only completed discovery renews the route deadline.
                     // A usable package can arrive after an incomplete metadata
                     // hop retained an older durable inbox/outbox projection.
-                    if relay_lists_completed.contains(&index)
+                    if coverage.relay_lists_completed.contains(&index)
                         && matches!(outcomes[index], Some(Ok(_)))
                     {
                         cache.insert(target.account_id_hex.clone(), target.relay_lists.clone());
@@ -1209,15 +1235,81 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         })
     }
 
+    // Reuse the original deadline and Partial cut-offs for each pass. The
+    // refresh only clears the affected members' outcomes.
+    async fn resolve_member_lookup_pass(
+        &self,
+        targets: &mut [MemberTarget],
+        relay_list_members: &[usize],
+        package_candidates: &[usize],
+        outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
+        lookup: &MemberLookup<'_>,
+        prior_evidence: &HashMap<usize, KeyPackageRecoveryEvidence>,
+    ) -> Result<MemberLookupCoverage, DirectoryError> {
+        let mut coverage = MemberLookupCoverage {
+            // A cancelled metadata pass can leave discovery-only snapshots.
+            relay_lists_unfinished: package_candidates.iter().copied().collect(),
+            ..MemberLookupCoverage::default()
+        };
+        let result = started_before(
+            Some(lookup.deadline),
+            tokio::time::timeout_at(lookup.deadline, async {
+                let RelayListResolution {
+                    completed,
+                    errors,
+                    unfinished,
+                } = self
+                    .resolve_missing_relay_lists(targets, relay_list_members, lookup.cut_offs)
+                    .await?;
+                coverage.relay_lists_completed = completed;
+                coverage.relay_lists_unfinished = unfinished;
+                for (index, error) in errors {
+                    outcomes[index] = Some(Err(error));
+                }
+                let unresolved = package_candidates
+                    .iter()
+                    .copied()
+                    .filter(|index| outcomes[*index].is_none())
+                    .collect::<Vec<_>>();
+                self.resolve_missing_key_packages(
+                    targets,
+                    &unresolved,
+                    outcomes,
+                    lookup,
+                    prior_evidence,
+                    &mut coverage.incompatible_evidence,
+                )
+                .await
+            }),
+        )
+        .await;
+        match result {
+            Some(Ok(result)) => result?,
+            _ => {
+                for &index in package_candidates {
+                    outcomes[index].get_or_insert_with(|| {
+                        Err(DirectoryError::DirectoryLookupIncomplete(
+                            targets[index].account_id_hex.clone(),
+                        ))
+                    });
+                }
+            }
+        }
+        Ok(coverage)
+    }
+
     async fn resolve_missing_key_packages(
         &self,
         targets: &[MemberTarget],
         unresolved: &[usize],
         outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
-        purpose: MemberResolutionPurpose,
-        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-        batch_cut_off: Option<tokio::time::Instant>,
+        lookup: &MemberLookup<'_>,
+        prior_evidence: &HashMap<usize, KeyPackageRecoveryEvidence>,
+        incompatible_evidence: &mut HashMap<usize, KeyPackageRecoveryEvidence>,
     ) -> Result<(), DirectoryError> {
+        let purpose = lookup.purpose;
+        let requirements = lookup.requirements;
+        let batch_cut_off = lookup.cut_offs.map(|cut_offs| cut_offs.key_package_batches);
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
         for index in unresolved.iter().copied() {
@@ -1318,11 +1410,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             for index in indices {
                 let account_id = &targets[index].account_id_hex;
                 let account_records = records_by_author.remove(account_id).unwrap_or_default();
-                let selected = select_key_packages_from_records(
+                let selected = select_key_packages_with_evidence(
                     account_id,
                     &account_records,
                     self.directory_freshness(),
                     requirements,
+                    prior_evidence.get(&index),
                 )
                 .map(|selection| selection.value);
                 // Batch results prove no coverage; every absence or rejection
@@ -1399,6 +1492,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     let directory = directory.clone();
                     async move {
                         let queries = key_package_queries(vec![target.account_id_hex.clone()]);
+                        let mut observed_incompatibility = None;
+                        let prior_evidence = prior_evidence.get(&index);
                         let result = async {
                             let fetched = directory
                                 .relay_plane
@@ -1422,6 +1517,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                         primary_complete: fetched.complete,
                                         discovery: &directory.directory_source_relays(&[]),
                                         requirements,
+                                        prior_evidence,
+                                        incompatible_evidence: Some(&mut observed_incompatibility),
                                         cached_target: None,
                                         wanted: MAX_KEY_PACKAGES_PER_ACCOUNT,
                                     },
@@ -1433,11 +1530,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                     &records.records,
                                 )
                                 .await?;
-                            select_key_packages_from_records(
+                            select_key_packages_with_evidence(
                                 &target.account_id_hex,
                                 &records.records,
                                 records.freshness,
                                 requirements,
+                                prior_evidence,
                             )?
                             // Recovery returned: an empty selection is a
                             // complete negative, while a non-empty one may
@@ -1445,12 +1543,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             .into_value_or_missing(&target.account_id_hex)
                         }
                         .await;
-                        (index, result)
+                        (index, result, observed_incompatibility)
                     }
                 });
         let mut fallback_results =
             stream::iter(work).buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY);
-        while let Some((index, result)) = fallback_results.next().await {
+        while let Some((index, result, observed_incompatibility)) = fallback_results.next().await {
+            if let Some(evidence) = observed_incompatibility {
+                incompatible_evidence.insert(index, evidence);
+            }
             outcomes[index] = Some(result.and_then(|selected| {
                 self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)
             }));

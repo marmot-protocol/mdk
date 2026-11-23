@@ -25,6 +25,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_submit_tagged_sticker` return durable local acceptance before relay publication.
 - `MARMOT_STATUS_INCOMPATIBLE_KEY_PACKAGE` identifies incompatible recipient chat keys that previously returned the generic runtime status.
 
+### Changed
+
+- A member's `MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPATIBLE_KEY_PACKAGE` now requires completed relay-list discovery
+  and complete KeyPackage reads. If either is incomplete, the status is `MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPLETE`.
+
 ## [0.19.0] - 2026-11-22
 
 ### Breaking changes

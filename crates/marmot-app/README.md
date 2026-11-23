@@ -351,9 +351,9 @@ with both accounts as founding admins.
 `DirectConversationOptions::disappearing_message_secs` is written into the founding MLS state and Welcome, as
 `AppCreateGroupOptions` does for generic creation, so the recipient joins with that duration and no retention commit
 follows. Options apply only when the call creates the group: reuse, retry, and same-account concurrent starts return the
-existing group with its founding duration and roles, whatever duration they propose. A newly created direct chat refreshes
-the recipient's relay lists before looking up KeyPackages. A nonzero duration requires the
-peer's KeyPackages to support message retention. When a lookup finds only KeyPackages incompatible with the chat's
+existing group with its founding duration and roles, whatever duration they propose. A new direct chat uses prewarmed relay
+routes when available and refreshes them within the same lookup if it finds only incompatible KeyPackages. A nonzero
+duration requires the peer's KeyPackages to support message retention. When a lookup finds only KeyPackages incompatible with the chat's
 founding requirements, the start returns `AppError::IncompatibleKeyPackage` if relay-list discovery and KeyPackage reads
 both completed. Otherwise it returns `AppError::DirectoryLookupIncomplete`. Either refusal creates no chat.
 `start_direct_conversation` is the same call with default options, which leave disappearing messages disabled.

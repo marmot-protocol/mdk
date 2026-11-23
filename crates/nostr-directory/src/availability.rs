@@ -993,6 +993,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     // deletion proofs belong to member invitation, not this projection.
                     discovery: &[],
                     requirements: None,
+                    prior_evidence: None,
+                    incompatible_evidence: None,
                     cached_target: None,
                     wanted: 0,
                 })
