@@ -568,3 +568,77 @@ async fn retry_cutoff_skips_a_send_that_only_owes_secondary_replication() {
         "the due send behind a quorum-met send sets the group's cutoff"
     );
 }
+
+/// A cold start hydrates its groups in batches and surfaces each batch's local events
+/// before it subscribes. That drain must not retry retained sends: against a slow or dead
+/// relay every batch re-drove every outstanding send and held live transport behind them
+/// (mdk#3367). The sends wait for the transport and go out once it is active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_hydration_retries_no_retained_send_before_transport_activation() {
+    let mut queue = OfflineQueue::online().await;
+    let published = queue.relay.published_event_ids();
+    queue.send_offline(OfflineFailure::Unavailable).await;
+    queue.runtime.shutdown().await;
+    let retained: std::collections::HashSet<String> = queue
+        .relay
+        .attempted_event_ids()
+        .into_iter()
+        .filter(|id| !published.contains(id))
+        .collect();
+    assert!(
+        !retained.is_empty(),
+        "the offline send must have been tried"
+    );
+    let retained_attempts = |queue: &OfflineQueue| {
+        queue
+            .relay
+            .attempted_event_ids()
+            .iter()
+            .filter(|id| retained.contains(*id))
+            .count()
+    };
+    // Make the retained send due at once, as a long gap since its last attempt does.
+    {
+        let client = queue.app.client("sender").await.unwrap();
+        for mut fanout in client
+            .runtime
+            .session()
+            .outbound_fanouts_for_group(&queue.group_id)
+            .unwrap()
+        {
+            assert!(fanout.wake_targets_for_restored_connectivity() > 0);
+            client
+                .runtime
+                .session()
+                .put_outbound_fanout(&fanout)
+                .unwrap();
+        }
+    }
+
+    // Hold the startup activation's first subscribe: hydration has finished by then.
+    queue.relay.block_next_subscribe();
+    let attempts_before = retained_attempts(&queue);
+    let runtime = MarmotAppRuntime::new(queue.app.clone());
+    let (reconciled, blocked) = tokio::join!(
+        runtime.reconcile_accounts(),
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            queue.relay.wait_for_blocked_subscribe()
+        ),
+    );
+    reconciled.unwrap();
+    blocked.expect("startup must reach transport activation");
+    assert_eq!(
+        retained_attempts(&queue),
+        attempts_before,
+        "startup hydration must not retry a retained send before transport activation"
+    );
+
+    queue.relay.allow_publishes();
+    queue.relay.release_subscribe();
+    queue.runtime = runtime;
+    queue
+        .assert_all_published_once_in_order(Duration::from_secs(8), "after activation")
+        .await;
+    queue.runtime.shutdown().await;
+}

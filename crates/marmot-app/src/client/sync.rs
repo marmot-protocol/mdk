@@ -1529,6 +1529,14 @@ impl AppClient {
         self.observe_drained_session_events(&effects).await
     }
 
+    /// [`Self::drain_pending_session_events`] for startup hydration, before
+    /// live transport: it leaves retained sends to the first drain after
+    /// activation (mdk#3367).
+    pub(crate) async fn drain_hydrated_session_events(&mut self) -> Result<SyncSummary, AppError> {
+        let effects = self.runtime.drain_without_fanout_resume().await?;
+        self.observe_drained_session_events(&effects).await
+    }
+
     /// Project one drained batch of engine events, split from the drain itself
     /// so the projection is exercisable against a given batch of effects.
     pub(crate) async fn observe_drained_session_events(

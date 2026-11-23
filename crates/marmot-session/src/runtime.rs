@@ -4850,11 +4850,20 @@ where
     /// to trigger a drain (mdk#426). Publishes any incidental transport
     /// work the same way `ingest_delivery` does.
     pub async fn drain(&mut self) -> AccountResult<AccountDeviceEffects> {
-        let effects = self.session.drain();
-        let mut output = self.publish_session_effects(effects).await?;
+        let mut output = self.drain_without_fanout_resume().await?;
         let resumed = self.resume_outbound_fanouts().await?;
         output.extend(resumed);
         Ok(output)
+    }
+
+    /// [`Self::drain`] without resuming retained outbound fanouts, for a
+    /// caller with no live transport yet. Startup hydration drains after
+    /// every batch; resuming there re-drove every outstanding fanout per
+    /// batch and held live transport behind them (mdk#3367). The caller's
+    /// first full drain after transport activation resumes them once.
+    pub async fn drain_without_fanout_resume(&mut self) -> AccountResult<AccountDeviceEffects> {
+        let effects = self.session.drain();
+        self.publish_session_effects(effects).await
     }
 
     /// Ingest a borrowed delivery through the ordinary engine and publication path.
