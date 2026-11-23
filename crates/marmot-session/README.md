@@ -151,12 +151,12 @@ once every member's leaf advertises it (the spec's "Enabling a Component in an E
 For every live group, enrolled or not, `run_due_maintenance` schedules a leaf refresh when the own leaf advertises fewer
 components than the build supports:
 
-- **When.** The self-update runs at a random time within 5 days, so a release does not make every member of a group
-  commit at once. The due time is stored on the group's maintenance record, so a restart keeps the sampled delay.
+- **When.** The first maintenance pass that detects a stale leaf queues its self-update. A quiet period and up to
+  15 minutes of contention jitter still spread publications out.
 - **How.** The self-update goes through the ordinary obligation pipeline, so every commit hold applies, and it
   re-advertises the supported set. Any own self-update already in flight satisfies the refresh.
-- **Cost.** The engine is queried for each group at most every ten minutes unless a due time has arrived. A group whose
-  state cannot be read is skipped for that tick without stopping maintenance for the rest of the account.
+- **Cost.** Maintenance checks each group at most every ten minutes. If it cannot read a group's state, it skips
+  that group for the current pass.
 
 Maintenance only refreshes leaves. Requiring a component in a group is a separate admin step, and nothing here does
 it.

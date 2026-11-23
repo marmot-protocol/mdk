@@ -83,7 +83,6 @@ where
                     continue;
                 };
                 let state = state.as_ref();
-                due.at_opt(state.and_then(|state| state.leaf_refresh_due_at));
                 // The component check repeats on its own interval, and the
                 // run skips a group whose own leaf is still being reconciled.
                 // An overdue check is owed, not due now: a time computed from

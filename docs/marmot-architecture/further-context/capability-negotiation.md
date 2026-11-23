@@ -209,7 +209,8 @@ Group" (`app-components/README.md`):
 
 - **Leaf refresh.** A self-update re-advertises every supported app component in the own leaf, keeping every other leaf
   byte.
-- **Stale leaves.** Account maintenance gives a stale own leaf a self-update at a persisted random time within 5 days.
+- **Stale leaves.** Account maintenance queues a self-update when it detects a stale own leaf. The usual quiet
+  period and contention jitter still apply.
 - **Activation.** Not implemented yet. Requiring a new component in an existing group (one admin Commit, once every
   leaf advertises it) lands with its first caller, such as moving `EnableDisbanding` onto the generic path.
 

@@ -1,6 +1,6 @@
 // Refreshing a stale own leaf, driven by account maintenance: a group whose own
 // leaf advertises fewer app components than the build supports gets a
-// self-update at a persisted, randomized due time.
+// self-update with persisted contention jitter.
 // `marmot.group.avatar-url.v1` stands in for the new component: it is optional
 // for new groups, so a group created before the "upgrade" does not require it.
 
@@ -33,7 +33,6 @@ fn component_migration_session(
 #[tokio::test]
 async fn maintenance_refreshes_a_stale_leaf_at_a_persisted_random_time() {
     use cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID;
-    const WINDOW_5_DAYS: u64 = 5 * 24 * 60 * 60;
 
     let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
@@ -81,7 +80,7 @@ async fn maintenance_refreshes_a_stale_leaf_at_a_persisted_random_time() {
     .with_maintenance_sources(
         wall.clone(),
         Arc::new(TestMonotonicClock::default()),
-        Arc::new(TestRandom::new(0)),
+        Arc::new(TestRandom::new(15_000)),
     )
     .with_maintenance_timing(MaintenanceTiming::immediate());
     assert_eq!(
@@ -95,24 +94,19 @@ async fn maintenance_refreshes_a_stale_leaf_at_a_persisted_random_time() {
         vec![GROUP_AVATAR_URL_COMPONENT_ID]
     );
 
-    // The first tick samples a due time inside the window and does not rotate.
-    runtime.run_due_maintenance().await.unwrap();
-    let due = runtime
-        .session()
-        .group_maintenance(&group_id)
-        .unwrap()
-        .unwrap()
-        .leaf_refresh_due_at
-        .expect("a stale leaf schedules a refresh");
-    assert!(due.0 >= start && due.0 <= start + WINDOW_5_DAYS);
-    assert!(
-        runtime
-            .session()
-            .maintenance_obligations_for_group(&group_id)
-            .unwrap()
-            .is_empty()
-    );
+    // The first tick persists the obligation but does not rotate yet.
     let epoch_before = runtime.session().epoch(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    let pending = runtime
+        .session()
+        .maintenance_obligations_for_group(&group_id)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    let due = pending[0]
+        .not_before
+        .expect("queued with contention jitter");
+    assert!(due.0 > start && due.0 <= start + 15 * 60);
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), epoch_before);
 
     // A restart keeps the sampled due time instead of resampling it.
     drop(runtime);
@@ -138,37 +132,14 @@ async fn maintenance_refreshes_a_stale_leaf_at_a_persisted_random_time() {
     assert_eq!(
         runtime
             .session()
-            .group_maintenance(&group_id)
-            .unwrap()
-            .unwrap()
-            .leaf_refresh_due_at,
-        Some(due)
+            .maintenance_obligations_for_group(&group_id)
+            .unwrap(),
+        pending
     );
 
-    // At the due time the refresh becomes an ordinary periodic obligation;
-    // once its contention jitter elapses the self-update runs and the leaf is
-    // current.
+    // The queued self-update publishes after its contention delay.
     wall.set(due.0);
-    for _ in 0..4 {
-        runtime.run_due_maintenance().await.unwrap();
-        if let Some(not_before) = runtime
-            .session()
-            .maintenance_obligations_for_group(&group_id)
-            .unwrap()
-            .iter()
-            .find_map(|obligation| obligation.not_before)
-        {
-            wall.set(wall.now().0.max(not_before.0));
-        }
-        if runtime
-            .session()
-            .own_leaf_missing_app_components(&group_id)
-            .unwrap()
-            .is_empty()
-        {
-            break;
-        }
-    }
+    runtime.run_due_maintenance().await.unwrap();
     assert!(
         runtime
             .session()
@@ -177,15 +148,9 @@ async fn maintenance_refreshes_a_stale_leaf_at_a_persisted_random_time() {
             .is_empty(),
         "the refresh self-update re-advertised the supported set"
     );
-    assert!(runtime.session().epoch(&group_id).unwrap() > epoch_before);
     assert_eq!(
-        runtime
-            .session()
-            .group_maintenance(&group_id)
-            .unwrap()
-            .unwrap()
-            .leaf_refresh_due_at,
-        None
+        runtime.session().epoch(&group_id).unwrap().0,
+        epoch_before.0 + 1
     );
 }
 
