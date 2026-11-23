@@ -577,10 +577,11 @@ HERMES_MARMOT_BUSY_ACK_DETAIL=0 \
 just hermes-phone-test-up
 ```
 
-To deliberately test Hermes tool-progress and interim-message behavior in the phone app, opt back in:
+To deliberately test Hermes interim-message behavior in the phone app, opt back in. Tool progress stays off: WN Agent
+refuses tool-progress and agent-activity sends, so `HERMES_MARMOT_TOOL_PROGRESS=all` shows nothing on the phone, and
+neither does an interim message that Hermes marks as non-final commentary.
 
 ```sh
-HERMES_MARMOT_TOOL_PROGRESS=all \
 HERMES_MARMOT_INTERIM_MESSAGES=1 \
 HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS=1 \
 just hermes-phone-test-up
@@ -879,8 +880,8 @@ reported as operationally connected.
   anyway, the adapter refuses the partial preview send, and `edit_message`
   refuses any durable message, so Hermes sends each completed reply once as a
   new message.
-- Explicit Hermes delivery context routes non-final commentary to durable agent
-  activity (`kind: 1201`, `status: commentary`).
+- Explicit Hermes delivery context routes non-final commentary to agent
+  activity, which WN Agent refuses, so that commentary is dropped.
 - Final answers and approvals remain durable `kind: 9` messages. Missing delivery
   context keeps this legacy final behavior for compatibility with older Hermes
   versions.

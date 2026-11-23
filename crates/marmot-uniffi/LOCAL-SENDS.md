@@ -9,7 +9,10 @@ again when delivery completes.
 
 `send_custom_event_with_client_token` admits an app-defined event the same way. Use it
 for an answer or a control sent to an agent (kind 1202), so that retrying a token after
-a restart does not send an interrupt twice.
+a restart does not send an interrupt twice. A 1202 has no timeline row, so it gets
+no optimistic bubble and steps 3 and 4 below do not apply to it. Allocate its token
+as in step 1. `local_send_status` reports its admission and send attempt, not a later
+delivery confirmation.
 
 ## Host integration
 
