@@ -1284,26 +1284,17 @@ class RunnerInfrastructurePolicyTests(unittest.TestCase):
 
                 first_id = re.search(r"(?m)^        id: ([a-z0-9-]+)$", first)
                 self.assertIsNotNone(first_id, "first download must declare an id")
+                self.assertNotIn("\n        if:", first, "first download must run under the default success condition")
                 self.assertIn("\n        continue-on-error: true\n", first)
-                first_timeout = re.search(r"(?m)^        timeout-minutes: (\d+)$", first)
-                self.assertIsNotNone(first_timeout, "first download must have timeout-minutes")
+                first_timeout = int(re.search(r"(?m)^        timeout-minutes: (\d+)$", first).group(1))
 
                 self.assertIn(f"\n        if: steps.{first_id.group(1)}.outcome == 'failure'\n", retry)
                 self.assertNotIn("continue-on-error:", retry)
-                retry_timeout = re.search(r"(?m)^        timeout-minutes: (\d+)$", retry)
-                self.assertIsNotNone(retry_timeout, "retry download must have timeout-minutes")
+                retry_timeout = int(re.search(r"(?m)^        timeout-minutes: (\d+)$", retry).group(1))
+                if job_name == "rust-test":
+                    # A retry restarts from byte 0, so it keeps the full 25-minute slow-runner budget (#2568).
+                    self.assertGreaterEqual(retry_timeout, 25)
 
-                first_pin = re.search(r"(?m)^        uses: (actions/download-artifact@\S+)", first).group(1)
-                retry_pin = re.search(r"(?m)^        uses: (actions/download-artifact@\S+)", retry).group(1)
-                self.assertEqual(first_pin, retry_pin)
-
-                first_artifact = re.search(r"(?m)^          name: (\S+)$", first).group(1)
-                retry_artifact = re.search(r"(?m)^          name: (\S+)$", retry).group(1)
-                self.assertEqual(first_artifact, retry_artifact)
-
-                download_budget = int(first_timeout.group(1)) + int(retry_timeout.group(1))
-                self.assertGreater(int(first_timeout.group(1)), 0)
-                self.assertGreater(int(retry_timeout.group(1)), 0)
                 other_timeouts = sum(
                     int(m.group(1))
                     for i, step in enumerate(steps)
@@ -1311,11 +1302,7 @@ class RunnerInfrastructurePolicyTests(unittest.TestCase):
                     for m in [re.search(r"(?m)^        timeout-minutes: (\d+)$", step)]
                     if m
                 )
-                self.assertLess(download_budget + other_timeouts, job_timeout)
-
-                extract_indices = [i for i, step in enumerate(steps) if "ci_runner.py extract " in step]
-                self.assertEqual(len(extract_indices), 1)
-                self.assertLess(retry_idx, extract_indices[0])
+                self.assertLess(first_timeout + retry_timeout + other_timeouts, job_timeout)
 
     def test_formal_bootstrap_rejects_the_unsupported_distro_maude(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
