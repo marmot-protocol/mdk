@@ -219,6 +219,31 @@ impl AppClient {
         Ok(Some(decision))
     }
 
+    /// A sibling's decision that arrived while this chat was deleted locally
+    /// was set aside with no work, because there was no row to apply it to,
+    /// and only an exact admission re-arms it. A message that recreates the
+    /// row is not an admission, so re-arm the current admission's decision
+    /// here and let the ordinary decision pass apply it to the restored row
+    /// (mdk#3555).
+    pub(super) fn owe_decision_set_aside_while_deleted(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        if !self.app.device_groups_enabled() || self.is_device_group(group_id)? {
+            return Ok(());
+        }
+        let account = self.app.account_storage(&self.state.label)?;
+        let Some(admission) = account.invitation_admission(group_id)? else {
+            return Ok(());
+        };
+        account.app_storage().owe_installed_invitation_decision(
+            &hex::encode(group_id.as_slice()),
+            &admission.generation,
+        )?;
+        self.invitation_decisions_changed = true;
+        Ok(())
+    }
+
     /// Called from the real admitted lifecycle event, including durable replay.
     pub(super) fn note_invitation_admission(
         &mut self,

@@ -19525,6 +19525,13 @@ async fn recreate_after_local_delete(
         reopened.state_group_record(&group_id).as_ref(),
         Some(&recreated)
     );
+    // A sibling Add forwards the standing the recreated row carries.
+    let forwarded = reopened.forwarded_invitation(&group_id);
+    assert_eq!(forwarded.confirmed, !recreated.pending_confirmation);
+    assert_eq!(
+        forwarded.inviter.map(hex::encode),
+        recreated.welcomer_account_id_hex.clone()
+    );
     recreated
 }
 

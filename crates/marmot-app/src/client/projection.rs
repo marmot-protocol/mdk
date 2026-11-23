@@ -522,6 +522,7 @@ impl AppClient {
         if changed {
             self.mark_group_projection_dirty_hex(group_id_hex);
         }
+        self.owe_decision_set_aside_while_deleted(group_id)?;
         Ok(true)
     }
 
