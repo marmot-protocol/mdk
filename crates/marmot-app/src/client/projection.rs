@@ -770,7 +770,7 @@ impl AppClient {
             if (request_exists || is_disbanded)
                 && let Err(error) = self
                     .app
-                    .delete_message_draft(&self.state.label, &projected_group.group_id_hex)
+                    .delete_group_message_drafts(&self.state.label, &projected_group.group_id_hex)
             {
                 tracing::warn!(
                     target: "marmot_app::client",
@@ -1564,6 +1564,8 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
             "read_marker_failed:message_draft_revision_conflict"
         }
         AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",
+        AppError::UnknownMessageDraft => "read_marker_failed:unknown_message_draft",
+        AppError::MessageDraftQuotaExceeded => "read_marker_failed:message_draft_quota_exceeded",
         AppError::Publish(_) => "read_marker_failed:publish",
         AppError::EventTooLarge { .. } => "read_marker_failed:event_too_large",
         AppError::NoUsableRelay => "read_marker_failed:no_usable_relay",

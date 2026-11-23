@@ -100,6 +100,44 @@ impl media_store::StageTarget for CheckedStage<'_> {
     }
 }
 
+fn validate_read_range(offset: u64, limit: usize) -> Result<(), AppError> {
+    if limit == 0 || limit > MAX_ATTACHMENT_LOCAL_READ_BYTES || offset >= i64::MAX as u64 {
+        return Err(AppError::InvalidMessageDraft(
+            "invalid attachment byte range".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_draft_bytes(
+    app: &crate::MarmotApp,
+    label: &str,
+    storage: &storage_sqlite::SqliteAccountStorage,
+    read: Option<MessageDraftAttachmentRead>,
+    offset: u64,
+    limit: usize,
+) -> Result<Option<Zeroizing<Vec<u8>>>, AppError> {
+    match read {
+        None => Ok(None),
+        Some(MessageDraftAttachmentRead::Bytes(bytes)) => Ok(Some(Zeroizing::new(bytes))),
+        Some(MessageDraftAttachmentRead::MediaFile(id)) => {
+            let media = app.account_media_store(label, storage)?;
+            let Some(mut reader) = media
+                .open_staged_reader(&id)
+                .map_err(storage_sqlite::media_storage_error)?
+            else {
+                return Ok(None);
+            };
+            let mut bytes = Zeroizing::new(vec![0; limit]);
+            let read = reader
+                .read_at(offset, &mut bytes)
+                .map_err(storage_sqlite::media_storage_error)?;
+            bytes.truncate(read);
+            Ok(Some(bytes))
+        }
+    }
+}
+
 fn refusal_error(refusal: Option<MessageDraftStageRefusal>, group: &str) -> AppError {
     match refusal {
         Some(MessageDraftStageRefusal::Conflict) => AppError::MessageDraftRevisionConflict,
@@ -108,6 +146,7 @@ fn refusal_error(refusal: Option<MessageDraftStageRefusal>, group: &str) -> AppE
             AppError::InvalidMessageDraft("attachment ids must be unique".into())
         }
         Some(MessageDraftStageRefusal::Full) => draft_full(),
+        Some(MessageDraftStageRefusal::QuotaExceeded) => AppError::MessageDraftQuotaExceeded,
         // The pending copy's row was gone at commit (another process swept
         // it): the draft did not refuse it, so retrying can succeed.
         None => AppError::InvalidEncryptedMedia(
@@ -185,12 +224,6 @@ impl MarmotAppRuntime {
             if len > MAX_MESSAGE_DRAFT_ATTACHMENT_FILE_BYTES {
                 return Err(blob_limit());
             }
-            if !draft_fits(count.saturating_add(1), bytes.saturating_add(len)) {
-                return Err(draft_full());
-            }
-            let disk = crate::media::outgoing::send_disk_policy(app, &storage)?;
-            crate::media::outgoing::admit_send_body(app, label, disk, len)?;
-            let media = app.account_media_store(label, &storage)?;
             let target = drafts
                 .message_draft_attachment_stage(
                     &revision,
@@ -207,6 +240,12 @@ impl MarmotAppRuntime {
                     draft_fits,
                 )
                 .map_err(|error| revision_error(error, &group))?;
+            if !draft_fits(count.saturating_add(1), bytes.saturating_add(len)) {
+                return Err(draft_full());
+            }
+            let disk = crate::media::outgoing::send_disk_policy(app, &storage)?;
+            crate::media::outgoing::admit_send_body(app, label, disk, len)?;
+            let media = app.account_media_store(label, &storage)?;
             let watch = source.watch()?;
             let checked = CheckedStage {
                 target: &target,
@@ -249,35 +288,46 @@ impl MarmotAppRuntime {
         offset: u64,
         limit: usize,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, AppError> {
-        if limit == 0 || limit > MAX_ATTACHMENT_LOCAL_READ_BYTES || offset >= i64::MAX as u64 {
-            return Err(AppError::InvalidMessageDraft(
-                "invalid attachment byte range".into(),
-            ));
-        }
+        validate_read_range(offset, limit)?;
         self.attachment_read_with(account_ref, move |app, label, storage, _| {
             let read = storage
                 .app_storage()
                 .read_message_draft_attachment_if_revision(&revision, &attachment_id, offset, limit)
                 .map_err(|error| revision_error(error, revision.group_id_hex()))?;
-            match read {
-                None => Ok(None),
-                Some(MessageDraftAttachmentRead::Bytes(bytes)) => Ok(Some(Zeroizing::new(bytes))),
-                Some(MessageDraftAttachmentRead::MediaFile(id)) => {
-                    let media = app.account_media_store(label, &storage)?;
-                    let Some(mut reader) = media
-                        .open_staged_reader(&id)
-                        .map_err(storage_sqlite::media_storage_error)?
-                    else {
-                        return Ok(None);
-                    };
-                    let mut bytes = Zeroizing::new(vec![0; limit]);
-                    let read = reader
-                        .read_at(offset, &mut bytes)
-                        .map_err(storage_sqlite::media_storage_error)?;
-                    bytes.truncate(read);
-                    Ok(Some(bytes))
-                }
-            }
+            read_draft_bytes(app, label, &storage, read, offset, limit)
+        })
+        .await
+    }
+
+    /// Read one bounded chunk from the content version returned by the identified draft read.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "identifies the draft, version and byte range"
+    )]
+    pub async fn read_identified_message_draft_attachment(
+        &self,
+        account_ref: &str,
+        group: String,
+        draft: crate::MessageDraftId,
+        content_revision: i64,
+        attachment_id: String,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, AppError> {
+        validate_read_range(offset, limit)?;
+        self.attachment_read_with(account_ref, move |app, label, storage, _| {
+            let read = storage
+                .app_storage()
+                .read_identified_message_draft_attachment(
+                    &group,
+                    draft,
+                    content_revision,
+                    &attachment_id,
+                    offset,
+                    limit,
+                )
+                .map_err(|error| revision_error(error, &group))?;
+            read_draft_bytes(app, label, &storage, read, offset, limit)
         })
         .await
     }

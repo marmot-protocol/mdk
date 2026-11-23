@@ -110,8 +110,8 @@ fn draft(store: &SqliteAccountStorage, id: &str, content: &str, attachment: bool
     .unwrap();
     if attachment {
         conn.execute(
-            "INSERT INTO message_draft_attachments(group_id_hex, position, attachment_id, file_name, media_type, plaintext)
-             VALUES (?1, 0, 'a', 'f.png', 'image/png', x'00')",
+            "INSERT INTO message_draft_attachments(draft_id, position, attachment_id, file_name, media_type, plaintext)
+             VALUES ((SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1 AND active = 1), 0, 'a', 'f.png', 'image/png', x'00')",
             [id],
         )
         .unwrap();

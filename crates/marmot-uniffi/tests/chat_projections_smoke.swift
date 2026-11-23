@@ -4,6 +4,13 @@ import Foundation
 struct ChatProjectionsSmoke {
     /// Exercise generated record layout and enum discriminants, including presentation roles.
     static func main() throws {
+        let draftId = MessageDraftIdFfi(hex: String(repeating: "ab", count: 16))
+        let draftContent = SelectedMessageDraftContentFfi(groupIdHex: "group", content: "draft 🦀", replyToMessageIdHex: "reply", mediaAttachments: [], createdAtMs: 1, updatedAtMs: 2)
+        for state in [MessageDraftStateFfi.active, .saved] {
+            let draft = IdentifiedMessageDraftFfi(id: draftId, state: state, contentRevision: 4, content: draftContent)
+            let copy = try FfiConverterTypeIdentifiedMessageDraftFfi.lift(FfiConverterTypeIdentifiedMessageDraftFfi.lower(draft))
+            precondition(copy == draft)
+        }
         // The generated host ABI must preserve typed backup identity and optional operation tokens.
         let backupSource = BackupHistorySourceFfi(recoveryPublicKeyHex: "recovery", backupIdHex: "archive", headSha256Hex: "head", writtenAt: UInt64.max)
         for provenance in [HistoryImportProvenanceFfi.device(deviceSlotIdHex: "slot"), .backup(source: backupSource)] {

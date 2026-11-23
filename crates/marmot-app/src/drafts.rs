@@ -1,5 +1,10 @@
 //! Encrypted, per-account composer draft persistence.
 
+pub use storage_sqlite::{
+    MessageDraftId, StoredIdentifiedMessageDraft as IdentifiedMessageDraft,
+    StoredIdentifiedMessageDraftSummary, StoredMessageDraftState as MessageDraftState,
+};
+
 use std::collections::HashSet;
 use std::fmt;
 
@@ -242,6 +247,24 @@ pub struct MessageDraftInvalidation {
     pub group_id_hex: String,
 }
 
+/// Group-scoped draft list entry with a bounded text preview.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdentifiedMessageDraftSummary {
+    pub id: MessageDraftId,
+    pub state: MessageDraftState,
+    pub summary: MessageDraftSummary,
+}
+
+impl From<StoredIdentifiedMessageDraftSummary> for IdentifiedMessageDraftSummary {
+    fn from(value: StoredIdentifiedMessageDraftSummary) -> Self {
+        Self {
+            id: value.id,
+            state: value.state,
+            summary: value.summary.into(),
+        }
+    }
+}
+
 pub(crate) fn revision_error(
     error: storage_sqlite::MessageDraftRevisionError,
     group: &str,
@@ -250,6 +273,7 @@ pub(crate) fn revision_error(
         storage_sqlite::MessageDraftRevisionError::Conflict => {
             AppError::MessageDraftRevisionConflict
         }
+        storage_sqlite::MessageDraftRevisionError::UnknownDraft => AppError::UnknownMessageDraft,
         storage_sqlite::MessageDraftRevisionError::Invalid(details) => {
             AppError::InvalidMessageDraft(details.to_owned())
         }
@@ -262,6 +286,7 @@ pub(crate) fn revision_error(
 fn draft_storage_error(error: StorageError, group: &str) -> AppError {
     match error {
         StorageError::NotFound => AppError::UnknownGroup(group.to_owned()),
+        StorageError::MessageDraftQuotaExceeded => AppError::MessageDraftQuotaExceeded,
         error => error.into(),
     }
 }
@@ -323,6 +348,84 @@ impl MarmotApp {
             .selected_message_draft(group)
             .map_err(|error| draft_storage_error(error, group))
     }
+    /// Local active and saved drafts in one conversation.
+    pub fn group_message_drafts(
+        &self,
+        account_ref: &str,
+        group: &str,
+    ) -> Result<Vec<IdentifiedMessageDraftSummary>, AppError> {
+        Ok(self
+            .draft_storage(account_ref)?
+            .app_storage()
+            .group_message_drafts(group)
+            .map_err(|error| draft_storage_error(error, group))?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    pub fn identified_message_draft(
+        &self,
+        account_ref: &str,
+        group: &str,
+        id: MessageDraftId,
+    ) -> Result<IdentifiedMessageDraft, AppError> {
+        self.draft_storage(account_ref)?
+            .app_storage()
+            .identified_message_draft(group, id)
+            .map_err(|error| revision_error(error, group))
+    }
+
+    pub fn archive_message_draft(
+        &self,
+        account_ref: &str,
+        expected: &MessageDraftRevision,
+    ) -> Result<MessageDraftId, AppError> {
+        let group = expected.group_id_hex();
+        let id = self
+            .draft_storage(account_ref)?
+            .app_storage()
+            .archive_message_draft(expected)
+            .map_err(|error| revision_error(error, group))?;
+        self.notify_draft_changed(account_ref, group);
+        Ok(id)
+    }
+
+    pub fn activate_message_draft(
+        &self,
+        account_ref: &str,
+        expected: &MessageDraftRevision,
+        id: MessageDraftId,
+    ) -> Result<SelectedMessageDraft, AppError> {
+        let group = expected.group_id_hex();
+        let selected = self
+            .draft_storage(account_ref)?
+            .app_storage()
+            .activate_message_draft(expected, id)
+            .map_err(|error| revision_error(error, group))?;
+        if selected.revision != *expected {
+            self.notify_draft_changed(account_ref, group);
+        }
+        Ok(selected)
+    }
+
+    pub fn delete_saved_message_draft(
+        &self,
+        account_ref: &str,
+        group: &str,
+        id: MessageDraftId,
+    ) -> Result<(), AppError> {
+        let storage = self.draft_storage(account_ref)?;
+        self.releasing_draft_files(account_ref, &storage, group, || {
+            storage
+                .app_storage()
+                .delete_saved_message_draft(group, id)
+                .map_err(|error| revision_error(error, group))
+        })?;
+        self.notify_draft_changed(account_ref, group);
+        Ok(())
+    }
+
     /// Replace the draft's text and attachments if `expected` is still
     /// current. An attachment left out is deleted, and a file it owned is
     /// unlinked.
@@ -558,8 +661,7 @@ impl MarmotApp {
                 self.notify_draft_changed(&account.label, group_id_hex);
                 Ok(draft.into())
             }
-            Err(StorageError::NotFound) => Err(AppError::UnknownGroup(group_id_hex.to_owned())),
-            Err(error) => Err(error.into()),
+            Err(error) => Err(draft_storage_error(error, group_id_hex)),
         }
     }
 
@@ -576,6 +678,19 @@ impl MarmotApp {
             Ok(storage.app_storage().delete_message_draft(group_id_hex)?)
         })?;
         self.notify_draft_changed(&account.label, group_id_hex);
+        Ok(())
+    }
+
+    pub(crate) fn delete_group_message_drafts(
+        &self,
+        account_ref: &str,
+        group: &str,
+    ) -> Result<(), AppError> {
+        let storage = self.draft_storage(account_ref)?;
+        self.releasing_draft_files(account_ref, &storage, group, || {
+            Ok(storage.app_storage().delete_group_message_drafts(group)?)
+        })?;
+        self.notify_draft_changed(account_ref, group);
         Ok(())
     }
 }

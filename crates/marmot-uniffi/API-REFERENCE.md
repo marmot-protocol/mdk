@@ -1724,9 +1724,9 @@ Stream cached public identities across accounts, then independent provider and g
 pub fn message_drafts( &self, account_ref: String, ) -> Result<Vec<MessageDraftSummaryFfi>, MarmotKitError>
 ```
 
-Metadata-only saved composer drafts for an account, newest-updated first. Attachment plaintext is intentionally omitted from this list; call `messageDraft` when restoring one selected composer. Hosts must delete empty or sent drafts; deleting a group also removes its draft.
+Active composer summaries for the account, newest first. Use `group_message_drafts` for the active and saved entries in one conversation.
 
-[Source](src/commands/draft.rs#L15)
+[Source](src/commands/draft.rs#L83)
 
 ### `Marmot::message_draft`
 
@@ -1736,9 +1736,9 @@ Metadata-only saved composer drafts for an account, newest-updated first. Attach
 pub fn message_draft( &self, account_ref: String, group_id_hex: String, ) -> Result<Option<MessageDraftFfi>, MarmotKitError>
 ```
 
-The saved composer draft for an account and MLS group, if one exists.
+The active composer draft for an account and MLS group, if one exists.
 
-[Source](src/commands/draft.rs#L28)
+[Source](src/commands/draft.rs#L96)
 
 ### `Marmot::save_message_draft`
 
@@ -1750,7 +1750,7 @@ pub fn save_message_draft( &self, account_ref: String, group_id_hex: String, con
 
 Upsert a composer draft into the account's encrypted SQLCipher store.
 
-[Source](src/commands/draft.rs#L41)
+[Source](src/commands/draft.rs#L109)
 
 ### `Marmot::delete_message_draft`
 
@@ -1760,9 +1760,69 @@ Upsert a composer draft into the account's encrypted SQLCipher store.
 pub fn delete_message_draft( &self, account_ref: String, group_id_hex: String, ) -> Result<(), MarmotKitError>
 ```
 
-Delete a saved composer draft. This is a no-op when no draft exists.
+Delete the active composer draft. This leaves saved entries in the group.
 
-[Source](src/commands/draft.rs#L64)
+[Source](src/commands/draft.rs#L132)
+
+### `Marmot::activate_message_draft`
+
+```rust
+pub fn activate_message_draft( &self, account_ref: String, revision: Arc<MessageDraftRevisionFfi>, id: MessageDraftIdFfi, ) -> Result<SelectedMessageDraftFfi, MarmotKitError>
+```
+
+Select a saved draft using the current composer revision. MDK parks the previous active draft in the same transaction and returns the new selected revision. An already active ID is a no-op when the revision still matches.
+
+[Source](src/commands/draft.rs#L56)
+
+### `Marmot::archive_message_draft`
+
+```rust
+pub fn archive_message_draft( &self, account_ref: String, revision: Arc<MessageDraftRevisionFfi>, ) -> Result<MessageDraftIdFfi, MarmotKitError>
+```
+
+Save the current draft for later using its selected revision. The active composer becomes empty, and the returned ID identifies the saved entry. A stale revision or a full saved list leaves the composer intact.
+
+[Source](src/commands/draft.rs#L44)
+
+### `Marmot::delete_saved_message_draft`
+
+```rust
+pub fn delete_saved_message_draft( &self, account_ref: String, group_id_hex: String, id: MessageDraftIdFfi, ) -> Result<(), MarmotKitError>
+```
+
+Remove an inactive draft from its owning conversation. An active, missing or foreign draft ID returns a typed failure. Its saved attachment keys are released according to the local deletion policy.
+
+[Source](src/commands/draft.rs#L69)
+
+### `Marmot::group_message_drafts`
+
+```rust
+pub fn group_message_drafts( &self, account_ref: String, group_id_hex: String, ) -> Result<Vec<IdentifiedMessageDraftSummaryFfi>, MarmotKitError>
+```
+
+List active and saved entries for one conversation, newest first with draft IDs breaking timestamp ties. Use it for a local draft picker. Attachment sizes and descriptors are available without attachment bytes.
+
+[Source](src/commands/draft.rs#L15)
+
+### `Marmot::identified_message_draft`
+
+```rust
+pub fn identified_message_draft( &self, account_ref: String, group_id_hex: String, id: MessageDraftIdFfi, ) -> Result<IdentifiedMessageDraftFfi, MarmotKitError>
+```
+
+Read the text, reply context, timestamps and descriptors for one local draft. Use its owning account and group. To read attachment bodies, pass this ID and the returned `content_revision` to the bounded attachment accessor.
+
+[Source](src/commands/draft.rs#L30)
+
+### `Marmot::read_identified_message_draft_attachment`
+
+```rust
+pub async fn read_identified_message_draft_attachment( &self, account_ref: String, group_id_hex: String, id: MessageDraftIdFfi, content_revision: i64, attachment_id: String, offset: u64, limit: u32, ) -> Result<Option<Vec<u8>>, MarmotKitError>
+```
+
+Read a bounded byte range of one local draft attachment. Pass the `content_revision` returned by `identified_message_draft` on every read. If content changes, the call returns `MessageDraftRevisionConflict`. Reload the draft and start the attachment again. Missing attachment data returns `None`. An empty buffer marks end of input.
+
+[Source](src/commands/draft.rs#L152)
 
 </details>
 
@@ -4532,7 +4592,7 @@ pub fn includes_chat_list_version(&self, version: Arc<ChatListDraftVersionFfi>) 
 
 Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes foreign store/group metadata and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-0130).
 
-[Source](src/conversions/conversation_window.rs#L358)
+[Source](src/conversions/conversation_window.rs#L438)
 
 </details>
 
@@ -6335,4 +6395,3 @@ Attempt bounded remote courtesy logout and erase the session's communication cre
 [Source](src/nip46.rs#L241)
 
 </details>
-

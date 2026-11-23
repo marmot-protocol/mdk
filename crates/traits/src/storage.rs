@@ -46,6 +46,8 @@ pub enum StorageError {
     /// Retrying identical input cannot repair it; callers must stop that attempt.
     #[error("invalid attachment body: {0}")]
     InvalidAttachmentBody(&'static str),
+    #[error("message draft storage quota exceeded")]
+    MessageDraftQuotaExceeded,
     /// Transient lock contention: the backend could not acquire the database
     /// lock in time (for SQLite this is `SQLITE_BUSY` / `SQLITE_LOCKED`). It is
     /// distinct from [`StorageError::Backend`] so callers can recognise a

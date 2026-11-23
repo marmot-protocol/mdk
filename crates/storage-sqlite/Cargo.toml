@@ -24,8 +24,8 @@ tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-# The migrated test template is copied with SQLite's backup API.
-rusqlite = { workspace = true, features = ["backup"] }
+# Copy the migrated test template and exercise upgrades under a lowered SQLite limit.
+rusqlite = { workspace = true, features = ["backup", "limits"] }
 media-store = { workspace = true, features = ["catalog-conformance"] }
 proc-macro2.workspace = true
 quote.workspace = true

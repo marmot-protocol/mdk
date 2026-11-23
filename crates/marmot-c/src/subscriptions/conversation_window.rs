@@ -1,7 +1,9 @@
 //! Fallible replacement streams use blocking next; paging has independent ownership.
 use super::*;
 use crate::types::conversation_window::*;
+use crate::types::draft::{MarmotIdentifiedMessageDraft, MarmotMessageDraftId};
 use crate::types::presentation::MarmotChatListDraftVersion;
+use marmot_uniffi::conversions::MessageDraftIdFfi;
 
 /// Free before its client. Concurrent next and commands are supported; never free during a call.
 pub struct MarmotConversationWindowSubscription {
@@ -260,6 +262,117 @@ pub unsafe extern "C" fn marmot_selected_message_draft(
         unsafe { deliver(client.marmot.selected_message_draft(account, group), out) }
     })
 }
+
+/// Read a draft's full text and descriptors without changing the composer.
+/// Free the result with marmot_identified_message_draft_free.
+/// # Safety
+/// Client and strings valid, out writable. The id is borrowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_identified_message_draft(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    draft_id_hex: *const c_char,
+    out: *mut *mut MarmotIdentifiedMessageDraft,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let group = try_arg!(unsafe { required_str(group_id_hex) });
+        let hex = try_arg!(unsafe { required_str(draft_id_hex) });
+        unsafe {
+            deliver(
+                client
+                    .marmot
+                    .identified_message_draft(account, group, MessageDraftIdFfi { hex }),
+                out,
+            )
+        }
+    })
+}
+
+/// Save the exact composer revision and leave the composer empty.
+/// Free the returned ID with marmot_message_draft_id_free.
+/// # Safety
+/// Client, account and revision valid, out writable. Revision's owning draft stays live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_archive_message_draft(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    revision: *const MarmotMessageDraftRevision,
+    out: *mut *mut MarmotMessageDraftId,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let revision = try_arg!(unsafe { revision.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        unsafe {
+            deliver(
+                client
+                    .marmot
+                    .archive_message_draft(account, revision.inner.clone()),
+                out,
+            )
+        }
+    })
+}
+
+/// Resume a saved draft and park the current composer in the same transaction.
+/// Free the result with marmot_selected_message_draft_free.
+/// # Safety
+/// Client, strings and revision valid, out writable. Revision's owning draft stays live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_activate_message_draft(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    revision: *const MarmotMessageDraftRevision,
+    draft_id_hex: *const c_char,
+    out: *mut *mut MarmotSelectedMessageDraft,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let revision = try_arg!(unsafe { revision.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        let hex = try_arg!(unsafe { required_str(draft_id_hex) });
+        unsafe {
+            deliver(
+                client.marmot.activate_message_draft(
+                    account,
+                    revision.inner.clone(),
+                    MessageDraftIdFfi { hex },
+                ),
+                out,
+            )
+        }
+    })
+}
+
+/// Remove the identified saved draft from this group.
+/// # Safety
+/// Client and strings valid for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_delete_saved_message_draft(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    draft_id_hex: *const c_char,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let group = try_arg!(unsafe { required_str(group_id_hex) });
+        let hex = try_arg!(unsafe { required_str(draft_id_hex) });
+        crate::commands::deliver_unit(client.marmot.delete_saved_message_draft(
+            account,
+            group,
+            MessageDraftIdFfi { hex },
+        ))
+    })
+}
+
 /// Compare an opaque chat-list draft version with a selected revision.
 /// Returns zero for a foreign store/group or a newer draft.
 /// # Safety
@@ -517,6 +630,55 @@ pub unsafe extern "C" fn marmot_read_message_draft_attachment(
         }
     })
 }
+
+/// Blocking local read of 1..=1048576 bytes from an active or saved draft.
+/// Pass the content revision returned by marmot_identified_message_draft.
+/// found=0 means the attachment is absent. found=1 with zero bytes means EOF.
+/// Free returned bytes with marmot_bytes_free.
+/// # Safety
+/// Client and strings valid, all out pointers writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_read_identified_message_draft_attachment(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    draft_id_hex: *const c_char,
+    content_revision: i64,
+    attachment_id: *const c_char,
+    offset: u64,
+    limit: u32,
+    out_found: *mut u8,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out(out_found) });
+        try_arg!(unsafe { preflight_out_ptr(out_data) });
+        try_arg!(unsafe { crate::preflight_out(out_len) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let group = try_arg!(unsafe { required_str(group_id_hex) });
+        let hex = try_arg!(unsafe { required_str(draft_id_hex) });
+        let attachment = try_arg!(unsafe { required_str(attachment_id) });
+        match client.block_on(client.marmot.read_identified_message_draft_attachment(
+            account,
+            group,
+            MessageDraftIdFfi { hex },
+            content_revision,
+            attachment,
+            offset,
+            limit,
+        )) {
+            Ok(Some(bytes)) => unsafe {
+                out_found.write(1);
+                crate::commands::deliver_bytes(Ok(bytes), out_data, out_len)
+            },
+            Ok(None) => MarmotStatus::Ok,
+            Err(e) => status_from_error(&e),
+        }
+    })
+}
+
 /// marmot_open_attachment_handoff for one draft attachment: a plaintext copy
 /// for an OS surface that needs a real file, released with
 /// marmot_release_attachment_handoff. The revision is checked once, before

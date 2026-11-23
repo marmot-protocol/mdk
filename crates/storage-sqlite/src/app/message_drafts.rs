@@ -1,5 +1,6 @@
 pub(crate) mod files;
 pub(crate) mod revisioned;
+mod saved;
 pub use files::{
     MessageDraftAttachmentFileMeta, MessageDraftAttachmentRead, MessageDraftAttachmentStage,
     MessageDraftStageRefusal, MessageDraftUploadBody, MessageDraftUploadSource,
@@ -7,6 +8,10 @@ pub use files::{
 pub use revisioned::{
     ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent,
+};
+pub use saved::{
+    MessageDraftId, StoredIdentifiedMessageDraft, StoredIdentifiedMessageDraftSummary,
+    StoredMessageDraftState,
 };
 
 #[cfg(test)]
@@ -180,33 +185,35 @@ impl SqliteAppStorage {
             let mut statement = tx
                 .prepare_cached(
                     "SELECT group_id_hex, content, reply_to_message_id_hex,
-                            created_at_ms, updated_at_ms
-                     FROM message_drafts
-                     ORDER BY updated_at_ms DESC",
+                            created_at_ms, updated_at_ms, draft_id
+                     FROM message_drafts WHERE active = 1
+                     ORDER BY updated_at_ms DESC, draft_id",
                 )
                 .storage()?;
             statement
                 .query_map([], |row| {
-                    Ok(StoredMessageDraftSummary {
-                        group_id_hex: row.get(0)?,
-                        content: row.get(1)?,
-                        reply_to_message_id_hex: row.get(2)?,
-                        media_attachments: Vec::new(),
-                        created_at_ms: row.get(3)?,
-                        updated_at_ms: row.get(4)?,
-                    })
+                    Ok((
+                        row.get::<_, [u8; 16]>(5)?,
+                        StoredMessageDraftSummary {
+                            group_id_hex: row.get(0)?,
+                            content: row.get(1)?,
+                            reply_to_message_id_hex: row.get(2)?,
+                            media_attachments: Vec::new(),
+                            created_at_ms: row.get(3)?,
+                            updated_at_ms: row.get(4)?,
+                        },
+                    ))
                 })
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
                 .storage()?
         };
 
-        for draft in &mut drafts {
-            draft.media_attachments =
-                load_message_draft_attachment_summaries(&tx, &draft.group_id_hex)?;
+        for (id, draft) in &mut drafts {
+            draft.media_attachments = load_message_draft_attachment_summaries(&tx, id)?;
         }
         tx.commit().storage()?;
-        Ok(drafts)
+        Ok(drafts.into_iter().map(|(_, draft)| draft).collect())
     }
 
     /// Load one fully hydrated draft for a group. A draft holding a
@@ -220,7 +227,8 @@ impl SqliteAppStorage {
         let file_backed: bool = tx
             .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM message_draft_attachments
-                 WHERE group_id_hex = ?1 AND file_id IS NOT NULL)",
+                 WHERE draft_id = (SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1 AND active = 1)
+                   AND file_id IS NOT NULL)",
                 params![group_id_hex],
                 |row| row.get(0),
             )
@@ -287,19 +295,24 @@ impl SqliteAppStorage {
             if !group_exists {
                 return Err(StorageError::NotFound);
             }
-            tx.execute_cached(
-                "INSERT INTO message_drafts (
+            let before = saved::DraftQuotaUsage::read(&tx, group_id_hex)?;
+            let draft_id: [u8; 16] = tx
+                .query_row_cached(
+                    "INSERT INTO message_drafts (
                     group_id_hex, content, reply_to_message_id_hex, created_at_ms, updated_at_ms
                  )
                  VALUES (?1, ?2, ?3, ?4, ?4)
-                 ON CONFLICT(group_id_hex) DO UPDATE SET
+                 ON CONFLICT(group_id_hex) WHERE active = 1 DO UPDATE SET
                     content = excluded.content,
                     reply_to_message_id_hex = excluded.reply_to_message_id_hex,
-                    updated_at_ms = excluded.updated_at_ms",
-                params![group_id_hex, content, reply_to_message_id_hex, now_ms],
-            )
-            .storage()?;
-            sync_message_draft_attachments(&tx, group_id_hex, media_attachments)?;
+                    updated_at_ms = excluded.updated_at_ms
+                 RETURNING draft_id",
+                    params![group_id_hex, content, reply_to_message_id_hex, now_ms],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            sync_message_draft_attachments(&tx, &draft_id, media_attachments)?;
+            saved::DraftQuotaUsage::read(&tx, group_id_hex)?.check_growth_from(&before)?;
             tx.commit().storage()?;
             Ok(())
         })
@@ -310,6 +323,21 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             revisioned::end_composition_tx(&conn, group_id_hex)
+        })
+    }
+
+    /// Clear all composer drafts when a group disbands.
+    pub fn delete_group_message_drafts(&self, group_id_hex: &str) -> StorageResult<()> {
+        self.connection.with_transaction(|| {
+            let mut conn = self.lock()?;
+            let tx = conn.savepoint().storage()?;
+            revisioned::end_composition_tx(&tx, group_id_hex)?;
+            tx.execute_cached(
+                "DELETE FROM message_drafts WHERE group_id_hex = ?1 AND active = 0",
+                [group_id_hex],
+            )
+            .storage()?;
+            tx.commit().storage()
         })
     }
 }
@@ -333,16 +361,16 @@ pub(crate) const ATTACHMENT_SUMMARIES_SQL: &str = "SELECT attachment_id, file_na
              CASE WHEN file_id IS NULL THEN length(plaintext)
                  ELSE (SELECT m.byte_len FROM media_files m WHERE m.id = file_id) END
              FROM message_draft_attachments
-             WHERE group_id_hex = ?1
+             WHERE draft_id = ?1
              ORDER BY position ASC";
 
 fn load_message_draft_attachment_summaries(
     conn: &Connection,
-    group_id_hex: &str,
+    draft_id: &[u8; 16],
 ) -> StorageResult<Vec<StoredMessageDraftAttachmentSummary>> {
     let mut statement = conn.prepare_cached(ATTACHMENT_SUMMARIES_SQL).storage()?;
     let rows = statement
-        .query_map(params![group_id_hex], |row| {
+        .query_map(params![draft_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -375,7 +403,8 @@ pub(crate) fn draft_attachment_ids_tx(
     let mut statement = conn
         .prepare_cached(
             "SELECT attachment_id FROM message_draft_attachments
-             WHERE group_id_hex = ?1 ORDER BY position",
+             WHERE draft_id = (SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1 AND active = 1)
+             ORDER BY position",
         )
         .storage()?;
     let ids = statement
@@ -406,10 +435,10 @@ impl ExistingAttachment {
 
 fn sync_message_draft_attachments(
     tx: &Connection,
-    group_id_hex: &str,
+    draft_id: &[u8; 16],
     incoming: &[DraftAttachmentInput<'_>],
 ) -> StorageResult<()> {
-    let existing = load_existing_attachments(tx, group_id_hex)?;
+    let existing = load_existing_attachments(tx, draft_id)?;
     if existing.len() == incoming.len()
         && existing
             .iter()
@@ -429,7 +458,7 @@ fn sync_message_draft_attachments(
             if let Some(replacement) = replacement.inline()
                 && !stored.kept_by(&DraftAttachmentInput::Inline(replacement))
             {
-                update_message_draft_attachment(tx, group_id_hex, None, replacement)?;
+                update_message_draft_attachment(tx, draft_id, None, replacement)?;
             }
         }
         return Ok(());
@@ -454,8 +483,8 @@ fn sync_message_draft_attachments(
         tx.execute_cached(
             "UPDATE message_draft_attachments
              SET position = position + ?2
-             WHERE group_id_hex = ?1",
-            params![group_id_hex, position_offset],
+             WHERE draft_id = ?1",
+            params![draft_id, position_offset],
         )
         .storage()?;
     }
@@ -468,16 +497,16 @@ fn sync_message_draft_attachments(
                 tx.execute_cached(
                     "UPDATE message_draft_attachments
                      SET position = ?3
-                     WHERE group_id_hex = ?1 AND attachment_id = ?2",
-                    params![group_id_hex, attachment.id(), position],
+                     WHERE draft_id = ?1 AND attachment_id = ?2",
+                    params![draft_id, attachment.id(), position],
                 )
                 .storage()?;
             }
             (Some(_), Some(replacement)) => {
-                update_message_draft_attachment(tx, group_id_hex, Some(position), replacement)?;
+                update_message_draft_attachment(tx, draft_id, Some(position), replacement)?;
             }
             (None, Some(new)) => {
-                insert_message_draft_attachment(tx, group_id_hex, position, new)?;
+                insert_message_draft_attachment(tx, draft_id, position, new)?;
             }
             // Callers check retained ids against the draft first.
             (_, None) => {
@@ -492,8 +521,8 @@ fn sync_message_draft_attachments(
         if !incoming_ids.contains(stored.attachment.id.as_str()) {
             tx.execute_cached(
                 "DELETE FROM message_draft_attachments
-                 WHERE group_id_hex = ?1 AND attachment_id = ?2",
-                params![group_id_hex, stored.attachment.id],
+                 WHERE draft_id = ?1 AND attachment_id = ?2",
+                params![draft_id, stored.attachment.id],
             )
             .storage()?;
         }
@@ -503,19 +532,19 @@ fn sync_message_draft_attachments(
 
 fn insert_message_draft_attachment(
     tx: &Connection,
-    group_id_hex: &str,
+    draft_id: &[u8; 16],
     position: i64,
     attachment: &StoredMessageDraftAttachment,
 ) -> StorageResult<()> {
     let waveform_samples = encoded_waveform_samples(attachment)?;
     tx.execute_cached(
         "INSERT INTO message_draft_attachments (
-            group_id_hex, position, attachment_id, file_name, media_type,
+            draft_id, position, attachment_id, file_name, media_type,
             plaintext, dim, thumbhash, duration_seconds, waveform_samples_json
          )
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
-            group_id_hex,
+            draft_id,
             position,
             attachment.id,
             attachment.file_name,
@@ -533,7 +562,7 @@ fn insert_message_draft_attachment(
 
 fn update_message_draft_attachment(
     tx: &Connection,
-    group_id_hex: &str,
+    draft_id: &[u8; 16],
     position: Option<i64>,
     attachment: &StoredMessageDraftAttachment,
 ) -> StorageResult<()> {
@@ -544,9 +573,9 @@ fn update_message_draft_attachment(
              SET position = ?3, file_name = ?4, media_type = ?5, plaintext = ?6,
                  dim = ?7, thumbhash = ?8, duration_seconds = ?9,
                  waveform_samples_json = ?10, file_id = NULL
-             WHERE group_id_hex = ?1 AND attachment_id = ?2",
+             WHERE draft_id = ?1 AND attachment_id = ?2",
             params![
-                group_id_hex,
+                draft_id,
                 attachment.id,
                 position,
                 attachment.file_name,
@@ -565,9 +594,9 @@ fn update_message_draft_attachment(
              SET file_name = ?3, media_type = ?4, plaintext = ?5, dim = ?6,
                  thumbhash = ?7, duration_seconds = ?8, waveform_samples_json = ?9,
                  file_id = NULL
-             WHERE group_id_hex = ?1 AND attachment_id = ?2",
+             WHERE draft_id = ?1 AND attachment_id = ?2",
             params![
-                group_id_hex,
+                draft_id,
                 attachment.id,
                 attachment.file_name,
                 attachment.media_type,
@@ -591,9 +620,9 @@ fn encoded_waveform_samples(attachment: &StoredMessageDraftAttachment) -> Storag
 
 fn load_message_draft_attachments(
     conn: &Connection,
-    group_id_hex: &str,
+    draft_id: &[u8; 16],
 ) -> StorageResult<Vec<StoredMessageDraftAttachment>> {
-    Ok(load_existing_attachments(conn, group_id_hex)?
+    Ok(load_existing_attachments(conn, draft_id)?
         .into_iter()
         .map(|stored| stored.attachment)
         .collect())
@@ -601,19 +630,19 @@ fn load_message_draft_attachments(
 
 fn load_existing_attachments(
     conn: &Connection,
-    group_id_hex: &str,
+    draft_id: &[u8; 16],
 ) -> StorageResult<Vec<ExistingAttachment>> {
     let mut statement = conn
         .prepare_cached(
             "SELECT attachment_id, file_name, media_type, plaintext, dim, thumbhash,
                     duration_seconds, waveform_samples_json, file_id IS NOT NULL
              FROM message_draft_attachments
-             WHERE group_id_hex = ?1
+             WHERE draft_id = ?1
              ORDER BY position ASC",
         )
         .storage()?;
     let rows = statement
-        .query_map(params![group_id_hex], |row| {
+        .query_map(params![draft_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -666,9 +695,9 @@ fn load_message_draft(
 ) -> StorageResult<Option<StoredMessageDraft>> {
     let draft = conn
         .query_row_cached(
-            "SELECT content, reply_to_message_id_hex, created_at_ms, updated_at_ms
+            "SELECT content, reply_to_message_id_hex, created_at_ms, updated_at_ms, draft_id
                  FROM message_drafts
-                 WHERE group_id_hex = ?1",
+                 WHERE group_id_hex = ?1 AND active = 1",
             params![group_id_hex],
             |row| {
                 Ok((
@@ -676,16 +705,18 @@ fn load_message_draft(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, [u8; 16]>(4)?,
                 ))
             },
         )
         .optional()
         .storage()?;
-    let Some((content, reply_to_message_id_hex, created_at_ms, updated_at_ms)) = draft else {
+    let Some((content, reply_to_message_id_hex, created_at_ms, updated_at_ms, draft_id)) = draft
+    else {
         return Ok(None);
     };
 
-    let media_attachments = load_message_draft_attachments(conn, group_id_hex)?;
+    let media_attachments = load_message_draft_attachments(conn, &draft_id)?;
 
     Ok(Some(StoredMessageDraft {
         group_id_hex: group_id_hex.to_owned(),
@@ -740,7 +771,8 @@ mod tests {
             .unwrap()
             .query_row(
                 "SELECT rowid FROM message_draft_attachments
-                 WHERE group_id_hex = ?1 AND attachment_id = ?2",
+                 WHERE draft_id = (SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1 AND active = 1)
+                   AND attachment_id = ?2",
                 params![group_id_hex, attachment_id],
                 |row| row.get(0),
             )
@@ -858,7 +890,25 @@ mod tests {
             "the draft-owning projection row must remain for the foreign key"
         );
 
-        app.delete_message_draft(&group_id_hex).unwrap();
+        let selected = app.selected_message_draft(&group_id_hex).unwrap();
+        let saved_id = app.archive_message_draft(&selected.revision).unwrap();
+        let empty_projection = StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: vec![],
+            last_transport_timestamp: None,
+            groups: vec![],
+        };
+        app.save_account_projection_state(&empty_projection, 100, MAX_FUTURE_SKEW_SECS)
+            .unwrap();
+        assert_eq!(
+            app.identified_message_draft(&group_id_hex, saved_id)
+                .unwrap()
+                .content
+                .content,
+            "protected"
+        );
+        app.delete_saved_message_draft(&group_id_hex, saved_id)
+            .unwrap();
         app.save_account_projection_state(
             &StoredAccountState {
                 label: "alice".to_owned(),

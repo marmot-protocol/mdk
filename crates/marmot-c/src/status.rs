@@ -250,6 +250,10 @@ pub enum MarmotStatus {
     /// A relay check of the account is running; nothing more was checked.
     /// Ask again once its rows stop saying `checking`.
     RelayCheckRunning = 135,
+    /// The draft does not exist in the requested group and state.
+    UnknownMessageDraft = 136,
+    /// The local saved-draft or attachment quota would be exceeded.
+    MessageDraftQuotaExceeded = 137,
 }
 
 thread_local! {
@@ -368,6 +372,8 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::GroupHydrationPending { .. } => MarmotStatus::GroupHydrationPending,
         MarmotKitError::InvalidChatPin { .. } => MarmotStatus::InvalidChatPin,
         MarmotKitError::InvalidMessageDraft { .. } => MarmotStatus::InvalidMessageDraft,
+        MarmotKitError::UnknownMessageDraft => MarmotStatus::UnknownMessageDraft,
+        MarmotKitError::MessageDraftQuotaExceeded => MarmotStatus::MessageDraftQuotaExceeded,
         MarmotKitError::InvalidAppComponent { .. } => MarmotStatus::InvalidAppComponent,
         MarmotKitError::InvalidMediaReference { .. } => MarmotStatus::InvalidMediaReference,
         MarmotKitError::MediaReferenceStaleEpoch { .. } => MarmotStatus::MediaReferenceStaleEpoch,
@@ -653,6 +659,8 @@ mod tests {
             MarmotKitError::NoUsableRelay,
             MarmotKitError::IncompatibleKeyPackage,
             MarmotKitError::RelayCheckRunning,
+            MarmotKitError::UnknownMessageDraft,
+            MarmotKitError::MessageDraftQuotaExceeded,
             MarmotKitError::MemberNotInGroup {
                 group_id_hex: "aa".into(),
                 member_id_hex: "bb".into(),
@@ -854,6 +862,14 @@ mod tests {
         assert_eq!(
             take_last_error().as_deref(),
             Some("a relay check of this account is already running")
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::UnknownMessageDraft) as i32,
+            136
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::MessageDraftQuotaExceeded) as i32,
+            137
         );
         assert_eq!(
             status_from_error(&MarmotKitError::GroupRecoverySourceMismatch {

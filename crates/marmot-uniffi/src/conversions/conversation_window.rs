@@ -1,5 +1,6 @@
 //! Prepared conversation screen values. No profile/roster reads occur in this mapper.
 use super::*;
+use crate::errors::MarmotKitError;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use marmot_app as app;
 use std::borrow::Cow;
@@ -273,6 +274,85 @@ impl From<app::SelectedMessageDraftAttachment> for SelectedMessageDraftAttachmen
         }
     }
 }
+/// Opaque local identifier. Pass this value back with the originating account and group.
+#[derive(Clone, uniffi::Record)]
+pub struct MessageDraftIdFfi {
+    pub hex: String,
+}
+
+impl From<app::MessageDraftId> for MessageDraftIdFfi {
+    fn from(value: app::MessageDraftId) -> Self {
+        Self {
+            hex: hex::encode(value.as_bytes()),
+        }
+    }
+}
+
+impl TryFrom<MessageDraftIdFfi> for app::MessageDraftId {
+    type Error = MarmotKitError;
+
+    fn try_from(value: MessageDraftIdFfi) -> Result<Self, Self::Error> {
+        let mut bytes = [0; 16];
+        hex::decode_to_slice(value.hex, &mut bytes).map_err(|_| {
+            MarmotKitError::InvalidMessageDraft {
+                details: "invalid draft identifier".to_owned(),
+            }
+        })?;
+        Ok(Self::from_bytes(bytes))
+    }
+}
+
+#[derive(Clone, Copy, uniffi::Enum)]
+pub enum MessageDraftStateFfi {
+    Active,
+    Saved,
+}
+
+impl From<app::MessageDraftState> for MessageDraftStateFfi {
+    fn from(value: app::MessageDraftState) -> Self {
+        match value {
+            app::MessageDraftState::Active => Self::Active,
+            app::MessageDraftState::Saved => Self::Saved,
+        }
+    }
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct IdentifiedMessageDraftSummaryFfi {
+    pub id: MessageDraftIdFfi,
+    pub state: MessageDraftStateFfi,
+    pub summary: MessageDraftSummaryFfi,
+}
+
+impl From<app::IdentifiedMessageDraftSummary> for IdentifiedMessageDraftSummaryFfi {
+    fn from(value: app::IdentifiedMessageDraftSummary) -> Self {
+        Self {
+            id: value.id.into(),
+            state: value.state.into(),
+            summary: value.summary.into(),
+        }
+    }
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct IdentifiedMessageDraftFfi {
+    pub id: MessageDraftIdFfi,
+    pub state: MessageDraftStateFfi,
+    pub content_revision: i64,
+    pub content: SelectedMessageDraftContentFfi,
+}
+
+impl From<app::IdentifiedMessageDraft> for IdentifiedMessageDraftFfi {
+    fn from(value: app::IdentifiedMessageDraft) -> Self {
+        Self {
+            id: value.id.into(),
+            state: value.state.into(),
+            content_revision: value.content_revision,
+            content: value.content.into(),
+        }
+    }
+}
+
 #[derive(Clone, uniffi::Record)]
 pub struct SelectedMessageDraftContentFfi {
     pub group_id_hex: String,

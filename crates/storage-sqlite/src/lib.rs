@@ -125,11 +125,12 @@ pub use app::history_deliveries::{
 pub use app::link_chat_progress::{LinkChatPage, LinkChatReport, ReceivedLinkChatReport};
 pub use app::message_drafts::{
     ChatListDraftVersion, MessageDraftAttachmentFileMeta, MessageDraftAttachmentRead,
-    MessageDraftAttachmentStage, MessageDraftRevision, MessageDraftRevisionError,
+    MessageDraftAttachmentStage, MessageDraftId, MessageDraftRevision, MessageDraftRevisionError,
     MessageDraftStageRefusal, MessageDraftUploadBody, MessageDraftUploadSource,
     SelectedMessageDraft, SelectedMessageDraftAttachment, SelectedMessageDraftContent,
-    StoredMessageDraft, StoredMessageDraftAttachment, StoredMessageDraftAttachmentInput,
-    StoredMessageDraftAttachmentSummary, StoredMessageDraftSummary,
+    StoredIdentifiedMessageDraft, StoredIdentifiedMessageDraftSummary, StoredMessageDraft,
+    StoredMessageDraftAttachment, StoredMessageDraftAttachmentInput,
+    StoredMessageDraftAttachmentSummary, StoredMessageDraftState, StoredMessageDraftSummary,
 };
 pub use app::pending_welcome_delivery::PendingWelcomeDeliveryRecord;
 pub use app::private_key_packages::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage};

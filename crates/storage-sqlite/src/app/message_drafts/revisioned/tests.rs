@@ -223,7 +223,7 @@ fn conditional_mutations_reject_stale_cross_store_and_failed_attachment_edits() 
     );
     assert!(
         matches!(&duplicate, Err(MessageDraftRevisionError::Storage(StorageError::Backend(message)))
-            if message == "UNIQUE constraint failed: message_draft_attachments.group_id_hex, message_draft_attachments.attachment_id"),
+            if message == "UNIQUE constraint failed: message_draft_attachments.draft_id, message_draft_attachments.attachment_id"),
         "{duplicate:?}"
     );
     assert_eq!(
@@ -451,6 +451,11 @@ fn accepted_and_unaccepted_draft_revisions_survive_encrypted_reopen() {
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let app = store.app_storage();
         seed(&store);
+        app.save_message_draft(GROUP, "saved sibling", None, &[])
+            .unwrap();
+        let sibling = app
+            .archive_message_draft(&app.selected_message_draft(GROUP).unwrap().revision)
+            .unwrap();
         app.save_message_draft(GROUP, "retained", None, &[attachment()])
             .unwrap();
         let selected = app.selected_message_draft(GROUP).unwrap();
@@ -470,6 +475,12 @@ fn accepted_and_unaccepted_draft_revisions_survive_encrypted_reopen() {
             .selected_message_draft(GROUP)
             .unwrap();
         assert_eq!(now.draft.is_none(), accepted);
+        let saved = reopened
+            .app_storage()
+            .identified_message_draft(GROUP, sibling)
+            .unwrap();
+        assert_eq!(saved.state, super::super::StoredMessageDraftState::Saved);
+        assert_eq!(saved.content.content, "saved sibling");
         assert_eq!(now.revision == selected.revision, !accepted);
         assert_eq!(
             !reopened
@@ -699,4 +710,54 @@ fn an_update_keeps_attachments_it_does_not_name_and_removes_only_named_ones() {
         ["b"],
         "a whole-list save still drops the rest"
     );
+}
+
+#[test]
+fn accepting_a_send_after_switching_consumes_only_the_sent_version() {
+    for edit_before_acceptance in [false, true] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        seed(&store);
+        app.save_message_draft(GROUP, "submitted", None, &[])
+            .unwrap();
+        let selected = app.selected_message_draft(GROUP).unwrap();
+        app.stage_message_draft_submission(&selected.revision, "submitted-event", b"submitted")
+            .unwrap();
+        let submitted = app.archive_message_draft(&selected.revision).unwrap();
+
+        if edit_before_acceptance {
+            let empty = app.selected_message_draft(GROUP).unwrap();
+            let restored = app
+                .activate_message_draft(&empty.revision, submitted)
+                .unwrap();
+            let edited = app
+                .save_message_draft_if_revision(&restored.revision, "edited", None, &[])
+                .unwrap();
+            app.archive_message_draft(&edited.revision).unwrap();
+        }
+        app.save_message_draft(GROUP, "next", None, &[]).unwrap();
+        let next = app.selected_message_draft(GROUP).unwrap();
+        app.stage_message_draft_submission(&next.revision, "next-event", b"next")
+            .unwrap();
+
+        store
+            .put_queued_outbound_intent(&queued(b"submitted"))
+            .unwrap();
+        assert_eq!(
+            app.selected_message_draft(GROUP).unwrap().revision,
+            next.revision
+        );
+        let remaining = app.identified_message_draft(GROUP, submitted);
+        if edit_before_acceptance {
+            assert_eq!(remaining.unwrap().content.content, "edited");
+        } else {
+            assert!(matches!(
+                remaining,
+                Err(MessageDraftRevisionError::UnknownDraft)
+            ));
+        }
+
+        store.put_queued_outbound_intent(&queued(b"next")).unwrap();
+        assert!(app.selected_message_draft(GROUP).unwrap().draft.is_none());
+    }
 }

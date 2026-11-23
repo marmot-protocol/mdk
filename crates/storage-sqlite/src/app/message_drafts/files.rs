@@ -40,7 +40,7 @@ impl fmt::Debug for MessageDraftAttachmentFileMeta {
 /// abandoned the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageDraftStageRefusal {
-    /// The store was reset, or the draft ended (cleared, deleted or sent),
+    /// The store was reset or the active composition changed
     /// since the staging started.
     Conflict,
     /// The group is gone.
@@ -49,6 +49,8 @@ pub enum MessageDraftStageRefusal {
     DuplicateId,
     /// The draft would exceed its attachment count or byte bound.
     Full,
+    /// The account store's draft quota would be exceeded.
+    QuotaExceeded,
 }
 
 /// The owner of one staged draft attachment while the store writes it. One
@@ -94,7 +96,8 @@ impl MessageDraftAttachmentStage {
         let duplicate: bool = conn
             .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM message_draft_attachments
-                 WHERE group_id_hex = ?1 AND attachment_id = ?2)",
+                 WHERE draft_id = (SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1 AND active = 1)
+                   AND attachment_id = ?2)",
                 params![group, self.meta.id],
                 |row| row.get(0),
             )
@@ -103,6 +106,14 @@ impl MessageDraftAttachmentStage {
             return self.refuse(MessageDraftStageRefusal::DuplicateId);
         }
         let (count, bytes) = draft_usage_tx(&conn, group)?;
+        let add_bytes = i64::try_from(self.byte_len).unwrap_or(i64::MAX);
+        match super::saved::check_attachment_limits(&conn, group, 1, add_bytes) {
+            Ok(()) => {}
+            Err(StorageError::MessageDraftQuotaExceeded) => {
+                return self.refuse(MessageDraftStageRefusal::QuotaExceeded);
+            }
+            Err(error) => return Err(error),
+        }
         if !(self.fits)(count.saturating_add(1), bytes.saturating_add(self.byte_len)) {
             return self.refuse(MessageDraftStageRefusal::Full);
         }
@@ -116,13 +127,15 @@ impl MessageDraftAttachmentStage {
             return Ok(StagedOutcome::Superseded);
         }
         let now_ms = unix_now_ms();
-        conn.execute_cached(
+        let draft_id: [u8; 16] = conn.query_row_cached(
             "INSERT INTO message_drafts (
                 group_id_hex, content, reply_to_message_id_hex, created_at_ms, updated_at_ms
              )
              VALUES (?1, '', NULL, ?2, ?2)
-             ON CONFLICT(group_id_hex) DO UPDATE SET updated_at_ms = excluded.updated_at_ms",
+             ON CONFLICT(group_id_hex) WHERE active = 1 DO UPDATE SET updated_at_ms = excluded.updated_at_ms
+             RETURNING draft_id",
             params![group, now_ms],
+            |row| row.get(0),
         )
         .storage()?;
         let waveform_samples =
@@ -131,14 +144,14 @@ impl MessageDraftAttachmentStage {
             })?;
         conn.execute_cached(
             "INSERT INTO message_draft_attachments (
-                group_id_hex, position, attachment_id, file_name, media_type,
+                draft_id, position, attachment_id, file_name, media_type,
                 plaintext, dim, thumbhash, duration_seconds, waveform_samples_json, file_id
              )
              VALUES (?1, (SELECT coalesce(max(position) + 1, 0) FROM message_draft_attachments
-                          WHERE group_id_hex = ?1),
+                          WHERE draft_id = ?1),
                      ?2, ?3, ?4, x'', ?5, ?6, ?7, ?8, ?9)",
             params![
-                group,
+                draft_id,
                 self.meta.id,
                 self.meta.file_name,
                 self.meta.media_type,
@@ -167,16 +180,22 @@ impl StageTarget for MessageDraftAttachmentStage {
         self.storage
             .connection
             .with_transaction(|| {
-                // The row's trigger deletes the staged file row (its key).
-                let deleted = self
-                    .storage
-                    .lock()?
-                    .execute(
+                let conn = self.storage.lock()?;
+                let group = self.expected.group_id_hex();
+                match revision_tx(&conn, group) {
+                    Ok(revision) if revision.same_store(&self.expected) => {}
+                    Ok(_) | Err(StorageError::NotFound) => return Ok(false),
+                    Err(error) => return Err(error),
+                }
+                // An explicit release follows the staged file's owner even
+                // after it parks. The row's trigger erases the file key.
+                let deleted = conn.execute(
                         "DELETE FROM message_draft_attachments
-                         WHERE group_id_hex = ?1 AND file_id = ?2
+                         WHERE draft_id IN (SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1)
+                           AND file_id = ?2
                          AND EXISTS(SELECT 1 FROM media_files WHERE id = ?2 AND state = ?3)",
                         params![
-                            self.expected.group_id_hex(),
+                            group,
                             id.as_bytes().as_slice(),
                             STATE_STAGED
                         ],
@@ -250,7 +269,7 @@ fn draft_usage_tx(conn: &Connection, group: &str) -> StorageResult<(u64, u64)> {
             "SELECT count(*), coalesce(sum(CASE WHEN a.file_id IS NULL THEN length(a.plaintext)
                  ELSE m.byte_len END), 0)
              FROM message_draft_attachments a LEFT JOIN media_files m ON m.id = a.file_id
-             WHERE a.group_id_hex = ?1",
+             WHERE a.draft_id = (SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1 AND active = 1)",
             [group],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -265,9 +284,8 @@ impl SqliteAppStorage {
     /// The owner of a file being staged into the draft `expected` selects,
     /// which must be current now. The commit needs the same store and
     /// composition, not the same revision, so text saves during the copy do
-    /// not lose it but a clear, delete or send refuses it; it appends the
-    /// attachment and moves the revision. `fits` bounds the draft's attachment count
-    /// and plaintext bytes with this file included.
+    /// not lose it but a clear, send or selection change refuses it. `fits`
+    /// checks the caller's upload limits at commit as well as the store quota.
     pub fn message_draft_attachment_stage(
         &self,
         expected: &MessageDraftRevision,
@@ -277,7 +295,10 @@ impl SqliteAppStorage {
     ) -> Result<MessageDraftAttachmentStage, MessageDraftRevisionError> {
         let composition = self.connection.with_deferred_read(|conn| {
             check_revision_tx(conn, expected)?;
-            Ok::<_, MessageDraftRevisionError>(composition_tx(conn, expected.group_id_hex())?)
+            let group = expected.group_id_hex();
+            let added_bytes = i64::try_from(byte_len).unwrap_or(i64::MAX);
+            super::saved::check_attachment_limits(conn, group, 1, added_bytes)?;
+            Ok::<_, MessageDraftRevisionError>(composition_tx(conn, group)?)
         })?;
         Ok(MessageDraftAttachmentStage {
             storage: self.clone(),
@@ -322,34 +343,18 @@ impl SqliteAppStorage {
         offset: u64,
         limit: usize,
     ) -> Result<Option<MessageDraftAttachmentRead>, MessageDraftRevisionError> {
-        let start = i64::try_from(offset)
-            .ok()
-            .and_then(|offset| offset.checked_add(1))
-            .ok_or(MessageDraftRevisionError::Invalid(
-                "invalid attachment range",
-            ))?;
-        let limit = i64::try_from(limit)
-            .map_err(|_| MessageDraftRevisionError::Invalid("invalid attachment range"))?;
         self.connection.with_deferred_read(|conn| {
             check_revision_tx(conn, expected)?;
-            conn.query_row_cached(
-                "SELECT file_id, CASE WHEN file_id IS NULL THEN substr(plaintext, ?3, ?4) END
-                 FROM message_draft_attachments WHERE group_id_hex = ?1 AND attachment_id = ?2",
-                params![expected.group_id_hex(), attachment_id, start, limit],
-                |row| {
-                    Ok(match row.get::<_, Option<Vec<u8>>>(0)? {
-                        Some(file) => Err(file),
-                        None => Ok(row.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default()),
-                    })
-                },
-            )
-            .optional()
-            .storage()?
-            .map(|read| match read {
-                Ok(bytes) => Ok(MessageDraftAttachmentRead::Bytes(bytes)),
-                Err(file) => Ok(MessageDraftAttachmentRead::MediaFile(file_id(file)?)),
-            })
-            .transpose()
+            let id = conn
+                .query_row_cached(
+                    "SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1 AND active = 1",
+                    [expected.group_id_hex()],
+                    |row| row.get::<_, [u8; 16]>(0),
+                )
+                .optional()
+                .storage()?;
+            let Some(id) = id else { return Ok(None) };
+            read_draft_attachment_tx(conn, &id, attachment_id, offset, limit)
         })
     }
 
@@ -382,7 +387,7 @@ impl SqliteAppStorage {
                             "SELECT a.plaintext, a.file_id, m.plaintext_digest
                              FROM message_draft_attachments a
                              LEFT JOIN media_files m ON m.id = a.file_id
-                             WHERE a.group_id_hex = ?1 AND a.attachment_id = ?2",
+                             WHERE a.draft_id = (SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1 AND active = 1) AND a.attachment_id = ?2",
                             params![expected.group_id_hex(), id],
                             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                         )
@@ -415,7 +420,8 @@ impl SqliteAppStorage {
         let mut statement = conn
             .prepare_cached(
                 "SELECT file_id FROM message_draft_attachments
-                 WHERE group_id_hex = ?1 AND file_id IS NOT NULL",
+                 WHERE draft_id IN (SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1)
+                   AND file_id IS NOT NULL",
             )
             .storage()?;
         let files = statement
@@ -425,6 +431,41 @@ impl SqliteAppStorage {
             .storage()?;
         files.into_iter().map(file_id).collect()
     }
+}
+
+pub(super) fn read_draft_attachment_tx(
+    conn: &Connection,
+    draft_id: &[u8; 16],
+    attachment_id: &str,
+    offset: u64,
+    limit: usize,
+) -> Result<Option<MessageDraftAttachmentRead>, MessageDraftRevisionError> {
+    let start = i64::try_from(offset)
+        .ok()
+        .and_then(|offset| offset.checked_add(1))
+        .ok_or(MessageDraftRevisionError::Invalid(
+            "invalid attachment range",
+        ))?;
+    let limit = i64::try_from(limit)
+        .map_err(|_| MessageDraftRevisionError::Invalid("invalid attachment range"))?;
+    conn.query_row_cached(
+        "SELECT file_id, CASE WHEN file_id IS NULL THEN substr(plaintext, ?3, ?4) END
+         FROM message_draft_attachments WHERE draft_id = ?1 AND attachment_id = ?2",
+        params![draft_id, attachment_id, start, limit],
+        |row| {
+            Ok(match row.get::<_, Option<Vec<u8>>>(0)? {
+                Some(file) => Err(file),
+                None => Ok(row.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default()),
+            })
+        },
+    )
+    .optional()
+    .storage()?
+    .map(|read| match read {
+        Ok(bytes) => Ok(MessageDraftAttachmentRead::Bytes(bytes)),
+        Err(file) => Ok(MessageDraftAttachmentRead::MediaFile(file_id(file)?)),
+    })
+    .transpose()
 }
 
 fn file_id(bytes: Vec<u8>) -> StorageResult<FileId> {

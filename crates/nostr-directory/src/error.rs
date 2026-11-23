@@ -179,6 +179,7 @@ pub fn storage_error_kind(error: &StorageError) -> &'static str {
         StorageError::Corruption(_) => "storage_corruption",
         StorageError::Capacity(_) => "storage_capacity",
         StorageError::Closed(_) => "storage_closed",
+        StorageError::MessageDraftQuotaExceeded => "storage_message_draft_quota_exceeded",
         StorageError::UnsupportedSchemaVersion { .. } => "storage_unsupported_schema_version",
         StorageError::InvalidAttachmentBody(_) => "storage_invalid_attachment_body",
         StorageError::Backend(_) => "storage_backend",

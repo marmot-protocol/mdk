@@ -569,6 +569,21 @@ header/capabilities, visible identities, read state and revisioned draft descrip
 [native conversation contract](../marmot-uniffi/CONVERSATION-WINDOW.md) for opening, paging, cancellation, timeout,
 ownership and draft migration.
 
+Use `marmot_group_message_drafts` to list the active composer and saved drafts for a group. Each entry
+has a bounded preview and an opaque identifier scoped to that account and group. Use
+`marmot_identified_message_draft` for the complete text and descriptors and
+`marmot_read_identified_message_draft_attachment` for attachment chunks. Pass the returned
+`content_revision` on every chunk and restart the read after a revision conflict.
+
+`marmot_archive_message_draft` saves the selected revision and clears the composer.
+`marmot_activate_message_draft` resumes a saved draft and parks the current composer atomically.
+`marmot_delete_saved_message_draft` removes only the specified saved draft. A stale composer revision
+returns `MARMOT_STATUS_MESSAGE_DRAFT_REVISION_CONFLICT`. Handle
+`MARMOT_STATUS_UNKNOWN_MESSAGE_DRAFT` by refreshing the list and
+`MARMOT_STATUS_MESSAGE_DRAFT_QUOTA_EXCEEDED` by letting the user remove a saved draft or attachment.
+Free each owned response with its matching `marmot_*_free` function. Strings and descriptors inside
+a response are borrowed from that response.
+
 Avatar screen metadata is mirrored as `MarmotAvatarAsset`; resolved chat/conversation records carry an optional
 avatar metadata pointer. Use `marmot_request_avatar_assets` for up to 16 visible
 opaque targets, `marmot_read_avatar_assets` for bounded local bytes (at most 16 references / 16 MiB), and

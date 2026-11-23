@@ -596,6 +596,10 @@ pub enum MarmotKitError {
     /// Ask again once its rows stop saying `checking`.
     #[error("a relay check of this account is already running")]
     RelayCheckRunning,
+    #[error("message draft not found in this conversation")]
+    UnknownMessageDraft,
+    #[error("message draft storage quota exceeded")]
+    MessageDraftQuotaExceeded,
 }
 
 impl From<AppError> for MarmotKitError {
@@ -755,6 +759,8 @@ impl From<&AppError> for MarmotKitError {
                 group_id_hex: group_id_hex.clone(),
             },
             AppError::MessageDraftRevisionConflict => Self::MessageDraftRevisionConflict,
+            AppError::UnknownMessageDraft => Self::UnknownMessageDraft,
+            AppError::MessageDraftQuotaExceeded => Self::MessageDraftQuotaExceeded,
             AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft {
                 details: details.clone(),
             },

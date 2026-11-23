@@ -608,10 +608,10 @@ impl FilterWriter<'_> {
                 ));
                 format!(
                     "EXISTS(SELECT 1 FROM message_drafts AS draft
-                        WHERE draft.group_id_hex = chat_list_rows.group_id_hex
+                        WHERE draft.group_id_hex = chat_list_rows.group_id_hex AND draft.active = 1
                           AND (trim(draft.content, ?{white_space}) != ''
                                OR EXISTS(SELECT 1 FROM message_draft_attachments AS attachment
-                                   WHERE attachment.group_id_hex = draft.group_id_hex)))"
+                                   WHERE attachment.draft_id = draft.draft_id)))"
                 )
             }
             // The delivery state the row shows for its preview message, so the leaf

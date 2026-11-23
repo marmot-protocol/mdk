@@ -99,6 +99,8 @@ pub struct SelectedMessageDraftContent {
 pub enum MessageDraftRevisionError {
     #[error("message draft revision no longer matches")]
     Conflict,
+    #[error("message draft not found in this conversation")]
+    UnknownDraft,
     /// A request the current draft cannot satisfy; retrying it unchanged fails again.
     #[error("invalid message draft: {0}")]
     Invalid(&'static str),
@@ -129,7 +131,7 @@ impl SqliteAppStorage {
                 .prepare_cached(
                     "SELECT a.plaintext, m.plaintext_digest
                      FROM message_draft_attachments a LEFT JOIN media_files m ON m.id = a.file_id
-                     WHERE a.group_id_hex = ?1 ORDER BY a.position ASC",
+                     WHERE a.draft_id = (SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1 AND active = 1) ORDER BY a.position ASC",
                 )
                 .storage()?;
             let mut rows = statement.query([&expected.group_id_hex]).storage()?;
@@ -255,7 +257,8 @@ impl SqliteAppStorage {
             let row: Option<(Vec<u8>, bool)> = conn
                 .query_row_cached(
                     "SELECT plaintext, file_id IS NOT NULL FROM message_draft_attachments
-                WHERE group_id_hex = ?1 AND attachment_id = ?2",
+                WHERE draft_id = (SELECT draft_id FROM message_drafts WHERE group_id_hex = ?1 AND active = 1)
+                    AND attachment_id = ?2",
                     params![expected.group_id_hex, attachment_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -285,20 +288,26 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             check_revision_tx(&conn, expected)?;
-            let present: bool = conn.query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM message_drafts WHERE group_id_hex = ?1)",
-                [&expected.group_id_hex],
-                |row| row.get(0),
-            ).storage()?;
-            if !present {
+            let staged = conn
+                .execute_cached(
+                    "INSERT INTO message_draft_submissions
+                    (group_id_hex, revision, app_event_id, payload_hash, draft_id, content_revision)
+                 SELECT group_id_hex, ?2, ?3, ?4, draft_id, content_revision
+                 FROM message_drafts WHERE group_id_hex = ?1 AND active = 1
+                 ON CONFLICT(group_id_hex, revision) DO UPDATE SET
+                    app_event_id = excluded.app_event_id, payload_hash = excluded.payload_hash,
+                    draft_id = excluded.draft_id, content_revision = excluded.content_revision",
+                    params![
+                        expected.group_id_hex,
+                        expected.revision,
+                        app_event_id,
+                        &hash[..]
+                    ],
+                )
+                .storage()?;
+            if staged == 0 {
                 return Err(MessageDraftRevisionError::Conflict);
             }
-            conn.execute_cached(
-                "INSERT INTO message_draft_submissions(group_id_hex, revision, app_event_id, payload_hash)
-                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(group_id_hex) DO UPDATE SET
-                 revision=excluded.revision, app_event_id=excluded.app_event_id, payload_hash=excluded.payload_hash",
-                params![expected.group_id_hex, expected.revision, app_event_id, &hash[..]],
-            ).storage()?;
             Ok(())
         })
     }
@@ -336,7 +345,7 @@ impl SqliteAppStorage {
 pub(super) fn end_composition_tx(conn: &Connection, group: &str) -> StorageResult<()> {
     let deleted = conn
         .execute_cached(
-            "DELETE FROM message_drafts WHERE group_id_hex = ?1",
+            "DELETE FROM message_drafts WHERE group_id_hex = ?1 AND active = 1",
             [group],
         )
         .storage()?;
@@ -426,26 +435,32 @@ pub(crate) fn selected_tx(conn: &Connection, group: &str) -> StorageResult<Selec
     let revision = revision_tx(conn, group)?;
     let mut draft = conn
         .query_row_cached(
-            "SELECT content, reply_to_message_id_hex, created_at_ms, updated_at_ms
-         FROM message_drafts WHERE group_id_hex = ?1",
+            "SELECT content, reply_to_message_id_hex, created_at_ms, updated_at_ms, draft_id
+         FROM message_drafts WHERE group_id_hex = ?1 AND active = 1",
             [group],
             |row| {
-                Ok(SelectedMessageDraftContent {
-                    group_id_hex: group.to_owned(),
-                    content: row.get(0)?,
-                    reply_to_message_id_hex: row.get(1)?,
-                    created_at_ms: row.get(2)?,
-                    updated_at_ms: row.get(3)?,
-                    media_attachments: vec![],
-                })
+                Ok((
+                    row.get::<_, [u8; 16]>(4)?,
+                    SelectedMessageDraftContent {
+                        group_id_hex: group.to_owned(),
+                        content: row.get(0)?,
+                        reply_to_message_id_hex: row.get(1)?,
+                        created_at_ms: row.get(2)?,
+                        updated_at_ms: row.get(3)?,
+                        media_attachments: vec![],
+                    },
+                ))
             },
         )
         .optional()
         .storage()?;
-    if let Some(draft) = &mut draft {
-        draft.media_attachments = selected_attachments_tx(conn, group)?;
+    if let Some((id, content)) = &mut draft {
+        content.media_attachments = selected_attachments_tx(conn, id)?;
     }
-    Ok(SelectedMessageDraft { revision, draft })
+    Ok(SelectedMessageDraft {
+        revision,
+        draft: draft.map(|(_, content)| content),
+    })
 }
 
 pub(crate) const SELECTED_ATTACHMENTS_SQL: &str = "SELECT attachment_id, file_name, media_type,
@@ -453,15 +468,15 @@ pub(crate) const SELECTED_ATTACHMENTS_SQL: &str = "SELECT attachment_id, file_na
             ELSE (SELECT m.byte_len FROM media_files m WHERE m.id = file_id) END,
         dim, thumbhash, duration_seconds, waveform_samples_json, file_id IS NOT NULL
         FROM message_draft_attachments
-        WHERE group_id_hex = ?1 ORDER BY position";
+        WHERE draft_id = ?1 ORDER BY position";
 
-fn selected_attachments_tx(
+pub(super) fn selected_attachments_tx(
     conn: &Connection,
-    group: &str,
+    draft_id: &[u8; 16],
 ) -> StorageResult<Vec<SelectedMessageDraftAttachment>> {
     let mut statement = conn.prepare_cached(SELECTED_ATTACHMENTS_SQL).storage()?;
     let rows = statement
-        .query_map([group], |row| {
+        .query_map([draft_id], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -524,28 +539,24 @@ pub(crate) fn accept_submission_tx(
         ),
         DraftAcceptance::Event(id) => ("app_event_id", rusqlite::types::Value::Text(id.to_owned())),
     };
-    let revision: Option<i64> = conn
-        .query_row_cached(
+    let changed = conn
+        .execute_cached(
             &format!(
-                "SELECT revision FROM message_draft_submissions
-                  WHERE group_id_hex = ?1 AND {field} = ?2"
+                "DELETE FROM message_drafts WHERE group_id_hex = ?1
+             AND EXISTS (
+                SELECT 1 FROM message_draft_submissions s
+                WHERE s.group_id_hex = ?1 AND s.{field} = ?2
+                  AND s.draft_id = message_drafts.draft_id
+                  AND s.content_revision = message_drafts.content_revision
+             )"
             ),
             params![group, value],
-            |row| row.get(0),
         )
-        .optional()
-        .storage()?;
-    let Some(revision) = revision else {
-        return Ok(false);
-    };
-    let changed = conn.execute_cached(
-        "DELETE FROM message_drafts WHERE group_id_hex = ?1
-         AND EXISTS(SELECT 1 FROM message_draft_revisions WHERE group_id_hex = ?1 AND revision = ?2)",
-        params![group, revision],
-    ).storage()? > 0;
+        .storage()?
+        > 0;
     conn.execute_cached(
-        "DELETE FROM message_draft_submissions WHERE group_id_hex = ?1 AND revision = ?2",
-        params![group, revision],
+        &format!("DELETE FROM message_draft_submissions WHERE group_id_hex = ?1 AND {field} = ?2"),
+        params![group, value],
     )
     .storage()?;
     Ok(changed)

@@ -5,16 +5,27 @@
 //! subscription read consume an item it can no longer hand back.
 
 use std::ffi::CString;
+use std::ptr::null_mut;
 use std::time::Instant;
 
 use marmot_c::commands::{
     marmot_begin_onboarding, marmot_begin_onboarding_with_options, marmot_group_app_component,
-    marmot_pending_welcome_deliveries, marmot_send_prepared_media_with_client_token,
-    marmot_set_group_archived, marmot_update_app_component,
+    marmot_group_message_drafts, marmot_pending_welcome_deliveries,
+    marmot_send_prepared_media_with_client_token, marmot_set_group_archived,
+    marmot_update_app_component,
 };
 use marmot_c::subscriptions::{
     MarmotEventsSubscription, marmot_events_subscription_free, marmot_events_subscription_next,
     marmot_subscribe_events,
+};
+use marmot_c::subscriptions::{
+    marmot_activate_message_draft, marmot_archive_message_draft,
+    marmot_save_message_draft_if_revision, marmot_selected_message_draft,
+};
+use marmot_c::types::conversation_window::marmot_selected_message_draft_free;
+use marmot_c::types::draft::{
+    MarmotMessageDraftState, marmot_identified_message_draft_summary_list_free,
+    marmot_message_draft_id_free,
 };
 use marmot_c::types::onboarding::{
     MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST,
@@ -294,6 +305,88 @@ impl Drop for ClientFixture {
             marmot_client_shutdown(self.client);
             marmot_client_free(self.client);
         }
+    }
+}
+
+#[test]
+fn saved_draft_mutations_preflight_outputs_and_return_owned_results() {
+    let mut fixture = ClientFixture::new();
+    fixture.populate();
+    let client = fixture.client;
+    let account = fixture.account.as_ptr();
+    let group = fixture.a.as_ptr();
+    let mut initial = null_mut();
+    let mut written = null_mut();
+    let mut saved = null_mut();
+    let mut summaries = null_mut();
+    let mut empty = null_mut();
+    let mut restored = null_mut();
+    unsafe {
+        assert_eq!(
+            marmot_selected_message_draft(client, account, group, &mut initial),
+            MarmotStatus::Ok
+        );
+        assert_eq!(
+            marmot_save_message_draft_if_revision(
+                client,
+                account,
+                (*initial).revision,
+                c"Long draft".as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                &mut written
+            ),
+            MarmotStatus::Ok
+        );
+        marmot_selected_message_draft_free(initial);
+        assert_eq!(
+            marmot_archive_message_draft(client, account, (*written).revision, null_mut()),
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(
+            marmot_archive_message_draft(client, account, (*written).revision, &mut saved),
+            MarmotStatus::Ok
+        );
+        marmot_selected_message_draft_free(written);
+        assert_eq!(
+            marmot_group_message_drafts(client, account, group, &mut summaries),
+            MarmotStatus::Ok
+        );
+        assert_eq!((*summaries).len, 1);
+        assert_eq!((*(*summaries).items).state, MarmotMessageDraftState::Saved);
+        marmot_identified_message_draft_summary_list_free(summaries);
+        assert_eq!(
+            marmot_selected_message_draft(client, account, group, &mut empty),
+            MarmotStatus::Ok
+        );
+        assert_eq!(
+            marmot_activate_message_draft(
+                client,
+                account,
+                (*empty).revision,
+                (*saved).hex,
+                null_mut()
+            ),
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(
+            marmot_activate_message_draft(
+                client,
+                account,
+                (*empty).revision,
+                (*saved).hex,
+                &mut restored
+            ),
+            MarmotStatus::Ok
+        );
+        assert_eq!(
+            std::ffi::CStr::from_ptr((*(*restored).draft).content),
+            c"Long draft"
+        );
+        marmot_message_draft_id_free(saved);
+        marmot_selected_message_draft_free(empty);
+        marmot_selected_message_draft_free(restored);
     }
 }
 

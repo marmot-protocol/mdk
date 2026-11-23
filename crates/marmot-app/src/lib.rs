@@ -285,8 +285,9 @@ pub use config::{
     MarmotServiceEndpoints, RelayTelemetrySettings,
 };
 pub use drafts::{
-    ChatListDraftVersion, MessageDraft, MessageDraftAttachment, MessageDraftAttachmentInput,
-    MessageDraftAttachmentSummary, MessageDraftInvalidation, MessageDraftRevision,
+    ChatListDraftVersion, IdentifiedMessageDraft, IdentifiedMessageDraftSummary, MessageDraft,
+    MessageDraftAttachment, MessageDraftAttachmentInput, MessageDraftAttachmentSummary,
+    MessageDraftId, MessageDraftInvalidation, MessageDraftRevision, MessageDraftState,
     MessageDraftSummary, SelectedMessageDraft, SelectedMessageDraftAttachment,
     SelectedMessageDraftContent,
 };

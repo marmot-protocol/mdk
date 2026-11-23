@@ -97,7 +97,7 @@ pub(crate) fn selected_preview_tx(
     // selected draft never crosses this boundary whole.
     let bytes: Option<Vec<u8>> = conn
         .query_row_cached(
-            "SELECT coalesce(substr(CAST(trim(content, ?2) AS BLOB), 1, ?3), x'') FROM message_drafts WHERE group_id_hex=?1",
+            "SELECT coalesce(substr(CAST(trim(content, ?2) AS BLOB), 1, ?3), x'') FROM message_drafts WHERE group_id_hex=?1 AND active=1",
             params![
                 row.group_id_hex,
                 DRAFT_WHITE_SPACE,
@@ -130,7 +130,9 @@ pub(crate) fn selected_preview_tx(
                 "SELECT CASE WHEN lower(media_type) LIKE 'image/%' THEN 0
                          WHEN lower(media_type) LIKE 'video/%' THEN 1
                          WHEN lower(media_type) LIKE 'audio/%' THEN 2 ELSE 3 END AS kind,
-                    count(*) FROM message_draft_attachments WHERE group_id_hex=?1 GROUP BY kind",
+                    count(*) FROM message_draft_attachments
+                    WHERE draft_id=(SELECT draft_id FROM message_drafts WHERE group_id_hex=?1 AND active=1)
+                    GROUP BY kind",
             )
             .storage()?;
         let mut attachment_count = 0u64;
@@ -304,7 +306,7 @@ mod tests {
             .unwrap();
         // Corrupt optional waveform metadata must not be decoded for a row preview.
         // Large BLOBs remain in SQLCipher; only type/count aggregates are selected.
-        store.lock().unwrap().execute("INSERT INTO message_draft_attachments(group_id_hex,position,attachment_id,file_name,media_type,plaintext,waveform_samples_json) VALUES ('11',0,'a','secret','image/png',zeroblob(8000000),'invalid-json'),('11',1,'b','secret','audio/mp4',zeroblob(8000000),'invalid-json')", []).unwrap();
+        store.lock().unwrap().execute("INSERT INTO message_draft_attachments(draft_id,position,attachment_id,file_name,media_type,plaintext,waveform_samples_json) VALUES ((SELECT draft_id FROM message_drafts WHERE group_id_hex='11' AND active=1),0,'a','secret','image/png',zeroblob(8000000),'invalid-json'),((SELECT draft_id FROM message_drafts WHERE group_id_hex='11' AND active=1),1,'b','secret','audio/mp4',zeroblob(8000000),'invalid-json')", []).unwrap();
         let SelectedChatPreview::Draft(draft) = preview(&store, &row) else {
             panic!("draft")
         };
@@ -332,7 +334,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .execute(
-                    "UPDATE message_draft_attachments SET media_type = ?1 WHERE group_id_hex='11'",
+                    "UPDATE message_draft_attachments SET media_type = ?1 WHERE draft_id=(SELECT draft_id FROM message_drafts WHERE group_id_hex='11' AND active=1)",
                     [media_type],
                 )
                 .unwrap();
@@ -381,7 +383,7 @@ mod tests {
                 .save_message_draft("11", "selected", None, &[])
                 .unwrap();
             let size = if count == 200 { 1024 } else { 8 * 1024 * 1024 };
-            store.lock().unwrap().execute("INSERT INTO message_draft_attachments(group_id_hex,position,attachment_id,file_name,media_type,plaintext) VALUES ('11',0,'a','file','image/png',zeroblob(?1))", [size]).unwrap();
+            store.lock().unwrap().execute("INSERT INTO message_draft_attachments(draft_id,position,attachment_id,file_name,media_type,plaintext) VALUES ((SELECT draft_id FROM message_drafts WHERE group_id_hex='11' AND active=1),0,'a','file','image/png',zeroblob(?1))", [size]).unwrap();
             store.lock().unwrap().execute_batch(&format!("INSERT INTO account_groups(group_id_hex,endpoint,updated_at)
                 WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < {count})
                 SELECT printf('other-%08d',x),'',0 FROM n;

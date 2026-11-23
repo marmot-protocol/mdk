@@ -230,6 +230,10 @@ pub enum AppError {
     /// The composer changed after the caller selected it; reload before retrying.
     #[error("message draft revision no longer matches")]
     MessageDraftRevisionConflict,
+    #[error("message draft not found in this conversation")]
+    UnknownMessageDraft,
+    #[error("message draft storage quota exceeded")]
+    MessageDraftQuotaExceeded,
     #[error("publish failed: {0}")]
     Publish(String),
     /// Every target refused this artifact for size on the observed attempt.
@@ -754,6 +758,8 @@ impl AppError {
             Self::GroupCommitPending(_) => "group_commit_pending",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::MessageDraftRevisionConflict => "message_draft_revision_conflict",
+            Self::UnknownMessageDraft => "unknown_message_draft",
+            Self::MessageDraftQuotaExceeded => "message_draft_quota_exceeded",
             Self::Publish(_) => "publish",
             Self::EventTooLarge { .. } => "event_too_large",
             Self::NoUsableRelay => "no_usable_relay",

@@ -1,15 +1,17 @@
 //! C mirrors of the per-conversation message-draft conversions.
 
 use marmot_uniffi::conversions::{
-    MessageDraftAttachmentFfi, MessageDraftAttachmentFileRequestFfi,
-    MessageDraftAttachmentInputFfi, MessageDraftAttachmentSummaryFfi, MessageDraftFfi,
+    IdentifiedMessageDraftFfi, IdentifiedMessageDraftSummaryFfi, MessageDraftAttachmentFfi,
+    MessageDraftAttachmentFileRequestFfi, MessageDraftAttachmentInputFfi,
+    MessageDraftAttachmentSummaryFfi, MessageDraftFfi, MessageDraftIdFfi, MessageDraftStateFfi,
     MessageDraftSummaryFfi,
 };
 
 use crate::MarmotStatus;
-use crate::macros::c_mirror;
+use crate::macros::{c_enum, c_mirror};
 use crate::memory::{optional_str, required_str};
 use crate::status::set_last_error;
+use crate::types::conversation_window::MarmotSelectedMessageDraftContent;
 
 c_mirror! {
     /// One attachment staged in a draft, with its plaintext bytes.
@@ -50,8 +52,7 @@ c_mirror! {
 }
 
 c_mirror! {
-    /// One draft as listed across the account: attachment metadata only,
-    /// so listing every draft does not materialize their bytes.
+    /// One draft summary with attachment metadata and no attachment bodies.
     MarmotMessageDraftSummary from MessageDraftSummaryFfi,
     free marmot_message_draft_summary_free,
     list(MarmotMessageDraftSummaryList, marmot_message_draft_summary_list_free) {
@@ -61,6 +62,39 @@ c_mirror! {
         vec media_attachments/media_attachments_len: MarmotMessageDraftAttachmentSummary,
         copy created_at_ms: i64,
         copy updated_at_ms: i64,
+    }
+}
+
+c_enum! {
+    /// Whether a draft is in the composer or saved for later.
+    MarmotMessageDraftState from MessageDraftStateFfi { Active, Saved }
+}
+
+c_mirror! {
+    /// Opaque local draft identifier. Use with the originating account and group.
+    MarmotMessageDraftId from MessageDraftIdFfi, free marmot_message_draft_id_free {
+        str hex,
+    }
+}
+
+c_mirror! {
+    /// One entry in the group draft list, with bounded text and attachment metadata.
+    MarmotIdentifiedMessageDraftSummary from IdentifiedMessageDraftSummaryFfi,
+    list(MarmotIdentifiedMessageDraftSummaryList, marmot_identified_message_draft_summary_list_free) {
+        rec id: MarmotMessageDraftId,
+        copy state: MarmotMessageDraftState,
+        rec summary: MarmotMessageDraftSummary,
+    }
+}
+
+c_mirror! {
+    /// Full draft text and reply/attachment descriptors, without attachment bodies.
+    MarmotIdentifiedMessageDraft from IdentifiedMessageDraftFfi, free marmot_identified_message_draft_free {
+        rec id: MarmotMessageDraftId,
+        copy state: MarmotMessageDraftState,
+        /// Pass with the draft ID on every attachment range read.
+        copy content_revision: i64,
+        rec content: MarmotSelectedMessageDraftContent,
     }
 }
 

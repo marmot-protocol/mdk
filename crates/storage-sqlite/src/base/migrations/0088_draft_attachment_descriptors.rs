@@ -103,11 +103,14 @@ mod tests {
                 [&bytes], |r| r.get(0),
             ).unwrap();
             assert_eq!(preserved, count);
+            let draft_id: [u8; 16] = conn
+                .query_row("SELECT draft_id FROM message_drafts", [], |row| row.get(0))
+                .unwrap();
             for sql in [SELECTED_ATTACHMENTS_SQL, ATTACHMENT_SUMMARIES_SQL] {
                 let plan: Vec<String> = conn
                     .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
                     .unwrap()
-                    .query_map(["group"], |r| r.get(3))
+                    .query_map([draft_id], |r| r.get(3))
                     .unwrap()
                     .collect::<Result<_, _>>()
                     .unwrap();
@@ -119,7 +122,7 @@ mod tests {
                 let descriptors: Vec<(String, i64)> = conn
                     .prepare(sql)
                     .unwrap()
-                    .query_map(["group"], |r| Ok((r.get(0)?, r.get(3)?)))
+                    .query_map([draft_id], |r| Ok((r.get(0)?, r.get(3)?)))
                     .unwrap()
                     .collect::<Result<_, _>>()
                     .unwrap();
@@ -140,7 +143,7 @@ mod tests {
                 "revision triggers must remain live"
             );
             let size: i64 = conn
-                .query_row(SELECTED_ATTACHMENTS_SQL, ["group"], |r| r.get(3))
+                .query_row(SELECTED_ATTACHMENTS_SQL, [draft_id], |r| r.get(3))
                 .unwrap();
             assert_eq!(size, 2, "covering index must track attachment updates");
         }

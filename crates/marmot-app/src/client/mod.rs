@@ -3818,7 +3818,7 @@ impl AppClient {
             self.remember_published_reports(&effects);
             if let Err(error) = self
                 .app
-                .delete_message_draft(&self.state.label, &hex::encode(group_id.as_slice()))
+                .delete_group_message_drafts(&self.state.label, &hex::encode(group_id.as_slice()))
             {
                 // The irreversible engine request is already durable. Treat draft
                 // cleanup like the other repairable post-canonical projections:

@@ -114,6 +114,66 @@ fn meta(id: &str) -> MessageDraftAttachmentFileMeta {
     }
 }
 
+#[test]
+fn saved_draft_stage_release_and_group_cleanup_erase_the_correct_keys() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let target = fixture.begin(&fixture.revision(), "video", 5, any);
+    let (
+        StageOutcome::Staged {
+            id: parked_file, ..
+        },
+        _,
+    ) = fixture.finish(&target, b"first")
+    else {
+        panic!("parked attachment must stage");
+    };
+    let parked = app.archive_message_draft(&fixture.revision()).unwrap();
+    let (
+        StageOutcome::Staged {
+            id: active_file, ..
+        },
+        _,
+    ) = fixture.stage(&fixture.revision(), "video", b"second", any)
+    else {
+        panic!("active attachment must stage");
+    };
+    let current = fixture.revision();
+    assert!(fixture.media.release_staged(&target, parked_file).unwrap());
+    assert_eq!(fixture.media.file_state(&parked_file).unwrap(), None);
+    assert_eq!(
+        fixture.media.file_state(&active_file).unwrap(),
+        Some(FileState::Staged)
+    );
+    assert!(
+        app.identified_message_draft(GROUP, parked)
+            .unwrap()
+            .content
+            .media_attachments
+            .is_empty()
+    );
+    assert_eq!(fixture.revision(), current);
+
+    let second = app.archive_message_draft(&current).unwrap();
+    let before = fixture.revision();
+    let copying = fixture.begin(&before, "late", 4, any);
+    app.delete_group_message_drafts(GROUP).unwrap();
+    assert!(app.group_message_drafts(GROUP).unwrap().is_empty());
+    assert!(matches!(
+        app.identified_message_draft(GROUP, second),
+        Err(MessageDraftRevisionError::UnknownDraft)
+    ));
+    assert_eq!(fixture.media.file_state(&active_file).unwrap(), None);
+    assert_eq!(
+        fixture.finish(&copying, b"late"),
+        (
+            StageOutcome::Superseded,
+            Some(MessageDraftStageRefusal::Conflict)
+        )
+    );
+    assert_eq!(fixture.media_rows(), 0);
+}
+
 fn inline(id: &str, bytes: &[u8]) -> StoredMessageDraftAttachmentInput {
     StoredMessageDraftAttachmentInput::Inline(StoredMessageDraftAttachment {
         id: id.to_owned(),
@@ -453,4 +513,43 @@ fn a_file_staged_into_a_draft_ended_during_the_copy_is_refused() {
         assert!(app.selected_message_draft(GROUP).unwrap().draft.is_none());
     }
     assert_eq!(fixture.media_rows(), 0, "refused copies left no rows");
+}
+
+#[test]
+fn saved_message_drafts_keep_staged_files_and_refuse_copies_from_previous_compositions() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    assert!(matches!(
+        fixture.stage(&fixture.revision(), "video", b"saved clip", any),
+        (StageOutcome::Staged { .. }, None)
+    ));
+    let archive_revision = fixture.revision();
+    let started_before_archive = fixture.begin(&archive_revision, "late", 9, any);
+    let id = app.archive_message_draft(&archive_revision).unwrap();
+    let empty = fixture.revision();
+    let started_while_empty = fixture.begin(&empty, "empty", 9, any);
+    let version = app
+        .identified_message_draft(GROUP, id)
+        .unwrap()
+        .content_revision;
+    assert!(matches!(
+        app.read_identified_message_draft_attachment(GROUP, id, version, "video", 0, 10)
+            .unwrap(),
+        Some(MessageDraftAttachmentRead::MediaFile(_))
+    ));
+    let restored = app.activate_message_draft(&empty, id).unwrap();
+    assert!(restored.draft.unwrap().media_attachments[0].file_backed);
+    for stage in [&started_before_archive, &started_while_empty] {
+        assert_eq!(
+            fixture.finish(stage, b"late copy"),
+            (
+                StageOutcome::Superseded,
+                Some(MessageDraftStageRefusal::Conflict)
+            )
+        );
+    }
+    assert_eq!(fixture.media_rows(), 1);
+    app.archive_message_draft(&fixture.revision()).unwrap();
+    app.delete_saved_message_draft(GROUP, id).unwrap();
+    assert_eq!(fixture.media_rows(), 0);
 }

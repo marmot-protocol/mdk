@@ -1,17 +1,85 @@
 //! Encrypted, local composer draft commands.
 
 use crate::conversions::{
-    MessageDraftAttachmentFfi, MessageDraftFfi, MessageDraftSummaryFfi, group_id_from_hex,
+    IdentifiedMessageDraftFfi, IdentifiedMessageDraftSummaryFfi, MessageDraftAttachmentFfi,
+    MessageDraftFfi, MessageDraftIdFfi, MessageDraftRevisionFfi, MessageDraftSummaryFfi,
+    SelectedMessageDraftFfi, group_id_from_hex,
 };
 use crate::errors::MarmotKitError;
 use crate::{Marmot, optional_message_id_hex};
+use std::sync::Arc;
 
 #[uniffi::export]
 impl Marmot {
-    /// Metadata-only saved composer drafts for an account, newest-updated
-    /// first. Attachment plaintext is intentionally omitted from this list;
-    /// call `messageDraft` when restoring one selected composer. Hosts must
-    /// delete empty or sent drafts; deleting a group also removes its draft.
+    /// List the local active and saved drafts for one group, newest first.
+    pub fn group_message_drafts(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<Vec<IdentifiedMessageDraftSummaryFfi>, MarmotKitError> {
+        let group = canonical_group_id_hex(&group_id_hex)?;
+        Ok(self
+            .app
+            .group_message_drafts(&account_ref, &group)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Read one draft's content and descriptors without changing the active composer.
+    pub fn identified_message_draft(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        id: MessageDraftIdFfi,
+    ) -> Result<IdentifiedMessageDraftFfi, MarmotKitError> {
+        let group = canonical_group_id_hex(&group_id_hex)?;
+        Ok(self
+            .app
+            .identified_message_draft(&account_ref, &group, id.try_into()?)?
+            .into())
+    }
+
+    /// Park the exact selected revision and leave the composer empty.
+    pub fn archive_message_draft(
+        &self,
+        account_ref: String,
+        revision: Arc<MessageDraftRevisionFfi>,
+    ) -> Result<MessageDraftIdFfi, MarmotKitError> {
+        Ok(self
+            .app
+            .archive_message_draft(&account_ref, &revision.inner)?
+            .into())
+    }
+
+    /// Select one saved draft and park the current active draft in the same transaction.
+    pub fn activate_message_draft(
+        &self,
+        account_ref: String,
+        revision: Arc<MessageDraftRevisionFfi>,
+        id: MessageDraftIdFfi,
+    ) -> Result<SelectedMessageDraftFfi, MarmotKitError> {
+        Ok(self
+            .app
+            .activate_message_draft(&account_ref, &revision.inner, id.try_into()?)?
+            .into())
+    }
+
+    /// Remove one saved draft. An active draft cannot be removed through this operation.
+    pub fn delete_saved_message_draft(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        id: MessageDraftIdFfi,
+    ) -> Result<(), MarmotKitError> {
+        let group = canonical_group_id_hex(&group_id_hex)?;
+        self.app
+            .delete_saved_message_draft(&account_ref, &group, id.try_into()?)?;
+        Ok(())
+    }
+
+    /// Active composer summaries for an account, newest first. For the
+    /// active and saved drafts in one conversation, use `groupMessageDrafts`.
     pub fn message_drafts(
         &self,
         account_ref: String,
@@ -24,7 +92,7 @@ impl Marmot {
             .collect())
     }
 
-    /// The saved composer draft for an account and MLS group, if one exists.
+    /// The active composer draft for an account and MLS group, if one exists.
     pub fn message_draft(
         &self,
         account_ref: String,
@@ -60,7 +128,7 @@ impl Marmot {
             .into())
     }
 
-    /// Delete a saved composer draft. This is a no-op when no draft exists.
+    /// Delete the active composer draft. This leaves saved entries in the group.
     pub fn delete_message_draft(
         &self,
         account_ref: String,
@@ -70,6 +138,41 @@ impl Marmot {
         self.runtime
             .delete_message_draft(&account_ref, &group_id_hex)?;
         Ok(())
+    }
+}
+
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
+impl Marmot {
+    /// Read up to 1 MiB from the content revision returned by the identified draft read.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "identifies the draft, version and byte range"
+    )]
+    pub async fn read_identified_message_draft_attachment(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        id: MessageDraftIdFfi,
+        content_revision: i64,
+        attachment_id: String,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Option<Vec<u8>>, MarmotKitError> {
+        let group = canonical_group_id_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .read_identified_message_draft_attachment(
+                &account_ref,
+                group,
+                id.try_into()?,
+                content_revision,
+                attachment_id,
+                offset,
+                limit as usize,
+            )
+            .await?
+            .map(|mut bytes| std::mem::take(&mut *bytes)))
     }
 }
 
@@ -219,6 +322,64 @@ mod tests {
             )
             .expect_err("unknown group should stay typed");
         assert!(matches!(unknown_group, MarmotKitError::UnknownGroup { .. }));
+
+        let revision = kit
+            .selected_message_draft(account_ref.clone(), group_id_hex.clone())
+            .unwrap()
+            .revision;
+        let id = kit
+            .archive_message_draft(account_ref.clone(), revision.clone())
+            .unwrap();
+        assert_eq!(id.hex.len(), 32);
+        let entries = kit
+            .group_message_drafts(account_ref.clone(), group_id_hex.clone())
+            .unwrap();
+        assert_eq!(entries[0].id.hex, id.hex);
+        assert!(matches!(
+            entries[0].state,
+            crate::conversions::MessageDraftStateFfi::Saved
+        ));
+        assert!(kit.message_drafts(account_ref.clone()).unwrap().is_empty());
+        assert!(matches!(
+            kit.activate_message_draft(account_ref.clone(), revision, id.clone()),
+            Err(MarmotKitError::MessageDraftRevisionConflict)
+        ));
+        assert!(matches!(
+            kit.identified_message_draft(
+                account_ref.clone(),
+                group_id_hex.clone(),
+                MessageDraftIdFfi {
+                    hex: "12".repeat(16)
+                }
+            ),
+            Err(MarmotKitError::UnknownMessageDraft)
+        ));
+        let inspected = kit
+            .identified_message_draft(account_ref.clone(), group_id_hex.clone(), id.clone())
+            .unwrap();
+        assert_eq!(
+            kit.read_identified_message_draft_attachment(
+                account_ref.clone(),
+                group_id_hex.clone(),
+                id.clone(),
+                inspected.content_revision,
+                "attachment-1".into(),
+                8,
+                10,
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            b"attachment"
+        );
+        let current = kit
+            .selected_message_draft(account_ref.clone(), group_id_hex.clone())
+            .unwrap()
+            .revision;
+        let restored = kit
+            .activate_message_draft(account_ref.clone(), current, id)
+            .unwrap();
+        assert_eq!(restored.draft.unwrap().content, "draft content");
 
         kit.delete_message_draft(account_ref.clone(), group_id_hex.clone())
             .expect("delete draft");

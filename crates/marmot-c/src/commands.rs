@@ -51,7 +51,9 @@ use crate::types::device_link::MarmotDeviceLinkSnapshot;
 use crate::types::directory::MarmotCachedIdentityProjectionList;
 use crate::types::directory::MarmotUserDirectorySearchResultList;
 use crate::types::draft::MarmotMessageDraftAttachmentInput;
-use crate::types::draft::{MarmotMessageDraft, MarmotMessageDraftSummaryList};
+use crate::types::draft::{
+    MarmotIdentifiedMessageDraftSummaryList, MarmotMessageDraft, MarmotMessageDraftSummaryList,
+};
 use crate::types::emoji_set::{
     MarmotEmojiSet, MarmotEmojiSetAsset, MarmotEmojiSetCover, MarmotEmojiSetList,
     MarmotEmojiSetSyncResult, MarmotInstalledCustomEmojiAsset, MarmotInstalledCustomEmojiList,
@@ -1498,9 +1500,13 @@ c_cmd! {
     /// return its local state. Free with `marmot_public_event_preview_free`.
     async fn marmot_resolve_public_event_preview(account_ref: str, reference: str) -> rec(MarmotPublicEventPreview) = resolve_public_event_preview;
 
-    /// Every stored draft for the account, attachment metadata only.
+    /// Active composer drafts for the account, attachment metadata only.
     /// Free with `marmot_message_draft_summary_list_free`.
     sync fn marmot_message_drafts(account_ref: str) -> rec(MarmotMessageDraftSummaryList) = message_drafts;
+
+    /// Active and saved drafts for one group, newest first. Free with
+    /// `marmot_identified_message_draft_summary_list_free`.
+    sync fn marmot_group_message_drafts(account_ref: str, group_id_hex: str) -> rec(MarmotIdentifiedMessageDraftSummaryList) = group_message_drafts;
 
     /// The stored draft for one conversation, with attachment bytes;
     /// writes NULL with `MARMOT_STATUS_OK` when there is none. Free with

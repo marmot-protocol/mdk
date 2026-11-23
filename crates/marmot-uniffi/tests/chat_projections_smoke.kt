@@ -2,6 +2,12 @@ package dev.ipf.marmotkit
 
 /** Exercise generated record layout and enum discriminants, including presentation roles. */
 fun main() {
+    val draftId = MessageDraftIdFfi("ab".repeat(16))
+    val draftContent = SelectedMessageDraftContentFfi("group", "draft 🦀", "reply", emptyList(), 1L, 2L)
+    for (state in MessageDraftStateFfi.entries) {
+        val draft = IdentifiedMessageDraftFfi(draftId, state, 4L, draftContent)
+        check(FfiConverterTypeIdentifiedMessageDraftFfi.lift(FfiConverterTypeIdentifiedMessageDraftFfi.lower(draft)) == draft)
+    }
     // Generated host ABI ownership: typed source payloads and optional ephemeral operation tokens.
     val backupSource = BackupHistorySourceFfi("recovery", "archive", "head", ULong.MAX_VALUE)
     for (provenance in listOf(HistoryImportProvenanceFfi.Device("slot"), HistoryImportProvenanceFfi.Backup(backupSource))) {
