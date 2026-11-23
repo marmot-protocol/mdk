@@ -18,7 +18,6 @@ use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
     GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GroupSystemEvent, MARMOT_APP_EVENT_KIND_DELETE,
     MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
-    group_system_canonical_id,
 };
 use cgka_traits::is_chat_message;
 
@@ -275,8 +274,7 @@ pub(crate) fn media_refs_from_tags(
         })
         .collect()
 }
-use cgka_traits::engine::GroupStateChange;
-use cgka_traits::{GroupId, engine::GroupEvent};
+use cgka_traits::engine::GroupEvent;
 use marmot_app::{AppError, AppMessageRecord, MarmotAppEvent, MarmotAppRuntime};
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
@@ -420,18 +418,7 @@ fn project_durable_record(
     account_id_hex: &str,
     record: AppMessageRecord,
     sender_display_name: Option<String>,
-    account_filter: Option<&str>,
-    group_filter: Option<&str>,
 ) -> Result<Option<AgentControlEvent>, AppError> {
-    if !inbound_filter_matches(
-        account_filter,
-        account_id_hex,
-        group_filter,
-        &record.group_id_hex,
-    ) {
-        return Ok(None);
-    }
-
     if record.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
         // Only locally synthesized group-system timeline rows represent the live
         // `GroupEvent::GroupStateChanged` signal. Ignore sent/received kind-1210 app events.
@@ -633,157 +620,39 @@ fn project_durable_record(
     }
 }
 
-pub(crate) fn control_event_from_runtime_event_with_runtime(
-    runtime: &MarmotAppRuntime,
+/// Project a live runtime event that has no stored row: a group invite. Messages and group-state
+/// changes are delivered from storage instead (see `inbound.rs`); their notice only wakes that
+/// read.
+pub(crate) fn control_event_from_runtime_event(
     event: MarmotAppEvent,
     account_filter: Option<&str>,
     group_filter: Option<&str>,
-) -> Result<Option<AgentControlEvent>, AppError> {
-    match event {
-        MarmotAppEvent::MessageReceived(update) => {
-            let Some(group_id_hex) = inbound_event_group_id_hex(
-                account_filter,
-                &update.account_id_hex,
-                group_filter,
-                &update.message.group_id,
-                &update.message.sender,
-            ) else {
-                return Ok(None);
-            };
-            let Some(record) = runtime.message_by_id(
-                &update.account_label,
-                &group_id_hex,
-                &update.message.message_id_hex,
-            )?
-            else {
-                // Durable rows are authoritative for the agent feed. Retention
-                // pruning or convergence invalidation can remove a row between
-                // commit and broadcast; falling back to the in-memory plaintext
-                // here would re-expose content the durable projection has already
-                // discarded.
-                return Ok(None);
-            };
-            project_durable_record(
-                runtime,
-                &update.account_label,
-                &update.account_id_hex,
-                record,
-                update.message.sender_display_name,
-                account_filter,
-                group_filter,
-            )
-        }
-        MarmotAppEvent::GroupEvent(group_event) => match group_event.event {
-            GroupEvent::GroupJoined {
-                group_id,
-                via_welcome,
-                welcomer,
-                ..
-            } => {
-                let group_id_hex = hex::encode(group_id.as_slice());
-                if !inbound_filter_matches(
-                    account_filter,
-                    &group_event.account_id_hex,
-                    group_filter,
-                    &group_id_hex,
-                ) {
-                    return Ok(None);
-                }
-                Ok(Some(AgentControlEvent::GroupInvite {
-                    account_id_hex: group_event.account_id_hex,
-                    group_id_hex,
-                    via_welcome_message_id_hex: hex::encode(via_welcome.as_slice()),
-                    welcomer_account_id_hex: welcomer.map(|member| hex::encode(member.as_slice())),
-                }))
-            }
-            GroupEvent::GroupStateChanged {
-                group_id,
-                epoch,
-                actor,
-                change,
-                ..
-            } => {
-                let group_id_hex = hex::encode(group_id.as_slice());
-                if !inbound_filter_matches(
-                    account_filter,
-                    &group_event.account_id_hex,
-                    group_filter,
-                    &group_id_hex,
-                ) {
-                    return Ok(None);
-                }
-                // Map to a coarse change kind. Privacy: the subject member's
-                // pubkey is NEVER surfaced; only a rename carries a detail (the
-                // new group display name, which is operationally visible).
-                let event_id_hex =
-                    group_state_change_replay_id(&group_id, epoch.0, actor.as_ref(), &change);
-                let (change, detail) = match change {
-                    GroupStateChange::MemberAdded { .. } => ("member_added", None),
-                    GroupStateChange::MemberRemoved { .. } => ("member_removed", None),
-                    GroupStateChange::MemberLeft { .. } => ("member_left", None),
-                    GroupStateChange::AdminAdded { .. } => ("admin_added", None),
-                    GroupStateChange::AdminRemoved { .. } => ("admin_removed", None),
-                    GroupStateChange::GroupRenamed { name, .. } => ("group_renamed", Some(name)),
-                    GroupStateChange::GroupAvatarChanged => ("group_avatar_changed", None),
-                    GroupStateChange::MessageRetentionChanged { .. } => {
-                        ("disappearing_timer_changed", None)
-                    }
-                    GroupStateChange::GroupDisbanded => ("group_disbanded", None),
-                };
-                Ok(Some(AgentControlEvent::GroupStateChanged {
-                    account_id_hex: group_event.account_id_hex,
-                    group_id_hex,
-                    event_id_hex,
-                    change: change.to_owned(),
-                    detail,
-                }))
-            }
-            _ => Ok(None),
-        },
-        _ => Ok(None),
-    }
-}
-
-/// Return the durable storage row id that corresponds to a live runtime event, when the
-/// storage-backed replay can later project the same fact. Recording this id for live delivery
-/// lets replay recover genuinely dropped chat/delete/group-state events without duplicating facts
-/// this subscription already emitted.
-pub(crate) fn runtime_replay_dedup_key(event: &MarmotAppEvent) -> Option<String> {
-    match event {
-        MarmotAppEvent::MessageReceived(update) => {
-            (matches!(
-                update.message.kind,
-                MARMOT_APP_EVENT_KIND_DELETE
-                    | MARMOT_APP_EVENT_KIND_EDIT
-                    | MARMOT_APP_EVENT_KIND_REACTION
-            ) || is_chat_message(update.message.kind, &update.message.tags))
-            .then(|| update.message.message_id_hex.clone())
-        }
-        MarmotAppEvent::GroupEvent(group_event) => {
-            if let GroupEvent::GroupStateChanged {
-                group_id,
-                epoch,
-                actor,
-                change,
-                ..
-            } = &group_event.event
-            {
-                group_state_change_replay_id(group_id, epoch.0, actor.as_ref(), change)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn group_state_change_replay_id(
-    group_id: &GroupId,
-    epoch: u64,
-    actor: Option<&cgka_traits::MemberId>,
-    change: &GroupStateChange,
-) -> Option<String> {
-    group_system_canonical_id(group_id, epoch, actor, change).ok()
+) -> Option<AgentControlEvent> {
+    let MarmotAppEvent::GroupEvent(group_event) = event else {
+        return None;
+    };
+    let GroupEvent::GroupJoined {
+        group_id,
+        via_welcome,
+        welcomer,
+        ..
+    } = group_event.event
+    else {
+        return None;
+    };
+    let group_id_hex = hex::encode(group_id.as_slice());
+    inbound_filter_matches(
+        account_filter,
+        &group_event.account_id_hex,
+        group_filter,
+        &group_id_hex,
+    )
+    .then(|| AgentControlEvent::GroupInvite {
+        account_id_hex: group_event.account_id_hex,
+        group_id_hex,
+        via_welcome_message_id_hex: hex::encode(via_welcome.as_slice()),
+        welcomer_account_id_hex: welcomer.map(|member| hex::encode(member.as_slice())),
+    })
 }
 
 fn group_system_control_parts(event: &GroupSystemEvent) -> Option<(&'static str, Option<String>)> {
@@ -870,23 +739,6 @@ pub(crate) fn control_event_from_debug_event(
         .then_some(event)
 }
 
-fn inbound_event_group_id_hex(
-    account_filter: Option<&str>,
-    account_id_hex: &str,
-    group_filter: Option<&str>,
-    group_id: &GroupId,
-    sender_account_id_hex: &str,
-) -> Option<String> {
-    let group_id_hex = hex::encode(group_id.as_slice());
-    if inbound_filter_matches(account_filter, account_id_hex, group_filter, &group_id_hex)
-        && sender_account_id_hex != account_id_hex
-    {
-        Some(group_id_hex)
-    } else {
-        None
-    }
-}
-
 fn inbound_filter_matches(
     account_filter: Option<&str>,
     account_id_hex: &str,
@@ -897,9 +749,8 @@ fn inbound_filter_matches(
         && group_filter.is_none_or(|filter| filter == group_id_hex)
 }
 
-/// Build a `ResyncRequired` control event scoped to this subscription's filters. Emitted when the
-/// inbound broadcast channel lags and drops events: the dropped inbound messages are gone for good
-/// (catch-up never re-emits already-broadcast messages), so the agent must re-query its own state.
+/// Build a `ResyncRequired` control event scoped to this subscription's filters. Emitted when
+/// stored inbound rows could not be read, so the agent re-queries its own state.
 pub(crate) fn resync_required_event(
     account_filter: Option<&str>,
     group_filter: Option<&str>,
@@ -923,27 +774,22 @@ pub(crate) fn inbound_message_event_from_record_with_runtime(
     account_ref: &str,
     account_id_hex: &str,
     record: AppMessageRecord,
-    account_filter: Option<&str>,
-    group_filter: Option<&str>,
 ) -> Result<Option<AgentControlEvent>, AppError> {
+    // Best-effort, like the live notice's name: the local directory's name for the sender.
+    let sender_display_name = runtime.display_name_for_account_id(&record.sender);
     project_durable_record(
         runtime,
         account_ref,
         account_id_hex,
         record,
-        // Storage replay has no directory join; display name is best-effort live-only.
-        None,
-        account_filter,
-        group_filter,
+        sender_display_name,
     )
 }
 
-/// Bounded set of durable replay row ids already delivered on a subscription, used to dedup
-/// storage-backed replay against live delivery (and against itself) after broadcast lag. Keeps a
-/// FIFO of recent ids so a long-lived subscription cannot grow memory without bound; once the
-/// capacity is reached the oldest id is evicted. The capacity comfortably exceeds the broadcast
-/// channel depth, so every row that could plausibly be re-queried after a single overflow is still
-/// tracked.
+/// Bounded set of debug-injected inbound message ids already delivered on a subscription, so a
+/// re-injected message is not handed to the agent twice. Keeps a FIFO of recent ids so a
+/// long-lived subscription cannot grow memory without bound; once the capacity is reached the
+/// oldest id is evicted.
 pub(crate) struct DeliveredInboundCursor {
     capacity: usize,
     order: VecDeque<String>,

@@ -15,6 +15,7 @@ mod event_projection;
 mod group_profile_tool;
 mod identity;
 mod inbound;
+mod inbound_marks;
 mod invite_policy;
 mod maintenance;
 mod media_roots;
@@ -114,9 +115,8 @@ pub(crate) const MEDIA_TEMP_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) use agent_control::{
     MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES, MAX_MEDIA_UPLOAD_ATTACHMENTS, MAX_MEDIA_UPLOAD_BATCH_BYTES,
 };
-/// Capacity of the per-subscription delivered-inbound-id cursor used to dedup storage-backed
-/// replay after broadcast lag. Comfortably larger than the runtime broadcast channel depth
-/// (1024) so every message that could be re-queried after a single overflow is still tracked.
+/// Capacity of the per-subscription cursor of debug-injected inbound message ids already
+/// delivered.
 pub(crate) const DELIVERED_INBOUND_CURSOR_CAPACITY: usize = 4096;
 pub(crate) const MAX_PROFILE_NAME_CHARS: usize = 80;
 /// Longest value the connector accepts for one optional kind-0 field (`about`,
@@ -229,6 +229,8 @@ pub struct AgentConnector {
     pub(crate) app: MarmotApp,
     pub(crate) runtime: MarmotAppRuntime,
     pub(crate) inbound_catch_up: InboundCatchUpDriver,
+    /// Durable per-scope inbound delivery marks (mdk#3551).
+    pub(crate) inbound_marks: inbound_marks::InboundMarks,
     /// Aggregate counters for the background reconciliation loops (mdk#1380).
     pub(crate) reconcile_telemetry: std::sync::Arc<reconcile_telemetry::ReconcileTelemetry>,
     /// Test-only fault-injection hooks for the invite-policy worker (absent
@@ -276,6 +278,7 @@ impl AgentConnector {
         let inbound_catch_up =
             InboundCatchUpDriver::new(runtime.clone(), reconcile_telemetry.clone());
         let allowlists = AllowlistStore::new(&config.home);
+        let inbound_marks = inbound_marks::InboundMarks::new(account_home.clone());
         let (debug_events, _) = broadcast::channel(1024);
         Ok(Self {
             account_home,
@@ -291,6 +294,7 @@ impl AgentConnector {
             app,
             runtime,
             inbound_catch_up,
+            inbound_marks,
             reconcile_telemetry,
             #[cfg(test)]
             test_hooks: std::sync::Arc::new(test_support::ConnectorTestHooks::default()),

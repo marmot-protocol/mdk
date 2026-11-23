@@ -1860,6 +1860,29 @@ impl SqliteAppStorage {
         self.read_app_messages(query, AppMessageRead::VisibleAfter(after))
     }
 
+    /// The insert position of the newest stored source row in the group, or in the whole
+    /// account; zero when there is none. Every row stored later has a greater position, so
+    /// [`Self::visible_app_messages_after_insert_order`] from it returns only those.
+    pub fn latest_app_message_insert_order(
+        &self,
+        group_id_hex: Option<&str>,
+    ) -> StorageResult<i64> {
+        let conn = self.lock()?;
+        match group_id_hex {
+            Some(group_id_hex) => conn.query_row_cached(
+                "SELECT COALESCE(MAX(insert_order), 0) FROM app_events WHERE group_id_hex = ?1",
+                params![group_id_hex],
+                |row| row.get(0),
+            ),
+            None => conn.query_row_cached(
+                "SELECT COALESCE(MAX(insert_order), 0) FROM app_events",
+                [],
+                |row| row.get(0),
+            ),
+        }
+        .storage()
+    }
+
     /// Raw event access for recovery and forensic consumers.
     pub fn app_messages(
         &self,
