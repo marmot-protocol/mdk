@@ -482,6 +482,7 @@ impl AppClient {
     ) -> Result<bool, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
         let storage = self.app.account_storage(&self.state.label)?;
+        let admission = storage.invitation_admission(group_id)?;
         let invitation = storage
             .app_storage()
             .local_group_deletion_invitation(&group_id_hex)?;
@@ -504,24 +505,38 @@ impl AppClient {
         else {
             return Ok(false);
         };
-        let previous = group.clone();
         group.adopt_prior_nostr_routes(routes);
         // A row rebuilt from an ordinary message starts accepted with no
         // inviter. Give it back the standing the deleted row had, so an
         // unanswered invitation stays one here and in what a sibling Add
         // forwards (mdk#3555). A row that carries a Welcome came from a new
-        // invitation crossing the frontier, which decides for itself.
+        // invitation crossing the frontier, which decides for itself. If the
+        // frontier's Welcome does not match the current MLS admission (for
+        // example a replacement Welcome whose join checkpoint failed before
+        // deletion), never inherit the old inviter/Welcome; keep an
+        // unprojected Welcome admission pending.
         if let Some(invitation) = invitation
             && group.via_welcome_message_id_hex.is_none()
         {
-            group.pending_confirmation = invitation.pending_confirmation;
-            group.welcomer_account_id_hex = invitation.welcomer_account_id_hex;
-            group.via_welcome_message_id_hex = invitation.via_welcome_message_id_hex;
+            match admission.as_ref() {
+                Some(admission)
+                    if !super::invitation_decisions::standing_matches_admission(
+                        invitation.via_welcome_message_id_hex.as_deref(),
+                        admission,
+                    ) =>
+                {
+                    group.pending_confirmation = !admission.created_locally;
+                    group.welcomer_account_id_hex = None;
+                    group.via_welcome_message_id_hex = None;
+                }
+                _ => {
+                    group.pending_confirmation = invitation.pending_confirmation;
+                    group.welcomer_account_id_hex = invitation.welcomer_account_id_hex;
+                    group.via_welcome_message_id_hex = invitation.via_welcome_message_id_hex;
+                }
+            }
         }
-        let changed = *group != previous;
-        if changed {
-            self.mark_group_projection_dirty_hex(group_id_hex);
-        }
+        self.mark_group_projection_dirty_hex(group_id_hex);
         Ok(true)
     }
 

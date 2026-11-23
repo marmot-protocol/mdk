@@ -4034,6 +4034,38 @@ fn delete_local_group_data_keeps_the_invitation_standing_on_its_frontier() {
         )
         .unwrap();
     assert_eq!(standing("ee"), None);
+
+    // If a replacement Welcome committed in MLS while its app checkpoint
+    // failed, the stale row's inviter and Welcome must not be copied onto
+    // the frontier; the unprojected Welcome admission stays pending with no
+    // inviter or Welcome.
+    let mut stale = group("ff", "stale accepted row");
+    stale.pending_confirmation = false;
+    stale.welcomer_account_id_hex = Some("55".repeat(32));
+    stale.via_welcome_message_id_hex = Some("66".repeat(32));
+    let stale_state = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![stale],
+    };
+    store
+        .app_storage()
+        .save_account_projection_state(&stale_state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    insert_protocol_group_marker(&store, &[0xff]);
+    cgka_traits::storage::GroupStorage::put_invitation_admission(
+        &store,
+        &cgka_traits::GroupId::new(vec![0xff]),
+        Some(&cgka_traits::group::InvitationAdmission {
+            generation: [0x77; 32],
+            created_locally: false,
+            via_welcome: Some(cgka_traits::MessageId::new(vec![0x88; 32])),
+        }),
+    )
+    .unwrap();
+    assert!(store.delete_local_group_data("ff").unwrap().did_delete());
+    assert_eq!(standing("ff"), invitation(true, None, None));
 }
 
 #[test]

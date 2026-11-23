@@ -93,7 +93,12 @@ impl SqliteAccountStorage {
                 // The frontier keeps it so a newer message that recreates the
                 // chat does not turn an unanswered invitation into an
                 // accepted one (mdk#3555).
-                let (prior_nostr_routes_json, invitation) = tx
+                let (
+                    prior_nostr_routes_json,
+                    mut pending_confirmation,
+                    mut welcomer_account_id_hex,
+                    mut via_welcome_message_id_hex,
+                ) = tx
                     .query_row_cached(
                         "SELECT prior_nostr_routes_json, pending_confirmation,
                                 welcomer_account_id_hex, via_welcome_message_id_hex
@@ -103,25 +108,46 @@ impl SqliteAccountStorage {
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
-                                (
-                                    row.get::<_, bool>(1)?,
-                                    row.get::<_, Option<String>>(2)?,
-                                    row.get::<_, Option<String>>(3)?,
-                                ),
+                                Some(row.get::<_, bool>(1)?),
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
                             ))
                         },
                     )
                     .optional()
                     .storage()?
-                    .map_or_else(
-                        || ("[]".to_owned(), None),
-                        |(routes, invitation)| (routes, Some(invitation)),
-                    );
-                let (pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex) =
-                    match invitation {
-                        Some((pending, welcomer, welcome)) => (Some(pending), welcomer, welcome),
-                        None => (None, None, None),
+                    .unwrap_or_else(|| ("[]".to_owned(), None, None, None));
+                // If a replacement Welcome (or founding) already committed in
+                // MLS while its app checkpoint failed, `account_groups` still
+                // holds an older admission's standing. Never copy that stale
+                // inviter or Welcome onto the frontier: record pending with no
+                // inviter/Welcome for an unprojected Welcome admission, or
+                // accepted with none for a local founding.
+                if pending_confirmation.is_some()
+                    && let Some((created_locally, admission_welcome)) = tx
+                        .query_row_cached(
+                            "SELECT created_locally, via_welcome
+                             FROM cgka_invitation_admissions
+                             WHERE group_id = ?1",
+                            params![&group_id],
+                            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+                        )
+                        .optional()
+                        .storage()?
+                {
+                    let matches_admission = match admission_welcome {
+                        None => created_locally && via_welcome_message_id_hex.is_none(),
+                        Some(welcome) => {
+                            via_welcome_message_id_hex.as_deref()
+                                == Some(hex::encode(welcome).as_str())
+                        }
                     };
+                    if !matches_admission {
+                        pending_confirmation = Some(!created_locally);
+                        welcomer_account_id_hex = None;
+                        via_welcome_message_id_hex = None;
+                    }
+                }
                 deleted = deleted.saturating_add(
                     tx.execute_cached(
                         "DELETE FROM pending_application_events WHERE group_id = ?1",

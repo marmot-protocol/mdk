@@ -3111,7 +3111,12 @@ async fn sibling_answer_while_deleted_then_recreated(declined: bool) {
 
     assert!(devices.phone.delete_group_local(&chat).await.unwrap());
     if declined {
+        // Keep the laptop's native Leave proposal off the relay so the chat
+        // stays quiet on the phone and the phone's own decision pass proves
+        // the full handoff to durable native Leave.
+        devices.relay.fail_publishes_as_unavailable();
         devices.laptop.decline_group_invite(&chat).await.unwrap();
+        devices.relay.allow_publishes();
     } else {
         devices.laptop.accept_group_invite(&chat).unwrap();
     }
@@ -3135,14 +3140,15 @@ async fn sibling_answer_while_deleted_then_recreated(declined: bool) {
         "with no row the answer is set aside"
     );
 
+    // Send two newer messages in one batch so the multi-event frontier guard
+    // is exercised as well (mdk#3555).
     super::history_delivery::send_text(&mut bob, &chat, "a newer message").await;
+    super::history_delivery::send_text(&mut bob, &chat, "a second newer message").await;
     deliver_all(&mut devices.phone, &devices.relay).await;
 
     if declined {
-        devices.phone.drive_invitation_decisions().await;
-        // The decline is owed again, as for a chat that was never deleted;
-        // the ordinary decision pass hands it to Leave once the group
-        // settles.
+        // Recreation re-arms the set-aside decline before the decision pass
+        // runs, and the pass then hands it off to durable native Leave.
         assert!(
             phone_store
                 .app_storage()
@@ -3150,8 +3156,29 @@ async fn sibling_answer_while_deleted_then_recreated(declined: bool) {
                 .unwrap()
                 .iter()
                 .any(|work| work.decision == answer && work.decline_owed),
-            "the decline made on the laptop is owed to the recreated chat"
+            "recreation must re-arm the laptop's decline before driving decisions"
         );
+        assert!(phone_store.leave_request(&chat).unwrap().is_none());
+        devices.phone.drive_invitation_decisions().await;
+        assert!(
+            phone_store.leave_request(&chat).unwrap().is_some(),
+            "the re-armed decline must hand off to durable native Leave"
+        );
+        assert!(
+            phone_store
+                .app_storage()
+                .invitation_decision_work()
+                .unwrap()
+                .iter()
+                .all(|work| work.decision.group_id_hex != chat_hex),
+            "Leave handoff must clear the re-armed decline work"
+        );
+        let recreated = devices
+            .phone
+            .state_group_record(&chat)
+            .expect("the recreated row remains archived after Leave handoff");
+        assert!(recreated.archived);
+        assert!(!recreated.pending_confirmation);
     } else {
         let recreated = devices
             .phone
@@ -3191,6 +3218,123 @@ async fn a_sibling_accept_made_while_deleted_applies_to_the_recreated_chat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_decline_made_while_deleted_applies_to_the_recreated_chat() {
     sibling_answer_while_deleted_then_recreated(true).await;
+}
+
+/// If a replacement Welcome commits in MLS while its app checkpoint fails and
+/// the user then deletes the chat locally, the old app row's inviter and
+/// accepted standing belong to the previous admission. Recreation must not
+/// inherit that stale inviter or auto-accept a retained sibling accept for the
+/// replacement admission (which could bypass a local block on the replacement
+/// inviter).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_replacement_welcome_checkpoint_before_local_delete_does_not_inherit_old_inviter() {
+    use crate::small_state::{KIND_SMALL_STATE_UPDATE, encode_invitation_decision_updates};
+
+    let (mut devices, device_group) = tagging_devices().await;
+    published_key_package(&mut devices.phone, &devices.relay).await;
+    published_key_package(&mut devices.laptop, &devices.relay).await;
+    let alice = devices
+        .phone_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, devices.relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let chat = bob
+        .create_group("replacement welcome checkpoint tear", &[&alice])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    devices.phone.accept_group_invite(&chat).unwrap();
+    let chat_hex = hex::encode(chat.as_slice());
+    let phone_store = group_storage(&devices.phone);
+
+    // Simulate a replacement Welcome committing in MLS before its app
+    // checkpoint ran: the engine's admission now names the replacement Welcome
+    // and generation, while `account_groups` still holds Bob's accepted row.
+    let replacement_generation = [0x99; 32];
+    phone_store
+        .put_invitation_admission(
+            &chat,
+            Some(&cgka_traits::group::InvitationAdmission {
+                generation: replacement_generation,
+                created_locally: false,
+                via_welcome: Some(cgka_traits::MessageId::new(vec![0xaa; 32])),
+            }),
+        )
+        .unwrap();
+
+    assert!(devices.phone.delete_group_local(&chat).await.unwrap());
+    let accepted = storage_sqlite::InvitationDecision {
+        group_id_hex: chat_hex.clone(),
+        generation: replacement_generation,
+        version: 1,
+        declined: false,
+    };
+    let [(content, _)] = <[_; 1]>::try_from(encode_invitation_decision_updates(
+        std::slice::from_ref(&accepted),
+    ))
+    .unwrap();
+    assert!(
+        devices
+            .laptop
+            .send_device_group_message(&device_group, KIND_SMALL_STATE_UPDATE, content)
+            .await
+            .unwrap()
+    );
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    devices.phone.drive_invitation_decisions().await;
+
+    super::history_delivery::send_text(&mut bob, &chat, "message after replacement tear").await;
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    devices.phone.drive_invitation_decisions().await;
+
+    let recreated = devices
+        .phone
+        .state_group_record(&chat)
+        .expect("a newer message recreates the chat");
+    assert!(
+        recreated.pending_confirmation,
+        "an unprojected replacement Welcome must come back pending, not accepted from the old row or sibling accept"
+    );
+    assert_eq!(recreated.welcomer_account_id_hex, None);
+    assert_eq!(recreated.via_welcome_message_id_hex, None);
+
+    // Even a newer sibling accept arriving afterwards must not auto-accept a
+    // row whose Welcome does not match the current admission.
+    let later_accept = storage_sqlite::InvitationDecision {
+        version: 2,
+        ..accepted
+    };
+    let [(content, _)] = <[_; 1]>::try_from(encode_invitation_decision_updates(
+        std::slice::from_ref(&later_accept),
+    ))
+    .unwrap();
+    assert!(
+        devices
+            .laptop
+            .send_device_group_message(&device_group, KIND_SMALL_STATE_UPDATE, content)
+            .await
+            .unwrap()
+    );
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    devices.phone.drive_invitation_decisions().await;
+    assert!(
+        devices
+            .phone
+            .state_group_record(&chat)
+            .unwrap()
+            .pending_confirmation
+    );
 }
 
 /// The native join and the App checkpoint are separate real transactions.
