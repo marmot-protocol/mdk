@@ -11,6 +11,7 @@
 
 use crate::error::{DirectoryError, MissingKeyPackageReason};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cgka_engine::key_package::key_package_metadata;
@@ -83,17 +84,40 @@ mod tests {
         assert!(cache.get(&format!("{:064x}", 0)).is_none());
 
         let newest = format!("{:064x}", MEMBER_PREWARM_CACHE_LIMIT);
-        cache.entries.get_mut(&newest).unwrap().inserted_at =
-            Instant::now() - MEMBER_PREWARM_CACHE_TTL - Duration::from_secs(1);
+        cache.set_inserted_at(
+            &newest,
+            Instant::now() - MEMBER_PREWARM_CACHE_TTL - Duration::from_secs(1),
+        );
         assert!(cache.get(&newest).is_none());
         assert!(!cache.order.contains(&newest));
+    }
+
+    #[test]
+    fn discarding_a_reused_prewarm_snapshot_preserves_its_replacement() {
+        let mut cache = MemberKeyPackagePrewarmCache::default();
+        let account = "01".repeat(32);
+        cache.insert(account.clone(), AccountRelayListStatus::empty());
+        let used = cache.snapshot(&account).unwrap();
+
+        let mut updated_routes = AccountRelayListStatus::empty();
+        updated_routes
+            .nip65
+            .relays
+            .push("wss://new-outbox.example".into());
+        cache.insert(account.clone(), updated_routes.clone());
+        cache.remove_if_current(&account, &used);
+        assert_eq!(cache.get(&account), Some(updated_routes));
+
+        let current = cache.snapshot(&account).unwrap();
+        cache.remove_if_current(&account, &current);
+        assert!(cache.snapshot(&account).is_none());
+        assert!(!cache.order.contains(&account));
     }
 
     /// A read queued behind one that answers at the cut-off never starts,
     /// however the stream is polled once the cut-off has passed.
     #[tokio::test(start_paused = true)]
     async fn no_read_starts_after_its_cut_off() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let cut_off = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -149,7 +173,7 @@ mod tests {
 
 #[derive(Default)]
 pub struct MemberKeyPackagePrewarmCache {
-    entries: HashMap<String, MemberKeyPackagePrewarmEntry>,
+    entries: HashMap<String, Arc<MemberKeyPackagePrewarmEntry>>,
     order: VecDeque<String>,
 }
 
@@ -166,15 +190,34 @@ impl MemberKeyPackagePrewarmCache {
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_inserted_at(&mut self, account_id_hex: &str, inserted_at: Instant) {
         if let Some(entry) = self.entries.get_mut(account_id_hex) {
-            entry.inserted_at = inserted_at;
+            Arc::make_mut(entry).inserted_at = inserted_at;
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn get(&mut self, account_id_hex: &str) -> Option<AccountRelayListStatus> {
-        self.remove_expired();
-        self.entries
-            .get(account_id_hex)
+        self.snapshot(account_id_hex)
             .map(|entry| entry.relay_lists.clone())
+    }
+
+    fn snapshot(&mut self, account_id_hex: &str) -> Option<Arc<MemberKeyPackagePrewarmEntry>> {
+        self.remove_expired();
+        self.entries.get(account_id_hex).cloned()
+    }
+
+    fn remove_if_current(
+        &mut self,
+        account_id_hex: &str,
+        used: &Arc<MemberKeyPackagePrewarmEntry>,
+    ) {
+        if self
+            .entries
+            .get(account_id_hex)
+            .is_some_and(|current| Arc::ptr_eq(current, used))
+        {
+            self.entries.remove(account_id_hex);
+            self.order.retain(|existing| existing != account_id_hex);
+        }
     }
 
     /// Insert freshly discovered routes, never a package-refresh result.
@@ -184,10 +227,10 @@ impl MemberKeyPackagePrewarmCache {
         self.order.push_back(account_id_hex.clone());
         self.entries.insert(
             account_id_hex,
-            MemberKeyPackagePrewarmEntry {
+            Arc::new(MemberKeyPackagePrewarmEntry {
                 relay_lists,
                 inserted_at: Instant::now(),
-            },
+            }),
         );
         while self.entries.len() > MEMBER_PREWARM_CACHE_LIMIT {
             let Some(oldest) = self.order.pop_front() else {
@@ -554,7 +597,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         // Even a valid, unexpired cached package may have been consumed on
         // another device. Every purpose, including composition prewarm, must
         // fetch current relay publications; only discovery routes are reused.
-        let mut reused_prewarmed_routes = HashSet::new();
+        let mut reused_prewarmed_routes = HashMap::new();
         for (index, target) in targets.iter_mut().enumerate() {
             // Recovery deliberately refreshes routes as well as packages.
             if purpose == MemberResolutionPurpose::CommitFresh {
@@ -565,10 +608,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 .member_key_package_prewarm_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&target.account_id_hex);
-            if let Some(relay_lists) = prefetched {
-                target.relay_lists =
-                    merge_relay_list_status(target.relay_lists.clone(), relay_lists);
+                .snapshot(&target.account_id_hex);
+            if let Some(snapshot) = prefetched {
+                target.relay_lists = merge_relay_list_status(
+                    target.relay_lists.clone(),
+                    snapshot.relay_lists.clone(),
+                );
                 target.cached_relay_lists = target.relay_lists.clone();
                 if !target.relay_lists.nip65.relays.is_empty()
                     && !self
@@ -586,7 +631,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         )
                         .is_empty()
                 {
-                    reused_prewarmed_routes.insert(index);
+                    reused_prewarmed_routes.insert(index, snapshot);
                 }
             }
         }
@@ -595,7 +640,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         // refresh. Process-local prewarm entries have an enforced TTL and were
         // already resolved through the outbox path during composition.
         let relay_list_unresolved = (0..targets.len())
-            .filter(|index| !reused_prewarmed_routes.contains(index))
+            .filter(|index| !reused_prewarmed_routes.contains_key(index))
             .collect::<Vec<_>>();
         // Unfinished relay lists cannot support any KeyPackage verdict.
         let (relay_lists_completed, relay_lists_unfinished, finished) =
@@ -660,9 +705,29 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 observation.directory_sample(outcome, "network", 1);
             }
         }
-        for (target, outcome) in targets.iter().zip(&mut outcomes) {
+        for (index, (target, outcome)) in targets.iter().zip(&mut outcomes).enumerate() {
             let Some(result) = outcome.take() else {
                 continue;
+            };
+            // An incompatibility verdict needs current outbox discovery as
+            // well as complete KeyPackage reads. Reused routes are hints.
+            let result = match result {
+                Err(DirectoryError::KeyPackageRequirements(error))
+                    if !relay_lists_completed.contains(&index)
+                        && key_package_requirements_are_incompatible(&error) =>
+                {
+                    if let Some(snapshot) = reused_prewarmed_routes.get(&index) {
+                        self.state
+                            .member_key_package_prewarm_cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove_if_current(&target.account_id_hex, snapshot);
+                    }
+                    Err(DirectoryError::DirectoryLookupIncomplete(
+                        target.account_id_hex.clone(),
+                    ))
+                }
+                result => result,
             };
             *outcome = Some(result.and_then(|packages| {
                 if packages.is_empty() {

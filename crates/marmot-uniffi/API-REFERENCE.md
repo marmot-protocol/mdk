@@ -1795,7 +1795,7 @@ pub async fn start_direct_conversation_with_options( &self, account_ref: String,
 
 Options apply only when the call creates the group. Reuse, retry and same-account concurrent starts return the existing canonical group with its founding duration and roles, even when they propose a different duration. A nonzero duration requires message retention support, as in `create_group_with_options`.
 
-A complete lookup that finds only KeyPackages incompatible with the chat's founding requirements returns `MarmotKitError::IncompatibleKeyPackage` (`MARMOT_STATUS_INCOMPATIBLE_KEY_PACKAGE` in C). If coverage is incomplete and the lookup finds only incompatible KeyPackages, it returns `MarmotKitError::DirectoryLookupIncomplete`. Either refusal creates no chat. The same rules apply to `start_direct_conversation`.
+When a lookup finds only KeyPackages incompatible with the chat's founding requirements, it returns `MarmotKitError::IncompatibleKeyPackage` (`MARMOT_STATUS_INCOMPATIBLE_KEY_PACKAGE` in C) if relay-list discovery and KeyPackage reads both completed. Otherwise it returns `MarmotKitError::DirectoryLookupIncomplete`. Either refusal creates no chat. The same rules apply to `start_direct_conversation`.
 
 [Source](src/commands/group.rs#L458)
 

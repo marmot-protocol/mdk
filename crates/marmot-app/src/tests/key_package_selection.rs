@@ -1071,14 +1071,20 @@ async fn per_author_refetch_preserves_slot_replacements_seen_in_batch() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_start_rejects_a_retention_incompatible_recipient_without_creating_a_chat() {
-    let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
-    let bob = &accounts[0];
+const UPDATED_DIRECT_OUTBOX: &str = "wss://new-outbox.example";
+
+async fn direct_start_outbox_fixture() -> (
+    tempfile::TempDir,
+    MarmotApp,
+    AccountSummary,
+    Arc<MemberResolutionDirectoryFetcher>,
+) {
+    let (dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let bob = accounts.into_iter().next().unwrap();
     app.account_home().create_account("alice").unwrap();
     let limited = fresh_key_package_with_components(
         &app,
-        bob,
+        &bob,
         false,
         app.supported_app_component_ids()
             .into_iter()
@@ -1086,12 +1092,97 @@ async fn direct_start_rejects_a_retention_incompatible_recipient_without_creatin
             .collect(),
     )
     .await;
-    {
-        let mut events = fetcher.events.lock().unwrap();
-        events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
-        events.push(candidate(bob, limited, "limited", None, unix_now_seconds()));
-    }
+    let mut known_records = fetcher.events.lock().unwrap().clone();
+    known_records.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    known_records.push(candidate(
+        &bob,
+        limited,
+        "limited",
+        None,
+        unix_now_seconds(),
+    ));
+    let mut new_outbox_records = known_records
+        .iter()
+        .filter(|event| event.kind == KIND_MARMOT_INBOX_RELAY_LIST)
+        .cloned()
+        .collect::<Vec<_>>();
+    new_outbox_records.push(candidate(
+        &bob,
+        fresh_key_package_for_account(&app, &bob, false).await,
+        "compatible",
+        None,
+        unix_now_seconds(),
+    ));
+    fetcher.events_by_endpoint.lock().unwrap().extend([
+        ("wss://directory.example".into(), known_records.clone()),
+        ("wss://shared.example".into(), known_records),
+        (UPDATED_DIRECT_OUTBOX.into(), new_outbox_records),
+    ]);
+    (dir, app, bob, fetcher)
+}
 
+fn advertise_updated_direct_outbox(
+    fetcher: &MemberResolutionDirectoryFetcher,
+    bob: &AccountSummary,
+) {
+    let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+    let records = by_endpoint.get_mut("wss://directory.example").unwrap();
+    let outbox = records
+        .iter_mut()
+        .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
+        .unwrap();
+    *outbox = NostrTransportEvent::new_unsigned_at(
+        bob.account_id_hex.clone(),
+        KIND_NIP65_RELAY_LIST,
+        vec![vec![
+            "r".into(),
+            UPDATED_DIRECT_OUTBOX.into(),
+            "write".into(),
+        ]],
+        String::new(),
+        outbox.created_at + 1,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_start_retries_after_incomplete_outbox_discovery() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let options = crate::DirectConversationOptions {
+        disappearing_message_secs: 300,
+    };
+    *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_NIP65_RELAY_LIST);
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://directory.example".into());
+    let error = runtime
+        .start_direct_conversation_with_options("alice", &bob.account_id_hex, options)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::DirectoryLookupIncomplete(account) if account == &bob.account_id_hex),
+        "{error}"
+    );
+    assert!(app.groups("alice").unwrap().is_empty());
+
+    advertise_updated_direct_outbox(&fetcher, &bob);
+    *fetcher.incomplete_endpoint.lock().unwrap() = None;
+    let created = runtime
+        .start_direct_conversation_with_options("alice", &bob.account_id_hex, options)
+        .await
+        .unwrap();
+    let groups = app.groups("alice").unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
+    runtime.shutdown().await;
+    {
+        let client = app.client("alice").await.unwrap();
+        assert_eq!(client.runtime.live_group_ids().unwrap(), vec![created]);
+    }
+    app.close_storage().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_start_requires_complete_discovery_for_incompatibility() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
     let runtime = MarmotAppRuntime::new(app.clone());
     let options = crate::DirectConversationOptions {
         disappearing_message_secs: 300,
@@ -1122,11 +1213,31 @@ async fn direct_start_rejects_a_retention_incompatible_recipient_without_creatin
         Some(cgka_traits::EngineError::MissingRequiredCapabilities { .. })
     ));
     assert!(app.groups("alice").unwrap().is_empty());
+
+    // A prewarm snapshot can also miss a later outbox publication.
+    app.directory()
+        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    advertise_updated_direct_outbox(&fetcher, &bob);
+    let error = runtime
+        .start_direct_conversation_with_options("alice", &bob.account_id_hex, options)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::DirectoryLookupIncomplete(account) if account == &bob.account_id_hex),
+        "{error}"
+    );
+    assert!(app.groups("alice").unwrap().is_empty());
+
+    let created = runtime
+        .start_direct_conversation_with_options("alice", &bob.account_id_hex, options)
+        .await
+        .unwrap();
+    let groups = app.groups("alice").unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].group_id_hex, hex::encode(created.as_slice()));
     runtime.shutdown().await;
-    {
-        let client = app.client("alice").await.unwrap();
-        assert!(client.runtime.live_group_ids().unwrap().is_empty());
-    }
     app.close_storage().unwrap();
 }
 
