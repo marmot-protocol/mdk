@@ -1907,7 +1907,7 @@ impl AccountHome {
                 // Identifying records remain in this detached directory, so
                 // the next leased recovery can retry without touching a live account.
                 tracing::warn!(target: TRACE_TARGET, method = "resume_wipe_cleanup",
-                    "detached payload cleanup remains pending");
+                    "detached account cleanup remains pending");
             }
         }
         self.resume_completed_contexts()
