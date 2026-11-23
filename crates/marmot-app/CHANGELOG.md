@@ -46,6 +46,9 @@
   added them, the same row the adder's timeline shows.
 - The README now states that chat history imported from another device, and backups, leave out group system rows
   and deleted-message placeholders, and why.
+- A newly linked device no longer shows a chat the account already accepted as an invitation, where declining it
+  would take the account out of the chat on every device (mdk#3556). Before each automatic sibling Add the adding
+  device sends the chat's invitation decision again, and an Add whose decision reaches no relay waits for a later pass.
 
 ## 0.19.0 - 2026-11-22
 

@@ -364,7 +364,9 @@ self-promote if they are not admins. Those clients must adopt the explicit start
 one authenticated admission generation and its automatic sibling Adds (mdk#2628 D96). A separate external Add batch
 or admission fork can prompt again; older unidentified invites stay local-only. A sibling Add forwards how the adding
 device holds the chat: its original inviter, and for an unidentified copy whether it is confirmed, so the new device
-shows it confirmed or as an invitation from that inviter (mdk#3546). Higher version wins, with decline
+shows it confirmed or as an invitation from that inviter (mdk#3546). For an identified copy the adding device first
+sends the generation's decision again, so a device linked after the decision went out learns it before its Welcome
+(mdk#3556); an Add whose decision reaches no relay waits. Higher version wins, with decline
 winning an equal version. Acceptance preserves membership, block/rejoin checks and explicit archive intent. Decline
 records durable work for this matching local leaf's ordinary Leave; a later accept never cancels an already-requested
 Leave or joins a device. `published = 0` with `CompletionUnknown` reports pending work, not completed departure by

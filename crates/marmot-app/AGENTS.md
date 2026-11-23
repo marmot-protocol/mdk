@@ -651,7 +651,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   LeaveRequest and worker maintenance; recheck current generation/winner after send preflight. Higher acceptance
   can replace unrequested intent but cannot cancel native LeaveRequest. Box the rare internal Leave future as the
   foreground owner does, to keep it out of idle maintenance frames. A known current-generation decline holds new
-  direct/gap sibling Adds at candidate and final preparation; private-stock requests follow their ordinary rules. Keep claims/waiters and
+  direct/gap sibling Adds at candidate and final preparation; private-stock requests follow their ordinary rules.
+  Every sibling Add sends its chat's held decision first (`send_invitation_decision_before_add`) and waits, spending
+  no stock, when that send reaches no relay: a device linked since the decision went out cannot read the earlier send,
+  and a broadcast answering its request can wait an hour (mdk#3556). Keep claims/waiters and
   exposed work settlement independent. Reuse durable winner work to schedule the affected chat's existing gap work,
   even without an epoch change; do not put per-chat decisions in the global slot/tag eligibility fingerprint.
   `a_declined_generation_holds_automatic_adds_until_a_later_accept` owns that app/transport boundary. Kind475 invitation

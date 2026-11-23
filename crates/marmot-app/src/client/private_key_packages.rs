@@ -978,9 +978,12 @@ impl AppClient {
 
     /// Add the sibling in `sibling` to `chat` with the exact received
     /// `candidate` the caller admitted, then send the sibling Welcome owed once
-    /// its Commit is published. The engine refuses the Add, writing nothing,
-    /// unless both devices are tagged in the trusted device group and the
-    /// chat names its relays; it checks a queued Add again at drain, and a
+    /// its Commit is published. The chat's invitation decision goes out
+    /// first, and an Add whose decision reaches no relay waits, spending no
+    /// stock ([`Self::send_invitation_decision_before_add`]). The engine
+    /// refuses the Add, writing nothing, unless both devices are tagged in
+    /// the trusted device group and the chat names its relays; it checks a
+    /// queued Add again at drain, and a
     /// refusal there retires the queued Add with its KeyPackage. The
     /// candidate must still be held and unexpired when claimed. Once claimed,
     /// the KeyPackage is spent either way and never handed back: an error after
@@ -1000,6 +1003,9 @@ impl AppClient {
         // Already admitted/signed work has its own settlement owner.
         if !self.invitation_allows_sibling_add(chat)? {
             return Ok(());
+        }
+        if !self.send_invitation_decision_before_add(chat).await? {
+            return Err(AppError::DeviceGroupRefused("invitation_decision_unsent"));
         }
         let forwarded = self.forwarded_invitation(chat);
         if !self.take_private_key_package_exact(sibling, &candidate)? {

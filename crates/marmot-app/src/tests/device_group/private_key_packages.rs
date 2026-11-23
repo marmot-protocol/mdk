@@ -1374,8 +1374,9 @@ async fn a_sibling_welcome_whose_stash_write_fails_is_kept_on_retry() {
     );
 }
 
-/// Adding the phone to a chat publishes the Add's Commit and then sends the
-/// sibling Welcome it leaves owed as a 461, which settles it delivered: no
+/// Adding the phone to a chat publishes the chat's invitation decision, the
+/// Add's Commit, and then the sibling Welcome it leaves owed as a 461, which
+/// settles it delivered: no
 /// later pass sends it again. The phone stashes it and joins the chat,
 /// consuming the KeyPackage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1392,7 +1393,7 @@ async fn adding_a_sibling_sends_its_welcome_once_the_commit_is_published() {
         )
         .await
         .unwrap();
-    assert_eq!(group_messages_since(&devices.relay, before), 2);
+    assert_eq!(group_messages_since(&devices.relay, before), 3);
     assert!(owed(&devices.laptop).is_empty());
     devices.laptop.run_due_maintenance().await.unwrap();
 
@@ -1968,17 +1969,27 @@ async fn a_sibling_welcome_waits_for_its_commit() {
     let (mut devices, _, [chat]) = tagging_devices_with_chats::<1>().await;
     let phone_slot = slot(&devices.phone);
     let stock = received_from(&devices.laptop, &phone_slot).len();
-    devices.relay.reject_next_publish();
-    let error = devices
-        .laptop
-        .add_sibling_to_chat(
-            &chat,
-            &phone_slot,
-            private_candidate(&devices.laptop, &phone_slot),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(error.privacy_safe_kind(), "publish");
+    // The chat's invitation decision goes out first; the Commit after it is
+    // refused.
+    let relay = &devices.relay;
+    let blocked = relay
+        .blocked_publish_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    relay.block_next_publishes(2);
+    let candidate = private_candidate(&devices.laptop, &phone_slot);
+    let (added, ()) = tokio::join!(
+        devices
+            .laptop
+            .add_sibling_to_chat(&chat, &phone_slot, candidate),
+        async {
+            relay.wait_for_blocked_publishes(blocked + 1).await;
+            relay.release_publish();
+            relay.wait_for_blocked_publishes(blocked + 2).await;
+            relay.reject_next_publish();
+            relay.release_publish();
+        }
+    );
+    assert_eq!(added.unwrap_err().privacy_safe_kind(), "publish");
     assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
     devices.laptop.send_owed_sibling_welcomes(&[]).await;
     deliver_all(&mut devices.phone, &devices.relay).await;
@@ -2001,7 +2012,8 @@ async fn a_sibling_welcome_waits_for_its_commit() {
 
 /// An Add the engine refuses spends its KeyPackage too, and never hands it
 /// back: a chat routed through two spellings of one relay, which the phone
-/// would read as one, takes no sibling, and nothing is published or owed.
+/// would read as one, takes no sibling, and nothing but the chat's
+/// invitation decision is published, and nothing is owed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_sibling_add_spends_its_key_package() {
     let (mut devices, _) = tagging_devices().await;
@@ -2039,7 +2051,11 @@ async fn a_refused_sibling_add_spends_its_key_package() {
         "{error}"
     );
     assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
-    assert_eq!(devices.relay.published_events.lock().unwrap().len(), before);
+    assert_eq!(group_messages_since(&devices.relay, before), 1);
+    assert_eq!(
+        devices.relay.published_events.lock().unwrap().len(),
+        before + 1
+    );
     assert!(owed(&devices.laptop).is_empty());
 }
 

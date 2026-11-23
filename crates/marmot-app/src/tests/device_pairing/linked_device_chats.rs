@@ -508,6 +508,75 @@ async fn a_recorded_acceptance_holds_every_new_device_until_it_is_sent() {
     }
 }
 
+/// An acceptance the phone sent before the tablet was linked reaches the
+/// tablet ahead of the chat's sibling Welcome, so the tablet never shows the
+/// chat as an invitation (mdk#3556). The tablet cannot read device-group
+/// messages from before it joined, and the phone answers its broadcast
+/// request only an hour after its own last broadcast, which here was the
+/// laptop's link. An Add whose decision reaches no relay waits for a later
+/// pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_acceptance_sent_before_a_link_reaches_the_new_device_ahead_of_its_welcome() {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    let alice = phone
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let chat = bob
+        .create_group("accepted", &[&alice])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    phone.client.sync().await.unwrap();
+    phone.client.accept_group_invite(&chat).unwrap();
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    passes(&relay, &mut [&mut phone, &mut laptop], 6).await;
+    assert!(
+        !laptop
+            .client
+            .state_group_record(&chat)
+            .expect("the phone added the laptop")
+            .pending_confirmation
+    );
+
+    let mut tablet = another_alice_device(&relay, &phone).await;
+    link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    // An Add whose decision reaches no relay waits, spending no stock.
+    hold_key_packages(&relay, &mut phone, &mut tablet).await;
+    relay.reject_publishes_of_kind_as_too_large(445);
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    relay.allow_all_publish_kinds();
+    assert_eq!(taken_from(&phone, &tablet), 0);
+    let mut seen = false;
+    for _ in 0..6 {
+        passes(&relay, &mut [&mut phone, &mut laptop, &mut tablet], 1).await;
+        if let Some(group) = tablet.client.state_group_record(&chat) {
+            assert!(
+                !group.pending_confirmation,
+                "the tablet got the chat before the account's acceptance"
+            );
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "a sibling added the tablet to the chat");
+}
+
 /// A real linked sender rebroadcasts a retained winning choice. It need not
 /// have this ordinary chat installed to authenticate its account's choice.
 async fn receive_account_choice(
@@ -2397,20 +2466,23 @@ async fn a_terminal_gap_add_waits_for_its_existing_claim_before_retrying() {
             .all(|chat| leaves_of(&phone, &laptop, chat, &group) == 0)
     );
 
-    // Accept the claim, then definitively reject the first chat's Commit.
-    // The fixture gates actual publishes; it supplies no retry decision.
+    // Accept the claim and the chat's invitation decision, then definitively
+    // reject the first chat's Commit. The fixture gates actual publishes; it
+    // supplies no retry decision.
     let blocked = relay
         .blocked_publish_count
         .load(std::sync::atomic::Ordering::SeqCst);
-    relay.block_next_publishes(2);
+    relay.block_next_publishes(3);
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut selection = Default::default();
         tokio::join!(
             phone.client.fill_sibling_chat_gaps(&[], 2, &mut selection),
             async {
-                relay.wait_for_blocked_publishes(blocked + 1).await;
-                relay.release_publish();
-                relay.wait_for_blocked_publishes(blocked + 2).await;
+                for accepted in 1..=2 {
+                    relay.wait_for_blocked_publishes(blocked + accepted).await;
+                    relay.release_publish();
+                }
+                relay.wait_for_blocked_publishes(blocked + 3).await;
                 relay.reject_next_publish();
                 relay.release_publish();
             }
@@ -2732,15 +2804,17 @@ async fn a_pending_gap_add_does_not_claim_the_next_sibling() {
     let blocked = relay
         .blocked_publish_count
         .load(std::sync::atomic::Ordering::SeqCst);
-    relay.block_next_publishes(2);
+    relay.block_next_publishes(3);
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut selection = Default::default();
         tokio::join!(
             phone.client.fill_sibling_chat_gaps(&[], 2, &mut selection),
             async {
-                relay.wait_for_blocked_publishes(blocked + 1).await;
-                relay.release_publish();
-                relay.wait_for_blocked_publishes(blocked + 2).await;
+                for accepted in 1..=2 {
+                    relay.wait_for_blocked_publishes(blocked + accepted).await;
+                    relay.release_publish();
+                }
+                relay.wait_for_blocked_publishes(blocked + 3).await;
                 relay.zero_ack_next_publish();
                 relay.release_publish();
             }
@@ -2753,8 +2827,8 @@ async fn a_pending_gap_add_does_not_claim_the_next_sibling() {
     assert_eq!(taken_from(&phone, &second), 0);
     assert_eq!(
         relay.published_event_ids().len(),
-        before + 1,
-        "only the first sibling's claim was published"
+        before + 2,
+        "only the first sibling's claim and the chat's decision were published"
     );
 }
 

@@ -332,6 +332,46 @@ impl AppClient {
         }
     }
 
+    /// Before a sibling Add of `chat`, send its generation's held decision
+    /// again in the trusted device group, so the sibling reads it ahead of
+    /// its Welcome (mdk#3556). A sibling linked since the decision went out
+    /// cannot read that send, and a broadcast answering its request can wait
+    /// an hour. Returns false when the send reached no relay.
+    pub(super) async fn send_invitation_decision_before_add(
+        &mut self,
+        chat: &GroupId,
+    ) -> Result<bool, AppError> {
+        let account = self.app.account_storage(&self.state.label)?;
+        let Some(admission) = account.invitation_admission(chat)? else {
+            return Ok(true);
+        };
+        let storage = account.app_storage();
+        let Some(decision) =
+            storage.invitation_decision(&hex::encode(chat.as_slice()), &admission.generation)?
+        else {
+            return Ok(true);
+        };
+        let Some(group_id) = self.trusted_device_group()? else {
+            return Ok(true);
+        };
+        for (content, carried) in
+            crate::small_state::encode_invitation_decision_updates(std::slice::from_ref(&decision))
+        {
+            if !self
+                .send_device_group_message(
+                    &group_id,
+                    crate::small_state::KIND_SMALL_STATE_UPDATE,
+                    content,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+            storage.mark_invitation_decisions_sent(&carried)?;
+        }
+        Ok(true)
+    }
+
     /// Native founding can be recovered by the ordinary projection reconcile
     /// even if a crash preceded delivery of its non-Welcome creation event.
     pub(super) fn remember_founding_invitation(&self, group_id: &GroupId) -> Result<(), AppError> {
