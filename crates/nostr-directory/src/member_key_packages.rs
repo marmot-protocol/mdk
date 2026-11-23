@@ -27,7 +27,7 @@ use super::resources::DirectoryResources;
 use crate::published_records::{
     KeyPackageJournalFence, MAX_KEY_PACKAGES_PER_ACCOUNT, fresh_relay_list_status_from_records,
     key_package_queries, key_package_read_page_full, merge_relay_list_status,
-    select_fenced_key_packages,
+    relay_list_state_from_event, select_fenced_key_packages,
 };
 use crate::{AccountRelayListStatus, FetchedKeyPackage};
 use transport_nostr::DirectoryEventQuery;
@@ -1170,32 +1170,42 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             !invalid_outboxes.contains(index) && !outbox_hop.cleared.contains(index)
         }));
         let completed_outbox = outbox_hop.completed;
-        // A remembered list counts only when a completed reply in this lookup
-        // served it. On a timestamp tie the remembered list keeps its routes
-        // and the cache cannot tell which tied list is current, so the served
-        // one's outboxes are read too but the tie decides nothing.
+        // A list counts only when a completed reply in this lookup served it,
+        // so a lookup no reply gave a list confirms none. Lists published in
+        // the same second tie: the remembered list keeps its routes and the
+        // cache cannot tell which tied list is current, so every tied list's
+        // outboxes are read too but a tie decides nothing.
+        let freshness = self.directory_freshness();
         let mut confirmed = HashSet::new();
         for &index in &needs_discovery {
             let target = &mut targets[index];
-            let newest = |records: &[transport_nostr::DirectoryRelayEventRecord]| {
-                let nip65 = fresh_relay_list_status_from_records(
-                    &target.account_id_hex,
-                    records.to_vec(),
-                    self.directory_freshness(),
-                )
-                .value
-                .nip65;
-                (nip65.created_at, nip65.relays)
+            let listed_at = target.relay_lists.nip65.created_at;
+            let listed = relay_identities(&target.relay_lists.nip65.relays);
+            let account = target.account_id_hex.as_str();
+            let same_second = |records: &[transport_nostr::DirectoryRelayEventRecord]| {
+                records
+                    .iter()
+                    .filter(|record| {
+                        record.event.pubkey == account
+                            && record.event.kind == KIND_NIP65_RELAY_LIST
+                            && freshness.accepts(record)
+                    })
+                    .filter_map(|record| relay_list_state_from_event(&record.event))
+                    .filter(|state| state.created_at == listed_at)
+                    .map(|state| state.relays)
+                    .collect::<Vec<_>>()
             };
-            let (served_at, served) = newest(&target.relay_records);
-            let completed = newest(&target.completed_relay_records);
-            let listed = (
-                target.relay_lists.nip65.created_at,
-                relay_identities(&target.relay_lists.nip65.relays),
-            );
-            if served_at == listed.0 && relay_identities(&served) != listed.1 {
-                target.tied_relays = served;
-            } else if (completed.0, relay_identities(&completed.1)) == listed {
+            let served = same_second(&target.completed_relay_records)
+                .iter()
+                .any(|relays| relay_identities(relays) == listed);
+            let tied = same_second(&target.relay_records)
+                .into_iter()
+                .filter(|relays| relay_identities(relays) != listed)
+                .flatten()
+                .collect::<Vec<_>>();
+            if !tied.is_empty() {
+                target.tied_relays = tied;
+            } else if served {
                 confirmed.insert(index);
             }
         }

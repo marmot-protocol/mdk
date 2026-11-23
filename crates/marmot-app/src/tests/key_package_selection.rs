@@ -1712,6 +1712,67 @@ async fn a_tied_relay_list_is_read_but_decides_nothing() {
     app.close_storage().unwrap();
 }
 
+/// Two relays can serve different relay lists published in the same second.
+/// The lower event id wins the list, but the other list is a tie all the
+/// same: its outbox is read, and the compatible package there is used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_losing_same_second_relay_list_is_still_read() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let compatible = {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let listed = by_endpoint["wss://directory.example"]
+            .iter()
+            .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
+            .unwrap()
+            .clone();
+        let losing = (0..)
+            .map(|nonce| {
+                NostrTransportEvent::new_unsigned_at(
+                    bob.account_id_hex.clone(),
+                    KIND_NIP65_RELAY_LIST,
+                    vec![vec![
+                        "r".into(),
+                        UPDATED_DIRECT_OUTBOX.into(),
+                        "write".into(),
+                    ]],
+                    nonce.to_string(),
+                    listed.created_at,
+                )
+            })
+            .find(|event| event.id > listed.id)
+            .unwrap();
+        let old_outbox = by_endpoint.get_mut("wss://shared.example").unwrap();
+        old_outbox.retain(|event| event.kind != KIND_NIP65_RELAY_LIST);
+        old_outbox.push(losing);
+        by_endpoint[UPDATED_DIRECT_OUTBOX]
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap()
+            .id
+            .clone()
+    };
+    let resolved = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved
+            .key_packages
+            .iter()
+            .map(|package| hex::encode(package.source.as_ref().unwrap().event_id.as_slice()))
+            .collect::<Vec<_>>(),
+        vec![compatible]
+    );
+    app.close_storage().unwrap();
+}
+
 /// A tied relay list can name enough relays to push the recipient's routes
 /// past the admission limit. The tie only adds reads, so the remembered outbox
 /// is still read and its compatible package is used.
@@ -1846,47 +1907,44 @@ async fn a_relay_list_only_an_unfinished_batch_returned_decides_nothing() {
 }
 
 /// When every relay-list read completes but none returns a list, the lookup
-/// cannot confirm the remembered one, so the remembered outbox's incompatible
-/// packages decide nothing.
+/// cannot confirm the remembered one, and a cold lookup has none to confirm,
+/// so the incompatible packages it reads decide nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unconfirmed_remembered_relay_list_decides_no_incompatibility() {
-    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
-    let requirements = retention_requirements(&app).await;
-    let first = app
-        .directory()
-        .resolve_compatible_member_key_packages(
-            vec![bob.account_id_hex.clone()],
-            &requirements,
-            nostr_directory::MemberResolutionPurpose::Commit,
-            nostr_directory::MemberResolutionPolicy::Atomic,
-        )
-        .await;
-    assert!(
-        matches!(first, Err(DirectoryError::KeyPackageRequirements(_))),
-        "{:?}",
-        first.err()
-    );
-    for relays in fetcher.events_by_endpoint.lock().unwrap().values_mut() {
-        relays.retain(|event| event.kind != KIND_NIP65_RELAY_LIST);
+    for remembered in [true, false] {
+        let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+        let requirements = retention_requirements(&app).await;
+        let directory = app.directory();
+        let resolve = || {
+            directory.resolve_compatible_member_key_packages(
+                vec![bob.account_id_hex.clone()],
+                &requirements,
+                nostr_directory::MemberResolutionPurpose::Commit,
+                nostr_directory::MemberResolutionPolicy::Atomic,
+            )
+        };
+        if remembered {
+            let first = resolve().await;
+            assert!(
+                matches!(first, Err(DirectoryError::KeyPackageRequirements(_))),
+                "{:?}",
+                first.err()
+            );
+        }
+        for relays in fetcher.events_by_endpoint.lock().unwrap().values_mut() {
+            relays.retain(|event| event.kind != KIND_NIP65_RELAY_LIST);
+        }
+        let result = resolve().await;
+        assert!(
+            matches!(
+                &result,
+                Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
+            ),
+            "remembered {remembered}: {:?}",
+            result.err()
+        );
+        app.close_storage().unwrap();
     }
-    let result = app
-        .directory()
-        .resolve_compatible_member_key_packages(
-            vec![bob.account_id_hex.clone()],
-            &requirements,
-            nostr_directory::MemberResolutionPurpose::Commit,
-            nostr_directory::MemberResolutionPolicy::Atomic,
-        )
-        .await;
-    assert!(
-        matches!(
-            &result,
-            Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
-        ),
-        "{:?}",
-        result.err()
-    );
-    app.close_storage().unwrap();
 }
 
 /// A prewarm can hold the only known route to a recipient's outbox. When the
