@@ -541,15 +541,12 @@ pub(super) fn settle(
             turn.now,
         )?;
     }
-    // A sweep that stopped on a second its relay cannot prove, under caps
-    // the relay published, stops there again while those caps stand. A
-    // comparison that ran out of budget only paused, and a sweep on unknown
-    // caps cannot tell an unprovable second from a document that failed to
-    // load.
+    // A sweep that stopped on a second its relay cannot prove stops there
+    // again while the relay's caps stand: those it published, or none, where
+    // the relay refused or ignored NIP-77 for the second (mdk#3264). A
+    // comparison that ran out of budget only paused.
     let saturated_second = match report.end {
-        SweepEnd::SaturatedSecond { second } if plan.compare.is_none() && plan.caps.is_some() => {
-            Some(second)
-        }
+        SweepEnd::SaturatedSecond { second } if plan.compare.is_none() => Some(second),
         _ => None,
     };
     let unit = turn.app.settle_recovery_unit_saturated(

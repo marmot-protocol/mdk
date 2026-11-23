@@ -256,10 +256,18 @@ impl SweepRelay for SdkSweepRelay {
             .await
         {
             Ok(compared) => compared.remote,
-            Err(NegFailure::Closed(reason)) => return self.second_refused(reason),
-            // A relay that ignores an unadvertised NEG-OPEN still answered its REQ.
+            // A relay with no document that refuses or ignores NIP-77 answers
+            // as one whose document omits it: it cannot prove this second
+            // (mdk#3264). Its REQ still answered, and a rate limit still waits.
+            Err(NegFailure::Closed(reason))
+                if self.caps.is_none()
+                    && reason.0 != Some(TransportEndpointRejectionCategory::RateLimited) =>
+            {
+                return SecondReply::Unproven;
+            }
+            Err(NegFailure::Closed(reason)) => return SecondReply::Closed(reason),
             Err(NegFailure::Unreachable(UnreachableKind::TimedOut)) if self.caps.is_none() => {
-                return SecondReply::Inconclusive;
+                return SecondReply::Unproven;
             }
             Err(NegFailure::Unreachable(kind)) => return SecondReply::Unreachable(kind),
             Err(NegFailure::Unproven) => return SecondReply::Unproven,

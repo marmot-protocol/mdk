@@ -1044,10 +1044,11 @@ cut short at their deadline, so nothing newer goes ahead of history its relay ma
 Two units hold nothing. A saturated one, whose last answered quantum stopped on the first
 second it owes because its relay cannot prove it under the caps the relay published (no cap and
 no NIP-77 proof; migration 0151 records that second), would stop on the same second if asked
-again while those caps stand. It pursues again once it owes an earlier second first or the
-relay's recorded caps change. An answer its deadline cut saturates nothing, and nor does a relay
-whose caps were never read: a document that failed to load is not a relay that cannot prove the
-second. Nor does an inconclusive NIP-77 answer: ids the relay listed and then did not all
+again while those caps stand. A relay whose document was never read saturates the same way once
+it refuses or ignores the NIP-77 attempt for that second (mdk#3264): the second stays owed, and
+newer live frames no longer wait about 15 minutes for the unit to break. It pursues again once
+it owes an earlier second first or the relay's recorded caps change, a document read included.
+An answer its deadline cut saturates nothing. Nor does an inconclusive NIP-77 answer: ids the relay listed and then did not all
 return (the event may have gone in between), an exchange that broke off on a malformed
 message, which is not a relay without NIP-77, or a one-id fetch cut short (the reply budget
 counts duplicate frames). Only the relay's own capability or the size of the set it holds for
