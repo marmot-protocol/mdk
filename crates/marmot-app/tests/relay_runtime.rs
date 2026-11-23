@@ -4140,6 +4140,13 @@ async fn tagged_poll_sticker_peer() {
 
     let token = "durable-sticker-token";
     gate.arm(1);
+    runtime
+        .submit_text(a, &group, "hold the send worker".into(), "blocker".into())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
+        .await
+        .unwrap();
     let sent = timeout(
         Duration::from_secs(5),
         runtime.submit_tagged_sticker(a, &group, sticker.clone(), tags.clone(), token.into()),
@@ -4148,17 +4155,38 @@ async fn tagged_poll_sticker_peer() {
     .expect("sticker admission waited for relay publication")
     .unwrap();
     assert_eq!(sent.client_token, token);
-    timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
+    assert_eq!(
+        runtime.local_send_status(a, &group, token).unwrap(),
+        Some(marmot_app::LocalSendStatus::Queued)
+    );
+    let sticker_id = &sent.message_id_hex;
+    assert!(
+        runtime
+            .timeline_message(b, &group_hex, sticker_id)
+            .unwrap()
+            .is_none()
+    );
+    drop(bob_timeline);
+    runtime.shutdown_and_close().await.unwrap();
+    gate.release();
+
+    let runtime = MarmotAppRuntime::new(durable_send_app(&dir, url));
+    let mut events = runtime.subscribe();
+    assert_eq!(
+        runtime.local_send_status(a, &group, token).unwrap(),
+        Some(marmot_app::LocalSendStatus::Queued)
+    );
+    runtime.start().await.unwrap();
+    let replay = runtime
+        .submit_tagged_sticker(a, &group, sticker.clone(), tags.clone(), token.into())
         .await
         .unwrap();
-    let sticker_id = &sent.message_id_hex;
-    let peer_before_release = runtime.timeline_message(b, &group_hex, sticker_id).unwrap();
-    gate.release();
-    assert!(peer_before_release.is_none());
-    wait_for_timeline_update(&mut bob_timeline, |update| {
-        matches!(update, marmot_app::RuntimeTimelineMessageUpdate::Projection(projection)
-            if projection.update.timeline_messages.iter().any(|row| row.message_id_hex == *sticker_id))
-    }).await;
+    assert_eq!(replay, sent);
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::MessageReceived(m)
+            if &m.account_id_hex == b && m.message.message_id_hex == *sticker_id)
+    })
+    .await;
     let peer = runtime
         .timeline_message(b, &group_hex, sticker_id)
         .unwrap()
@@ -4175,14 +4203,12 @@ async fn tagged_poll_sticker_peer() {
         marmot_app::sticker_ref_from_tags(peer.kind, &peer.tags),
         Some(sticker.clone())
     );
-    drop(bob_timeline);
-    runtime.shutdown_and_close().await.unwrap();
-    let runtime = MarmotAppRuntime::new(durable_send_app(&dir, url));
-    let replay = runtime
-        .submit_tagged_sticker(a, &group, sticker.clone(), tags.clone(), token.into())
-        .await
-        .unwrap();
-    assert_eq!(replay, sent);
+    assert_durable_send_conflict(
+        runtime
+            .submit_tagged_sticker(a, &group, sticker.clone(), vec![], token.into())
+            .await
+            .unwrap_err(),
+    );
     assert_durable_send_conflict(
         runtime
             .submit_tagged_sticker(

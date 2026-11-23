@@ -5467,6 +5467,54 @@ caller cancellation and restart; delivery uses ordinary subscriptions. See [loca
 
 [Source](src/commands/local_submissions.rs#L38)
 
+### `Marmot::submit_tagged_reply`
+
+```rust
+pub async fn submit_tagged_reply( &self, account_ref: String, group_id_hex: String, target_message_id: String, text: String, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Durably admit a kind-9 inline reply with application tags. MDK supplies the
+`e` and `q` tags from `target_message_id`. Use `submit_thread_message` for a
+NIP-22 comment. See [retry and delivery status](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L126)
+
+### `Marmot::submit_tagged_sticker`
+
+```rust
+pub async fn submit_tagged_sticker( &self, account_ref: String, group_id_hex: String, sticker_ref: StickerRefFfi, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Durably admit a pack sticker with context tags. MDK checks the coordinate,
+shortcode, and hash against the account's catalog. Do not supply a `sticker`
+or `imeta` tag. See [retry and delivery status](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L177)
+
+### `Marmot::submit_tagged_text`
+
+```rust
+pub async fn submit_tagged_text( &self, account_ref: String, group_id_hex: String, text: String, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Durably admit a kind-9 text message with application tags. Do not pass
+`imeta` tags. See [retry and delivery status](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L104)
+
+### `Marmot::submit_thread_message`
+
+```rust
+pub async fn submit_thread_message( &self, account_ref: String, group_id_hex: String, parent_message_id: String, text: String, attachments: Vec<MediaAttachmentReferenceFfi>, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Durably admit a NIP-22 comment with text, uploaded attachments, or both.
+MDK resolves `parent_message_id` in the local timeline and builds the placement
+tags. Pass the attachment references with their upload epoch identity and in
+display order. See [retry and delivery status](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L151)
+
 ### `Marmot::upload_media_with_client_token`
 
 ```rust
@@ -6219,58 +6267,5 @@ pub async fn logout(&self) -> Result<(), Nip46ErrorFfi>
 Attempt bounded remote courtesy logout and erase the session's communication credentials even when no acknowledgement arrives or the foreign caller cancels its wait. Successful local erasure detaches the revoked signer so a fresh pairing can be registered in the same process. A vault deletion error stops signing but retains cleanup ownership; retry logout or account-level removal after the vault recovers. This does not sign out the MDK account; account sign-out already leaves attached handles logged out.
 
 [Source](src/nip46.rs#L241)
-
-</details>
-
-<details>
-<summary>New exports — complete and organize before merging</summary>
-
-### `Marmot::submit_tagged_reply`
-
-```rust
-pub async fn submit_tagged_reply( &self, account_ref: String, group_id_hex: String, target_message_id: String, text: String, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
-```
-
-Durably admit a kind-9 inline reply with application tags. MDK supplies the
-`e` and `q` tags from `target_message_id`. Use `submit_thread_message` for a
-NIP-22 comment. See [retry and delivery status](LOCAL-SENDS.md).
-
-[Source](src/commands/local_submissions.rs#L126)
-
-### `Marmot::submit_tagged_sticker`
-
-```rust
-pub async fn submit_tagged_sticker( &self, account_ref: String, group_id_hex: String, sticker_ref: StickerRefFfi, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
-```
-
-Durably admit a pack sticker with context tags. MDK checks the coordinate,
-shortcode, and hash against the account's catalog. Do not supply a `sticker`
-or `imeta` tag. See [retry and delivery status](LOCAL-SENDS.md).
-
-[Source](src/commands/local_submissions.rs#L177)
-
-### `Marmot::submit_tagged_text`
-
-```rust
-pub async fn submit_tagged_text( &self, account_ref: String, group_id_hex: String, text: String, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
-```
-
-Durably admit a kind-9 text message with application tags. Do not pass
-`imeta` tags. See [retry and delivery status](LOCAL-SENDS.md).
-
-[Source](src/commands/local_submissions.rs#L104)
-
-### `Marmot::submit_thread_message`
-
-```rust
-pub async fn submit_thread_message( &self, account_ref: String, group_id_hex: String, parent_message_id: String, text: String, attachments: Vec<MediaAttachmentReferenceFfi>, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
-```
-
-Durably admit a NIP-22 comment with text, uploaded attachments, or both.
-MDK resolves `parent_message_id` in the local timeline and builds the placement
-tags. Pass the attachment references with their upload epoch identity and in
-display order. See [retry and delivery status](LOCAL-SENDS.md).
-
-[Source](src/commands/local_submissions.rs#L151)
 
 </details>

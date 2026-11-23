@@ -4935,7 +4935,10 @@ impl AppClient {
             .observed(family, operation, ProductUnit::Action);
         let work = async move {
             self.ensure_group_application_messages_allowed(group_id)?;
-            if let AppMessageIntent::Sticker { sticker_ref, .. } = &intent {
+            // A retained sticker was authorized before its event was admitted.
+            if prepared.is_none()
+                && let AppMessageIntent::Sticker { sticker_ref, .. } = &intent
+            {
                 let storage = self.app.account_storage(&self.state.label)?.app_storage();
                 MarmotApp::authorize_sticker_ref(&storage, sticker_ref)?;
             }

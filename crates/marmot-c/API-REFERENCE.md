@@ -6058,6 +6058,55 @@ See [local sends](../marmot-uniffi/LOCAL-SENDS.md).
 
 [Header contract](include/marmot.h#L10347)
 
+### `marmot_submit_tagged_reply`
+
+```c
+MarmotStatus marmot_submit_tagged_reply(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *target_message_id, const char *text, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);
+```
+
+Admit a kind-9 inline reply with application tags. MDK supplies its `e` and
+`q` tags. Free the local receipt with `marmot_local_send_acceptance_free`.
+See [local sends](README.md#local-sends).
+
+[Header contract](include/marmot.h#L12617)
+
+### `marmot_submit_tagged_sticker`
+
+```c
+MarmotStatus marmot_submit_tagged_sticker(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *pack_coordinate, const char *shortcode, const char *plaintext_sha256, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);
+```
+
+Admit a pack sticker with context tags. The coordinate, shortcode, and hash
+must identify a sticker known to this account. Free the local receipt with
+`marmot_local_send_acceptance_free`. See [local sends](README.md#local-sends).
+
+[Header contract](include/marmot.h#L13401)
+
+### `marmot_submit_tagged_text`
+
+```c
+MarmotStatus marmot_submit_tagged_text(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *text, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);
+```
+
+Admit a kind-9 text message with application tags, excluding `imeta`. Free
+the local receipt with `marmot_local_send_acceptance_free`. See
+[local sends](README.md#local-sends).
+
+[Header contract](include/marmot.h#L12599)
+
+### `marmot_submit_thread_message`
+
+```c
+MarmotStatus marmot_submit_thread_message(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *parent_message_id, const char *text, const struct MarmotMediaAttachmentReference *attachments, uintptr_t attachments_len, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);
+```
+
+Admit a NIP-22 comment. Pass uploaded attachments in display order, with
+their upload epoch identity. MDK builds placement and `imeta` tags. Free the
+local receipt with `marmot_local_send_acceptance_free`. See
+[local sends](README.md#local-sends).
+
+[Header contract](include/marmot.h#L12217)
+
 ### `marmot_upload_media_with_client_token`
 
 ```c
@@ -7396,59 +7445,5 @@ Refresh at most 100 direct follows with bounded relay work and persist each comp
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotrefresh_follow_availability)
 
 [Header contract](include/marmot.h#L11577)
-
-</details>
-
-<details>
-<summary>New exports — complete and organize before merging</summary>
-
-### `marmot_submit_tagged_reply`
-
-```c
-MarmotStatus marmot_submit_tagged_reply(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *target_message_id, const char *text, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);
-```
-
-Admit a kind-9 inline reply with application tags. MDK supplies its `e` and
-`q` tags. Free the local receipt with `marmot_local_send_acceptance_free`.
-See [local sends](README.md#local-sends).
-
-[Header contract](include/marmot.h#L12617)
-
-### `marmot_submit_tagged_sticker`
-
-```c
-MarmotStatus marmot_submit_tagged_sticker(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *pack_coordinate, const char *shortcode, const char *plaintext_sha256, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);
-```
-
-Admit a pack sticker with context tags. The coordinate, shortcode, and hash
-must identify a sticker known to this account. Free the local receipt with
-`marmot_local_send_acceptance_free`. See [local sends](README.md#local-sends).
-
-[Header contract](include/marmot.h#L13401)
-
-### `marmot_submit_tagged_text`
-
-```c
-MarmotStatus marmot_submit_tagged_text(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *text, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);
-```
-
-Admit a kind-9 text message with application tags, excluding `imeta`. Free
-the local receipt with `marmot_local_send_acceptance_free`. See
-[local sends](README.md#local-sends).
-
-[Header contract](include/marmot.h#L12599)
-
-### `marmot_submit_thread_message`
-
-```c
-MarmotStatus marmot_submit_thread_message(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *parent_message_id, const char *text, const struct MarmotMediaAttachmentReference *attachments, uintptr_t attachments_len, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);
-```
-
-Admit a NIP-22 comment. Pass uploaded attachments in display order, with
-their upload epoch identity. MDK builds placement and `imeta` tags. Free the
-local receipt with `marmot_local_send_acceptance_free`. See
-[local sends](README.md#local-sends).
-
-[Header contract](include/marmot.h#L12217)
 
 </details>

@@ -97,7 +97,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `u64`, or a lowercase `e` tag: `cgka_traits::is_nip22_comment`) gain missing mention `p` tags. Match existing `p`
   tags by pubkey even with relay hints or extra elements; preserve supplied tags and content. Kind 1111 with neither
   remains app-defined. Thread messages are sent through `AppMessageIntent::ThreadMessage`, which places them from the
-  parent's row (`client/thread_placement.rs`); the client contract is
+  parent's row (`src/thread_placement.rs`) for both direct sends and durable admission. The client contract is
   `docs/marmot-architecture/overview/thread-messages.md`. Kinds MDK owns
   (`is_reserved_app_event_kind`: chat, reaction, edit, delete,
   agent, group system, push token, and the device-group kinds `is_device_group_kind` lists) are rejected with `AppError::InvalidAppMessagePayload` so apps cannot forge
