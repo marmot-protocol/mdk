@@ -849,18 +849,21 @@ impl AccountHome {
         if state.phase == AccountSetupPhase::CompensationPending {
             return Err(AccountHomeError::AccountSetupConflict);
         }
-        // Completion commits before opaque context cleanup. A later cleanup
+        // Logical completion commits before opaque context cleanup. A later
         // failure must not revert a published account to incomplete setup.
         fs::remove_file(self.account_setup_state_path(&account.label))?;
         // Sync the journal commit even if the context unlink fails.
-        let cleanup = self
-            .clear_setup_context(&account.label)
-            .and(sync_directory(&self.account_dir(&account.label)).map_err(Into::into));
+        let cleanup = self.clear_setup_context(&account.label);
+        let sync = sync_directory(&self.account_dir(&account.label));
         if cleanup.is_err() {
-            // Context without a journal is durable cleanup intent. Leased
+            // Context without a journal is cleanup intent. Leased
             // reopen retries it; a fresh attempt must clear it before admission.
             tracing::warn!(target: TRACE_TARGET, method = "complete_account_setup",
-                "setup committed; context cleanup remains pending");
+                "setup logically complete; context cleanup remains pending");
+        }
+        if sync.is_err() {
+            tracing::warn!(target: TRACE_TARGET, method = "complete_account_setup",
+                "setup logically complete; directory sync failed, power-loss durability is not acknowledged");
         }
         Ok(())
     }
@@ -2020,7 +2023,11 @@ impl AccountHome {
 
     fn move_to_tombstone(&self, label: &str) -> AccountHomeResult<PathBuf> {
         validate_account_label(label)?;
-        let live_dir = self.account_dir(label);
+        let mut live_dir = self.accounts_dir();
+        if !fs::symlink_metadata(&live_dir)?.is_dir() {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotADirectory).into());
+        }
+        live_dir.push(label);
         if !fs::symlink_metadata(&live_dir)?.is_dir() {
             return Err(std::io::Error::from(std::io::ErrorKind::NotADirectory).into());
         }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
 use marmot_account::{
@@ -680,7 +680,9 @@ fn restored_public_wipe_retires() {
                 )
                 .unwrap();
                 assert_eq!(owner, id);
+                let calls = store.remove_calls.load(Ordering::SeqCst);
                 home.resume_wipe_cleanup().unwrap();
+                assert_eq!(store.remove_calls.load(Ordering::SeqCst), calls);
                 assert_eq!(
                     store.keys.lock().unwrap()[&credential],
                     hex::encode(*database)
@@ -1960,6 +1962,33 @@ fn nip46_storage_failure_retry() {
     assert!(store.keys.lock().unwrap().is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn wipe_rejects_accounts_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account().unwrap();
+    let accounts = dir.path().join("accounts");
+    let physical = dir.path().join("physical-accounts");
+    std::fs::rename(&accounts, &physical).unwrap();
+    std::os::unix::fs::symlink(&physical, &accounts).unwrap();
+    let live = physical.join(&account.label);
+    let record = live.join("account.json");
+    let key = live.join("secret.json");
+    let record_bytes = std::fs::read(&record).unwrap();
+    let key_bytes = Zeroizing::new(std::fs::read(&key).unwrap());
+
+    assert!(
+        matches!(home.remove_account(&account.label), Err(AccountHomeError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotADirectory)
+    );
+    assert_eq!(std::fs::read(record).unwrap(), record_bytes);
+    assert!(
+        std::fs::read(key).unwrap() == *key_bytes,
+        "signing key changed"
+    );
+}
+
 #[test]
 fn wipe_commits_on_vault_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -2891,6 +2920,7 @@ struct MemorySecretStore {
     interrupt_after_write: AtomicBool,
     fail_remove: AtomicBool,
     fail_remove_after_delete: AtomicBool,
+    remove_calls: AtomicUsize,
 }
 
 impl AccountSecretStore for MemorySecretStore {
@@ -2947,6 +2977,7 @@ impl AccountSecretStore for MemorySecretStore {
     }
 
     fn remove_secret(&self, account: &marmot_account::AccountSummary) -> AccountHomeResult<()> {
+        self.remove_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_remove.load(Ordering::SeqCst) {
             return Err(AccountHomeError::SecretStore(
                 "injected removal failure".into(),

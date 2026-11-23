@@ -47,15 +47,22 @@ reset returns `AccountSetupConflict` before changing the account or moving its f
 key stay intact; retrying reset cannot recover this backend. Back up the signing key before wiping the account,
 then import the backed-up key. Wipe also removes the account's local data.
 
-Completion commits when the setup journal is removed. Failed context cleanup does not make that account incomplete
-again: the remaining private context is cleanup intent. A fresh attempt must clear it before admission. Public-role
-restoration also keeps database-credential ownership, so a later full wipe retires that credential independently of role.
+Setup succeeds once the journal is removed. If the subsequent directory sync fails, that logical completion does not
+guarantee the removal survives power loss. Failed context cleanup leaves the account complete and the private context
+pending cleanup. A fresh attempt must clear it before admission.
+
+Public-role restoration keeps a database-credential ownership marker so a later full wipe can retire that credential.
+The current records cannot prove a historical credential is absent, so even a role-only restoration can leave a later
+wipe with pending credential cleanup.
 
 Opening an `AccountHome` does not remove leftover wipe directories. `MarmotApp` replays local file cleanup after
 acquiring the root runtime lease. Lower-level hosts can call `resume_wipe_cleanup` under that exclusive lease;
 replay retries completed setup context and detached payload cleanup, retains native cleanup records, and never removes
 native credentials. A failed payload cleanup remains pending without blocking unrelated accounts. Invalid root
 containers or rename-parent sync failures reject startup; replay refuses container symlinks.
+
+On Windows, the private-file replacement fallback for shared readers is atomic. It does not request write-through
+or guarantee durability across power loss.
 
 ## What it does not do
 

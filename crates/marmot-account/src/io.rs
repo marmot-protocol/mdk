@@ -225,6 +225,8 @@ fn publish_file(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHomeResult<
                 match windows_move_for_commit(&temp_path, path, MOVEFILE_REPLACE_EXISTING) {
                     // std can replace a delete-shared destination through
                     // FileRenameInfoEx without moving the old name aside.
+                    // This fallback is atomic but does not request write-through
+                    // and does not guarantee durability across power loss.
                     Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
                         fs::rename(&temp_path, path)?;
                     }
