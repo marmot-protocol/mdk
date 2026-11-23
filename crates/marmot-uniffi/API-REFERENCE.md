@@ -5391,7 +5391,7 @@ Read a retained submission's local state without relay I/O. `None` means no reta
 association. `Completed` describes the worker attempt; inspect its summary disposition
 and follow timeline updates for later delivery. See [local sends](LOCAL-SENDS.md).
 
-[Source](src/commands/local_submissions.rs#L230)
+[Source](src/commands/local_submissions.rs#L325)
 
 ### `Marmot::edit_local_message_with_client_token`
 
@@ -5430,7 +5430,7 @@ Atomically consume exactly the supplied draft revision and retain its token-boun
 message. Prepared attachments must match selected descriptors. Returns local
 acceptance, not delivery; never clear a newer composer on completion. See [local sends](LOCAL-SENDS.md).
 
-[Source](src/commands/local_submissions.rs#L130)
+[Source](src/commands/local_submissions.rs#L225)
 
 ### `Marmot::send_prepared_media_with_client_token`
 
@@ -5440,7 +5440,7 @@ pub async fn send_prepared_media_with_client_token( &self, account_ref: String, 
 
 Admit an uploaded ordinary-media snapshot with its stable client token and optional captured draft revision. Conditional consumption is transactional, bound to ordered plaintext SHA-256 hashes, and preserves newer drafts. The method has no reply target. See the [captured-media contract](LOCAL-SENDS.md#captured-ordinary-media-drafts) for token replay, interruption recovery and matching bindings.
 
-[Source](src/commands/local_submissions.rs#L152)
+[Source](src/commands/local_submissions.rs#L247)
 
 ### `Marmot::send_custom_event_with_client_token`
 
@@ -5453,7 +5453,7 @@ token correlation and status reporting as `send_text_with_client_token`. Use it 
 answer or a control sent to an agent (kind 1202): the same token after a restart returns
 the same event and sends nothing, so a retried interrupt is not sent twice. See [local sends](LOCAL-SENDS.md).
 
-[Source](src/commands/local_submissions.rs#L106)
+[Source](src/commands/local_submissions.rs#L201)
 
 ### `Marmot::send_text_with_client_token`
 
@@ -5478,7 +5478,7 @@ The result includes uploaded references and optional local acceptance. Uploads t
 are not idempotent or restart-resumable; query token status after unknown outcomes.
 See [local sends](LOCAL-SENDS.md) for cancellation and epoch-bound media handling.
 
-[Source](src/commands/local_submissions.rs#L177)
+[Source](src/commands/local_submissions.rs#L272)
 
 ### `Marmot::upload_media_files_with_client_token`
 
@@ -5490,7 +5490,7 @@ pub async fn upload_media_files_with_client_token( &self, account_ref: String, g
 
 File-backed `upload_media_with_client_token`: every attachment is stored locally and uploaded before durable token admission; a source the disk cannot hold fails with `StorageFull` before anything is uploaded. Cancellation observed before admission starts returns an error and admits nothing. Once admission starts it is not interruptible, even before durable acceptance returns; follow `local_send_status` and timeline delivery, including uncertain-delivery handling. Admission rejects references from a source epoch that is no longer current with `MediaReferenceStaleEpoch` (upload again), and refuses while the group's epoch is unsettled with `MediaReferenceEpochUnsettled` (sync and send again). There is no fixed worker-response timeout; per-endpoint network deadlines still apply.
 
-[Source](src/commands/local_submissions.rs#L204)
+[Source](src/commands/local_submissions.rs#L299)
 
 </details>
 
@@ -6222,3 +6222,55 @@ Attempt bounded remote courtesy logout and erase the session's communication cre
 
 </details>
 
+<details>
+<summary>New exports — complete and organize before merging</summary>
+
+### `Marmot::submit_tagged_reply`
+
+```rust
+pub async fn submit_tagged_reply( &self, account_ref: String, group_id_hex: String, target_message_id: String, text: String, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Durably admit a kind-9 inline reply with application tags. MDK supplies the
+`e` and `q` tags from `target_message_id`. Use `submit_thread_message` for a
+NIP-22 comment. See [retry and delivery status](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L126)
+
+### `Marmot::submit_tagged_sticker`
+
+```rust
+pub async fn submit_tagged_sticker( &self, account_ref: String, group_id_hex: String, sticker_ref: StickerRefFfi, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Durably admit a pack sticker with context tags. MDK checks the coordinate,
+shortcode, and hash against the account's catalog. Do not supply a `sticker`
+or `imeta` tag. See [retry and delivery status](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L177)
+
+### `Marmot::submit_tagged_text`
+
+```rust
+pub async fn submit_tagged_text( &self, account_ref: String, group_id_hex: String, text: String, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Durably admit a kind-9 text message with application tags. Do not pass
+`imeta` tags. See [retry and delivery status](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L104)
+
+### `Marmot::submit_thread_message`
+
+```rust
+pub async fn submit_thread_message( &self, account_ref: String, group_id_hex: String, parent_message_id: String, text: String, attachments: Vec<MediaAttachmentReferenceFfi>, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Durably admit a NIP-22 comment with text, uploaded attachments, or both.
+MDK resolves `parent_message_id` in the local timeline and builds the placement
+tags. Pass the attachment references with their upload epoch identity and in
+display order. See [retry and delivery status](LOCAL-SENDS.md).
+
+[Source](src/commands/local_submissions.rs#L151)
+
+</details>

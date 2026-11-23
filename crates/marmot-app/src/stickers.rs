@@ -511,14 +511,11 @@ impl MarmotApp {
     }
 
     pub(crate) fn authorize_sticker_ref(
-        &self,
-        account_ref: &str,
+        storage: &SqliteAppStorage,
         sticker_ref: &AppStickerRef,
     ) -> Result<(), AppError> {
         let sticker_ref = sticker_ref.to_sdk()?;
-        let account = self.account_home().account(account_ref)?;
-        self.account_storage(&account.label)?
-            .app_storage()
+        storage
             .sticker_for_ref(
                 &sticker_ref.pack.coordinate(),
                 &sticker_ref.shortcode,

@@ -1,4 +1,4 @@
-//! Placing a new thread message from this device's timeline rows.
+//! Resolve NIP-22 placement for direct sends and durable admission.
 
 use crate::AppError;
 use crate::messages::ThreadPlacement;

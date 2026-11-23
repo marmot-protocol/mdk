@@ -109,7 +109,6 @@ pub(crate) mod sign_ins;
 pub(crate) mod sign_out;
 mod small_state;
 mod sync;
-mod thread_placement;
 #[cfg(test)]
 pub(crate) mod upload_cleanup_tests;
 pub(crate) mod welcome_waves;
@@ -4937,8 +4936,8 @@ impl AppClient {
         let work = async move {
             self.ensure_group_application_messages_allowed(group_id)?;
             if let AppMessageIntent::Sticker { sticker_ref, .. } = &intent {
-                self.app
-                    .authorize_sticker_ref(&self.state.label, sticker_ref)?;
+                let storage = self.app.account_storage(&self.state.label)?.app_storage();
+                MarmotApp::authorize_sticker_ref(&storage, sticker_ref)?;
             }
             // Capture the human-action descriptor before `Unreact` is rewritten to
             // `DeleteReactions` below, so the audit log records the user's actual
@@ -5025,20 +5024,21 @@ impl AppClient {
                         .ok_or(AppError::InvalidEditTarget)?;
                     intent
                 }
+                // Durable admission already fixed the placement in the retained event.
                 AppMessageIntent::ThreadMessage {
                     parent_message_id,
                     content,
                     attachments,
                     message_tags,
                     placement: None,
-                } => {
+                } if prepared.is_none() => {
                     if !attachments.is_empty() {
                         self.sync_runtime_groups_for_send("send_thread_message")
                             .await?;
                         self.validate_draft_media_references(group_id, &attachments)?;
                     }
                     let storage = self.app.account_storage(&self.state.label)?.app_storage();
-                    let placement = thread_placement::thread_placement(
+                    let placement = crate::thread_placement::thread_placement(
                         &storage,
                         &hex::encode(group_id.as_slice()),
                         &parent_message_id,

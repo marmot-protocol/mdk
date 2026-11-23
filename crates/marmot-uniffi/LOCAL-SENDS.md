@@ -7,6 +7,20 @@ transaction records ownership and the pending timeline row. The draft variant
 consumes only the selected revision in that transaction. Do not clear the composer
 again when delivery completes.
 
+Use `submit_tagged_text` and `submit_tagged_reply` for kind-9 messages with
+application tags. `submit_tagged_reply` builds the `e` and `q` tags. Neither
+accepts a caller-supplied `imeta` tag.
+
+Use `submit_thread_message` for a NIP-22 comment. Pass the parent message ID,
+text, already-uploaded attachment references in display order, and application
+tags. MDK resolves the root from the parent's timeline row and builds the
+placement and `imeta` tags. The attachment references must carry their upload
+epoch identity.
+
+Use `submit_tagged_sticker` with the pack coordinate, shortcode, and plaintext
+SHA-256 in a `StickerRefFfi`, plus any context tags. MDK checks the reference
+against the account's sticker catalog and builds the `sticker` tag.
+
 `send_custom_event_with_client_token` admits an app-defined event the same way. Use it
 for an answer or a control sent to an agent (kind 1202), so that retrying a token after
 a restart does not send an interrupt twice. A 1202 has no timeline row, so it gets
@@ -59,11 +73,12 @@ same `Cleared` reason, and the group receives the delete.
 
 - Tokens contain 1–128 UTF-8 bytes and are scoped to one account-device and group.
   They are opaque, local-only values, never wire tags or diagnostics.
-- Repeating a text/reply/draft request with its original token returns the same
-  identity while queued, engine-owned or completed. A rejected attempt returns
+- Repeating a request with its original token returns the same identity while
+  queued, engine-owned, or completed. A rejected attempt returns
   `InvalidAppMessagePayload` and requires a new token. A different request using
-  that token is rejected. Draft retry identity binds the original opaque revision,
-  including after that draft was consumed.
+  that token is rejected. Parent IDs, application tags, attachment order, and
+  sticker references are part of request identity. For draft sends, keep the
+  original opaque revision even after MDK consumes the draft.
 - Event IDs and transmitted tags keep their existing protocol behavior. Identical
   sender, second-level timestamp, kind, content and tags produce the same ID.
   If a new token would reuse an existing local submission or source-row identity,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::local_submissions::{LocalDraftAdmission, LocalMessageRequest};
+use crate::local_submissions::{LocalDraftAdmission, LocalMessageRequest, LocalTypedSend};
 use std::sync::Arc;
 
 /// Reject a malformed token before any upload work, not after the PUT.
@@ -365,6 +365,61 @@ impl MarmotAppRuntime {
                 content: text,
                 reply_to: Some(target),
                 tags,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Durably admit a NIP-22 thread message using [`Self::send_thread_message`]'s
+    /// placement and tag rules. Attachment references must be in display order.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_thread_message(
+        &self,
+        account: &str,
+        group: &GroupId,
+        parent_message_id: String,
+        text: String,
+        attachments: Vec<MediaAttachmentReference>,
+        tags: Vec<Vec<String>>,
+        client_token: String,
+    ) -> Result<crate::LocalSendAcceptance, AppError> {
+        self.submit_local_message(
+            account,
+            group,
+            client_token,
+            LocalMessageRequest {
+                content: text,
+                attachments,
+                tags,
+                typed: Some(LocalTypedSend::Thread { parent_message_id }),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Durably admit a pack sticker with [`Self::send_tagged_sticker`]'s
+    /// authorization and tag rules.
+    pub async fn submit_tagged_sticker(
+        &self,
+        account: &str,
+        group: &GroupId,
+        sticker_ref: crate::AppStickerRef,
+        tags: Vec<Vec<String>>,
+        client_token: String,
+    ) -> Result<crate::LocalSendAcceptance, AppError> {
+        self.submit_local_message(
+            account,
+            group,
+            client_token,
+            LocalMessageRequest {
+                tags,
+                typed: Some(LocalTypedSend::Sticker(sticker_ref)),
                 ..Default::default()
             },
             None,

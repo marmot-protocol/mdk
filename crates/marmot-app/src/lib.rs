@@ -147,6 +147,7 @@ pub use startup_diagnostics::{
 mod stickers;
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
+mod thread_placement;
 /// Named account-worker fences for tests: the host crates' tests and this
 /// crate's own (mdk#3273).
 #[cfg(any(test, feature = "test-support"))]
