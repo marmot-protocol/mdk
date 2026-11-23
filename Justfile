@@ -505,6 +505,7 @@ tracing-audit:
 
 tamarin:
     @command -v tamarin-prover >/dev/null || { echo "error: tamarin-prover not found on PATH"; exit 127; }
+    python3 -B -m unittest discover -s formal/tamarin -p 'test_*.py'
     @make -C formal/tamarin prove
     python3 -B -m unittest discover -s formal/pairing -p 'test_*.py'
     python3 formal/pairing/verify_pairing.py --out "${CARGO_TARGET_DIR:-target}/formal-pairing"

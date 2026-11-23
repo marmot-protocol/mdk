@@ -10,6 +10,8 @@ and how lemmas map to Rust tests.
 | `distributed_convergence_v0.spthy` | Abstract convergence, lifecycle, delivery-order, and app-output lemmas. |
 | `policy_cases.json` | Shared bounded policy cases used by Rust and Tamarin generation. |
 | `Makefile` | `prove` and `interactive` targets used by the root `Justfile`. |
+| `prove_tamarin.py` | Batch proof runner and narrow GHC RTS `<<loop>>` crash retry shared with `formal/pairing`. |
+| `test_prove_tamarin.py` | Contract tests for `prove_tamarin.py` and `make prove` retry boundaries. |
 | `README.md` | Human explanation of what the model proves and how proofs map to tests. |
 
 Rust consumers: `crates/cgka-conformance-simulator/src/policy_cases.rs`, `src/bin/cgka-policy-casegen.rs`,

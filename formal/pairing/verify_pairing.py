@@ -13,6 +13,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tamarin"))
+from prove_tamarin import MAX_ATTEMPTS, SUMMARY_MARKER, is_ghc_loop_crash  # noqa: E402
+
 TERMINATION_GRACE_SECONDS = 2
 
 
@@ -75,36 +78,51 @@ def check(tamarin, model, folder, name, expected, timeout):
     start = time.monotonic()
     timed_out = False
     termination = None
+    status = None
+    text = ""
     log = folder / "prover.log"
-    with log.open("w") as output:
-        process = subprocess.Popen(
-            command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True
-        )
-        try:
-            status = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            termination = "SIGTERM"
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        timed_out = False
+        termination = None
+        with log.open("w") as output:
+            process = subprocess.Popen(
+                command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True
+            )
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                status = process.wait(timeout=TERMINATION_GRACE_SECONDS)
+                status = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                termination = "SIGKILL"
+                timed_out = True
+                termination = "SIGTERM"
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    os.killpg(process.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
                 try:
                     status = process.wait(timeout=TERMINATION_GRACE_SECONDS)
                 except subprocess.TimeoutExpired:
-                    termination = "SIGKILL-unreaped"
-                    status = None
-    text = log.read_text()
-    marker = "summary of summaries:"
-    summary = text.split(marker, 1)[1] if marker in text else ""
+                    termination = "SIGKILL"
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        status = process.wait(timeout=TERMINATION_GRACE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        termination = "SIGKILL-unreaped"
+                        status = None
+        text = log.read_text(errors="replace")
+        # Narrow crash-only retry for GHC 9.6.7 RTS <<loop>> abort before any summary
+        # (mdk#3033, tamarin-prover#973, GHC#26324).
+        if not timed_out and attempt < MAX_ATTEMPTS and is_ghc_loop_crash(status, text):
+            print(
+                "warning: tamarin-prover aborted with GHC RTS <<loop>> before summary; "
+                f"retrying once (attempt {attempt}/{MAX_ATTEMPTS}, mdk#3033, tamarin-prover#973, GHC#26324)",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+        break
+    summary = text.split(SUMMARY_MARKER, 1)[1] if SUMMARY_MARKER in text else ""
     outcomes = dict(
         re.findall(r"^  (\w+) \((?:all-traces|exists-trace)\): (.+)$", summary, re.M)
     )
