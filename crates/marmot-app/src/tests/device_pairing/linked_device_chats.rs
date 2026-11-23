@@ -195,7 +195,9 @@ fn held_from(device: &Device, issuer: &Device) -> usize {
 }
 
 /// The phone asks for the laptop's KeyPackages, and holds them, before any
-/// add pass of its own runs.
+/// add pass of its own runs. It then sends its small state, as a
+/// maintenance pass does before its Adds: an Add of a chat holding a
+/// decision waits for that (mdk#3556).
 async fn hold_key_packages(
     relay: &ScriptedPushRelayClient,
     phone: &mut Device,
@@ -232,6 +234,7 @@ async fn hold_key_packages(
     })
     .await
     .expect("the phone receives the laptop's private KeyPackage hand-off");
+    boxed(|| phone.client.drive_small_state()).await;
 }
 
 /// A removal of the laptop another device decided reaches the phone, which
@@ -602,6 +605,67 @@ async fn a_device_linked_soon_after_another_gets_an_accepted_chat_accepted() {
         }
     }
     assert!(seen, "the tablet joined from the phone's sibling Welcome");
+}
+
+/// An accepted chat's decision still owed to the siblings, as after an
+/// update that reached no relay, holds the chat's Add to a new device until
+/// it goes out (mdk#3556). Before, the Add went ahead and the Welcome could
+/// reach the device ahead of the decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owed_decision_holds_its_chats_add_until_it_goes_out() {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    let alice = phone
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let chat = bob
+        .create_group("accepted", &[&alice])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    phone.client.sync().await.unwrap();
+    phone.client.accept_group_invite(&chat).unwrap();
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    phone
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .owe_all_small_state_items()
+        .unwrap();
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    assert_eq!(taken_from(&phone, &laptop), 0);
+
+    phone.client.drive_small_state().await;
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    assert_eq!(taken_from(&phone, &laptop), 1);
+    passes(&relay, &mut [&mut laptop, &mut phone], 4).await;
+    assert!(
+        !laptop
+            .client
+            .state_group_record(&chat)
+            .expect("the laptop joined from the phone's sibling Welcome")
+            .pending_confirmation
+    );
 }
 
 /// A real linked sender rebroadcasts a retained winning choice. It need not
