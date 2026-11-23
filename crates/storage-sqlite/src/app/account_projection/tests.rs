@@ -3968,6 +3968,75 @@ fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() 
 }
 
 #[test]
+fn delete_local_group_data_keeps_the_invitation_standing_on_its_frontier() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut pending = group("aa", "pending invitation");
+    pending.pending_confirmation = true;
+    pending.welcomer_account_id_hex = Some("11".repeat(32));
+    pending.via_welcome_message_id_hex = Some("22".repeat(32));
+    let mut accepted = group("bb", "accepted invitation");
+    accepted.welcomer_account_id_hex = Some("33".repeat(32));
+    accepted.via_welcome_message_id_hex = Some("44".repeat(32));
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![pending, accepted, group("cc", "founded here")],
+    };
+    store
+        .app_storage()
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    for (marker, id) in [([0xaa_u8], "aa"), ([0xbb], "bb"), ([0xcc], "cc")] {
+        insert_protocol_group_marker(&store, &marker);
+        assert!(store.delete_local_group_data(id).unwrap().did_delete());
+    }
+
+    let standing = |id: &str| {
+        store
+            .app_storage()
+            .local_group_deletion_invitation(id)
+            .unwrap()
+    };
+    let invitation = |pending: bool, welcomer: Option<String>, welcome: Option<String>| {
+        Some(LocalGroupDeletionInvitation {
+            pending_confirmation: pending,
+            welcomer_account_id_hex: welcomer,
+            via_welcome_message_id_hex: welcome,
+        })
+    };
+    assert_eq!(
+        standing("aa"),
+        invitation(true, Some("11".repeat(32)), Some("22".repeat(32)))
+    );
+    assert_eq!(
+        standing("bb"),
+        invitation(false, Some("33".repeat(32)), Some("44".repeat(32)))
+    );
+    assert_eq!(standing("cc"), invitation(false, None, None));
+
+    // A repeat delete finds no row and keeps what the first one recorded.
+    store.delete_local_group_data("aa").unwrap();
+    assert_eq!(
+        standing("aa"),
+        invitation(true, Some("11".repeat(32)), Some("22".repeat(32)))
+    );
+
+    // No frontier, or one written before the standing was kept: unknown.
+    assert_eq!(standing("dd"), None);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO local_group_deletion_frontiers (group_id_hex, message_insert_order)
+             VALUES ('ee', 0)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(standing("ee"), None);
+}
+
+#[test]
 fn delete_local_group_data_rejects_blank_group_id() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let err = store

@@ -3058,6 +3058,141 @@ async fn a_shared_decline_keeps_native_leave_work_across_a_later_accept_and_rest
     .await;
 }
 
+/// The phone deletes an unanswered invitation locally, the user answers it
+/// on the laptop, and the answer reaches the phone while it has no row, so it
+/// is set aside. A newer chat message then brings the chat back on the phone
+/// with the standing it had at deletion, pending. The set-aside answer must
+/// be owed to that row again, so an accept settles it (in the recreating
+/// batch, without a pending flash) and a decline goes to Leave, instead of
+/// leaving it pending (mdk#3555).
+async fn sibling_answer_while_deleted_then_recreated(declined: bool) {
+    let (mut devices, _device_group) = tagging_devices().await;
+    published_key_package(&mut devices.phone, &devices.relay).await;
+    published_key_package(&mut devices.laptop, &devices.relay).await;
+    let alice = devices
+        .phone_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_id = AccountHome::open(bob_dir.path())
+        .account("bob")
+        .unwrap()
+        .account_id_hex;
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, devices.relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let chat = bob
+        .create_group("answered while deleted", &[&alice])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    let phone_store = group_storage(&devices.phone);
+    let generation = phone_store
+        .invitation_admission(&chat)
+        .unwrap()
+        .unwrap()
+        .generation;
+    assert!(
+        devices
+            .phone
+            .state_group_record(&chat)
+            .unwrap()
+            .pending_confirmation
+    );
+
+    assert!(devices.phone.delete_group_local(&chat).await.unwrap());
+    if declined {
+        devices.laptop.decline_group_invite(&chat).await.unwrap();
+    } else {
+        devices.laptop.accept_group_invite(&chat).unwrap();
+    }
+    devices.laptop.drive_small_state().await;
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    devices.phone.drive_invitation_decisions().await;
+    let answer = phone_store
+        .app_storage()
+        .invitation_decision(&chat_hex, &generation)
+        .unwrap()
+        .expect("the laptop's answer reaches the phone");
+    assert_eq!(answer.declined, declined);
+    assert!(devices.phone.state_group_record(&chat).is_none());
+    assert!(
+        phone_store
+            .app_storage()
+            .invitation_decision_work()
+            .unwrap()
+            .iter()
+            .all(|work| work.decision.group_id_hex != chat_hex),
+        "with no row the answer is set aside"
+    );
+
+    super::history_delivery::send_text(&mut bob, &chat, "a newer message").await;
+    deliver_all(&mut devices.phone, &devices.relay).await;
+
+    if declined {
+        devices.phone.drive_invitation_decisions().await;
+        // The decline is owed again, as for a chat that was never deleted;
+        // the ordinary decision pass hands it to Leave once the group
+        // settles.
+        assert!(
+            phone_store
+                .app_storage()
+                .invitation_decision_work()
+                .unwrap()
+                .iter()
+                .any(|work| work.decision == answer && work.decline_owed),
+            "the decline made on the laptop is owed to the recreated chat"
+        );
+    } else {
+        let recreated = devices
+            .phone
+            .state_group_record(&chat)
+            .expect("a newer message recreates the chat");
+        assert!(
+            !recreated.pending_confirmation,
+            "an accept made on the laptop settles the recreated row immediately"
+        );
+        assert_eq!(
+            recreated.welcomer_account_id_hex.as_deref(),
+            Some(bob_id.as_str())
+        );
+        let forwarded = devices.phone.forwarded_invitation(&chat);
+        assert!(forwarded.confirmed);
+        assert_eq!(
+            forwarded.inviter.map(hex::encode).as_deref(),
+            Some(bob_id.as_str())
+        );
+        devices.phone.drive_invitation_decisions().await;
+        assert!(
+            phone_store
+                .app_storage()
+                .invitation_decision_work()
+                .unwrap()
+                .iter()
+                .all(|work| work.decision.group_id_hex != chat_hex)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_accept_made_while_deleted_applies_to_the_recreated_chat() {
+    sibling_answer_while_deleted_then_recreated(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_decline_made_while_deleted_applies_to_the_recreated_chat() {
+    sibling_answer_while_deleted_then_recreated(true).await;
+}
+
 /// The native join and the App checkpoint are separate real transactions.
 /// A retained pre-Welcome decision must survive maintenance between them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

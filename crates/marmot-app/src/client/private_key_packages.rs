@@ -960,7 +960,7 @@ impl AppClient {
     /// What this device's copy of `chat` says about the invitation it came
     /// in by, for the sibling it adds to show the chat as it stands here
     /// (mdk#3546).
-    fn forwarded_invitation(&self, chat: &GroupId) -> ForwardedInvitation {
+    pub(crate) fn forwarded_invitation(&self, chat: &GroupId) -> ForwardedInvitation {
         let Some(group) = self.state_group_record(chat) else {
             return ForwardedInvitation::default();
         };

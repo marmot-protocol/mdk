@@ -4292,11 +4292,25 @@ impl AppClient {
         let Some(group_id) = event_group_id(event) else {
             return Ok(false);
         };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if self
+            .pending_local_group_deletion_frontier_clears
+            .contains_key(&group_id_hex)
+        {
+            return Ok(true);
+        }
         if !self.adopt_local_deleted_group_prior_routes(group_id)? {
             return Ok(false);
         }
+        // A new Welcome crossing the frontier already ran
+        // `note_invitation_admission` with its exact Welcome match. Any other
+        // crossing event (a newer chat message) did not, so re-arm any
+        // sibling decision set aside while this chat was deleted (mdk#3555).
+        if !matches!(event, cgka_traits::engine::GroupEvent::GroupJoined { .. }) {
+            self.owe_decision_set_aside_while_deleted(group_id)?;
+        }
         self.pending_local_group_deletion_frontier_clears
-            .entry(hex::encode(group_id.as_slice()))
+            .entry(group_id_hex)
             .or_insert(frontier);
         Ok(true)
     }

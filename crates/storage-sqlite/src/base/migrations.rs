@@ -423,6 +423,8 @@ mod migration_0220_chat_activity_creation_fallback;
 mod migration_0221_agent_item_expired_targets;
 #[path = "migrations/0222_small_state_broadcast_devices.rs"]
 mod migration_0222_small_state_broadcast_devices;
+#[path = "migrations/0223_local_deletion_invitation.rs"]
+mod migration_0223_local_deletion_invitation;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1609,6 +1611,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0222_small_state_broadcast_devices",
         suspend_foreign_keys: &[],
         apply: migration_0222_small_state_broadcast_devices::apply,
+    },
+    Migration {
+        version: 223,
+        name: "0223_local_deletion_invitation",
+        suspend_foreign_keys: &[],
+        apply: migration_0223_local_deletion_invitation::apply,
     },
 ];
 

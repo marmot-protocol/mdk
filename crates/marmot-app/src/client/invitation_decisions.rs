@@ -220,6 +220,42 @@ impl AppClient {
         Ok(Some(decision))
     }
 
+    /// A sibling's decision that arrived while this chat was deleted locally
+    /// was set aside with no work, because there was no row to apply it to,
+    /// and only an exact admission re-arms it. A message that recreates the
+    /// row is not an admission, so re-arm the current admission's decision
+    /// here, settle an acceptable retained accept in the same batch (as
+    /// [`Self::note_invitation_admission`] does), and let the ordinary
+    /// decision pass finish any decline or gap bookkeeping (mdk#3555).
+    pub(super) fn owe_decision_set_aside_while_deleted(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        if !self.app.device_groups_enabled() || self.is_device_group(group_id)? {
+            return Ok(());
+        }
+        let account = self.app.account_storage(&self.state.label)?;
+        let Some(admission) = account.invitation_admission(group_id)? else {
+            return Ok(());
+        };
+        let chat = hex::encode(group_id.as_slice());
+        account
+            .app_storage()
+            .owe_installed_invitation_decision(&chat, &admission.generation)?;
+        self.invitation_decisions_changed = true;
+        if self.accepted_invitation_projection(group_id)?.is_some()
+            && let Some(group) = self
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id_hex == chat)
+        {
+            group.pending_confirmation = false;
+            self.mark_group_projection_dirty(group_id);
+        }
+        Ok(())
+    }
+
     /// Called from the real admitted lifecycle event, including durable replay.
     pub(super) fn note_invitation_admission(
         &mut self,
@@ -276,8 +312,9 @@ impl AppClient {
     /// sibling installs its copy settled and no send takes in device-group
     /// traffic mid-scan. Only a copy founded here, or whose presented
     /// invitation is that admission's own Welcome, counts as accepted: a row
-    /// rebuilt after a local deletion is unconfirmed by default and carries no
-    /// Welcome.
+    /// rebuilt after a local deletion carries the standing and Welcome the
+    /// deleted row had, or none if its deletion predates that record
+    /// (mdk#3555).
     pub(super) fn record_unrecorded_acceptance(
         &mut self,
         group_id: &GroupId,
