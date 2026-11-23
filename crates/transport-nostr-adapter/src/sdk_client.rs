@@ -3089,13 +3089,6 @@ impl NostrSdkRelayClient {
             ))
             .await;
         }
-        // A comparison fetches what it finds missing with finite requests, so
-        // a client without them refuses before any relay I/O or cursor write.
-        if self.finite_requests.is_none() {
-            return Err(TransportAdapterError::Subscription(
-                "reconciliation requires a client built with from_builder".to_owned(),
-            ));
-        }
         let mut plan = Self::plan_subscription(&subscription)?;
         // Startup compares the gap below the subscription floor; explicit
         // backfill also compares its current window so upstream SDK dedup
@@ -3123,6 +3116,13 @@ impl NostrSdkRelayClient {
             // neither relay coverage nor backend-wide incapability evidence.
             return Ok((NostrReconciliationSummary::default(), Vec::new()));
         };
+        // A comparison fetches what it finds missing with finite requests, so
+        // a client without them refuses before any relay I/O or cursor write.
+        if self.finite_requests.is_none() {
+            return Err(TransportAdapterError::Subscription(
+                "reconciliation requires a client built with from_builder".to_owned(),
+            ));
+        }
         let subscription_id = plan.subscription_id.to_string();
         let items = local_items
             .iter()
@@ -5922,7 +5922,14 @@ impl NostrRelayClient for NostrSdkRelayClient {
             })
             .collect::<Vec<_>>();
         let replies = futures::future::join_all(relays.iter().map(|url| async {
-            let Ok(relay) = timeout_at(fetch_deadline, self.client.relay(*url)).await else {
+            let relay = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    return Some(FiniteReply::ended(FiniteEnd::Cancelled));
+                }
+                relay = timeout_at(fetch_deadline, self.client.relay(*url)) => relay,
+            };
+            let Ok(relay) = relay else {
                 return Some(FiniteReply::ended(FiniteEnd::TimedOut));
             };
             // An endpoint missing from the pool failed registration.
@@ -7036,17 +7043,7 @@ mod tests {
     #[test]
     fn closed_replies_keep_their_kind() {
         let endpoint = TransportEndpoint("wss://ids.example".to_owned());
-        let reply = |end| FiniteReply {
-            events: Vec::new(),
-            raw_items: 0,
-            received_items: 0,
-            duplicates: 0,
-            event_bytes: 0,
-            kept_event_bytes: 0,
-            fetched_bytes: 0,
-            more: false,
-            end,
-        };
+        let reply = FiniteReply::ended;
         for (reason, end) in [
             ("blocked: no", NostrAcquisitionEnd::Rejected),
             ("rate-limited: slow", NostrAcquisitionEnd::Rejected),

@@ -634,7 +634,7 @@ impl NostrReconciliationProgress for Cursor {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::disallowed_methods)]
 async fn empty_endpoint_comparison_keeps_public_no_op_result() {
-    let sdk = NostrSdkRelayClient::from_builder(SdkClient::builder());
+    let sdk = NostrSdkRelayClient::new(SdkClient::builder().build());
     let subscription = NostrSubscription::Group {
         account_id: cgka_traits::MemberId::new(vec![0xa1; 32]),
         group_id: GroupId::new(vec![0xb2; 16]),

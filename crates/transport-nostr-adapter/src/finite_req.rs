@@ -114,7 +114,7 @@ pub(crate) enum FiniteEnd {
 }
 
 /// What one request read.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct FiniteReply {
     /// Distinct valid events within the budgets, in the order they came.
     pub(crate) events: Vec<Event>,
@@ -290,7 +290,9 @@ impl Slot {
             }
             return;
         }
-        if bytes > self.max_frame {
+        // The SDK checks its message limit on the trimmed frame; the queue
+        // takes no frame past its own ceiling, whatever that limit is.
+        if bytes > MAX_FRAME_BYTES || text.trim().len() > self.max_frame {
             state.end = Some(FiniteEnd::InvalidMessage);
         } else if event && state.event_frames > self.max_items {
             // The collector stops at the first frame over the budget.
@@ -1597,6 +1599,11 @@ mod tests {
             registry.received(1, format!("{frame}  "));
         }
         assert_eq!(queued(&slot), page.len());
+        assert_eq!(slot.lock().end, None);
+        // At the limit once trimmed, as the SDK measures it.
+        let at_limit = format!(r#"["EOSE","~f1","{}"]"#, "x".repeat(500 - 17));
+        assert_eq!(at_limit.len(), 500);
+        registry.received(1, format!("\n{at_limit}\n"));
         assert_eq!(slot.lock().end, None);
         registry.received(1, format!(r#"["EVENT","~f1","{}"]"#, "x".repeat(500)));
         assert_eq!(slot.lock().end, Some(FiniteEnd::InvalidMessage));
