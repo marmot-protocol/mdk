@@ -45,13 +45,12 @@ fn not_advertising(
         .unwrap()
 }
 
-/// Maintenance randomness that steps a day per draw, so two groups that
-/// sample a refresh time never draw the same one.
-struct DayStepRandom(AtomicU64);
+/// Give the two groups different contention delays.
+struct FiveMinuteRandom(AtomicU64);
 
-impl MaintenanceRandom for DayStepRandom {
+impl MaintenanceRandom for FiveMinuteRandom {
     fn next_u64(&self) -> u64 {
-        self.0.fetch_add(1, Ordering::Relaxed) * 24 * 60 * 60
+        self.0.fetch_add(1, Ordering::Relaxed) * 5 * 60 * 1_000
     }
 }
 
@@ -123,7 +122,6 @@ async fn an_upgrade_replaces_the_published_key_package_with_one_advertising_acco
 #[tokio::test]
 async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
     use cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID;
-    const WINDOW_5_DAYS: u64 = 5 * 24 * 60 * 60;
 
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("leaf refresh account-devices upgrade").unwrap();
@@ -156,9 +154,13 @@ async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
             vec![alice.self_id()]
         );
     }
-    drop(alice);
 
     let start = 100_000u64;
+    let mut old = alice.group_maintenance(&groups[0]).unwrap().unwrap();
+    old.leaf_refresh_due_at = Some(Timestamp(start + 4 * 24 * 60 * 60));
+    alice.put_group_maintenance(&old).unwrap();
+    drop(alice);
+
     let wall = Arc::new(TestWallClock::new(start));
     let adapter = RecordingAdapter::default();
     let mut routing = StaticTransportRouting::new(vec![]).required_acks(1);
@@ -178,7 +180,7 @@ async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
     .with_maintenance_sources(
         wall.clone(),
         Arc::new(TestMonotonicClock::default()),
-        Arc::new(DayStepRandom(AtomicU64::new(1))),
+        Arc::new(FiveMinuteRandom(AtomicU64::new(1))),
     )
     .with_maintenance_timing(MaintenanceTiming::immediate());
     let epochs_before: Vec<_> = groups
@@ -186,14 +188,14 @@ async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
         .map(|group_id| runtime.session().epoch(group_id).unwrap())
         .collect();
 
-    // The first tick only samples a due time for each group.
+    // Both groups queue a refresh on the first sweep, including the group
+    // with a saved deadline far beyond the contention window.
     runtime.run_due_maintenance().await.unwrap();
     let mut order: Vec<_> = groups
         .iter()
         .map(|group_id| {
-            let at =
-                refresh_due_at(&runtime, group_id).expect("each stale leaf schedules a refresh");
-            assert!(at.0 >= start && at.0 <= start + WINDOW_5_DAYS);
+            let at = contention_deadline(&runtime, group_id);
+            assert!(at.0 >= start && at.0 <= start + 15 * 60);
             (at, group_id.clone())
         })
         .collect();
@@ -201,24 +203,21 @@ async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
     let [(early_at, early), (late_at, late)] = &order[..] else {
         unreachable!()
     };
-    assert!(late_at.0 > early_at.0 + 60 * 60, "{early_at:?} {late_at:?}");
+    assert!(late_at > early_at, "{early_at:?} {late_at:?}");
     assert!(adapter.publishes().is_empty());
 
     // At the earlier time only that group's leaf is refreshed.
     wall.set(early_at.0);
-    refresh_leaf(&mut runtime, &wall, early).await;
-    assert!(
-        leaf_is_stale(&runtime, late),
-        "the other group waits for its own time"
+    runtime.run_due_maintenance().await.unwrap();
+    let early_index = groups
+        .iter()
+        .position(|group_id| group_id == early)
+        .unwrap();
+    assert_eq!(
+        runtime.session().epoch(early).unwrap().0,
+        epochs_before[early_index].0 + 1
     );
-    assert_eq!(refresh_due_at(&runtime, late), Some(*late_at));
-    assert!(
-        runtime
-            .session()
-            .maintenance_obligations_for_group(late)
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(contention_deadline(&runtime, late), *late_at);
     let late_index = groups.iter().position(|group_id| group_id == late).unwrap();
     assert_eq!(
         runtime.session().epoch(late).unwrap(),
@@ -226,7 +225,7 @@ async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
     );
 
     wall.set(late_at.0);
-    refresh_leaf(&mut runtime, &wall, late).await;
+    runtime.run_due_maintenance().await.unwrap();
 
     // Bob accepts both self-updates. Alice's leaf now advertises
     // account-devices and everything each group requires, and neither group
@@ -314,42 +313,15 @@ async fn a_device_that_does_not_advertise_account_devices_still_joins() {
 type AdvertisingRuntime =
     AccountDeviceRuntime<RecordingAdapter, StaticTransportRouting, RecordingKeyPackages>;
 
-fn refresh_due_at(runtime: &AdvertisingRuntime, group_id: &GroupId) -> Option<Timestamp> {
-    runtime
+fn contention_deadline(runtime: &AdvertisingRuntime, group_id: &GroupId) -> Timestamp {
+    let obligations = runtime
         .session()
-        .group_maintenance(group_id)
-        .unwrap()
-        .unwrap()
-        .leaf_refresh_due_at
-}
-
-fn leaf_is_stale(runtime: &AdvertisingRuntime, group_id: &GroupId) -> bool {
-    !runtime
-        .session()
-        .own_leaf_missing_app_components(group_id)
-        .unwrap()
-        .is_empty()
-}
-
-/// Run maintenance from a reached due time until the refresh self-update has
-/// replaced the leaf, letting the clock reach its contention jitter.
-async fn refresh_leaf(runtime: &mut AdvertisingRuntime, wall: &TestWallClock, group_id: &GroupId) {
-    for _ in 0..4 {
-        runtime.run_due_maintenance().await.unwrap();
-        if let Some(not_before) = runtime
-            .session()
-            .maintenance_obligations_for_group(group_id)
-            .unwrap()
-            .iter()
-            .find_map(|obligation| obligation.not_before)
-        {
-            wall.set(wall.now().0.max(not_before.0));
-        }
-        if !leaf_is_stale(runtime, group_id) {
-            return;
-        }
-    }
-    panic!("the refresh self-update did not run");
+        .maintenance_obligations_for_group(group_id)
+        .unwrap();
+    assert_eq!(obligations.len(), 1);
+    obligations[0]
+        .not_before
+        .expect("queued with contention jitter")
 }
 
 fn joined_group(effects: &marmot_session::IngestEffects) -> GroupId {
