@@ -2314,45 +2314,55 @@ async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attac
         }
         panic!("the agent account never stored {text:?}");
     };
-    // Subscribes as the agent, then sends `live` and returns the inbound texts read up to it.
-    let subscribe_and_read_through = async |id: &'static str, live: &'static str| {
-        let stream = connect_with_retry(&socket).await;
-        let (read, mut write) = tokio::io::split(stream);
-        let mut read = BufReader::new(read);
-        let subscribe = AgentControlEnvelope::request(
-            Some(id.to_owned()),
-            AgentControlRequest::SubscribeInbound {
-                account_id_hex: Some(agent.account.account_id_hex.clone()),
-                group_id_hex: None,
-            },
-        );
-        write_frame(&mut write, &subscribe).await.unwrap();
-        let ack: AgentControlEnvelope<AgentControlResponse> =
-            timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut read))
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-        assert_eq!(ack.payload, AgentControlResponse::Ack);
-        human_says("req-live", live).await;
-        let mut texts = Vec::new();
-        while !texts.iter().any(|text| text == live) {
-            let event: AgentControlEnvelope<AgentControlEvent> =
+    // Subscribes as the agent, reads until every `stored` text has arrived, then sends `live`
+    // and returns every inbound text read up to it.
+    let subscribe_and_read_through =
+        async |id: &'static str, stored: &[&'static str], live: &'static str| {
+            let stream = connect_with_retry(&socket).await;
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+            let subscribe = AgentControlEnvelope::request(
+                Some(id.to_owned()),
+                AgentControlRequest::SubscribeInbound {
+                    account_id_hex: Some(agent.account.account_id_hex.clone()),
+                    group_id_hex: None,
+                },
+            );
+            write_frame(&mut write, &subscribe).await.unwrap();
+            let ack: AgentControlEnvelope<AgentControlResponse> =
                 timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut read))
                     .await
-                    .expect("the subscriber receives the live message")
+                    .unwrap()
                     .unwrap()
                     .unwrap();
-            if let AgentControlEvent::InboundMessage { message, .. } = event.payload {
-                texts.push(message.text);
+            assert_eq!(ack.payload, AgentControlResponse::Ack);
+            let mut texts = Vec::new();
+            let mut live_sent = false;
+            while !texts.iter().any(|text| text == live) {
+                if !live_sent
+                    && stored
+                        .iter()
+                        .all(|text| texts.contains(&(*text).to_owned()))
+                {
+                    human_says("req-live", live).await;
+                    live_sent = true;
+                }
+                let event: AgentControlEnvelope<AgentControlEvent> =
+                    timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut read))
+                        .await
+                        .expect("the subscriber receives the stored and the live messages")
+                        .unwrap()
+                        .unwrap();
+                if let AgentControlEvent::InboundMessage { message, .. } = event.payload {
+                    texts.push(message.text);
+                }
             }
-        }
-        texts
-    };
+            texts
+        };
 
     human_says_and_agent_stores("req-history", "history").await;
     assert_eq!(
-        subscribe_and_read_through("req-first-subscribe", "before the restart").await,
+        subscribe_and_read_through("req-first-subscribe", &[], "before the restart").await,
         ["before the restart"],
         "the first subscriber starts at the newest stored message"
     );
@@ -2360,7 +2370,12 @@ async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attac
     // The agent runtime is away: the message is ingested and stored with nobody listening.
     human_says_and_agent_stores("req-away", "while you were away").await;
     assert_eq!(
-        subscribe_and_read_through("req-second-subscribe", "after the restart").await,
+        subscribe_and_read_through(
+            "req-second-subscribe",
+            &["while you were away"],
+            "after the restart"
+        )
+        .await,
         ["while you were away", "after the restart"],
         "the stored message is delivered once, and nothing the first subscriber had is repeated"
     );
@@ -2369,25 +2384,49 @@ async fn connector_socket_delivers_messages_stored_while_no_subscriber_was_attac
     let _ = server.await;
 }
 
-/// mdk#3551: a scope's delivery mark outlives the connector, never moves back, and each
-/// subscription scope keeps its own.
+/// mdk#3551: a scope's delivery mark outlives the connector, never moves back, keeps each
+/// subscription scope apart and is owner-only. It lives beside the account database, so wiping
+/// the account removes it, and an unreadable record is reported rather than taken as a first
+/// subscription.
 #[test]
-fn inbound_marks_persist_per_scope_and_only_move_forward() {
-    let dir = tempfile::tempdir().unwrap();
-    let account = "aa".repeat(32);
-    let group = "bb".repeat(32);
-    let marks = crate::inbound_marks::InboundMarks::new(dir.path());
-    assert_eq!(marks.get(&account, None).unwrap(), None);
-    marks.advance(&account, None, 7).unwrap();
-    marks.advance(&account, None, 3).unwrap();
-    marks.advance(&account, Some(&group), 2).unwrap();
+fn inbound_marks_persist_per_scope_and_go_with_the_account() {
+    use std::os::unix::fs::PermissionsExt;
 
-    let reopened = crate::inbound_marks::InboundMarks::new(dir.path());
-    assert_eq!(reopened.get(&account, None).unwrap(), Some(7));
-    assert_eq!(reopened.get(&account, Some(&group)).unwrap(), Some(2));
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("agent").unwrap();
+    let group = "bb".repeat(32);
+    let marks = crate::inbound_marks::InboundMarks::new(home.clone());
+    assert_eq!(marks.get("agent", None).unwrap(), None);
+    marks.advance("agent", None, 7).unwrap();
+    marks.advance("agent", None, 3).unwrap();
+    marks.advance("agent", Some(&group), 2).unwrap();
+
+    let reopened = crate::inbound_marks::InboundMarks::new(AccountHome::open(dir.path()));
+    assert_eq!(reopened.get("agent", None).unwrap(), Some(7));
+    assert_eq!(reopened.get("agent", Some(&group)).unwrap(), Some(2));
+    assert_eq!(reopened.get("agent", Some(&"cc".repeat(32))).unwrap(), None);
+    let file = home.account_dir("agent").join("agent-inbound-marks.json");
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
     assert_eq!(
-        reopened.get(&account, Some(&"cc".repeat(32))).unwrap(),
-        None
+        mode, 0o600,
+        "the marks name groups, so only the owner reads them"
+    );
+
+    std::fs::write(&file, b"not json").unwrap();
+    assert!(
+        reopened.get("agent", None).is_err(),
+        "lost marks are not a first run"
+    );
+    reopened.advance("agent", None, 9).unwrap();
+    assert_eq!(reopened.get("agent", None).unwrap(), Some(9));
+
+    home.remove_account("agent").unwrap();
+    home.create_account("agent").unwrap();
+    assert_eq!(
+        reopened.get("agent", None).unwrap(),
+        None,
+        "a re-created account starts afresh"
     );
 }
 
@@ -4929,14 +4968,14 @@ fn deletes(stored: &[AppMessageRecord], target: &str) -> bool {
     })
 }
 
-/// Drain a lag replay the way the inbound stream does, one projection per row.
+/// Drain the account's stored rows the way the inbound stream does, one projection per row.
 fn replay_missed(
     connector: &AgentConnector,
-    account_filter: Option<&str>,
+    account_id_hex: &str,
     group_filter: Option<&str>,
     delivered: &mut DeliveredInboundCursor,
 ) -> Result<Vec<AgentControlEvent>, crate::error::ConnectorError> {
-    let mut missed = connector.missed_inbound(account_filter, group_filter, delivered)?;
+    let mut missed = connector.stored_page(account_id_hex, account_id_hex, group_filter, 0)?;
     let mut events = Vec::new();
     while let Some(event) = missed.next_event(connector, delivered)? {
         events.push(event);
@@ -5027,7 +5066,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     let mut delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
     let replayed = replay_missed(
         &connector,
-        Some(&agent.account.account_id_hex),
+        &agent.account.account_id_hex,
         Some(&group_id_hex),
         &mut delivered,
     )
@@ -5158,7 +5197,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
 
     let mutation_replay = replay_missed(
         &connector,
-        Some(&agent.account.account_id_hex),
+        &agent.account.account_id_hex,
         Some(&group_id_hex),
         &mut delivered,
     )
@@ -5242,7 +5281,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     // A subsequent replay must not re-deliver either the message or mutations.
     let replayed_again = replay_missed(
         &connector,
-        Some(&agent.account.account_id_hex),
+        &agent.account.account_id_hex,
         Some(&group_id_hex),
         &mut delivered,
     )
@@ -5282,11 +5321,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         "both replies did not arrive"
     );
     let mut missed = connector
-        .missed_inbound(
-            Some(&agent.account.account_id_hex),
-            Some(&group_id_hex),
-            &delivered,
-        )
+        .stored_page(agent_id, agent_id, Some(&group_id_hex), 0)
         .unwrap();
     connector
         .runtime
@@ -5325,7 +5360,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     );
     let after = replay_missed(
         &connector,
-        Some(&agent.account.account_id_hex),
+        &agent.account.account_id_hex,
         Some(&group_id_hex),
         &mut delivered,
     )
@@ -5398,7 +5433,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     let mut human_delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
     let rejected = replay_missed(
         &connector,
-        Some(&human.account.account_id_hex),
+        &human.account.account_id_hex,
         Some(&group_id_hex),
         &mut human_delivered,
     )
@@ -5422,6 +5457,41 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             } if reaction_event_id_hex == &retained_reaction_id_hex
         )),
         "wrong-author reaction removal must not enter the agent feed: {rejected:?}"
+    );
+
+    // Each row is read again just before it is projected, with the page read's visibility
+    // rules: a row that stops being visible after the page was read (here its sender is
+    // blocked; retention expiry and pruning work the same way) never goes out from the copy
+    // the page holds.
+    let hidden_id_hex = thread_reply("hidden mid-replay").await;
+    assert!(
+        catch_up_until(&connector, agent_id, &group_id_hex, |stored| {
+            stored
+                .iter()
+                .any(|message| message.message_id_hex == hidden_id_hex)
+        })
+        .await,
+        "the reply did not arrive"
+    );
+    let mut page = connector
+        .stored_page(agent_id, agent_id, Some(&group_id_hex), 0)
+        .unwrap();
+    connector
+        .runtime
+        .block_user(agent_id, &human.account.account_id_hex)
+        .await
+        .unwrap();
+    let mut in_flight = Vec::new();
+    while let Some(event) = page.next_event(&connector, &mut delivered).unwrap() {
+        in_flight.push(event);
+    }
+    assert!(
+        !in_flight.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::InboundMessage { message, .. }
+                if message.message_id_hex == hidden_id_hex
+        )),
+        "a row hidden after the page was read must not reach the agent: {in_flight:?}"
     );
 }
 

@@ -279,6 +279,7 @@ impl AgentConnector {
         let inbound_catch_up =
             InboundCatchUpDriver::new(runtime.clone(), reconcile_telemetry.clone());
         let allowlists = AllowlistStore::new(&config.home);
+        let inbound_marks = inbound_marks::InboundMarks::new(account_home.clone());
         let (debug_events, _) = broadcast::channel(1024);
         Ok(Self {
             account_home,
@@ -294,7 +295,7 @@ impl AgentConnector {
             app,
             runtime,
             inbound_catch_up,
-            inbound_marks: inbound_marks::InboundMarks::new(&config.home),
+            inbound_marks,
             reconcile_telemetry,
             #[cfg(test)]
             test_hooks: std::sync::Arc::new(test_support::ConnectorTestHooks::default()),

@@ -53,13 +53,13 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/messaging.rs` — final-message sends, the group-system event handler, and debug send
   recording/inject helpers (`DebugFinalSendStore`). `connection.rs` refuses the retired agent activity and agent
   operation requests (`retired_agent_event`).
-- `src/inbound.rs` — `SubscribeInbound` drain loop, storage-backed `missed_inbound` recovery after broadcast
-  lag, and delivery of what a scope stored after its durable mark (mdk#3551): on subscribe and after each live
-  message or group-state notice it reads `messages_after_insert_order` from the mark, so a message stored while no
-  subscriber was attached reaches the next one. The first subscriber of a scope starts at the newest stored row; a
-  backlog beyond the replay window emits `resync_required`.
-- `src/inbound_marks.rs` — `InboundMarks`, the per-account delivery marks (`$MARMOT_HOME/dev/inbound-delivered/`)
-  keyed by subscription scope (every group, or one group); a mark only moves forward.
+- `src/inbound.rs` — `SubscribeInbound` drain loop. On subscribe, after each live message or group-state notice,
+  and after broadcast lag, it delivers what each covered account stored after the scope's durable mark, paging
+  `messages_after_insert_order` and re-reading each row just before projecting it, so a message stored while no
+  subscriber was attached reaches the next one (mdk#3551). The first subscriber of a scope starts at the newest
+  stored row.
+- `src/inbound_marks.rs` — `InboundMarks`, the delivery marks per subscription scope (every group, or one group),
+  kept in the account directory beside the database whose positions they name; a mark only moves forward.
 - `src/invite_policy.rs` — background reconciliation of pending group invites against the welcomer allowlist
   (worker spawn, reconcile, candidate enumeration, apply). Event- and retry-driven: `GroupJoined` events apply
   immediately, per-candidate retries wake on their own backoff, and full enumeration is an adaptive safety net
