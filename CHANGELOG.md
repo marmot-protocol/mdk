@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Rust account setup methods return a captured `AccountSetupState`. Pass it to phase changes and completion.
+  Use the setup-specific creation methods instead of publishing an account and then starting a journal.
+  Replace import rollback and external signer reversion with `start_setup_compensation` and
+  `finish_setup_compensation`. Use an explicit `LegacyReset` attempt with `reset_legacy_setup` for an
+  incomplete account that has no journal. Other accounts with unknown setup provenance are not eligible
+  for compensation.
+- `AccountHome` constructors no longer remove leftover wipe directories. `MarmotApp` replays local file
+  cleanup under its root runtime lease. Lower-level hosts call `resume_wipe_cleanup` while holding
+  exclusive root ownership; native cleanup records remain pending.
+
+### Fixed
+
+- Destructive sign-out and rollback commit local account removal before deleting vault credentials.
+  A vault failure leaves cleanup pending without restoring the removed account. Rolling back a public
+  account's signer setup keeps its data. Windows replaces setup journals without removing the live name.
+- Explicit setup retries finish pending compensation before generated creation, import, sign-in,
+  or interactive onboarding.
+  Fresh generated retries use the caller's request and refuse unreadable account catalogs. Binding
+  rollback errors preserve actionable publish, storage, and NIP-46 categories. Cancelled external-signer
+  onboarding can resume ordinary sign-in without replacing its captured attempt. NIP-46 rollback
+  preserves later reconnects and restores the previous host signer even when the cleanup claim fails.
+
 ## 0.19.0 - 2026-11-22
 
 See the [release notes](docs/release/0.19.0.md) and the [0.18.0 → 0.19.0 upgrade guide](docs/integration/0.19.0.md).

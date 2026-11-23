@@ -683,14 +683,8 @@ impl MarmotApp {
         purged
     }
 
-    /// Close `label`'s report admission, stop its in-flight report work and
-    /// delete every report it queued. Admission stays closed until the fence
-    /// drops, so a teardown holds it until the account is signed out or gone.
-    /// The fence is returned even when the purge fails.
-    pub(crate) async fn fence_moderation_reports(
-        &self,
-        label: &str,
-    ) -> (ModerationReportFence, Result<u64, AppError>) {
+    /// Drain report work without deleting rows owned by a restored public account.
+    pub(crate) async fn fence_report_work(&self, label: &str) -> ModerationReportFence {
         let slot = self.moderation_reports.slot(label);
         // Raise the fence before bumping: work that subscribes after the bump
         // sees the fence under the lock instead.
@@ -700,6 +694,15 @@ impl MarmotApp {
         slot.generation
             .send_modify(|generation| *generation = generation.wrapping_add(1));
         let _work = slot.work.lock().await;
+        fence
+    }
+
+    /// Close admission through teardown, returning the fence even if purge fails.
+    pub(crate) async fn fence_moderation_reports(
+        &self,
+        label: &str,
+    ) -> (ModerationReportFence, Result<u64, AppError>) {
+        let fence = self.fence_report_work(label).await;
         // An account that cannot sign, or whose database was never created,
         // has no reports. Do not create and migrate a database to learn that.
         #[cfg(test)]

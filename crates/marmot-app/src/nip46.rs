@@ -189,11 +189,16 @@ struct Data {
     approved: Option<Nip46Permissions>,
     reviewed: bool,
     verified: bool,
+    binding_epoch: u64,
     status: Nip46Status,
     pending: HashMap<String, watch::Sender<bool>>,
     active: Option<String>,
-    account: Option<String>,
+    account: Option<BoundAccount>,
     registration: Option<Weak<dyn crate::ExternalAccountSigner>>,
+}
+struct BoundAccount {
+    label: String,
+    owner: Nip46BindingOwner,
 }
 struct Shared {
     data: Mutex<Data>,
@@ -248,11 +253,19 @@ enum Operation {
 
 enum BindingCleanup<'a> {
     Revoke,
+    // AccountHome already owns persistent retirement.
+    Forget,
     Rollback {
-        previous: &'a Nip46SessionWrite,
+        previous: Option<&'a Nip46SessionWrite>,
         signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
-        generation: u64,
+        owner: Nip46BindingOwner,
     },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Nip46BindingOwner {
+    generation: u64,
+    epoch: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -361,7 +374,7 @@ impl Shared {
         if let Some(account) = &data.account {
             let (keys, record) = Self::record(data)?;
             self.home
-                .store_nip46_session(account, &keys, &record)
+                .store_nip46_session(&account.label, &keys, &record)
                 .map_err(|_| Nip46Error::Storage)?;
         }
         Ok(())
@@ -495,7 +508,13 @@ impl Nip46Session {
         let relay_policy =
             RelaySafetyPolicy::with_allow_loopback(app.config.allow_loopback_relay_endpoints);
         let mut data = protocol::restore_data(keys, record, &relay_policy)?;
-        data.account = Some(account.label);
+        data.account = Some(BoundAccount {
+            label: account.label,
+            owner: Nip46BindingOwner {
+                generation: data.status.generation,
+                epoch: 0,
+            },
+        });
         Self::spawn(app, data, relay_policy)
     }
     pub fn belongs_to(&self, app: &MarmotApp) -> bool {
@@ -593,7 +612,7 @@ impl Nip46Session {
         &self,
         account_ref: &str,
         generation: u64,
-    ) -> Result<Nip46SessionWrite> {
+    ) -> Result<(Nip46SessionWrite, Nip46BindingOwner)> {
         let mut data = lock(&self.core.shared.data);
         Shared::check(&data, generation)?;
         let account = self
@@ -604,8 +623,8 @@ impl Nip46Session {
             .map_err(|_| Nip46Error::Storage)?;
         if data
             .account
-            .as_deref()
-            .is_some_and(|bound| bound != account.label)
+            .as_ref()
+            .is_some_and(|bound| bound.label != account.label)
         {
             return Err(Nip46Error::Mismatch);
         }
@@ -619,8 +638,16 @@ impl Nip46Session {
             .home
             .store_nip46_session(&account.label, &keys, &record)
             .map_err(|_| Nip46Error::Storage)?;
-        data.account = Some(account.label);
-        Ok(previous)
+        data.binding_epoch = data.binding_epoch.wrapping_add(1);
+        let owner = Nip46BindingOwner {
+            generation,
+            epoch: data.binding_epoch,
+        };
+        data.account = Some(BoundAccount {
+            label: account.label,
+            owner,
+        });
+        Ok((previous, owner))
     }
     pub fn export(&self) -> Result<String> {
         let data = lock(&self.core.shared.data);
@@ -697,16 +724,40 @@ impl Nip46Session {
     pub fn erase_local(&self) -> Result<()> {
         self.clear_binding(BindingCleanup::Revoke)
     }
+    pub(crate) fn forget_binding(&self) -> Result<()> {
+        self.clear_binding(BindingCleanup::Forget)
+    }
+    pub(crate) fn detach_account_binding(
+        &self,
+        home: &AccountHome,
+        account_id: &str,
+    ) -> Result<()> {
+        let shared = &self.core.shared;
+        if shared.home.root() != home.root() {
+            return Ok(());
+        }
+        let Ok(user) = PublicKey::from_hex(account_id) else {
+            return Ok(());
+        };
+        let owner = {
+            let data = lock(&shared.data);
+            let Some(bound) = data.account.as_ref().filter(|_| data.user == Some(user)) else {
+                return Ok(());
+            };
+            bound.owner
+        };
+        self.unbind_account(None, None, owner)
+    }
     pub(crate) fn unbind_account(
         &self,
-        previous: &Nip46SessionWrite,
+        previous: Option<&Nip46SessionWrite>,
         signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
-        generation: u64,
+        owner: Nip46BindingOwner,
     ) -> Result<()> {
         self.clear_binding(BindingCleanup::Rollback {
             previous,
             signer,
-            generation,
+            owner,
         })
     }
     fn clear_binding(&self, cleanup: BindingCleanup<'_>) -> Result<()> {
@@ -726,6 +777,26 @@ impl Nip46Session {
         // Registry -> session -> secret store is also the binding lock order.
         // A retired handle must not erase a replacement session's credentials.
         let mut data = lock(&self.core.shared.data);
+        if let BindingCleanup::Rollback {
+            previous, owner, ..
+        } = &cleanup
+        {
+            if !data
+                .account
+                .as_ref()
+                .is_some_and(|bound| bound.owner.epoch == owner.epoch)
+            {
+                return Ok(());
+            }
+            if data.binding_epoch != owner.epoch {
+                // The reconnect owns the live pairing. Only drop its obsolete
+                // persistence pointer if AccountHome already retired it.
+                if previous.is_none() {
+                    data.account = None;
+                }
+                return Ok(());
+            }
+        }
         let removal = data
             .account
             .as_ref()
@@ -733,16 +804,16 @@ impl Nip46Session {
             .map(|account| match &cleanup {
                 BindingCleanup::Revoke
                 | BindingCleanup::Rollback {
-                    previous: Nip46SessionWrite::Created,
+                    previous: Some(Nip46SessionWrite::Created),
                     ..
                 } => self
                     .core
                     .shared
                     .home
-                    .remove_nip46_session(account, Nip46Removal::IncludingOrphaned)
+                    .remove_nip46_session(&account.label, Nip46Removal::IncludingOrphaned)
                     .map_err(|_| Nip46Error::Storage),
                 BindingCleanup::Rollback {
-                    previous: Nip46SessionWrite::Existing(record),
+                    previous: Some(Nip46SessionWrite::Existing(record)),
                     ..
                 } => data
                     .keys
@@ -752,13 +823,14 @@ impl Nip46Session {
                         self.core
                             .shared
                             .home
-                            .store_nip46_session(account, keys, record)
+                            .store_nip46_session(&account.label, keys, record)
                             .map(drop)
                             .map_err(|_| Nip46Error::Storage)
                     }),
+                BindingCleanup::Forget | BindingCleanup::Rollback { previous: None, .. } => Ok(()),
             })
             .transpose();
-        if matches!(&cleanup, BindingCleanup::Revoke) {
+        if matches!(&cleanup, BindingCleanup::Revoke | BindingCleanup::Forget) {
             data.keys = None;
             data.secret = None;
         }
@@ -767,16 +839,16 @@ impl Nip46Session {
             data.account = None;
             data.registration = None;
         }
-        // Retired bindings still undo storage, but no longer own a newer transport.
+        // Cancellation or disconnect retires transport work, not the binding.
         let owns_control = match &cleanup {
-            BindingCleanup::Revoke => true,
-            BindingCleanup::Rollback { generation, .. } => data.status.generation == *generation,
+            BindingCleanup::Revoke | BindingCleanup::Forget => true,
+            BindingCleanup::Rollback { owner, .. } => data.status.generation == owner.generation,
         };
         if owns_control {
             data.verified = false;
             data.status.generation = data.status.generation.wrapping_add(1);
             data.status.state = match &cleanup {
-                BindingCleanup::Revoke => Nip46State::LoggedOut,
+                BindingCleanup::Revoke | BindingCleanup::Forget => Nip46State::LoggedOut,
                 BindingCleanup::Rollback { .. }
                     if matches!(
                         data.status.state,
@@ -808,7 +880,7 @@ impl Nip46Session {
                 && let Some(current) = lock(&signers).get(id)
             {
                 let previous = match cleanup {
-                    BindingCleanup::Revoke => None,
+                    BindingCleanup::Revoke | BindingCleanup::Forget => None,
                     BindingCleanup::Rollback { signer, .. } => signer,
                 };
                 current.restore_if(&registration, previous);
@@ -858,6 +930,8 @@ impl Nip46Session {
             if data.pending.len() >= MAX_PENDING {
                 return Err(Nip46Error::Busy);
             }
+            let reconnect =
+                matches!(operation, Operation::Connect) && !data.verified && data.account.is_some();
             let generation = data.status.generation;
             self.core
                 .commands
@@ -870,6 +944,9 @@ impl Nip46Session {
                     reply,
                 })
                 .map_err(|_| Nip46Error::Busy)?;
+            if reconnect {
+                data.binding_epoch = data.binding_epoch.wrapping_add(1);
+            }
             data.pending.insert(id.clone(), cancellation.clone());
         }
         Ok((

@@ -33,6 +33,19 @@ account identity.
 - Relay-list discovery and repair belong above this crate in the Nostr account transport / app-runtime layer. CLI
   account selection belongs in presentation surfaces such as `wn`.
 
+For runtime setup, use the setup-specific creation and import methods. They return the account and its captured
+`AccountSetupState`. Pass that state to phase changes, completion, and compensation so an old task cannot change a
+replacement attempt. The journal records whether setup created the account or promoted a public account before
+publishing the account record or its new role.
+
+To cancel an unpublished attempt, call `start_setup_compensation` before stopping its runtime, then call
+`finish_setup_compensation` once the runtime has released the account. Retry `CompensationPending` rather than
+starting the account. An old journal without recorded ownership can resume setup but cannot authorize compensation.
+
+Opening an `AccountHome` does not remove leftover wipe directories. `MarmotApp` replays local file cleanup after
+acquiring the root runtime lease. Lower-level hosts can call `resume_wipe_cleanup` under that exclusive lease;
+replay retains cleanup records and never removes native credentials.
+
 ## What it does not do
 
 - No MLS state, session, transport or publish work (see `marmot-session`).

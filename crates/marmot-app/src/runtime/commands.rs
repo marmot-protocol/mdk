@@ -1886,7 +1886,8 @@ impl AccountManager {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
         self.setup_records()
-            .require_onboarding_complete_for(&account)?;
+            .require_onboarding_complete_for(&account)
+            .map(drop)?;
         if !account.can_sign() {
             return Err(
                 marmot_account::AccountHomeError::SecretNotFound(account.account_id_hex).into(),
@@ -3123,11 +3124,12 @@ impl AccountManager {
     pub(crate) async fn publish_setup_key_package(
         &self,
         account_ref: &str,
+        setup: Option<super::AccountSetupState>,
     ) -> Result<usize, AppError> {
         let command = self.worker_commands_for_setup(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
-            .send(AccountWorkerCommand::PublishSetupKeyPackage { respond })
+            .send(AccountWorkerCommand::PublishSetupKeyPackage { setup, respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await

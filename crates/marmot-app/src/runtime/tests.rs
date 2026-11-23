@@ -1468,6 +1468,7 @@ async fn failed_import_relay_discovery_does_not_publish_default_lists() {
             true,
             false,
             None,
+            Some(imported.setup()),
         )
         .await
         .expect_err("failed discovery must not become a write of request defaults");
@@ -3177,7 +3178,7 @@ fn lifecycle_refuses_account_open_after_shutdown_begins() {
     lifecycle.begin_shutdown();
 
     assert!(matches!(
-        lifecycle.begin_account_open(),
+        lifecycle.begin_account_open("alice"),
         Err(AppError::RuntimeStopping)
     ));
 }
@@ -3206,7 +3207,7 @@ async fn member_key_package_prewarm_refuses_work_after_shutdown_begins() {
 async fn lifecycle_waits_for_account_opens_to_drain() {
     let lifecycle = RuntimeLifecycle::new();
     let permit = lifecycle
-        .begin_account_open()
+        .begin_account_open("alice")
         .expect("account open should start before shutdown");
 
     let waiter = {
@@ -3618,6 +3619,234 @@ async fn cancelled_startup_is_reaped() {
         .expect("first requested lookup succeeds");
     assert!(!commands.same_channel(&old_commands));
     assert!(manager.workers.lock().await[&account.account_id_hex].ready);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn compensation_waits_for_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://setup.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let home = app.account_home();
+    let (account, setup) = home.create_nostr_account_for_setup().unwrap();
+    let runtime = app.runtime();
+    let relays = vec![TransportEndpoint("wss://setup.example".into())];
+    let saved = GeneratedAccountSetupContext::from_request(&AccountSetupRequest {
+        default_relays: relays.clone(),
+        bootstrap_relays: relays.clone(),
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: false,
+        ..AccountSetupRequest::default()
+    });
+    home.set_account_setup_context(&account.label, &serde_json::to_vec(&saved).unwrap())
+        .unwrap();
+    let mut client = open_runtime_local_test_client(&app, &runtime, &account.label).await;
+    client
+        .prepare_initial_key_package(relays.clone())
+        .await
+        .unwrap();
+    drop(client);
+    home.set_account_setup_phase(&account.label, &setup, AccountSetupPhase::LocalReady)
+        .unwrap();
+    let manager = runtime.accounts();
+    let (reached, proceed) = install_local_open_gate(&app, &account.label);
+    let starting = manager.clone();
+    let reconcile = tokio::spawn(async move { starting.reconcile().await });
+    wait_for_test_signal(reached, "held SQLCipher session").await;
+    assert!(matches!(
+        app.acquire_account_session(&account.label),
+        Err(AppError::AccountSessionBusy)
+    ));
+    reconcile.abort();
+    assert!(reconcile.await.unwrap_err().is_cancelled());
+    manager.workers.lock().await[&account.account_id_hex]
+        .handle
+        .abort();
+    let pending = home
+        .start_setup_compensation(&account.label, &setup)
+        .unwrap()
+        .unwrap();
+    let stopping = manager.clone();
+    let captured = account.clone();
+    let expected = pending.clone();
+    let compensation =
+        tokio::spawn(async move { stopping.compensate_setup(&captured, &expected, None).await });
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if manager.account_is_tearing_down(&account.account_id_hex)
+                && manager.workers.lock().await.is_empty()
+                && manager.worker_reapers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("aborted worker is reaped while its blocking open remains held");
+    assert_eq!(manager.shared.lifecycle().active_account_opens(), 1);
+    tokio::time::pause();
+    tokio::time::advance(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT * 2 + Duration::from_secs(1)).await;
+    let error = compensation.await.unwrap().unwrap_err();
+    tokio::time::resume();
+    assert!(matches!(error, AppError::BlockingTask(_)));
+    assert_eq!(
+        home.account_setup_state(&account.label).unwrap(),
+        Some(pending.clone())
+    );
+    assert_eq!(
+        home.load_signing_keys(&account.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        account.account_id_hex
+    );
+    let shared = runtime.shared_services();
+    assert!(matches!(
+        app.runtime_local_client(
+            &account.label,
+            shared.relay_plane(),
+            shared.lifecycle(),
+            None
+        )
+        .await,
+        Err(AppError::AccountSetupRetryRequired)
+    ));
+    assert!(matches!(
+        app.acquire_account_session(&account.label),
+        Err(AppError::AccountSessionBusy)
+    ));
+    proceed.send(()).unwrap();
+    assert!(
+        shared
+            .lifecycle()
+            .wait_for_account_opens_to_drain(ACCOUNT_OPEN_TEST_DEADLINE)
+            .await
+    );
+    drop(
+        app.acquire_account_session(&account.label)
+            .expect("detached output released its real session guard"),
+    );
+    assert!(matches!(
+        runtime
+            .create_identity(AccountSetupRequest::default())
+            .await,
+        Err(AppError::MissingDefaultRelays)
+    ));
+    assert_eq!(
+        home.account_setup_state(&account.label).unwrap(),
+        Some(pending)
+    );
+    let fresh_relays = vec![TransportEndpoint("wss://replacement.example".into())];
+    let replacement = timeout(
+        ACCOUNT_OPEN_TEST_DEADLINE,
+        runtime.create_identity(AccountSetupRequest {
+            default_relays: fresh_relays.clone(),
+            bootstrap_relays: fresh_relays.clone(),
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        }),
+    )
+    .await
+    .expect("create retries pending compensation after the session releases")
+    .unwrap();
+    assert!(matches!(
+        home.account(&account.label),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    assert_ne!(replacement.account.account_id_hex, account.account_id_hex);
+    assert_eq!(replacement.readiness, AccountSetupReadiness::NetworkReady);
+    assert!(replacement.key_package_bytes.is_some());
+    assert_eq!(
+        replacement.relay_lists.nip65.relays,
+        vec![fresh_relays[0].0.clone()]
+    );
+    assert_eq!(home.accounts().unwrap(), vec![replacement.account.clone()]);
+    assert_eq!(
+        home.load_signing_keys(&replacement.account.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        replacement.account.account_id_hex
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promotion_keeps_public_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let home = app.account_home();
+    let public = home
+        .add_public_account(&nostr::prelude::Keys::generate().public_key().to_hex())
+        .unwrap();
+    let artifact = app.key_package_record_path(&public.label);
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, b"original public compatibility artifact").unwrap();
+    let (promoted, setup) = home
+        .add_external_signer_for_setup(&public.account_id_hex, None)
+        .unwrap();
+    let report = storage_sqlite::ModerationReportOutboxEntry {
+        report_id: "a".repeat(32),
+        dedupe_key: "b".repeat(64),
+        recipient_pubkey_hex: "c".repeat(64),
+        outcome: storage_sqlite::ModerationReportOutboxOutcome::AcceptedPending,
+        event_json: Some("{\"kind\":1059}".into()),
+        created_at_ms: 1_000,
+        attempts: 0,
+    };
+    app.account_storage(&public.label)
+        .unwrap()
+        .app_storage()
+        .stage_moderation_report(&report)
+        .unwrap();
+    let pending = home
+        .start_setup_compensation(&promoted.label, &setup.unwrap())
+        .unwrap()
+        .unwrap();
+    let runtime = app.runtime();
+    runtime
+        .accounts()
+        .compensate_setup(&promoted, &pending, None)
+        .await
+        .unwrap();
+    assert_eq!(home.account(&public.label).unwrap(), public);
+    assert_eq!(
+        std::fs::read(&artifact).unwrap(),
+        b"original public compatibility artifact"
+    );
+    // Public catalog entries do not open an account engine. Re-promotion
+    // must reopen the retained database with its original native key.
+    let (reopened, setup) = home
+        .add_external_signer_for_setup(&public.account_id_hex, None)
+        .unwrap();
+    assert!(matches!(
+        runtime
+            .accounts()
+            .compensate_setup(&promoted, &pending, None)
+            .await,
+        Err(AppError::AccountHome(
+            AccountHomeError::AccountSetupConflict
+        ))
+    ));
+    let reports = app
+        .account_storage(&public.label)
+        .unwrap()
+        .app_storage()
+        .pending_moderation_reports(1)
+        .unwrap();
+    assert_eq!(reports, vec![report]);
+    let pending = home
+        .start_setup_compensation(&reopened.label, &setup.unwrap())
+        .unwrap()
+        .unwrap();
+    runtime
+        .accounts()
+        .compensate_setup(&reopened, &pending, None)
+        .await
+        .unwrap();
+    assert_eq!(home.account(&public.label).unwrap(), public);
     runtime.shutdown().await;
 }
 

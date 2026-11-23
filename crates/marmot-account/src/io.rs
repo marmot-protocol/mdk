@@ -138,12 +138,23 @@ pub(crate) fn write_private_json<T: Serialize>(
     path: impl AsRef<Path>,
     value: &T,
 ) -> AccountHomeResult<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
-    write_file_atomically(path.as_ref(), &bytes, FileMode::Private)
+    write_private_bytes(path, &serde_json::to_vec_pretty(value)?)
+}
+
+/// Publish a record whose caller must distinguish a rename from a failed
+/// directory sync. Sync the containing directory before external effects.
+pub(crate) fn publish_private_json<T: Serialize>(
+    path: PathBuf,
+    value: &T,
+) -> AccountHomeResult<()> {
+    publish_file(&path, &serde_json::to_vec_pretty(value)?, FileMode::Private)
 }
 
 pub(crate) fn write_private_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> AccountHomeResult<()> {
-    write_file_atomically(path.as_ref(), bytes, FileMode::Private)
+    let path = path.as_ref();
+    publish_file(path, bytes, FileMode::Private)?;
+    sync_directory(parent_dir(path))?;
+    Ok(())
 }
 
 /// Key material only: read it back with [`read_secret_json`].
@@ -152,12 +163,14 @@ pub(crate) fn write_secret_json<T: Serialize>(
     value: &T,
 ) -> AccountHomeResult<()> {
     let bytes = Zeroizing::new(serde_json::to_vec_pretty(value)?);
-    write_file_atomically(path.as_ref(), bytes.as_slice(), FileMode::Secret)
+    let path = path.as_ref();
+    publish_file(path, bytes.as_slice(), FileMode::Secret)?;
+    sync_directory(parent_dir(path))?;
+    Ok(())
 }
 
-/// Every mode publishes by renaming a synced owner-only temp file over the
-/// target, so on Unix a reader sees the complete previous file or the complete
-/// new one.
+/// Private writes publish the synced temp file under one live name. On Windows,
+/// Secret writes move the old file aside first so it can still be scrubbed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileMode {
     /// Owner-only. The replaced inode is left intact for readers that still
@@ -168,11 +181,14 @@ enum FileMode {
     Secret,
 }
 
-fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHomeResult<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let parent = parent.unwrap_or_else(|| Path::new("."));
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn publish_file(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHomeResult<()> {
+    let parent = parent_dir(path);
     fs_private::create_dir_all_private(parent)?;
 
     let (mut file, temp_path) = create_temp_file(parent, path)?;
@@ -200,14 +216,21 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
         } else {
             None
         };
-        replace_file(&temp_path, path)?;
+        match mode {
+            #[cfg(windows)]
+            FileMode::Private => {
+                use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
+
+                windows_move_for_commit(&temp_path, path, MOVEFILE_REPLACE_EXISTING)?;
+            }
+            _ => replace_file(&temp_path, path)?,
+        }
         // The handle still refers to the replaced inode after the atomic rename,
         // so scrub it without creating a window where the live secret path is
         // zeroed if replacement fails. Best-effort, matching secret deletion.
         if let Some(file) = &mut replaced_secret_file {
             let _ = overwrite_open_file_with_zeros(file);
         }
-        sync_directory(parent)?;
         Ok(())
     })();
 
@@ -365,16 +388,58 @@ fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
 
 #[cfg(not(windows))]
 fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
-    fs::rename(temp_path, path)
+    rename_for_commit(temp_path, path)
+}
+
+#[cfg(windows)]
+pub(crate) fn rename_for_commit(from: &Path, to: &Path) -> io::Result<()> {
+    windows_move_for_commit(from, to, 0)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn rename_for_commit(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn windows_move_for_commit(from: &Path, to: &Path, flags: u32) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let from = windows_move_path(from)?;
+    let to = windows_move_path(to)?;
+    // Both paths are NUL-terminated and remain live for the call.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags | MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_move_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "rename path has no filename")
+    })?;
+    let absolute = parent_dir(path).canonicalize()?.join(name);
+    let mut wide: Vec<_> = absolute.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename path contains NUL",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -606,6 +671,29 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+
+    #[test]
+    fn private_replace_keeps_live() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(".account-setup.json");
+        write_private_bytes(&path, b"first journal").unwrap();
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(write_private_bytes(&path, b"second journal"),
+            Err(AccountHomeError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)));
+        assert_eq!(fs::read(&path).unwrap(), b"first journal");
+        drop(reader);
+
+        write_private_bytes(&path, b"second journal").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second journal");
+    }
 
     #[test]
     fn secret_replace_scrubs_old_file() {

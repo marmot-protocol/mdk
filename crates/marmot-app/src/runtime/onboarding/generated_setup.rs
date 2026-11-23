@@ -1,8 +1,9 @@
 //! Generated setup: the procedures behind `create_identity` and its
-//! local-ready variants. They stay `MarmotAppRuntime` methods; living in setup's
-//! module tree lets them reach its transaction and background task registry.
+//! local-ready variants. Runtime and account-manager entry points share the
+//! borrowed setup owner; only the runtime schedules background publication.
 use super::generated_setup_tasks::GeneratedSetupGate;
 use super::*;
+use std::borrow::Cow;
 
 const GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS: usize = 3;
 const GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
@@ -19,31 +20,31 @@ enum InitialPublication {
     Skipped,
 }
 
-enum GeneratedSetupPreparation {
-    Pending(AccountSetupResult, GeneratedAccountSetupContext),
-    Complete(AccountSetupResult),
+struct GeneratedSetupPreparation {
+    result: AccountSetupResult,
+    pending: Option<(GeneratedAccountSetupContext, AccountSetupState)>,
 }
 
 impl MarmotAppRuntime {
     pub(in crate::runtime) async fn resume_generated_account_setup(&self) -> Result<(), AppError> {
-        let Some(account) = self
+        let Some((account, setup)) = self
             .accounts
             .app
             .account_home()
-            .resumable_generated_account_setup()?
+            .resumable_generated_setup()?
         else {
             return Ok(());
         };
-        let account = match self
+        match self
             .accounts
             .pending_generated_account(&account.account_id_hex)
         {
-            Ok(Some(account)) => account,
-            Ok(None) | Err(AppError::AccountHome(AccountHomeError::UnknownAccount(_))) => {
+            Ok(Some((_, current))) if setup.attempt_id == current.attempt_id => {}
+            Ok(_) | Err(AppError::AccountHome(AccountHomeError::UnknownAccount(_))) => {
                 return Ok(());
             }
             Err(error) => return Err(error),
-        };
+        }
         let bytes = match self
             .accounts
             .app
@@ -56,9 +57,9 @@ impl MarmotAppRuntime {
                     .accounts
                     .pending_generated_account(&account.account_id_hex)
                 {
-                    Ok(Some(_)) => self
+                    Ok(Some((_, current))) if setup.attempt_id == current.attempt_id => self
                         .report_generated_setup_resume_deferred(&account, "setup_context_missing"),
-                    Ok(None) | Err(AppError::AccountHome(AccountHomeError::UnknownAccount(_))) => {}
+                    Ok(_) | Err(AppError::AccountHome(AccountHomeError::UnknownAccount(_))) => {}
                     Err(error) => return Err(error),
                 }
                 return Ok(());
@@ -78,7 +79,7 @@ impl MarmotAppRuntime {
                 context.request(),
                 true,
                 None,
-                GeneratedIdentity::Continue(&account.account_id_hex),
+                GeneratedIdentity::Continue(&account.account_id_hex, &setup),
             )
             .await
         {
@@ -121,6 +122,10 @@ impl MarmotAppRuntime {
         generated: GeneratedIdentity<'_>,
     ) -> Result<AccountSetupResult, AppError> {
         self.shared.lifecycle().ensure_running()?;
+        let setup = self.account_setup();
+        if matches!(generated, GeneratedIdentity::ResumeOrCreate) {
+            setup.resume_generated_compensation(&request).await?;
+        }
         let _generated_setup_transaction =
             self.setup.generated_setup_local_transaction.lock().await;
         let handoff = if schedule_background {
@@ -128,18 +133,51 @@ impl MarmotAppRuntime {
         } else {
             GeneratedSetupHandoff::Foreground
         };
-        match self
+        let preparation = setup
             .prepare_generated_account(request, handoff, initial_profile, generated)
-            .await?
-        {
-            GeneratedSetupPreparation::Pending(local, context) => {
-                if schedule_background {
-                    self.schedule_generated_account_setup(local.account.clone(), context);
-                }
-                Ok(local)
-            }
-            GeneratedSetupPreparation::Complete(complete) => Ok(complete),
+            .await?;
+        if schedule_background && let Some((context, setup)) = preparation.pending {
+            self.schedule_generated_account_setup(
+                preparation.result.account.clone(),
+                context,
+                setup,
+            );
         }
+        Ok(preparation.result)
+    }
+}
+
+impl AccountSetup<'_> {
+    async fn resume_generated_compensation(
+        &self,
+        request: &AccountSetupRequest,
+    ) -> Result<(), AppError> {
+        validate_account_setup_request(request, AccountSetupOperation::CreateIdentityOnly)?;
+        let home = self.app().account_home();
+        let mut validated = false;
+        for account in home.accounts_strict()? {
+            let Some(pending) = home.account_setup_state(&account.label)?.filter(|state| {
+                state.kind == AccountSetupKind::GeneratedIdentity
+                    && state.phase == AccountSetupPhase::CompensationPending
+            }) else {
+                continue;
+            };
+            if !validated {
+                let bootstrap = AccountRelayListBootstrap::new(
+                    request.default_relays.clone(),
+                    request.bootstrap_relays.clone(),
+                )
+                .with_inbox_relays(request.inbox_relays.clone());
+                if bootstrap.default_relays.is_empty() {
+                    return Err(AppError::MissingDefaultRelays);
+                }
+                self.app()
+                    .validate_account_relay_list_declarations(&bootstrap, None)?;
+                validated = true;
+            }
+            self.resume_setup_compensation(&account, &pending).await?;
+        }
+        Ok(())
     }
 
     // The caller holds local admission through the returned future.
@@ -151,24 +189,25 @@ impl MarmotAppRuntime {
         initial_profile: Option<UserProfileMetadata>,
         generated: GeneratedIdentity<'a>,
     ) -> impl Future<Output = Result<GeneratedSetupPreparation, AppError>> + Send + 'a {
-        let observed = self.shared.observer.product().observed(
+        let observed = self.manager.shared.observer.product().observed(
             crate::ProductFamily::Account,
             "local_ready",
             crate::ProductUnit::Attempt,
         );
         let selection = (|| {
-            self.shared.lifecycle().ensure_running()?;
+            self.manager.shared.lifecycle().ensure_running()?;
             validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)?;
 
             let resumable = match generated {
                 GeneratedIdentity::ResumeOrCreate => self
-                    .accounts
+                    .manager
                     .app
                     .account_home()
-                    .resumable_generated_account_setup()?,
+                    .resumable_generated_setup()?
+                    .map(|(account, setup)| (account, Cow::Owned(setup))),
                 GeneratedIdentity::Fresh => None,
-                GeneratedIdentity::Continue(id) => {
-                    let account = self.accounts.app.account_home().account(id)?;
+                GeneratedIdentity::Continue(id, setup) => {
+                    let account = self.manager.app.account_home().account(id)?;
                     if account.account_id_hex != id
                         || account.signed_out
                         || account.unlinked
@@ -176,14 +215,14 @@ impl MarmotAppRuntime {
                     {
                         return Err(AccountHomeError::UnknownAccount(id.to_owned()).into());
                     }
-                    Some(account)
+                    Some((account, Cow::Borrowed(setup)))
                 }
             };
             // Persisted relays win on resume so every retry retains the exact
             // locally prepared initial KeyPackage and its publication targets.
             let context = match resumable.as_ref() {
-                Some(account) => match self
-                    .accounts
+                Some((account, _)) => match self
+                    .manager
                     .app
                     .account_home()
                     .account_setup_context(&account.label)?
@@ -202,7 +241,7 @@ impl MarmotAppRuntime {
             if bootstrap.default_relays.is_empty() {
                 return Err(AppError::MissingDefaultRelays);
             }
-            self.accounts
+            self.manager
                 .app
                 .validate_account_relay_list_declarations(&bootstrap, None)?;
             Ok::<_, AppError>((resumable, context, effective_request))
@@ -217,54 +256,53 @@ impl MarmotAppRuntime {
 
             // A fresh selection stays fresh even if sign-in makes a journal
             // eligible before creation. Existing selections stay on their ID.
-            let generated = resumable
-                .as_ref()
-                .map_or(GeneratedIdentity::Fresh, |account| {
-                    GeneratedIdentity::Continue(&account.account_id_hex)
-                });
+            let generated =
+                resumable
+                    .as_ref()
+                    .map_or(GeneratedIdentity::Fresh, |(account, setup)| {
+                        GeneratedIdentity::Continue(&account.account_id_hex, setup.as_ref())
+                    });
             let result = async {
                 let identity_started = Instant::now();
                 let identity_result = self
-                    .accounts
-                    .create_nostr_account_from_setup(&effective_request, generated);
-                self.shared.observer.performance().record(
+                    .manager
+                    .admit_setup_account(&effective_request, generated);
+                self.manager.shared.observer.performance().record(
                     AppPerformanceOperation::AccountSetupIdentityLocal,
                     identity_started.elapsed(),
                     identity_result.is_ok(),
                 );
-                let (account, _) = identity_result?;
+                let (account, setup) = identity_result?;
+                let setup = setup.ok_or(AppError::AccountSetupRetryRequired)?;
+                if setup.phase == AccountSetupPhase::CompensationPending {
+                    return Err(AppError::AccountSetupRetryRequired);
+                }
                 if self
-                    .accounts
+                    .manager
                     .app
                     .account_home()
                     .account_setup_context(&account.label)?
                     .is_none()
                 {
-                    self.accounts.app.account_home().set_account_setup_context(
+                    self.manager.app.account_home().set_account_setup_context(
                         &account.label,
                         &serde_json::to_vec(&context)?,
                     )?;
                 }
                 let storage_started = Instant::now();
-                let storage_result = self.accounts.app.account_storage(&account.label);
-                self.shared.observer.performance().record(
+                let storage_result = self.manager.app.account_storage(&account.label);
+                self.manager.shared.observer.performance().record(
                     AppPerformanceOperation::AccountSetupStorageLocal,
                     storage_started.elapsed(),
                     storage_result.is_ok(),
                 );
                 storage_result?;
-                let phase = self
-                    .accounts
-                    .app
-                    .account_home()
-                    .account_setup_state(&account.label)?
-                    .map(|state| state.phase)
-                    .ok_or(AppError::AccountSetupRetryRequired)?;
+                let phase = setup.phase;
 
                 let profile_started = Instant::now();
                 let profile_result = (|| {
                     let cached = self
-                        .accounts
+                        .manager
                         .app
                         .directory()
                         .directory_entry_for_account_id(&account.account_id_hex)?
@@ -277,14 +315,14 @@ impl MarmotAppRuntime {
                         unix_now_seconds(),
                     );
                     if store {
-                        self.accounts
+                        self.manager
                             .app
                             .directory()
                             .remember_directory_profile(&account.account_id_hex, &profile)?;
                     }
                     Ok::<_, AppError>(profile)
                 })();
-                self.shared.observer.performance().record(
+                self.manager.shared.observer.performance().record(
                     AppPerformanceOperation::AccountSetupProfileLocal,
                     profile_started.elapsed(),
                     profile_result.is_ok(),
@@ -295,12 +333,12 @@ impl MarmotAppRuntime {
                 let key_package_result = async {
                     if phase == AccountSetupPhase::LocalStateCreated {
                         let mut client = self
-                            .accounts
+                            .manager
                             .app
                             .local_client_with_relay_plane(
                                 &account.label,
-                                self.shared.relay_plane(),
-                                Some(self.shared.lifecycle()),
+                                self.manager.shared.relay_plane(),
+                                Some(self.manager.shared.lifecycle()),
                             )
                             .await?;
                         let key_package = client
@@ -308,15 +346,16 @@ impl MarmotAppRuntime {
                             .await?;
                         let bytes = key_package.bytes().len();
                         drop(client);
-                        self.accounts.app.account_home().set_account_setup_phase(
+                        self.manager.app.account_home().set_account_setup_phase(
                             &account.label,
+                            &setup,
                             AccountSetupPhase::LocalReady,
                         )?;
-                        self.accounts.app.presentation_signals.catalog_changed();
+                        self.manager.app.presentation_signals.catalog_changed();
                         Ok(bytes)
                     } else {
                         let lifecycle = self
-                            .accounts
+                            .manager
                             .app
                             .account_storage(&account.label)?
                             .key_package_lifecycle()?
@@ -335,7 +374,7 @@ impl MarmotAppRuntime {
                     }
                 }
                 .await;
-                self.shared.observer.performance().record(
+                self.manager.shared.observer.performance().record(
                     AppPerformanceOperation::AccountSetupKeyPackageLocal,
                     key_package_started.elapsed(),
                     key_package_result.is_ok(),
@@ -344,46 +383,46 @@ impl MarmotAppRuntime {
                 if phase == AccountSetupPhase::LocalStateCreated
                     && matches!(handoff, GeneratedSetupHandoff::Foreground)
                 {
-                    self.accounts
+                    self.manager
                         .reset_startup_retry(&account.account_id_hex)
                         .await;
                 }
 
-                let relay_lists = self
-                    .accounts
-                    .app
-                    .account_relay_list_status(&account.label)?;
-                let readiness = self.account_setup_readiness(&account.label)?;
+                let relay_lists = self.manager.app.account_relay_list_status(&account.label)?;
+                let readiness = self.readiness(&account.label)?;
                 if matches!(handoff, GeneratedSetupHandoff::Background) {
                     let handoff_started_at = Instant::now();
                     let handoff_result = if phase == AccountSetupPhase::LocalStateCreated {
-                        self.accounts
+                        self.manager
                             .retry_and_reconcile_for_account(&account.account_id_hex)
                             .await
                     } else {
-                        self.accounts
+                        self.manager
                             .reconcile_for_account(&account.account_id_hex)
                             .await
                     };
-                    self.shared.observer.performance().record(
+                    self.manager.shared.observer.performance().record(
                         AppPerformanceOperation::AccountSetupLocalReadyHandoff,
                         handoff_started_at.elapsed(),
                         handoff_result.is_ok(),
                     );
                     handoff_result?;
                 }
-                Ok(AccountSetupResult {
-                    account,
-                    relay_lists,
-                    key_package_bytes: effective_request
-                        .publish_initial_key_package
-                        .then_some(key_package_bytes),
-                    profile: Some(profile),
-                    readiness,
-                })
+                Ok((
+                    AccountSetupResult {
+                        account,
+                        relay_lists,
+                        key_package_bytes: effective_request
+                            .publish_initial_key_package
+                            .then_some(key_package_bytes),
+                        profile: Some(profile),
+                        readiness,
+                    },
+                    setup,
+                ))
             }
             .await;
-            let local = match result {
+            let (local, setup) = match result {
                 Ok(local) => local,
                 Err(
                     error @ (AppError::AccountHome(
@@ -392,11 +431,14 @@ impl MarmotAppRuntime {
                     )
                     | AppError::AccountSetupRetryRequired),
                 ) => {
-                    if let Some(account) = resumable.as_ref()
+                    if let Some((account, _)) = resumable.as_ref()
                         && let Some(complete) =
                             self.completed_generated_setup(&account.account_id_hex, publication)?
                     {
-                        return Ok(GeneratedSetupPreparation::Complete(complete));
+                        return Ok(GeneratedSetupPreparation {
+                            result: complete,
+                            pending: None,
+                        });
                     }
                     return Err(error);
                 }
@@ -406,21 +448,28 @@ impl MarmotAppRuntime {
                 && let Some(complete) =
                     self.completed_generated_setup(&local.account.account_id_hex, publication)?
             {
-                return Ok(GeneratedSetupPreparation::Complete(complete));
+                return Ok(GeneratedSetupPreparation {
+                    result: complete,
+                    pending: None,
+                });
             }
-            Ok(GeneratedSetupPreparation::Pending(local, context))
+            Ok(GeneratedSetupPreparation {
+                result: local,
+                pending: Some((context, setup)),
+            })
         };
         observed.run_async(work, marmot_observability::success_or_failure)
     }
 
-    pub(in crate::runtime) async fn create_generated_account_network_ready(
+    pub(in crate::runtime) async fn create_generated_ready(
         &self,
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
-        self.shared.lifecycle().ensure_running()?;
+        self.manager.shared.lifecycle().ensure_running()?;
+        self.resume_generated_compensation(&request).await?;
         let preparation = {
             let _generated_setup_transaction =
-                self.setup.generated_setup_local_transaction.lock().await;
+                self.state.generated_setup_local_transaction.lock().await;
             self.prepare_generated_account(
                 request,
                 GeneratedSetupHandoff::Foreground,
@@ -429,11 +478,12 @@ impl MarmotAppRuntime {
             )
             .await?
         };
-        match preparation {
-            GeneratedSetupPreparation::Pending(local, context) => {
-                self.finish_generated_setup(local, context).await
+        match preparation.pending {
+            Some((context, setup)) => {
+                self.finish_generated_setup(preparation.result, context, setup)
+                    .await
             }
-            GeneratedSetupPreparation::Complete(complete) => Ok(complete),
+            None => Ok(preparation.result),
         }
     }
 
@@ -441,10 +491,10 @@ impl MarmotAppRuntime {
         &self,
         local: AccountSetupResult,
         context: GeneratedAccountSetupContext,
+        captured: AccountSetupState,
     ) -> Result<AccountSetupResult, AppError> {
         let started_at = Instant::now();
-        let setup = self.account_setup();
-        let transaction = setup
+        let transaction = self
             .app()
             .onboarding_transaction(&local.account.account_id_hex);
         let _transaction = transaction.lock().await;
@@ -455,8 +505,8 @@ impl MarmotAppRuntime {
             InitialPublication::Skipped
         };
         let result = self
-            .accounts
-            .continue_generated_account_setup(&local.account.account_id_hex, request)
+            .manager
+            .continue_generated_setup(&local.account.account_id_hex, request, &captured)
             .await;
         let result = match result {
             Ok(mut result) => {
@@ -476,7 +526,7 @@ impl MarmotAppRuntime {
                 .and_then(|complete| complete.ok_or(error)),
             Err(error) => Err(error),
         };
-        self.shared.observer.performance().record(
+        self.manager.shared.observer.performance().record(
             AppPerformanceOperation::AccountSetupNetworkReady,
             started_at.elapsed(),
             result.is_ok(),
@@ -489,7 +539,7 @@ impl MarmotAppRuntime {
         account_id_hex: &str,
         publication: InitialPublication,
     ) -> Result<Option<AccountSetupResult>, AppError> {
-        let home = self.accounts.app.account_home();
+        let home = self.manager.app.account_home();
         let account = home.account(account_id_hex)?;
         if account.account_id_hex != account_id_hex
             || account.signed_out
@@ -501,23 +551,20 @@ impl MarmotAppRuntime {
         if home.account_setup_state(&account.label)?.is_some() {
             return Ok(None);
         }
-        let readiness = self.account_setup_readiness(&account.label)?;
+        let readiness = self.readiness(&account.label)?;
         if readiness != AccountSetupReadiness::NetworkReady {
             return Ok(None);
         }
-        let relay_lists = self
-            .accounts
-            .app
-            .account_relay_list_status(&account.label)?;
+        let relay_lists = self.manager.app.account_relay_list_status(&account.label)?;
         let profile = self
-            .accounts
+            .manager
             .app
             .directory()
             .directory_entry_for_account_id(account_id_hex)?
             .and_then(|entry| entry.profile);
         let key_package_bytes = if matches!(publication, InitialPublication::Requested) {
             Some(
-                self.accounts
+                self.manager
                     .confirmed_setup_key_package_bytes(&account.label)?
                     .ok_or(AppError::AccountSetupRetryRequired)?,
             )
@@ -532,7 +579,9 @@ impl MarmotAppRuntime {
             readiness,
         }))
     }
+}
 
+impl MarmotAppRuntime {
     /// Publish `account`'s generated setup in the background. The task
     /// continues that account only: it ends once the account is removed,
     /// signed out or set up, and never resumes or creates another identity.
@@ -543,6 +592,7 @@ impl MarmotAppRuntime {
         &self,
         account: AccountSummary,
         context: GeneratedAccountSetupContext,
+        setup: AccountSetupState,
     ) {
         let manager = self.clone();
         let account_id_hex = account.account_id_hex.clone();
@@ -550,7 +600,7 @@ impl MarmotAppRuntime {
             .generated_setup_tasks
             .spawn(&account_id_hex, move |gate| async move {
                 manager
-                    .run_generated_account_setup(gate, account, context)
+                    .run_generated_account_setup(gate, account, context, setup)
                     .await;
             });
     }
@@ -560,17 +610,18 @@ impl MarmotAppRuntime {
         gate: GeneratedSetupGate,
         account: AccountSummary,
         context: GeneratedAccountSetupContext,
+        setup: AccountSetupState,
     ) {
         // Only a definite answer ends the task: the account was removed,
         // signed out or set up. A failed lookup is retried and reported like
         // any failed attempt, and the attempt itself never resumes or creates
         // another identity.
         let gone = || {
-            matches!(
-                self.accounts
-                    .pending_generated_account(&account.account_id_hex),
-                Ok(None)
-            )
+            self.accounts
+                .pending_generated_account(&account.account_id_hex)
+                .is_ok_and(|current| {
+                    current.is_none_or(|(_, current)| current.attempt_id != setup.attempt_id)
+                })
         };
         let mut failures = 0;
         loop {
@@ -580,12 +631,11 @@ impl MarmotAppRuntime {
             }
             let started_at = Instant::now();
             let Some(result) = gate
-                .attempt(
-                    self.accounts.continue_generated_account_setup(
-                        &account.account_id_hex,
-                        context.request(),
-                    ),
-                )
+                .attempt(self.accounts.continue_generated_setup(
+                    &account.account_id_hex,
+                    context.request(),
+                    &setup,
+                ))
                 .await
             else {
                 // A teardown fenced the account; check again once it returns.
@@ -638,7 +688,8 @@ impl MarmotAppRuntime {
     /// task. A missing or unreadable setup context waits for the next
     /// runtime start, as resume does.
     pub(in crate::runtime) fn continue_pending_generated_setup(&self, account_id_hex: &str) {
-        let Ok(Some(account)) = self.accounts.pending_generated_account(account_id_hex) else {
+        let Ok(Some((account, setup))) = self.accounts.pending_generated_account(account_id_hex)
+        else {
             return;
         };
         let Ok(Some(bytes)) = self
@@ -650,7 +701,7 @@ impl MarmotAppRuntime {
             return;
         };
         if let Ok(context) = serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes) {
-            self.schedule_generated_account_setup(account, context);
+            self.schedule_generated_account_setup(account, context, setup);
         }
     }
 }
@@ -705,7 +756,8 @@ mod selection_tests {
             .unwrap();
 
         let admission = runtime.setup.generated_setup_local_transaction.lock().await;
-        let preparation = runtime.prepare_generated_account(
+        let account_setup = runtime.account_setup();
+        let preparation = account_setup.prepare_generated_account(
             request("wss://new.example"),
             GeneratedSetupHandoff::Foreground,
             None,
@@ -714,11 +766,13 @@ mod selection_tests {
         // Land sign-in's durable transition after selection and before creation.
         home.set_account_signed_out(&original.account.label, false)
             .unwrap();
-        let GeneratedSetupPreparation::Pending(local, context) =
-            tokio::time::timeout(Duration::from_secs(30), preparation)
-                .await
-                .unwrap()
-                .unwrap()
+        let GeneratedSetupPreparation {
+            result: local,
+            pending: Some((context, _)),
+        } = tokio::time::timeout(Duration::from_secs(30), preparation)
+            .await
+            .unwrap()
+            .unwrap()
         else {
             panic!("fresh preparation must not report the old account as complete");
         };

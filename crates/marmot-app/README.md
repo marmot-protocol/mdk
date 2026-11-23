@@ -120,6 +120,18 @@ For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on
 and the diagnostics exporters are the [`marmot-observability`](../marmot-observability) crate) see
 [`AGENTS.md`](AGENTS.md).
 
+## Account setup recovery
+
+Explicit generated creation, nsec import, and public or external sign-in finish pending compensation before normal
+setup admission. Pending accounts cannot start workers or publish. Generated creation reads the strict account catalog;
+an unreadable record blocks cleanup and fresh identity creation.
+
+Interactive import and external-signer onboarding use the same recovery before admitting a new onboarding attempt.
+
+After compensating a generated attempt, retry uses the caller's new relay lists and publication flags. Saved setup
+context applies only when continuing the same live attempt. Binding errors preserve publish and storage categories;
+oversized and engine causes retain precedence, and NIP-46 credential cleanup failures retain their recovery category.
+
 ## Remote signer accounts
 
 The runtime owns NIP-46 sessions for `bunker://` and client-initiated
@@ -132,7 +144,8 @@ stops waiting, not adoption. First await successful session `connect`; `nip46_lo
 accepts only an already-verified `Ready` session and never silently connects.
 Pairing is separately caller-owned and cancellable, with no account mutation while unbound.
 Reconnect never resumes an adoption retired by an earlier disconnect.
-Rollback still cleans its binding without cancelling a newer generation.
+Rollback cleans only its captured activation. A later reconnect or transport
+generation keeps its binding, signer, and credentials.
 Account deletion excludes session resume until credential erasure and removal finish;
 a queued resume reports the removed account, leaving a fresh pairing free to log in.
 Explicit session cancellation, disconnect, or logout interrupts adoption; shutdown

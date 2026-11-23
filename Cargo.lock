@@ -3458,6 +3458,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "windows-native-keyring-store",
+ "windows-sys 0.61.2",
  "zbus-secret-service-keyring-store",
  "zeroize",
 ]

@@ -28,7 +28,9 @@ use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, SecretBytes};
 use futures::FutureExt;
-use marmot_account::{AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSetupState};
+use marmot_account::{
+    AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSetupState,
+};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
@@ -830,6 +832,7 @@ pub(crate) enum AccountWorkerCommand {
     /// account-setup journal. This is deliberately distinct from the general
     /// publication command so no other mutation can enter the startup lane.
     PublishSetupKeyPackage {
+        setup: Option<AccountSetupState>,
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
     RotateKeyPackage {
@@ -1046,7 +1049,7 @@ fn handle_startup_sync_command(
     queued: QueuedCommand,
     published: Option<&watch::Receiver<Arc<crate::client::read_state::ReadState>>>,
     deferred: &mut Vec<DeferredStartupCommand>,
-    setup_key_package_result: &mut Option<Result<usize, AppError>>,
+    setup_key_package_result: &mut SetupPublishCache<'_>,
 ) {
     let Some(queued) =
         queued.serve_or_keep(|command| acknowledge_from_published(command, published))
@@ -1083,14 +1086,12 @@ fn handle_startup_sync_command(
             deferred.push(DeferredStartupCommand::CatchUp(respond));
             None
         }
-        AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
-            match setup_key_package_result.take() {
-                Some(result) => {
-                    let _ = answer_off_quiescent(respond, result);
-                    None
-                }
-                None => Some(AccountWorkerCommand::PublishSetupKeyPackage { respond }),
-            }
+        AccountWorkerCommand::PublishSetupKeyPackage { ref setup, respond }
+            if setup_key_package_result.matches(setup.as_ref()) =>
+        {
+            let result = setup_key_package_result.take();
+            let _ = answer_off_quiescent(respond, result);
+            None
         }
         other => Some(other),
     }) else {
@@ -1198,6 +1199,17 @@ async fn run_app_runtime_account_worker(
         unit,
         read_state,
     } = runtime;
+    let home = app.account_home();
+    let setup_key_package_priority =
+        match setup_key_package_priority(home.account_setup_state(&account_label)) {
+            Ok(setup) => setup,
+            Err(error) => {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Err(error));
+                }
+                return;
+            }
+        };
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut relay_config_updates = app.presentation_signals.profile_updates.subscribe();
     let mut device_group_wakes = app.device_group_wakes.subscribe();
@@ -1297,21 +1309,20 @@ async fn run_app_runtime_account_worker(
             true,
         );
     }
-    // Snapshot setup intent before publishing readiness. Generated-account
-    // local readiness deliberately returns while bootstrap publication is
-    // still background work, and that task may advance the journal as soon as
-    // the ready signal is observed. Capturing here preserves the narrow
-    // priority lane for the exact locally prepared KeyPackage.
-    let setup_key_package_priority =
-        setup_key_package_priority(app.account_home().account_setup_state(&account_label));
-    if let Err(error) = &setup_key_package_priority {
-        publish_app_runtime_account_error(
-            Emit::Quiescent(&client),
-            &events,
-            &account_id_hex,
-            &account_label,
-            account_error_message("account setup state lookup failed", error),
-        );
+    match home.account_setup_state(&account_label) {
+        Ok(Some(state)) if state.phase == AccountSetupPhase::CompensationPending => {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(AppError::AccountSetupRetryRequired));
+            }
+            return;
+        }
+        Err(error) => {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(error.into()));
+            }
+            return;
+        }
+        Ok(_) => {}
     }
     if let Some(ready) = ready.take() {
         shared.observer.performance().record(
@@ -1330,14 +1341,12 @@ async fn run_app_runtime_account_worker(
     // publish (or retry) the lifecycle-owned exact KeyPackage before unrelated
     // hydration and initial catch-up. General mutations, including the public
     // PublishKeyPackage command, remain on the ordinary startup FIFO.
-    let mut setup_key_package_result = match setup_key_package_priority {
-        Ok(SetupKeyPackagePriority::PublishExactDurableInitial) => {
+    let result = match setup_key_package_priority {
+        Some(setup) => {
             let started_at = Instant::now();
-            let result = async {
-                let key_package = client.publish_setup_key_package().await?;
-                Ok(key_package.bytes().len())
-            }
-            .await;
+            let result =
+                publish_captured_key_package(&home, &account_label, Some(&setup), &mut client)
+                    .await;
             shared.observer.performance().record(
                 AppPerformanceOperation::AccountInitialKeyPackagePublish,
                 started_at.elapsed(),
@@ -1352,10 +1361,14 @@ async fn run_app_runtime_account_worker(
                 Duration::ZERO,
                 result.is_ok(),
             );
-            Some(result)
+            Some((setup, result))
         }
-        Ok(SetupKeyPackagePriority::Skip) => None,
-        Err(error) => Some(Err(error)),
+        None => None,
+    };
+    let mut setup_key_package_result = SetupPublishCache {
+        home: &home,
+        label: &account_label,
+        result,
     };
 
     // Background hydration pipeline (mdk#1161): the deferred open above only
@@ -1720,20 +1733,14 @@ async fn run_app_runtime_account_worker(
                     );
                 }
             }
-            AccountWorkerCommand::PublishSetupKeyPackage { respond }
-                if setup_key_package_result.is_some() =>
+            AccountWorkerCommand::PublishSetupKeyPackage { ref setup, respond }
+                if setup_key_package_result.matches(setup.as_ref()) =>
             {
                 // The durable setup lane may publish before background setup
                 // sends its worker command. Return that exact result even if
                 // the initial catch-up has already finished.
                 wait.take_up();
-                let _ = reply(
-                    respond,
-                    setup_key_package_result
-                        .take()
-                        .expect("cached setup result"),
-                    &client,
-                );
+                let _ = reply(respond, setup_key_package_result.take(), &client);
             }
             command => {
                 handle_account_worker_command(
@@ -2378,12 +2385,12 @@ async fn run_app_runtime_account_worker(
                                 )
                                 .await;
                             }
-                            AccountWorkerCommand::PublishSetupKeyPackage { respond }
-                                if setup_key_package_result.is_some() =>
+                            AccountWorkerCommand::PublishSetupKeyPackage { ref setup, respond }
+                                if setup_key_package_result.matches(setup.as_ref()) =>
                             {
                                 wait.take_up();
                                 let _ = reply( respond,
-                                    setup_key_package_result.take().expect("cached setup result"),&client,
+                                    setup_key_package_result.take(),&client,
                                 );
                             }
                             command => {
@@ -4489,7 +4496,7 @@ async fn run_startup_hydration_pipeline(
     account_id_hex: &str,
     account_label: &str,
     shared: &RuntimeSharedServices,
-    setup_key_package_result: &mut Option<Result<usize, AppError>>,
+    setup_key_package_result: &mut SetupPublishCache<'_>,
     shutdown: &mut oneshot::Receiver<()>,
     lifecycle: &RuntimeLifecycle,
 ) -> StartupHydrationOutcome {
@@ -4727,7 +4734,7 @@ async fn handle_startup_hydration_command(
     account_id_hex: &str,
     account_label: &str,
     shared: &RuntimeSharedServices,
-    setup_key_package_result: &mut Option<Result<usize, AppError>>,
+    setup_key_package_result: &mut SetupPublishCache<'_>,
 ) {
     // A mutation served here ends its wait as it starts; one deferred keeps
     // it for the replay. Reads carry no mutation wait.
@@ -4952,19 +4959,12 @@ async fn handle_startup_hydration_command(
         AccountWorkerCommand::CatchUp { respond } => {
             deferred.push(DeferredStartupCommand::CatchUp(respond));
         }
-        AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
-            match setup_key_package_result.take() {
-                Some(result) => {
-                    wait.take_up();
-                    let _ = reply(respond, result, client);
-                }
-                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                    QueuedCommand::from_parts(
-                        AccountWorkerCommand::PublishSetupKeyPackage { respond },
-                        wait,
-                    ),
-                ))),
-            }
+        AccountWorkerCommand::PublishSetupKeyPackage { ref setup, respond }
+            if setup_key_package_result.matches(setup.as_ref()) =>
+        {
+            let result = setup_key_package_result.take();
+            wait.take_up();
+            let _ = reply(respond, result, client);
         }
         other => deferred.push(DeferredStartupCommand::Command(Box::new(
             QueuedCommand::from_parts(other, wait),
@@ -7905,12 +7905,14 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
             true
         }),
-        AccountWorkerCommand::PublishSetupKeyPackage { respond } => Box::pin(async move {
+        AccountWorkerCommand::PublishSetupKeyPackage { setup, respond } => Box::pin(async move {
             let started_at = Instant::now();
-            let result = async {
-                let key_package = client.publish_setup_key_package().await?;
-                Ok(key_package.bytes().len())
-            }
+            let result = publish_captured_key_package(
+                &app.account_home(),
+                account_label,
+                setup.as_ref(),
+                client,
+            )
             .await;
             shared.observer.performance().record(
                 AppPerformanceOperation::AccountInitialKeyPackagePublish,
@@ -9763,16 +9765,17 @@ fn publish_pending_welcome_delivery_events(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SetupKeyPackagePriority {
-    PublishExactDurableInitial,
-    Skip,
-}
-
 fn setup_key_package_priority(
     state: Result<Option<AccountSetupState>, AccountHomeError>,
-) -> Result<SetupKeyPackagePriority, AppError> {
-    let publish = state?.is_some_and(|state| {
+) -> Result<Option<AccountSetupState>, AppError> {
+    let state = state?;
+    if state
+        .as_ref()
+        .is_some_and(|s| s.phase == AccountSetupPhase::CompensationPending)
+    {
+        return Err(AppError::AccountSetupRetryRequired);
+    }
+    Ok(state.filter(|state| {
         state.kind == AccountSetupKind::GeneratedIdentity
             && matches!(
                 state.phase,
@@ -9781,12 +9784,56 @@ fn setup_key_package_priority(
                     | AccountSetupPhase::BootstrapPublicationConfirmed
                     | AccountSetupPhase::KeyPackagePublicationStarted
             )
-    });
-    Ok(if publish {
-        SetupKeyPackagePriority::PublishExactDurableInitial
-    } else {
-        SetupKeyPackagePriority::Skip
-    })
+    }))
+}
+
+struct SetupPublishCache<'a> {
+    home: &'a AccountHome,
+    label: &'a str,
+    result: Option<(AccountSetupState, Result<usize, AppError>)>,
+}
+
+impl SetupPublishCache<'_> {
+    fn matches(&self, setup: Option<&AccountSetupState>) -> bool {
+        self.result
+            .as_ref()
+            .zip(setup)
+            .is_some_and(|((state, _), setup)| {
+                state.attempt_id == setup.attempt_id && state.kind == setup.kind
+            })
+    }
+
+    fn take(&mut self) -> Result<usize, AppError> {
+        let (setup, result) = self.result.take().expect("cached setup result");
+        self.home
+            .set_account_setup_phase(self.label, &setup, setup.phase)?;
+        result
+    }
+}
+
+async fn publish_captured_key_package(
+    home: &AccountHome,
+    label: &str,
+    setup: Option<&AccountSetupState>,
+    client: &mut AppClient,
+) -> Result<usize, AppError> {
+    match setup {
+        Some(setup) => {
+            let phase = if setup.kind == AccountSetupKind::GeneratedIdentity {
+                // Early publication closes rollback without confirming the bootstrap records.
+                AccountSetupPhase::BootstrapPublicationStarted
+            } else {
+                AccountSetupPhase::KeyPackagePublicationStarted
+            };
+            home.set_account_setup_phase(label, setup, phase)?;
+        }
+        None if home.account_setup_state(label)?.is_some() => {
+            return Err(AccountHomeError::AccountSetupConflict.into());
+        }
+        None => {}
+    }
+    let key_package = client.publish_setup_key_package().await?;
+    Ok(key_package.bytes().len())
 }
 
 /// Build a [`RuntimeAccountError`] message from a static prefix and the
@@ -9966,6 +10013,8 @@ mod tests {
     fn setup_state(kind: AccountSetupKind, phase: AccountSetupPhase) -> AccountSetupState {
         AccountSetupState {
             account_id_hex: "00".repeat(32),
+            attempt_id: None,
+            origin: Default::default(),
             reused_account_id_credential: false,
             kind,
             phase,
@@ -10703,7 +10752,12 @@ mod tests {
         let mut client = app.client("alice").await.unwrap();
         let (events, _) = broadcast::channel(16);
         let mut deferred = Vec::new();
-        let mut setup = None;
+        let home = app.account_home();
+        let mut setup = SetupPublishCache {
+            home: &home,
+            label: "alice",
+            result: None,
+        };
         let id = cgka_traits::MessageId::new(vec![0x75; 32]);
         let (respond, mut confirm) = oneshot::channel();
         handle_startup_hydration_command(
@@ -10768,7 +10822,7 @@ mod tests {
                     phase,
                 ))))
                 .unwrap(),
-                SetupKeyPackagePriority::PublishExactDurableInitial,
+                Some(setup_state(AccountSetupKind::GeneratedIdentity, phase)),
                 "phase {phase:?} must select the lifecycle-owned initial KeyPackage"
             );
         }
@@ -10788,7 +10842,7 @@ mod tests {
                     phase,
                 ))))
                 .unwrap(),
-                SetupKeyPackagePriority::Skip
+                None
             );
         }
         for phase in [
@@ -10801,13 +10855,10 @@ mod tests {
                     phase,
                 ))))
                 .unwrap(),
-                SetupKeyPackagePriority::Skip
+                None
             );
         }
-        assert_eq!(
-            setup_key_package_priority(Ok(None)).unwrap(),
-            SetupKeyPackagePriority::Skip
-        );
+        assert_eq!(setup_key_package_priority(Ok(None)).unwrap(), None);
     }
 
     #[test]

@@ -31,6 +31,11 @@ Tests: `tests/home.rs` (account home).
 - Depend on no protocol crate: no `cgka-*` crate, no `marmot-forensics`, no storage crate (mdk#2602). The bindings,
   the CLI and the agent connector use this crate for identity alone.
 - Keep CLI account-selection ergonomics and relay-list repair out of this crate; those belong in `wn` and `marmot-app`.
+- Setup mutations require the captured attempt and phase under the home mutation lock. Persist ownership before
+  publishing a new account or promoting its role. Unknown legacy ownership cannot authorize destructive compensation.
+  `CompensationPending` blocks ordinary start and publication until an explicit retry finishes cleanup.
+- Constructors never replay deletion. Local cleanup replay requires the host's exclusive root lease and retains native
+  cleanup intent; this crate cannot infer a credential provider's identity or replay native deletion safely.
 - Replace account-home files only through the `io.rs` writers, and never change a published file in place while a reader
   can still open it. Owner-only files that hold no key material (setup journal and context, onboarding checkpoints) use
   `write_private_json`/`write_private_bytes`. Only `write_secret_json` zeroes the inode it replaces, so read those files

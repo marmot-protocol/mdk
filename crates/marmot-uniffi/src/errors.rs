@@ -607,16 +607,28 @@ impl From<marmot_app::DirectoryError> for MarmotKitError {
 
 impl From<&AppError> for MarmotKitError {
     fn from(value: &AppError) -> Self {
-        if let Some(cause) = value.as_oversized_event() {
+        let mut primary = value;
+        while let AppError::AccountSetupRollback { source, .. } = primary {
+            primary = source;
+        }
+        if let Some(cause) = primary.as_oversized_event() {
             return Self::EventTooLarge {
                 artifact: cause.artifact.into(),
                 size_class: cause.size_class.into(),
             };
         }
-        if let Some(err) = value.as_engine_error() {
+        if let Some(err) = primary.as_engine_error() {
             return Self::from_engine_error(err);
         }
-        match value {
+        // A NIP-46 cleanup failure can require different recovery from the setup failure.
+        if let Some(error) = value.as_nip46_error() {
+            return Self::Nip46 {
+                reason: error.clone().into(),
+            };
+        }
+        let rollback_details =
+            || matches!(value, AppError::AccountSetupRollback { .. }).then(|| value.to_string());
+        match primary {
             AppError::InvalidAppComponent(details) => Self::InvalidAppComponent {
                 details: details.clone(),
             },
@@ -804,14 +816,7 @@ impl From<&AppError> for MarmotKitError {
                 details: details.clone(),
             },
             AppError::Publish(details) => Self::Publish {
-                details: details.clone(),
-            },
-            AppError::EventTooLarge {
-                artifact,
-                size_class,
-            } => Self::EventTooLarge {
-                artifact: (*artifact).into(),
-                size_class: (*size_class).into(),
+                details: rollback_details().unwrap_or_else(|| details.clone()),
             },
             AppError::NoUsableRelay => Self::NoUsableRelay,
             AppError::FollowListUnavailable => Self::FollowListUnavailable,
@@ -840,26 +845,23 @@ impl From<&AppError> for MarmotKitError {
             // as the typed transient variant here too, so Android never sees
             // transient contention as an untyped fatal Runtime error.
             AppError::Storage(storage_err) if storage_err.is_transient() => Self::StorageBusy {
-                details: storage_err.to_string(),
+                details: rollback_details().unwrap_or_else(|| storage_err.to_string()),
             },
             // A store closed for suspension is an orderly end state, not a
             // fault. Give it its own variant so hosts can drop the result
             // silently instead of surfacing an error while backgrounding.
             AppError::Storage(storage_err) if storage_err.is_closed() => Self::StorageClosed {
-                details: storage_err.to_string(),
+                details: rollback_details().unwrap_or_else(|| storage_err.to_string()),
             },
             AppError::Storage(storage_err @ cgka_traits::StorageError::Capacity(_)) => {
                 Self::StorageFull {
-                    details: storage_err.to_string(),
+                    details: rollback_details().unwrap_or_else(|| storage_err.to_string()),
                 }
             }
             AppError::ExternalSignerUnavailable(account) => Self::ExternalSignerUnavailable {
                 account: account.clone(),
             },
             AppError::ExternalSignerMismatch => Self::ExternalSignerMismatch,
-            AppError::Nip46(error) => Self::Nip46 {
-                reason: error.clone().into(),
-            },
             AppError::ExternalSignerRejected => Self::ExternalSignerRejected,
             AppError::InvalidSticker(details) => Self::InvalidSticker {
                 details: details.clone(),
@@ -894,8 +896,8 @@ impl From<&AppError> for MarmotKitError {
                 current_event_id_hex: current_event_id_hex.clone(),
             },
             AppError::EmojiSetInstallCancelled => Self::EmojiSetInstallCancelled,
-            other => Self::Runtime {
-                details: other.to_string(),
+            _ => Self::Runtime {
+                details: value.to_string(),
             },
         }
     }
@@ -1928,6 +1930,123 @@ mod tests {
     fn incomplete_account_setup_crosses_ffi_as_typed_recovery() {
         let ffi: MarmotKitError = AppError::AccountSetupRecoveryRequired.into();
         assert!(matches!(ffi, MarmotKitError::AccountSetupRecoveryRequired));
+    }
+
+    #[test]
+    fn rollback_keeps_host_action() {
+        use marmot_app::Nip46Error;
+
+        const CLEANUP_DETAIL: &str = "could not remove the account home";
+        let cleanup_io = || {
+            vec![AppError::AccountHome(AccountHomeError::Io(
+                std::io::Error::other(CLEANUP_DETAIL),
+            ))]
+        };
+        let nip46_storage = |e: &MarmotKitError| {
+            matches!(
+                e,
+                MarmotKitError::Nip46 {
+                    reason: crate::Nip46ErrorFfi::Storage
+                }
+            )
+        };
+        type Expected = fn(&MarmotKitError) -> bool;
+        let cases: [(AppError, Expected); 7] = [
+            (
+                AppError::AccountSetupRollback {
+                    source: Box::new(AppError::EventTooLarge {
+                        artifact: marmot_app::OversizedArtifact::ApplicationMessage,
+                        size_class: marmot_app::EventSizeClass::of_bytes(1024),
+                    }),
+                    cleanup: vec![AppError::Nip46(Nip46Error::Storage)],
+                },
+                |e| {
+                    matches!(
+                        e,
+                        MarmotKitError::EventTooLarge {
+                            artifact: super::OversizedArtifactFfi::ApplicationMessage,
+                            size_class: super::EventSizeClassFfi::Under64Kib,
+                        }
+                    )
+                },
+            ),
+            (
+                AppError::AccountSetupRollback {
+                    source: Box::new(AppError::Session(
+                        EngineError::QueuedOutboundAtCapacity {
+                            group_id: cgka_traits::GroupId::new(vec![0x33; 16]),
+                        }
+                        .into(),
+                    )),
+                    cleanup: vec![AppError::Nip46(Nip46Error::Storage)],
+                },
+                |e| {
+                    matches!(e, MarmotKitError::GroupSendQueueFull { group_id_hex }
+                    if group_id_hex == &hex::encode([0x33; 16]))
+                },
+            ),
+            (
+                AppError::AccountSetupRollback {
+                    source: Box::new(AppError::Publish(
+                        "no relay acknowledged publication".into(),
+                    )),
+                    cleanup: cleanup_io(),
+                },
+                |e| {
+                    matches!(e, MarmotKitError::Publish { details }
+                    if details.contains("no relay acknowledged publication") && details.contains(CLEANUP_DETAIL))
+                },
+            ),
+            (
+                AppError::AccountSetupRollback {
+                    source: Box::new(AppError::Storage(StorageError::Busy(
+                        "database is locked".into(),
+                    ))),
+                    cleanup: cleanup_io(),
+                },
+                |e| {
+                    matches!(e, MarmotKitError::StorageBusy { details }
+                    if details.contains("database is locked") && details.contains(CLEANUP_DETAIL))
+                },
+            ),
+            (
+                AppError::AccountSetupRollback {
+                    source: Box::new(AppError::Storage(StorageError::Closed(
+                        "closed for suspension".into(),
+                    ))),
+                    cleanup: cleanup_io(),
+                },
+                |e| {
+                    matches!(e, MarmotKitError::StorageClosed { details }
+                    if details.contains("closed for suspension") && details.contains(CLEANUP_DETAIL))
+                },
+            ),
+            (
+                AppError::AccountSetupRollback {
+                    source: Box::new(AppError::Publish(
+                        "no relay acknowledged publication".into(),
+                    )),
+                    cleanup: vec![AppError::Nip46(Nip46Error::Storage)],
+                },
+                nip46_storage,
+            ),
+            (
+                AppError::AccountSetupRollback {
+                    source: Box::new(AppError::Nip46(Nip46Error::Unavailable)),
+                    cleanup: vec![AppError::AccountSetupRollback {
+                        source: Box::new(AppError::AccountHome(
+                            AccountHomeError::AccountSetupConflict,
+                        )),
+                        cleanup: vec![AppError::Nip46(Nip46Error::Storage)],
+                    }],
+                },
+                nip46_storage,
+            ),
+        ];
+        for (error, expected) in cases {
+            let ffi = MarmotKitError::from(&error);
+            assert!(expected(&ffi), "{error:?} mapped to {ffi:?}");
+        }
     }
 
     #[test]

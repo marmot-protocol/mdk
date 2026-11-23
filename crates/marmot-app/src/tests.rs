@@ -5775,7 +5775,7 @@ async fn push_registration_removal_retry_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_account_bootstrap_separates_operational_and_indexer_batches() {
     let directory = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(directory.path())
+    let (account, _setup) = AccountHome::open(directory.path())
         .create_nostr_account_for_setup()
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -5882,7 +5882,7 @@ async fn generated_account_bootstrap_separates_operational_and_indexer_batches()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_and_relay_list_updates_copy_to_indexers_without_adopting_them() {
     let directory = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(directory.path())
+    let (account, _setup) = AccountHome::open(directory.path())
         .create_nostr_account_for_setup()
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -5955,7 +5955,7 @@ async fn profile_and_relay_list_updates_copy_to_indexers_without_adopting_them()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_indexer_does_not_undo_acknowledged_account_bootstrap() {
     let directory = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(directory.path())
+    let (account, _setup) = AccountHome::open(directory.path())
         .create_nostr_account_for_setup()
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -5990,7 +5990,7 @@ async fn unavailable_indexer_does_not_undo_acknowledged_account_bootstrap() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsafe_indexer_is_skipped_without_blocking_account_bootstrap() {
     let directory = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(directory.path())
+    let (account, _setup) = AccountHome::open(directory.path())
         .create_nostr_account_for_setup()
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6016,7 +6016,7 @@ async fn unsafe_indexer_is_skipped_without_blocking_account_bootstrap() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loopback_account_relays_suppress_public_indexer_copies() {
     let directory = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(directory.path())
+    let (account, _setup) = AccountHome::open(directory.path())
         .create_nostr_account_for_setup()
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6058,7 +6058,7 @@ async fn loopback_account_relays_suppress_public_indexer_copies() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_loopback_declarations_suppress_profile_and_relay_list_indexer_copies() {
     let directory = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(directory.path())
+    let (account, _setup) = AccountHome::open(directory.path())
         .create_nostr_account_for_setup()
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6090,7 +6090,7 @@ async fn mixed_loopback_declarations_suppress_profile_and_relay_list_indexer_cop
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replacing_loopback_outbox_copies_new_public_relay_lists_to_indexer() {
     let directory = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(directory.path())
+    let (account, _setup) = AccountHome::open(directory.path())
         .create_nostr_account_for_setup()
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6211,7 +6211,7 @@ async fn confirmed_bootstrap_retry_republishes_public_indexer_copies() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_indexer_copy_preserves_directional_nip65_roles() {
     let directory = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(directory.path())
+    let (account, _setup) = AccountHome::open(directory.path())
         .create_nostr_account_for_setup()
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6396,7 +6396,7 @@ async fn account_removal_cancels_pending_indexer_copies() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_indexer_does_not_delay_profile_publish_return() {
     let directory = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(directory.path())
+    let (account, _setup) = AccountHome::open(directory.path())
         .create_nostr_account_for_setup()
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6494,7 +6494,7 @@ async fn generated_account_setup_records_distinct_network_ready_phases() {
 async fn initial_setup_key_package_publishes_before_stalled_initial_sync_finishes() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
-    let account = home.create_nostr_account_for_setup().unwrap();
+    let (account, setup) = home.create_nostr_account_for_setup().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
@@ -6510,6 +6510,7 @@ async fn initial_setup_key_package_publishes_before_stalled_initial_sync_finishe
     .unwrap();
     home.set_account_setup_phase(
         &account.label,
+        &setup,
         marmot_account::AccountSetupPhase::KeyPackagePublicationStarted,
     )
     .unwrap();
@@ -6528,7 +6529,9 @@ async fn initial_setup_key_package_publishes_before_stalled_initial_sync_finishe
         .any(|event| event.kind == KIND_MARMOT_KEY_PACKAGE);
     let setup_finished_before_sync = tokio::time::timeout(
         Duration::from_millis(250),
-        runtime.accounts().publish_setup_key_package(&account.label),
+        runtime
+            .accounts()
+            .publish_setup_key_package(&account.label, Some(setup)),
     )
     .await
     .expect("setup publication result must bypass stalled initial sync")
@@ -6775,22 +6778,26 @@ async fn initial_profile_retry_returns_the_profile_a_running_bootstrap_publishes
         .await
         .unwrap();
     // `BootstrapPublicationStarted` follows the bootstrap's profile capture.
-    // Rewind to `LocalReady` to reproduce the window between the two.
+    // Restore the earlier checkpoint while both publishes are blocked to
+    // reproduce the window between profile capture and the journal advance.
     relay.wait_for_blocked_publishes(2).await;
+    let home = app.account_home();
+    let mut setup = home
+        .account_setup_state(&first.account.label)
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        app.account_home()
-            .account_setup_state(&first.account.label)
-            .unwrap()
-            .unwrap()
-            .phase,
+        setup.phase,
         marmot_account::AccountSetupPhase::BootstrapPublicationStarted
     );
-    app.account_home()
-        .set_account_setup_phase(
-            &first.account.label,
-            marmot_account::AccountSetupPhase::LocalReady,
-        )
-        .unwrap();
+    setup.phase = marmot_account::AccountSetupPhase::LocalReady;
+    fs_private::write_private(
+        &home
+            .account_dir(&first.account.label)
+            .join(".account-setup.json"),
+        &serde_json::to_vec(&setup).unwrap(),
+    )
+    .unwrap();
 
     let retried = runtime
         .create_identity_local_ready_with_initial_profile(
@@ -7154,8 +7161,25 @@ async fn generated_identity_restart_resumes_every_durable_setup_phase() {
         drop(app);
 
         let home = AccountHome::open(directory.path());
-        home.set_account_setup_phase(&result.account.label, phase)
+        let mut setup = home
+            .account_setup_state(&result.account.label)
+            .unwrap()
             .unwrap();
+        // The running setup has already started publication. Seed each
+        // restart checkpoint without rewinding through the live API.
+        if phase < setup.phase {
+            setup.phase = phase;
+            fs_private::write_private(
+                &home
+                    .account_dir(&result.account.label)
+                    .join(".account-setup.json"),
+                &serde_json::to_vec(&setup).unwrap(),
+            )
+            .unwrap();
+        } else {
+            home.set_account_setup_phase(&result.account.label, &setup, phase)
+                .unwrap();
+        }
         let restarted_app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let restarted = MarmotAppRuntime::new(restarted_app.clone());
@@ -7270,12 +7294,17 @@ async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() 
     drop(app);
     relay.block_next_publishes(0);
 
-    AccountHome::open(directory.path())
-        .set_account_setup_phase(
-            &local.account.label,
-            marmot_account::AccountSetupPhase::BootstrapPublicationConfirmed,
-        )
+    let home = AccountHome::open(directory.path());
+    let setup = home
+        .account_setup_state(&local.account.label)
+        .unwrap()
         .unwrap();
+    home.set_account_setup_phase(
+        &local.account.label,
+        &setup,
+        marmot_account::AccountSetupPhase::BootstrapPublicationConfirmed,
+    )
+    .unwrap();
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let runtime = MarmotAppRuntime::new(app);
@@ -7452,7 +7481,7 @@ async fn key_package_routing_sees_lists_a_setup_projected_after_the_routing_read
     // relays.
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
-    let account = home.create_nostr_account_for_setup().unwrap();
+    let (account, setup) = home.create_nostr_account_for_setup().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(directory.path(), "wss://app-default.example")
         .with_test_relay_client(relay);
@@ -7467,7 +7496,7 @@ async fn key_package_routing_sees_lists_a_setup_projected_after_the_routing_read
     )
     .await
     .unwrap();
-    home.complete_account_setup(&account.label).unwrap();
+    home.complete_account_setup(&account.label, &setup).unwrap();
 
     assert_eq!(
         app.key_package_endpoints(&account.label, &stale).unwrap(),
@@ -8065,8 +8094,7 @@ fn existing_account_database_without_slot_evidence_fails_closed() {
 fn durable_incomplete_setup_can_provision_slot_after_database_creation() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
-    let account = home.create_account("journaled-fresh-setup").unwrap();
-    home.begin_account_setup(&account, false).unwrap();
+    let (account, _setup) = home.create_nostr_account_for_setup().unwrap();
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
 
     // Reproduce the critical ordering: an advisory/local operation creates the

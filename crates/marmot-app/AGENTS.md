@@ -30,10 +30,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   fields are private to `runtime/onboarding/`; setup's code runs on `AccountSetup` (that state paired with an
   `AccountManager`, both borrowed: an owned manager clone is 3 KB and, nested under every reconcile, overflowed the
   debug tokio worker stack in the CLI daemon test; spawned tasks capture the owned pair and borrow it inside), and
-  generated setup's procedures stay `MarmotAppRuntime` methods in that module tree. Hosts reach onboarding through
+  generated preparation and completion use the same borrowed owner. Generated entry points remain runtime methods.
+  Hosts reach onboarding through
   `MarmotAppRuntime::account_setup()`; `AccountManager` exposes no onboarding methods.
   Helpers that only return another future return it directly: extra async wrappers hit the simulator's layout-depth limit.
-  `AccountManager` holds one `SetupState` for five hooks only, each where it is called: reconcile (worker transaction
+  `AccountManager` borrows the shared setup owner for admission and recovery. Its lifecycle hooks keep their lock state:
+  reconcile (worker transaction
   held; it never takes it again), the teardown fence (removal and sign-out, before the worker transaction), removal
   (under the transaction, after the removal commit point), the direct-write check (under the transaction, before
   `write_without_worker` writes) and shutdown's two phases (before the invite catch-up drain; after the first reaper
@@ -61,6 +63,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   transaction, generated local preparation admission (removal only), the worker transaction, then the worker map.
   Local preparation never waits for the onboarding transaction. The cancellation registry precedes the per-account
   state lock.
+  Pending compensation takes the background fence, the plain foreground transaction, then local preparation admission
+  before normal setup gates. It must not retire the retry's own NIP-46 adoption. Initial-failure compensation already
+  holds foreground admission and must not take it again. Match the captured attempt and phase under the home mutation
+  lock before cleanup. Generated retries enumerate the strict catalog before mutation and use the caller's fresh
+  request after compensation; saved context belongs only to continuation of the same live attempt.
 - Write an account's groups through its worker whenever it signs on one (`AccountManager::signs_on_worker`: an active
   local signer, or a signed-in external signer whose signer is registered). The worker keeps the account's state in
   memory and saves each dirty group's whole record, so a storage write beside it is undone at its next save and leaves

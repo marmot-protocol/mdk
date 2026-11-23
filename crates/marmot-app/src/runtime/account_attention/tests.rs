@@ -339,7 +339,7 @@ async fn catalog_tracks_creation_sign_out_removal_and_external_accounts_without_
     let (new_account, _) = f
         .runtime
         .accounts
-        .create_nostr_account_from_setup(
+        .admit_setup_account(
             &AccountSetupRequest::default(),
             crate::runtime::GeneratedIdentity::ResumeOrCreate,
         )

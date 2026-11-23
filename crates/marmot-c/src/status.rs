@@ -910,6 +910,18 @@ mod tests {
     }
 
     #[test]
+    fn nip46_storage_status_detail() {
+        let error = MarmotKitError::Nip46 {
+            reason: marmot_uniffi::Nip46ErrorFfi::Storage,
+        };
+        assert_eq!(status_from_error(&error), MarmotStatus::Runtime);
+        assert_eq!(
+            take_last_error().as_deref(),
+            Some("remote signer credential storage failed")
+        );
+    }
+
+    #[test]
     fn last_error_details_are_consumed_only_on_the_calling_thread() {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         set_last_error("host-thread-detail");

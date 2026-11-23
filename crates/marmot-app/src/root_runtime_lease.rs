@@ -198,6 +198,25 @@ mod tests {
     }
 
     #[test]
+    fn leased_open_checks_home_root() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let sentinel = other.path().join("sentinel");
+        std::fs::write(&sentinel, b"outside account root").unwrap();
+        let result = MarmotApp::try_with_relays_and_account_home_and_config(
+            root.path(),
+            Vec::new(),
+            AccountHome::open(other.path()),
+            MarmotAppConfig::white_noise(),
+        );
+        assert!(
+            matches!(result, Err(AppError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput)
+        );
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"outside account root");
+        drop(MarmotRootRuntimeLease::try_acquire(root.path()).unwrap());
+    }
+
+    #[test]
     fn exclusive_root_app_clones_retain_ownership() {
         let root = tempfile::tempdir().unwrap();
         let app = MarmotApp::try_with_relays_and_account_home_and_config(

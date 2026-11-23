@@ -2,8 +2,10 @@ use super::*;
 use ::nostr::prelude::{Event, Filter, PublicKey, nip44};
 use ::nostr_sdk::prelude::{Client, ClientNotification};
 use futures::StreamExt;
-use marmot_account::Nip46SessionRecord;
-use marmot_account::{AccountHomeResult, AccountSecretStore, LocalFileSecretStore};
+use marmot_account::{
+    AccountHomeResult, AccountSecretStore, LocalFileSecretStore, Nip46Removal, Nip46SessionRecord,
+    Nip46SessionWrite,
+};
 
 const KEY_PACKAGE_KIND: u64 = 30443;
 
@@ -867,87 +869,123 @@ async fn nip46_login_needs_pairing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip46_login_retains_retry() {
+    #[derive(Clone, Copy, Debug)]
+    enum PendingSession {
+        Fresh,
+        Restored,
+    }
+
     let peer = LoginPeer::new().await;
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    relay.fail_publishes_of_kind(KEY_PACKAGE_KIND);
-    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
-    let open_app = || {
-        MarmotApp::with_relays_and_account_home_and_config(
-            dir.path(),
-            vec!["wss://account-relay.example".into()],
-            home.clone(),
-            config.clone(),
-        )
-        .with_test_relay_client(relay.clone())
-    };
-    let app = open_app();
-    let runtime = app.runtime();
-    let session = peer.session(&app);
-    let communication_key = session.client_public_key().unwrap();
-    session.connect_async().await.unwrap();
-    let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
-    runtime
-        .nip46_login(session.clone(), endpoints(), endpoints(), Vec::new())
-        .await
-        .unwrap_err();
-    let id = peer.user.public_key().to_hex();
-    let account = home.account(&id).unwrap();
-    assert!(!account.signed_out);
-    assert_eq!(
-        home.account_setup_state(&id).unwrap().unwrap().phase,
-        marmot_account::AccountSetupPhase::KeyPackagePublicationStarted
-    );
-    assert_eq!(
-        home.load_nip46_session(&id)
+    for pending_session in [PendingSession::Fresh, PendingSession::Restored] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        relay.fail_publishes_of_kind(KEY_PACKAGE_KIND);
+        let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+        let open_app = || {
+            MarmotApp::with_relays_and_account_home_and_config(
+                dir.path(),
+                vec!["wss://account-relay.example".into()],
+                home.clone(),
+                config.clone(),
+            )
+            .with_test_relay_client(relay.clone())
+        };
+        let mut app = open_app();
+        let mut runtime = app.runtime();
+        let mut session = peer.session(&app);
+        let communication_key = session.client_public_key().unwrap();
+        session.connect_async().await.unwrap();
+        let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+        let id = peer.user.public_key().to_hex();
+        let (pending_account, pending_setup) =
+            home.add_external_signer_for_setup(&id, None).unwrap();
+        if matches!(pending_session, PendingSession::Restored) {
+            session
+                .bind_account(&pending_account.label, session.status().generation)
+                .unwrap();
+        }
+        home.start_setup_compensation(&pending_account.label, &pending_setup.unwrap())
             .unwrap()
-            .unwrap()
-            .0
-            .public_key(),
-        communication_key
-    );
-    let rejected = relay
-        .attempted_events
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|event| event.kind == KEY_PACKAGE_KIND)
-        .unwrap()
-        .id
-        .clone();
-    runtime.shutdown_and_close().await.unwrap();
-    drop(session);
-    drop(runtime);
-    drop(app);
-    relay.allow_all_publish_kinds();
-    let app = open_app();
-    let runtime = app.runtime();
-    runtime.start().await.unwrap();
-    let restored = runtime.nip46_resume(&id).await.unwrap();
-    assert_eq!(restored.client_public_key().unwrap(), communication_key);
-    restored.connect_async().await.unwrap();
-    assert_eq!(
+            .unwrap();
+        if matches!(pending_session, PendingSession::Restored) {
+            runtime.shutdown_and_close().await.unwrap();
+            drop(session);
+            drop(runtime);
+            drop(app);
+            app = open_app();
+            runtime = app.runtime();
+            runtime.start().await.unwrap();
+            session = runtime.nip46_resume(&id).await.unwrap();
+            assert_eq!(session.client_public_key().unwrap(), communication_key);
+            session.connect_async().await.unwrap();
+        }
+        assert_eq!(
+            session.status().state,
+            Nip46State::Ready,
+            "{pending_session:?}"
+        );
         runtime
-            .nip46_login(restored, endpoints(), endpoints(), Vec::new())
+            .nip46_login(session.clone(), endpoints(), endpoints(), Vec::new())
             .await
+            .unwrap_err();
+        let account = home.account(&id).unwrap();
+        assert!(!account.signed_out);
+        assert_eq!(
+            home.account_setup_state(&id).unwrap().unwrap().phase,
+            marmot_account::AccountSetupPhase::KeyPackagePublicationStarted
+        );
+        assert_eq!(
+            home.load_nip46_session(&id)
+                .unwrap()
+                .unwrap()
+                .0
+                .public_key(),
+            communication_key
+        );
+        let rejected = relay
+            .attempted_events
+            .lock()
             .unwrap()
-            .account_id_hex,
-        id
-    );
-    let published = relay
-        .published_events
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|event| event.kind == KEY_PACKAGE_KIND)
-        .unwrap()
-        .clone();
-    assert_eq!(published.id, rejected);
-    let signed: Event = serde_json::from_str(&serde_json::to_string(&published).unwrap()).unwrap();
-    signed.verify().unwrap();
-    assert_eq!(signed.pubkey, peer.user.public_key());
-    runtime.shutdown_and_close().await.unwrap();
+            .iter()
+            .find(|event| event.kind == KEY_PACKAGE_KIND)
+            .unwrap()
+            .id
+            .clone();
+        runtime.shutdown_and_close().await.unwrap();
+        drop(session);
+        drop(runtime);
+        drop(app);
+        relay.allow_all_publish_kinds();
+        let app = open_app();
+        let runtime = app.runtime();
+        runtime.start().await.unwrap();
+        let restored = runtime.nip46_resume(&id).await.unwrap();
+        assert_eq!(restored.client_public_key().unwrap(), communication_key);
+        restored.connect_async().await.unwrap();
+        assert_eq!(
+            runtime
+                .nip46_login(restored, endpoints(), endpoints(), Vec::new())
+                .await
+                .unwrap()
+                .account_id_hex,
+            id
+        );
+        let published = relay
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| event.kind == KEY_PACKAGE_KIND)
+            .unwrap()
+            .clone();
+        assert_eq!(published.id, rejected);
+        let signed: Event =
+            serde_json::from_str(&serde_json::to_string(&published).unwrap()).unwrap();
+        signed.verify().unwrap();
+        assert_eq!(signed.pubkey, peer.user.public_key());
+        runtime.shutdown_and_close().await.unwrap();
+    }
     peer.close().await;
 }
 
@@ -1444,10 +1482,46 @@ async fn nip46_erase_retry() {
         MarmotAppConfig::white_noise(),
     );
     let runtime = app.runtime();
+    let host = Arc::new(TestExternalAccountSigner { keys: user.clone() });
+    app.pin_external_signer(&account.account_id_hex, user.public_key(), host.clone());
+    let cached = app
+        .account_signer_for_summary(&account)
+        .unwrap()
+        .as_nostr_signer();
     let session = runtime.nip46_resume(&account.label).await.unwrap();
+    let (_, owner) = session
+        .bind_account(&account.label, session.status().generation)
+        .unwrap();
     store
         .refuse
         .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    session.cancel();
+    session.unbind_account(None, Some(host), owner).unwrap();
+    assert_eq!(session.public_key(), Err(Nip46Error::Cancelled));
+    let mut unsigned = EventBuilder::new(Kind::Metadata, "{}").finalize_unsigned(user.public_key());
+    unsigned.ensure_id();
+    let expected = unsigned.id.unwrap();
+    let signed = tokio::time::timeout(Duration::from_secs(5), cached.sign_event(unsigned))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(signed.id, expected);
+
+    let session = runtime.nip46_resume(&account.label).await.unwrap();
+    session.forget_binding().unwrap();
+    assert_eq!(session.public_key(), Err(Nip46Error::LoggedOut));
+    assert!(!app.has_external_signer(&account.account_id_hex));
+    assert_eq!(
+        home.load_nip46_session(&account.label)
+            .unwrap()
+            .unwrap()
+            .0
+            .public_key(),
+        client.public_key()
+    );
+
+    let session = runtime.nip46_resume(&account.label).await.unwrap();
     assert_eq!(session.erase_local(), Err(Nip46Error::Storage));
     assert_eq!(session.public_key(), Err(Nip46Error::LoggedOut));
     assert!(!app.has_external_signer(&account.account_id_hex));
@@ -1465,6 +1539,115 @@ async fn nip46_erase_retry() {
         Err(AppError::Nip46(Nip46Error::Unavailable))
     ));
     runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_reconnect_keeps_binding() {
+    let peer = LoginPeer::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let user = peer.user.public_key();
+    let account = home.add_external_signer_account(&user.to_hex()).unwrap();
+    let client = Keys::generate();
+    let permissions = Nip46Session::permissions();
+    let record = Nip46SessionRecord {
+        version: 1,
+        user_public_key: account.account_id_hex.clone(),
+        remote_signer_public_key: peer.remote.public_key().to_hex(),
+        client_public_key: client.public_key().to_hex(),
+        relays: vec![peer.url.clone()],
+        name: "Resumed pairing".into(),
+        permission_version: permissions.version,
+        permissions: permissions.grants,
+    };
+    home.store_nip46_session(&account.label, &client, &record)
+        .unwrap();
+    let app = MarmotApp::with_relays_and_account_home_and_config(
+        dir.path(),
+        vec![],
+        home.clone(),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = app.runtime();
+    let host = Arc::new(TestExternalAccountSigner {
+        keys: peer.user.clone(),
+    });
+    app.pin_external_signer(&account.account_id_hex, user, host.clone());
+    let cached = app
+        .account_signer_for_summary(&account)
+        .unwrap()
+        .as_nostr_signer();
+    let session = runtime.nip46_resume(&account.label).await.unwrap();
+    let generation = session.status().generation;
+
+    let prior = Nip46SessionRecord {
+        name: "Prior record".into(),
+        ..record.clone()
+    };
+    home.store_nip46_session(&account.label, &client, &prior)
+        .unwrap();
+    let (previous, owner) = session.bind_account(&account.label, generation).unwrap();
+    assert!(matches!(&previous, Nip46SessionWrite::Existing(saved) if saved == &prior));
+    session
+        .detach_account_binding(
+            &AccountHome::open(dir.path().join("other-home")),
+            &account.account_id_hex,
+        )
+        .unwrap();
+    session
+        .detach_account_binding(&home, &client.public_key().to_hex())
+        .unwrap();
+    peer.hold_public_key
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut reconnect = Box::pin(session.connect_async());
+    assert!(futures::poll!(reconnect.as_mut()).is_pending());
+    assert_eq!(session.status().generation, generation);
+
+    session
+        .unbind_account(Some(&previous), Some(host), owner)
+        .unwrap();
+    let (retained_keys, retained_record) =
+        home.load_nip46_session(&account.label).unwrap().unwrap();
+    assert_eq!(retained_keys.public_key(), client.public_key());
+    assert_eq!(retained_record.name, record.name);
+    assert!(
+        runtime
+            .nip46_resume(&account.label)
+            .await
+            .unwrap()
+            .same_session(&session)
+    );
+
+    home.remove_nip46_session(&account.label, Nip46Removal::IncludingOrphaned)
+        .unwrap();
+    session
+        .detach_account_binding(&home, &account.account_id_hex)
+        .unwrap();
+    peer.public_key_release.notify_one();
+    let connected = tokio::time::timeout(Duration::from_secs(5), reconnect)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(connected, account.account_id_hex);
+    assert_eq!(session.status().generation, generation);
+    assert_eq!(session.status().state, Nip46State::Ready);
+    let mut unsigned = EventBuilder::new(Kind::Metadata, "{}").finalize_unsigned(user);
+    unsigned.ensure_id();
+    let signed = tokio::time::timeout(Duration::from_secs(5), cached.sign_event(unsigned))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(peer.signed_profiles.lock().unwrap().contains(&signed.id));
+    assert!(home.load_nip46_session(&account.label).unwrap().is_none());
+    assert!(
+        runtime
+            .nip46_resume(&account.label)
+            .await
+            .unwrap()
+            .same_session(&session)
+    );
+    runtime.shutdown_and_close().await.unwrap();
+    peer.close().await;
 }
 
 struct BindingHoldStore {
@@ -1509,6 +1692,99 @@ impl AccountSecretStore for BindingHoldStore {
     fn remove_secret(&self, account: &marmot_account::AccountSummary) -> AccountHomeResult<()> {
         self.inner.remove_secret(account)
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_claim_failure_unbinds() {
+    let peer = LoginPeer::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BindingHoldStore {
+        inner: LocalFileSecretStore::new(dir.path()),
+        hold_once: std::sync::atomic::AtomicBool::new(true),
+        entered: tokio::sync::Notify::new(),
+        released: std::sync::Mutex::new(false),
+        changed: std::sync::Condvar::new(),
+    });
+    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let app = MarmotApp::with_relays_and_account_home_and_config(
+        dir.path(),
+        vec!["wss://account-relay.example".into()],
+        home.clone(),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let user = peer.user.public_key();
+    let id = user.to_hex();
+    app.pin_external_signer(
+        &id,
+        user,
+        Arc::new(TestExternalAccountSigner {
+            keys: peer.user.clone(),
+        }),
+    );
+    let runtime = app.runtime();
+    let session = peer.session(&app);
+    tokio::time::timeout(Duration::from_secs(5), session.connect_async())
+        .await
+        .unwrap()
+        .unwrap();
+    let login = {
+        let runtime = runtime.clone();
+        let session = session.clone();
+        tokio::spawn(async move {
+            runtime
+                .nip46_login(session, Vec::new(), Vec::new(), Vec::new())
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), store.entered.notified())
+        .await
+        .expect("native binding must write its communication key before setup validation");
+    let account = home.account(&id).unwrap();
+    let journal = home.account_dir(&account.label).join(".account-setup.json");
+    let saved = journal.with_extension("saved");
+    std::fs::rename(&journal, &saved).unwrap();
+    std::fs::create_dir(&journal).unwrap();
+    *store.released.lock().unwrap() = true;
+    store.changed.notify_one();
+
+    let result = tokio::time::timeout(Duration::from_secs(10), login).await;
+    std::fs::remove_dir(&journal).unwrap();
+    std::fs::rename(&saved, &journal).unwrap();
+    let error = result.unwrap().unwrap().unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::AccountSetupRollback { source, cleanup }
+            if matches!(*source, AppError::MissingDefaultRelays)
+                && cleanup.iter().any(|cause| matches!(cause, AppError::AccountHome(AccountHomeError::Io(_))))
+    ));
+    assert_eq!(session.status().state, Nip46State::Disconnected);
+    assert!(home.load_nip46_session(&id).unwrap().is_none());
+    assert!(
+        !store
+            .has_secret_for_label(&format!(".nip46-client/{}", account.label))
+            .unwrap()
+    );
+    assert!(matches!(
+        runtime.nip46_resume(&id).await,
+        Err(AppError::Nip46(Nip46Error::Unavailable))
+    ));
+
+    let signer = app
+        .account_signer_for_summary(&account)
+        .unwrap()
+        .as_nostr_signer();
+    let mut unsigned = EventBuilder::new(Kind::Metadata, "{}").finalize_unsigned(user);
+    unsigned.ensure_id();
+    let expected = unsigned.id.unwrap();
+    let signed = tokio::time::timeout(Duration::from_secs(5), signer.sign_event(unsigned))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(signed.id, expected);
+    assert!(!peer.signed_profiles.lock().unwrap().contains(&expected));
+    runtime.shutdown_and_close().await.unwrap();
+    peer.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1669,6 +1945,7 @@ async fn nip46_disconnect_during_bind() {
             AfterDisconnect::ReconnectBeforeRollback => {
                 state == Nip46State::Ready
                     && matches!(reconnected, Some(Ok(ref user)) if user == &id)
+                    && app.has_external_signer(&id)
             }
         };
         runtime.shutdown_and_close().await.unwrap();

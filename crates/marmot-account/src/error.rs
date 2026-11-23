@@ -28,6 +28,8 @@ pub enum AccountHomeError {
     AccountIdMismatch,
     #[error("durable account setup state is missing")]
     AccountSetupStateMissing,
+    #[error("account setup attempt or phase no longer permits this operation")]
+    AccountSetupConflict,
     #[error("unsupported account secret storage backend: {0}")]
     UnsupportedSecretBackend(String),
     #[error("account secret store is not initialized: {0}")]

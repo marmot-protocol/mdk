@@ -970,30 +970,34 @@ async fn accounts_without_sibling_signout_commands_are_wiped_immediately() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
-        let account = match case {
-            Case::MissingSigner => home
-                .add_external_signer_account(
+        let (account, worker_setup) = match case {
+            Case::MissingSigner => (
+                home.add_external_signer_account(
                     &nostr::prelude::Keys::generate().public_key().to_hex(),
                 )
                 .unwrap(),
-            Case::SignedOut | Case::OnboardingGated => home.create_account("alice").unwrap(),
+                None,
+            ),
+            Case::SignedOut | Case::OnboardingGated => {
+                (home.create_account("alice").unwrap(), None)
+            }
             Case::OnboardingWorkerCommandGated => {
                 use nostr::prelude::ToBech32;
-                home.import_nostr_account_for_onboarding(
-                    &nostr::prelude::Keys::generate()
-                        .secret_key()
-                        .to_bech32()
-                        .unwrap(),
-                )
-                .unwrap()
-                .account()
-                .clone()
+                let (account, setup) = home
+                    .import_nostr_account_for_onboarding(
+                        &nostr::prelude::Keys::generate()
+                            .secret_key()
+                            .to_bech32()
+                            .unwrap(),
+                    )
+                    .unwrap()
+                    .into_parts();
+                (account, Some(setup))
             }
         };
         if matches!(case, Case::OnboardingGated) {
             home.begin_account_setup_with(
                 &account,
-                false,
                 marmot_account::AccountSetupKind::InteractiveIdentity,
                 marmot_account::AccountSetupPhase::LocalStateCreated,
             )
@@ -1002,7 +1006,7 @@ async fn accounts_without_sibling_signout_commands_are_wiped_immediately() {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = device_group_app_at(&dir, relay.clone());
         let runtime = MarmotAppRuntime::new(app.clone());
-        if matches!(case, Case::OnboardingWorkerCommandGated) {
+        if let Some(setup) = worker_setup {
             use crate::{OnboardingOptions, OnboardingStatus, OnboardingStep};
             use nostr::prelude::ToBech32;
             // Initialize a real attempt through the public runtime, then retain
@@ -1037,6 +1041,7 @@ async fn accounts_without_sibling_signout_commands_are_wiped_immediately() {
                 .unwrap();
             home.set_account_setup_phase(
                 &account.label,
+                &setup,
                 marmot_account::AccountSetupPhase::KeyPackagePublicationStarted,
             )
             .unwrap();

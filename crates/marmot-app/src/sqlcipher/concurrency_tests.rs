@@ -164,7 +164,7 @@ async fn generated_account_attention_waits_for_local_readiness() {
     use crate::{AccountAttentionState, AccountAttentionUnavailable, MarmotAppRuntime};
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let account = app.account_home().create_nostr_account_for_setup().unwrap();
+    let (account, _) = app.account_home().create_nostr_account_for_setup().unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
     let attention = runtime.subscribe_account_attention().await.unwrap();
     assert_eq!(attention.snapshot.accounts.len(), 1);
@@ -185,7 +185,7 @@ async fn generated_account_without_setup_context_retries_the_same_identity() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
     // Simulate a crash after identity creation but before setup context is saved.
-    let unfinished = app.account_home().create_nostr_account_for_setup().unwrap();
+    let (unfinished, _) = app.account_home().create_nostr_account_for_setup().unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.start().await.unwrap();
     assert!(!app.account_storage_path(&unfinished.label).exists());
@@ -395,7 +395,7 @@ async fn unreadable_unfinished_account_is_preserved_while_healthy_account_starts
         .await
         .unwrap()
         .account;
-    let unfinished = app.account_home().create_nostr_account_for_setup().unwrap();
+    let (unfinished, _) = app.account_home().create_nostr_account_for_setup().unwrap();
     app.account_storage(&unfinished.label).unwrap();
     app.account_home()
         .set_account_setup_context(

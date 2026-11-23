@@ -2967,6 +2967,7 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::AccountSessionBusy => "account_session_busy",
         AppError::AccountWorkerBusy => "account_worker_busy",
         AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
+        AppError::AccountSetupRollback { .. } => "account_setup_rollback",
         AppError::ChatPresentationNotReady => "chat_presentation_not_ready",
         AppError::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
         AppError::RuntimeBusy => "runtime_busy",
@@ -3060,6 +3061,7 @@ fn app_error(error: AppError) -> SubjectError {
         );
     }
     let category = match error {
+        AppError::AccountSetupRollback { .. } => SubjectFailureCategory::Environment,
         AppError::Nip46(ref error) => match error {
             Nip46Error::Invalid => SubjectFailureCategory::Protocol,
             Nip46Error::ProxyConfig | Nip46Error::Storage => SubjectFailureCategory::Environment,

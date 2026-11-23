@@ -48,6 +48,7 @@ fn initial_data(keys: Keys, name: String, relays: Vec<RelayUrl>) -> Data {
         approved: None,
         reviewed: false,
         verified: false,
+        binding_epoch: 0,
         status: Nip46Status {
             state: Nip46State::PermissionApproval,
             last_error: Some(Nip46Error::PermissionApprovalRequired),

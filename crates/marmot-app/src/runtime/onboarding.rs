@@ -19,9 +19,9 @@ mod relay_repair;
 mod single_device;
 
 /// Account setup's in-memory state: interactive onboarding and generated
-/// setup. Its fields are private to this module tree. `AccountManager` holds
-/// one handle for its hooks (reconcile, the teardown fence, removal and the
-/// two shutdown phases) and reaches nothing else through it.
+/// setup. Its fields are private to this module tree. `AccountManager` borrows
+/// the setup owner for admission and recovery and retains one shared handle
+/// for its worker-lifecycle hooks.
 #[derive(Clone)]
 pub(super) struct SetupState {
     generated_setup_local_transaction: Arc<Mutex<()>>,
@@ -44,6 +44,7 @@ pub(super) struct GeneratedTeardownFence {
 
 /// Account setup: interactive onboarding, its recovery and its sign-in
 /// notices, reached through `MarmotAppRuntime::account_setup`.
+/// Generated entry points borrow this owner for preparation and completion.
 ///
 /// It pairs setup's state with the account manager whose worker-lifecycle
 /// surface it reaches workers through. It borrows both, so a call made through
@@ -205,6 +206,93 @@ impl SetupState {
 impl<'a> AccountSetup<'a> {
     pub(super) fn new(state: &'a SetupState, manager: &'a AccountManager) -> Self {
         Self { state, manager }
+    }
+
+    pub(super) fn readiness(&self, account_ref: &str) -> Result<AccountSetupReadiness, AppError> {
+        let account = self.manager.resolve(account_ref)?;
+        if self
+            .onboarding_snapshot(account_ref)?
+            .is_some_and(|snapshot| !snapshot.ready || snapshot.cancellation_pending)
+        {
+            return Ok(AccountSetupReadiness::Initializing);
+        }
+        if self
+            .app()
+            .legacy_incomplete_setup_requires_recovery(&account.label)?
+        {
+            return Ok(AccountSetupReadiness::RecoveryRequired);
+        }
+        let Some(state) = self
+            .app()
+            .account_home()
+            .account_setup_state(&account.label)?
+        else {
+            return Ok(AccountSetupReadiness::NetworkReady);
+        };
+        Ok(match state.phase {
+            AccountSetupPhase::LocalStateCreated | AccountSetupPhase::CompensationPending => {
+                AccountSetupReadiness::Initializing
+            }
+            AccountSetupPhase::LocalReady => AccountSetupReadiness::LocalReady,
+            AccountSetupPhase::BootstrapPublicationStarted
+            | AccountSetupPhase::BootstrapPublicationConfirmed
+            | AccountSetupPhase::KeyPackagePublicationStarted
+            | AccountSetupPhase::KeyPackagePublicationConfirmed => {
+                AccountSetupReadiness::Publishing
+            }
+        })
+    }
+
+    pub(super) async fn resume_pending_setup(&self, account_id: &str) -> Result<(), AppError> {
+        let home = self.app().account_home();
+        let account = match home.account(account_id) {
+            Ok(account) => account,
+            Err(AccountHomeError::UnknownAccount(_)) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        refuse_unlinked(&account)?;
+        if let Some(pending) = home.account_setup_state(&account.label)?
+            && pending.phase == AccountSetupPhase::CompensationPending
+        {
+            self.resume_setup_compensation(&account, &pending).await?;
+        }
+        Ok(())
+    }
+
+    async fn resume_setup_compensation(
+        &self,
+        account: &AccountSummary,
+        pending: &AccountSetupState,
+    ) -> Result<(), AppError> {
+        let background = self
+            .state
+            .fence_generated_setup(&account.account_id_hex)
+            .await;
+        // Admission waits for foreground work without cancelling its own native adoption.
+        let foreground = self
+            .app()
+            .onboarding_transaction(&account.account_id_hex)
+            .lock_owned()
+            .await;
+        let fence = GeneratedTeardownFence {
+            _background: background,
+            _foreground: foreground,
+        };
+        let _preparation = self.state.fence_generated_removal(&fence).await;
+        let home = self.app().account_home();
+        let current = match home.account(&account.account_id_hex) {
+            Ok(current) => current,
+            Err(AccountHomeError::UnknownAccount(_)) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        refuse_unlinked(&current)?;
+        match home.account_setup_state(&current.label)? {
+            None => Ok(()),
+            Some(state) if state == *pending => {
+                self.manager.compensate_setup(&current, pending, None).await
+            }
+            Some(_) => Err(AppError::AccountSetupRetryRequired),
+        }
     }
 
     fn app(&self) -> &'a MarmotApp {
@@ -667,6 +755,8 @@ struct OnboardingCheckpoint {
     #[serde(default)]
     setup_cleanup_pending: bool,
     #[serde(default)]
+    setup_attempt: Option<AccountSetupState>,
+    #[serde(default)]
     attempt_start_revision: u64,
     // A host-selected discovery set is used as given, without public indexers,
     // so a host can still look past an unreachable indexer.
@@ -796,6 +886,7 @@ impl OnboardingCheckpoint {
             single_device_acknowledged: false,
             stale_device_acknowledgment: None,
             setup_cleanup_pending: false,
+            setup_attempt: None,
             attempt_start_revision: 0,
             explicit_discovery: false,
             reported_pauses: Vec::new(),
@@ -1312,11 +1403,23 @@ impl<'a> SetupRecords<'a> {
         &self,
         account_ref: &str,
     ) -> Result<Option<OnboardingCheckpoint>, AppError> {
+        self.refuse_pending_setup(account_ref)?;
         let c = self.read_onboarding_checkpoint(account_ref)?;
         if c.as_ref().is_some_and(|c| c.snapshot.cancellation_pending) {
             return Err(onboarding_error());
         }
         Ok(c)
+    }
+    fn refuse_pending_setup(&self, account_ref: &str) -> Result<(), AppError> {
+        if self
+            .app
+            .account_home()
+            .account_setup_state(account_ref)?
+            .is_some_and(|s| s.phase == AccountSetupPhase::CompensationPending)
+        {
+            return Err(onboarding_error());
+        }
+        Ok(())
     }
     fn read_onboarding_checkpoint(
         &self,
@@ -1374,6 +1477,26 @@ impl<'a> SetupRecords<'a> {
             &account.account_id_hex,
         )?))
     }
+    fn cancelled_setup_proof(
+        &self,
+        account: &AccountSummary,
+        setup: &AccountSetupState,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        let Some(bytes) = self
+            .app
+            .account_home()
+            .cancelled_account_onboarding(&account.label)?
+        else {
+            return Ok(None);
+        };
+        let checkpoint = decode_onboarding_checkpoint(&bytes, &account.account_id_hex)?;
+        Ok((checkpoint.snapshot.cancellation_pending
+            && checkpoint
+                .setup_attempt
+                .as_ref()
+                .is_some_and(|state| state.attempt_id == setup.attempt_id))
+        .then_some(bytes))
+    }
     fn read_cancelled_onboarding_checkpoint(
         &self,
         account_ref: &str,
@@ -1391,47 +1514,70 @@ impl<'a> SetupRecords<'a> {
     }
     pub(super) fn require_onboarding_complete(&self, account_ref: &str) -> Result<(), AppError> {
         self.require_onboarding_complete_for(&self.resolve(account_ref)?)
+            .map(drop)
     }
     pub(super) fn require_onboarding_complete_for(
         &self,
         account: &AccountSummary,
-    ) -> Result<(), AppError> {
-        let required = match self.read_onboarding_checkpoint_for(account)? {
-            Some(c) => !c.snapshot.ready || c.snapshot.cancellation_pending,
-            None => self
-                .app
-                .account_home()
-                .account_setup_state(&account.label)?
-                .is_some_and(|s| s.kind == AccountSetupKind::InteractiveIdentity),
-        };
-        if required {
+    ) -> Result<Option<(AccountSetupState, Vec<u8>)>, AppError> {
+        let setup = self
+            .app
+            .account_home()
+            .account_setup_state(&account.label)?;
+        if setup
+            .as_ref()
+            .is_some_and(|s| s.phase == AccountSetupPhase::CompensationPending)
+        {
             return Err(AppError::OnboardingRequired);
         }
-        Ok(())
+        if let Some(checkpoint) = self.read_onboarding_checkpoint_for(account)? {
+            if !checkpoint.snapshot.ready || checkpoint.snapshot.cancellation_pending {
+                return Err(AppError::OnboardingRequired);
+            }
+            return Ok(None);
+        }
+        let Some(setup) = setup.filter(|state| state.kind == AccountSetupKind::InteractiveIdentity)
+        else {
+            return Ok(None);
+        };
+        let bytes = self
+            .cancelled_setup_proof(account, &setup)?
+            .ok_or(AppError::OnboardingRequired)?;
+        Ok(Some((setup, bytes)))
     }
     pub(super) fn onboarding_worker_allowed(&self, account_ref: &str) -> Result<bool, AppError> {
         if self.onboarding_recovery_pending(account_ref)? {
             return Ok(false);
         }
-        let checkpoint = self.read_onboarding_checkpoint(account_ref)?;
+        let account = self.resolve(account_ref)?;
+        let checkpoint = self.read_onboarding_checkpoint_for(&account)?;
         if checkpoint
             .as_ref()
             .is_some_and(|c| c.snapshot.cancellation_pending)
         {
             return Ok(false);
         }
-        if checkpoint.is_none()
-            && self
-                .app
-                .account_home()
-                .account_setup_state(account_ref)?
-                .is_some_and(|s| {
-                    s.kind == AccountSetupKind::InteractiveIdentity
-                        || (s.kind == AccountSetupKind::GeneratedIdentity
-                            && s.phase == AccountSetupPhase::LocalStateCreated)
-                })
+        if let Some(setup) = self
+            .app
+            .account_home()
+            .account_setup_state(&account.label)?
         {
-            return Ok(false);
+            if setup.phase == AccountSetupPhase::CompensationPending {
+                return Ok(false);
+            }
+            if checkpoint.is_none() {
+                match setup.kind {
+                    AccountSetupKind::InteractiveIdentity => {
+                        return Ok(self.cancelled_setup_proof(&account, &setup)?.is_some());
+                    }
+                    AccountSetupKind::GeneratedIdentity
+                        if setup.phase == AccountSetupPhase::LocalStateCreated =>
+                    {
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
         }
         Ok(checkpoint.is_none_or(|c| {
             c.snapshot.ready
@@ -1539,15 +1685,19 @@ impl AccountSetup<'_> {
         let _state = state.lock().unwrap_or_else(|p| p.into_inner());
         self.require_live_onboarding_attempt(checkpoint)?;
         let home = self.app().account_home();
-        // A later legacy sign-in may have started after completion was
-        // persisted. Never clear its unfinished setup as housekeeping.
-        if home
-            .account_setup_state(&checkpoint.snapshot.account_id_hex)?
-            .is_none_or(|s| s.phase == AccountSetupPhase::KeyPackagePublicationConfirmed)
+        // Clean up only the journal captured by the ready checkpoint.
+        if let Some(setup) = checkpoint.setup_attempt.as_ref()
+            && home
+                .account_setup_state(&checkpoint.snapshot.account_id_hex)?
+                .is_some_and(|s| {
+                    s.attempt_id == setup.attempt_id
+                        && s.phase == AccountSetupPhase::KeyPackagePublicationConfirmed
+                })
         {
-            home.complete_account_setup(&checkpoint.snapshot.account_id_hex)?;
+            home.complete_account_setup(&checkpoint.snapshot.account_id_hex, setup)?;
         }
         checkpoint.setup_cleanup_pending = false;
+        checkpoint.setup_attempt = None;
         self.save_onboarding_locked(checkpoint)
     }
     async fn await_while_onboarding_live<T>(
@@ -1917,18 +2067,21 @@ impl AccountSetup<'_> {
         &self,
         account: &AccountSummary,
         options: OnboardingOptions,
+        admitted: Option<AccountSetupState>,
     ) -> Result<OnboardingSnapshot, AppError> {
+        if admitted
+            .as_ref()
+            .is_some_and(|s| s.phase == AccountSetupPhase::CompensationPending)
+        {
+            return Err(onboarding_error());
+        }
         if let Some(mut existing) = self.records().onboarding_checkpoint(&account.label)? {
             if existing.snapshot.ready
-                && self
-                    .app()
-                    .account_home()
-                    .account_setup_state(&account.label)?
-                    .is_some_and(|s| {
-                        s.kind != AccountSetupKind::InteractiveIdentity
-                            && !(existing.setup_cleanup_pending
-                                && s.phase == AccountSetupPhase::KeyPackagePublicationConfirmed)
-                    })
+                && admitted.as_ref().is_some_and(|s| {
+                    s.kind != AccountSetupKind::InteractiveIdentity
+                        && !(existing.setup_cleanup_pending
+                            && s.phase == AccountSetupPhase::KeyPackagePublicationConfirmed)
+                })
             {
                 return Err(onboarding_error());
             }
@@ -1945,6 +2098,7 @@ impl AccountSetup<'_> {
                 existing.single_device_acknowledged = false;
                 existing.stale_device_acknowledgment = None;
                 existing.snapshot.single_device_notice = None;
+                existing.setup_attempt = admitted;
                 for index in 0..STEP_COUNT {
                     let step = existing.snapshot.steps[index].step;
                     existing.set(step, OnboardingStatus::Pending, Vec::new());
@@ -1953,10 +2107,6 @@ impl AccountSetup<'_> {
             }
             return Ok(existing.snapshot);
         }
-        let setup = self
-            .app()
-            .account_home()
-            .account_setup_state(&account.label)?;
         let cancelled = match self
             .records()
             .read_cancelled_onboarding_checkpoint_for(account)?
@@ -1967,11 +2117,11 @@ impl AccountSetup<'_> {
             }
             Some(_) => return Err(onboarding_error()),
         };
-        if (setup
+        if (admitted
             .as_ref()
             .is_some_and(|s| s.kind != AccountSetupKind::InteractiveIdentity)
             && cancelled.is_none())
-            || (setup.is_none() && !account.signed_out)
+            || (admitted.is_none() && !account.signed_out)
         {
             return Err(onboarding_error());
         }
@@ -1992,6 +2142,7 @@ impl AccountSetup<'_> {
         let attempt = high_water.checked_add(1).ok_or_else(onboarding_error)?;
         let mut checkpoint =
             OnboardingCheckpoint::new_attempt(account, options, attempt, high_water);
+        checkpoint.setup_attempt = admitted;
         checkpoint.snapshot.recovery_epoch = cancelled
             .as_ref()
             .and_then(|c| c.snapshot.recovery_epoch.clone());
@@ -2011,29 +2162,27 @@ impl AccountSetup<'_> {
         self.shared().lifecycle().ensure_running()?;
         self.validate_onboarding_options(&options)?;
         let id = AccountHome::account_id_for_secret(&nsec)?;
+        self.resume_pending_setup(&id).await?;
         let transaction = self.app().onboarding_transaction(&id);
         let _transaction = transaction.lock().await;
         let _workers = self.manager.lock_worker_transaction().await;
-        let snapshot = match self.app().account_home().account(&id) {
+        let home = self.app().account_home();
+        let snapshot = match home.account(&id) {
             Ok(account) if account.local_signing => {
                 refuse_unlinked(&account)?;
                 // Reset a completed checkpoint before import clears signed_out.
                 // A crash between the two writes must leave the account gated.
-                let snapshot = self.initialize_onboarding(&account, options)?;
-                self.app()
-                    .account_home()
-                    .import_account_idempotent(&account.label, &nsec)?;
+                let setup = home.account_setup_state(&account.label)?;
+                let snapshot = self.initialize_onboarding(&account, options, setup)?;
+                home.import_account_idempotent(&account.label, &nsec)?;
                 snapshot
             }
             Ok(_) => return Err(onboarding_error()),
             Err(AccountHomeError::UnknownAccount(_)) => {
-                let account = self
-                    .app()
-                    .account_home()
+                let (account, setup) = home
                     .import_nostr_account_for_onboarding(&nsec)?
-                    .account()
-                    .clone();
-                self.initialize_onboarding(&account, options)?
+                    .into_parts();
+                self.initialize_onboarding(&account, options, Some(setup))?
             }
             Err(error) => return Err(error.into()),
         };
@@ -2062,45 +2211,30 @@ impl AccountSetup<'_> {
         {
             return Err(AppError::ExternalSignerMismatch);
         }
+        self.resume_pending_setup(&id).await?;
         let transaction = self.app().onboarding_transaction(&id);
         let _transaction = transaction.lock().await;
         let _workers = self.manager.lock_worker_transaction().await;
-        // Existing identities must be gated before promotion can clear their
-        // signed-out state, and before signer registration makes them runnable.
-        let snapshot = match self.app().account_home().account(&id) {
+        let home = self.app().account_home();
+        let (account, setup) = match home.account(&id) {
             Ok(account) => {
                 refuse_unlinked(&account)?;
-                let snapshot = self.initialize_onboarding(&account, options)?;
-                self.app()
-                    .account_home()
-                    .add_external_signer_account(&public_key)?;
-                snapshot
+                if account.local_signing {
+                    return Err(onboarding_error());
+                }
+                if account.external_signing {
+                    let setup = home.account_setup_state(&account.label)?;
+                    (account, setup)
+                } else {
+                    home.add_external_for_onboarding(&public_key)?
+                }
             }
             Err(AccountHomeError::UnknownAccount(_)) => {
-                // Record ownership of this setup before making the external
-                // account visible, just as the nsec import path does.
-                let pending = AccountSummary {
-                    label: id.clone(),
-                    account_id_hex: id.clone(),
-                    local_signing: false,
-                    external_signing: true,
-                    signed_out: false,
-                    unlinked: false,
-                };
-                self.app().account_home().begin_account_setup_with(
-                    &pending,
-                    false,
-                    AccountSetupKind::InteractiveIdentity,
-                    AccountSetupPhase::LocalStateCreated,
-                )?;
-                let account = self
-                    .app()
-                    .account_home()
-                    .add_external_signer_account(&public_key)?;
-                self.initialize_onboarding(&account, options)?
+                home.add_external_for_onboarding(&public_key)?
             }
             Err(error) => return Err(error.into()),
         };
+        let snapshot = self.initialize_onboarding(&account, options, setup)?;
         self.manager.clear_startup_retry(&snapshot.account_id_hex);
         self.manager
             .reconcile_locked_report_for(Some(&snapshot.account_id_hex))
@@ -2126,16 +2260,45 @@ impl AccountSetup<'_> {
     }
     async fn run_onboarding_locked(&self, c: &mut OnboardingCheckpoint) -> Result<(), AppError> {
         self.shared().lifecycle().ensure_running()?;
+        let current = self
+            .app()
+            .account_home()
+            .account_setup_state(&c.snapshot.account_id_hex)?;
+        if current
+            .as_ref()
+            .is_some_and(|s| s.phase == AccountSetupPhase::CompensationPending)
+        {
+            return Err(onboarding_error());
+        }
         if c.snapshot.ready {
             // Completion is checkpointed before journal cleanup; a crash in
             // between must leave only idempotent housekeeping to resume.
             if c.setup_cleanup_pending {
+                if c.setup_attempt.is_none() {
+                    c.setup_attempt = current.filter(|s| s.attempt_id.is_none());
+                }
                 #[cfg(test)]
                 self.await_onboarding_test_hold(&self.state.onboarding_test_holds.setup_cleanup)
                     .await;
                 self.finish_live_onboarding_setup_cleanup(c)?;
             }
             return Ok(());
+        }
+        match (&c.setup_attempt, current) {
+            (Some(captured), Some(current)) if captured.attempt_id == current.attempt_id => {}
+            // Resume an old checkpoint or one interrupted between journal creation and its save.
+            (None, Some(current))
+                if current.attempt_id.is_none()
+                    || (current.origin == AccountSetupOrigin::LegacyUnknown
+                        && current.phase == AccountSetupPhase::KeyPackagePublicationStarted
+                        && c.snapshot.steps[OnboardingStep::KeyPackage.index()].status
+                            == OnboardingStatus::Checking) =>
+            {
+                c.setup_attempt = Some(current);
+                self.save_onboarding(c)?;
+            }
+            (None, None) => {}
+            _ => return Err(onboarding_error()),
         }
         if !c.approved && c.snapshot.proposal.is_none() {
             // A long pause cannot turn a historical reachability check into
@@ -2211,31 +2374,29 @@ impl AccountSetup<'_> {
                         vec![finding(OnboardingIssue::SignerUnavailable)],
                     );
                 } else {
-                    self.admit_live_onboarding_mutation(c, || {
-                        if self
-                            .app()
-                            .account_home()
-                            .account_setup_state(&account.label)?
-                            .is_none()
-                        {
-                            self.app().account_home().begin_account_setup_with(
+                    let home = self.app().account_home();
+                    let setup = self.admit_live_onboarding_mutation(c, || {
+                        Ok(match c.setup_attempt.as_ref() {
+                            Some(setup) => home.set_account_setup_phase(
+                                &account.label,
+                                setup,
+                                AccountSetupPhase::KeyPackagePublicationStarted,
+                            )?,
+                            None => home.begin_account_setup_with(
                                 &account,
-                                false,
                                 if account.external_signing {
                                     AccountSetupKind::ExternalSigner
                                 } else {
                                     AccountSetupKind::ImportedIdentity
                                 },
                                 AccountSetupPhase::KeyPackagePublicationStarted,
-                            )?;
-                        } else {
-                            self.app().account_home().set_account_setup_phase(
-                                &account.label,
-                                AccountSetupPhase::KeyPackagePublicationStarted,
-                            )?;
-                        }
-                        Ok(())
+                            )?,
+                        })
                     })?;
+                    if c.setup_attempt.is_none() {
+                        c.setup_attempt = Some(setup);
+                        self.save_onboarding(c)?;
+                    }
                     if account.external_signing {
                         c.set(step, OnboardingStatus::WaitingForSigner, Vec::new());
                         self.save_onboarding(c)?;
@@ -2244,21 +2405,25 @@ impl AccountSetup<'_> {
                     #[cfg(test)]
                     self.await_onboarding_test_hold(&self.state.onboarding_test_holds.activation)
                         .await;
+                    let setup = c.setup_attempt.as_ref().ok_or_else(onboarding_error)?;
                     let account = self.admit_live_onboarding_mutation(c, || {
-                        Ok(self
-                            .app()
-                            .account_home()
-                            .set_account_signed_out(&account.label, false)?)
+                        home.set_account_setup_phase(
+                            &account.label,
+                            setup,
+                            AccountSetupPhase::KeyPackagePublicationStarted,
+                        )?;
+                        Ok(home.set_account_signed_out(&account.label, false)?)
                     })?;
                     match self
                         .manager
-                        .publish_initial_key_package_for_account(&account)
+                        .publish_setup_key_package_for(&account, Some(setup))
                         .await
                     {
                         Ok(_) => {
                             self.admit_live_onboarding_mutation(c, || {
-                                self.app().account_home().set_account_setup_phase(
+                                home.set_account_setup_phase(
                                     &account.label,
+                                    setup,
                                     AccountSetupPhase::KeyPackagePublicationConfirmed,
                                 )?;
                                 Ok(())
@@ -3526,9 +3691,13 @@ impl AccountSetup<'_> {
             self.save_onboarding(c)?;
         }
         let event = c.signed_repair.clone().ok_or_else(onboarding_error)?;
-        if self.require_live_onboarding_attempt(c).is_err() {
-            return Ok(false);
-        }
+        self.admit_live_onboarding_mutation(c, || {
+            self.manager.mark_bootstrap_phase(
+                &account.label,
+                c.setup_attempt.as_ref(),
+                AccountSetupPhase::BootstrapPublicationStarted,
+            )
+        })?;
         // Repairs publish where they did before indexers were searched: the
         // host's discovery relays and the account's declared relays. Indexers
         // pick up replaceable records from those relays themselves.

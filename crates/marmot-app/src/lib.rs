@@ -2199,6 +2199,25 @@ impl MarmotApp {
         network_proxy::socks5_proxy().map_err(network_proxy::config_error)?;
         let root = root.as_ref().to_path_buf();
         let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
+        if account_home.root() != root.as_path() {
+            let leased_root = if root.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                root.as_path()
+            };
+            let home_root = if account_home.root().as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                account_home.root()
+            };
+            if std::fs::canonicalize(leased_root)? != std::fs::canonicalize(home_root)? {
+                return Err(AppError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "account home must share the leased runtime root",
+                )));
+            }
+        }
+        account_home.resume_wipe_cleanup()?;
         audit_log::cleanup_legacy_audit_logs(&root);
         let app =
             Self::with_relays_and_account_home_and_config(&root, relay_urls, account_home, config);
@@ -2357,7 +2376,7 @@ impl MarmotApp {
         let relay_plane_for_open = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
-            .map(runtime::RuntimeLifecycle::begin_account_open)
+            .map(|lifecycle| lifecycle.begin_account_open(&account.account_id_hex))
             .transpose()?;
         // Only a starting worker records stage spans; other opens pass `None`.
         let enter_stage = |progress: Option<&AccountStartupProgress>, stage| {
@@ -2367,8 +2386,20 @@ impl MarmotApp {
         };
         enter_stage(startup_progress, AccountStartupStage::OpenQueued);
         let blocking_progress = startup_progress.cloned();
-        let open = blocking_app_task(move || {
-            let _permit = permit;
+        // Locals drop in reverse declaration order, including during restore cancellation.
+        let _open_permit;
+        let open;
+        (open, _open_permit) = blocking_app_task(move || {
+            let open_permit = permit;
+            if app
+                .account_home()
+                .account_setup_state(&label)?
+                .is_some_and(|setup| {
+                    setup.phase == marmot_account::AccountSetupPhase::CompensationPending
+                })
+            {
+                return Err(AppError::AccountSetupRetryRequired);
+            }
             enter_stage(
                 blocking_progress.as_ref(),
                 AccountStartupStage::AccountState,
@@ -2379,7 +2410,9 @@ impl MarmotApp {
             #[cfg(test)]
             app.local_open_gates
                 .wait(&label, AccountStartupStage::SessionOpen);
-            open
+            // Detached task outputs drop tuple fields in order: release the
+            // opened engine and session guard before notifying teardown.
+            open.map(|open| (open, open_permit))
         })
         .await?;
         enter_stage(startup_progress, AccountStartupStage::ClientRestore);
@@ -5407,6 +5440,15 @@ impl MarmotApp {
         defer_group_hydration: bool,
     ) -> Result<OpenAppAccount, AppError> {
         let account = self.account_home().account(label)?;
+        if self
+            .account_home()
+            .account_setup_state(&account.label)?
+            .is_some_and(|setup| {
+                setup.phase == marmot_account::AccountSetupPhase::CompensationPending
+            })
+        {
+            return Err(AppError::AccountSetupRetryRequired);
+        }
         // Account refs may be labels, hex pubkeys, or npubs. Ownership is keyed
         // by the canonical stored label so aliases cannot open a second engine.
         let label = account.label.as_str();

@@ -889,7 +889,7 @@ impl MarmotAppRuntime {
                 return Err(ConversationWindowError::InvalidLimit);
             }
             let account = self.accounts.resolve(account_ref)?;
-            self.accounts.setup_records().require_onboarding_complete_for(&account)?;
+            self.accounts.setup_records().require_onboarding_complete_for(&account).map(drop)?;
             if !account.can_sign() {
                 return Err(
                     AppError::from(marmot_account::AccountHomeError::SecretNotFound(

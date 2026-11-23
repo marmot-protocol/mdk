@@ -175,9 +175,9 @@ impl MarmotAppRuntime {
                 binding
                     .session
                     .unbind_account(
-                        &binding.previous,
+                        Some(&binding.previous),
                         binding.previous_signer,
-                        binding.generation,
+                        binding.owner,
                     )
                     .map_err(AppError::from)
             })
@@ -387,7 +387,7 @@ impl AccountManager {
         if public_key.to_hex() != account.account_id_hex {
             return Err(Nip46Error::Mismatch.into());
         }
-        let previous = session.bind_account(&account.label, generation)?;
+        let (previous, owner) = session.bind_account(&account.label, generation)?;
         let signer = session.registered_signer();
         let previous_signer =
             self.app
@@ -401,7 +401,7 @@ impl AccountManager {
         }
         Ok(Some(Nip46Binding {
             session,
-            generation,
+            owner,
             previous,
             previous_signer,
         }))

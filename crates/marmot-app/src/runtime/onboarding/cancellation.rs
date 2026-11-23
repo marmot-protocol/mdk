@@ -94,12 +94,15 @@ impl AccountSetup<'_> {
             .account_setup_state(&account.label)?;
         if setup
             .as_ref()
-            .is_some_and(|s| s.account_id_hex != account.account_id_hex)
+            .is_some_and(|s| s.phase == AccountSetupPhase::CompensationPending)
         {
             return Err(onboarding_error());
         }
         if checkpoint.snapshot.cancellation_pending {
             return Ok(Some((account, checkpoint.attempt())));
+        }
+        if checkpoint.setup_attempt.is_none() {
+            checkpoint.setup_attempt = setup.filter(|s| s.attempt_id.is_none());
         }
         checkpoint.snapshot.cancellation_pending = true;
         checkpoint.snapshot.ready = false;
@@ -218,6 +221,7 @@ impl AccountSetup<'_> {
         if checkpoint.attempt() != attempt || !checkpoint.snapshot.cancellation_pending {
             return Ok(());
         }
+        self.records().refuse_pending_setup(&account.label)?;
         self.app()
             .account_home()
             .set_account_signed_out(&account.label, true)?;
@@ -241,22 +245,6 @@ impl AccountSetup<'_> {
             )
             .await?;
             self.app().drop_account_caches(&account.label);
-            let setup = self
-                .app()
-                .account_home()
-                .account_setup_state(&account.label)?;
-            if let Some(setup) = setup.filter(|s| s.kind == AccountSetupKind::InteractiveIdentity) {
-                self.app().account_home().begin_account_setup_with(
-                    account,
-                    setup.reused_account_id_credential,
-                    if account.local_signing {
-                        AccountSetupKind::ImportedIdentity
-                    } else {
-                        AccountSetupKind::ExternalSigner
-                    },
-                    setup.phase,
-                )?;
-            }
             self.app()
                 .account_home()
                 .archive_account_onboarding(&account.label)?;

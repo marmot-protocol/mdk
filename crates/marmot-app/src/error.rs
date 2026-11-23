@@ -464,6 +464,12 @@ pub enum AppError {
     AccountSetupRecoveryRequired,
     #[error("durable account setup can be resumed by retrying the original operation")]
     AccountSetupRetryRequired,
+    #[error("account setup failed: {source}; rollback failed: {}", SetupCleanupDisplay(.cleanup))]
+    AccountSetupRollback {
+        #[source]
+        source: Box<AppError>,
+        cleanup: Vec<AppError>,
+    },
     #[error("onboarding action is unavailable or stale")]
     OnboardingActionUnavailable,
     #[error("account must complete interactive onboarding")]
@@ -484,6 +490,20 @@ pub enum AppError {
     ReactionNotFound,
     #[error("transport event stream closed")]
     TransportClosed,
+}
+
+struct SetupCleanupDisplay<'a>(&'a [AppError]);
+
+impl std::fmt::Display for SetupCleanupDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, error) in self.0.iter().enumerate() {
+            if index != 0 {
+                f.write_str("; ")?;
+            }
+            std::fmt::Display::fmt(error, f)?;
+        }
+        Ok(())
+    }
 }
 
 /// The directory's errors convert back to the `AppError` they replaced: the
@@ -826,6 +846,7 @@ impl AppError {
             Self::OnboardingActionUnavailable => "onboarding_action_unavailable",
             Self::OnboardingRequired => "onboarding_required",
             Self::AccountSetupRetryRequired => "account_setup_retry_required",
+            Self::AccountSetupRollback { .. } => "account_setup_rollback",
             Self::AccountSetupResetNotApplicable => "account_setup_reset_not_applicable",
             Self::AccountSetupKeyPackageRecoveryAvailable => {
                 "account_setup_key_package_recovery_available"
@@ -845,6 +866,12 @@ impl AppError {
         }
         match self {
             Self::Storage(error) => storage_error_class(error),
+            Self::Nip46(crate::Nip46Error::Storage) => SyncErrorClass::Storage,
+            Self::AccountSetupRollback { source, cleanup } => cleanup
+                .iter()
+                .map(Self::sync_error_class)
+                .find(|class| *class != SyncErrorClass::Unknown)
+                .unwrap_or_else(|| source.sync_error_class()),
             Self::Sqlite(error) => match error.sqlite_error_code() {
                 Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
                     SyncErrorClass::StorageBusy
@@ -888,6 +915,18 @@ impl AppError {
         match self {
             Self::Account(error) => error.as_engine_error(),
             Self::Session(error) => Some(error.as_engine_error()),
+            _ => None,
+        }
+    }
+
+    /// Typed NIP-46 cause, preferring rollback failures over the setup failure.
+    pub fn as_nip46_error(&self) -> Option<&crate::Nip46Error> {
+        match self {
+            Self::Nip46(error) => Some(error),
+            Self::AccountSetupRollback { source, cleanup } => cleanup
+                .iter()
+                .find_map(Self::as_nip46_error)
+                .or_else(|| source.as_nip46_error()),
             _ => None,
         }
     }
@@ -974,6 +1013,7 @@ fn account_home_error_kind(error: &AccountHomeError) -> &'static str {
         AccountHomeError::InvalidAccountLabel(_) => "account_home_invalid_account_label",
         AccountHomeError::AccountIdMismatch => "account_home_account_id_mismatch",
         AccountHomeError::AccountSetupStateMissing => "account_home_setup_state_missing",
+        AccountHomeError::AccountSetupConflict => "account_home_setup_conflict",
         AccountHomeError::UnsupportedSecretBackend(_) => "account_home_unsupported_secret_backend",
         AccountHomeError::SecretStoreNotInitialized(_) => {
             "account_home_secret_store_not_initialized"
@@ -1014,10 +1054,31 @@ fn storage_error_class(error: &StorageError) -> SyncErrorClass {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountCatchUpFailure, AccountError, AppError, StorageError};
-    use crate::SyncFailureClassification;
+    use super::{AccountCatchUpFailure, AccountError, AccountHomeError, AppError, StorageError};
+    use crate::{Nip46Error, SyncFailureClassification};
     use cgka_traits::error::EngineError;
     use cgka_traits::types::{EpochId, GroupId};
+
+    #[test]
+    fn rollback_reports_all_causes() {
+        let error = AppError::AccountSetupRollback {
+            source: Box::new(AppError::Nip46(Nip46Error::Unavailable)),
+            cleanup: vec![
+                AppError::AccountHome(AccountHomeError::AccountSetupConflict),
+                AppError::Nip46(Nip46Error::Storage),
+            ],
+        };
+        assert_eq!(
+            error.to_string(),
+            "account setup failed: remote signer unavailable; rollback failed: \
+             account setup attempt or phase no longer permits this operation; \
+             NIP-46 credential storage failed"
+        );
+        let source = std::error::Error::source(&error).expect("original setup failure");
+        assert_eq!(source.to_string(), "remote signer unavailable");
+        assert_eq!(error.privacy_safe_kind(), "account_setup_rollback");
+        assert_eq!(error.sync_error_class(), crate::SyncErrorClass::Storage);
+    }
 
     #[test]
     fn missing_welcome_key_package() {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::{KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST};
 use async_trait::async_trait;
 use cgka_traits::{MemberId, TransportAdapterError};
 use nostr::prelude::{FinalizeEvent, ToBech32};
@@ -1310,12 +1311,12 @@ async fn onboarding_completed_checkpoint_does_not_hide_or_clear_later_setup() {
     }
     manager.account_setup().save_onboarding(&mut c).unwrap();
     let account = manager.resolve(&id).unwrap();
-    manager
-        .app
-        .account_home()
+    let home = manager.app.account_home();
+    let original = c.setup_attempt.clone().unwrap();
+    home.complete_account_setup(&id, &original).unwrap();
+    let later = home
         .begin_account_setup_with(
             &account,
-            false,
             AccountSetupKind::ImportedIdentity,
             AccountSetupPhase::KeyPackagePublicationStarted,
         )
@@ -1360,10 +1361,37 @@ async fn onboarding_completed_checkpoint_does_not_hide_or_clear_later_setup() {
             .phase,
         AccountSetupPhase::KeyPackagePublicationStarted
     );
+    let later = home
+        .set_account_setup_phase(
+            &id,
+            &later,
+            AccountSetupPhase::KeyPackagePublicationConfirmed,
+        )
+        .unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    c.setup_cleanup_pending = true;
+    c.setup_attempt = Some(original);
+    manager.account_setup().save_onboarding(&mut c).unwrap();
+    assert!(
+        manager
+            .account_setup()
+            .run_onboarding(&id)
+            .await
+            .unwrap()
+            .ready
+    );
+    assert_eq!(
+        home.account_setup_state(&id).unwrap().as_ref(),
+        Some(&later)
+    );
     manager
         .app
         .account_home()
-        .complete_account_setup(&id)
+        .complete_account_setup(&id, &later)
         .unwrap();
     crate::tests::account_database_from_an_older_build(&manager.app, &id);
     assert_eq!(
@@ -4970,7 +4998,11 @@ async fn completed_checkpoint_resumes_interrupted_journal_cleanup() {
     manager
         .app
         .account_home()
-        .set_account_setup_phase(&id, AccountSetupPhase::KeyPackagePublicationConfirmed)
+        .set_account_setup_phase(
+            &id,
+            c.setup_attempt.as_ref().unwrap(),
+            AccountSetupPhase::KeyPackagePublicationConfirmed,
+        )
         .unwrap();
     manager.account_setup().save_onboarding(&mut c).unwrap();
     assert!(
@@ -6072,6 +6104,68 @@ async fn cancel_during_blocked_signer_allows_fresh_external_begin() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_external_signin() {
+    let directory = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = runtime(directory.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    for (kind, tag) in [
+        (KIND_NIP65_RELAY_LIST, "r"),
+        (KIND_MARMOT_INBOX_RELAY_LIST, "relay"),
+    ] {
+        network.events.lock().push(signed(
+            &keys,
+            u16::try_from(kind).unwrap(),
+            vec![vec![tag.into(), "wss://default.example".into()]],
+            "",
+            unix_now_seconds(),
+        ));
+    }
+    let signer = || BlockingSigner {
+        keys: keys.clone(),
+        block: Arc::new(AtomicBool::new(false)),
+        started: Arc::new(Notify::new()),
+    };
+    runtime
+        .account_setup()
+        .begin_external_signer_onboarding(id.clone(), signer(), options())
+        .await
+        .unwrap();
+    let home = runtime.accounts.app.account_home();
+    let admitted = home.account_setup_state(&id).unwrap().unwrap();
+    runtime
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
+    assert!(home.account(&id).unwrap().signed_out);
+    assert_eq!(home.account_setup_state(&id).unwrap(), Some(admitted));
+    let signed_in = timeout(
+        Duration::from_secs(30),
+        runtime.login_external_signer(
+            id.clone(),
+            signer(),
+            AccountSetupRequest {
+                default_relays: vec![TransportEndpoint("wss://default.example".into())],
+                bootstrap_relays: vec![TransportEndpoint("wss://default.example".into())],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+        ),
+    )
+    .await
+    .expect("cancelled external onboarding can sign in normally")
+    .unwrap();
+    assert_eq!(signed_in.account.account_id_hex, id);
+    assert!(!signed_in.account.signed_out);
+    assert_eq!(signed_in.readiness, AccountSetupReadiness::NetworkReady);
+    assert_eq!(home.account_setup_state(&id).unwrap(), None);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_between_liveness_and_activation_keeps_account_signed_out() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
@@ -6269,7 +6363,11 @@ async fn stale_ready_cleanup_after_cancel_retains_setup_journal() {
     manager
         .app
         .account_home()
-        .set_account_setup_phase(&id, AccountSetupPhase::KeyPackagePublicationConfirmed)
+        .set_account_setup_phase(
+            &id,
+            c.setup_attempt.as_ref().unwrap(),
+            AccountSetupPhase::KeyPackagePublicationConfirmed,
+        )
         .unwrap();
     manager
         .app
@@ -6312,16 +6410,15 @@ async fn stale_ready_cleanup_after_cancel_retains_setup_journal() {
             .is_some()
     );
     let account = manager.resolve(&id).unwrap();
-    manager
-        .app
-        .account_home()
-        .begin_account_setup_with(
-            &account,
-            false,
-            AccountSetupKind::ImportedIdentity,
-            AccountSetupPhase::KeyPackagePublicationStarted,
-        )
+    let home = manager.app.account_home();
+    home.complete_account_setup(&id, c.setup_attempt.as_ref().unwrap())
         .unwrap();
+    home.begin_account_setup_with(
+        &account,
+        AccountSetupKind::ImportedIdentity,
+        AccountSetupPhase::KeyPackagePublicationStarted,
+    )
+    .unwrap();
     manager
         .app
         .account_home()
@@ -6370,7 +6467,11 @@ async fn cancel_during_ready_cleanup_hold_retains_setup() {
     manager
         .app
         .account_home()
-        .set_account_setup_phase(&id, AccountSetupPhase::KeyPackagePublicationConfirmed)
+        .set_account_setup_phase(
+            &id,
+            c.setup_attempt.as_ref().unwrap(),
+            AccountSetupPhase::KeyPackagePublicationConfirmed,
+        )
         .unwrap();
     manager
         .app
@@ -6460,8 +6561,7 @@ async fn stale_key_package_setup_after_cancel_does_not_mutate_setup() {
         .account_setup_state(&id)
         .unwrap()
         .unwrap();
-    assert_eq!(after.phase, before.phase);
-    assert_ne!(after.kind, AccountSetupKind::InteractiveIdentity);
+    assert_eq!(after, before);
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -8989,7 +9089,9 @@ async fn concurrent_creates_coalesce() {
     let original = runtime.accounts.app.account_home().accounts().unwrap();
     assert_eq!(original.len(), 1);
 
-    let second = runtime.create_identity(generated_setup_request());
+    let second = runtime
+        .accounts
+        .create_or_import_account(generated_setup_request());
     tokio::pin!(second);
     assert!(futures::poll!(second.as_mut()).is_pending());
     assert_eq!(
@@ -9079,6 +9181,265 @@ fn assert_network_setup(
     assert_eq!(lifecycle.current_key_package.unwrap().bytes(), bytes);
 }
 
+fn generated_handoff(
+    runtime: &MarmotAppRuntime,
+    label: &str,
+) -> (GeneratedAccountSetupContext, AccountSetupState) {
+    let home = runtime.accounts.app.account_home();
+    let context =
+        serde_json::from_slice(&home.account_setup_context(label).unwrap().unwrap()).unwrap();
+    let setup = home.account_setup_state(label).unwrap().unwrap();
+    (context, setup)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_setup_stays_quiet() {
+    let (_dir, runtime, network, secrets) = generated_setup_fixture();
+    let local = runtime
+        .create_generated_account_local_ready(
+            generated_setup_request(),
+            false,
+            None,
+            GeneratedIdentity::Fresh,
+        )
+        .await
+        .unwrap();
+    let home = runtime.accounts.app.account_home();
+    let (context, setup) = generated_handoff(&runtime, &local.account.label);
+    let generated = home
+        .start_setup_compensation(&local.account.label, &setup)
+        .unwrap()
+        .expect("generated admission must be eligible for compensation");
+    let keys = nostr::prelude::Keys::generate();
+    let imported = home
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    let imported_pending = home
+        .start_setup_compensation(&imported.account().label, imported.setup())
+        .unwrap()
+        .expect("import admission must be eligible for compensation");
+
+    runtime.start().await.unwrap();
+    timeout(
+        Duration::from_secs(30),
+        runtime.setup.join_generated_setup_tasks_for_test(),
+    )
+    .await
+    .unwrap();
+    let label = local.account.label.clone();
+    assert!(matches!(
+        runtime
+            .account_setup()
+            .finish_generated_setup(local, context, setup)
+            .await,
+        Err(AppError::AccountSetupRetryRequired)
+    ));
+    assert!(
+        runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .iter()
+            .all(|account| !account.running)
+    );
+    assert!(network.attempts.lock().is_empty());
+    assert_eq!(
+        home.account_setup_state(&label).unwrap(),
+        Some(generated.clone())
+    );
+    assert_eq!(
+        home.account_setup_state(&imported.account().label).unwrap(),
+        Some(imported_pending.clone())
+    );
+    let record = home
+        .account_dir(&imported.account().label)
+        .join("account.json");
+    let original_record = std::fs::read(&record).unwrap();
+    let original_writes = secrets.written.lock().clone();
+    std::fs::write(&record, b"{").unwrap();
+    let retry = runtime.create_identity(generated_setup_request()).await;
+    std::fs::write(&record, original_record).unwrap();
+    assert!(matches!(
+        retry,
+        Err(AppError::AccountHome(AccountHomeError::Json(_)))
+    ));
+    assert_eq!(*secrets.written.lock(), original_writes);
+    assert_eq!(home.account_setup_state(&label).unwrap(), Some(generated));
+    assert_eq!(
+        home.account_setup_state(&imported.account().label).unwrap(),
+        Some(imported_pending)
+    );
+    assert_eq!(
+        home.load_signing_keys(&label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        label
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_identity_retries() {
+    #[derive(Clone, Copy, Debug)]
+    enum Identity {
+        Imported,
+        Public,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum Entry {
+        Network,
+        Interactive,
+    }
+
+    for entry in [Entry::Network, Entry::Interactive] {
+        for identity in [Identity::Imported, Identity::Public] {
+            let dir = tempfile::tempdir().unwrap();
+            let network = Arc::new(Network::default());
+            let runtime = runtime(dir.path(), network.clone());
+            let keys = nostr::prelude::Keys::generate();
+            let id = keys.public_key().to_hex();
+            let nsec = Zeroizing::new(keys.secret_key().to_bech32().unwrap());
+            if matches!(entry, Entry::Network) {
+                for (kind, tag) in [
+                    (KIND_NIP65_RELAY_LIST, "r"),
+                    (KIND_MARMOT_INBOX_RELAY_LIST, "relay"),
+                ] {
+                    network.events.lock().push(signed(
+                        &keys,
+                        u16::try_from(kind).unwrap(),
+                        vec![vec![tag.into(), "wss://default.example".into()]],
+                        "",
+                        unix_now_seconds(),
+                    ));
+                }
+            }
+            let home = runtime.accounts.app.account_home();
+            let (account, setup) = match identity {
+                Identity::Imported => home
+                    .import_nostr_account_idempotent(&nsec)
+                    .unwrap()
+                    .into_parts(),
+                Identity::Public => home.add_public_account_for_setup(&id).unwrap(),
+            };
+            home.start_setup_compensation(&account.label, &setup)
+                .unwrap()
+                .unwrap();
+            let account = timeout(Duration::from_secs(30), async {
+                match (identity, entry) {
+                    (_, Entry::Network) => {
+                        let request = AccountSetupRequest {
+                            default_relays: vec![TransportEndpoint("wss://default.example".into())],
+                            bootstrap_relays: vec![TransportEndpoint(
+                                "wss://default.example".into(),
+                            )],
+                            publish_missing_relay_lists: false,
+                            publish_initial_key_package: false,
+                            ..AccountSetupRequest::default()
+                        };
+                        let result = match identity {
+                            Identity::Imported => {
+                                runtime
+                                    .create_or_import_account(AccountSetupRequest {
+                                        import_nsec: Some(nsec),
+                                        ..request
+                                    })
+                                    .await?
+                            }
+                            Identity::Public => {
+                                runtime
+                                    .login(keys.public_key().to_bech32().unwrap(), request)
+                                    .await?
+                            }
+                        };
+                        assert_eq!(result.readiness, AccountSetupReadiness::NetworkReady);
+                        Ok::<_, AppError>(result.account)
+                    }
+                    (Identity::Imported, Entry::Interactive) => {
+                        let snapshot = runtime
+                            .account_setup()
+                            .begin_onboarding(nsec, options())
+                            .await?;
+                        assert_eq!(snapshot.account_id_hex, id);
+                        Ok(home.account(&id)?)
+                    }
+                    (Identity::Public, Entry::Interactive) => {
+                        let signer = BlockingSigner {
+                            keys: keys.clone(),
+                            block: Arc::new(AtomicBool::new(false)),
+                            started: Arc::new(Notify::new()),
+                        };
+                        let snapshot = runtime
+                            .account_setup()
+                            .begin_external_signer_onboarding(id.clone(), signer, options())
+                            .await?;
+                        assert_eq!(snapshot.account_id_hex, id);
+                        Ok(home.account(&id)?)
+                    }
+                }
+            })
+            .await
+            .expect("explicit retry finishes compensation before normal or interactive admission")
+            .unwrap();
+            assert_eq!(account.account_id_hex, id);
+            assert_eq!(
+                account.local_signing,
+                matches!(identity, Identity::Imported)
+            );
+            let state = home.account_setup_state(&account.label).unwrap();
+            match entry {
+                Entry::Network => assert_eq!(state, None),
+                Entry::Interactive => {
+                    let state = state.unwrap();
+                    assert_eq!(state.kind, AccountSetupKind::InteractiveIdentity);
+                    assert_ne!(state.phase, AccountSetupPhase::CompensationPending);
+                    assert!(network.attempts.lock().is_empty());
+                }
+            }
+            assert_eq!(home.accounts_strict().unwrap(), vec![account]);
+            runtime.shutdown_and_close().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_generated_capture() {
+    let (_dir, runtime, network, _secrets) = generated_setup_fixture();
+    let local = runtime
+        .create_generated_account_local_ready(
+            generated_setup_request(),
+            false,
+            None,
+            GeneratedIdentity::Fresh,
+        )
+        .await
+        .unwrap();
+    let label = local.account.label.clone();
+    let (context, setup) = generated_handoff(&runtime, &label);
+    let home = runtime.accounts.app.account_home();
+    home.complete_account_setup(&label, &setup).unwrap();
+    let replacement = home
+        .begin_account_setup_with(
+            &local.account,
+            AccountSetupKind::GeneratedIdentity,
+            AccountSetupPhase::LocalReady,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        runtime
+            .account_setup()
+            .finish_generated_setup(local, context, setup)
+            .await,
+        Err(AppError::AccountHome(
+            AccountHomeError::AccountSetupConflict
+        ))
+    ));
+    assert_eq!(home.account_setup_state(&label).unwrap(), Some(replacement));
+    assert!(network.attempts.lock().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_wins_handoff() {
     let (_dir, runtime, network, secrets) = generated_setup_fixture();
@@ -9093,16 +9454,7 @@ async fn background_wins_handoff() {
         .unwrap();
     assert_eq!(local.readiness, AccountSetupReadiness::LocalReady);
     let original = local.account.clone();
-    let context: GeneratedAccountSetupContext = serde_json::from_slice(
-        &runtime
-            .accounts
-            .app
-            .account_home()
-            .account_setup_context(&original.label)
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
+    let (context, setup) = generated_handoff(&runtime, &local.account.label);
     runtime.start().await.unwrap();
     timeout(
         Duration::from_secs(30),
@@ -9118,7 +9470,9 @@ async fn background_wins_handoff() {
     );
     let completed = timeout(
         Duration::from_secs(30),
-        runtime.finish_generated_setup(local, context),
+        runtime
+            .account_setup()
+            .finish_generated_setup(local, context, setup),
     )
     .await
     .unwrap()
@@ -9228,13 +9582,7 @@ async fn stale_foreground_stays_gone() {
             .unwrap();
         assert_eq!(local.readiness, AccountSetupReadiness::LocalReady);
         let home = runtime.accounts.app.account_home();
-        let context: GeneratedAccountSetupContext = serde_json::from_slice(
-            &home
-                .account_setup_context(&local.account.label)
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+        let (context, setup) = generated_handoff(&runtime, &local.account.label);
         assert_eq!(
             home.load_signing_keys(&local.account.label)
                 .unwrap()
@@ -9268,7 +9616,9 @@ async fn stale_foreground_stays_gone() {
         // persisted request after removal, just before network continuation.
         let continued = timeout(
             Duration::from_secs(30),
-            runtime.finish_generated_setup(local, context),
+            runtime
+                .account_setup()
+                .finish_generated_setup(local, context, setup),
         )
         .await
         .expect("a stale foreground handoff must settle");
@@ -9301,18 +9651,10 @@ async fn foreground_blocks_removal() {
         .unwrap();
     assert_eq!(local.readiness, AccountSetupReadiness::LocalReady);
     let original = local.account.clone();
-    let context: GeneratedAccountSetupContext = serde_json::from_slice(
-        &runtime
-            .accounts
-            .app
-            .account_home()
-            .account_setup_context(&original.label)
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
+    let (context, setup) = generated_handoff(&runtime, &local.account.label);
     network.block_publish.store(true, Ordering::SeqCst);
-    let foreground = runtime.finish_generated_setup(local, context);
+    let account_setup = runtime.account_setup();
+    let foreground = account_setup.finish_generated_setup(local, context, setup);
     tokio::pin!(foreground);
     assert!(futures::poll!(foreground.as_mut()).is_pending());
     timeout(Duration::from_secs(30), async {
@@ -9408,18 +9750,10 @@ async fn foreground_before_withdrawal() {
             .await
             .unwrap();
         let original = local.account.clone();
-        let context = serde_json::from_slice(
-            &runtime
-                .accounts
-                .app
-                .account_home()
-                .account_setup_context(&original.label)
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+        let (context, setup) = generated_handoff(&runtime, &local.account.label);
         network.block_publish.store(true, Ordering::SeqCst);
-        let foreground = runtime.finish_generated_setup(local, context);
+        let account_setup = runtime.account_setup();
+        let foreground = account_setup.finish_generated_setup(local, context, setup);
         tokio::pin!(foreground);
         assert!(futures::poll!(foreground.as_mut()).is_pending());
         timeout(Duration::from_secs(30), async {
