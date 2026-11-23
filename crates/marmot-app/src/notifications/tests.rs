@@ -2654,23 +2654,27 @@ fn an_agent_item_edit_alerts_only_as_the_items_latest_version() {
     chat.agent = agent;
 }
 
+/// An edit that arrives before its item, or whose item this member joined too
+/// late to read, alerts as the item it shows (marmot-agents D-124). The item
+/// arriving later announces the same version, under the same delivery key, so
+/// the subscription shows it once.
 #[test]
-fn an_agent_item_whose_edit_came_first_alerts_when_it_arrives() {
+fn an_agent_item_whose_edit_came_first_alerts_from_the_edit() {
     use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_EDIT};
 
     let mut chat = AgentNotifications::new();
     let item = "b1".repeat(32);
-    assert!(
-        chat.receive(
+    let held = chat
+        .receive(
             &"b2".repeat(32),
             MARMOT_APP_EVENT_KIND_EDIT,
             edit_of(&item, agent_item_tags("approval", "waiting", 2)),
             "Allow?",
             11,
         )
-        .is_none(),
-        "nothing to show before the item arrives"
-    );
+        .expect("the held version is waiting for a person");
+    assert_eq!(held.message_id_hex.as_deref(), Some(item.as_str()));
+    assert_eq!(held.preview_text.as_deref(), Some("Allow?"));
     let update = chat
         .receive(
             &item,
@@ -2679,8 +2683,9 @@ fn an_agent_item_whose_edit_came_first_alerts_when_it_arrives() {
             "Preparing",
             10,
         )
-        .expect("the held version is waiting for a person");
+        .expect("the item's latest version is waiting for a person");
     assert_eq!(update.preview_text.as_deref(), Some("Allow?"));
+    assert_eq!(update.delivery_key, held.delivery_key);
 }
 
 #[test]

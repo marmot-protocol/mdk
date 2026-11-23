@@ -87,6 +87,7 @@ fn message(group: &str, sender: &str) -> TimelineMessageRecord {
         history_import_provenance: None,
         agent_item: None,
         timeline_order_seq: 0,
+        agent_item_first_event_missing: false,
     }
 }
 fn page(messages: Vec<TimelineMessageRecord>) -> TimelinePage {

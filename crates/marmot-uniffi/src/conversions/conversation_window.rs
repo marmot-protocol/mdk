@@ -470,6 +470,7 @@ fn presented_timeline_with_tokens(
             None
         },
         agent_item: row.agent_item.clone().map(Into::into),
+        agent_item_first_event_missing: row.agent_item_first_event_missing,
         reactions: TimelineReactionSummaryFfi {
             by_emoji: vec![],
             user_reactions: vec![],
@@ -634,6 +635,7 @@ impl ConversationConversionCache {
             imported_from: row.imported_from.clone(),
             history_import_provenance: row.history_import_provenance.clone(),
             agent_item: row.agent_item.clone(),
+            agent_item_first_event_missing: row.agent_item_first_event_missing,
             timeline_order_seq: row.timeline_order_seq,
         };
         let tokens = match cached.filter(|cached| {
@@ -702,6 +704,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         imported_from,
         history_import_provenance,
         agent_item,
+        agent_item_first_event_missing,
         timeline_order_seq: _,
     } = row;
     (
@@ -740,6 +743,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
             history_import_provenance,
             thread,
             agent_item,
+            agent_item_first_event_missing,
         ),
     )
 }
@@ -893,6 +897,7 @@ mod tests {
             history_import_provenance: None,
             agent_item: None,
             timeline_order_seq: 0,
+            agent_item_first_event_missing: false,
         };
 
         record

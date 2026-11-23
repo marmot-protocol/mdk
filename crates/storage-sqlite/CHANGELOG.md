@@ -13,7 +13,11 @@
 - Kind-1009 edits apply to kind-1201 agent items: the highest `v` replaces the row's content and tags, an older
   version is ignored, and the row is not marked edited. Agent items have no edit history.
 - A kind-1201 agent item with an `E` tag is placed in that thread, under the parent its `e` names or else the root,
-  and `reply_to_message_id_hex` is that parent unless the item names a `started_by`. An edit keeps the thread tags
+  and `reply_to_message_id_hex` is that parent unless the item names a `started_by`.
+- An agent item whose first event this device does not hold, such as one sent before the member joined, gets a row
+  from its edits: the earliest readable edit stands in for the first event, at its place, and the highest version
+  shows. `TimelineMessageRecord::agent_item_first_event_missing` says so. The first event, if it arrives, takes the
+  row back to its own place. An edit keeps the thread tags
   of the item's first event, whatever thread tags it carries.
 - An agent's own words in a thread under one of its agent items (a kind 1111 with `E`, `K` 1201 and `P` its sender)
   never count as unread, in the projection, its rebuild and the retention sweep.

@@ -10,6 +10,8 @@
 
 ### Added
 
+- `TimelineMessageRecordFfi::agent_item_first_event_missing`: true for an agent item whose first event this device
+  does not hold, such as one that began before the member joined; the row is built from its edits.
 - `TimelineMessageRecordFfi::agent_item` (`AgentItemFfi`, `AgentItemStateFfi`): the latest version of a kind-1201
   agent item, with its type, fields JSON, `settles` and whether it alerts. A kind-1201 row without one is an
   unreadable item, such as the old shape.

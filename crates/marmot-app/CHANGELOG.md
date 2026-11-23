@@ -34,6 +34,9 @@
   and `e`/`k`/`p` (parent), and `submit_custom_event` and `send_custom_event` take its `e` only beside an `E`. An edit
   of an item still carries no `e` but its target's. A thread message answering an item in a thread names that item's
   root and the item as its parent.
+- An agent item whose first event this device never gets, such as one sent before the member joined, is shown from
+  its edits in its place in the timeline and its thread (marmot-agents D-124), with
+  `TimelineMessageRecord::agent_item_first_event_missing` set, and an alerting edit of it alerts.
 - The agent's own words in a thread under one of its items, a kind 1111 with an `E` whose `K` is 1201 and whose `P`
   is its author, neither notify nor wake members (D-122), and never count as unread or raise the @-badge. Items in a
   thread keep their own alert rule.

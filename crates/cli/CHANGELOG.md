@@ -13,6 +13,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - `wn messages send-event` accepts kinds 1201 (agent item) and 1202 (answer or control) in the marmot-agents shape,
   and refuses them in any other.
+- Timeline JSON gains `agent_item_first_event_missing`, true for an agent item shown from its edits because its
+  first event is not on this device.
 - WN Agent refuses `send_agent_activity` and `send_agent_operation_event` with `retired_agent_event` and publishes
   nothing: MDK no longer builds the old shape of kinds 1201 and 1202.
 - `wn messages timeline list` carries a kind-1201 row's parsed `agent_item` in `--json`, and shows an item MDK cannot

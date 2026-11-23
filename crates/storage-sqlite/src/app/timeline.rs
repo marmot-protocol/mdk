@@ -347,6 +347,13 @@ pub struct TimelineMessageRecord {
     /// such as the old shape an outdated connector sends (D-051).
     #[serde(default)]
     pub agent_item: Option<cgka_traits::AgentItem>,
+    /// True for an agent item whose first event this device does not hold,
+    /// such as one that began before this member joined: the row is its
+    /// earliest edit, at that edit's place, showing the latest version
+    /// (marmot-agents D-124). An app can say the item started earlier. False
+    /// once the first event arrives, and for every other row.
+    #[serde(default)]
+    pub agent_item_first_event_missing: bool,
     /// An agent item's `seq` from its first event, which orders a turn's rows
     /// within one second; 0 for every other row.
     #[serde(default)]
@@ -2458,7 +2465,19 @@ fn project_single_message_timeline_tx(
     message_id_hex: &str,
 ) -> StorageResult<Option<TimelineRow>> {
     let Some(event) = raw_app_event_tx(tx, group_id_hex, message_id_hex)? else {
-        return Ok(None);
+        let held = app_events_targeting_message_tx(
+            tx,
+            group_id_hex,
+            MARMOT_APP_EVENT_KIND_EDIT,
+            message_id_hex,
+        )?;
+        let deleted = deleted_reaction_ids_for_target_tx(tx, group_id_hex, &held)?;
+        let Some(mut row) = edits::held_agent_item_row(message_id_hex, held.iter(), &deleted)
+        else {
+            return Ok(None);
+        };
+        apply_targeted_modifiers_tx(tx, &mut row)?;
+        return Ok(Some(row));
     };
 
     let mut row = match event.kind {
@@ -4313,6 +4332,7 @@ fn project_group_events(
         }
     }
 
+    edits::add_held_agent_items(&mut timeline, &events);
     edits::apply_group(&mut timeline, &events);
 
     let events_by_id = events
@@ -4916,6 +4936,7 @@ fn timeline_record_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timeline
             .try_into()
             .unwrap_or_default(),
         agent_item: None,
+        agent_item_first_event_missing: false,
         edit: row
             .get::<_, Option<String>>(19)?
             .map(|json| serde_json::from_str(&json))
@@ -5181,6 +5202,19 @@ fn hydrate_timeline_presentation(
     reports::hydrate(conn, messages)?;
     filter_blocked_reactions(conn, messages)?;
     hydrate_polls(conn, messages)?;
+    for message in messages
+        .iter_mut()
+        .filter(|message| message.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM)
+    {
+        message.agent_item_first_event_missing = !conn
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM app_events
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2)",
+                params![message.group_id_hex, message.message_id_hex],
+                |row| row.get::<_, bool>(0),
+            )
+            .storage()?;
+    }
     let mut legacy_roots = HashMap::new();
     for message in messages.iter_mut() {
         message.thread = threads::thread_ref(

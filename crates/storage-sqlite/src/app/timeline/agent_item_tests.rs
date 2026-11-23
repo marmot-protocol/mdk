@@ -168,7 +168,7 @@ fn an_edit_that_arrives_before_its_item_is_held_and_applied() {
     store
         .record_app_event(&item_edit("edit-2", "item", 11, 2, "waiting"))
         .unwrap();
-    assert!(rows(&store).is_empty());
+    assert_eq!(row(&store, "item").plaintext, "v2 waiting");
 
     store
         .record_app_event(&item("item", 10, 1, "running", 1))
@@ -177,6 +177,96 @@ fn an_edit_that_arrives_before_its_item_is_held_and_applied() {
     let latest = row(&store, "item");
     assert_eq!(latest.plaintext, "v2 waiting");
     assert_eq!(latest.agent_item.unwrap().version, 2);
+    assert!(!latest.agent_item_first_event_missing);
+    assert_eq!(latest.timeline_at, 10);
+}
+
+/// A member added after an item began never gets its first event, only its
+/// later edits, each carrying the whole item (marmot-agents D-124). The
+/// item's row is then its earliest edit, at that edit's place, holding the
+/// highest version and saying its first event is missing. Only that edit's
+/// sender's versions count, an edit naming another message too is no
+/// version, and a rebuild agrees. The first event, should it arrive, takes
+/// the row back to its own place.
+#[test]
+fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .record_app_event(&item_edit("edit-3", "item", 30, 3, "running"))
+        .unwrap();
+    store
+        .record_app_event(&item_edit("edit-4", "item", 40, 4, "waiting"))
+        .unwrap();
+    let mut foreign = item_edit("edit-9", "item", 50, 9, "done");
+    foreign.sender = "someone".to_owned();
+    store.record_app_event(&foreign).unwrap();
+    let mut two_targets = item_edit("edit-8", "item", 20, 8, "failed");
+    two_targets.tags.push(tag(&["e", "other"]));
+    store.record_app_event(&two_targets).unwrap();
+    // An edit of a chat message that never arrived is no item.
+    store
+        .record_app_event(&event(
+            "chat-edit",
+            "agent",
+            25,
+            MARMOT_APP_EVENT_KIND_EDIT,
+            vec![tag(&["e", "chat"])],
+            "fixed",
+        ))
+        .unwrap();
+
+    for _ in 0..2 {
+        assert_eq!(rows(&store), ["item"]);
+        let held = row(&store, "item");
+        assert!(held.agent_item_first_event_missing);
+        assert_eq!(held.sender, "agent");
+        assert_eq!(held.kind, MARMOT_APP_EVENT_KIND_AGENT_ITEM);
+        assert_eq!(held.timeline_at, 30);
+        assert_eq!(held.plaintext, "v4 waiting");
+        assert_eq!(held.tags, item_tags(4, "waiting", 104));
+        assert_eq!(held.agent_item.unwrap().version, 4);
+        assert_eq!(held.edit, None);
+        store.rebuild_message_timeline_for_group(GROUP).unwrap();
+    }
+
+    store
+        .record_app_event(&item("item", 10, 1, "running", 1))
+        .unwrap();
+    let first = row(&store, "item");
+    assert!(!first.agent_item_first_event_missing);
+    assert_eq!(first.timeline_at, 10);
+    assert_eq!(first.plaintext, "v4 waiting");
+}
+
+/// The agent deleting an item it never sent this device removes the row
+/// built from its edits, as it would the item's own.
+#[test]
+fn an_item_shown_from_its_edits_can_be_deleted_by_its_agent() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .record_app_event(&item_edit("edit-2", "item", 20, 2, "running"))
+        .unwrap();
+    let delete = |id: &str, sender: &str, at: u64| {
+        event(
+            id,
+            sender,
+            at,
+            MARMOT_APP_EVENT_KIND_DELETE,
+            vec![tag(&["e", "item"])],
+            "",
+        )
+    };
+    store
+        .record_app_event(&delete("forged", "someone", 21))
+        .unwrap();
+    assert!(!row(&store, "item").deleted);
+    store
+        .record_app_event(&delete("delete", "agent", 22))
+        .unwrap();
+    for _ in 0..2 {
+        assert!(row(&store, "item").deleted);
+        store.rebuild_message_timeline_for_group(GROUP).unwrap();
+    }
 }
 
 #[test]
@@ -442,4 +532,43 @@ fn an_item_outside_a_thread_takes_its_edits_tags_but_never_joins_a_thread() {
     expected.push(tag(&["p", "someone-else"]));
     assert_eq!(latest.tags, expected);
     assert_eq!(latest.thread, None);
+}
+
+/// An item in a subagent's thread whose first event this device never got is
+/// placed by the root its edits repeat, answering that root, since an edit
+/// cannot name the parent; later edits keep it there.
+#[test]
+fn an_item_shown_from_its_edits_sits_in_the_thread_they_name() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let in_thread = |mut edit: StoredAppEvent, root: &str| {
+        edit.tags.retain(|tag| tag[0] != "started_by");
+        edit.tags.extend([
+            tag(&["E", root, "", "agent"]),
+            tag(&["K", "1201"]),
+            tag(&["P", "agent"]),
+        ]);
+        edit
+    };
+    store
+        .record_app_event(&in_thread(
+            item_edit("edit-2", "item", 20, 2, "running"),
+            "task",
+        ))
+        .unwrap();
+    store
+        .record_app_event(&in_thread(
+            item_edit("edit-3", "item", 30, 3, "done"),
+            "elsewhere",
+        ))
+        .unwrap();
+    let held = row(&store, "item");
+    assert_eq!(held.plaintext, "v3 done");
+    assert_eq!(
+        held.thread,
+        Some(TimelineThreadRef {
+            root_message_id_hex: "task".to_owned(),
+            parent_message_id_hex: "task".to_owned(),
+        })
+    );
+    assert_eq!(held.reply_to_message_id_hex.as_deref(), Some("task"));
 }

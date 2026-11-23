@@ -2283,8 +2283,9 @@ enum AgentItemAlert {
 /// Decide an agent item, or an edit of one, against the item's stored row,
 /// which holds its highest version: it alerts while that version is a
 /// waiting approval or question, or a failed turn (D-024). An edit alerts only
-/// when it is that version, so a late older one never does; an item whose
-/// edit came first alerts when the item arrives. A removed or invalidated item
+/// when it is that version, so a late older one never does; an edit that comes
+/// before its item, or of an item sent before this member joined, alerts from
+/// the row it gives the item. A removed or invalidated item
 /// never alerts.
 fn agent_item_alert(
     app: &MarmotApp,

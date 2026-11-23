@@ -1723,6 +1723,7 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         reactions: Default::default(),
         agent_item: None,
         timeline_order_seq: 0,
+        agent_item_first_event_missing: false,
     }
 }
 

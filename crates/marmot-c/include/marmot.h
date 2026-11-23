@@ -5898,6 +5898,12 @@ typedef struct MarmotTimelineMessageRecord {
    * kinds; a kind-1201 row with NULL here is an unreadable item.
    */
   struct MarmotAgentItem *agent_item;
+  /**
+   * True for an agent item whose first event this device does not
+   * hold, such as one that began before this member joined: the row
+   * is its earliest edit, showing the latest version.
+   */
+  bool agent_item_first_event_missing;
   struct MarmotTimelineReactionSummary reactions;
   struct MarmotTimelineEditSummary *edit;
   bool deleted;
