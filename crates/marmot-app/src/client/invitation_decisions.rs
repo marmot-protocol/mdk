@@ -336,9 +336,16 @@ impl AppClient {
     /// again in the trusted device group, so the sibling reads it ahead of
     /// its Welcome (mdk#3556). A sibling linked since the decision went out
     /// cannot read that send, and a broadcast answering its request can wait
-    /// an hour. Returns false until a relay accepted the send. Pinned to the
-    /// device group's epoch, the send is refused rather than queued while
-    /// that group settles, so a retry never stacks copies behind a Commit.
+    /// an hour. Pinned to the device group's epoch, the send is refused
+    /// rather than queued while that group settles, so a retry never stacks
+    /// copies behind a Commit. Returns false when it reached no relay.
+    ///
+    /// Known limits, both closed once the sibling Welcome carries the
+    /// decision (planned spec change): a send left unresolved for retry
+    /// counts as sent, so the Add can go out ahead of it; and the decision
+    /// travels apart from the Welcome, so a sibling that reads the Welcome
+    /// from a relay not yet holding the decision shows an invitation until
+    /// it arrives.
     pub(super) async fn send_invitation_decision_before_add(
         &mut self,
         chat: &GroupId,
@@ -360,11 +367,10 @@ impl AppClient {
             crate::small_state::encode_invitation_decision_updates(std::slice::from_ref(&decision))
         {
             if !self
-                .publish_device_group_message(
+                .send_device_group_event_at(
                     &exchange.group_id,
-                    crate::small_state::KIND_SMALL_STATE_UPDATE,
-                    content,
-                    exchange.pin,
+                    self.device_group_event(crate::small_state::KIND_SMALL_STATE_UPDATE, content)?,
+                    Some(exchange.pin),
                 )
                 .await?
             {

@@ -48,9 +48,11 @@
   and deleted-message placeholders, and why.
 - A newly linked device no longer shows a chat the account already accepted as an invitation for up to an hour, where
   declining it would take the account out of the chat on every device (mdk#3556). Before each automatic sibling Add
-  the adding device publishes the chat's invitation decision again, epoch-pinned, and the Add waits for a later pass
-  until a relay accepted it. The decision is published ahead of the sibling Welcome but travels separately, so a device
-  that reads the Welcome from a relay not yet holding the decision can still show the invitation until it arrives.
+  the adding device sends the chat's invitation decision again, epoch-pinned, and an Add whose decision reaches no
+  relay waits for a later pass. This is an interim fix with two known limits, both closed once the sibling Welcome
+  carries the decision (planned spec change): a decision send left unresolved for retry counts as sent, so the Add can
+  go out ahead of it; and the decision travels apart from the Welcome, so a device that reads the Welcome from a relay
+  not yet holding the decision still shows the invitation until it arrives.
 
 ## 0.19.0 - 2026-11-22
 

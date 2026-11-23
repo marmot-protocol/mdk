@@ -104,17 +104,6 @@ impl Exchange {
     }
 }
 
-/// What became of one device-group message a send handed the engine.
-#[derive(PartialEq, Eq)]
-enum DeviceGroupSend {
-    /// A relay accepted it.
-    Published,
-    /// Unresolved, or queued when unpinned: that same message still goes out.
-    Pending,
-    /// Its publication failed terminally and reached no one.
-    Failed,
-}
-
 impl AppClient {
     /// The exchange this device takes part in: the trusted device group's,
     /// while the roster lists this device.
@@ -346,20 +335,6 @@ impl AppClient {
         self.send_device_group_event(group_id, event).await
     }
 
-    /// [`Self::send_device_group_message`] pinned to `pin`, as
-    /// [`Self::send_device_group_event_at`] is, and `true` only once a relay
-    /// accepted the message: one unresolved has not gone out yet.
-    pub(crate) async fn publish_device_group_message(
-        &mut self,
-        group_id: &GroupId,
-        kind: u64,
-        content: String,
-        pin: EpochPin,
-    ) -> Result<bool, AppError> {
-        let event = self.device_group_event(kind, content)?;
-        Ok(self.device_group_send(group_id, event, Some(pin)).await? == DeviceGroupSend::Published)
-    }
-
     /// A device-group message of `kind` from this device, not yet sent.
     pub(crate) fn device_group_event(
         &self,
@@ -397,18 +372,6 @@ impl AppClient {
         event: MarmotAppEvent,
         expected_epoch: Option<EpochPin>,
     ) -> Result<bool, AppError> {
-        Ok(self
-            .device_group_send(group_id, event, expected_epoch)
-            .await?
-            != DeviceGroupSend::Failed)
-    }
-
-    async fn device_group_send(
-        &mut self,
-        group_id: &GroupId,
-        event: MarmotAppEvent,
-        expected_epoch: Option<EpochPin>,
-    ) -> Result<DeviceGroupSend, AppError> {
         let kind = event.kind;
         let payload = event
             .encode()
@@ -430,22 +393,14 @@ impl AppClient {
             .failed_app_messages
             .iter()
             .any(|failed| failed.group_id == *group_id && failed.app_event_id == event.id);
-        let published = effects
-            .published_app_messages
-            .iter()
-            .any(|sent| sent.group_id == *group_id && sent.app_event_id == event.id);
         let observed = self.observe_drained_session_events(&effects).await;
         // This message's terminal failure is also the drain's publish error;
         // the caller undoes its marks instead of failing.
         if !reached {
-            return Ok(DeviceGroupSend::Failed);
+            return Ok(false);
         }
         observed?;
-        Ok(if published {
-            DeviceGroupSend::Published
-        } else {
-            DeviceGroupSend::Pending
-        })
+        Ok(true)
     }
 
     /// Hand a device-group message that branch selection withdrew to the

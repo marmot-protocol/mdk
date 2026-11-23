@@ -365,9 +365,10 @@ one authenticated admission generation and its automatic sibling Adds (mdk#2628 
 or admission fork can prompt again; older unidentified invites stay local-only. A sibling Add forwards how the adding
 device holds the chat: its original inviter, and for an unidentified copy whether it is confirmed, so the new device
 shows it confirmed or as an invitation from that inviter (mdk#3546). For an identified copy the adding device first
-publishes the generation's decision again and adds only once a relay accepted it, so a device linked after the
-decision went out does not wait for a broadcast to learn it (mdk#3556). The decision still travels apart from the
-Welcome: a device that reads the Welcome from a relay not yet holding it shows the invitation until it arrives. Higher version wins, with decline
+sends the generation's decision again, and does not add while that send reaches no relay, so a device linked after
+the decision went out does not wait for a broadcast to learn it (mdk#3556). Until the sibling Welcome carries the
+decision, two gaps remain: a send left unresolved for retry counts as sent, and a device that reads the Welcome from a
+relay not yet holding the decision shows the invitation until it arrives. Higher version wins, with decline
 winning an equal version. Acceptance preserves membership, block/rejoin checks and explicit archive intent. Decline
 records durable work for this matching local leaf's ordinary Leave; a later accept never cancels an already-requested
 Leave or joins a device. `published = 0` with `CompletionUnknown` reports pending work, not completed departure by

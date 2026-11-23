@@ -979,8 +979,9 @@ impl AppClient {
     /// Add the sibling in `sibling` to `chat` with the exact received
     /// `candidate` the caller admitted, then send the sibling Welcome owed once
     /// its Commit is published. The chat's invitation decision goes out
-    /// first, and the Add waits, spending no stock, until a relay accepted it
-    /// ([`Self::send_invitation_decision_before_add`]). The engine refuses
+    /// first, and an Add whose decision reaches no relay waits, spending no
+    /// stock ([`Self::send_invitation_decision_before_add`], with its known
+    /// limits). The engine refuses
     /// the Add, writing nothing, unless both devices are tagged in the
     /// trusted device group and the chat names its relays; it checks a
     /// queued Add again at drain, and a refusal there retires the queued Add
