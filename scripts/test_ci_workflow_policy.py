@@ -383,7 +383,7 @@ class MergeGatePolicyTests(unittest.TestCase):
         # Build and test jobs run third-party code; none of them may cancel or dispatch runs.
         self.assertEqual(len(re.findall(r"(?m)^ +actions: write$", workflow)), 1)
         # A job-level continue-on-error reads as success in `needs` but as a failed job to the watcher.
-        self.assertEqual(len(re.findall(r"(?m)^ +continue-on-error:", workflow)), 1)
+        self.assertEqual(len(re.findall(r"(?m)^    continue-on-error:", workflow)), 1)
         timeout = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", watcher).group(1))
         watch = int(re.search(r"deadline=\$\(\(SECONDS \+ (\d+) \* 60\)\)", watcher).group(1))
         self.assertLess(watch, timeout)
@@ -1259,6 +1259,63 @@ class RunnerInfrastructurePolicyTests(unittest.TestCase):
                 self.assertLess(job.index("ci_runner.py prepare"), job.index("uses: Swatinem/rust-cache@"))
                 self.assertIn("ci_runner.py manifest", job)
                 self.assertIn(".tar.zst.manifest.json", job)
+
+    def test_consumer_archive_downloads_are_bounded_and_retried_once(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        jobs = re.split(r"\n  (?=[a-z][a-z0-9-]*:\n)", workflow.split("\njobs:\n", 1)[1])
+        consumers = [job for job in jobs if "actions/download-artifact@" in job]
+        extractors = [job for job in jobs if "ci_runner.py extract " in job]
+        self.assertTrue(consumers)
+        self.assertEqual(
+            {job.splitlines()[0].rstrip(":") for job in consumers},
+            {job.splitlines()[0].rstrip(":") for job in extractors},
+        )
+        # Only a retried archive download may use step-level continue-on-error, so no test step can swallow failures.
+        self.assertEqual(len(re.findall(r"(?m)^        continue-on-error:", workflow)), len(consumers))
+        for job in consumers:
+            job_name = job.splitlines()[0].rstrip(":")
+            with self.subTest(job=job_name):
+                job_timeout = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", job).group(1))
+                steps = re.split(r"\n      - (?=name: )", job.split("\n    steps:\n", 1)[1])
+                downloads = [(i, step) for i, step in enumerate(steps) if "actions/download-artifact@" in step]
+                self.assertEqual(len(downloads), 2, "expected one bounded download and one bounded retry")
+                (first_idx, first), (retry_idx, retry) = downloads
+                self.assertEqual(retry_idx, first_idx + 1, "retry must follow the first download immediately")
+
+                first_id = re.search(r"(?m)^        id: ([a-z0-9-]+)$", first)
+                self.assertIsNotNone(first_id, "first download must declare an id")
+                self.assertIn("\n        continue-on-error: true\n", first)
+                first_timeout = re.search(r"(?m)^        timeout-minutes: (\d+)$", first)
+                self.assertIsNotNone(first_timeout, "first download must have timeout-minutes")
+
+                self.assertIn(f"\n        if: steps.{first_id.group(1)}.outcome == 'failure'\n", retry)
+                self.assertNotIn("continue-on-error:", retry)
+                retry_timeout = re.search(r"(?m)^        timeout-minutes: (\d+)$", retry)
+                self.assertIsNotNone(retry_timeout, "retry download must have timeout-minutes")
+
+                first_pin = re.search(r"(?m)^        uses: (actions/download-artifact@\S+)", first).group(1)
+                retry_pin = re.search(r"(?m)^        uses: (actions/download-artifact@\S+)", retry).group(1)
+                self.assertEqual(first_pin, retry_pin)
+
+                first_artifact = re.search(r"(?m)^          name: (\S+)$", first).group(1)
+                retry_artifact = re.search(r"(?m)^          name: (\S+)$", retry).group(1)
+                self.assertEqual(first_artifact, retry_artifact)
+
+                download_budget = int(first_timeout.group(1)) + int(retry_timeout.group(1))
+                self.assertGreater(int(first_timeout.group(1)), 0)
+                self.assertGreater(int(retry_timeout.group(1)), 0)
+                other_timeouts = sum(
+                    int(m.group(1))
+                    for i, step in enumerate(steps)
+                    if i not in (first_idx, retry_idx)
+                    for m in [re.search(r"(?m)^        timeout-minutes: (\d+)$", step)]
+                    if m
+                )
+                self.assertLess(download_budget + other_timeouts, job_timeout)
+
+                extract_indices = [i for i, step in enumerate(steps) if "ci_runner.py extract " in step]
+                self.assertEqual(len(extract_indices), 1)
+                self.assertLess(retry_idx, extract_indices[0])
 
     def test_formal_bootstrap_rejects_the_unsupported_distro_maude(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
