@@ -1953,6 +1953,11 @@ const ORIGINAL_PLAINTEXT_SQL: &str = "COALESCE((SELECT original.plaintext FROM a
 /// moves it.
 const NOT_IMPORTED_SQL: &str = "NOT EXISTS (SELECT 1 FROM app_event_imports AS imported WHERE imported.group_id_hex=message_timeline.group_id_hex AND imported.message_id_hex=message_timeline.message_id_hex)";
 
+/// An agent's own words in a thread under one of its agent items never count as
+/// unread (marmot-agents D-122). `marmot_agent_thread_words` is the Rust rule
+/// that also keeps them silent, so the two cannot drift.
+const NOT_AGENT_THREAD_WORDS_SQL: &str = "NOT marmot_agent_thread_words(kind, tags_json, sender)";
+
 /// WHERE clause + parameters selecting rows that sort after a conversation's
 /// read cursor: the single definition of "unread" shared by the projection
 /// and the retention sweep (mdk#2425). Placeholders are numbered from
@@ -2026,7 +2031,8 @@ fn unread_membership_for_message_tx(
          FROM message_timeline
          WHERE group_id_hex = ?1 AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2 AND message_id_hex = ?3
            AND {activity_filter} AND deleted = 0
-           AND invalidation_status IS NULL AND {NOT_IMPORTED_SQL} AND {where_sql}"
+           AND invalidation_status IS NULL AND {NOT_IMPORTED_SQL}
+           AND {NOT_AGENT_THREAD_WORDS_SQL} AND {where_sql}"
     );
     let mut query_params = vec![
         rusqlite::types::Value::Text(group_id_hex.to_owned()),
@@ -2094,6 +2100,7 @@ fn rebuild_unread_membership_tx(
            AND invalidation_status IS NULL
            AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2
            AND {NOT_IMPORTED_SQL}
+           AND {NOT_AGENT_THREAD_WORDS_SQL}
            AND {where_sql}
          ORDER BY {order_sql}"
     );
@@ -2208,6 +2215,7 @@ fn retention_expiry_scan_tx(
                     AND sender NOT IN (SELECT public_key FROM user_blocks)
                     AND sender != ?2
                     AND {NOT_IMPORTED_SQL}
+                    AND {NOT_AGENT_THREAD_WORDS_SQL}
                     AND message_id_hex IN (
                         SELECT message_id_hex FROM app_events
                         WHERE group_id_hex = ?1 AND retention_expires_at <= ?3)
@@ -2224,16 +2232,20 @@ fn retention_expiry_scan_tx(
         // No read cursor yet: stay conservative, as the replaced page scan
         // did, and treat every expired received row as unread rather than
         // guessing what the account has seen. An imported row is never
-        // unread, so it expires on time.
+        // unread, nor is an agent's own words in its subagent thread, so
+        // both expire on time.
         _ => timeline_exists_tx(
             tx,
-            "SELECT EXISTS(SELECT 1 FROM app_events
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM app_events
                       WHERE group_id_hex = ?1
                         AND direction = 'received'
                         AND retention_expires_at <= ?2
+                        AND {NOT_AGENT_THREAD_WORDS_SQL}
                         AND NOT EXISTS (SELECT 1 FROM app_event_imports AS imported
                             WHERE imported.group_id_hex = app_events.group_id_hex
-                              AND imported.message_id_hex = app_events.message_id_hex))",
+                              AND imported.message_id_hex = app_events.message_id_hex))"
+            ),
             &[group, now],
         )?,
     };

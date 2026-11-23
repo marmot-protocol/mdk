@@ -1,5 +1,6 @@
 //! The connection, codec, migrations and open progress both sides build on.
 
+pub(crate) mod agent_threads;
 #[cfg(test)]
 mod boundary_tests;
 pub(crate) mod codec;

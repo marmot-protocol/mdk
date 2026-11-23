@@ -564,7 +564,8 @@ tags. MDK renames one tag of that design: a turn names the chat message that sta
   [Replies and Thread Messages](../../docs/marmot-architecture/overview/thread-messages.md#agent-items-in-threads).
 - **Alerts.** An item notifies only while its latest version is an approval or a question that is `waiting`, or a
   turn that ended `failed`; its notification is keyed by the item's first event. Kind 1202 never notifies, and nor
-  does a chat message tagged `["phase", "commentary"]` or the agent's own words in a thread under one of its items.
+  does a chat message tagged `["phase", "commentary"]` or the agent's own words in a thread under one of its items;
+  those words never count as unread either.
 - **Receiving requests.** A kind 1202 arrives as `MessageReceived` like any other message and is read with
   `message_by_id` or `messages_after_insert_order`; `AgentRequest::from_tags` reads its agent, item and action.
 

@@ -3086,6 +3086,76 @@ fn thread_messages_are_chat_activity() {
         ))
         .unwrap();
     assert_eq!(summary(&store), (Some("thread".into()), at + 2, 2, 1));
+
+    // An agent's words in a thread under its own agent item are activity but
+    // never unread, even with a mention. A comment under another author's
+    // item, and one missing its root, root author or root kind, is unread.
+    // The live refresh and a rebuild agree.
+    let words = |id: &str, at: u64, root_author: Option<&str>, root: bool| {
+        let mut tags: Vec<Vec<&str>> = vec![
+            vec!["K", "1201"],
+            vec!["e", "task"],
+            vec!["k", "1201"],
+            vec!["p", LOCAL],
+        ];
+        if let Some(author) = root_author {
+            tags.push(vec!["P", author]);
+        }
+        if root {
+            tags.push(vec!["E", "task"]);
+        }
+        let tags = tags.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        thread_event(id, at, &tags)
+    };
+    let arrive = |store: &SqliteAppStorage, event: StoredAppEvent| {
+        store.record_app_event(&event).unwrap();
+        let row = store
+            .refresh_chat_list_row_for_messages(
+                LOCAL,
+                GROUP,
+                std::slice::from_ref(&event.message_id_hex),
+                &mentions_local,
+            )
+            .unwrap()
+            .expect("chat row");
+        (row.unread_count, row.unread_mention_count)
+    };
+    assert_eq!(
+        arrive(&store, words("agent-words", at + 3, Some(REMOTE), true)),
+        (2, 1)
+    );
+    // It is still the chat's latest activity.
+    assert_eq!(summary(&store), (Some("agent-words".into()), at + 3, 2, 1));
+    assert_eq!(
+        arrive(
+            &store,
+            words("under-another", at + 4, Some("someone"), true)
+        ),
+        (3, 2)
+    );
+    assert_eq!(
+        arrive(&store, words("rootless", at + 5, Some(REMOTE), false)),
+        (4, 3)
+    );
+    assert_eq!(
+        arrive(&store, words("no-root-author", at + 6, None, true)),
+        (5, 4)
+    );
+    let no_root_kind = thread_event(
+        "no-root-kind",
+        at + 7,
+        &[
+            &["E", "task"],
+            &["P", REMOTE],
+            &["e", "task"],
+            &["k", "1201"],
+        ],
+    );
+    assert_eq!(arrive(&store, no_root_kind), (6, 4));
+    store
+        .set_chat_manually_unread(LOCAL, GROUP, false, &mentions_local)
+        .unwrap();
+    assert_eq!(summary(&store), (Some("no-root-kind".into()), at + 7, 6, 4));
 }
 
 #[test]
@@ -4934,6 +5004,42 @@ fn retention_scan_without_read_cursor_keeps_received_rows() {
     let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
     assert!(scan.expired_unread);
     assert!(scan.expired_rows);
+}
+
+/// An agent's own words in its subagent thread are never unread, so they
+/// expire on time, with or without a read cursor.
+#[test]
+fn retention_scan_lets_an_agents_own_thread_words_expire() {
+    let words = |id: &str, at: u64| StoredAppEvent {
+        kind: cgka_traits::NIP22_COMMENT_KIND,
+        ..chat_with_tags(
+            id,
+            REMOTE,
+            at,
+            "found the fixtures",
+            vec![
+                vec!["E".into(), "task".into()],
+                vec!["K".into(), "1201".into()],
+                vec!["P".into(), REMOTE.into()],
+                vec!["e".into(), "task".into()],
+                vec!["k".into(), "1201".into()],
+            ],
+        )
+    };
+    let app = setup_store().app_storage();
+    record_expiring(&app, &words("words", 100)).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
+    assert!(!scan.expired_unread);
+    assert!(scan.expired_rows);
+
+    app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    record_expiring(&app, &chat("read", REMOTE, 90, "hi")).unwrap();
+    app.mark_timeline_message_read(LOCAL, GROUP, "read", &no_mentions)
+        .unwrap();
+    record_expiring(&app, &words("more-words", 110)).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
+    assert!(!scan.expired_unread);
 }
 
 #[test]
