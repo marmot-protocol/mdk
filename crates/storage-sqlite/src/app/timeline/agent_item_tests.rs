@@ -630,3 +630,63 @@ fn an_item_shown_from_an_imported_edit_names_the_import_source() {
         Some(HistoryImportProvenance::Device(slot))
     );
 }
+
+/// A history import that deletes the only edit an item is shown from tells an
+/// open timeline to drop the row; one that also brings the item's first event
+/// keeps it.
+#[test]
+fn an_import_that_deletes_the_only_edit_removes_the_item_from_open_timelines() {
+    let imported = |event: StoredAppEvent| ImportedAppEvent {
+        message_id_hex: event.message_id_hex,
+        source_epoch: 3,
+        sender: event.sender,
+        plaintext: event.plaintext,
+        kind: event.kind,
+        tags: event.tags,
+        created_at: event.recorded_at,
+        retention: None,
+        moderation_grant: None,
+        file_keys: Vec::new(),
+    };
+    let delete_edit = || {
+        imported(event(
+            "delete",
+            "agent",
+            21,
+            MARMOT_APP_EVENT_KIND_DELETE,
+            vec![tag(&["e", "edit-2"])],
+            "",
+        ))
+    };
+    let item_change = |batch: Vec<ImportedAppEvent>| {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        store
+            .record_app_event(&item_edit("edit-2", "item", 20, 2, "running"))
+            .unwrap();
+        let changes = store
+            .import_app_events(GROUP, &[7; 32], &batch, 100)
+            .unwrap()
+            .update
+            .changes;
+        let mut item = changes.into_iter().filter(|change| match change {
+            TimelineMessageChange::Upsert { message, .. } => message.message_id_hex == "item",
+            TimelineMessageChange::Remove { message_id_hex, .. } => message_id_hex == "item",
+        });
+        let change = item.next().expect("the import names the item's row");
+        assert!(item.next().is_none());
+        change
+    };
+
+    assert!(matches!(
+        item_change(vec![delete_edit()]),
+        TimelineMessageChange::Remove { .. }
+    ));
+    let TimelineMessageChange::Upsert { message, .. } = item_change(vec![
+        delete_edit(),
+        imported(item("item", 10, 1, "running", 1)),
+    ]) else {
+        panic!("the item's first event brings its row back");
+    };
+    assert!(!message.agent_item_first_event_missing);
+    assert_eq!(message.plaintext, "v1 running");
+}
