@@ -89,11 +89,10 @@ behavior and JSON fields are documented in the README; the rules below are the o
 - Runtime subscriptions should keep local signing accounts current; explicit catch-up remains a diagnostic/repair path.
 - Keep daemon status JSON useful for scripts: running state, pid, socket, log path, last runtime activity summary,
   and relay health.
-- Keep daemon streaming output newline-delimited and typed. Current user-facing subscription feeds are
-  `messages subscribe`, `messages timeline subscribe`, `chats subscribe`, `chats subscribe-archived`, and
-  `groups subscribe-state`. `messages timeline subscribe`, `chats subscribe-archived`, `groups subscribe-state`, and
-  `notifications subscribe` are deprecated (they served the removed TUI): keep them working, add nothing to them, and
-  remove them in a later change rather than piecemeal.
+- Keep daemon streaming output newline-delimited and typed. The current user-facing subscription feeds are
+  `messages subscribe` and `chats subscribe`. `messages timeline subscribe`, `chats subscribe-archived`,
+  `groups subscribe-state`, and `notifications subscribe` are deprecated (they served the removed TUI): keep them
+  working, add nothing to them, and remove them in a later change rather than piecemeal.
 
 ## Key files
 

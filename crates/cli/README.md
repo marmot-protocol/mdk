@@ -42,6 +42,9 @@ wn --help
 wnd --help
 ```
 
+A `wnd` that is already running keeps serving the old code after an upgrade. Stop it with `wn daemon stop` and start it
+again (see [Daemon](#daemon)).
+
 To run from a source checkout without installing:
 
 ```sh

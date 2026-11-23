@@ -2465,6 +2465,18 @@ fn whitenoise_parity_commands_have_real_or_explicit_contracts() {
     assert_eq!(settings["language"], "system");
     let settings = run_json(home.path(), &["settings", "language", "en"]);
     assert_eq!(settings["language"], "en");
+    // A settings file written while `settings theme` existed still loads, and
+    // its theme is no longer reported.
+    let legacy_home = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(legacy_home.path().join("dev")).expect("legacy dev dir");
+    std::fs::write(
+        legacy_home.path().join("dev").join("settings.json"),
+        r#"{"theme":"dark","language":"de"}"#,
+    )
+    .expect("legacy settings file");
+    let settings = run_json(legacy_home.path(), &["settings", "show"]);
+    assert_eq!(settings["language"], "de");
+    assert!(settings.get("theme").is_none(), "{settings}");
     #[cfg(unix)]
     {
         let dev_dir = home.path().join("dev");

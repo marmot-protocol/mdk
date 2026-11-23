@@ -28,7 +28,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - The terminal UI is gone: `wn tui` no longer exists. This is a breaking change for anyone who used it; every chat,
   group and message action it offered is a `wn` command. A home the TUI ran in may keep a `tui-media-cache/`
-  directory, which can be deleted.
+  directory; after an unclean exit it can hold decrypted attachments. Delete it by hand.
 - `wn settings theme` is removed. It was meant for the TUI, which never read it. `wn settings show` no longer prints a
   `theme` field, and a `theme` value in an existing `settings.json` is ignored.
 
