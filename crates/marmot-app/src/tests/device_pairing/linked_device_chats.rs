@@ -513,8 +513,8 @@ async fn a_recorded_acceptance_holds_every_new_device_until_it_is_sent() {
 /// chat as an invitation (mdk#3556). The tablet cannot read device-group
 /// messages from before it joined, and the phone answers its broadcast
 /// request only an hour after its own last broadcast, which here was the
-/// laptop's link. An Add whose decision reaches no relay waits for a later
-/// pass.
+/// laptop's link. An Add waits for a later pass until a relay accepted its
+/// decision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_acceptance_sent_before_a_link_reaches_the_new_device_ahead_of_its_welcome() {
     let (relay, [mut phone]) = alice_devices::<1>().await;
@@ -553,14 +553,13 @@ async fn an_acceptance_sent_before_a_link_reaches_the_new_device_ahead_of_its_we
 
     let mut tablet = another_alice_device(&relay, &phone).await;
     link(&relay, &mut phone, &mut tablet, "Tablet").await;
-    // An Add whose decision reaches no relay waits, spending no stock.
+    // A decision no relay acknowledged holds the Add, spending no stock.
     hold_key_packages(&relay, &mut phone, &mut tablet).await;
-    relay.reject_publishes_of_kind_as_too_large(445);
+    relay.zero_ack_next_publish();
     phone
         .client
         .add_linked_devices_to_chats(&[], &mut Default::default())
         .await;
-    relay.allow_all_publish_kinds();
     assert_eq!(taken_from(&phone, &tablet), 0);
     let mut seen = false;
     for _ in 0..6 {
