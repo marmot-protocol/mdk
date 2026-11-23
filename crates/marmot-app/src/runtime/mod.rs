@@ -7473,13 +7473,10 @@ impl AccountManager {
         fence: &onboarding::GeneratedTeardownFence,
     ) -> Result<(), AppError> {
         // A label may have been reused while foreground setup finished.
-        // Check before purging reports and after taking the worker transaction.
+        // Check before fencing reports and after taking the worker transaction.
         self.resolve_original(expected)?;
-        // Stop and delete the account's moderation reports, and admit none
-        // until the removal below has committed (every removal entry point).
-        // Fenced before the global lock: the purge may open account storage.
-        // Removing the directory deletes the rows even if this purge fails.
-        let (_report_fence, _) = self.fence_moderation_reports(&expected.label).await;
+        // Leave the outbox in the account directory until removal can detach it.
+        let _report_fence = self.app.fence_report_work(&expected.label).await;
         let _preparation = self.setup.fence_generated_removal(fence).await;
         let lock_wait = self
             .shared

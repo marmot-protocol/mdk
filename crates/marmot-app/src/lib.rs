@@ -6105,7 +6105,9 @@ impl MarmotApp {
         lifecycle: Option<cgka_traits::KeyPackageLifecycleState>,
     ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
         let account = self.account_home().account(label)?;
-        let legacy_record = read_json::<KeyPackageRecord>(self.key_package_record_path(label)).ok();
+        let legacy_record = self
+            .read_inventory_record(label, self.key_package_record_path(label))
+            .ok();
         let source_relays = self.account_nip65_relays(label).unwrap_or_default();
         let mut entries = Vec::with_capacity(owned_key_packages.len());
 
@@ -6452,6 +6454,19 @@ impl MarmotApp {
 
     fn key_package_record_path(&self, label: &str) -> PathBuf {
         self.key_package_artifact_path(label, KEY_PACKAGE_RECORD)
+    }
+
+    fn read_inventory_record(
+        &self,
+        label: &str,
+        path: PathBuf,
+    ) -> Result<KeyPackageRecord, AppError> {
+        match read_json(path) {
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                read_json(self.key_package_record_path(label))
+            }
+            result => result,
+        }
     }
 
     fn reusable_key_package_slot_id(

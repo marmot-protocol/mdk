@@ -882,6 +882,44 @@ async fn cache_metadata_without_owned_bundle_is_not_local() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inventory_reads_staged_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(directory.path(), DIRECTORY);
+    let account = app.account_home().create_account("inventory").unwrap();
+    let label = &account.label;
+    let legacy_path = directory
+        .path()
+        .join(crate::LEGACY_KEY_PACKAGE_DIR)
+        .join(format!("{label}.{}", crate::KEY_PACKAGE_RECORD));
+    crate::write_json(
+        &legacy_path,
+        &crate::KeyPackageRecord {
+            account_label: label.clone(),
+            account_id_hex: account.account_id_hex,
+            key_package_id: SLOT.into(),
+            key_package_ref_hex: "legacy-ref".into(),
+            key_package_event_id: "legacy-event".into(),
+            published_at: 1_700_000_000,
+            key_package_hex: "00".into(),
+        },
+    )
+    .unwrap();
+
+    let resolved = app.key_package_record_path(label);
+    assert_eq!(resolved, legacy_path);
+    app.stage_key_package_artifacts(label).unwrap();
+    assert_eq!(
+        std::fs::symlink_metadata(&resolved).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+
+    let record = app.read_inventory_record(label, resolved).unwrap();
+    assert_eq!(record.key_package_id, SLOT);
+    assert_eq!(record.key_package_event_id, "legacy-event");
+    assert_eq!(record.published_at, 1_700_000_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refresh_merges_current_echo_and_keeps_retained_local_only() {
     let (_dir, runtime, account, fetcher, relay) = runtime_inventory_fixture().await;
     runtime

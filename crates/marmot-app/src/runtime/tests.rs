@@ -3634,12 +3634,42 @@ async fn cancelled_startup_is_reaped() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removal_refuses_direct_sync() {
+    use storage_sqlite::{ModerationReportOutboxEntry, ModerationReportOutboxOutcome};
+
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://setup.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let home = app.account_home();
     let account = home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
+    let signer = home.load_signing_keys("alice").unwrap();
+    let recipient = nostr::prelude::Keys::generate().public_key();
+    let rumor = crate::moderation_reports::moderation_report_rumor(
+        signer.public_key(),
+        nostr::prelude::Keys::generate().public_key(),
+        crate::ReportReason::Spam,
+        crate::ModerationReportOrigin::Report,
+        "retry this report",
+        "test",
+    );
+    let wrap = transport_nostr_peeler::gift_wrap_rumor(Arc::new(signer), recipient, rumor)
+        .await
+        .unwrap();
+    let event = crate::NostrTransportEvent::from_nostr_event(&wrap).unwrap();
+    let report = ModerationReportOutboxEntry {
+        report_id: "a".repeat(32),
+        dedupe_key: "b".repeat(64),
+        recipient_pubkey_hex: recipient.to_hex(),
+        outcome: ModerationReportOutboxOutcome::CompletionUnknown,
+        event_json: Some(serde_json::to_string(&event).unwrap()),
+        created_at_ms: u64::try_from(crate::notifications::unix_now_ms()).unwrap(),
+        attempts: 1,
+    };
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .stage_moderation_report(&report)
+        .unwrap();
     let runtime = app.runtime();
     let (reached, proceed) = install_local_open_gate(&app, "alice");
     let sync = tokio::spawn({
@@ -3650,6 +3680,11 @@ async fn removal_refuses_direct_sync() {
     let removal = runtime.accounts().remove_account("alice").await;
     let other = runtime.accounts().remove_account("bob").await;
     let live = home.account("alice");
+    let pending = app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .pending_moderation_reports(1);
     proceed.send(()).unwrap();
     assert!(matches!(removal, Err(AppError::AccountSessionBusy)));
     other.unwrap();
@@ -3658,12 +3693,14 @@ async fn removal_refuses_direct_sync() {
         Err(AccountHomeError::UnknownAccount(_))
     ));
     assert_eq!(live.unwrap(), account);
+    assert_eq!(pending.unwrap(), vec![report]);
     let _pass = sync.await.unwrap().expect("direct sync still opens");
     runtime.accounts().remove_account("alice").await.unwrap();
     assert!(matches!(
         home.account("alice"),
         Err(AccountHomeError::UnknownAccount(_))
     ));
+    assert!(!app.account_dir("alice").try_exists().unwrap());
     runtime.shutdown().await;
 }
 

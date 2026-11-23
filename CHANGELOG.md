@@ -34,7 +34,10 @@
   imports use their derived public identity for admission; binding rollback errors retain cleanup details.
 - Setup completion remains committed when context cleanup fails. Leased reopen retries leftover context
   and detached payloads without blocking unrelated accounts on individual cleanup failures. Restored
-  public accounts retain database-credential ownership for a later wipe and explicit NIP-46 cleanup.
+  public accounts retain database-credential cleanup intent for a later wipe and explicit NIP-46 cleanup.
+  Completion is logical after journal removal; a failed directory sync does not guarantee power-loss durability.
+- Refused busy-account removal keeps queued moderation reports. Lower-level removal validates the
+  accounts container before moving the account; inventory reads follow relocated legacy KeyPackage records.
 
 ## 0.19.0 - 2026-11-22
 

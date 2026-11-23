@@ -8114,6 +8114,8 @@ fn durable_incomplete_setup_can_provision_slot_after_database_creation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_ambiguous_setup_requires_consent_before_reset() {
+    use marmot_account::AccountSecretStore;
+
     let directory = tempfile::tempdir().unwrap();
     let keys = nostr::prelude::Keys::generate();
     if keyring_core::get_default_store().is_none() {
@@ -8174,15 +8176,19 @@ async fn legacy_ambiguous_setup_requires_consent_before_reset() {
     ));
     assert!(!app.key_package_cutover_replacement_pending(&account.label));
     assert_eq!(
-        marmot_account::AccountSecretStore::load_secret(store.as_ref(), &account)
-            .unwrap()
-            .public_key(),
+        store.load_secret(&account).unwrap().public_key(),
         keys.public_key()
     );
 
     let retried = home.import_nostr_account_idempotent(&secret).unwrap();
     assert_eq!(retried.account().account_id_hex, account.account_id_hex);
     runtime.shutdown().await;
+    store.remove_secret(retried.account()).unwrap();
+    assert!(
+        !store
+            .has_secret_for_account_id(&account.account_id_hex)
+            .unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
