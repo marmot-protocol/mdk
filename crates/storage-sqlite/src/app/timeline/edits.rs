@@ -33,9 +33,20 @@ pub struct TimelineEditHistoryPage {
     pub has_more_before: bool,
 }
 
+/// Apply each row's edits. An agent item this group holds edits of, but not
+/// the first event of, first gets its row: see [`held_agent_item_row`].
 pub(super) fn apply_group(rows: &mut BTreeMap<String, TimelineRow>, events: &[RawAppEvent]) {
+    let stored = events
+        .iter()
+        .map(|event| event.message_id_hex.as_str())
+        .collect::<HashSet<_>>();
     let (by_target, deleted) = edits_by_target(events);
     for (target, edits) in by_target {
+        if !stored.contains(target)
+            && let Some(held) = held_agent_item_row(target, edits.iter().copied(), &deleted)
+        {
+            rows.insert(target.to_owned(), held);
+        }
         if let Some(row) = rows.get_mut(target) {
             let versions = resolve(row, edits.into_iter(), &deleted);
             apply(row, &versions);
@@ -71,26 +82,6 @@ fn edits_by_target(events: &[RawAppEvent]) -> (HashMap<&str, Vec<&RawAppEvent>>,
         }
     }
     (by_target, deleted)
-}
-
-/// Give each agent item this group holds edits of, but not the first event
-/// of, its row: see [`held_agent_item_row`].
-pub(super) fn add_held_agent_items(
-    rows: &mut BTreeMap<String, TimelineRow>,
-    events: &[RawAppEvent],
-) {
-    let stored = events
-        .iter()
-        .map(|event| event.message_id_hex.as_str())
-        .collect::<HashSet<_>>();
-    let (by_target, deleted) = edits_by_target(events);
-    for (target, edits) in by_target {
-        if !stored.contains(target)
-            && let Some(row) = held_agent_item_row(target, edits.into_iter(), &deleted)
-        {
-            rows.insert(target.to_owned(), row);
-        }
-    }
 }
 
 /// The row of an agent item whose first event this device does not hold. A

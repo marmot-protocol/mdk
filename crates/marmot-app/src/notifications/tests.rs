@@ -2688,6 +2688,53 @@ fn an_agent_item_whose_edit_came_first_alerts_from_the_edit() {
     assert_eq!(update.delivery_key, held.delivery_key);
 }
 
+/// A member who sends an edit of the agent's item before the agent does owns
+/// the row a late joiner sees until the item's first event arrives. The
+/// agent's own alert at the same version, once that event arrives, is still
+/// delivered: an item version's delivery names the row's author.
+#[test]
+fn an_edit_by_another_member_never_takes_the_agents_alert() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_AGENT_ITEM, MARMOT_APP_EVENT_KIND_EDIT};
+
+    let mut chat = AgentNotifications::new();
+    let agent = chat.agent.clone();
+    let item = "b1".repeat(32);
+    chat.agent = "cc".repeat(32);
+    let forged = chat
+        .receive(
+            &"b2".repeat(32),
+            MARMOT_APP_EVENT_KIND_EDIT,
+            edit_of(&item, agent_item_tags("approval", "waiting", 2)),
+            "Allow?",
+            5,
+        )
+        .expect("the row is the other member's waiting approval");
+    assert_eq!(forged.sender.account_id_hex, chat.agent);
+    chat.agent = agent;
+    assert!(
+        chat.receive(
+            &"b3".repeat(32),
+            MARMOT_APP_EVENT_KIND_EDIT,
+            edit_of(&item, agent_item_tags("approval", "waiting", 2)),
+            "Allow?",
+            11,
+        )
+        .is_none(),
+        "the agent's edit is no version of another member's row"
+    );
+    let genuine = chat
+        .receive(
+            &item,
+            MARMOT_APP_EVENT_KIND_AGENT_ITEM,
+            agent_item_tags("approval", "running", 1),
+            "Preparing",
+            10,
+        )
+        .expect("the agent's item is waiting for a person");
+    assert_eq!(genuine.sender.account_id_hex, chat.agent);
+    assert_ne!(genuine.delivery_key, forged.delivery_key);
+}
+
 #[test]
 fn an_answer_a_control_or_a_remark_never_notifies_and_an_item_respects_mute() {
     use cgka_traits::app_event::{

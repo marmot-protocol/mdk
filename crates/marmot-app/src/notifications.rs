@@ -2246,8 +2246,14 @@ fn notification_update_from_message(
         None => preview_text_for_message(&event.message),
     };
     let notification_key = format!("message:{}:{message_id_hex}", event.account_id_hex);
-    let delivery_key = match agent_item.as_ref().and_then(|row| row.agent_item.as_ref()) {
-        Some(item) => format!("{notification_key}:v{}", item.version),
+    // The row's author is part of an item version's delivery: a row built
+    // from a held edit is that edit's sender's, and must not take the place
+    // of the agent's own alert once the item's first event arrives.
+    let delivery_key = match agent_item
+        .as_ref()
+        .and_then(|row| row.agent_item.as_ref().map(|item| (&row.sender, item)))
+    {
+        Some((sender, item)) => format!("{notification_key}:{sender}:v{}", item.version),
         None => notification_key.clone(),
     };
     Ok(Some(NotificationUpdate {

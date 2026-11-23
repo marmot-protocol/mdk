@@ -191,8 +191,10 @@ fn an_edit_that_arrives_before_its_item_is_held_and_applied() {
 #[test]
 fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    // The edit anchoring the row gives it its retention.
+    let retention = Some(AppMessageRetentionDecision::new(30, 3600));
     store
-        .record_app_event(&item_edit("edit-3", "item", 30, 3, "running"))
+        .record_app_event_with_retention(&item_edit("edit-3", "item", 30, 3, "running"), retention)
         .unwrap();
     store
         .record_app_event(&item_edit("edit-4", "item", 40, 4, "waiting"))
@@ -226,6 +228,8 @@ fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
         assert_eq!(held.tags, item_tags(4, "waiting", 104));
         assert_eq!(held.agent_item.unwrap().version, 4);
         assert_eq!(held.edit, None);
+        assert_eq!(held.retention_seconds, Some(3600));
+        assert_eq!(held.retention_expires_at, Some(3630));
         store.rebuild_message_timeline_for_group(GROUP).unwrap();
     }
 
@@ -571,4 +575,38 @@ fn an_item_shown_from_its_edits_sits_in_the_thread_they_name() {
         })
     );
     assert_eq!(held.reply_to_message_id_hex.as_deref(), Some("task"));
+}
+
+/// An item's edit imported from a sibling's history, without the first event,
+/// shows the item with that import's source.
+#[test]
+fn an_item_shown_from_an_imported_edit_names_the_import_source() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let edit = item_edit("edit-2", "item", 20, 2, "running");
+    let slot = [7; 32];
+    store
+        .import_app_events(
+            GROUP,
+            &slot,
+            &[ImportedAppEvent {
+                message_id_hex: edit.message_id_hex.clone(),
+                source_epoch: 3,
+                sender: edit.sender.clone(),
+                plaintext: edit.plaintext.clone(),
+                kind: edit.kind,
+                tags: edit.tags.clone(),
+                created_at: edit.recorded_at,
+                retention: None,
+                moderation_grant: None,
+                file_keys: Vec::new(),
+            }],
+            100,
+        )
+        .unwrap();
+    let held = row(&store, "item");
+    assert!(held.agent_item_first_event_missing);
+    assert_eq!(
+        held.history_import_provenance,
+        Some(HistoryImportProvenance::Device(slot))
+    );
 }

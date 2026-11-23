@@ -4332,7 +4332,6 @@ fn project_group_events(
         }
     }
 
-    edits::add_held_agent_items(&mut timeline, &events);
     edits::apply_group(&mut timeline, &events);
 
     let events_by_id = events
@@ -5214,6 +5213,9 @@ fn hydrate_timeline_presentation(
                 |row| row.get::<_, bool>(0),
             )
             .storage()?;
+        if message.agent_item_first_event_missing {
+            hydrate_held_agent_item_source(conn, message)?;
+        }
     }
     let mut legacy_roots = HashMap::new();
     for message in messages.iter_mut() {
@@ -5253,6 +5255,70 @@ fn hydrate_timeline_presentation(
             .get(&message.group_id_hex)
             .and_then(|group| group.get(target))
             .cloned();
+    }
+    Ok(())
+}
+
+/// A row built from an agent item's edits has the retention and import source
+/// of the edit that anchors it, its sender's earliest edit of the item, at the
+/// row's place: the first event the row stands for has neither.
+fn hydrate_held_agent_item_source(
+    conn: &Connection,
+    message: &mut TimelineMessageRecord,
+) -> StorageResult<()> {
+    let anchor = conn
+        .query_row_cached(
+            &format!(
+                "SELECT source.retention_seconds, source.retention_expires_at,
+                        {TIMELINE_IMPORT_PROVENANCE_SQL},
+                        {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
+                 FROM message_modifier_edges AS edges
+                 JOIN app_events AS source
+                   ON source.group_id_hex = edges.group_id_hex
+                  AND source.message_id_hex = edges.modifier_message_id_hex
+                 LEFT JOIN app_event_imports AS imported
+                   ON imported.group_id_hex = source.group_id_hex
+                  AND imported.message_id_hex = source.message_id_hex
+                 WHERE edges.group_id_hex = ?1
+                   AND edges.target_message_id_hex = ?2
+                   AND edges.kind = {MARMOT_APP_EVENT_KIND_EDIT}
+                   AND edges.sender = ?3
+                   AND edges.recorded_at = ?4
+                   AND source.invalidated = 0
+                 ORDER BY source.message_id_hex
+                 LIMIT 1"
+            ),
+            params![
+                message.group_id_hex,
+                message.message_id_hex,
+                message.sender,
+                u64_to_i64(message.timeline_at)?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?
+                        .and_then(|value| value.try_into().ok()),
+                    row.get::<_, Option<i64>>(1)?
+                        .and_then(|value| value.try_into().ok()),
+                    history_import_provenance_from_row(row)?,
+                    row.get::<_, Option<Vec<u8>>>("imported_source_slot")?
+                        .map(|slot| -> rusqlite::Result<_> {
+                            Ok(HistoryImportSource::new(
+                                &slot,
+                                row.get("imported_source_label")?,
+                            ))
+                        })
+                        .transpose()?,
+                ))
+            },
+        )
+        .optional()
+        .storage()?;
+    if let Some((retention_seconds, retention_expires_at, provenance, imported_from)) = anchor {
+        message.retention_seconds = retention_seconds;
+        message.retention_expires_at = retention_expires_at;
+        message.history_import_provenance = provenance;
+        message.imported_from = imported_from;
     }
     Ok(())
 }
