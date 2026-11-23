@@ -1246,8 +1246,8 @@ Still to delete:
   produced a count since the stall samples went, so only evidence a 0.14.0 process persisted
   can restore one.
 - Data-dead APIs no production code calls since row 8: the maintenance REQ API
-  (`install_group_maintenance_*`) and the window acquisition scopes (`AccountInboxWindow`,
-  `GroupWindow`, `GroupsWindow`). The storage `SubscriptionReplay` APIs went in rows 9–10.
+  (`install_group_maintenance_*`). The storage `SubscriptionReplay` APIs went in rows 9–10, and the
+  window acquisition scopes and `oldest_raw_created_at` went with #2885's stage 0.
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
 
 Each PR reports exact before/after line counts. The goal is a large net reduction across

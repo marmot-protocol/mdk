@@ -10,36 +10,11 @@ use transport_nostr_peeler::NostrTransportEvent;
 /// token fires or the acquisition future is dropped.
 pub type NostrAcquisitionCancellation = tokio_util::sync::CancellationToken;
 
-/// The exact Nostr query the recovery owner has justified. Explicit IDs can
-/// reacquire known inventory; a history window is bounded investigation and
-/// does not by itself establish complete coverage.
+/// The exact Nostr query the recovery owner has justified: known Nostr event
+/// IDs to reacquire. This cannot discover unknown history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NostrAcquisitionScope {
-    /// Reacquire known Nostr event IDs. This cannot discover unknown history.
     KnownEventIds(Vec<[u8; 32]>),
-    /// Kind-1059 gift wraps addressed to `request.account_id` via the `p` tag.
-    /// Both time bounds are inclusive; never issue an unfiltered time REQ.
-    AccountInboxWindow { since: u64, until: u64 },
-    /// Kind-445 group events with the exact `h` tag below. Both time bounds
-    /// are inclusive; never issue an unfiltered time REQ.
-    GroupWindow {
-        transport_group_id: [u8; 32],
-        since: u64,
-        until: u64,
-        /// Ask for at most this many of the window's newest events (the
-        /// NIP-01 `limit`, which relays answer newest first). `None` leaves
-        /// the order and page size to the relay, so the item budget may cut
-        /// any prefix of the window.
-        newest: Option<usize>,
-    },
-    /// Kind-445 group events carrying any of the `h` tags below: the routes
-    /// one batched live REQ carries, at most
-    /// [`crate::GROUP_BATCH_ROUTES`]. Both time bounds are inclusive.
-    GroupsWindow {
-        transport_group_ids: Vec<[u8; 32]>,
-        since: u64,
-        until: u64,
-    },
 }
 
 /// Per-endpoint received-item and serialized-event-JSON byte budgets, plus an
@@ -92,34 +67,15 @@ impl NostrAcquisitionRequest {
         {
             return Err(NostrAcquisitionError::InvalidRequest);
         }
-        match &self.scope {
-            NostrAcquisitionScope::KnownEventIds(ids)
-                if ids.is_empty()
-                    || limits.max_requested_event_ids == 0
-                    || ids.len() > limits.max_requested_event_ids
-                    || ids.iter().collect::<HashSet<_>>().len() != ids.len() =>
-            {
-                Err(NostrAcquisitionError::InvalidRequest)
-            }
-            NostrAcquisitionScope::AccountInboxWindow { since, until }
-            | NostrAcquisitionScope::GroupWindow { since, until, .. }
-            | NostrAcquisitionScope::GroupsWindow { since, until, .. }
-                if since > until =>
-            {
-                Err(NostrAcquisitionError::InvalidRequest)
-            }
-            NostrAcquisitionScope::GroupsWindow {
-                transport_group_ids,
-                ..
-            } if transport_group_ids.is_empty()
-                || transport_group_ids.len() > crate::GROUP_BATCH_ROUTES
-                || transport_group_ids.iter().collect::<HashSet<_>>().len()
-                    != transport_group_ids.len() =>
-            {
-                Err(NostrAcquisitionError::InvalidRequest)
-            }
-            _ => Ok(()),
+        let NostrAcquisitionScope::KnownEventIds(ids) = &self.scope;
+        if ids.is_empty()
+            || limits.max_requested_event_ids == 0
+            || ids.len() > limits.max_requested_event_ids
+            || ids.iter().collect::<HashSet<_>>().len() != ids.len()
+        {
+            return Err(NostrAcquisitionError::InvalidRequest);
         }
+        Ok(())
     }
 }
 
@@ -160,9 +116,6 @@ pub struct NostrAcquisitionStats {
     /// Parsed EVENTs for this request before SDK event filtering, including
     /// duplicates and the first raw item-budget overflow frame.
     pub raw_received_items: usize,
-    /// Minimum timestamp among those raw EVENTs. Advisory paging evidence,
-    /// never proof of event validity, durable admission or history coverage.
-    pub oldest_raw_created_at: Option<u64>,
     pub received_items: usize,
     pub serialized_event_bytes: usize,
     pub duplicates: usize,

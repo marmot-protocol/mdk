@@ -397,10 +397,9 @@ events recur on wrap; only durable app ingestion removes an event from the missi
 
 ## Raw page evidence
 
-Bounded acquisition reports `raw_received_items` and `oldest_raw_created_at` before SDK cache,
-duplicate and event filtering. A short validated event list does not establish a short relay page.
-Epoch-gap paging uses the raw evidence to descend, and a completed oldest page for admission;
-neither the evidence nor end of stored events certifies durable history coverage.
+Bounded acquisition reports `raw_received_items` before SDK cache, duplicate and event filtering.
+A short validated event list does not establish a short relay page, and neither the raw count nor
+end of stored events certifies durable history coverage.
 The byte allowance counts validated serialized event JSON, not rejected wire bytes or process memory.
 
 ## Time-sliced sweep

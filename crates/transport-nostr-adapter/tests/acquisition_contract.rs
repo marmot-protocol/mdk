@@ -126,34 +126,6 @@ fn request_validation_rejects_invalid_inputs() {
             Err(NostrAcquisitionError::InvalidRequest)
         );
     }
-    for routes in [
-        vec![],
-        vec![[1; 32], [1; 32]],
-        (0..=transport_nostr_adapter::GROUP_BATCH_ROUTES)
-            .map(|index| [index as u8; 32])
-            .collect(),
-    ] {
-        let mut invalid = request();
-        invalid.scope = NostrAcquisitionScope::GroupsWindow {
-            transport_group_ids: routes,
-            since: 9,
-            until: 10,
-        };
-        assert_eq!(
-            invalid.validate(),
-            Err(NostrAcquisitionError::InvalidRequest)
-        );
-    }
-    let mut groups = request();
-    groups.scope = NostrAcquisitionScope::GroupsWindow {
-        transport_group_ids: (0..transport_nostr_adapter::GROUP_BATCH_ROUTES)
-            .map(|index| [index as u8; 32])
-            .collect(),
-        since: 10,
-        until: 10,
-    };
-    groups.limits.max_requested_event_ids = 0;
-    assert_eq!(groups.validate(), Ok(()));
     let mut invalid = request();
     invalid.limits.max_received_items_per_endpoint = 0;
     assert_eq!(
@@ -178,21 +150,6 @@ fn request_validation_rejects_invalid_inputs() {
         invalid.validate(),
         Err(NostrAcquisitionError::InvalidRequest)
     );
-    let mut invalid = request();
-    invalid.scope = NostrAcquisitionScope::AccountInboxWindow {
-        since: 10,
-        until: 9,
-    };
-    assert_eq!(
-        invalid.validate(),
-        Err(NostrAcquisitionError::InvalidRequest)
-    );
-    invalid.scope = NostrAcquisitionScope::AccountInboxWindow {
-        since: 9,
-        until: 10,
-    };
-    invalid.limits.max_requested_event_ids = 0;
-    assert_eq!(invalid.validate(), Ok(()));
     assert_eq!(request().validate(), Ok(()));
 }
 
