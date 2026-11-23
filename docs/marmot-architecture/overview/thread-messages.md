@@ -63,9 +63,9 @@ top-level `task` item carries no thread tags.
   refuses an `e` on a kind 1201 without an `E`: there it would read as an edit's target.
 - **Edits.** A later version is a kind-1009 edit whose one `e` names its target, so it carries no parent `e`. It may
   repeat `E`/`K`/`P`. The item stays where its first event placed it, whatever thread tags an edit carries.
-- **The agent's words** are kind 1111 comments with the same tags. One with an `E`, whose `K` is 1201 and whose `P` is its
-  own author, neither notifies nor wakes members (D-122). Items in the thread keep their own alert rule (D-024): a
-  subagent's approval or question alerts.
+- **The agent's words** are kind 1111 comments with the same tags. One with an `E`, whose `K` is 1201 and whose `P` is
+  its own author, neither notifies, wakes members nor counts as unread (D-122). Items in the thread keep their own
+  alert rule (D-024): a subagent's approval or question alerts.
 - **The parent `p`** always names the event's own author. A `p` is a mention only for the account it names, and an
   account's own messages never notify, raise the @-badge or count as unread, so it is never a mention.
 - **A person writing in the thread** sends an ordinary thread message with `send_thread_message`. Answering any item
@@ -108,7 +108,8 @@ it later), bringing back a locally deleted chat, author edits and deletes, histo
 keys in storage and in the engine, and the `wn-agent` feed (incoming messages with their parent as the reply target,
 edits and deletes, live and on replay; a message deleted before the agent sees it reaches the agent only as its
 deletion). The agent's own words in a thread under one of its items are the one exception: they send no
-notification and wake no one ([above](#agent-items-in-threads)), and count everywhere else.
+notification, wake no one and are never unread, so they raise neither the unread count nor the @-badge
+([above](#agent-items-in-threads)). They count everywhere else, the chat-list preview and order included.
 
 A kind 1111 with a numeric `k` but no lowercase `e` is a comment without a parent. Like every comment it keeps its
 author's edits and deletes and its attachments, and timeline search matches it as it matches every row. It stays a

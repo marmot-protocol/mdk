@@ -1953,6 +1953,22 @@ const ORIGINAL_PLAINTEXT_SQL: &str = "COALESCE((SELECT original.plaintext FROM a
 /// moves it.
 const NOT_IMPORTED_SQL: &str = "NOT EXISTS (SELECT 1 FROM app_event_imports AS imported WHERE imported.group_id_hex=message_timeline.group_id_hex AND imported.message_id_hex=message_timeline.message_id_hex)";
 
+/// An agent's own words in a thread under one of its agent items never count as
+/// unread (marmot-agents D-122): a thread message naming its root with `E`,
+/// whose first `K` is 1201 and whose first `P` is its sender. The same rule as
+/// `cgka_traits::is_agent_own_thread_comment`, which keeps them silent; rows
+/// with tags that do not decode count as usual.
+const NOT_AGENT_THREAD_WORDS_SQL: &str = "NOT (kind = 1111 AND CASE WHEN json_valid(tags_json) THEN
+    (SELECT json_extract(tag.value, '$[1]') FROM json_each(tags_json) AS tag
+      WHERE json_extract(tag.value, '$[0]') = 'E' ORDER BY tag.key LIMIT 1) IS NOT NULL
+    AND (SELECT CASE WHEN value GLOB '[0-9]*' AND value NOT GLOB '*[^0-9]*'
+                     THEN CAST(value AS INTEGER) = 1201 ELSE 0 END
+           FROM (SELECT json_extract(tag.value, '$[1]') AS value FROM json_each(tags_json) AS tag
+                  WHERE json_extract(tag.value, '$[0]') = 'K' ORDER BY tag.key LIMIT 1))
+    AND lower((SELECT json_extract(tag.value, '$[1]') FROM json_each(tags_json) AS tag
+                WHERE json_extract(tag.value, '$[0]') = 'P' ORDER BY tag.key LIMIT 1)) = lower(sender)
+    ELSE 0 END)";
+
 /// WHERE clause + parameters selecting rows that sort after a conversation's
 /// read cursor: the single definition of "unread" shared by the projection
 /// and the retention sweep (mdk#2425). Placeholders are numbered from
@@ -2026,7 +2042,8 @@ fn unread_membership_for_message_tx(
          FROM message_timeline
          WHERE group_id_hex = ?1 AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2 AND message_id_hex = ?3
            AND {activity_filter} AND deleted = 0
-           AND invalidation_status IS NULL AND {NOT_IMPORTED_SQL} AND {where_sql}"
+           AND invalidation_status IS NULL AND {NOT_IMPORTED_SQL}
+           AND {NOT_AGENT_THREAD_WORDS_SQL} AND {where_sql}"
     );
     let mut query_params = vec![
         rusqlite::types::Value::Text(group_id_hex.to_owned()),
@@ -2094,6 +2111,7 @@ fn rebuild_unread_membership_tx(
            AND invalidation_status IS NULL
            AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2
            AND {NOT_IMPORTED_SQL}
+           AND {NOT_AGENT_THREAD_WORDS_SQL}
            AND {where_sql}
          ORDER BY {order_sql}"
     );
@@ -2208,6 +2226,7 @@ fn retention_expiry_scan_tx(
                     AND sender NOT IN (SELECT public_key FROM user_blocks)
                     AND sender != ?2
                     AND {NOT_IMPORTED_SQL}
+                    AND {NOT_AGENT_THREAD_WORDS_SQL}
                     AND message_id_hex IN (
                         SELECT message_id_hex FROM app_events
                         WHERE group_id_hex = ?1 AND retention_expires_at <= ?3)

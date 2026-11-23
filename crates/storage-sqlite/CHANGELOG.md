@@ -15,6 +15,8 @@
 - A kind-1201 agent item with an `E` tag is placed in that thread, under the parent its `e` names or else the root,
   and `reply_to_message_id_hex` is that parent unless the item names a `started_by`. An edit keeps the thread tags
   of the item's first event, whatever thread tags it carries.
+- An agent's own words in a thread under one of its agent items (a kind 1111 with `E`, `K` 1201 and `P` its sender)
+  never count as unread, in the projection, its rebuild and the retention sweep.
 
 ## 0.19.0 - 2026-11-22
 

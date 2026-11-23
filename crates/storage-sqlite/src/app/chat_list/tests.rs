@@ -3086,6 +3086,39 @@ fn thread_messages_are_chat_activity() {
         ))
         .unwrap();
     assert_eq!(summary(&store), (Some("thread".into()), at + 2, 2, 1));
+
+    // An agent's words in a thread under its own agent item are activity but
+    // never unread, even with a mention; a comment under another author's
+    // item, or one naming no root, is unread. A rebuild agrees.
+    let words = |id: &str, at: u64, root_author: &str, root: bool| {
+        let mut tags: Vec<&[&str]> = vec![
+            &["K", "1201"],
+            &["e", "task"],
+            &["k", "1201"],
+            &["p", LOCAL],
+        ];
+        let p_tag = ["P", root_author];
+        tags.push(&p_tag);
+        if root {
+            tags.push(&["E", "task"]);
+        }
+        thread_event(id, at, &tags)
+    };
+    store
+        .record_app_event(&words("agent-words", at + 3, REMOTE, true))
+        .unwrap();
+    assert_eq!(summary(&store), (Some("agent-words".into()), at + 3, 2, 1));
+    store
+        .record_app_event(&words("under-another", at + 4, "someone", true))
+        .unwrap();
+    store
+        .record_app_event(&words("rootless", at + 5, REMOTE, false))
+        .unwrap();
+    assert_eq!(summary(&store), (Some("rootless".into()), at + 5, 4, 3));
+    store
+        .set_chat_manually_unread(LOCAL, GROUP, false, &mentions_local)
+        .unwrap();
+    assert_eq!(summary(&store), (Some("rootless".into()), at + 5, 4, 3));
 }
 
 #[test]
