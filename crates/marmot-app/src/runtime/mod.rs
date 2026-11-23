@@ -1153,16 +1153,13 @@ pub struct RelayFailure {
     pub reason: String,
 }
 
-/// Local-cleanup stage result. In mdk, removing the account directory
-/// atomically drops the SQLCipher session database (MLS state + projections),
-/// the cached media/source-epoch secrets, the on-disk KeyPackage material, the
-/// SQL account record, and the secret-store nsec; the in-memory caches,
-/// subscriptions, and the managed account worker are torn down first. The wipe
-/// only marks this stage `completed` once that removal returns `Ok`.
+/// Local-removal result. Runtime teardown precedes the atomic removal of the
+/// live account namespace. Completion does not confirm vault erasure or
+/// reclamation of detached bytes; failed cleanup retains a durable tombstone.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalCleanupReport {
-    /// Whether local cleanup finished. When `false`, `reason` carries the
-    /// failure summary and the account ref may still be partially valid.
+    /// Whether local removal finished. When `false`, `reason` carries the
+    /// teardown or removal failure summary.
     pub completed: bool,
     /// Failure summary when `completed` is `false`. Privacy-safe.
     pub reason: Option<String>,
@@ -5163,8 +5160,8 @@ impl MarmotAppRuntime {
     ///   partially wiped — a live account either still fully exists (rename not
     ///   done) or is entirely gone (rename done). `local_cleanup.completed` is
     ///   only `false` when that rename never happened (nothing was wiped); once
-    ///   it succeeds the wipe completes even if deleting the orphaned tombstone
-    ///   bytes later fails.
+    ///   it succeeds the wipe completes even if vault erasure or detached-byte
+    ///   cleanup fails. The tombstone retains that pending work.
     /// - After a successful wipe the `account_ref` is no longer valid for any
     ///   further runtime/FFI call.
     /// - Stages 1 and 2 are network-bound; their per-target failures are
@@ -5315,9 +5312,8 @@ impl MarmotAppRuntime {
         }
 
         // Stages 3-5: local cleanup. `remove_account` shuts the worker down,
-        // drops in-memory caches, and removes the account directory (MLS DB,
-        // media, KeyPackage material, SQL row) plus the secret-store nsec in a
-        // single all-or-nothing step.
+        // drops in-memory caches, and atomically detaches the account directory.
+        // Credential erasure and detached-byte cleanup may remain pending.
         match self
             .accounts
             .remove_account_fenced(&account, &generated_setup_fence)

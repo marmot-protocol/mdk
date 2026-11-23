@@ -1302,7 +1302,7 @@ async fn an_unlinked_device_stops_its_account_for_good() {
 /// its secret. The account is gone all the same, so its publish stop goes
 /// with it: the same account linked again here publishes (mdk#2628 D67).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() {
+async fn unlinked_pending_wipe_relinks() {
     use marmot_account::{
         AccountHomeResult, AccountSecretStore, AccountSummary, LocalFileSecretStore,
     };
@@ -1359,8 +1359,18 @@ async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() 
     .expect("the runtime deactivates the account");
 
     let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
-    assert!(!outcome.local_cleanup.completed, "the secret is kept");
+    assert!(outcome.local_cleanup.completed);
     assert!(app.account_home().accounts().unwrap().is_empty());
+    let tombstone = std::fs::read_dir(root.path().join(".wipe-tombstones"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let pending: AccountSummary =
+        serde_json::from_slice(&std::fs::read(tombstone.join("account.json")).unwrap()).unwrap();
+    assert_eq!(pending.account_id_hex, keys.public_key().to_hex());
+    assert!(pending.unlinked);
 
     let attempted = relay.attempted_events().len();
     app.account_home()
@@ -1374,7 +1384,7 @@ async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() 
     })
     .await
     .expect("the account linked again publishes");
-    runtime.shutdown().await;
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 /// Signing out on a single device keeps its leaf in a chat its account is
