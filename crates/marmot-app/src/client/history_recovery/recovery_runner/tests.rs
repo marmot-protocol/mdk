@@ -2170,7 +2170,7 @@ async fn recovery_runner_retries_at_once_when_an_uncover_takes_back_its_proof() 
 
 /// A unit records the second its sweep stopped on only when its relay
 /// cannot prove it: asking again stops there too. With no document that
-/// means the relay refused the NEG-OPEN for the second (mdk#3264). A
+/// means the relay's own NIP-77 answer said so (mdk#3264). A
 /// failed read sweeps on the caps recorded last, an answer cut short at the
 /// quantum's deadline may still return history, and a quantum that gets past
 /// the second clears it.

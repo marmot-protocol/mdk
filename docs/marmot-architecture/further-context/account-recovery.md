@@ -1045,8 +1045,9 @@ Two units hold nothing. A saturated one, whose last answered quantum stopped on 
 second it owes because its relay cannot prove it under the caps the relay published (no cap and
 no NIP-77 proof; migration 0151 records that second), would stop on the same second if asked
 again while those caps stand. A relay whose document was never read saturates the same way once
-it refuses the NEG-OPEN for that second with NEG-ERR before any NIP-77 reply (mdk#3264): the
-second stays owed, and newer live frames no longer wait about 15 minutes for the unit to break. A
+the relay itself answers that it cannot prove that second (mdk#3264): a NEG-ERR to the NEG-OPEN
+before any NIP-77 reply, its `unknown cmd` NOTICE, or more ids for the second than one exchange
+lists. The second stays owed, and newer live frames no longer wait about 15 minutes for the unit to break. A
 `rate-limited:` refusal is waited out, and an `auth-required:` or `error:` one, silence, or a
 failure after the relay began reconciling is inconclusive: a relay that ignores the NEG-OPEN still
 holds them until the unit breaks. It pursues again once
@@ -1055,7 +1056,7 @@ An answer its deadline cut saturates nothing. Nor does an inconclusive NIP-77 an
 return (the event may have gone in between), an exchange that broke off on a malformed
 message, which is not a relay without NIP-77, or a one-id fetch cut short (the reply budget
 counts duplicate frames). Only the relay's own capability (its document, or with none its
-refusal of the NEG-OPEN) or the size of the set it holds for the second proves it cannot prove it. The sweep ends on an inconclusive second and asks
+answer to the NEG-OPEN) or the size of the set it holds for the second proves it cannot prove it. The sweep ends on an inconclusive second and asks
 again on the backoff. A broken unit's debt is parked. The group's frames go once each
 holding unit saturates or breaks, or a relay serves the group again. An admission turn ingests at most 16 staged
 events in one worker command, stopping at the first event the engine keeps no trace of, so

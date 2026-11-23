@@ -12,9 +12,10 @@
 //! - **Leaving the frontier.** A unit stops holding the frontier once its
 //!   last quantum ended without progress (no progress, unreachable, refused)
 //!   or stopped on the first second it owes because its relay cannot prove
-//!   it under the caps the relay published (saturated, even after advancing),
-//!   and while its relay cools down or it is broken or retired. An answer its
-//!   deadline cut, or a relay whose caps were never read, saturates nothing.
+//!   it (saturated, even after advancing): under the caps the relay
+//!   published, or, with none read, by the relay's own answer for that second
+//!   (mdk#3264). It also leaves while its relay cools down or it is broken or
+//!   retired. An answer its deadline cut saturates nothing.
 //!   What it stages later is late input. When no unit serves its group (each
 //!   has left, and none is an active one with nothing left to fetch), the
 //!   group is stranded: each of its units still pursuing its debt holds the

@@ -413,10 +413,11 @@ a full one-second slice is fetched through NIP-77. Completeness comes from count
 relay's NIP-11 `max_limit` (strfry 500, wok's marmot preset 5,000), or, with no published cap, a reply below the
 largest full reply the relay sent. When no current or saved NIP-11 document is available and the count
 cannot prove one second complete, the sweep tries NIP-77 for that second. It covers the second only after
-reconciliation completes and every listed event is fetched. A relay that refuses the NEG-OPEN with NEG-ERR
-before any NIP-77 reply cannot prove the second, like one whose document omits NIP-77, which keeps the sweep
-on count-based proofs (mdk#3264); a `rate-limited:` refusal is waited out, and an `auth-required:` or
-`error:` refusal, silence, or a failure after the relay began reconciling leaves the second inconclusive. That count is proof only for kinds everyone may read, as kind 445 is: strfry spends its cap on events it withholds. `rate-limited:` refusals are waited out; unreachable relays and refusals are
+reconciliation completes and every listed event is fetched. A document that omits NIP-77 keeps the sweep on
+count-based proofs. With no document, the relay's own answer can also say it cannot prove the second: a
+NEG-ERR before any NIP-77 reply, its `unknown cmd` NOTICE, or more ids for the second than one exchange lists.
+That second is unproven, as under a document that omits NIP-77 (mdk#3264). An `auth-required:` or `error:`
+refusal, silence, or a failure after the relay began reconciling leaves it inconclusive. That count is proof only for kinds everyone may read, as kind 445 is: strfry spends its cap on events it withholds. `rate-limited:` refusals are waited out; unreachable relays and refusals are
 reported apart from "answered, nothing new". Each call reports its covered slices (with their proof) and one
 outcome for the caller's backoff. Fullness uses the raw received count before SDK validation: a raw page of
 500 with one invalid signature still counts as full even though only 499 events survive. The wire sweep regression

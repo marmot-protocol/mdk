@@ -543,7 +543,7 @@ pub(super) fn settle(
     }
     // A sweep that stopped on a second its relay cannot prove stops there
     // again while the relay's caps stand: those it published, or none, where
-    // the relay refused the NEG-OPEN for the second (mdk#3264). A
+    // the relay's own answer for the second said so (mdk#3264). A
     // comparison that ran out of budget only paused.
     let saturated_second = match report.end {
         SweepEnd::SaturatedSecond { second } if plan.compare.is_none() => Some(second),
