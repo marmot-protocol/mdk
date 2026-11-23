@@ -30,6 +30,7 @@
   rollback errors preserve actionable publish, storage, and NIP-46 categories. Cancelled external-signer
   onboarding can resume ordinary sign-in without replacing its captured attempt. NIP-46 rollback
   preserves later reconnects and restores the previous host signer even when the cleanup claim fails.
+  NIP-46 registration finishes pending compensation before rebinding the verified session.
   Account-picker sign-in refuses pending compensation without clearing the signed-out marker. Hex-secret
   imports use their derived public identity for admission; binding rollback errors retain cleanup details.
 - Setup completion remains committed when context cleanup fails. Leased reopen retries leftover context

@@ -147,15 +147,29 @@ impl MarmotAppRuntime {
         session: Nip46Session,
         generation: u64,
     ) -> Result<(), AppError> {
+        let observer = (session.clone(), generation);
+        Nip46Session::during_adoption(
+            Some(&observer),
+            self.accounts
+                .account_setup()
+                .resume_pending_setup(&account.account_id_hex),
+        )
+        .await?;
         let gate = self
             .accounts
             .app
             .onboarding_transaction(&account.account_id_hex);
-        let observer = (session.clone(), generation);
         let _transaction =
             Nip46Session::during_adoption(Some(&observer), async { Ok(gate.lock().await) }).await?;
         self.shared.lifecycle().ensure_running()?;
         self.accounts.app.ensure_storage_open("NIP-46 adoption")?;
+        let account = self.accounts.resolve_original(&account)?;
+        if !account.external_signing {
+            return Err(Nip46Error::Mismatch.into());
+        }
+        self.accounts
+            .setup_records()
+            .require_onboarding_complete_for(&account)?;
         let accounts = self.accounts.clone();
         let label = account.label.clone();
         let binding =

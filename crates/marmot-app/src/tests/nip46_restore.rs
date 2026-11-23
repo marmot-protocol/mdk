@@ -873,10 +873,15 @@ async fn nip46_login_retains_retry() {
     enum PendingSession {
         Fresh,
         Restored,
+        Rebound,
     }
 
     let peer = LoginPeer::new().await;
-    for pending_session in [PendingSession::Fresh, PendingSession::Restored] {
+    for pending_session in [
+        PendingSession::Fresh,
+        PendingSession::Restored,
+        PendingSession::Rebound,
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -900,7 +905,10 @@ async fn nip46_login_retains_retry() {
         let id = peer.user.public_key().to_hex();
         let (pending_account, pending_setup) =
             home.add_external_signer_for_setup(&id, None).unwrap();
-        if matches!(pending_session, PendingSession::Restored) {
+        if matches!(
+            pending_session,
+            PendingSession::Restored | PendingSession::Rebound
+        ) {
             session
                 .bind_account(&pending_account.label, session.status().generation)
                 .unwrap();
@@ -908,7 +916,10 @@ async fn nip46_login_retains_retry() {
         home.start_setup_compensation(&pending_account.label, &pending_setup.unwrap())
             .unwrap()
             .unwrap();
-        if matches!(pending_session, PendingSession::Restored) {
+        if matches!(
+            pending_session,
+            PendingSession::Restored | PendingSession::Rebound
+        ) {
             runtime.shutdown_and_close().await.unwrap();
             drop(session);
             drop(runtime);
@@ -925,6 +936,12 @@ async fn nip46_login_retains_retry() {
             Nip46State::Ready,
             "{pending_session:?}"
         );
+        if matches!(pending_session, PendingSession::Rebound) {
+            runtime
+                .nip46_register(&id, session.clone())
+                .await
+                .unwrap_err();
+        }
         runtime
             .nip46_login(session.clone(), endpoints(), endpoints(), Vec::new())
             .await
