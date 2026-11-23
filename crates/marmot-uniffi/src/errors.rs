@@ -617,8 +617,9 @@ impl From<&AppError> for MarmotKitError {
                 size_class: cause.size_class.into(),
             };
         }
+        let rollback = matches!(value, AppError::AccountSetupRollback { .. }).then_some(value);
         if let Some(err) = primary.as_engine_error() {
-            return Self::from_engine_error(err);
+            return Self::from_engine_error(err, rollback);
         }
         // A NIP-46 cleanup failure can require different recovery from the setup failure.
         if let Some(error) = value.as_nip46_error() {
@@ -626,8 +627,7 @@ impl From<&AppError> for MarmotKitError {
                 reason: error.clone().into(),
             };
         }
-        let rollback_details =
-            || matches!(value, AppError::AccountSetupRollback { .. }).then(|| value.to_string());
+        let rollback_details = || rollback.map(ToString::to_string);
         match primary {
             AppError::InvalidAppComponent(details) => Self::InvalidAppComponent {
                 details: details.clone(),
@@ -704,10 +704,10 @@ impl From<&AppError> for MarmotKitError {
             // entry, or persisting the key-security byte — surfaced either
             // directly at the app layer or wrapped in an AccountHomeError.
             AppError::Io(err) => Self::Io {
-                details: err.to_string(),
+                details: rollback_details().unwrap_or_else(|| err.to_string()),
             },
             AppError::AccountHome(err @ AccountHomeError::Io(_)) => Self::Io {
-                details: err.to_string(),
+                details: rollback_details().unwrap_or_else(|| err.to_string()),
             },
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup {
                 group_id_hex: group_id_hex.clone(),
@@ -904,7 +904,8 @@ impl From<&AppError> for MarmotKitError {
 }
 
 impl MarmotKitError {
-    fn from_engine_error(value: &EngineError) -> Self {
+    fn from_engine_error(value: &EngineError, rollback: Option<&AppError>) -> Self {
+        let rollback_details = || rollback.map(ToString::to_string);
         match value {
             EngineError::GroupRecoveryUnsettled { group_id } => Self::GroupRecoveryUnsettled {
                 group_id_hex: hex::encode(group_id.as_slice()),
@@ -982,20 +983,20 @@ impl MarmotKitError {
             // untyped `Runtime` bucket. `StorageError::is_transient()` is the
             // single source of truth for which storage errors are transient.
             EngineError::Storage(storage_err) if storage_err.is_transient() => Self::StorageBusy {
-                details: storage_err.to_string(),
+                details: rollback_details().unwrap_or_else(|| storage_err.to_string()),
             },
             // Engine work racing a close for suspension: an orderly end state,
             // reported as such rather than as a runtime fault.
             EngineError::Storage(storage_err) if storage_err.is_closed() => Self::StorageClosed {
-                details: storage_err.to_string(),
+                details: rollback_details().unwrap_or_else(|| storage_err.to_string()),
             },
             EngineError::Storage(storage_err @ cgka_traits::StorageError::Capacity(_)) => {
                 Self::StorageFull {
-                    details: storage_err.to_string(),
+                    details: rollback_details().unwrap_or_else(|| storage_err.to_string()),
                 }
             }
             other => Self::Runtime {
-                details: other.to_string(),
+                details: rollback_details().unwrap_or_else(|| other.to_string()),
             },
         }
     }
@@ -1375,9 +1376,12 @@ mod tests {
     #[test]
     fn leave_already_requested_crosses_ffi_as_typed_variant() {
         let group_id = cgka_traits::GroupId::new(vec![0x11; 16]);
-        let ffi = MarmotKitError::from_engine_error(&EngineError::LeaveAlreadyRequested {
-            group_id: group_id.clone(),
-        });
+        let ffi = MarmotKitError::from_engine_error(
+            &EngineError::LeaveAlreadyRequested {
+                group_id: group_id.clone(),
+            },
+            None,
+        );
         match ffi {
             MarmotKitError::LeaveAlreadyRequested { group_id_hex } => {
                 assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
@@ -1389,9 +1393,12 @@ mod tests {
     #[test]
     fn leave_not_blocked_crosses_ffi_as_typed_variant() {
         let group_id = cgka_traits::GroupId::new(vec![0x12; 16]);
-        let ffi = MarmotKitError::from_engine_error(&EngineError::LeaveNotBlocked {
-            group_id: group_id.clone(),
-        });
+        let ffi = MarmotKitError::from_engine_error(
+            &EngineError::LeaveNotBlocked {
+                group_id: group_id.clone(),
+            },
+            None,
+        );
         match ffi {
             MarmotKitError::LeaveNotBlocked { group_id_hex } => {
                 assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
@@ -1403,9 +1410,12 @@ mod tests {
     #[test]
     fn disbanding_not_enabled_crosses_ffi_as_typed_variant() {
         let group_id = cgka_traits::GroupId::new(vec![0x22; 16]);
-        let ffi = MarmotKitError::from_engine_error(&EngineError::DisbandingNotEnabled {
-            group_id: group_id.clone(),
-        });
+        let ffi = MarmotKitError::from_engine_error(
+            &EngineError::DisbandingNotEnabled {
+                group_id: group_id.clone(),
+            },
+            None,
+        );
         match ffi {
             MarmotKitError::DisbandingNotEnabled { group_id_hex } => {
                 assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
@@ -1442,11 +1452,13 @@ mod tests {
                 AccountDevicesActivationFfi::DeviceLimitExceeded,
             ),
         ] {
-            let ffi =
-                MarmotKitError::from_engine_error(&EngineError::AccountDevicesActivationRefused {
+            let ffi = MarmotKitError::from_engine_error(
+                &EngineError::AccountDevicesActivationRefused {
                     group_id: group_id.clone(),
                     reason,
-                });
+                },
+                None,
+            );
             match ffi {
                 MarmotKitError::AccountDevicesActivationRefused {
                     group_id_hex,
@@ -1508,7 +1520,7 @@ mod tests {
             ),
         ];
         for (source, expected) in cases {
-            let ffi = MarmotKitError::from_engine_error(&source);
+            let ffi = MarmotKitError::from_engine_error(&source, None);
             assert!(expected(&ffi), "{source:?} mapped to {ffi:?}");
         }
     }
@@ -1548,13 +1560,16 @@ mod tests {
     fn recovery_error_retry_meaning() {
         let group_id = cgka_traits::GroupId::new(vec![0x33; 16]);
         let expected = hex::encode(group_id.as_slice());
-        let unsettled = MarmotKitError::from_engine_error(&EngineError::GroupRecoveryUnsettled {
-            group_id: group_id.clone(),
-        });
-        let changed =
-            MarmotKitError::from_engine_error(&EngineError::GroupRecoverySourceMismatch {
-                group_id,
-            });
+        let unsettled = MarmotKitError::from_engine_error(
+            &EngineError::GroupRecoveryUnsettled {
+                group_id: group_id.clone(),
+            },
+            None,
+        );
+        let changed = MarmotKitError::from_engine_error(
+            &EngineError::GroupRecoverySourceMismatch { group_id },
+            None,
+        );
         assert!(!unsettled.to_string().contains(&expected));
         assert!(!changed.to_string().contains(&expected));
         assert!(
@@ -1572,9 +1587,12 @@ mod tests {
     #[test]
     fn queued_outbound_at_capacity_crosses_ffi_as_typed_variant() {
         let group_id = cgka_traits::GroupId::new(vec![0x33; 16]);
-        let ffi = MarmotKitError::from_engine_error(&EngineError::QueuedOutboundAtCapacity {
-            group_id: group_id.clone(),
-        });
+        let ffi = MarmotKitError::from_engine_error(
+            &EngineError::QueuedOutboundAtCapacity {
+                group_id: group_id.clone(),
+            },
+            None,
+        );
         match ffi {
             MarmotKitError::GroupSendQueueFull { group_id_hex } => {
                 assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
@@ -1589,10 +1607,12 @@ mod tests {
     #[test]
     fn group_unrecoverable_repair_required_crosses_ffi_as_typed_variant() {
         let group_id = cgka_traits::GroupId::new(vec![0x44; 16]);
-        let ffi =
-            MarmotKitError::from_engine_error(&EngineError::GroupUnrecoverableRepairRequired {
+        let ffi = MarmotKitError::from_engine_error(
+            &EngineError::GroupUnrecoverableRepairRequired {
                 group_id: group_id.clone(),
-            });
+            },
+            None,
+        );
         match ffi {
             MarmotKitError::GroupUnrecoverableRepairRequired { group_id_hex } => {
                 assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
@@ -1605,13 +1625,14 @@ mod tests {
     // some future refactor reusing `InvalidTransition` for this case.
     #[test]
     fn invalid_transition_remains_the_untyped_engine_bug_signal() {
-        let ffi = MarmotKitError::from_engine_error(&EngineError::InvalidTransition(
-            cgka_traits::engine_state::InvalidTransition {
+        let ffi = MarmotKitError::from_engine_error(
+            &EngineError::InvalidTransition(cgka_traits::engine_state::InvalidTransition {
                 from: "Leaving",
                 to: "AppMessage",
                 reason: "leave request is current",
-            },
-        ));
+            }),
+            None,
+        );
         assert!(
             matches!(ffi, MarmotKitError::Runtime { .. }),
             "InvalidTransition denotes an engine bug and stays untyped; got {ffi:?}"
@@ -1951,7 +1972,7 @@ mod tests {
             )
         };
         type Expected = fn(&MarmotKitError) -> bool;
-        let cases: [(AppError, Expected); 7] = [
+        let cases: [(AppError, Expected); 10] = [
             (
                 AppError::AccountSetupRollback {
                     source: Box::new(AppError::EventTooLarge {
@@ -2019,6 +2040,43 @@ mod tests {
                 |e| {
                     matches!(e, MarmotKitError::StorageClosed { details }
                     if details.contains("closed for suspension") && details.contains(CLEANUP_DETAIL))
+                },
+            ),
+            (
+                AppError::AccountSetupRollback {
+                    source: Box::new(AppError::Session(
+                        EngineError::Storage(StorageError::Busy(
+                            "engine database is locked".into(),
+                        ))
+                        .into(),
+                    )),
+                    cleanup: cleanup_io(),
+                },
+                |e| {
+                    matches!(e, MarmotKitError::StorageBusy { details }
+                    if details.contains("engine database is locked") && details.contains(CLEANUP_DETAIL))
+                },
+            ),
+            (
+                AppError::AccountSetupRollback {
+                    source: Box::new(AppError::Io(std::io::Error::other("setup write failed"))),
+                    cleanup: cleanup_io(),
+                },
+                |e| {
+                    matches!(e, MarmotKitError::Io { details }
+                    if details.contains("setup write failed") && details.contains(CLEANUP_DETAIL))
+                },
+            ),
+            (
+                AppError::AccountSetupRollback {
+                    source: Box::new(AppError::AccountHome(AccountHomeError::Io(
+                        std::io::Error::other("account write failed"),
+                    ))),
+                    cleanup: cleanup_io(),
+                },
+                |e| {
+                    matches!(e, MarmotKitError::Io { details }
+                    if details.contains("account write failed") && details.contains(CLEANUP_DETAIL))
                 },
             ),
             (

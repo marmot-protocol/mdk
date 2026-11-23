@@ -329,7 +329,8 @@ pub struct WipeOutcomeFfi {
     pub key_packages_deleted: u32,
     /// KeyPackage slot deletion failures.
     pub key_package_failures: Vec<RelayFailureFfi>,
-    /// Local cleanup (MLS DB, media cache, SQL row, secret-store nsec) result.
+    /// Completion confirms local account removal by directory detachment.
+    /// It does not confirm vault erasure or disk space reclamation.
     pub local_cleanup: LocalCleanupReportFfi,
     /// Chats this device did not leave itself because another of the
     /// account's devices takes it out of them: it signed out through its
@@ -355,9 +356,13 @@ pub struct RelayFailureFfi {
     pub reason: String,
 }
 
+/// Local cleanup result for sign-out or wipe. The operation determines what
+/// completion means.
 #[derive(Clone, Debug, Default, uniffi::Record)]
 pub struct LocalCleanupReportFfi {
+    /// Whether the operation's local cleanup finished.
     pub completed: bool,
+    /// Failure summary when `completed` is `false`.
     pub reason: Option<String>,
 }
 
@@ -372,8 +377,8 @@ pub struct SignOutOutcomeFfi {
     pub key_packages_deleted: u32,
     /// KeyPackage slot deletion failures. Best-effort.
     pub key_package_failures: Vec<RelayFailureFfi>,
-    /// Local teardown (worker shutdown, subscription deactivation, in-memory
-    /// cache eviction) result. Never removes on-disk state.
+    /// Completion confirms worker shutdown, subscription deactivation, and
+    /// in-memory cache eviction. The account stays on the device.
     pub local_cleanup: LocalCleanupReportFfi,
 }
 

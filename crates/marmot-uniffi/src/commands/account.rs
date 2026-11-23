@@ -66,14 +66,14 @@ impl Marmot {
     }
 
     /// Destructive sign-out: leave every active MLS group (best-effort), delete
-    /// this device's relay-published KeyPackage slot, then wipe all local state for
-    /// this account (MLS state DB, cached media/secrets, SQL account row, and
-    /// the secret-store nsec). After this returns the account ref is no longer
-    /// valid for any further FFI call. The returned `WipeOutcomeFfi` reports
-    /// each stage independently so the app can show progress and a
-    /// partial-failure sheet (mdk#478). In a device group, it first asks the
-    /// account's other devices to take it out, which can take about 30
-    /// seconds, and leaves them the chats they can take it out of
+    /// this device's relay-published KeyPackage slot, then attempt local account
+    /// removal. `WipeOutcomeFfi` reports each stage independently (mdk#478).
+    /// Check `local_cleanup.completed` before treating the account as removed.
+    /// Completion confirms directory detachment, not vault erasure or disk
+    /// space reclamation.
+    ///
+    /// In a device group, it first asks the account's other devices to take it
+    /// out, which can take about 30 seconds, and leaves them the chats they can take it out of
     /// (mdk#2628). In a chat its account administers with another account
     /// and no other of its devices is in, it steps the account down first,
     /// then waits up to about 30 seconds for its removal (mdk#2818). It
@@ -94,16 +94,12 @@ impl Marmot {
     /// nobody can add this device to a new group while it is signed out. The
     /// account's other devices keep their KeyPackages.
     ///
-    /// Unlike [`sign_out_and_wipe`](Self::sign_out_and_wipe) /
-    /// [`remove_account`](Self::remove_account), this keeps ALL local state on
-    /// device — the SQLCipher session database (MLS state + projections), cached
-    /// media/secrets, the SQL account record, and the secret-store nsec — so the
-    /// same identity can be signed back in from the account picker with its
-    /// groups, message history, and drafts intact. The account ref stays valid
-    /// after this returns. The returned `SignOutOutcomeFfi` surfaces per-relay
-    /// KeyPackage cleanup failures. These are the final best-effort results for
-    /// this call; the runtime does not persist a remote-deletion retry queue
-    /// (mdk#477).
+    /// `local_cleanup.completed` confirms local teardown. The account, its
+    /// databases, and its secret-store nsec remain on the device. The account
+    /// ref stays valid for signing back in from the account picker with groups,
+    /// message history, and drafts intact. `SignOutOutcomeFfi` reports
+    /// KeyPackage deletion failures separately. The runtime does not persist
+    /// a remote-deletion retry queue (mdk#477).
     pub async fn sign_out(
         &self,
         account_ref: String,

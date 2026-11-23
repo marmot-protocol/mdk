@@ -209,9 +209,8 @@ c_mirror! {
 }
 
 c_mirror! {
-    /// Local cleanup result inside a sign-out/wipe outcome.
-    /// Completion confirms local account removal, not vault erasure or
-    /// reclamation of detached bytes.
+    /// Local cleanup result for sign-out or wipe. The operation determines
+    /// what completion means.
     MarmotLocalCleanupReport from LocalCleanupReportFfi {
         copy completed: bool,
         /// Failure classification when not completed. Nullable.
@@ -235,6 +234,8 @@ c_mirror! {
         /// KeyPackage slot, otherwise `0`.
         copy key_packages_deleted: u32,
         vec key_package_failures/key_package_failures_len: MarmotRelayFailure,
+        /// Completion confirms local account removal by directory detachment.
+        /// It does not confirm vault erasure or disk space reclamation.
         rec local_cleanup: MarmotLocalCleanupReport,
         /// Chats this device did not leave itself because another of the
         /// account's devices takes it out of them.
@@ -255,6 +256,8 @@ c_mirror! {
         /// requested).
         copy key_packages_deleted: u32,
         vec key_package_failures/key_package_failures_len: MarmotRelayFailure,
+        /// Completion confirms local teardown. The account and its local data
+        /// remain on the device.
         rec local_cleanup: MarmotLocalCleanupReport,
     }
 }

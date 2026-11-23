@@ -2575,9 +2575,8 @@ typedef struct MarmotRelayFailure {
 } MarmotRelayFailure;
 
 /**
- * Local cleanup result inside a sign-out/wipe outcome.
- * Completion confirms local account removal, not vault erasure or
- * reclamation of detached bytes.
+ * Local cleanup result for sign-out or wipe. The operation determines
+ * what completion means.
  */
 typedef struct MarmotLocalCleanupReport {
   bool completed;
@@ -2609,6 +2608,10 @@ typedef struct MarmotWipeOutcome {
   uint32_t key_packages_deleted;
   struct MarmotRelayFailure *key_package_failures;
   uintptr_t key_package_failures_len;
+  /**
+   * Completion confirms local account removal by directory detachment.
+   * It does not confirm vault erasure or disk space reclamation.
+   */
   struct MarmotLocalCleanupReport local_cleanup;
   /**
    * Chats this device did not leave itself because another of the
@@ -2635,6 +2638,10 @@ typedef struct MarmotSignOutOutcome {
   uint32_t key_packages_deleted;
   struct MarmotRelayFailure *key_package_failures;
   uintptr_t key_package_failures_len;
+  /**
+   * Completion confirms local teardown. The account and its local data
+   * remain on the device.
+   */
   struct MarmotLocalCleanupReport local_cleanup;
 } MarmotSignOutOutcome;
 
