@@ -397,7 +397,10 @@ events recur on wrap; only durable app ingestion removes an event from the missi
 
 ## Raw page evidence
 
-Bounded acquisition reports `raw_received_items` before SDK cache, duplicate and event filtering.
+Bounded acquisition sends each endpoint's request as a finite request, as the sweep does (below), so its replies
+never pass through the SDK's reader or notification queue; a client built with `NostrSdkRelayClient::new` returns
+`Unsupported`. It reports `raw_received_items` before any check: shape, signature, filter, admission policy, deletions
+and duplicates.
 A short validated event list does not establish a short relay page, and neither the raw count nor
 end of stored events certifies durable history coverage.
 The byte allowance counts validated serialized event JSON, not rejected wire bytes or process memory.
@@ -424,8 +427,7 @@ the wire for the sweep's own REQs, and `more` splits a slice. No hint proves one
 finite requests, which only a client built with `from_builder` has: over a client from `NostrSdkRelayClient::new`
 every slice reads as unreachable. A call cut by its deadline or cancellation ends the request in flight between
 frames and still reports every event frame the relay sent it, read or not, so a caller's byte budget sees the cut
-reply too. Nothing schedules the
-sweep yet; the recovery runner will (#2660).
+reply too. The recovery runner schedules it for the ranges an account owes.
 
 ## NIP-77 comparison
 

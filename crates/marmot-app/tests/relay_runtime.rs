@@ -463,7 +463,7 @@ async fn publish_socket_isolation() {
         .unwrap();
     // Neither account publisher can rescue an accidental public send through
     // the signer-bound path. The receive socket must authenticate for REQs.
-    let fallback = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    let fallback = NostrSdkRelayClient::from_builder(NostrSdkClient::builder());
     fallback.client().shutdown().await;
     let adapter = plane.account_adapter(account.clone(), Arc::new(fallback.clone()));
     adapter
@@ -1590,7 +1590,7 @@ async fn publish_garbage_group_message(
         .expect("sign ephemeral kind-445 test event");
     let transport_event =
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event");
-    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    let relay_client = NostrSdkRelayClient::from_builder(NostrSdkClient::builder());
     relay_client
         .publish_event(&[endpoint(relay_url)], &transport_event, 1)
         .await
@@ -2698,7 +2698,7 @@ async fn fetch_and_refresh_profile_inherit_extra_field_bounds_from_shared_parser
         .expect("sign hostile kind:0");
     let transport_event =
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed kind:0");
-    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    let relay_client = NostrSdkRelayClient::from_builder(NostrSdkClient::builder());
     relay_client
         .publish_event(&[endpoint(&url)], &transport_event, 1)
         .await
@@ -4100,7 +4100,7 @@ async fn tagged_poll_sticker_peer() {
         .tags(pack_tags)
         .finalize(&author)
         .unwrap();
-    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    let relay_client = NostrSdkRelayClient::from_builder(NostrSdkClient::builder());
     relay_client
         .publish_event(
             &[endpoint(&url)],

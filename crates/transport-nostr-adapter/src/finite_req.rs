@@ -123,6 +123,16 @@ pub(crate) struct FiniteReply {
     /// EVENT frames read for the request, valid or not, duplicates and the
     /// first one over the item budget included.
     pub(crate) raw_items: usize,
+    /// Valid copies read, duplicates and the first one over a budget
+    /// included.
+    pub(crate) received_items: usize,
+    /// Valid copies of an event already kept.
+    pub(crate) duplicates: usize,
+    /// Serialized JSON of every valid copy read, duplicates and the first one
+    /// over a budget included: what the byte budget counts.
+    pub(crate) event_bytes: usize,
+    /// Serialized JSON of the events kept.
+    pub(crate) kept_event_bytes: usize,
     /// Event bytes the relay sent for the request: the serialized JSON of
     /// each valid copy, and the whole frame of every other EVENT taken off
     /// the wire for it, read or not. A cut or cancelled reply reports them too.
@@ -137,6 +147,10 @@ impl FiniteReply {
         Self {
             events: Vec::new(),
             raw_items: 0,
+            received_items: 0,
+            duplicates: 0,
+            event_bytes: 0,
+            kept_event_bytes: 0,
             fetched_bytes: 0,
             more: false,
             end,
@@ -427,7 +441,7 @@ impl FiniteRequests {
 
 /// Whether a `CLOSED` reason asks for NIP-42 authentication. Some relays put
 /// the prefix behind one `error:` wrapper (mdk#3439).
-fn is_auth_required(reason: &str) -> bool {
+pub(crate) fn is_auth_required(reason: &str) -> bool {
     let reason = reason
         .get(..6)
         .filter(|wrapper| wrapper.eq_ignore_ascii_case("error:"))
@@ -551,7 +565,10 @@ struct Collector<'a> {
     seen: HashSet<EventId>,
     events: Vec<Event>,
     raw_items: usize,
+    received_items: usize,
+    duplicates: usize,
     event_bytes: usize,
+    kept_event_bytes: usize,
     fetched_bytes: u64,
     more: bool,
 }
@@ -573,7 +590,10 @@ impl<'a> Collector<'a> {
             seen: HashSet::new(),
             events: Vec::new(),
             raw_items: 0,
+            received_items: 0,
+            duplicates: 0,
             event_bytes: 0,
+            kept_event_bytes: 0,
             fetched_bytes: 0,
             more: false,
         }
@@ -610,6 +630,7 @@ impl<'a> Collector<'a> {
             return (self.raw_items > self.limits.max_items).then_some(FiniteEnd::ItemLimit);
         }
         let bytes = event.as_json().len();
+        self.received_items += 1;
         self.fetched_bytes += bytes as u64;
         self.event_bytes = self.event_bytes.saturating_add(bytes);
         if self.raw_items > self.limits.max_items {
@@ -619,7 +640,10 @@ impl<'a> Collector<'a> {
             return Some(FiniteEnd::ByteLimit);
         }
         if self.seen.insert(event.id) {
+            self.kept_event_bytes += bytes;
             self.events.push(event);
+        } else {
+            self.duplicates += 1;
         }
         None
     }
@@ -688,6 +712,10 @@ impl<'a> Collector<'a> {
         FiniteReply {
             events: self.events,
             raw_items: self.raw_items,
+            received_items: self.received_items,
+            duplicates: self.duplicates,
+            event_bytes: self.event_bytes,
+            kept_event_bytes: self.kept_event_bytes,
             fetched_bytes: self.fetched_bytes,
             more: self.more,
             end,
@@ -1641,10 +1669,11 @@ mod tests {
         relay.run().await.unwrap();
         let url = relay.url().await;
         let keys = Keys::generate();
+        // The request is the registry's first, so its id is `~f0`.
         let mut page_bytes = 0;
         for n in 0..300 {
             let event = note(&keys, &format!("history {n}"));
-            page_bytes += event.as_json().len() as u64;
+            page_bytes += event_frame(&event).len() as u64;
             relay.add_event(event).await.unwrap();
         }
         let started = Arc::new(Notify::new());
@@ -1680,11 +1709,9 @@ mod tests {
         cancel.cancel();
         let reply = fetch.await;
         assert_eq!(reply.end, FiniteEnd::Cancelled);
-        assert!(
-            reply.fetched_bytes >= page_bytes,
-            "every frame sent is charged: {} < {page_bytes}",
-            reply.fetched_bytes
-        );
+        // Every frame is charged once, whole, the one held in admission
+        // included.
+        assert_eq!(reply.fetched_bytes, page_bytes);
         client.shutdown().await;
     }
 

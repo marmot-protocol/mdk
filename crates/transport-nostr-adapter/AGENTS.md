@@ -247,9 +247,9 @@ for reconnect/backoff and relay status mechanics.
   only off the wire, where a misread `finish` would skip history while a misread `more` only costs requests, so an
   EOSE the SDK takes whose hints cannot be read counts as `more`. Do not
   add a hint-based `SliceProof` until nostr-sdk surfaces hints itself.
-- Every `SdkSweepRelay` REQ is a finite request (`src/finite_req.rs`), which `NostrSdkRelayClient::from_builder`
-  installs under the builder's transport; a client built with `new` cannot make one, and its sweep relays read as
-  unreachable. A finite request's id starts with `ID_PREFIX`, which no SDK or adapter id does. Its REQ goes out through
+- Every `SdkSweepRelay` REQ and every `acquire_history` request is a finite request (`src/finite_req.rs`), which
+  `NostrSdkRelayClient::from_builder` installs under the builder's transport; a client built with `new` cannot make
+  one: its sweep relays read as unreachable and `acquire_history` returns `Unsupported`. A finite request's id starts with `ID_PREFIX`, which no SDK or adapter id does. Its REQ goes out through
   `Relay::send_msg`, so the SDK never registers or resends it, and binds to the connection that sends it. The wrapper
   takes every EVENT, EOSE and CLOSED frame under a finite id off the connection, whether or not its request is still
   registered: a relay keeps answering until it reads the CLOSE, and those frames must never reach the SDK. It never

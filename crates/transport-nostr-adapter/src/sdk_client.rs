@@ -18,11 +18,10 @@ use futures::{Stream, StreamExt};
 use nostr_gossip::NostrGossip;
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
-    AcquisitionEnd as SdkAcquisitionEnd, AcquisitionLimits as SdkAcquisitionLimits, Client,
-    ClientBuilder, ClientNotification, ErrorKind as SdkErrorKind, Event, EventBuilder, EventId,
-    Filter, FinalizeEventAsync, Kind, PublicKey, Relay, RelayAcquisition, RelayCapabilities,
-    RelayMessage, RelayStatus, RelayUrl, ReqTarget, SingleLetterTag, SubscriptionId, SyncDirection,
-    SyncOptions, Tag, Timestamp as NostrTimestamp,
+    Client, ClientBuilder, ClientNotification, ErrorKind as SdkErrorKind, Event, EventBuilder,
+    EventId, Filter, FinalizeEventAsync, Kind, MachineReadablePrefix, PublicKey, Relay,
+    RelayCapabilities, RelayMessage, RelayStatus, RelayUrl, ReqTarget, SingleLetterTag,
+    SubscriptionId, SyncDirection, SyncOptions, Tag, Timestamp as NostrTimestamp,
 };
 use nostr_sdk::relay::{EventSendStatus, RelayNotification};
 use nostr_sdk::transport::websocket::{WebSocketSink, WebSocketStream, WebSocketTransport};
@@ -33,7 +32,7 @@ use transport_nostr_peeler::{
     KIND_MARMOT_GROUP_MESSAGE, MarmotNostrSigner, NostrTransportEvent, SdkSigner,
 };
 
-use crate::finite_req::FiniteRequests;
+use crate::finite_req::{FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests, is_auth_required};
 use crate::network_proxy as process_proxy;
 use crate::sweep::hint_tap::{EoseHints, HintTransport};
 use crate::{
@@ -544,9 +543,9 @@ fn acquisition_filter(request: &NostrAcquisitionRequest) -> Filter {
 
 fn project_acquisition(
     endpoint: TransportEndpoint,
-    outcome: Option<RelayAcquisition>,
+    reply: Option<FiniteReply>,
 ) -> NostrAcquisitionEndpoint {
-    let Some(outcome) = outcome else {
+    let Some(reply) = reply else {
         return NostrAcquisitionEndpoint {
             endpoint,
             session_generation: None,
@@ -555,24 +554,26 @@ fn project_acquisition(
             stats: NostrAcquisitionStats::default(),
         };
     };
-    let (mut end, skipped) = match outcome.end {
-        SdkAcquisitionEnd::Completed => (NostrAcquisitionEnd::RequestPolicySatisfied, 0),
-        SdkAcquisitionEnd::ExitLimitReached => (NostrAcquisitionEnd::UnexpectedExitLimit, 0),
-        SdkAcquisitionEnd::ItemBudgetExceeded => (NostrAcquisitionEnd::ItemLimitReached, 0),
-        SdkAcquisitionEnd::ByteBudgetExceeded => (NostrAcquisitionEnd::ByteLimitReached, 0),
-        SdkAcquisitionEnd::Cancelled => (NostrAcquisitionEnd::Cancelled, 0),
-        SdkAcquisitionEnd::TimedOut => (NostrAcquisitionEnd::Deadline, 0),
-        SdkAcquisitionEnd::Disconnected => (NostrAcquisitionEnd::Disconnected, 0),
-        SdkAcquisitionEnd::ReceiveLoss(skipped) => (NostrAcquisitionEnd::ReceiveLoss, skipped),
-        SdkAcquisitionEnd::InvalidMessage => (NostrAcquisitionEnd::InvalidMessage, 0),
-        SdkAcquisitionEnd::ReceiverClosed => (NostrAcquisitionEnd::ReceiverClosed, 0),
-        SdkAcquisitionEnd::AuthenticationFailed => (NostrAcquisitionEnd::AuthenticationFailed, 0),
-        SdkAcquisitionEnd::Rejected(_) => (NostrAcquisitionEnd::Rejected, 0),
-        SdkAcquisitionEnd::RelayClosed(_) => (NostrAcquisitionEnd::RelayClosed, 0),
-        SdkAcquisitionEnd::Failed(_) => (NostrAcquisitionEnd::SetupFailed, 0),
+    let mut end = match &reply.end {
+        FiniteEnd::Eose => NostrAcquisitionEnd::RequestPolicySatisfied,
+        FiniteEnd::ItemLimit => NostrAcquisitionEnd::ItemLimitReached,
+        FiniteEnd::ByteLimit => NostrAcquisitionEnd::ByteLimitReached,
+        FiniteEnd::Cancelled => NostrAcquisitionEnd::Cancelled,
+        FiniteEnd::TimedOut => NostrAcquisitionEnd::Deadline,
+        FiniteEnd::Disconnected => NostrAcquisitionEnd::Disconnected,
+        FiniteEnd::InvalidMessage => NostrAcquisitionEnd::InvalidMessage,
+        FiniteEnd::SetupFailed => NostrAcquisitionEnd::SetupFailed,
+        // Still refused after the one retry, or no authenticator to retry with.
+        FiniteEnd::Closed(reason) if is_auth_required(reason) => {
+            NostrAcquisitionEnd::AuthenticationFailed
+        }
+        FiniteEnd::Closed(reason) if MachineReadablePrefix::parse(reason).is_some() => {
+            NostrAcquisitionEnd::Rejected
+        }
+        FiniteEnd::Closed(_) => NostrAcquisitionEnd::RelayClosed,
     };
-    let mut events = Vec::with_capacity(outcome.events.len());
-    for event in &outcome.events {
+    let mut events = Vec::with_capacity(reply.events.len());
+    for event in &reply.events {
         match NostrTransportEvent::from_nostr_event(event) {
             Ok(event) => events.push(event),
             Err(_) => end = NostrAcquisitionEnd::SetupFailed,
@@ -584,13 +585,13 @@ fn project_acquisition(
         events,
         end,
         stats: NostrAcquisitionStats {
-            raw_received_items: outcome.raw_received_items,
-            received_items: outcome.received_items,
-            serialized_event_bytes: outcome.received_event_bytes,
-            duplicates: outcome.duplicates,
-            retained_high_water_items: outcome.high_water_items,
-            retained_high_water_event_bytes: outcome.high_water_event_bytes,
-            receiver_skipped_notifications: skipped,
+            raw_received_items: reply.raw_items,
+            received_items: reply.received_items,
+            serialized_event_bytes: reply.event_bytes,
+            duplicates: reply.duplicates,
+            // Kept events are never dropped, so the most held is what is kept.
+            retained_high_water_items: reply.events.len(),
+            retained_high_water_event_bytes: reply.kept_event_bytes,
         },
     }
 }
@@ -2368,11 +2369,15 @@ impl NostrSdkRelayClient {
         account_id: MemberId,
         signer: Arc<dyn MarmotNostrSigner>,
     ) -> Self {
-        let mut this = Self::new(client);
-        this.signer = Some(SdkSigner(signer));
-        this.frontier.set_account(&account_id);
-        this.account_id = Some(account_id);
-        this
+        Self::new(client).signed_as(account_id, signer)
+    }
+
+    /// This client, serving `account_id` with `signer`.
+    fn signed_as(mut self, account_id: MemberId, signer: Arc<dyn MarmotNostrSigner>) -> Self {
+        self.signer = Some(SdkSigner(signer));
+        self.frontier.set_account(&account_id);
+        self.account_id = Some(account_id);
+        self
     }
 
     /// Install one immutable authentication context. Repeated registration
@@ -2416,11 +2421,9 @@ impl NostrSdkRelayClient {
         let builder = process_proxy::nostr_builder(Ok(proxy)).authenticator(
             nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(signer.clone())),
         );
-        let mut context =
-            Self::from_builder_with_liveness(builder, self.frontier.observations.changes.clone());
-        context.signer = Some(SdkSigner(signer));
-        context.frontier.set_account(&account_id);
-        context.account_id = Some(account_id.clone());
+        let context =
+            Self::from_builder_with_liveness(builder, self.frontier.observations.changes.clone())
+                .signed_as(account_id.clone(), signer);
         clients.insert(account_id, context.clone());
         self.frontier.observations.changed();
         Ok(context)
@@ -5857,6 +5860,11 @@ impl NostrRelayClient for NostrSdkRelayClient {
         {
             return Err(NostrAcquisitionError::InvalidRequest);
         }
+        // Only a client built with its finite requests installed can keep
+        // history off the SDK's reader.
+        let Some(finite) = self.finite_requests.as_ref() else {
+            return Err(NostrAcquisitionError::Unsupported);
+        };
         if cancellation.is_cancelled() {
             return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Cancelled));
         }
@@ -5884,68 +5892,34 @@ impl NostrRelayClient for NostrSdkRelayClient {
         if connected.is_err() {
             return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Deadline));
         }
-        // The SDK owns the request-local REQs and returns partial data when
-        // its endpoint deadline fires. Reserve a short slice of the declared
-        // whole-call budget to collect and project that report.
+        // Each request returns what it read when its deadline fires. Reserve
+        // a short slice of the declared whole-call budget to retire the
+        // requests and project their replies.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Deadline));
         }
-        let endpoint_budget = remaining.mul_f32(0.9);
-        let limits = SdkAcquisitionLimits::new(
-            request.limits.max_endpoints,
-            request.limits.max_received_items_per_endpoint,
-            request.limits.max_serialized_event_bytes_per_endpoint,
-            endpoint_budget.max(Duration::from_millis(1)),
-        );
-        let target = ReqTarget::manual(
-            endpoints
-                .iter()
-                .cloned()
-                .map(|endpoint| (endpoint, vec![filter.clone()])),
-        );
-        let handle = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Cancelled));
-            }
-            result = timeout_at(deadline, self.client.acquire_events(target, limits)) => {
-                match result {
-                    Ok(Ok(handle)) => handle,
-                    Ok(Err(_)) => return Ok(empty_acquisition(&request, NostrAcquisitionEnd::SetupFailed)),
-                    Err(_) => return Ok(empty_acquisition(&request, NostrAcquisitionEnd::Deadline)),
-                }
-            }
+        let limits = FiniteLimits {
+            max_items: request.limits.max_received_items_per_endpoint,
+            max_event_bytes: request.limits.max_serialized_event_bytes_per_endpoint,
+            timeout: remaining.mul_f32(0.9).max(Duration::from_millis(1)),
         };
-        let canceller = handle.canceller();
-        let mut finish = Box::pin(handle.finish());
-        let report = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                canceller.cancel();
-                timeout_at(deadline, finish.as_mut()).await
-            }
-            result = timeout_at(deadline, finish.as_mut()) => result,
-        };
-        let Ok(Ok(report)) = report else {
-            // Dropping finish aborts only this acquisition's REQs. A setup or
-            // deadline failure has no report to project; never claim EOSE.
-            return Ok(empty_acquisition(
-                &request,
-                if cancellation.is_cancelled() {
-                    NostrAcquisitionEnd::Cancelled
-                } else {
-                    NostrAcquisitionEnd::Deadline
-                },
-            ));
-        };
-        let mut outcomes = report.relays;
+        let replies = futures::future::join_all(endpoints.iter().map(|url| async {
+            // An endpoint missing from the pool failed registration.
+            let relay = self.client.relay(url.clone()).await.ok().flatten()?;
+            Some(
+                finite
+                    .fetch(&relay, filter.clone(), limits, &cancellation)
+                    .await,
+            )
+        }))
+        .await;
         Ok(NostrAcquisitionResult {
             endpoints: request
                 .endpoints
                 .into_iter()
-                .zip(endpoints)
-                .map(|(endpoint, url)| project_acquisition(endpoint, outcomes.remove(&url)))
+                .zip(replies)
+                .map(|(endpoint, reply)| project_acquisition(endpoint, reply))
                 .collect(),
         })
     }
@@ -6747,11 +6721,8 @@ fn acquisition_failure(end: NostrAcquisitionEnd) -> NostrReconciliationFailure {
         NostrAcquisitionEnd::RequestPolicySatisfied
         | NostrAcquisitionEnd::ItemLimitReached
         | NostrAcquisitionEnd::ByteLimitReached
-        | NostrAcquisitionEnd::UnexpectedExitLimit
         | NostrAcquisitionEnd::Cancelled
-        | NostrAcquisitionEnd::ReceiveLoss
         | NostrAcquisitionEnd::InvalidMessage
-        | NostrAcquisitionEnd::ReceiverClosed
         | NostrAcquisitionEnd::SetupFailed => NostrReconciliationFailure::LocalError,
     }
 }
@@ -6944,6 +6915,73 @@ mod tests {
         assert_eq!(filter.ids.map(|ids| ids.len()), Some(2));
     }
 
+    /// Only a client built with its finite requests installed acquires
+    /// history; an opaque one refuses before any network work.
+    #[tokio::test]
+    async fn an_opaque_client_cannot_acquire_history() {
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let request = acquisition_request(
+            MemberId::new(vec![7; 32]),
+            RelayUrl::parse("wss://ids.example").unwrap(),
+            vec![[1; 32]],
+            1,
+            4_096,
+        );
+        assert_eq!(
+            sdk.acquire_history(request, NostrAcquisitionCancellation::new())
+                .await,
+            Err(NostrAcquisitionError::Unsupported)
+        );
+        assert!(sdk.client.relays().await.is_empty());
+    }
+
+    /// A relay's refusal keeps its kind: a machine-readable prefix rejects,
+    /// a bare reason closes, and an `auth-required` refusal that outlasted
+    /// the retry fails authentication. None is a satisfied request.
+    #[test]
+    fn closed_replies_keep_their_kind() {
+        let endpoint = TransportEndpoint("wss://ids.example".to_owned());
+        let reply = |end| FiniteReply {
+            events: Vec::new(),
+            raw_items: 0,
+            received_items: 0,
+            duplicates: 0,
+            event_bytes: 0,
+            kept_event_bytes: 0,
+            fetched_bytes: 0,
+            more: false,
+            end,
+        };
+        for (reason, end) in [
+            ("blocked: no", NostrAcquisitionEnd::Rejected),
+            ("rate-limited: slow", NostrAcquisitionEnd::Rejected),
+            (
+                "auth-required: sign in",
+                NostrAcquisitionEnd::AuthenticationFailed,
+            ),
+            (
+                "error: auth-required: sign in",
+                NostrAcquisitionEnd::AuthenticationFailed,
+            ),
+            ("done", NostrAcquisitionEnd::RelayClosed),
+            ("", NostrAcquisitionEnd::RelayClosed),
+        ] {
+            let projected = project_acquisition(
+                endpoint.clone(),
+                Some(reply(FiniteEnd::Closed(reason.to_owned()))),
+            );
+            assert_eq!(projected.end, end, "{reason:?}");
+        }
+        assert_eq!(
+            project_acquisition(endpoint.clone(), Some(reply(FiniteEnd::Eose))).end,
+            NostrAcquisitionEnd::RequestPolicySatisfied
+        );
+        assert_eq!(
+            project_acquisition(endpoint, None).end,
+            NostrAcquisitionEnd::SetupFailed
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn acquisition_account_lookup_obeys_cancellation_and_original_deadline() {
         let root = NostrSdkRelayClient::multi_account();
@@ -7055,7 +7093,7 @@ mod tests {
         for event in &events {
             relay.add_event(event.clone()).await.unwrap();
         }
-        let sdk = NostrSdkRelayClient::new(Client::default());
+        let sdk = NostrSdkRelayClient::from_builder(crate::network_proxy::nostr_builder(Ok(None)));
         let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
         let ids = events.iter().map(|event| event.id.to_bytes()).collect();
         let report = sdk
@@ -7095,7 +7133,7 @@ mod tests {
         let endpoint = TransportEndpoint(url.to_string());
         let keys = Keys::generate();
         let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
-        let sdk = signed_sdk(keys);
+        let sdk = signed_history_sdk(keys);
 
         let history = timeout(
             Duration::from_secs(5),
@@ -7138,7 +7176,7 @@ mod tests {
         let endpoint = TransportEndpoint(url.to_string());
         let keys = Keys::generate();
         let account = MemberId::new(keys.public_key().to_bytes().to_vec());
-        let sdk = signed_sdk(keys.clone());
+        let sdk = signed_history_sdk(keys.clone());
         let event = EventBuilder::new(Kind::TextNote, "retained publication")
             .finalize(&keys)
             .unwrap();
@@ -7240,7 +7278,8 @@ mod tests {
             }
         });
 
-        let client = Client::default();
+        let sdk = NostrSdkRelayClient::from_builder(crate::network_proxy::nostr_builder(Ok(None)));
+        let client = sdk.client.clone();
         client.add_relay(url.clone()).await.unwrap();
         client
             .try_connect_relay(url.clone(), Duration::from_secs(2))
@@ -7263,7 +7302,6 @@ mod tests {
             ("REQ".into(), "live".into())
         );
 
-        let sdk = NostrSdkRelayClient::new(client.clone());
         let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
         let request = acquisition_request(account_id, url.clone(), vec![[7; 32]], 4, 100_000);
         let cancellation = NostrAcquisitionCancellation::new();
@@ -8460,7 +8498,7 @@ mod tests {
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let keys = Keys::generate();
         let account = MemberId::new(keys.public_key().to_bytes().to_vec());
-        let sdk = NostrSdkRelayClient::new(Client::default());
+        let sdk = NostrSdkRelayClient::from_builder(crate::network_proxy::nostr_builder(Ok(None)));
         let mut notifications = sdk.notifications();
         let subscription = NostrSubscription::AccountInbox {
             account_id: account.clone(),
@@ -10642,6 +10680,17 @@ mod tests {
         NostrSdkRelayClient::with_account_signer(client, account_id, Arc::new(keys))
     }
 
+    /// A signed client built as an account's history client is, with its
+    /// finite requests installed.
+    fn signed_history_sdk(keys: Keys) -> NostrSdkRelayClient {
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let signer: Arc<dyn MarmotNostrSigner> = Arc::new(keys);
+        let builder = crate::network_proxy::nostr_builder(Ok(None)).authenticator(
+            nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(signer.clone())),
+        );
+        NostrSdkRelayClient::from_builder(builder).signed_as(account_id, signer)
+    }
+
     fn signed_sdk(keys: Keys) -> NostrSdkRelayClient {
         let signer = SdkSigner(Arc::new(keys.clone()));
         let client = Client::builder()
@@ -11240,7 +11289,7 @@ mod tests {
         let relay = LocalRelay::new(RelayBuilder::default().database(database));
         relay.run().await.unwrap();
         let endpoint = RelayUrl::parse(&relay.url().await.to_string()).unwrap();
-        let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
         let progress = TestReconciliationProgress::default();
         let mut notifications = sdk.client.notifications();
         sdk.client.add_relay(endpoint.clone()).await.unwrap();
@@ -11349,7 +11398,7 @@ mod tests {
         // This exercises the durable cursor's ID-order rotation, which
         // oldest-first acquisition falls back to; the integration tests cover
         // the ordering itself.
-        let mut sdk = NostrSdkRelayClient::new(Client::builder().build());
+        let mut sdk = NostrSdkRelayClient::from_builder(Client::builder());
         sdk.id_order_only = true;
         let progress = TestReconciliationProgress::default();
         sdk.client.add_relay(endpoint.clone()).await.unwrap();

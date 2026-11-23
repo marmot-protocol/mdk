@@ -90,7 +90,7 @@ async fn publish_malformed_group_message_at(
         .expect("sign ephemeral kind-445 test event");
     let transport_event =
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event");
-    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    let relay_client = NostrSdkRelayClient::from_builder(NostrSdkClient::builder());
     relay_client
         .publish_event(
             &[cgka_traits::TransportEndpoint(relay_url.to_owned())],

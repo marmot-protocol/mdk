@@ -97,7 +97,7 @@ async fn publish_signed(relay_url: &str, keys: &Keys, kind: u16, tags: Vec<Tag>,
         .expect("sign test event");
     let transport_event =
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event");
-    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    let relay_client = NostrSdkRelayClient::from_builder(NostrSdkClient::builder());
     relay_client
         .publish_event(&[endpoint(relay_url)], &transport_event, 1)
         .await

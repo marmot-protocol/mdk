@@ -639,12 +639,6 @@ type HeldPublish = (u64, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 #[derive(Default)]
 pub(crate) struct ScriptedPushRelayClient {
-    pub(crate) acquisition_result:
-        std::sync::Mutex<Option<transport_nostr_adapter::NostrAcquisitionResult>>,
-    pub(crate) acquisition_calls: std::sync::atomic::AtomicUsize,
-    pub(crate) acquisition_block: std::sync::atomic::AtomicBool,
-    pub(crate) acquisition_entered: tokio::sync::Notify,
-    pub(crate) acquisition_release: tokio::sync::Notify,
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
@@ -1658,43 +1652,6 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         Some(transport_nostr_adapter::RelayConnection::new(0, attempt))
     }
 
-    async fn acquire_history(
-        &self,
-        request: transport_nostr_adapter::NostrAcquisitionRequest,
-        cancellation: transport_nostr_adapter::NostrAcquisitionCancellation,
-    ) -> Result<
-        transport_nostr_adapter::NostrAcquisitionResult,
-        transport_nostr_adapter::NostrAcquisitionError,
-    > {
-        request.validate()?;
-        self.acquisition_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.acquisition_entered.notify_one();
-        if self
-            .acquisition_block
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            tokio::select! {
-                _ = self.acquisition_release.notified() => {},
-                _ = cancellation.cancelled() => {
-                    return Ok(transport_nostr_adapter::NostrAcquisitionResult {
-                        endpoints: request.endpoints.into_iter().map(|endpoint| transport_nostr_adapter::NostrAcquisitionEndpoint {
-                            endpoint,
-                            session_generation: None,
-                            events: Vec::new(),
-                            end: transport_nostr_adapter::NostrAcquisitionEnd::Cancelled,
-                            stats: Default::default(),
-                        }).collect(),
-                    });
-                }
-            }
-        }
-        let scripted = self.acquisition_result.lock().unwrap();
-        let scripted = scripted
-            .as_ref()
-            .ok_or(transport_nostr_adapter::NostrAcquisitionError::Unsupported)?;
-        Ok(scripted.clone())
-    }
     fn supports_scoped_subscriptions(&self) -> bool {
         true
     }
