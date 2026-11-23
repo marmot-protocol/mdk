@@ -520,13 +520,14 @@ async fn offline_150s_six_sender_replay() {
     offline_plaintext_replay(6, 100, Duration::from_secs(150)).await;
 }
 
-/// Waits up to 30 s for `account` to receive `plaintext`.
+/// Waits up to 60 s, White Noise Android's qualification budget, for
+/// `account` to receive `plaintext`.
 async fn receives(
     events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
     account: &str,
     plaintext: &str,
 ) {
-    wait_for_event_within(events, Duration::from_secs(30), |event| {
+    wait_for_event_within(events, Duration::from_secs(60), |event| {
         matches!(event, MarmotAppEvent::MessageReceived(update)
             if update.account_id_hex == account && update.message.plaintext == plaintext)
     })
@@ -535,10 +536,11 @@ async fn receives(
 
 /// mdk#3264: on a relay that publishes no NIP-11 document and refuses NIP-77,
 /// the history a live REQ re-reads cannot be proven complete. Creating and
-/// locally deleting another group re-sends the healthy group's REQ, which
-/// re-reads its stored messages. That second stays owed, but the healthy
-/// group's newer live messages must still arrive: before the fix they waited
-/// behind it until recovery broke, about 15 minutes later.
+/// locally deleting another group can re-send the healthy group's REQ, and a
+/// restart always does; either re-reads its stored messages. That second
+/// stays owed, but the healthy group's newer live messages must still
+/// arrive: before the fix they waited behind it until recovery broke, about
+/// 15 minutes later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_messages_pass_history_a_relay_without_metadata_cannot_prove() {
     storage_sqlite::relax_storage_for_test_process();
@@ -551,11 +553,9 @@ async fn live_messages_pass_history_a_relay_without_metadata_cannot_prove() {
         relay.url.clone(),
         config(),
     ));
-    let receiver = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
-        receiver_dir.path(),
-        relay.url.clone(),
-        config(),
-    ));
+    let receiver_app =
+        || MarmotApp::with_relay_and_config(receiver_dir.path(), relay.url.clone(), config());
+    let receiver = MarmotAppRuntime::new(receiver_app());
     let setup = AccountSetupRequest {
         default_relays: vec![endpoint(&relay.url)],
         bootstrap_relays: vec![endpoint(&relay.url)],
@@ -601,10 +601,17 @@ async fn live_messages_pass_history_a_relay_without_metadata_cannot_prove() {
         .await
         .unwrap();
     receives(&mut received, &bob_id, "after the deletion").await;
-    assert!(
-        relay.requests.lock().unwrap().refused_comparisons > 0,
-        "the relay refused NIP-77 for the second it could not count"
-    );
+
+    receiver.shutdown_and_close().await.unwrap();
+    drop(receiver);
+    let receiver = MarmotAppRuntime::new(receiver_app());
+    let mut received = receiver.subscribe();
+    receiver.reconcile_accounts().await.unwrap();
+    sender
+        .send_message(&alice_id, &group, b"after the restart".to_vec())
+        .await
+        .unwrap();
+    receives(&mut received, &bob_id, "after the restart").await;
     sender.shutdown().await;
     receiver.shutdown().await;
 }

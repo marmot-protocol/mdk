@@ -6591,16 +6591,15 @@ async fn sync_watching_neg_cap(
 }
 
 /// A failed NIP-77 sync: its reconciliation class, whether the SDK reported a
-/// protocol error, and whether the relay may have answered. A malformed
-/// exchange is not the relay saying it lacks NIP-77, and a later attempt may
-/// complete it.
+/// protocol error, and whether the relay may have begun reconciling. A
+/// malformed exchange is not the relay saying it lacks NIP-77, and a later
+/// attempt may complete it.
 struct NegSyncError {
     failure: NostrReconciliationFailure,
     malformed: bool,
-    /// The relay sent a NEG-MSG, or its connection changed or notifications
-    /// were missed, so a failure may not be its refusal of NIP-77. Another
-    /// NEG session on the same relay may set it too, which only keeps a
-    /// refusal from counting as one.
+    /// The relay sent a NEG-MSG, or notifications were missed, so its NEG-ERR
+    /// may not refuse the NEG-OPEN. Another NEG session on the same relay may
+    /// set it too, which only keeps a refusal from counting as one.
     answered: bool,
 }
 
@@ -6619,14 +6618,11 @@ impl NegWatch {
             return;
         };
         self.cap_notice |= is_neg_cap_notice(&notification);
-        self.answered |= match &notification {
-            RelayNotification::Message { message } => {
-                matches!(message.as_ref(), RelayMessage::NegMsg { .. })
-            }
-            // The connection may not have carried a reply.
-            RelayNotification::RelayStatus { .. } => true,
-            _ => false,
-        };
+        self.answered |= matches!(
+            &notification,
+            RelayNotification::Message { message }
+                if matches!(message.as_ref(), RelayMessage::NegMsg { .. })
+        );
     }
 
     fn settled(&self) -> bool {
@@ -6750,18 +6746,15 @@ pub(crate) async fn neg_sync_dry_run(
         }) => (failure, answered),
     };
     Err(match failure {
-        // NEG-ERR or silence before any NEG-MSG: the relay never began.
+        // NEG-ERR before any NEG-MSG: the relay refused the NEG-OPEN.
         NostrReconciliationFailure::NegErr(category) if !answered => {
-            NegFailure::Declined(Some(ClosedReason(category)))
+            NegFailure::Declined(ClosedReason(category))
         }
-        NostrReconciliationFailure::FirstReplyTimeout if !answered => NegFailure::Declined(None),
         NostrReconciliationFailure::NegErr(category) => NegFailure::Closed(ClosedReason(category)),
         // The cap NOTICE is a transient refusal, waited out like a rate limit.
         NostrReconciliationFailure::NegCapNotice => NegFailure::Closed(ClosedReason(Some(
             TransportEndpointRejectionCategory::RateLimited,
         ))),
-        // After a first reply (the SDK's idle timer reports it as a first
-        // reply's), or waiting for a local NEG credit.
         NostrReconciliationFailure::FirstReplyTimeout
         | NostrReconciliationFailure::RouteTimeout => {
             NegFailure::Unreachable(UnreachableKind::TimedOut)
