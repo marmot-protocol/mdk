@@ -17,6 +17,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   nothing: MDK no longer builds the old shape of kinds 1201 and 1202.
 - `wn messages timeline list` carries a kind-1201 row's parsed `agent_item` in `--json`, and shows an item MDK cannot
   read, such as the old shape, as `[unreadable agent item]` instead of its payload.
+- `wn messages delete` by an admin of their own chat message sends an author kind 5 (empty content), not kind 4891,
+  so it syncs as deleted by its author.
 
 ### Deprecated
 

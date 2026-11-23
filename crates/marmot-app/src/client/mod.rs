@@ -5055,8 +5055,11 @@ impl AppClient {
                     let storage = self.app.account_storage(&self.state.label)?.app_storage();
                     let target = storage
                         .app_message(&hex::encode(group_id.as_slice()), &target_message_id)?;
+                    // An admin retracts their own message as its author (kind 5),
+                    // so every client shows it as deleted by its author.
                     if target.as_ref().is_some_and(|target| {
                         target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                            && target.sender != sender
                     }) && self.delete_moderation_grant(group_id, &sender)
                         && storage
                             .report_target_author(

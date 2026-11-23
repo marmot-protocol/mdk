@@ -20,17 +20,15 @@ individual reports for a group or message; `report_dismissals` pages the labels
 on a particular report. A report's `dismissed` flag means at least one currently
 valid source-authorized dismissal label references that event.
 
-The existing `delete_message` API sends kind 4891 when an active admin deletes a
-whole chat message, including an unreported message or their own message. This
-hides its original content, edits, and attachments in message projections. Other
-authors still retract their own content with kind 5. Kind 4891 does not extend
-NIP-09, and a dismissal cannot undo a deletion. Admin deletion intentionally uses
-one moderation operation for all whole-chat targets, regardless of authorship.
-This includes self-deletion: older peers may keep that content visible, and a
-demotion before encryption rejects the operation rather than changing it to an
-author retraction. Admin removal currently applies only to chat messages (kind 9),
-including their edits; it does not remove custom-kind events. Authors can retract
-their own custom events with kind 5.
+The existing `delete_message` API sends kind 4891 when an active admin deletes
+another account's whole chat message, reported or not. This hides its original
+content, edits, and attachments in message projections. Every author, admins
+included, retracts their own content with kind 5, so an admin's own deletion
+shows as the author's. Kind 4891 does not extend NIP-09, and a dismissal cannot
+undo a deletion. A demotion before encryption rejects an admin removal rather
+than changing it to an author retraction. Admin removal currently applies only to
+chat messages (kind 9), including their edits; it does not remove custom-kind
+events. Authors can retract their own custom events with kind 5.
 
 Timeline records expose `has_reports`. Existing timeline and projection events
 carry updates; there is no dedicated shared review queue, pending count, or
@@ -61,7 +59,7 @@ events are author-only.
 Message presentation exposes typed `deletion_source` on timeline/conversation rows,
 chat-list previews, reply previews, and `reported_message`. It describes the selected
 accepted deletion: author-authorized kind 5 is `Author`; authenticated kind 4891 is
-`Admin`, including self-removal. Legacy kind-5 removals of another author's content
+`Admin`, including a self-removal an older client sent. Legacy kind-5 removals of another author's content
 remain honored but are `Unknown`, as are tombstones without recoverable evidence.
 This does not infer an administrator from sender identity or present-day roles.
 The greatest `(authenticated event timestamp, event ID)` selects both provenance

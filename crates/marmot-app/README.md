@@ -820,6 +820,21 @@ not distinguish live history from a backup. A backup is "restored from backup", 
 archive identity proves neither its writer nor historical authorship. The UniFFI and C timeline/conversation DTOs
 carry the same typed provenance; their legacy sibling field stays unchanged.
 
+Imported history carries the chat's app events (messages, reactions, edits, polls, attachment keys and the like)
+but deliberately leaves out two kinds of timeline rows, so a chat's imported stretch shows neither:
+
+- **Group system rows** (kind 1210: renames, photo changes, admin changes, members added, removed or leaving,
+  disappearing-timer changes). Each device derives these from the commits its own MLS state processed, and the
+  timeline marks them as authenticated group state. A new device never processed the commits before it joined, so
+  it cannot vouch for them, and MDK does not present a sibling's account of them as authenticated.
+- **Deleted and admin-removed messages.** The deletion erased the message's content, so no placeholder can be
+  checked against the message's id. An author's kind 5 or an admin's kind 4891 is imported with the history, so it
+  still hides the message if the original arrives later. A legacy kind 5 that removed another author's message is not
+  honored on the new device.
+
+A backup leaves out the same two kinds of rows. Changes made after the device joined show as usual. To explain the
+gap, a host can say that group changes and deleted messages from before this device was linked are not shown.
+
 `MarmotAppRuntime::chat_history_imports(account_ref)` lists each held chat whose history is `Receiving` (a delivery
 waits to be imported; `retrying` once an attempt to get its bundle failed) or `Imported` (the latest import's source and time).
 It shows facts only: a chat with nothing to bring sends nothing, so no chat waits for one, and a delivery that expired
@@ -1085,8 +1100,9 @@ through relay synchronization.
 directly, without a revision tag or per-reporter deduplication. Admins use `dismiss_reports` to label specific report
 events with kind 1985 and an optional explanation. Each label is independent.
 
-The existing `delete_message` API sends kind 4891 for admin deletion of a whole chat, including an unreported message or
-the admin's own message. Kind 5 remains author-only retraction. Admin authorization comes from authenticated source
+The existing `delete_message` API sends kind 4891 for admin deletion of another account's whole chat, reported or not.
+An admin deleting their own message sends kind 5 like any author, so it shows as deleted by its author. Kind 5 remains
+author-only retraction. Admin authorization comes from authenticated source
 state; later demotion does not revoke an established verdict. Group size and name do not affect authorization.
 
 `content_reports` lists individual reports, optionally filtered to a message. `report_dismissals` lists admin labels.

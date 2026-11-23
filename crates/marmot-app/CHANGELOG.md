@@ -30,6 +30,15 @@
   first event's `seq`, which orders a turn's rows within one second. `AgentItem`, `AgentItemState`, `AgentRequest`
   and the agent kind constants are re-exported.
 
+### Fixed
+
+- An admin deleting their own chat message sends an author kind 5, so every client shows it as deleted by its author
+  (`DeletionSource::Author`) rather than by an admin. Kind 4891 is for another account's content only.
+- A member removed from a chat, or who left it, and then added back gets a kind-1210 "member added" row naming who
+  added them, the same row the adder's timeline shows.
+- The README now states that chat history imported from another device, and backups, leave out group system rows
+  and deleted-message placeholders, and why.
+
 ## 0.19.0 - 2026-11-22
 
 ### Breaking changes
