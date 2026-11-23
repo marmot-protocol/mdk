@@ -19434,7 +19434,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
 async fn recreate_after_local_delete(
     standing: (bool, Option<String>, Option<String>),
 ) -> AppGroupRecord {
-    use cgka_traits::storage::MessageStorage;
+    use cgka_traits::storage::{GroupStorage as _, MessageStorage};
 
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -19464,6 +19464,11 @@ async fn recreate_after_local_delete(
         row.via_welcome_message_id_hex,
     ) = standing;
     app.save_state(&state).unwrap();
+    // Chats from before invitation generations (mdk#2914) have no admission,
+    // so only the app row records their standing.
+    let storage = app.account_storage("alice").unwrap();
+    storage.put_invitation_admission(&group_id, None).unwrap();
+    assert!(storage.invitation_admission(&group_id).unwrap().is_none());
 
     let mut client = app.client("alice").await.unwrap();
     let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
@@ -19502,11 +19507,12 @@ async fn recreate_after_local_delete(
         retention: None,
         encrypted_media_secret: None,
     };
-    let storage = app.account_storage("alice").unwrap();
     storage.put_pending_application_event(&event).unwrap();
     drop(client);
     let mut reopened = app.client("alice").await.unwrap();
     reopened.drain_pending_session_events().await.unwrap();
+    // No decision may settle the restored standing.
+    reopened.drive_invitation_decisions().await;
 
     assert_eq!(
         storage
