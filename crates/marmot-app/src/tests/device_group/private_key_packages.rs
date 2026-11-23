@@ -3140,11 +3140,44 @@ async fn sibling_answer_while_deleted_then_recreated(declined: bool) {
         "with no row the answer is set aside"
     );
 
-    // Send two newer messages in one batch so the multi-event frontier guard
-    // is exercised as well (mdk#3555).
+    // Collect two newer messages into one native effects batch before app
+    // projection so both crossing events share one batch-start frontier and
+    // exercise the multi-event guard in `prepare_local_group_deletion_frontier_clear`
+    // (mdk#3555).
+    let mut phone_cursor = devices.relay.published_events.lock().unwrap().len();
     super::history_delivery::send_text(&mut bob, &chat, "a newer message").await;
     super::history_delivery::send_text(&mut bob, &chat, "a second newer message").await;
-    deliver_all(&mut devices.phone, &devices.relay).await;
+    let mut batch = marmot_session::AccountDeviceEffects::default();
+    crate::tests::canonical_membership::collect_new_deliveries(
+        &mut devices.phone,
+        &devices.relay,
+        &mut phone_cursor,
+        &mut batch,
+    )
+    .await;
+    assert_eq!(
+        batch
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                cgka_traits::engine::GroupEvent::MessageReceived { group_id, .. }
+                    if group_id == &chat
+            ))
+            .count(),
+        2,
+        "both newer messages must project in one effects batch"
+    );
+    devices
+        .phone
+        .observe_drained_session_events(&batch)
+        .await
+        .unwrap();
+    devices.phone.refresh_group_routes().unwrap();
+    devices
+        .phone
+        .save_state_with_pending_local_group_deletion_frontier_clears()
+        .unwrap();
 
     if declined {
         // Recreation re-arms the set-aside decline before the decision pass
@@ -3335,6 +3368,103 @@ async fn failed_replacement_welcome_checkpoint_before_local_delete_does_not_inhe
             .unwrap()
             .pending_confirmation
     );
+}
+
+/// A sibling Welcome without an invitation generation clears
+/// `cgka_invitation_admissions` (`group_lifecycle.rs:2014`). If it commits as
+/// a replacement while its app checkpoint fails and `delete_group_local` runs
+/// before the queued `GroupJoined` drains, the frontier must record the queued
+/// replacement Welcome's pending standing and inviter rather than inheriting
+/// the old copy's acceptance (mdk#3555).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn torn_ungenerated_sibling_replacement_welcome_before_local_delete_stays_pending() {
+    use cgka_traits::storage::MessageStorage as _;
+
+    let (mut devices, _device_group) = tagging_devices().await;
+    published_key_package(&mut devices.phone, &devices.relay).await;
+    published_key_package(&mut devices.laptop, &devices.relay).await;
+    let alice = devices
+        .phone_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, devices.relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let chat = bob
+        .create_group("ungenerated sibling replacement tear", &[&alice])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    devices.phone.accept_group_invite(&chat).unwrap();
+    assert!(
+        !devices
+            .phone
+            .state_group_record(&chat)
+            .unwrap()
+            .pending_confirmation
+    );
+
+    // Model an un-generated sibling replacement Welcome committing in MLS
+    // before its app checkpoint runs: `cgka_invitation_admissions` is cleared,
+    // `pending_application_events` holds the replacement `GroupJoined`, and
+    // `account_groups` still holds the old accepted row.
+    let phone_store = group_storage(&devices.phone);
+    phone_store.put_invitation_admission(&chat, None).unwrap();
+    let replacement_welcome = cgka_traits::MessageId::new(vec![0xab; 32]);
+    let replacement_inviter = [0xcd; 32];
+    let replacement_inviter_hex = hex::encode(replacement_inviter);
+    account_database(&devices.phone_app)
+        .execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 1, 1, x'00')",
+            rusqlite::params![replacement_welcome.as_slice(), chat.as_slice()],
+        )
+        .unwrap();
+    phone_store
+        .put_pending_application_event(&cgka_traits::engine::GroupEvent::GroupJoined {
+            group_id: chat.clone(),
+            via_welcome: replacement_welcome.clone(),
+            welcomer: Some(MemberId::new(hex::decode(&alice).unwrap())),
+            explicitly_confirmed: false,
+            forwarded: cgka_traits::engine::ForwardedInvitation {
+                inviter: Some(replacement_inviter),
+                confirmed: false,
+            },
+        })
+        .unwrap();
+
+    assert!(devices.phone.delete_group_local(&chat).await.unwrap());
+    super::history_delivery::send_text(&mut bob, &chat, "message after ungenerated replacement")
+        .await;
+    deliver_all(&mut devices.phone, &devices.relay).await;
+
+    let recreated = devices
+        .phone
+        .state_group_record(&chat)
+        .expect("a newer message recreates the chat");
+    assert!(
+        recreated.pending_confirmation,
+        "a torn un-generated sibling replacement Welcome must recreate pending, not accepted from the old copy"
+    );
+    assert_eq!(
+        recreated.welcomer_account_id_hex.as_deref(),
+        Some(replacement_inviter_hex.as_str())
+    );
+    assert_eq!(
+        recreated.via_welcome_message_id_hex.as_deref(),
+        Some(hex::encode(replacement_welcome.as_slice()).as_str())
+    );
+    let forwarded = devices.phone.forwarded_invitation(&chat);
+    assert!(!forwarded.confirmed);
+    assert_eq!(forwarded.inviter, Some(replacement_inviter));
 }
 
 /// The native join and the App checkpoint are separate real transactions.

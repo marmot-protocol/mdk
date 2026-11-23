@@ -22,7 +22,7 @@ pub(super) enum AccountLeaveReason<'a> {
 
 /// Whether a row's or frontier's recorded `via_welcome_message_id_hex` belongs
 /// to `admission`. A mismatch means the projection predates a replacement
-/// admission (or predates migration 0220), so its inviter cannot be trusted to
+/// admission (or predates migration 0223), so its inviter cannot be trusted to
 /// evaluate local blocks for `admission`.
 pub(super) fn standing_matches_admission(
     via_welcome_hex: Option<&str>,
@@ -293,7 +293,7 @@ impl AppClient {
         });
         if !standing_matches {
             // Without this admission's own Welcome/inviter on the recreated
-            // row (a pre-0220 frontier, or a replacement Welcome whose join
+            // row (a pre-0223 frontier, or a replacement Welcome whose join
             // checkpoint failed before deletion), we cannot verify the inviter
             // against local blocks for an accept. Still re-arm a retained
             // decline so Leave runs as the sibling decided.
@@ -381,13 +381,7 @@ impl AppClient {
         {
             return Ok(false);
         }
-        let accepted_here = match &admission.via_welcome {
-            None => admission.created_locally,
-            Some(welcome) => {
-                group.via_welcome_message_id_hex == Some(hex::encode(welcome.as_slice()))
-            }
-        };
-        if !accepted_here {
+        if !standing_matches_admission(group.via_welcome_message_id_hex.as_deref(), &admission) {
             return Ok(false);
         }
         storage.ensure_founding_invitation_decision(&chat, admission.generation)?;

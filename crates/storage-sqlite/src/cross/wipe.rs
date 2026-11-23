@@ -117,35 +117,56 @@ impl SqliteAccountStorage {
                     .optional()
                     .storage()?
                     .unwrap_or_else(|| ("[]".to_owned(), None, None, None));
-                // If a replacement Welcome (or founding) already committed in
-                // MLS while its app checkpoint failed, `account_groups` still
-                // holds an older admission's standing. Never copy that stale
-                // inviter or Welcome onto the frontier: record pending with no
-                // inviter/Welcome for an unprojected Welcome admission, or
-                // accepted with none for a local founding.
-                if pending_confirmation.is_some()
-                    && let Some((created_locally, admission_welcome)) = tx
-                        .query_row_cached(
-                            "SELECT created_locally, via_welcome
-                             FROM cgka_invitation_admissions
-                             WHERE group_id = ?1",
-                            params![&group_id],
-                            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
-                        )
-                        .optional()
-                        .storage()?
-                {
-                    let matches_admission = match admission_welcome {
-                        None => created_locally && via_welcome_message_id_hex.is_none(),
-                        Some(welcome) => {
-                            via_welcome_message_id_hex.as_deref()
-                                == Some(hex::encode(welcome).as_str())
-                        }
+                // A replacement Welcome (generated or un-generated) can commit
+                // in MLS while its app checkpoint fails, leaving `account_groups`
+                // on the old copy's standing until the queued `GroupJoined`
+                // drains. Read any queued `GroupJoined` before wiping the
+                // outbox so the frontier records the current Welcome's standing
+                // (matching `observe_event`'s `GroupConfirmationProjection::Welcome`)
+                // instead of copying a stale acceptance or inviter (mdk#3555).
+                if !forget {
+                    let queued_events = {
+                        let mut stmt = tx
+                            .prepare_cached(
+                                "SELECT record
+                                 FROM pending_application_events
+                                 WHERE group_id = ?1
+                                 ORDER BY message_insert_order, message_id",
+                            )
+                            .storage()?;
+                        stmt.query_map(params![&group_id], |row| row.get::<_, Vec<u8>>(0))
+                            .storage()?
+                            .collect::<Result<Vec<_>, _>>()
+                            .storage()?
                     };
-                    if !matches_admission {
-                        pending_confirmation = Some(!created_locally);
-                        welcomer_account_id_hex = None;
-                        via_welcome_message_id_hex = None;
+                    for record in queued_events {
+                        if let cgka_traits::engine::GroupEvent::GroupJoined {
+                            via_welcome,
+                            welcomer,
+                            explicitly_confirmed,
+                            forwarded,
+                            ..
+                        } = crate::base::codec::deserialize(&record)?
+                        {
+                            let welcome_hex = hex::encode(via_welcome.as_slice());
+                            // Match `AppGroupRecord::apply_confirmation_state`:
+                            // a replay of an already-resolved Welcome keeps it
+                            // accepted; any new Welcome supersedes the old row.
+                            if pending_confirmation == Some(false)
+                                && via_welcome_message_id_hex.as_deref()
+                                    == Some(welcome_hex.as_str())
+                            {
+                                continue;
+                            }
+                            pending_confirmation = Some(!explicitly_confirmed);
+                            welcomer_account_id_hex =
+                                forwarded.inviter.map(hex::encode).or_else(|| {
+                                    welcomer
+                                        .as_ref()
+                                        .map(|member_id| hex::encode(member_id.as_slice()))
+                                });
+                            via_welcome_message_id_hex = Some(welcome_hex);
+                        }
                     }
                 }
                 deleted = deleted.saturating_add(

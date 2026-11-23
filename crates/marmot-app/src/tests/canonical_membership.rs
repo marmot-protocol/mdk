@@ -107,7 +107,7 @@ fn collect_effects(
 }
 
 /// Feed signed relay deliveries to this client's own runtime, delaying app projection.
-async fn collect_new_deliveries(
+pub(super) async fn collect_new_deliveries(
     client: &mut AppClient,
     relay: &ScriptedPushRelayClient,
     cursor: &mut usize,
