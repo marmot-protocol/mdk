@@ -59,10 +59,7 @@ impl Fixture {
     }
 
     async fn with_limits(config: LimitConfig) -> Self {
-        Self::with_client(config, NostrSdkRelayClient::from_builder(Client::builder())).await
-    }
-
-    async fn with_client(config: LimitConfig, sdk: NostrSdkRelayClient) -> Self {
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
         let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
             events: true,
             max_events: Some(16_384),
@@ -643,18 +640,13 @@ fn one_full_page() -> (Vec<Event>, HashSet<nostr_sdk::prelude::EventId>) {
 }
 
 /// A reply holding exactly the cap may hide more, so it is split and proven by
-/// counts. wok's `finish` changes nothing: the sweep runs the same with it,
-/// without it, and through a client built without the tap.
+/// counts. wok's `finish` changes nothing: the sweep runs the same with it and
+/// without it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_finish_hint_changes_nothing() {
     let mut runs = Vec::new();
-    for (relay_hints, tapped) in [(true, true), (false, true), (true, false)] {
-        let sdk = if tapped {
-            NostrSdkRelayClient::from_builder(Client::builder())
-        } else {
-            NostrSdkRelayClient::new(Client::builder().build())
-        };
-        let fixture = Fixture::with_client(hinted_limits(relay_hints), sdk).await;
+    for relay_hints in [true, false] {
+        let fixture = Fixture::with_limits(hinted_limits(relay_hints)).await;
         let (events, wanted) = one_full_page();
         fixture.store(&events).await;
         let mut sink = Sink::default();
@@ -666,7 +658,7 @@ async fn a_finish_hint_changes_nothing() {
             &CancellationToken::new(),
         )
         .await;
-        let case = format!("relay hints {relay_hints}, tapped {tapped}");
+        let case = format!("relay hints {relay_hints}");
         assert_eq!(report.end, SweepEnd::Finished, "{case}: {report:?}");
         assert_once_in_order(&sink, &wanted);
         assert!(report.stats.halvings > 0, "{case}");

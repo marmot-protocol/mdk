@@ -6,16 +6,17 @@
 //! admits relays only through the dial-safety chokepoint. An endpoint missing
 //! from the pool reads as unreachable.
 //!
-//! nostr-sdk's EOSE parser drops NIP-67 hints, so slice REQs read `more` off
-//! the wire through the client's hint tap ([`super::hint_tap`]). A client
-//! built without the tap ([`NostrSdkRelayClient::new`]), a relay that sends no
-//! hint, or a REQ the tap can't single out reports none. Either way the sweep
-//! proves the slice by counting against the NIP-11 cap.
+//! Every REQ is a finite request ([`crate::finite_req`]): its replies never
+//! reach the SDK's reader, so a large page delays no live message, and its
+//! EOSE keeps the NIP-67 `more` hint the SDK's parser drops. A relay that
+//! sends no hint is proven by counting against the NIP-11 cap. A client built
+//! without finite requests ([`NostrSdkRelayClient::new`]) reads as
+//! unreachable.
 //!
-//! An interrupted relay cancels its acquisition in flight rather than
-//! dropping it: a cancelled acquisition still reports every event byte it
-//! received, so a cut reply is metered like any other. Its NIP-77 exchanges
-//! carry ids, not events, and are dropped.
+//! An interrupted relay cancels its request in flight rather than dropping
+//! it: a cancelled request still reports every event byte it received, so a
+//! cut reply is metered like any other. Its NIP-77 exchanges carry ids, not
+//! events, and are dropped.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,20 +26,19 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cgka_traits::TransportEndpointRejectionCategory;
 use nostr_sdk::prelude::{
-    AcquisitionEnd, AcquisitionLimits, Client, Event, EventId, Filter, Relay, RelayAcquisition,
-    RelayUrl, ReqTarget, SyncDirection, SyncOptions, Timestamp,
+    Client, Event, EventId, Filter, Relay, RelayUrl, SyncDirection, SyncOptions, Timestamp,
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use super::hint_tap::{EoseHints, HintWatch};
 use super::{
     ClosedReason, RelayCaps, SecondReply, SliceQuery, SliceReply, SweepRange, SweepRelay,
     SweepRoute, UnreachableKind,
 };
 use crate::NostrSdkRelayClient;
 use crate::compare::{CompareRelay, CompareReply, IdsReply, LocalItem};
-use crate::sdk_client::{NegCompared, neg_sync_dry_run, sweep_eose_hints, sweep_neg_credit};
+use crate::finite_req::{FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests};
+use crate::sdk_client::{NegCompared, neg_sync_dry_run, sweep_finite_requests, sweep_neg_credit};
 
 /// Default bytes one reply may carry. A full wok page is 5,000 events.
 const REPLY_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -53,7 +53,7 @@ pub struct SdkSweepRelay {
     endpoint: RelayUrl,
     caps: Option<RelayCaps>,
     neg_credit: Arc<Semaphore>,
-    eose_hints: Option<Arc<EoseHints>>,
+    finite: Option<FiniteRequests>,
     request_timeout: Duration,
     reply_max_bytes: usize,
     /// Event bytes read since [`SweepRelay::take_fetched_bytes`] last ran.
@@ -85,7 +85,7 @@ impl SdkSweepRelay {
         Self {
             client: relay_client.client().clone(),
             neg_credit: sweep_neg_credit(relay_client, &endpoint),
-            eose_hints: sweep_eose_hints(relay_client),
+            finite: sweep_finite_requests(relay_client),
             endpoint,
             caps,
             request_timeout,
@@ -143,60 +143,43 @@ impl SdkSweepRelay {
         }
     }
 
-    /// One bounded REQ to this relay, closed at EOSE. An interruption cancels
+    /// One finite REQ to this relay, closed at EOSE. An interruption cancels
     /// it, and its partial reply still reports the bytes it read; `None` once
-    /// interrupted before it began.
-    async fn acquire(&self, filter: Filter, max_items: usize) -> Option<RelayAcquisition> {
+    /// interrupted before it began, or when the relay is not in the pool.
+    async fn acquire(&self, filter: Filter, max_items: usize) -> Option<FiniteReply> {
         if self.interrupted.is_cancelled() {
             return None;
         }
-        let limits =
-            AcquisitionLimits::new(1, max_items, self.reply_max_bytes, self.request_timeout);
-        let target = ReqTarget::manual([(self.endpoint.clone(), vec![filter])]);
-        let handle = self.client.acquire_events(target, limits).await.ok()?;
-        // Cancelling, unlike dropping the handle, keeps its report.
-        let canceller = handle.canceller();
-        let mut finish = std::pin::pin!(handle.finish());
-        let report = tokio::select! {
-            report = &mut finish => report,
-            () = self.interrupted.cancelled() => {
-                canceller.cancel();
-                finish.await
-            }
+        let finite = self.finite.as_ref()?;
+        let relay = self.client.relay(&self.endpoint).await.ok()??;
+        let limits = FiniteLimits {
+            max_items,
+            max_event_bytes: self.reply_max_bytes,
+            timeout: self.request_timeout,
         };
-        let mut report = report.ok()?;
-        let reply = report.relays.remove(&self.endpoint)?;
-        self.fetched_bytes.fetch_add(
-            u64::try_from(reply.received_event_bytes).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        let reply = finite
+            .fetch(&relay, filter, limits, &self.interrupted)
+            .await;
+        self.fetched_bytes
+            .fetch_add(reply.fetched_bytes, Ordering::Relaxed);
         Some(reply)
     }
 }
 
-/// A terminal acquisition end other than a complete reply.
-fn failed_end(end: AcquisitionEnd) -> Result<(), FailedEnd> {
+/// A terminal request end other than a complete reply.
+fn failed_end(end: FiniteEnd) -> Result<(), FailedEnd> {
     match end {
-        AcquisitionEnd::Completed => Ok(()),
-        AcquisitionEnd::Rejected(message) | AcquisitionEnd::RelayClosed(message) => {
-            Err(FailedEnd::Closed(ClosedReason::from_message(&message)))
-        }
-        AcquisitionEnd::AuthenticationFailed => Err(FailedEnd::Closed(ClosedReason(Some(
-            cgka_traits::TransportEndpointRejectionCategory::AuthRequired,
-        )))),
+        FiniteEnd::Eose => Ok(()),
+        FiniteEnd::Closed(message) => Err(FailedEnd::Closed(ClosedReason::from_message(&message))),
         // More than one reply may hold: a cut, never a proof.
-        AcquisitionEnd::ItemBudgetExceeded
-        | AcquisitionEnd::ByteBudgetExceeded
-        | AcquisitionEnd::ExitLimitReached => Err(FailedEnd::Cut),
-        AcquisitionEnd::TimedOut => Err(FailedEnd::Unreachable(UnreachableKind::TimedOut)),
+        FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => Err(FailedEnd::Cut),
+        FiniteEnd::TimedOut => Err(FailedEnd::Unreachable(UnreachableKind::TimedOut)),
         // The reply was lost on its way in, or never started: nothing of it is
         // trusted, and the relay is retried like a dropped connection.
-        AcquisitionEnd::Disconnected
-        | AcquisitionEnd::Cancelled
-        | AcquisitionEnd::ReceiveLoss(_)
-        | AcquisitionEnd::InvalidMessage
-        | AcquisitionEnd::ReceiverClosed
-        | AcquisitionEnd::Failed(_) => Err(FailedEnd::Unreachable(UnreachableKind::Disconnected)),
+        FiniteEnd::Disconnected
+        | FiniteEnd::Cancelled
+        | FiniteEnd::InvalidMessage
+        | FiniteEnd::SetupFailed => Err(FailedEnd::Unreachable(UnreachableKind::Disconnected)),
     }
 }
 
@@ -214,21 +197,15 @@ impl SweepRelay for SdkSweepRelay {
 
     async fn fetch_slice(&self, query: SliceQuery) -> SliceReply {
         let limit = query.limit.map_or(usize::MAX, |limit| limit as usize);
-        let filter = query.filter();
-        // Registered before the REQ goes out; its EOSE fills it in.
-        let watch = self
-            .eose_hints
-            .as_ref()
-            .map(|hints| hints.watch(&self.endpoint, &filter));
         // One over the limit, so a relay that ignores `limit` reads as a cut.
-        let Some(reply) = self.acquire(filter, limit.saturating_add(1)).await else {
+        let Some(reply) = self.acquire(query.filter(), limit.saturating_add(1)).await else {
             return SliceReply::Unreachable(UnreachableKind::Disconnected);
         };
         match failed_end(reply.end) {
             Ok(()) => SliceReply::Answered {
-                received: reply.raw_received_items,
-                events: reply.events.into_iter().collect(),
-                more: watch.as_ref().is_some_and(HintWatch::more),
+                received: reply.raw_items,
+                events: reply.events,
+                more: reply.more,
             },
             Err(FailedEnd::Cut) => SliceReply::Answered {
                 events: Vec::new(),
@@ -443,7 +420,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn acquisition_ends_never_manufacture_completeness() {
+    fn request_ends_never_manufacture_completeness() {
         #[derive(Debug, PartialEq, Eq)]
         enum End {
             Complete,
@@ -452,48 +429,39 @@ mod tests {
             Unreachable(UnreachableKind),
         }
         for (input, expected) in [
-            (AcquisitionEnd::Completed, End::Complete),
+            (FiniteEnd::Eose, End::Complete),
             (
-                AcquisitionEnd::Rejected("restricted: private diagnostic".into()),
+                FiniteEnd::Closed("restricted: private diagnostic".into()),
                 End::Closed(Some(Category::Restricted)),
             ),
             (
-                AcquisitionEnd::RelayClosed("private diagnostic".into()),
+                FiniteEnd::Closed("private diagnostic".into()),
                 End::Closed(None),
             ),
             (
-                AcquisitionEnd::AuthenticationFailed,
+                FiniteEnd::Closed("auth-required: sign in".into()),
                 End::Closed(Some(Category::AuthRequired)),
             ),
-            (AcquisitionEnd::ItemBudgetExceeded, End::Cut),
-            (AcquisitionEnd::ByteBudgetExceeded, End::Cut),
-            (AcquisitionEnd::ExitLimitReached, End::Cut),
+            (FiniteEnd::ItemLimit, End::Cut),
+            (FiniteEnd::ByteLimit, End::Cut),
             (
-                AcquisitionEnd::TimedOut,
+                FiniteEnd::TimedOut,
                 End::Unreachable(UnreachableKind::TimedOut),
             ),
             (
-                AcquisitionEnd::Disconnected,
+                FiniteEnd::Disconnected,
                 End::Unreachable(UnreachableKind::Disconnected),
             ),
             (
-                AcquisitionEnd::Cancelled,
+                FiniteEnd::Cancelled,
                 End::Unreachable(UnreachableKind::Disconnected),
             ),
             (
-                AcquisitionEnd::ReceiveLoss(7),
+                FiniteEnd::InvalidMessage,
                 End::Unreachable(UnreachableKind::Disconnected),
             ),
             (
-                AcquisitionEnd::InvalidMessage,
-                End::Unreachable(UnreachableKind::Disconnected),
-            ),
-            (
-                AcquisitionEnd::ReceiverClosed,
-                End::Unreachable(UnreachableKind::Disconnected),
-            ),
-            (
-                AcquisitionEnd::Failed(nostr_sdk::error::Error::other("private diagnostic")),
+                FiniteEnd::SetupFailed,
                 End::Unreachable(UnreachableKind::Disconnected),
             ),
         ] {
@@ -533,6 +501,38 @@ mod tests {
             SecondReply::Unreachable(UnreachableKind::Disconnected)
         ));
         assert!(sdk.client().relays().all().await.is_empty());
+        sdk.shutdown().await;
+    }
+
+    /// A client built without finite requests cannot sweep: its relay reads
+    /// as unreachable, never as a page the relay answered.
+    #[tokio::test]
+    async fn a_client_without_finite_requests_reads_as_unreachable() {
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let endpoint = RelayUrl::parse("wss://opaque.invalid").unwrap();
+        // In the pool but never connected: nothing is dialed.
+        sdk.client().add_relay(endpoint.clone()).await.unwrap();
+        let relay = SdkSweepRelay::new(
+            &sdk,
+            endpoint,
+            RelayCaps {
+                max_limit: Some(500),
+                negentropy: true,
+            },
+            Duration::from_secs(1),
+        );
+        let query = SliceQuery {
+            route: SweepRoute::Group {
+                nostr_group_id: [7; 32],
+            },
+            since: 1,
+            until: 2,
+            limit: Some(500),
+        };
+        assert!(matches!(
+            relay.fetch_slice(query).await,
+            SliceReply::Unreachable(UnreachableKind::Disconnected)
+        ));
         sdk.shutdown().await;
     }
 

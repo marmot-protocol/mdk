@@ -27,9 +27,10 @@ for reconnect/backoff and relay status mechanics.
 | `src/key_package.rs` | Marmot kind `30443` KeyPackage event building/publishing (`NostrKeyPackagePublication`, `NostrKeyPackagePublisher`). |
 | `src/pairing.rs` | Device-pairing messages as rumors gift-wrapped to the account's own key. |
 | `src/relay_list.rs` | NIP-65 kind `10002` and Marmot inbox kind `10050` relay-list event building. |
-| `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, `hint_tap.rs` reads NIP-67 `more` off the wire for it and counts each live REQ's reply frames. Called by `marmot-app`'s recovery runner `quantum.rs`, which owns account history debt by default since PR 5g. |
+| `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, whose REQs are finite requests; `hint_tap.rs` counts each live REQ's reply frames. Called by `marmot-app`'s recovery runner `quantum.rs`, which owns account history debt by default since PR 5g. |
 | `src/compare/` | NIP-77 comparison of one (route, relay, range) against the caller's held ids (#2660 phase 4): windows under the relay's set limit, differences fetched by id oldest first, each window certified once every id the relay holds there is fetched or held. Called by the same recovery runner's `compare.rs`; its `host.rs` builds `SdkSweepRelay` from the account's existing pool. |
 | `src/replay_fence.rs` | Fences on a group's live frames (#2660 phase 4): arming at a counted EOSE, the owner's `ReplayFencePlan` answers, partial release, owner-completed holds, buffered live frames, held or waiting for admission, moving to the coverage a fresh activation installs, and the history copies its REQs ask for again owed there. Enabled by the recovery runner from PR 5g. |
+| `src/finite_req.rs` | Finite requests (#2885): history REQs sent through `Relay::send_msg` under reserved ids, whose replies a transport wrapper takes off the connection before nostr-sdk's reader and the caller's task verifies and counts. |
 | `src/sdk_client.rs` | Optional `nostr-sdk` relay client implementation and SDK planning tests. |
 | `src/telemetry.rs` | Relay delivery telemetry: cross-relay arrival spread (phase 1) and subscription sync timing / initial-sync gate (phase 2); local-time, aggregate, privacy-safe. |
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
@@ -233,9 +234,9 @@ for reconnect/backoff and relay status mechanics.
   comparison and ids REQ an explicit `limit`, and a comparison that fills it proves nothing. `SdkSweepRelay` dials nothing: its endpoint must already be in the client's pool.
 - Never drop a request its relay can end itself (mdk#2719). Both drivers run each request through `ask_until_cut`: on
   its deadline or cancellation it calls the relay's `interrupt`, and when that returns `true` awaits the request for
-  up to `INTERRUPT_GRACE` before dropping it, and never uses its reply. `SdkSweepRelay` cancels its acquisition
-  through the SDK's `AcquisitionCanceller` (dropping the handle would discard the report), so the partial reply still
-  meters its `received_event_bytes`, and once interrupted it starts no further request, a second's next id chunk
+  up to `INTERRUPT_GRACE` before dropping it, and never uses its reply. `SdkSweepRelay` cancels its finite request
+  through its cancellation token (dropping the request would discard its reply), so the partial reply still meters
+  every event byte it was sent, and once interrupted it starts no further request, a second's next id chunk
   included. Its NIP-77 exchanges carry ids, not events, and are dropped.
 - Keep the comparison driver (`src/compare/`) a mechanism like the sweep. A window certifies only when the relay's
   set for it stayed under `COMPARE_SET_LIMIT` and every id the relay holds there was fetched or already held; a
@@ -245,18 +246,21 @@ for reconnect/backoff and relay status mechanics.
 - No NIP-67 hint proves a slice; only counting does. `more` splits, and `finish` is never read: hints reach the sweep
   only off the wire, where a misread `finish` would skip history while a misread `more` only costs requests. Do not
   add a hint-based `SliceProof` until nostr-sdk surfaces hints itself.
-- `SdkSweepRelay` reads `more` through the client's wire tap (`src/sweep/hint_tap.rs`), which
-  `NostrSdkRelayClient::from_builder` installs around the builder's transport. A slice registers its filter before its
-  REQ goes out, binds to the next REQ to that relay carrying exactly that one filter, and takes that id's first EOSE.
-  A hint the tap can't pin on one REQ reads as none, and the slice is left to counting. That covers two watches with
-  one filter, a second one-filter REQ carrying the filter while the watch is live (a stale or unrelated REQ looks the
-  same as the sweep's), a REQ re-using the bound id, and an EOSE too long to be real. The tap reads the relay's frames
-  as the SDK does: text frames only, the verb decoded as JSON decodes it, and an EOSE identified by nostr's own
-  `RelayMessage` parser, which alone decides that a frame ends the REQ. It runs before the SDK's size check, so it
-  parses only EOSEs of at most 1 KiB, outside its lock. It never alters, delays or drops a frame, and keeps no event,
-  id or payload past the watch.
-- The same tap counts, per REQ, the EVENT frames its relay sends before that REQ's EOSE, valid or not, on the
-  connection the REQ went out on (`ReplyCounts`). `dispatch_sdk_notification` asks
+- Every `SdkSweepRelay` REQ is a finite request (`src/finite_req.rs`), which `NostrSdkRelayClient::from_builder`
+  installs under the builder's transport; a client built with `new` cannot make one, and its sweep relays read as
+  unreachable. A finite request's id starts with `ID_PREFIX`, which no SDK or adapter id does. Its REQ goes out through
+  `Relay::send_msg`, so the SDK never registers or resends it, and binds to the connection that sends it. The wrapper
+  takes every EVENT, EOSE and CLOSED frame under a finite id off the connection, whether or not its request is still
+  registered: a relay keeps answering until it reads the CLOSE, and those frames must never reach the SDK. It never
+  blocks or delays another frame. A frame whose verb or EVENT id it cannot read passes on and ends that connection's
+  requests `InvalidMessage`. Each request's queue holds its byte budget plus one frame, so a slow caller never fails a
+  request that keeps to its budget. The collector applies the SDK's message and tag ceilings, expiry, the filter and
+  the event id and signature of the supplied bytes; an id and signature pair it verified before skips only the
+  signature check. A request the collector ends (EOSE, CLOSED, a budget) charges nothing past that frame; one something
+  else ends (cancellation, deadline, connection) charges every EVENT frame it was sent and did not read. An
+  `auth-required:` refusal is retried once under a new id after the client authenticates.
+- The client's wire tap (`src/sweep/hint_tap.rs`) counts, per REQ, the EVENT frames its relay sends before that
+  REQ's EOSE, valid or not, on the connection the REQ went out on (`ReplyCounts`). `dispatch_sdk_notification` asks
   `NostrRelayClient::reply_sent_nothing` once as it dispatches each EOSE, and each ask answers only the oldest EOSE
   for the id not yet asked about, true only if that is also the newest (the SDK may have re-sent the id and had it
   answered before the dispatch); every EOSE frame is counted, even with no count open. The live count keeps the answer as
@@ -327,7 +331,7 @@ for reconnect/backoff and relay status mechanics.
 ## Verification
 
 History driver tests own admission, saved cursors, budgets and certification. Keep real SDK wire tests for request
-limits, byte-cut splitting, hint binding and interruption reports; a model reply does not prove those boundaries.
+limits, byte-cut splitting, hint reading and interruption reports; a model reply does not prove those boundaries.
 Script only replies supported producers can deliver: optional SDK filter verification is off by default, but its
 acquisition set already deduplicates identical events. A proxy's outbound FIFO marker does not prove the SDK processed
 inbound bytes, so it cannot replace the third-chunk cancellation test's receipt premise.
