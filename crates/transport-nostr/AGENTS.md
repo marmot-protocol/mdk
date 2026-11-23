@@ -52,6 +52,10 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   account, and its events reach no ingest, sweep cursor or coverage ledger. Only a copy that verifies as the exact
   event is `Found`, and only an EOSE is `NotFound`. It runs when the session asks; it is not history acquisition and
   not a recovery-runner quantum.
+- One-shot directory reads (`fetch_directory_events`, `fetch_public_events`, `inspect_directory_events`) send each
+  relay's REQ as one of the adapter's finite requests, on an owned client built with `FiniteRequests::install`: each
+  relay's reply keeps its own end (EOSE, CLOSED reason, cut, deadline), and a relay that requires NIP-42 is asked once
+  more after the signer authenticates. Authentication still under way at the deadline is `TimedOut`, not a refusal.
 - Recovery debt, retry selection and native input qualification belong to the app's recovery runner.
   Bridge the runner's fence plans and borrowed source guards; never fetch history of the plane's own or schedule quiet-period
   repair here. Import actual loss before cursor authorization and retain placement/spill locking through the owner's
