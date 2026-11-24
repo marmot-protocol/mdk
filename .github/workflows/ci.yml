@@ -692,16 +692,18 @@ jobs:
   # passes 20 minutes. `slice:` deals the whole test list out in turn, which
   # stays balanced as tests are added; `count:` restarts the deal for every test
   # binary, so each binary's first test lands on shard 1.
-  # The 2 GB test archive downloads in under a minute on East US runners but
-  # has taken up to 20 minutes on central and western ones (#2568), so the
-  # download and the tests get separate budgets and a slow download cannot cut
-  # the test run short.
+  # The 2 GB test archive downloads in under a minute on East US runners, has
+  # taken up to 20 minutes on central and western ones (#2568), and has also
+  # stalled until timeout (#3465). A 5-minute first attempt cuts a stalled
+  # connection short and retries once with the full 25-minute budget so slow
+  # runners still finish, keeping download and test budgets separate inside 65
+  # minutes.
   rust-test:
     name: Rust tests (${{ matrix.partition }}/14)
     needs: [changes, rust-test-build]
     if: needs.changes.outputs.ci_mode == 'full'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 65
     strategy:
       fail-fast: false
       matrix:
@@ -733,6 +735,15 @@ jobs:
           tool: cargo-nextest@0.9.132
 
       - name: Download test archive
+        id: download-archive
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: rust-test
+
+      - name: Retry test archive download
+        if: steps.download-archive.outcome == 'failure'
         timeout-minutes: 25
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -937,6 +948,16 @@ jobs:
           tool: cargo-nextest@0.9.132
 
       - name: Download test archive
+        id: download-archive
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cli-e2e
+
+      - name: Retry test archive download
+        if: steps.download-archive.outcome == 'failure'
+        timeout-minutes: 5
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: cli-e2e
@@ -1064,6 +1085,16 @@ jobs:
           cargo --version
 
       - name: Download test archive
+        id: download-archive
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: relay-runtime
+
+      - name: Retry test archive download
+        if: steps.download-archive.outcome == 'failure'
+        timeout-minutes: 5
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: relay-runtime
@@ -1131,6 +1162,16 @@ jobs:
           tool: cargo-nextest@0.9.132
 
       - name: Download test archive
+        id: download-archive
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cli-e2e
+
+      - name: Retry test archive download
+        if: steps.download-archive.outcome == 'failure'
+        timeout-minutes: 5
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: cli-e2e
@@ -1295,6 +1336,16 @@ jobs:
           tool: just
 
       - name: Download simulator test archive
+        id: download-archive
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: simulator-tests
+
+      - name: Retry simulator test archive download
+        if: steps.download-archive.outcome == 'failure'
+        timeout-minutes: 15
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: simulator-tests
