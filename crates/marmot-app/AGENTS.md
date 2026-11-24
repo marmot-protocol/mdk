@@ -629,9 +629,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   device it was not made for, and an hour after the last when a sibling asked. A sibling Add (link pass or gap fill)
   of a chat holding a decision waits until the last broadcast was made for that sibling and the chat's decision has
   gone out since (`sibling_holds_decision`, mdk#3556), so the decision is sent ahead of the Welcome. For that to hold,
-  decisions are sent before other items, a decision page counts as sent only once a relay took it
-  (`DeviceGroupSend::Accepted`; a queued or unacknowledged page stays owed and goes out again next pass), and a
-  winning decision read from an update older than the last broadcast's tip is owed again. Each maintenance pass then sends what is owed: updates split
+  decisions are sent before other items and a winning decision read from an update older than the last broadcast's
+  tip is owed again. A decision page the session holds, queued or unacknowledged, counts as sent like any other page,
+  so during a relay outage the Add can go ahead before the decision lands; the device shows the chat as an invitation
+  until the session's retry delivers it. Carrying the decision in the Welcome would close that window (mdk#3648).
+  Each maintenance pass then sends what is owed: updates split
   to fit 32,768 bytes, each page's items marked sent only after it went out (a duplicate is harmless, a loss is not),
   and a broadcast request when owed. Updates and requests are read from any member of the trusted device group, never
   through `ensure_sent_by`. A withdrawn update owes every held item again, whoever sent it, and a withdrawn broadcast

@@ -607,12 +607,10 @@ async fn a_device_linked_soon_after_another_gets_an_accepted_chat_accepted() {
     assert!(seen, "the tablet joined from the phone's sibling Welcome");
 }
 
-/// An accepted chat's decision that no relay has taken yet holds the chat's
-/// Add to a new device until one does (mdk#3556). Here the phone owes it again
-/// and sends it while every relay is unavailable, so the session holds the
-/// page unacknowledged; the relays come back before it is retried. Before,
-/// the session holding the page counted as sent, the Add went ahead, and
-/// the Welcome could reach the device ahead of the decision.
+/// An accepted chat's decision still owed to the siblings, as after an
+/// update that reached no relay, holds the chat's Add to a new device until
+/// it goes out (mdk#3556). Before, the Add went ahead and the Welcome could
+/// reach the device ahead of the decision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_owed_decision_holds_its_chats_add_until_it_goes_out() {
     owed_decision_case(false).await;
@@ -668,9 +666,6 @@ async fn owed_decision_case(gap_fill: bool) {
         .app_storage()
         .owe_all_small_state_items()
         .unwrap();
-    relay.fail_publishes_as_unavailable();
-    phone.client.drive_small_state().await;
-    relay.allow_publishes();
     let add = async |phone: &mut Device| {
         if gap_fill {
             phone

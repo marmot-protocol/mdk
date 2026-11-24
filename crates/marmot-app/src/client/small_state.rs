@@ -23,7 +23,6 @@ use marmot_session::CanonicalizationPolicy;
 use storage_sqlite::{SmallStateItem, SmallStateItemName};
 
 use super::AppClient;
-use super::device_group::DeviceGroupSend;
 use crate::small_state::{
     BROADCAST_REQUEST, KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE,
     SmallStateMergeRule, broadcast_devices, broadcast_due, decode_broadcast_request,
@@ -80,22 +79,19 @@ impl AppClient {
         let mut sent = 0;
         // Invitation decisions first: a sibling Add waits on them (mdk#3556),
         // and a page of other items no relay takes must not hold them back.
-        // Each stays owed until a relay takes a page carrying it, not only
-        // until the session holds one: the Add would otherwise go ahead while
-        // the page still waits, queued or unacknowledged. The next pass sends
-        // it again, and a duplicate merges to the same winner.
+        // A page the session holds, queued or unacknowledged, counts as sent,
+        // as for other items: while no relay is up the Add can then go ahead
+        // before the decision lands, until the session's retry delivers it.
         for (content, carried) in
             encode_invitation_decision_updates(&storage.unsent_invitation_decisions()?)
         {
-            let event = self.device_group_event(KIND_SMALL_STATE_UPDATE, content)?;
-            match self
-                .send_device_group_event_with_outcome(&group_id, event, None)
+            if !self
+                .send_device_group_message(&group_id, KIND_SMALL_STATE_UPDATE, content)
                 .await?
             {
-                DeviceGroupSend::Accepted => storage.mark_invitation_decisions_sent(&carried)?,
-                DeviceGroupSend::Pending => {}
-                DeviceGroupSend::Failed => return Ok(()),
+                return Ok(());
             }
+            storage.mark_invitation_decisions_sent(&carried)?;
             sent += 1;
         }
         for (content, carried) in encode_small_state_update(&storage.unsent_small_state_items()?) {
