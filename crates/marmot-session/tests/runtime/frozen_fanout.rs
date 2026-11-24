@@ -2461,9 +2461,12 @@ async fn invite_quorum_survives_restart() {
                 .iter()
                 .any(|pending| matches!(pending, PendingResolution::Confirmed { .. }))
         );
+        // Two commit sends, then the Welcome: a resumed commit send and one
+        // request to both inbox relays when it needs both, otherwise one
+        // request per inbox relay.
         assert_eq!(
             adapter.publishes().len(),
-            if required_acks == 2 { 4 } else { 3 },
+            4,
             "Welcome starts once quorum is met"
         );
         assert!(matches!(
@@ -2634,10 +2637,12 @@ async fn secondary_retry_yield_preserves_exact_fanout_and_required_quorum() {
                 },
             );
             tokio::pin!(retry);
+            // With one required ACK, the released Welcome asked each of its
+            // two inbox relays on its own.
             wait_for_publish_count(
                 retry.as_mut(),
                 &adapter,
-                if required_acks == 1 { 4 } else { 3 },
+                if required_acks == 1 { 5 } else { 3 },
             )
             .await;
             request_yield.send(()).unwrap();
@@ -2656,20 +2661,20 @@ async fn secondary_retry_yield_preserves_exact_fanout_and_required_quorum() {
                 .unwrap();
         }
         let attempts = adapter.publishes();
-        let retried = &attempts[if required_acks == 1 { 3 } else { 2 }];
+        let retried = &attempts[if required_acks == 1 { 4 } else { 2 }];
         assert_eq!(retried.message, original.request().message);
         assert_eq!(retried.target.endpoints(), std::slice::from_ref(&slow));
+        let welcome_sends = attempts
+            .iter()
+            .filter(|attempt| matches!(attempt.message.envelope, TransportEnvelope::Welcome { .. }))
+            .flat_map(|attempt| attempt.target.endpoints().to_vec())
+            .collect::<Vec<_>>();
         assert_eq!(
-            attempts
-                .iter()
-                .filter(|attempt| matches!(
-                    attempt.message.envelope,
-                    TransportEnvelope::Welcome { .. }
-                ))
-                .count(),
-            1,
+            welcome_sends.len(),
+            2,
             "required confirmation must release its Welcome exactly once despite foreground pressure"
         );
+        assert_ne!(welcome_sends[0], welcome_sends[1], "once to each inbox relay");
         if required_acks == 1 {
             let retained = runtime
                 .session()
@@ -2714,7 +2719,7 @@ async fn secondary_retry_yield_preserves_exact_fanout_and_required_quorum() {
                 .unwrap();
             assert_eq!(
                 adapter.publishes().len(),
-                4,
+                5,
                 "already-ready pressure must not start another attempt"
             );
             assert_eq!(
@@ -2726,12 +2731,12 @@ async fn secondary_retry_yield_preserves_exact_fanout_and_required_quorum() {
             runtime.advance_convergence(&group).await.unwrap();
             assert_eq!(
                 adapter.publishes().len(),
-                5,
+                6,
                 "a fresh quiet pass must resume replication"
             );
-            assert_eq!(adapter.publishes()[4].message, original.request().message);
+            assert_eq!(adapter.publishes()[5].message, original.request().message);
             assert_eq!(
-                adapter.publishes()[4].target.endpoints(),
+                adapter.publishes()[5].target.endpoints(),
                 std::slice::from_ref(&slow)
             );
         }

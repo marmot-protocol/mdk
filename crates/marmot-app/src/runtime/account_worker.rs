@@ -1836,6 +1836,8 @@ async fn run_app_runtime_account_worker(
         // worker has exited (mdk#2628 D67).
         if client.device_unlinked() {
             stop_recovery_runner(&mut recovery_runner, &mut client).await;
+            // Its waves stop before its audit recording closes.
+            welcome_runs.stop(&mut client).await;
             stop_unlinked_worker(&mut client, unlinked).await;
             break 'worker;
         }
@@ -2097,13 +2099,15 @@ async fn run_app_runtime_account_worker(
                 if let Some(deadline) = lifecycle.welcome_wave_deadline() {
                     welcome_runs.settle_until(&mut client, &shared, deadline).await;
                 }
+                // The rest are cancelled and joined before the audit closes.
+                welcome_runs.cancel_and_join(Some(&mut client), false).await;
                 client.finish_audit_recording();
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
             }
             stop = &mut shutdown => {
                 if stop.is_ok() {
-                    welcome_runs.record_returned(&mut client);
+                    welcome_runs.stop(&mut client).await;
                     client.finish_audit_recording();
                 }
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;

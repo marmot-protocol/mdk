@@ -513,18 +513,9 @@ where
         route_source: audit_v5::RouteSource,
     ) -> Option<V5WelcomePass> {
         let v5 = self.v5_welcome_of(facts?)?;
-        let target_count = u32::try_from(endpoints.len()).ok()?;
+        let (targets, target_count, targets_complete) = v5_pass_targets(endpoints)?;
         let required_acks = u32::try_from(required_acks).ok()?;
         let accepted_before_count = u32::try_from(accepted_before).ok()?;
-        let mut targets = endpoints
-            .iter()
-            .filter_map(v5_endpoint_ref)
-            .collect::<Vec<_>>();
-        targets.sort();
-        targets.dedup();
-        let targets_complete =
-            targets.len() == endpoints.len() && targets.len() <= audit_v5::MAX_ENDPOINTS;
-        targets.truncate(audit_v5::MAX_ENDPOINTS);
         Some(V5WelcomePass {
             welcome_id: v5.facts.id.clone(),
             group_ref: v5.group_ref,
@@ -583,7 +574,49 @@ where
     }
 }
 
+/// A pass's started-row targets for `endpoints`: their references, their
+/// count, and whether the references name them all.
+fn v5_pass_targets(
+    endpoints: &[TransportEndpoint],
+) -> Option<(Vec<audit_v5::EndpointRef>, u32, bool)> {
+    let target_count = u32::try_from(endpoints.len()).ok()?;
+    let mut targets = endpoints
+        .iter()
+        .filter_map(v5_endpoint_ref)
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    let targets_complete =
+        targets.len() == endpoints.len() && targets.len() <= audit_v5::MAX_ENDPOINTS;
+    targets.truncate(audit_v5::MAX_ENDPOINTS);
+    Some((targets, target_count, targets_complete))
+}
+
 impl V5WelcomePass {
+    /// The pass over `endpoints`, the relays this pass was still waiting on
+    /// when it was done, after `accepted_before` acceptances; ready for
+    /// [`Self::start`].
+    pub(super) fn remaining(
+        &self,
+        endpoints: &[TransportEndpoint],
+        accepted_before: usize,
+    ) -> Option<Self> {
+        let (targets, target_count, targets_complete) = v5_pass_targets(endpoints)?;
+        Some(Self {
+            welcome_id: self.welcome_id.clone(),
+            group_ref: self.group_ref.clone(),
+            started: audit_v5::WelcomePublishStarted {
+                route_source: audit_v5::RouteSource::RetainedTarget,
+                targets,
+                target_count: Some(target_count),
+                targets_complete,
+                accepted_before_count: u32::try_from(accepted_before).ok()?,
+                ..self.started.clone()
+            },
+            recorded: false,
+        })
+    }
+
     /// Record this pass's finished row, if it started, from the relays'
     /// answers it observed, without its stored total, policy or retention:
     /// for a pass whose results are dropped unreconciled, as when its

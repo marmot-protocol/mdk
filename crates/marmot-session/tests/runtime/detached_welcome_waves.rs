@@ -573,3 +573,333 @@ async fn an_interrupted_maintenance_release_stays_owed() {
     );
     assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
 }
+
+/// Carol's two inbox relays: one that answers at once, and one that may be
+/// held.
+const FAST_INBOX: &str = "wss://carol-fast.example";
+const SLOW_INBOX: &str = "wss://carol-slow.example";
+
+/// Alice's invite of carol, whose inbox relays are [`FAST_INBOX`] and
+/// [`SLOW_INBOX`], on a detached runtime that records its v5 audit at
+/// `audit`. The commit is confirmed, and carol's Welcome waits in its wave.
+struct TwoInboxInvite {
+    runtime: WithdrawalRuntime,
+    adapter: RecordingAdapter,
+    wall: Arc<TestWallClock>,
+    audit: std::path::PathBuf,
+}
+
+async fn two_inbox_invite(dir: &std::path::Path) -> TwoInboxInvite {
+    let key = SqlCipherKey::new(DETACHED_KEY).unwrap();
+    let mut alice =
+        current_nostr_welcome_session(dir.join("alice.sqlite"), &key, b"alice-two-inbox");
+    let mut carol = current_session(dir.join("carol.sqlite"), &key, b"carol-two-inbox");
+    let group_id = alice
+        .create_group(CreateGroupRequest {
+            name: "two inbox relays".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .group_id;
+    let adapter = RecordingAdapter::default();
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            )
+            .with_inbox_route(
+                carol.self_id(),
+                vec![
+                    TransportEndpoint(FAST_INBOX.into()),
+                    TransportEndpoint(SLOW_INBOX.into()),
+                ],
+            );
+    let wall = Arc::new(TestWallClock::new(300_000));
+    let mut runtime = detached_runtime(alice, &adapter, &policy, &wall);
+    let audit = dir.join("two-inbox-audit-v5.jsonl");
+    runtime.audit_recorder().swap(v5_audit_recorder(&audit));
+    let sent = runtime
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        sent.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    TwoInboxInvite {
+        runtime,
+        adapter,
+        wall,
+        audit,
+    }
+}
+
+/// The state and attempt count of the Welcome's retry record for `endpoint`.
+fn inbox_target(
+    runtime: &WithdrawalRuntime,
+    welcome: &MessageId,
+    endpoint: &str,
+) -> (cgka_traits::TransportFanoutAttemptState, u32) {
+    let fanout = runtime
+        .session()
+        .transport_fanout(welcome)
+        .unwrap()
+        .expect("the Welcome keeps its retry record");
+    let target = fanout
+        .targets
+        .iter()
+        .find(|target| target.endpoint.0 == endpoint)
+        .unwrap();
+    (target.state, target.attempt_count)
+}
+
+/// The v5 publish rows of `welcome`, in order.
+fn publish_rows(audit: &std::path::Path, welcome: &MessageId) -> Vec<serde_json::Value> {
+    let outer = marmot_forensics::v5::NostrEventRef::from_validated_event_id(
+        &<[u8; 32]>::try_from(welcome.as_slice()).unwrap(),
+    );
+    v5_audit_rows(audit)
+        .into_iter()
+        .filter(|row| row["event"]["outer_event_ref"] == outer.as_str())
+        .filter(|row| {
+            row["event"]["type"]
+                .as_str()
+                .unwrap()
+                .starts_with("welcome_publish_")
+        })
+        .collect()
+}
+
+/// A Welcome reaches every inbox relay of its recipient in its first pass.
+/// The transport may answer a request at its acknowledgement goal and leave
+/// the other relays unanswered, so a Welcome sent as one request reached
+/// only the first relay that took it, and a relay that takes gift wraps it
+/// cannot serve back could be that one. Each relay is asked on its own: both
+/// accept in one attempt each, and the pass's finished row names both.
+#[tokio::test]
+async fn a_welcome_reaches_every_inbox_relay_in_its_first_pass() {
+    let dir = relaxed_storage_dir().unwrap();
+    let TwoInboxInvite {
+        mut runtime,
+        adapter,
+        audit,
+        ..
+    } = two_inbox_invite(dir.path()).await;
+    let task = the_wave(&mut runtime);
+    let [welcome] = task.message_ids() else {
+        panic!("carol's Welcome");
+    };
+    let welcome = welcome.clone();
+    // The next request answers once one relay has taken it.
+    adapter.accept_next(1);
+
+    let finished = runtime
+        .finish_welcome_publish_task(task.run().await)
+        .await
+        .unwrap();
+
+    assert!(finished.welcome_failures.is_empty());
+    assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
+    for inbox in [FAST_INBOX, SLOW_INBOX] {
+        assert_eq!(
+            inbox_target(&runtime, &welcome, inbox),
+            (cgka_traits::TransportFanoutAttemptState::Accepted, 1),
+            "{inbox} took the Welcome in the first pass"
+        );
+    }
+    let rows = publish_rows(&audit, &welcome);
+    assert_eq!(rows.len(), 2, "one pass: {rows:?}");
+    let finished = &rows[1]["event"];
+    assert_eq!(finished["results_complete"], true, "{finished}");
+    assert_eq!(finished["accepted_this_attempt_count"], 2, "{finished}");
+    assert_eq!(finished["retained_state"], "completed", "{finished}");
+}
+
+/// A slow inbox relay does not hold back a Welcome's settlement. The wave
+/// returns once the fast relay took the Welcome, and its finish marks the
+/// Welcome delivered while the slow relay is still answering. That relay goes
+/// on as the wave's remaining pass, whose finish records its acceptance on
+/// the same attempt: nothing is left to retry, and the remaining pass has
+/// its own started and finished rows.
+#[tokio::test]
+async fn a_slow_inbox_relay_answers_after_its_welcome_settled() {
+    let dir = relaxed_storage_dir().unwrap();
+    let TwoInboxInvite {
+        mut runtime,
+        adapter,
+        wall,
+        audit,
+        ..
+    } = two_inbox_invite(dir.path()).await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *adapter.inner.endpoint_gate.lock().unwrap() =
+        Some((TransportEndpoint(SLOW_INBOX.into()), gate.clone()));
+    let task = the_wave(&mut runtime);
+    let welcome = task.message_ids()[0].clone();
+
+    let mut completed = tokio::time::timeout(Duration::from_secs(5), task.run())
+        .await
+        .expect("the wave returns at the fast relay's acceptance");
+    let remaining = completed
+        .take_remaining()
+        .expect("the slow relay is still answering");
+    assert_eq!(remaining.message_ids(), std::slice::from_ref(&welcome));
+    let finished = runtime.finish_welcome_publish_task(completed).await.unwrap();
+    assert!(finished.welcome_failures.is_empty());
+    assert!(
+        runtime.outstanding_welcome_deliveries().unwrap().is_empty(),
+        "the fast relay's acceptance settled the Welcome"
+    );
+    assert_eq!(
+        inbox_target(&runtime, &welcome, SLOW_INBOX).0,
+        cgka_traits::TransportFanoutAttemptState::AttemptedFailed,
+        "the slow relay has not answered yet"
+    );
+
+    gate.add_permits(1);
+    runtime
+        .finish_welcome_publish_task(remaining.run().await)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        inbox_target(&runtime, &welcome, SLOW_INBOX),
+        (cgka_traits::TransportFanoutAttemptState::Accepted, 1),
+        "its late acceptance ends the first attempt"
+    );
+    let tried = welcome_publishes(&adapter).len();
+    wall.set(300_000 + 3_600);
+    runtime.run_due_maintenance().await.unwrap();
+    assert!(runtime.take_prepared_welcome_tasks().is_empty());
+    assert_eq!(welcome_publishes(&adapter).len(), tried, "nothing is retried");
+
+    let rows = publish_rows(&audit, &welcome);
+    let kinds = rows
+        .iter()
+        .map(|row| row["event"]["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            "welcome_publish_started",
+            "welcome_publish_started",
+            "welcome_publish_finished",
+            "welcome_publish_finished"
+        ]
+    );
+    let (first, rest) = (&rows[0]["event"], &rows[1]["event"]);
+    assert_eq!(first["target_count"], 2, "{first}");
+    assert_eq!(rest["target_count"], 1, "{rest}");
+    assert_eq!(rest["accepted_before_count"], 1, "{rest}");
+    assert_eq!(rest["route_source"], "retained_target", "{rest}");
+    assert_ne!(first["attempt_id"], rest["attempt_id"]);
+    let first_finished = &rows[2]["event"];
+    assert_eq!(first_finished["attempt_id"], first["attempt_id"]);
+    assert_eq!(first_finished["results_complete"], false, "{first_finished}");
+    assert_eq!(first_finished["policy"], "met", "{first_finished}");
+    let rest_finished = &rows[3]["event"];
+    assert_eq!(rest_finished["attempt_id"], rest["attempt_id"]);
+    assert_eq!(rest_finished["results_complete"], true, "{rest_finished}");
+    assert_eq!(rest_finished["accepted_total_count"], 2, "{rest_finished}");
+    assert_eq!(rest_finished["retained_state"], "completed", "{rest_finished}");
+}
+
+/// A remaining pass cut short, as when its worker stops, keeps what the
+/// first pass settled: the Welcome stays delivered and the fast relay's
+/// acceptance stays stored. The slow relay is retried after its backoff, as
+/// a relay the first pass did not hear from always was.
+#[tokio::test]
+async fn a_remaining_pass_cut_short_keeps_the_settled_acceptance() {
+    let dir = relaxed_storage_dir().unwrap();
+    let TwoInboxInvite {
+        mut runtime,
+        adapter,
+        wall,
+        ..
+    } = two_inbox_invite(dir.path()).await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *adapter.inner.endpoint_gate.lock().unwrap() =
+        Some((TransportEndpoint(SLOW_INBOX.into()), gate.clone()));
+    let task = the_wave(&mut runtime);
+    let welcome = task.message_ids()[0].clone();
+    let mut completed = tokio::time::timeout(Duration::from_secs(5), task.run())
+        .await
+        .expect("the wave returns at the fast relay's acceptance");
+    let remaining = completed.take_remaining().unwrap();
+    runtime.finish_welcome_publish_task(completed).await.unwrap();
+
+    runtime.abandon_welcome_publish_task(remaining.message_ids());
+    drop(remaining);
+
+    assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
+    assert_eq!(
+        runtime.withdraw_welcome(&welcome).unwrap(),
+        WelcomeWithdrawal::AlreadyDelivered
+    );
+    assert_eq!(
+        inbox_target(&runtime, &welcome, FAST_INBOX).0,
+        cgka_traits::TransportFanoutAttemptState::Accepted
+    );
+    *adapter.inner.endpoint_gate.lock().unwrap() = None;
+    let tried = welcome_publishes(&adapter).len();
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(welcome_publishes(&adapter).len(), tried, "no retry before backoff");
+    wall.set(300_000 + 31);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        inbox_target(&runtime, &welcome, SLOW_INBOX),
+        (cgka_traits::TransportFanoutAttemptState::Accepted, 2),
+        "maintenance retries the slow relay"
+    );
+}
+
+/// A late acceptance after the first pass's record could not be saved
+/// counts and dates the attempt it ends: the stored record never shows an
+/// accepted relay with no attempt.
+#[tokio::test]
+async fn a_late_acceptance_after_a_failed_first_record_counts_its_attempt() {
+    let dir = relaxed_storage_dir().unwrap();
+    let TwoInboxInvite {
+        mut runtime,
+        adapter,
+        ..
+    } = two_inbox_invite(dir.path()).await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *adapter.inner.endpoint_gate.lock().unwrap() =
+        Some((TransportEndpoint(SLOW_INBOX.into()), gate.clone()));
+    let task = the_wave(&mut runtime);
+    let welcome = task.message_ids()[0].clone();
+    let mut completed = tokio::time::timeout(Duration::from_secs(5), task.run())
+        .await
+        .expect("the wave returns at the fast relay's acceptance");
+    let remaining = completed.take_remaining().unwrap();
+    runtime.arm_finish_stage_failure(welcome.clone());
+    assert!(
+        runtime.finish_welcome_publish_task(completed).await.is_err(),
+        "the first pass's record is not saved"
+    );
+    // Only another message's record fails from here.
+    runtime.arm_finish_stage_failure(MessageId::new(vec![0; 32]));
+
+    gate.add_permits(1);
+    runtime
+        .finish_welcome_publish_task(remaining.run().await)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        inbox_target(&runtime, &welcome, SLOW_INBOX),
+        (cgka_traits::TransportFanoutAttemptState::Accepted, 1)
+    );
+}

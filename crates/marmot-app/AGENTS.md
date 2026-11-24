@@ -693,7 +693,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the host no longer shows, and a `Drain` answers once every wave started before it has settled. A
   `PendingWelcomeDeliveries` read waits the same way, beside the writer, and answers with the list computed then
   (W8): a read after a create or invite sees that wave's first attempt settled, as it did when the worker published
-  inline. A wave started after the worker took the read up never extends its wait. A wait answers where its last
+  inline. A wave started after the worker took the read up never extends its wait. A wave returns once each of its
+  passes met its Welcome's policy or heard from every relay; the relays a pass was still waiting on keep answering in
+  a remaining wave (`WelcomeWaveTail::Remaining`) that the wave's task starts as it returns. The worker settles it
+  like any wave, so their late answers are recorded, but no `Drain` or read waits for it; only L3's bound does. A
+  remaining wave that is cancelled (L3's bound, a client replacement, a stop, an unlink, a forced teardown) records
+  nothing: its relays stay owed and are retried after their backoff. A stop or an unlink first settles each wave that
+  already returned, then cancels and joins the rest (`WelcomeRuns::stop`); shutdown cancels and joins what L3's bound
+  left (`WelcomeRuns::cancel_and_join`); both before the audit recording closes. A
+  wait answers where its last
   wave settles: on the writer, or on the replaced client before the reconnect backoff. One parked at exit gets the
   error a queued command gets. At runtime shutdown a wait whose waves settle within the bound (L3) answers with its
   result, or with a storage error once `shutdown_and_close` has closed storage; a reply's precedence over shutdown is

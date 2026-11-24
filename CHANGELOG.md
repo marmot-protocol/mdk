@@ -21,6 +21,15 @@
   adapters. An audit of every async export found eight whose steps could be torn by a cancel; they now keep running
   when a Kotlin or Swift caller cancels them: sign-out, sign-in, account removal, the three logins, NIP-46 signer
   removal and the audit-log switch. Overlapping audit-log switch calls end with the last stored value.
+- When the app's account worker publishes a Welcome (an invite's, a new chat's, or a retry of either), the first pass
+  now reaches every inbox relay of its recipient, not only the first relay that acknowledged it. Each relay is asked
+  on its own. The Welcome is still marked delivered at the first acknowledgement, and the host and the account worker
+  do not wait for the other relays. Their answers are recorded once all of them have answered. If the worker stops
+  waiting first (at the shutdown bound, a reconnect, sign-out or unlink), nothing more is recorded: those relays stay
+  owed and are retried after their backoff, and one that already stored the Welcome answers duplicate. A Welcome whose
+  only acknowledgement came from a relay that accepts gift wraps but cannot serve them back no longer depends on a
+  retry 30 seconds later, which a closed app never ran. `redeliver_welcome` and runtimes that publish Welcomes inline
+  still stop at the first acknowledgement.
 - A device linked soon after another no longer shows the account's accepted chats as invitations for up to an hour,
   where a decline turned into a leave on every device (mdk#3556). Each device broadcasts its small state to a newly
   listed device at once, and adds it to a chat only after that chat's invitation decision went out. During a relay

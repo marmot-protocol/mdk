@@ -12,6 +12,13 @@
 //! stays owed. Maintenance retries its fanout record, and the next open's
 //! startup retry sends it.
 //!
+//! A wave returns once each of its passes is done, while the relays a pass
+//! was still waiting on keep answering in a wave of their own, started by
+//! the wave's task as it returns ([`WelcomeWaveResults::remaining`]). The
+//! writer settles the wave at once, then takes that remaining wave up like
+//! any other: its settle records the late answers, and cancelling it leaves
+//! those relays to maintenance, as before.
+//!
 //! Every wave counts toward the app's waves in flight
 //! ([`WelcomeWavesInFlight`]) until its relay task ends or is aborted: a
 //! create's or an invite's from before its host is answered
@@ -62,17 +69,33 @@ pub(crate) enum WelcomeWaveTail {
     },
     /// Welcomes a confirmed commit or a maintenance pass released.
     Released,
+    /// The relays a settled wave's passes were still waiting on. Their
+    /// Welcomes' first attempts have settled, so nothing waits for this
+    /// wave but the shutdown bound.
+    Remaining,
 }
 
 impl WelcomeWaveTail {
     pub(crate) fn is_founding(&self) -> bool {
         matches!(self, Self::Founding { .. })
     }
+
+    pub(crate) fn is_remaining(&self) -> bool {
+        matches!(self, Self::Remaining)
+    }
 }
 
 /// A wave's relay task. Dropping it aborts the task, so no publish outlives
 /// the worker or the client generation that started it.
-pub(crate) struct WelcomeWaveRun(JoinHandle<Vec<CompletedWelcomePublishTask>>);
+pub(crate) struct WelcomeWaveRun(pub(crate) JoinHandle<WelcomeWaveResults>);
+
+/// What a wave's relay task returns.
+pub(crate) struct WelcomeWaveResults {
+    pub(crate) completed: Vec<CompletedWelcomePublishTask>,
+    /// The wave that goes on asking the relays its passes were still waiting
+    /// on, already running. Dropping it stops them.
+    pub(crate) remaining: Option<Box<StartedWelcomeWave>>,
+}
 
 impl WelcomeWaveRun {
     pub(crate) fn abort_handle(&self) -> AbortHandle {
@@ -81,7 +104,7 @@ impl WelcomeWaveRun {
 }
 
 impl Future for WelcomeWaveRun {
-    type Output = Result<Vec<CompletedWelcomePublishTask>, JoinError>;
+    type Output = Result<WelcomeWaveResults, JoinError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.0).poll(cx)
@@ -150,7 +173,9 @@ enum StashedDelivery {
 /// Run `tasks` as one wave's relay task, or nothing when there are none.
 /// The task captures only the prepared publishes: each holds a transport
 /// handle, a clock and its exact attempts, nothing of the client. It counts
-/// in `in_flight` until it ends or is aborted.
+/// in `in_flight` until it ends or is aborted. As it returns, it starts the
+/// relays its passes left answering as their own wave, which counts before
+/// this one stops counting.
 fn spawn_welcome_wave(
     tasks: Vec<PreparedWelcomePublishTask>,
     in_flight: &WelcomeWavesInFlight,
@@ -165,9 +190,25 @@ fn spawn_welcome_wave(
     let publishes =
         futures::future::join_all(tasks.into_iter().map(PreparedWelcomePublishTask::run));
     let hold = in_flight.hold();
+    let in_flight = in_flight.clone();
     let run = WelcomeWaveRun(tokio::spawn(async move {
         let _hold = hold;
-        publishes.await
+        let mut completed = publishes.await;
+        let remaining = completed
+            .iter_mut()
+            .filter_map(CompletedWelcomePublishTask::take_remaining)
+            .collect();
+        let remaining = spawn_welcome_wave(remaining, &in_flight).map(|(run, message_ids)| {
+            Box::new(StartedWelcomeWave {
+                run,
+                message_ids,
+                tail: WelcomeWaveTail::Remaining,
+            })
+        });
+        WelcomeWaveResults {
+            completed,
+            remaining,
+        }
     }));
     Some((run, message_ids))
 }
@@ -470,16 +511,23 @@ impl AppClient {
     /// published, in input order, or abandon it if the task panicked or was
     /// cancelled, then run the wave's tail. The results of a group that is
     /// gone (see [`Self::welcome_wave_group_gone`]) are dropped first, so the
-    /// wave changes nothing of it.
+    /// wave changes nothing of it. The wave of the relays it left answering
+    /// is started here, for the worker to take up.
     pub(crate) async fn settle_welcome_wave(
         &mut self,
         message_ids: Vec<MessageId>,
         tail: WelcomeWaveTail,
-        run: Result<Vec<CompletedWelcomePublishTask>, JoinError>,
+        run: Result<WelcomeWaveResults, JoinError>,
     ) -> WelcomeDelivery {
         let mut effects = AccountDeviceEffects::default();
         let finished = match run {
-            Ok(completed) => {
+            Ok(WelcomeWaveResults {
+                completed,
+                remaining,
+            }) => {
+                if let Some(remaining) = remaining {
+                    self.started_welcome_waves.push(*remaining);
+                }
                 let mut finished = true;
                 for mut task in completed {
                     task.drop_gone_groups(|group_id| self.welcome_wave_group_gone(group_id));
@@ -597,7 +645,7 @@ impl AppClient {
                 self.remember_published_reports(&effects);
                 WelcomeDelivery::of(true, &effects)
             }
-            WelcomeWaveTail::Released => {
+            WelcomeWaveTail::Released | WelcomeWaveTail::Remaining => {
                 self.remember_published_reports(&wave);
                 WelcomeDelivery::of(finished, &wave)
             }
