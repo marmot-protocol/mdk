@@ -371,6 +371,14 @@ impl FiniteRequests {
         }
     }
 
+    /// `relay`'s authentication outcomes from now on, for [`Self::fetch_watching`];
+    /// `None` when this client cannot authenticate.
+    pub fn watch_auth(&self, relay: &Relay) -> Option<AuthWatch> {
+        self.0
+            .can_authenticate
+            .then(|| AuthWatch(relay.notifications_with_gaps()))
+    }
+
     /// Ask `relay` for `filter`'s events until its EOSE, within `limits`. A
     /// relay that requires NIP-42 authentication is asked once more under a
     /// new id after the client authenticates, within what the refused attempt
@@ -382,22 +390,35 @@ impl FiniteRequests {
         limits: FiniteLimits,
         cancel: &CancellationToken,
     ) -> FiniteReply {
-        let deadline = Instant::now() + limits.timeout;
         // Subscribed before the REQ, so an authentication the SDK finishes
         // while the relay answers is still in the stream.
-        let mut notifications = self
-            .0
-            .can_authenticate
-            .then(|| relay.notifications_with_gaps());
+        let mut auth = self.watch_auth(relay);
+        self.fetch_watching(relay, filters, limits, cancel, &mut auth)
+            .await
+    }
+
+    /// [`Self::fetch`], reading the authentication outcome from `auth`, a
+    /// watch the caller started earlier (before connecting, say, to see an
+    /// authentication that finished then). A retry takes the watch, so a
+    /// later refusal under it is final.
+    pub async fn fetch_watching(
+        &self,
+        relay: &Relay,
+        filters: Vec<Filter>,
+        limits: FiniteLimits,
+        cancel: &CancellationToken,
+        auth: &mut Option<AuthWatch>,
+    ) -> FiniteReply {
+        let deadline = Instant::now() + limits.timeout;
         let first = self
             .request(relay, &filters, limits, deadline, cancel)
             .await;
         let auth_required =
             matches!(&first.end, FiniteEnd::Closed(reason) if is_auth_required(reason));
-        let Some(notifications) = notifications.as_mut().filter(|_| auth_required) else {
+        let Some(mut watch) = auth.take_if(|_| auth_required && self.0.can_authenticate) else {
             return first;
         };
-        match authenticated(notifications, deadline, cancel).await {
+        match authenticated(&mut watch.0, deadline, cancel).await {
             Ok(()) => {}
             // The refusal stands.
             Err(None) => return first,
@@ -533,6 +554,15 @@ async fn authenticated(
         () = cancel.cancelled() => Err(Some(FiniteEnd::Cancelled)),
         () = tokio::time::sleep_until(deadline) => Err(Some(FiniteEnd::TimedOut)),
         authenticated = wait => authenticated,
+    }
+}
+
+/// A relay's authentication outcomes, from [`FiniteRequests::watch_auth`].
+pub struct AuthWatch(Pin<Box<dyn Stream<Item = NotificationUpdate<RelayNotification>> + Send>>);
+
+impl fmt::Debug for AuthWatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthWatch").finish_non_exhaustive()
     }
 }
 

@@ -793,7 +793,8 @@ impl NostrSdkDirectoryRelayFetcher {
     }
 
     /// Each of `relay_urls`' finite reply to `filters`, in order; `None` for
-    /// a relay missing from the pool.
+    /// a relay missing from the pool. The relays share one read's byte
+    /// budget, so the replies held together stay within it.
     async fn fetch_each(
         &self,
         relay_urls: &[RelayUrl],
@@ -802,7 +803,7 @@ impl NostrSdkDirectoryRelayFetcher {
     ) -> Vec<Option<FiniteReply>> {
         let limits = FiniteLimits {
             max_items: max_items.max(1),
-            max_event_bytes: DIRECTORY_REPLY_MAX_BYTES,
+            max_event_bytes: DIRECTORY_REPLY_MAX_BYTES / relay_urls.len().max(1),
             timeout: DIRECTORY_RELAY_FETCH_WAIT,
         };
         let cancel = CancellationToken::new();
@@ -943,9 +944,13 @@ impl NostrSdkDirectoryRelayFetcher {
                 let relay_urls = &relay_urls;
                 async move {
                     let filter = directory_query_filter(&query, false)?;
-                    // The newest `limit` distinct events any relay sent.
+                    // The newest `limit` distinct events any relay sent. A
+                    // relay's every EVENT frame counts toward an item cap,
+                    // matching or not, so none is set: the byte budget and
+                    // the deadline bound the read, and a relay that ignores
+                    // the filter cannot crowd out the event asked for.
                     let events = self
-                        .fetch_each(relay_urls, std::slice::from_ref(&filter), query.limit)
+                        .fetch_each(relay_urls, std::slice::from_ref(&filter), usize::MAX)
                         .await
                         .into_iter()
                         .flatten()
@@ -1002,8 +1007,9 @@ impl PublicEventFetch {
 /// event against the reference they asked for.
 ///
 /// It returns at most `max_events` distinct events, the newest first. A read
-/// with more than that, or a relay that did not connect or reach its end of
-/// stored events, is incomplete; one relay's failure does not stop the others.
+/// with more than that, or a relay that did not connect, did not reach its end
+/// of stored events or said it has more, is incomplete; one relay's failure
+/// does not stop the others.
 pub async fn fetch_public_events(
     endpoints: &[TransportEndpoint],
     filters: Vec<Filter>,
@@ -1026,7 +1032,8 @@ pub async fn fetch_public_events(
                 complete = false;
                 continue;
             };
-            complete &= reply.end == FiniteEnd::Eose;
+            // NIP-67 `more`: the relay cut its own answer short.
+            complete &= reply.end == FiniteEnd::Eose && !reply.more;
             for event in reply.events {
                 let from = sources.entry(event.id).or_default();
                 let relay = TransportEndpoint(url.to_string());
@@ -1081,6 +1088,15 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .add_relay(url.clone())
             .await
             .map_err(|_| Unreachable)?;
+        let relay = client
+            .relay(url.clone())
+            .await
+            .map_err(|_| Unreachable)?
+            .ok_or(Unreachable)?;
+        // Watched before the dial, so an authentication a challenge on
+        // connect starts is seen however early it ends. One retry per
+        // inspection: the watch goes with it.
+        let mut auth = finite.watch_auth(&relay);
         // `connect_relay` only queues the dial. Await the handshake, so the
         // EOSE window below is the relay's answer time alone.
         match timeout(
@@ -1096,11 +1112,6 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             Ok(Err(_)) => return Err(Unreachable),
             Err(_) => return Err(TimedOut),
         }
-        let relay = client
-            .relay(url.clone())
-            .await
-            .map_err(|_| Unreachable)?
-            .ok_or(Unreachable)?;
         let deadline = tokio::time::Instant::now() + DIRECTORY_INSPECTION_EOSE_WAIT;
         let cancel = CancellationToken::new();
         let mut records = Vec::new();
@@ -1120,7 +1131,9 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 max_event_bytes: DIRECTORY_REPLY_MAX_BYTES,
                 timeout: remaining,
             };
-            let result = finite.fetch(&relay, vec![filter], limits, &cancel).await;
+            let result = finite
+                .fetch_watching(&relay, vec![filter], limits, &cancel, &mut auth)
+                .await;
             match &result.end {
                 FiniteEnd::Eose => {}
                 FiniteEnd::Closed(reason) => return Err(directory_closed_reason(reason)),
@@ -1437,6 +1450,8 @@ mod tests {
 
     enum QueryRelayEnd {
         Eose,
+        /// EOSE with NIP-67's `more`: the relay cut its answer short.
+        More,
         Stalled,
     }
 
@@ -1475,8 +1490,12 @@ mod tests {
                     .filter(|event| u64::from(event.kind.as_u16()) == kind)
                     .map(|event| serde_json::json!(["EVENT", request[1], event]))
                     .collect::<Vec<_>>();
-                if matches!(completion, QueryRelayEnd::Eose) {
-                    replies.push(serde_json::json!(["EOSE", request[1]]));
+                match completion {
+                    QueryRelayEnd::Eose => replies.push(serde_json::json!(["EOSE", request[1]])),
+                    QueryRelayEnd::More => {
+                        replies.push(serde_json::json!(["EOSE", request[1], ["more"]]));
+                    }
+                    QueryRelayEnd::Stalled => {}
                 }
                 for reply in replies {
                     if socket
@@ -1658,6 +1677,34 @@ mod tests {
             fetched.sources.keys().copied().collect::<HashSet<_>>(),
             kept
         );
+    }
+
+    // A relay that says it has more cut its own answer: what it sent is kept,
+    // and the read does not prove it has nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_public_fetch_a_relay_cut_short_is_incomplete() {
+        use nostr_sdk::prelude::{EventBuilder, Keys};
+
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::from(1), "kept")
+            .finalize(&keys)
+            .unwrap();
+        let (relay, server) = spawn_query_relay(vec![event.clone()], QueryRelayEnd::More).await;
+        let fetched = timeout(
+            Duration::from_secs(5),
+            fetch_public_events(
+                std::slice::from_ref(&relay),
+                vec![Filter::new().kind(Kind::from(1)).author(keys.public_key())],
+                8,
+            ),
+        )
+        .await
+        .expect("the relay answers")
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        assert_eq!(fetched.events, vec![event]);
+        assert!(!fetched.complete);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1847,6 +1894,10 @@ mod tests {
         /// that wraps the NIP-01 prefix does, sending its challenge (if
         /// `challenge`) after the CLOSED. Answer EOSE once authenticated.
         WrappedAuthRequired { challenge: bool },
+        /// Challenge on connect and refuse the client's AUTH, then answer a
+        /// REQ with EOSE once it has refused, and close an inbox REQ as
+        /// `auth-required:`.
+        RefusesAuthOnConnect,
         /// Accept the WebSocket handshake after the first delay, then answer
         /// each REQ's EOSE after the second.
         Slow { handshake: Duration, eose: Duration },
@@ -1877,12 +1928,45 @@ mod tests {
             }
             let mut socket = accept_async(stream).await.unwrap();
             let mut authenticated = false;
+            let (mut refused, mut held) = (false, Vec::new());
+            if matches!(script, InspectionRelay::RefusesAuthOnConnect) {
+                let challenge = serde_json::json!(["AUTH", "connect-challenge"]);
+                let _ = socket
+                    .send(Message::Text(challenge.to_string().into()))
+                    .await;
+            }
             while let Some(Ok(message)) = socket.next().await {
                 let Message::Text(text) = message else {
                     continue;
                 };
                 let request: serde_json::Value = serde_json::from_str(&text).unwrap();
                 let replies = match (request[0].as_str(), script) {
+                    (Some("AUTH"), InspectionRelay::RefusesAuthOnConnect) => {
+                        refused = true;
+                        let mut replies = vec![serde_json::json!([
+                            "OK",
+                            request[1]["id"],
+                            false,
+                            "restricted: no"
+                        ])];
+                        replies.append(&mut held);
+                        replies
+                    }
+                    (Some("REQ"), InspectionRelay::RefusesAuthOnConnect) => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        if request[2]["kinds"][0] == 1059 {
+                            vec![serde_json::json!([
+                                "CLOSED",
+                                request[1],
+                                "auth-required: sign in"
+                            ])]
+                        } else if refused {
+                            vec![serde_json::json!(["EOSE", request[1]])]
+                        } else {
+                            held.push(serde_json::json!(["EOSE", request[1]]));
+                            continue;
+                        }
+                    }
                     (Some("AUTH"), _) => {
                         authenticated = true;
                         vec![serde_json::json!(["OK", request[1]["id"], true, ""])]
@@ -1982,6 +2066,37 @@ mod tests {
         assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    // An authentication the relay refused while the client connected, before
+    // any query, still decides a later `auth-required:` close: the route is
+    // refused, not undecided.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_inspection_sees_an_authentication_refused_on_connect() {
+        let (endpoint, reqs, server) =
+            spawn_inspection_relay(InspectionRelay::RefusesAuthOnConnect).await;
+        let keys = nostr::prelude::Keys::generate();
+        let request = DirectoryFetchRequest::new(
+            vec![endpoint],
+            vec![
+                DirectoryEventQuery::new(0, vec![keys.public_key().to_hex()], 1),
+                DirectoryEventQuery::new(1059, vec![keys.public_key().to_hex()], 32),
+            ],
+        )
+        .unwrap();
+        let result = timeout(
+            DIRECTORY_INSPECTION_EOSE_WAIT / 2,
+            NostrSdkDirectoryRelayFetcher::standalone()
+                .inspect_directory_events(request, Some(Arc::new(keys))),
+        )
+        .await
+        .expect("a refused authentication is not waited out");
+        server.abort();
+        assert_eq!(
+            result,
+            Err(DirectoryInspectionError::AuthenticationRequired)
+        );
+        assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     // mdk#3439: a healthy relay can take several seconds to finish a gift-wrap
     // query. Onboarding inspection waits longer than the pooled directory
     // reads, and its EOSE window starts once the slow handshake is done.
@@ -2060,6 +2175,45 @@ mod tests {
             }
         });
         (endpoint, filter_counts, server)
+    }
+
+    /// A relay that ignores the filter and sends other events first still
+    /// delivers the event asked for: they count toward no cap of the read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_directory_read_finds_its_event_behind_ones_it_did_not_ask_for() {
+        use nostr_sdk::prelude::{EventBuilder, Keys};
+
+        let keys = Keys::generate();
+        let mut stored = (0..12)
+            .map(|n| {
+                let note = EventBuilder::new(Kind::from(1), n.to_string());
+                serde_json::to_value(note.finalize(&keys).unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let relays = EventBuilder::new(Kind::RelayList, "")
+            .finalize(&keys)
+            .unwrap();
+        stored.push(serde_json::to_value(&relays).unwrap());
+        let (endpoint, _, server) = spawn_filter_limited_relay(3, stored).await;
+        let request = DirectoryFetchRequest::new(
+            vec![endpoint],
+            vec![DirectoryEventQuery::new(
+                10002,
+                vec![keys.public_key().to_hex()],
+                1,
+            )],
+        )
+        .unwrap();
+        let records = timeout(
+            Duration::from_secs(5),
+            NostrSdkDirectoryRelayFetcher::standalone().fetch_directory_events(request),
+        )
+        .await
+        .expect("the relay answers")
+        .unwrap();
+        server.abort();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event.id, relays.id.to_hex());
     }
 
     /// Production relays allow at most 3 filters per REQ and refuse more with

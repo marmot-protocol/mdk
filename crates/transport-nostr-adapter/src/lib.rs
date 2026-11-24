@@ -76,7 +76,7 @@ mod finite_req;
 /// SDK clients the relay plane builds itself.
 #[cfg(feature = "sdk")]
 #[doc(hidden)]
-pub use finite_req::{FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests};
+pub use finite_req::{AuthWatch, FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests};
 mod key_package;
 #[cfg(feature = "sdk")]
 #[doc(hidden)]
