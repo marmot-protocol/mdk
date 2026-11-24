@@ -2556,7 +2556,9 @@ fn project_single_message_timeline_tx(
         else {
             return Ok(None);
         };
-        apply_targeted_modifiers_tx(tx, &mut row)?;
+        let versions = edits::resolve(&row, held.iter(), &deleted);
+        edits::apply(&mut row, &versions);
+        apply_reactions_and_removals_tx(tx, &mut row)?;
         return Ok(Some(row));
     };
 
@@ -2658,6 +2660,11 @@ fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> 
 fn apply_targeted_modifiers_tx(tx: &Connection, row: &mut TimelineRow) -> StorageResult<()> {
     let edits = edits::accepted_versions_tx(tx, row)?;
     edits::apply(row, &edits);
+    apply_reactions_and_removals_tx(tx, row)
+}
+
+/// Every modifier but edits, for a row whose edits are already applied.
+fn apply_reactions_and_removals_tx(tx: &Connection, row: &mut TimelineRow) -> StorageResult<()> {
     let reactions = app_events_targeting_message_tx(
         tx,
         &row.group_id_hex,
@@ -3412,13 +3419,12 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
     let mut ids = BTreeSet::new();
     let mut reply_preview_targets = BTreeSet::new();
     // An event that is no agent item, arriving with the id of an item shown
-    // from its edits, shows those edits named no item: the row goes.
+    // from its edits, shows those edits named no item: the row goes, and so
+    // do replies' quotes of it.
     if kind != MARMOT_APP_EVENT_KIND_AGENT_ITEM {
-        ids.extend(agent_item_rows_tx(
-            tx,
-            group_id_hex,
-            [message_id_hex.to_owned()],
-        )?);
+        let stand_in = agent_item_rows_tx(tx, group_id_hex, [message_id_hex.to_owned()])?;
+        reply_preview_targets.extend(stand_in.iter().cloned());
+        ids.extend(stand_in);
     }
     match kind {
         MARMOT_APP_EVENT_KIND_CHAT
@@ -3824,23 +3830,25 @@ fn timeline_trigger_for_event_row(
     row: &TimelineMessageRecord,
 ) -> TimelineUpdateTrigger {
     let event_targets = tag_values(tags, EVENT_REF_TAG).collect::<Vec<_>>();
+    // A reply to this event itself, of whatever kind (such as one with the id
+    // of an agent item shown from its edits), or to a message it changes.
     if row.message_id_hex != event_message_id_hex
         && row
             .reply_to_message_id_hex
             .as_deref()
             .is_some_and(|reply_target| {
                 reply_target == event_message_id_hex
-                    || event_targets.iter().any(|target| target == &reply_target)
+                    || (event_targets.iter().any(|target| target == &reply_target)
+                        && (cgka_traits::is_chat_message(kind, tags)
+                            || matches!(
+                                kind,
+                                MARMOT_APP_EVENT_KIND_AGENT_ITEM
+                                    | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+                                    | MARMOT_APP_EVENT_KIND_DELETE
+                                    | MARMOT_APP_EVENT_KIND_REMOVE
+                                    | MARMOT_APP_EVENT_KIND_EDIT
+                            )))
             })
-        && (cgka_traits::is_chat_message(kind, tags)
-            || matches!(
-                kind,
-                MARMOT_APP_EVENT_KIND_AGENT_ITEM
-                    | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
-                    | MARMOT_APP_EVENT_KIND_DELETE
-                    | MARMOT_APP_EVENT_KIND_REMOVE
-                    | MARMOT_APP_EVENT_KIND_EDIT
-            ))
     {
         return TimelineUpdateTrigger::ReplyPreviewChanged;
     }

@@ -159,7 +159,7 @@ pub(super) struct AcceptedEdit {
     agent_item: Option<(u64, Vec<Vec<String>>)>,
 }
 
-fn resolve<'a>(
+pub(super) fn resolve<'a>(
     row: &TimelineRow,
     edits: impl Iterator<Item = &'a RawAppEvent>,
     deleted: &HashSet<String>,
