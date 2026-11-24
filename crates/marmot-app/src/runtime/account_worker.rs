@@ -2100,7 +2100,7 @@ async fn run_app_runtime_account_worker(
                     welcome_runs.settle_until(&mut client, &shared, deadline).await;
                 }
                 // The rest are cancelled and joined before the audit closes.
-                welcome_runs.cancel_and_join(Some(&mut client)).await;
+                welcome_runs.cancel_and_join(Some(&mut client), false).await;
                 client.finish_audit_recording();
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;

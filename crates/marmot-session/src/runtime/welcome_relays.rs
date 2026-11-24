@@ -75,10 +75,16 @@ where
         .collect()
 }
 
+/// The most relays a pass asks one by one. A longer route goes out as one
+/// request, so the transport judges it whole, as it did before passes asked
+/// relay by relay: a transport that limits a route's relays refuses it.
+const MAX_RELAYS_ASKED_ONE_BY_ONE: usize = 16;
+
 /// The relays a pass asks one by one: each distinct relay of `endpoints`,
-/// when there are more of them than the goal. `None` when one request over
-/// all of them does, since every relay must answer anyway. A relay named
-/// twice is one relay: asked twice, it would meet a goal of two on its own.
+/// when there are more of them than the goal and no more than
+/// [`MAX_RELAYS_ASKED_ONE_BY_ONE`]. `None` when one request over all of them
+/// does. A relay named twice is one relay: asked twice, it would meet a goal
+/// of two on its own.
 fn asked_one_by_one(
     endpoints: &[TransportEndpoint],
     required_acks: usize,
@@ -89,7 +95,9 @@ fn asked_one_by_one(
             distinct.push(endpoint.clone());
         }
     }
-    (distinct.len() > required_acks.max(1)).then_some(distinct)
+    (required_acks.max(1) + 1..=MAX_RELAYS_ASKED_ONE_BY_ONE)
+        .contains(&distinct.len())
+        .then_some(distinct)
 }
 
 /// Run `sends` until their answers meet `required_acks`, or all have
@@ -497,5 +505,20 @@ mod tests {
             Some(relays(&["a", "b"]))
         );
         assert_eq!(asked_one_by_one(&relays(&["a", "b", "a"]), 2), None);
+    }
+
+    /// A route over the limit is not split into requests of one relay, each
+    /// of which a transport that limits a route's relays would let through.
+    #[test]
+    fn a_route_over_the_limit_goes_out_as_one_request() {
+        let names = (0..=MAX_RELAYS_ASKED_ONE_BY_ONE)
+            .map(|at| format!("r{at}"))
+            .collect::<Vec<_>>();
+        let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(asked_one_by_one(&relays(&names), 1), None);
+        assert_eq!(
+            asked_one_by_one(&relays(&names[1..]), 1),
+            Some(relays(&names[1..]))
+        );
     }
 }

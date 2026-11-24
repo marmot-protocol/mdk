@@ -244,17 +244,23 @@ impl WelcomeRuns {
     /// returned, as the worker would have, and cancel the rest, waiting for
     /// each ([`Self::cancel_and_join`]).
     pub(super) async fn stop(&mut self, client: &mut AppClient) {
-        self.cancel_and_join(Some(client)).await;
+        self.cancel_and_join(Some(client), true).await;
     }
 
     /// Cancel every wave and wait for its task to end, and for the task of
     /// each remaining wave a returned wave started. A cancelled wave records
     /// nothing: its Welcomes and relays stay owed. A wave whose task returned
-    /// before its cancel took effect holds real answers, and is settled on
-    /// `client`, when there is one; the remaining wave it starts is cancelled
-    /// in turn. Each task is waited for, never polled once: a task that has
-    /// finished can still read as not ready.
-    pub(super) async fn cancel_and_join(&mut self, mut client: Option<&mut AppClient>) {
+    /// before its cancel took effect holds real answers. On `client`, when
+    /// there is one, a remaining wave that returned is settled, and with
+    /// `settle_first` a first wave too. The shutdown bound passes `false`:
+    /// its deadline is over, and a first wave's settle can wait on relays.
+    /// Each task is waited for, never polled once: a task that has finished
+    /// can still read as not ready.
+    pub(super) async fn cancel_and_join(
+        &mut self,
+        mut client: Option<&mut AppClient>,
+        settle_first: bool,
+    ) {
         if let Some(client) = client.as_deref_mut() {
             self.adopt(client);
         }
@@ -264,13 +270,18 @@ impl WelcomeRuns {
         let mut remaining = Vec::new();
         while let Some(ended) = self.running.next().await {
             if ended.run.is_ok()
+                && (settle_first || ended.tail.is_remaining())
                 && let Some(client) = client.as_deref_mut()
             {
+                // The remaining wave it started stops asking before its
+                // settle, which can wait on relays, begins.
+                if let Ok(results) = &ended.run
+                    && let Some(wave) = &results.remaining
+                {
+                    wave.run.abort_handle().abort();
+                }
                 self.settle(client, ended).await;
                 self.adopt(client);
-                for (_, abort, _) in &self.in_flight {
-                    abort.abort();
-                }
                 continue;
             }
             if let Ok(results) = ended.run {
@@ -290,7 +301,7 @@ impl WelcomeRuns {
     /// gets when the worker exits, and so does a waiting pending-deliveries
     /// read, which is answered with it.
     pub(super) async fn end(&mut self) {
-        self.cancel_and_join(None).await;
+        self.cancel_and_join(None, false).await;
         self.drains.clear();
         for (_, respond) in self.reads.drain(..) {
             let _ = respond.send(Err(AppError::TransportClosed));
