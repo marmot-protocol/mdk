@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- Odin hosts can statically link the Markdown parser without duplicate runtime symbols. The parser also builds for
+  GNU Windows targets with LLVM-MinGW.
 - A device linked soon after another no longer shows the account's accepted chats as invitations for up to an hour,
   where a decline turned into a leave on every device (mdk#3556). Each device broadcasts its small state to a newly
   listed device at once, and adds it to a chat only after that chat's invitation decision went out. During a relay
