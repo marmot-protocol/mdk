@@ -1,5 +1,11 @@
 //! Physical record operations anchored to a held directory.
 
+#[derive(Clone, Copy)]
+pub(crate) enum DirAccess {
+    Search,
+    Read,
+}
+
 #[cfg(unix)]
 pub(crate) use unix::*;
 #[cfg(windows)]
@@ -16,6 +22,7 @@ mod unix {
     use std::path::Path;
 
     use super::super::{overwrite_open_file_with_zeros, unix_directory};
+    use super::DirAccess;
     use unix_directory::{component_name, open_at, open_directory_at};
 
     pub(crate) fn open_root(path: &Path) -> io::Result<File> {
@@ -25,8 +32,15 @@ mod unix {
         OpenOptions::new().read(true).custom_flags(flags).open(path)
     }
 
-    pub(crate) fn open_dir(parent: &File, name: &OsStr) -> io::Result<File> {
-        open_directory_at(parent, &component_name(name, &mut [0; 256])?)
+    pub(crate) fn open_dir(parent: &File, name: &OsStr, access: DirAccess) -> io::Result<File> {
+        let mut buffer = [0; 256];
+        let name = component_name(name, &mut buffer)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if matches!(access, DirAccess::Search) {
+            return open_at(parent, &name, libc::O_PATH | libc::O_DIRECTORY);
+        }
+        let _ = access;
+        open_directory_at(parent, &name)
     }
 
     pub(crate) fn create_dir(parent: &File, name: &OsStr) -> io::Result<File> {
@@ -209,7 +223,8 @@ mod unix {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: Successful fstatat initialized stat.
-        Ok(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT)
+        let mode = unsafe { stat.assume_init() }.st_mode;
+        Ok((u64::from(mode) & u64::from(libc::S_IFMT)) as libc::mode_t)
     }
 
     pub(crate) fn visit_entries<E: From<io::Error>>(
@@ -225,7 +240,7 @@ mod unix {
         }
 
         // Open a fresh cursor on the held directory. dup would share its offset.
-        let directory = open_dir(parent, OsStr::new("."))?;
+        let directory = open_dir(parent, OsStr::new("."), DirAccess::Read)?;
         // SAFETY: The descriptor is live and ownership transfers only on success.
         let stream = unsafe { libc::fdopendir(directory.as_raw_fd()) };
         if stream.is_null() {
@@ -348,6 +363,7 @@ mod windows {
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     use super::super::{overwrite_open_file_with_zeros, temporary_name};
+    use super::DirAccess;
 
     pub(crate) const WINDOWS_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     const DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_TRAVERSE;
@@ -362,12 +378,15 @@ mod windows {
         Ok(file)
     }
 
-    pub(crate) fn open_dir(parent: &File, name: &OsStr) -> io::Result<File> {
+    pub(crate) fn open_dir(parent: &File, name: &OsStr, access: DirAccess) -> io::Result<File> {
         open_child(
             parent,
             name,
             true,
-            DIRECTORY_ACCESS,
+            match access {
+                DirAccess::Search => FILE_TRAVERSE,
+                DirAccess::Read => DIRECTORY_ACCESS,
+            },
             FILE_OPEN,
             0,
             WINDOWS_SHARE,
@@ -847,6 +866,8 @@ mod unsupported {
     use std::io;
     use std::path::Path;
 
+    use super::DirAccess;
+
     fn unsupported<T>() -> io::Result<T> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -857,7 +878,7 @@ mod unsupported {
     pub(crate) fn open_root(_: &Path) -> io::Result<File> {
         unsupported()
     }
-    pub(crate) fn open_dir(_: &File, _: &OsStr) -> io::Result<File> {
+    pub(crate) fn open_dir(_: &File, _: &OsStr, _: DirAccess) -> io::Result<File> {
         unsupported()
     }
     pub(crate) fn create_dir(_: &File, _: &OsStr) -> io::Result<File> {

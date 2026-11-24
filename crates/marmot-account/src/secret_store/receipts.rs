@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 use crate::IosOptions;
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::home::{ACCOUNT_SECRET_FILE, LOCAL_FILE_SECRET_BACKEND};
+use crate::io::record_directory::DirAccess;
 use crate::io::{
     open_durable_private_dir, read_secret_json, read_secret_text_with, record_directory,
     remove_file_then_scrub, write_private_record, write_secret_record,
@@ -107,9 +108,9 @@ impl FileVaultDirectory {
         Ok(&self.path)
     }
 
-    fn open_records(&self, kind: RecordKind) -> io::Result<File> {
-        let owned = record_directory::open_dir(&self.handle, OsStr::new(OWNED_SECRET_DIR))?;
-        record_directory::open_dir(&owned, OsStr::new(record_directory_name(kind)))
+    fn open_records(&self, kind: RecordKind, access: DirAccess) -> io::Result<File> {
+        let owned = record_directory::open_dir(&self.handle, OsStr::new(OWNED_SECRET_DIR), access)?;
+        record_directory::open_dir(&owned, OsStr::new(record_directory_name(kind)), access)
     }
 
     fn create_records(&self, kind: RecordKind) -> io::Result<File> {
@@ -184,7 +185,11 @@ impl FileVaultDirectory {
 
         // Unpublished drafts wrote managed records without a marker. The old
         // pathname-derived namespace cannot verify which directory held them.
-        match record_directory::open_dir(&self.handle, OsStr::new(OWNED_SECRET_DIR)) {
+        match record_directory::open_dir(
+            &self.handle,
+            OsStr::new(OWNED_SECRET_DIR),
+            DirAccess::Search,
+        ) {
             Ok(_) => {
                 return Err(AccountHomeError::SecretStore(
                     "file vault identity marker is missing over managed credential storage".into(),
@@ -399,16 +404,18 @@ impl LocalFileSecretStore {
                 (root, handle)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let root = canonical_storage_candidate(&self.root)?;
                 #[cfg(any(target_os = "ios", target_os = "android"))]
-                crate::location::root_hash(&root, &self.ios_options)?;
-                let handle = open_durable_private_dir(&root, &root)?;
-                if root.canonicalize()? != root || !is_vault_directory(&handle, &root)? {
-                    return Err(AccountHomeError::SecretStore(
-                        "file vault directory changed during creation".into(),
-                    ));
+                {
+                    let root = canonical_storage_candidate(&self.root)?;
+                    crate::location::root_hash(&root, &self.ios_options)?;
+                    let handle = open_durable_private_dir(&root, &root)?;
+                    (root, handle)
                 }
-                (root, handle)
+                #[cfg(not(any(target_os = "ios", target_os = "android")))]
+                {
+                    let handle = open_durable_private_dir(&self.root, &self.root)?;
+                    (self.root.canonicalize()?, handle)
+                }
             }
             Err(error) => return Err(error.into()),
         };
@@ -418,12 +425,17 @@ impl LocalFileSecretStore {
             handle,
             namespace: OnceLock::new(),
         };
+        let configured = self.root.canonicalize()?;
+        let changed = || {
+            AccountHomeError::SecretStore("file vault directory changed during selection".into())
+        };
+        if selected.path != configured {
+            return Err(changed());
+        }
         selected.verify()?;
         let directory = self.directory.get_or_init(|| selected);
-        if directory.path != self.root.canonicalize()? {
-            return Err(AccountHomeError::SecretStore(
-                "file vault directory changed during selection".into(),
-            ));
+        if directory.path != configured {
+            return Err(changed());
         }
         directory.verify()?;
         Ok(directory)
@@ -452,6 +464,8 @@ impl LocalFileSecretStore {
     }
 
     fn lock_directory(directory: &FileVaultDirectory) -> AccountHomeResult<FileVaultGuard> {
+        #[cfg(unix)]
+        crate::io::tighten_private_directory(&directory.handle)?;
         let guard = acquire_vault_lease(&directory.handle)?;
         directory.verify()?;
         Ok(guard)
@@ -480,7 +494,7 @@ impl LocalFileSecretStore {
             validate_record_name(name.as_ref())?;
         }
         let directory = self.storage_directory()?;
-        let records = match directory.open_records(RecordKind::Receipt) {
+        let records = match directory.open_records(RecordKind::Receipt, DirAccess::Read) {
             Ok(records) => records,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
@@ -505,6 +519,7 @@ impl LocalFileSecretStore {
     }
 }
 
+#[cfg(any(target_os = "ios", target_os = "android"))]
 fn canonical_storage_candidate(path: &Path) -> io::Result<PathBuf> {
     match path.canonicalize() {
         Ok(path) => Ok(path),
@@ -573,7 +588,7 @@ impl VaultStorage for LocalFileSecretStore {
     fn read(&self, kind: RecordKind, name: &str) -> AccountHomeResult<Option<Zeroizing<String>>> {
         validate_record_name(name)?;
         let directory = self.storage_directory()?;
-        let value = match directory.open_records(kind) {
+        let value = match directory.open_records(kind, DirAccess::Search) {
             Ok(records) => read_owned_record(&records, OsStr::new(name)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
@@ -603,7 +618,9 @@ impl VaultStorage for LocalFileSecretStore {
 
     fn sync(&self, kind: RecordKind) -> AccountHomeResult<()> {
         Ok(record_directory::sync(
-            &self.storage_directory()?.open_records(kind)?,
+            &self
+                .storage_directory()?
+                .open_records(kind, DirAccess::Read)?,
         )?)
     }
 
@@ -622,7 +639,7 @@ impl VaultStorage for LocalFileSecretStore {
 
     fn names(&self, kind: RecordKind) -> AccountHomeResult<Vec<String>> {
         let directory = self.storage_directory()?;
-        let records = match directory.open_records(kind) {
+        let records = match directory.open_records(kind, DirAccess::Read) {
             Ok(records) => records,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
@@ -931,6 +948,25 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn file_vault_writer_tightens_the_held_root_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSecretStore::new(dir.path(), IosOptions::default());
+        let namespace = store.cleanup_namespace().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let mode = || fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+
+        let reopened = LocalFileSecretStore::new(dir.path(), IosOptions::default());
+        assert_eq!(reopened.cleanup_namespace().unwrap(), namespace);
+        assert_eq!(mode(), 0o755);
+
+        reopened.reconcile_cleanup().unwrap();
+        assert_eq!(mode(), 0o700);
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn file_vault_rejects_retarget() {
@@ -995,7 +1031,9 @@ mod tests {
         assert_ne!(other.as_str(), original.as_str());
 
         // Move the pathname after obtaining the directory, but before opening the record.
-        let records = held_directory.open_records(RecordKind::Receipt).unwrap();
+        let records = held_directory
+            .open_records(RecordKind::Receipt, DirAccess::Search)
+            .unwrap();
         let pinned = read_owned_record(&records, OsStr::new(&name))
             .unwrap()
             .unwrap();

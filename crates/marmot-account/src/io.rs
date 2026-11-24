@@ -277,7 +277,15 @@ pub(crate) fn open_durable_private_dir(owned_root: &Path, path: &Path) -> io::Re
     }
     #[cfg(not(unix))]
     {
-        let mut directory = open_or_create_root(owned_root)?;
+        let mut directory = match owned_root.canonicalize() {
+            Ok(root) => record_directory::open_root(&root)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // Windows absolute applies Win32 normalization to ordinary paths
+                // but leaves verbatim names alone; NtCreateFile receives a leaf.
+                open_or_create_root(&std::path::absolute(owned_root)?)?
+            }
+            Err(error) => return Err(error),
+        };
         for part in relative {
             directory = record_directory::create_dir(&directory, part)?;
         }
@@ -299,13 +307,22 @@ fn open_or_create_root(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(unix)]
+pub(crate) fn tighten_private_directory(directory: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if directory.metadata()?.permissions().mode() & 0o7777 != 0o700 {
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 mod unix_directory {
     use super::*;
     use std::borrow::Cow;
     use std::ffi::{CStr, CString, OsStr};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
 
     pub(super) fn create(
         root: &Path,
@@ -313,7 +330,7 @@ mod unix_directory {
         mut sync: impl FnMut(&File, &Path) -> io::Result<()>,
     ) -> io::Result<File> {
         let (directory, mut path) = bootstrap(root, &mut sync)?;
-        tighten(&directory)?;
+        tighten_private_directory(&directory)?;
         sync_tree(directory, &mut path, relative.iter(), &mut sync)
     }
 
@@ -337,7 +354,7 @@ mod unix_directory {
                 let result = (|| -> io::Result<File> {
                     let directory = open_directory_at(&parent, &name_c)?;
                     if created {
-                        tighten(&directory)?;
+                        tighten_private_directory(&directory)?;
                     }
                     sync(&parent, &parent_path)?;
                     Ok(directory)
@@ -389,7 +406,7 @@ mod unix_directory {
             }
             result => result?,
         };
-        tighten(&child)?;
+        tighten_private_directory(&child)?;
         Ok(child)
     }
 
@@ -460,13 +477,6 @@ mod unix_directory {
             ));
         }
         Ok(file)
-    }
-
-    fn tighten(directory: &File) -> io::Result<()> {
-        if directory.metadata()?.permissions().mode() & 0o7777 != 0o700 {
-            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
-        }
-        Ok(())
     }
 }
 
@@ -1172,6 +1182,29 @@ mod windows_tests {
     use super::*;
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+    #[test]
+    fn creating_private_roots_preserves_win32_and_verbatim_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let ordinary = directory.path().join("ordinary-root. ");
+        assert!(
+            !matches!(ordinary.components().next(), Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim())
+        );
+        write_private_bytes(&ordinary, ordinary.join("record"), b"ordinary").unwrap();
+        assert_eq!(
+            fs::read(directory.path().join("ordinary-root/record")).unwrap(),
+            b"ordinary"
+        );
+
+        let verbatim = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("verbatim-root. ");
+        write_private_bytes(&verbatim, verbatim.join("record"), b"verbatim").unwrap();
+        assert_eq!(fs::read(verbatim.join("record")).unwrap(), b"verbatim");
+        assert!(!directory.path().join("verbatim-root").exists());
+    }
 
     #[test]
     fn private_replacement_leaves_open_reader_the_previous_file() {
