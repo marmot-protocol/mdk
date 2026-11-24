@@ -501,7 +501,17 @@ fn write_file_atomically(
     let parent = containing_dir(path);
     create_durable_private_dir(owned_root, parent)?;
 
-    let (mut file, temp_path) = create_temp_file(parent, path, mode)?;
+    let (file, temp_path) = create_temp_file(parent, path, mode)?;
+    write_staged_file(file, &temp_path, path, bytes, mode)
+}
+
+fn write_staged_file(
+    mut file: File,
+    temp_path: &Path,
+    path: &Path,
+    bytes: &[u8],
+    mode: FileMode,
+) -> AccountHomeResult<()> {
     let result = (|| -> AccountHomeResult<()> {
         file.write_all(bytes)?;
 
@@ -521,7 +531,7 @@ fn write_file_atomically(
             #[cfg(not(windows))]
             {
                 drop(file);
-                replace_file_for_commit(&temp_path, path)?;
+                replace_file_for_commit(temp_path, path)?;
             }
             return Ok(());
         }
@@ -532,22 +542,22 @@ fn write_file_atomically(
             Err(err) if err.kind() == io::ErrorKind::NotFound => None,
             Err(err) => return Err(err.into()),
         };
-        replace_secret_file(&temp_path, path)?;
+        replace_secret_file(temp_path, path)?;
         // The handle still refers to the replaced file after publication,
         // so scrub it without creating a window where the live secret path is
         // zeroed if replacement fails. Best-effort, matching secret deletion.
         if let Some(file) = &mut replaced_secret_file {
             let _ = overwrite_open_file_with_zeros(file);
         }
-        sync_directory(parent)?;
+        sync_directory(containing_dir(path))?;
         Ok(())
     })();
 
     if result.is_err() {
         if mode == FileMode::Secret {
-            let _ = overwrite_file_with_zeros(&temp_path);
+            let _ = overwrite_file_with_zeros(temp_path);
         }
-        let _ = fs::remove_file(&temp_path);
+        let _ = fs::remove_file(temp_path);
     }
 
     result
@@ -1048,19 +1058,23 @@ mod tests {
 
     #[test]
     fn failed_secret_atomic_write_scrubs_temp_before_unlink() {
-        let source = include_str!("io.rs");
-        let cleanup = source
-            .split("if result.is_err()")
-            .nth(1)
-            .unwrap()
-            .split("result\n}")
-            .next()
-            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("secret");
+        fs::create_dir(&destination).unwrap();
+        let (staged, path) = create_temp_file(root.path(), &destination, FileMode::Secret).unwrap();
+        let mut reader = File::open(&path).unwrap();
+        const BYTES: &[u8] = b"unpublished secret";
 
+        let error =
+            write_staged_file(staged, &path, &destination, BYTES, FileMode::Secret).unwrap_err();
         assert!(
-            cleanup.find("overwrite_file_with_zeros").unwrap()
-                < cleanup.find("remove_file").unwrap()
+            matches!(error, AccountHomeError::Io(error) if error.raw_os_error() == Some(libc::EISDIR))
         );
+        assert!(destination.is_dir());
+        assert!(!path.exists());
+        let mut contents = Vec::new();
+        reader.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, [0; BYTES.len()]);
     }
 
     #[test]
