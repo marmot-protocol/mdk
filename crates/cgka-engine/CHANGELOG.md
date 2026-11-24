@@ -17,8 +17,8 @@
 
 - Re-deferring an unopenable `PeelDeferred` row across an epoch sweep preserves its original arrival epoch instead of
   restamping it to the tip epoch.
-- Deferred-peel sweeps at the retry-budget cutoff attempt the newly arrived peel context once before deleting the row,
-  so a commit that unlocks the row on the cutoff sweep decrypts instead of being discarded.
+- Deferred-peel sweeps at the retry-budget or residence-budget cutoff attempt a newly arrived peel context once before
+  deleting the row, so a commit that unlocks the row on the cutoff sweep decrypts instead of being discarded.
 
 ## 0.19.0 - 2026-11-22
 

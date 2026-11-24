@@ -5116,6 +5116,108 @@ async fn advancing_live_epoch_spends_the_retry_budget_once_per_epoch() {
     );
 }
 
+/// If a commit unlocks a deferred row right as its residence deadline elapses,
+/// the sweep gives the newly arrived peel context one bounded attempt so the
+/// readable message decrypts while an unreadable row at the same deadline is
+/// still released with `TransportDeferredResidenceBudget`.
+#[tokio::test]
+async fn deferred_peel_residence_expiry_tries_new_context_before_releasing() {
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let carol_client =
+        build_counting_client_with_storage_and_clock(b"carol", storage.clone(), clock.clone());
+    let (mut alice, mut carol, carol_storage, _peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs_with(carol_client).await;
+
+    // Epoch-3 message unlocked once `commit2` and `commit3` apply.
+    let readable_at_deadline = send_app(&mut alice, &group_id, "unlocks-at-residence").await;
+
+    // Advance Alice to epoch 4 so `stuck_app` remains unreadable at epoch 3.
+    let (mut frank, _frank_storage) = build_client(b"frank-res-cutoff");
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let (_withheld, pending) = evolution(
+        alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![frank_kp],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(pending).await.unwrap();
+    let stuck_app = send_app(&mut alice, &group_id, "still-unreadable-at-residence").await;
+
+    carol.set_deferred_peel_residence_ms(1_000);
+    for msg in [&readable_at_deadline, &stuck_app] {
+        assert!(matches!(
+            carol.ingest(msg.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+
+    // First sweep at epoch 1 records `last_context_fingerprint` before expiry.
+    carol.retry_deferred_peels(&group_id).await.unwrap();
+    assert_eq!(
+        carol_storage
+            .get_message(&readable_at_deadline.id)
+            .unwrap()
+            .state,
+        MessageState::PeelDeferred
+    );
+    assert_eq!(
+        carol_storage.get_message(&stuck_app.id).unwrap().state,
+        MessageState::PeelDeferred
+    );
+
+    // Advance past the residence deadline right as the unlocking commits land.
+    clock.advance_ms(1_500);
+    carol.drain_events();
+    carol.ingest(commit2).await.unwrap();
+    carol.ingest(commit3).await.unwrap();
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_005)
+        .await
+        .unwrap();
+
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(
+        carol_storage
+            .get_message(&readable_at_deadline.id)
+            .unwrap()
+            .state,
+        MessageState::Processed,
+        "a row unlocked right as its residence deadline elapses must decrypt"
+    );
+    assert!(
+        matches!(
+            carol_storage.get_message(&stuck_app.id),
+            Err(StorageError::NotFound)
+        ),
+        "an unreadable row at the residence deadline must still be released"
+    );
+    let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::MessageReceived { payload, .. }
+                if String::from_utf8_lossy(payload).contains("unlocks-at-residence")
+        )),
+        "the unlocked row must deliver its application message"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::TransportObjectResourceRefused {
+                message_id,
+                resource: InboundResourceLimit::TransportDeferredResidenceBudget,
+                ..
+            } if *message_id == stuck_app.id
+        )),
+        "the still-unreadable row must be refused under the residence budget"
+    );
+}
+
 /// A completed sweep's generation remains the retry owner if deleting its
 /// barrier fails after recovered content was durably retained (mdk#3074).
 #[cfg(feature = "test-policy-overrides")]
