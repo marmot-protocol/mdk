@@ -22322,6 +22322,153 @@ fn receipt_path(root: &std::path::Path, owner_id: &str) -> std::path::PathBuf {
     receipt.path()
 }
 
+#[test]
+fn wipe_replay_needs_root_lease() {
+    use marmot_account::{
+        AccountHomeError, AccountHomeResult, AccountSecretStore, AcquiredSecret, IosOptions,
+        LocalFileSecretStore, SecretClaimMode, SecretCredential, SecretCredentialKind,
+        SecretReleaseMode, SecretReleaseOutcome,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct RetryVault {
+        files: LocalFileSecretStore,
+        fail_remove: AtomicBool,
+        receipt: std::sync::Mutex<Option<(String, String)>>,
+    }
+    impl AccountSecretStore for RetryVault {
+        fn cleanup_namespace(&self) -> AccountHomeResult<String> {
+            self.files.cleanup_namespace()
+        }
+
+        fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
+            self.files.has_secret_for_label(label)
+        }
+        fn acquire_secret(
+            &self,
+            credential: SecretCredential<'_>,
+            mode: SecretClaimMode,
+            proposed: Option<&nostr::prelude::Keys>,
+        ) -> AccountHomeResult<AcquiredSecret> {
+            let acquired = self.files.acquire_secret(credential, mode, proposed)?;
+            *self.receipt.lock().unwrap() = Some((
+                credential.home_id.to_owned(),
+                credential.owner_id.to_owned(),
+            ));
+            Ok(acquired)
+        }
+        fn load_secret(
+            &self,
+            credential: SecretCredential<'_>,
+        ) -> AccountHomeResult<nostr::prelude::Keys> {
+            self.files.load_secret(credential)
+        }
+        fn release_secret(
+            &self,
+            credential: SecretCredential<'_>,
+            mode: SecretReleaseMode,
+        ) -> AccountHomeResult<SecretReleaseOutcome> {
+            if self.fail_remove.load(Ordering::SeqCst) {
+                return Err(AccountHomeError::SecretStoreUnavailable(
+                    "locked vault".into(),
+                ));
+            }
+            self.files.release_secret(credential, mode)
+        }
+        fn reconcile_cleanup(&self) -> AccountHomeResult<()> {
+            self.files.reconcile_cleanup()
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let vault = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(RetryVault {
+        files: LocalFileSecretStore::new(vault.path(), IosOptions::default()),
+        fail_remove: AtomicBool::new(false),
+        receipt: std::sync::Mutex::new(None),
+    });
+    let home =
+        AccountHome::open_with_secret_store(root.path(), store.clone(), IosOptions::default());
+    let account = home.create_account("removed").unwrap();
+    let key = home.load_signing_keys(&account.label).unwrap().public_key();
+    let (home_id, owner_id) = store.receipt.lock().unwrap().clone().unwrap();
+    let receipt = receipt_path(vault.path(), &owner_id);
+    let credential = SecretCredential {
+        label: &account.label,
+        account_id_hex: &account.account_id_hex,
+        home_id: &home_id,
+        owner_id: &owner_id,
+        kind: SecretCredentialKind::Signing,
+    };
+    store.fail_remove.store(true, Ordering::SeqCst);
+    home.remove_account(&account.label).unwrap();
+    let tombstones = root.path().join(".wipe-tombstones");
+    let tombstone = std::fs::read_dir(&tombstones)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let intent = tombstone.join(".wipe-cleanup.json");
+    let pending = std::fs::read(&intent).unwrap();
+    let owner = MarmotRootRuntimeLease::try_acquire(root.path()).unwrap();
+    store.fail_remove.store(false, Ordering::SeqCst);
+
+    // A rejected or mismatched opener cannot perform a pending vault deletion.
+    let rejected = MarmotApp::try_with_relays_and_account_home_and_config(
+        root.path(),
+        Vec::new(),
+        AccountHome::open_with_secret_store(root.path(), store.clone(), IosOptions::default()),
+        MarmotAppConfig::white_noise(),
+    );
+    assert!(matches!(rejected, Err(AppError::RuntimeBusy)));
+    assert_eq!(store.load_secret(credential).unwrap().public_key(), key);
+    assert_eq!(std::fs::read(&intent).unwrap(), pending);
+    let mismatched = MarmotApp::try_with_relays_and_account_home_and_config(
+        other.path(),
+        Vec::new(),
+        AccountHome::open_with_secret_store(root.path(), store.clone(), IosOptions::default()),
+        MarmotAppConfig::white_noise(),
+    )
+    .unwrap();
+    assert_eq!(store.load_secret(credential).unwrap().public_key(), key);
+    assert_eq!(std::fs::read(&intent).unwrap(), pending);
+    mismatched.close_storage().unwrap();
+    drop(owner);
+
+    let mutation = fs_private::try_acquire_private_exclusive_file_lease(
+        &root.path().join(".account-mutation.lock"),
+    )
+    .unwrap();
+    let blocked = MarmotApp::try_with_relays_and_account_home_and_config(
+        root.path(),
+        Vec::new(),
+        AccountHome::open_with_secret_store(root.path(), store.clone(), IosOptions::default()),
+        MarmotAppConfig::white_noise(),
+    );
+    assert!(blocked.is_err());
+    assert_eq!(store.load_secret(credential).unwrap().public_key(), key);
+    assert_eq!(std::fs::read(&intent).unwrap(), pending);
+    drop(MarmotRootRuntimeLease::try_acquire(root.path()).unwrap());
+    drop(mutation);
+
+    let recovered = MarmotApp::try_with_relays_and_account_home_and_config(
+        root.path(),
+        Vec::new(),
+        AccountHome::open_with_secret_store(root.path(), store.clone(), IosOptions::default()),
+        MarmotAppConfig::white_noise(),
+    )
+    .unwrap();
+    assert!(!store.has_secret_for_label(&account.label).unwrap());
+    assert!(
+        !receipt.try_exists().unwrap(),
+        "replay must unlink the receipt"
+    );
+    assert_eq!(std::fs::read_dir(tombstones).unwrap().count(), 0);
+    recovered.close_storage().unwrap();
+}
+
 /// Every SQLite database this app can open, plus the root runtime lease, must
 /// be released by one `close_storage` call — that is the whole contract iOS
 /// depends on before it suspends the process (`0xdead10cc` is raised for *any*

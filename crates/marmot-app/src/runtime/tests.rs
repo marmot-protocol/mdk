@@ -3710,6 +3710,84 @@ async fn cancelled_startup_is_reaped() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_rollback_reaps_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let keys = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
+    let imported = app
+        .account_home()
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    let account = imported.account().clone();
+    let runtime = app.runtime();
+    let manager = runtime.accounts();
+    let (reached, proceed) = install_local_open_gate(&app, &account.label);
+    let starting = manager.clone();
+    let reconcile = tokio::spawn(async move { starting.reconcile().await });
+    wait_for_test_signal(reached, "imported account session open").await;
+    reconcile.abort();
+    assert!(reconcile.await.unwrap_err().is_cancelled());
+    let old_commands = manager.workers.lock().await[&account.account_id_hex]
+        .commands
+        .clone();
+
+    let mut rollback = Box::pin(manager.rollback_import_setup::<()>(
+        &account,
+        Some(&imported),
+        AppError::MissingDefaultRelays,
+    ));
+    let early = timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        loop {
+            if let std::task::Poll::Ready(result) = futures::poll!(rollback.as_mut()) {
+                break Some(result);
+            }
+            let reaping = manager
+                .worker_reapers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|reaper| reaper.account_id == account.account_id_hex);
+            if reaping {
+                break None;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rollback reaches its tracked worker reaper");
+    let reached_reaper = early.is_none();
+    let live_while_open = app.account_home().account(&account.label).is_ok();
+    let worker_held = !old_commands.is_closed();
+    proceed.send(()).unwrap();
+    let result = match early {
+        Some(result) => result,
+        None => rollback.await,
+    };
+    let worker_stopped = old_commands.is_closed();
+    let removed = matches!(
+        app.account_home().account(&account.label),
+        Err(AccountHomeError::UnknownAccount(_))
+    );
+    runtime.shutdown().await;
+
+    assert!(
+        reached_reaper,
+        "rollback completed before reaping its worker"
+    );
+    assert!(worker_held, "the session gate still holds the old worker");
+    assert!(
+        live_while_open,
+        "rollback must not tombstone an open session"
+    );
+    assert!(
+        worker_stopped,
+        "the old worker must stop before removal completes"
+    );
+    assert!(matches!(result, Err(AppError::MissingDefaultRelays)));
+    assert!(removed, "successful compensation removes the failed import");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finished_worker_is_replaced_on_first_requested_lookup() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);

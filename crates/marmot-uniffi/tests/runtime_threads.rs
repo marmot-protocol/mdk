@@ -120,11 +120,7 @@ impl SecretStore for MemorySecretStore {
         if mode == SecretClaimMode::CreateOnly && (source.is_some() || proposed.is_none()) {
             return Err(fixture_error());
         }
-        if matches!(
-            mode,
-            SecretClaimMode::AdoptOnly | SecretClaimMode::MigrateLegacy
-        ) && source.is_none()
-        {
+        if mode == SecretClaimMode::AdoptOnly && source.is_none() {
             return Err(fixture_missing());
         }
         let origin = if source.is_some() {

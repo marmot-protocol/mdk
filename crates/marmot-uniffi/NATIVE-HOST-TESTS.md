@@ -33,6 +33,8 @@ The test's `MemorySecretStore` keeps plaintext secret-key hex only in memory. It
 
 Retain the store for the whole test, including same-root reopening. The encrypted account files and the signing keys are separate state. The same root plus the retained store preserves usable keys; a fresh empty store requires a fresh test root. Opening persisted files with an empty replacement store does not recover the account's credentials. Do not use real imported identities or production account directories in this recipe.
 
+For a new receipt, `AdoptOnly` requires an existing source. If `MigrateLegacy` finds no source, it uses a valid proposed key and records `Created` as the receipt origin. If neither is available, `MigrateLegacy` returns `SecretNotFound`.
+
 ### Keep the host filesystem and keychain boundaries separate
 
 Derive test roots from a host-authorized directory URL, then create a unique owned child. In an Apple app, use the appropriate sandbox or App Group container supplied by platform APIs. Canonicalization is for the host-authorized path, not permission to accept arbitrary raw paths or resolve untrusted symlinks into trusted storage.

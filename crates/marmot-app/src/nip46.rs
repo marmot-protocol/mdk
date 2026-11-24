@@ -248,9 +248,10 @@ enum Operation {
 
 enum BindingCleanup<'a> {
     Revoke,
+    // Whole-account cleanup owns persistent credential retirement.
     Forget,
     Rollback {
-        previous: &'a Nip46SessionWrite,
+        previous: Option<&'a Nip46SessionWrite>,
         signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
         generation: u64,
     },
@@ -703,7 +704,7 @@ impl Nip46Session {
     }
     pub(crate) fn unbind_account(
         &self,
-        previous: &Nip46SessionWrite,
+        previous: Option<&Nip46SessionWrite>,
         signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
         generation: u64,
     ) -> Result<()> {
@@ -734,33 +735,35 @@ impl Nip46Session {
             .account
             .as_ref()
             .filter(|_| current)
-            .map(|account| match &cleanup {
+            .and_then(|account| match &cleanup {
                 BindingCleanup::Revoke
                 | BindingCleanup::Rollback {
-                    previous: Nip46SessionWrite::Created,
+                    previous: Some(Nip46SessionWrite::Created),
                     ..
-                } => self
-                    .core
-                    .shared
-                    .home
-                    .remove_nip46_session(account, Nip46Removal::IncludingOrphaned)
-                    .map_err(|_| Nip46Error::Storage),
+                } => Some(
+                    self.core
+                        .shared
+                        .home
+                        .remove_nip46_session(account, Nip46Removal::IncludingOrphaned)
+                        .map_err(|_| Nip46Error::Storage),
+                ),
                 BindingCleanup::Rollback {
-                    previous: Nip46SessionWrite::Existing(record),
+                    previous: Some(Nip46SessionWrite::Existing(record)),
                     ..
-                } => data
-                    .keys
-                    .as_ref()
-                    .ok_or(Nip46Error::Storage)
-                    .and_then(|keys| {
-                        self.core
-                            .shared
-                            .home
-                            .store_nip46_session(account, keys, record)
-                            .map(drop)
-                            .map_err(|_| Nip46Error::Storage)
-                    }),
-                BindingCleanup::Forget => Ok(()),
+                } => Some(
+                    data.keys
+                        .as_ref()
+                        .ok_or(Nip46Error::Storage)
+                        .and_then(|keys| {
+                            self.core
+                                .shared
+                                .home
+                                .store_nip46_session(account, keys, record)
+                                .map(drop)
+                                .map_err(|_| Nip46Error::Storage)
+                        }),
+                ),
+                BindingCleanup::Forget | BindingCleanup::Rollback { previous: None, .. } => None,
             })
             .transpose();
         if matches!(&cleanup, BindingCleanup::Revoke | BindingCleanup::Forget) {

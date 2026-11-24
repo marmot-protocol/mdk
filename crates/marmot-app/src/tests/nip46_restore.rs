@@ -8,6 +8,90 @@ use marmot_account::{AccountHomeResult, AccountSecretStore, IosOptions, LocalFil
 const KEY_PACKAGE_KIND: u64 = 30443;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_nip46_signout() {
+    #[derive(Clone, Copy)]
+    enum RawKey {
+        Valid,
+        Malformed,
+    }
+
+    for raw_key in [RawKey::Valid, RawKey::Malformed] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let user = Keys::parse(&"01".repeat(32)).unwrap();
+        let client = Keys::parse(&"02".repeat(32)).unwrap();
+        let id = user.public_key().to_hex();
+        let directory = home.account_dir(&id);
+        fs_private::create_dir_all_private(&directory).unwrap();
+        fs_private::write_private(
+            &directory.join("account.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "label": id, "account_id_hex": id, "local_signing": false, "external_signing": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let permissions = Nip46Session::permissions();
+        fs_private::write_private(
+            &directory.join(".nip46-session.json"),
+            &serde_json::to_vec(&Nip46SessionRecord {
+                version: 1,
+                user_public_key: id.clone(),
+                remote_signer_public_key: Keys::generate().public_key().to_hex(),
+                client_public_key: client.public_key().to_hex(),
+                relays: vec!["wss://signer.example".into()],
+                name: "Legacy signer".into(),
+                permission_version: permissions.version,
+                permissions: permissions.grants,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let raw_directory = dir.path().join("accounts/.nip46-client").join(&id);
+        fs_private::create_dir_all_private(&raw_directory).unwrap();
+        let raw = raw_directory.join("secret.json");
+        let raw_bytes = match raw_key {
+            RawKey::Valid => serde_json::to_vec(&serde_json::json!({
+                "secret_key_hex": client.secret_key().to_secret_hex(),
+            }))
+            .unwrap(),
+            RawKey::Malformed => b"{".to_vec(),
+        };
+        fs_private::write_private(&raw, &raw_bytes).unwrap();
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            home.clone(),
+            MarmotAppConfig::white_noise(),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        app.register_external_signer(&id, TestExternalAccountSigner { keys: user })
+            .await
+            .unwrap();
+
+        let runtime = app.runtime();
+        let outcome = runtime
+            .sign_out(
+                &id,
+                crate::runtime::SignOutOptions {
+                    delete_key_packages: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            outcome.local_cleanup.completed,
+            "{:?}",
+            outcome.local_cleanup.reason
+        );
+        assert!(home.account(&id).unwrap().signed_out);
+        assert!(home.load_nip46_session(&id).unwrap().is_none());
+        assert_eq!(std::fs::read(raw).unwrap(), raw_bytes);
+        runtime.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip46_restore_and_signout() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -1839,4 +1923,236 @@ async fn nip46_disconnect_during_bind() {
             .all(|(_, retired, absent, transport)| *retired && *absent && *transport),
         "disconnect retires the old adoption without blocking a new explicit connection: {observations:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_bind_failure_stays_gated() {
+    #[derive(Clone, Copy)]
+    enum Origin {
+        Created,
+        Promoted,
+    }
+    #[derive(Clone, Copy)]
+    enum Fault {
+        Release,
+        MutationLease,
+        CleanupJournal,
+    }
+
+    let peer = LoginPeer::new().await;
+    let id = peer.user.public_key().to_hex();
+    for (origin, fault) in [
+        (Origin::Created, Fault::Release),
+        (Origin::Promoted, Fault::Release),
+        (Origin::Created, Fault::MutationLease),
+        (Origin::Created, Fault::CleanupJournal),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BindingHoldStore {
+            inner: LocalFileSecretStore::new(dir.path(), IosOptions::default()),
+            hold_once: std::sync::atomic::AtomicBool::new(true),
+            refuse_release: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+        });
+        let home =
+            AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+        let payload = home.account_dir(&id).join("retained-public-data");
+        if matches!(origin, Origin::Promoted) {
+            home.add_public_account(&id).unwrap();
+            fs_private::write_private(&payload, b"existing public payload").unwrap();
+        }
+        let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
+        let (fetch_entered, fetch_release) = fetcher.hold_fetches_for_kind(KIND_NIP65_RELAY_LIST);
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            home.clone(),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        )
+        .with_test_relay_client(relay.clone());
+        app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+            Some(Duration::from_secs(120)),
+            relay,
+            fetcher,
+            false,
+        );
+        let runtime = app.runtime();
+        let session = peer.session(&app);
+        session.connect_async().await.unwrap();
+        let login = {
+            let runtime = runtime.clone();
+            let session = session.clone();
+            tokio::spawn(async move {
+                let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+                runtime
+                    .nip46_login(session, endpoints(), endpoints(), Vec::new())
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), store.entered.notified())
+            .await
+            .unwrap();
+        if matches!(fault, Fault::Release) {
+            app.register_external_signer(
+                &id,
+                TestExternalAccountSigner {
+                    keys: peer.user.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let binding_readiness = runtime.account_setup_readiness(&id).unwrap();
+        let binding_contention = fs_private::try_acquire_private_exclusive_file_lease(
+            &dir.path().join(".account-mutation.lock"),
+        );
+        *store.released.lock().unwrap() = true;
+        store.changed.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), fetch_entered.notified())
+            .await
+            .unwrap();
+
+        let lease = match fault {
+            Fault::MutationLease => Some(
+                fs_private::try_acquire_private_exclusive_file_lease(
+                    &dir.path().join(".account-mutation.lock"),
+                )
+                .unwrap(),
+            ),
+            Fault::CleanupJournal => {
+                fs_private::create_dir_all_private(
+                    &home.account_dir(&id).join(".wipe-cleanup.json"),
+                )
+                .unwrap();
+                None
+            }
+            Fault::Release => {
+                store
+                    .refuse_release
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                None
+            }
+        };
+        session.disconnect();
+        fetch_release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), login)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(lease);
+        assert_eq!(binding_readiness, AccountSetupReadiness::Initializing);
+        assert!(
+            matches!(binding_contention, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+
+        if matches!(fault, Fault::Release) {
+            match origin {
+                Origin::Created => {
+                    assert!(matches!(
+                        home.account(&id),
+                        Err(AccountHomeError::UnknownAccount(_))
+                    ));
+                    assert!(!app.has_external_signer(&id));
+                    assert!(!home.account_dir(&id).exists());
+                    let tombstone = std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    assert!(tombstone.join(".wipe-cleanup.json").is_file());
+                }
+                Origin::Promoted => {
+                    let retained = home.account(&id).unwrap();
+                    assert!(!retained.external_signing);
+                    assert!(!retained.local_signing);
+                    assert_eq!(std::fs::read(&payload).unwrap(), b"existing public payload");
+                    assert!(app.has_external_signer(&id));
+                    assert!(
+                        home.account_dir(&id)
+                            .join(".nip46-session-removing.json")
+                            .is_file()
+                    );
+                }
+            }
+            assert!(matches!(
+                result,
+                Err(AppError::Nip46(Nip46Error::Disconnected))
+            ));
+        } else {
+            let retained = home.account(&id).unwrap();
+            assert!(matches!(result, Err(AppError::RelayDirectory(error))
+                    if error.contains("rollback error:")
+                        && error.contains(&Nip46Error::Disconnected.to_string())));
+            assert!(retained.external_signing);
+            assert_eq!(
+                runtime.account_setup_readiness(&id).unwrap(),
+                AccountSetupReadiness::Initializing
+            );
+            let state = home.account_setup_state(&id).unwrap().unwrap();
+            assert_eq!(state.kind, marmot_account::AccountSetupKind::ExternalSigner);
+            assert_eq!(
+                state.phase,
+                marmot_account::AccountSetupPhase::LocalStateCreated
+            );
+        }
+        runtime.shutdown_and_close().await.unwrap();
+        drop(session);
+        drop(runtime);
+        drop(app);
+
+        store
+            .refuse_release
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let reopened =
+            AccountHome::open_with_secret_store(dir.path(), store, IosOptions::default());
+        if matches!((origin, fault), (Origin::Created, Fault::Release)) {
+            let _lease = crate::MarmotRootRuntimeLease::try_acquire(dir.path()).unwrap();
+            reopened.resume_wipe_cleanup().unwrap();
+        }
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            reopened.clone(),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let runtime = app.runtime();
+        if matches!(fault, Fault::Release) {
+            let replacement = peer.session(&app);
+            let replacement_key = replacement.client_public_key().unwrap();
+            replacement.connect_async().await.unwrap();
+            let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+            assert_eq!(
+                runtime
+                    .nip46_login(replacement, endpoints(), endpoints(), Vec::new())
+                    .await
+                    .unwrap()
+                    .account_id_hex,
+                id
+            );
+            assert_eq!(
+                reopened
+                    .load_nip46_session(&id)
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .public_key(),
+                replacement_key
+            );
+            if matches!(origin, Origin::Promoted) {
+                assert_eq!(std::fs::read(&payload).unwrap(), b"existing public payload");
+            }
+        } else {
+            assert_eq!(
+                runtime.account_setup_readiness(&id).unwrap(),
+                AccountSetupReadiness::Initializing
+            );
+        }
+        runtime.shutdown_and_close().await.unwrap();
+    }
+    peer.close().await;
 }

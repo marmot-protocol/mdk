@@ -58,7 +58,7 @@ final class MemorySecretStore: SecretStore, @unchecked Sendable {
     }
     let source = receipts.first { sameSlot($0.record, record) && $0.secret != nil }
     if mode == .createOnly && (source != nil || proposedHex == nil) { throw conflict() }
-    if (mode == .adoptOnly || mode == .migrateLegacy) && source == nil { throw missing() }
+    if mode == .adoptOnly && source == nil { throw missing() }
     guard let secret = source?.secret ?? proposedHex else { throw missing() }
     guard proposedHex == nil || proposedHex == secret else { throw conflict() }
     guard secret.utf8.count == 64,

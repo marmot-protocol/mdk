@@ -7334,6 +7334,25 @@ impl AccountManager {
         Ok(())
     }
 
+    // The caller holds the worker transaction through the local commit.
+    async fn quiesce_account_worker(
+        &self,
+        account: &AccountSummary,
+    ) -> Result<AccountTeardownGuard<'_>, AppError> {
+        self.ensure_worker_reaped(&account.account_id_hex).await?;
+        let teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
+        self.shared
+            .attachment_permissions
+            .forget_account(&account.account_id_hex);
+        self.shared.attachment_cancellations.send_modify(|_| {});
+        let worker = self.workers.lock().await.remove(&account.account_id_hex);
+        if let Some(worker) = worker {
+            self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
+            self.ensure_worker_reaped(&account.account_id_hex).await?;
+        }
+        Ok(teardown)
+    }
+
     async fn finish_worker_reapers_unbounded(&self) {
         loop {
             let reaper = self
@@ -7430,6 +7449,33 @@ impl AccountManager {
         }
     }
 
+    fn forget_removed_account_signers(
+        &self,
+        account: &AccountSummary,
+        binding: Option<Nip46Binding>,
+    ) -> Result<(), AppError> {
+        // Setup rollback owns its captured generation, not a later reconnect.
+        let detached = match binding {
+            Some(binding) => {
+                binding
+                    .session
+                    .unbind_account(None, binding.previous_signer, binding.generation)
+            }
+            None => {
+                let session = self
+                    .app
+                    .nip46_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&account.account_id_hex)
+                    .cloned();
+                session.map_or(Ok(()), |session| session.forget_binding())
+            }
+        };
+        self.app.forget_external_signer(&account.account_id_hex);
+        detached.map_err(AppError::from)
+    }
+
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
         let account = self.app.account_home().account(account_ref)?;
         self.finish_nip46_account(&account).await;
@@ -7465,6 +7511,16 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve_original(expected)?;
+        self.remove_account_locked(&account, None, None).await
+    }
+
+    // The moderation fence and worker transaction are held by the caller.
+    async fn remove_account_locked(
+        &self,
+        account: &AccountSummary,
+        private_key_import: Option<&NostrAccountImport>,
+        binding: Option<Nip46Binding>,
+    ) -> Result<(), AppError> {
         for task in self
             .app
             .abort_public_indexer_copies_for_account(&account.account_id_hex)
@@ -7475,76 +7531,52 @@ impl AccountManager {
         let account_id = account.account_id_hex.clone();
         let _audit_export_mutation =
             blocking_app_task(move || Ok(audit_export.mutate_account(&account_id))).await?;
-        self.ensure_worker_reaped(&account.account_id_hex).await?;
-        let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
-        async {
-            self.shared
-                .attachment_permissions
-                .forget_account(&account.account_id_hex);
-            self.shared.attachment_cancellations.send_modify(|_| {});
-            let worker = self.workers.lock().await.remove(&account.account_id_hex);
-            if let Some(worker) = worker {
-                self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
-                self.ensure_worker_reaped(&account.account_id_hex).await?;
-            }
-            // Evict every in-memory handle and warm flag for this label BEFORE
-            // the account directory is deleted. Otherwise the cached account
-            // storage connection (and directory cache) keeps pointing at the
-            // unlinked inode and a later re-import silently splits writes
-            // across a stale handle.
+        let _teardown = self.quiesce_account_worker(account).await?;
+        // Evict every in-memory handle and warm flag for this label BEFORE
+        // the account directory is deleted. Otherwise the cached account
+        // storage connection (and directory cache) keeps pointing at the
+        // unlinked inode and a later re-import silently splits writes
+        // across a stale handle.
+        {
+            // A committed removal and observation cancellation cannot be
+            // overtaken by an already-owned local admission. No network
+            // or async cleanup runs while this account gate is held.
+            let gate = self.shared.local_submission_gate(&account.account_id_hex);
+            let _admission = gate.lock().await;
+            self.app.drop_account_caches(&account.label);
+            self.app
+                .remove_account_key_package_artifacts(&account.label)?;
+            let home = self.app.account_home();
+            let removed = match private_key_import {
+                Some(imported) => home.rollback_nostr_account_import(imported),
+                None => home.remove_account(&account.label),
+            };
+            if removed.is_ok()
+                || matches!(
+                    self.app.account_home().account(&account.label),
+                    Err(AccountHomeError::UnknownAccount(_))
+                )
             {
-                // A committed removal and observation cancellation cannot be
-                // overtaken by an already-owned local admission. No network
-                // or async cleanup runs while this account gate is held.
-                let gate = self.shared.local_submission_gate(&account.account_id_hex);
-                let _admission = gate.lock().await;
-                self.app.drop_account_caches(&account.label);
+                self.shared
+                    .local_submission_queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .cancel_account(&account.account_id_hex);
                 self.app
-                    .remove_account_key_package_artifacts(&account.label)?;
-                let removed = self.app.account_home().remove_account(&account.label);
-                if removed.is_ok()
-                    || matches!(
-                        self.app.account_home().account(&account.label),
-                        Err(AccountHomeError::UnknownAccount(_))
-                    )
-                {
-                    // Secret cleanup may fail after the live-directory rename.
-                    // Cancel only a confirmed removal, including that case;
-                    // pre-commit and ambiguous failures retain live-row timing.
-                    self.shared
-                        .local_submission_queue
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .cancel_account(&account.account_id_hex);
-                    // Nor does a removed account keep its publish stop, so a
-                    // new link under this id publishes.
-                    self.app
-                        .forget_unlinked_publish_stop(&account.account_id_hex);
-                    let session = self
-                        .app
-                        .nip46_sessions
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .get(&account.account_id_hex)
-                        .cloned();
-                    self.app.forget_external_signer(&account.account_id_hex);
-                    if let Some(session) = session {
-                        session.forget_binding()?;
-                    }
-                }
-                removed?;
+                    .forget_unlinked_publish_stop(&account.account_id_hex);
+                self.forget_removed_account_signers(account, binding)?;
             }
-            for task in self
-                .app
-                .abort_public_indexer_copies_for_account(&account.account_id_hex)
-            {
-                let _ = task.await;
-            }
-            self.clear_startup_retry(&account.account_id_hex);
-            self.setup.account_removed(&account.account_id_hex);
-            Ok(())
+            removed?;
         }
-        .await
+        for task in self
+            .app
+            .abort_public_indexer_copies_for_account(&account.account_id_hex)
+        {
+            let _ = task.await;
+        }
+        self.clear_startup_retry(&account.account_id_hex);
+        self.setup.account_removed(&account.account_id_hex);
+        Ok(())
     }
 
     /// Explicit recovery for an account created before durable setup journals.
@@ -8827,17 +8859,9 @@ impl AccountManager {
                     {
                         Ok(result) => result,
                         Err(err) => {
-                            if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
-                                return self.rollback_import_after_setup_failure(
-                                    &account,
-                                    private_key_import.as_ref(),
-                                    err,
-                                );
-                            }
-                            // Once the helper records publication intent, a relay may
-                            // hold one replaceable bootstrap record. Retain the
-                            // journaled identity and retry instead of deleting it.
-                            return Err(err);
+                            return self
+                                .rollback_import_setup(&account, private_key_import.as_ref(), err)
+                                .await;
                         }
                     }
                 } else {
@@ -8853,14 +8877,9 @@ impl AccountManager {
                     {
                         Ok(relay_lists) => relay_lists,
                         Err(err) => {
-                            if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
-                                return self.rollback_import_after_setup_failure(
-                                    &account,
-                                    private_key_import.as_ref(),
-                                    err,
-                                );
-                            }
-                            return Err(err);
+                            return self
+                                .rollback_import_setup(&account, private_key_import.as_ref(), err)
+                                .await;
                         }
                     };
                     (relay_lists, None)
@@ -8890,14 +8909,13 @@ impl AccountManager {
                                 AccountSetupPhase::KeyPackagePublicationStarted,
                             )
                         {
-                            if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
-                                return self.rollback_import_after_setup_failure(
+                            return self
+                                .rollback_import_setup(
                                     &account,
                                     private_key_import.as_ref(),
                                     err.into(),
-                                );
-                            }
-                            return Err(err.into());
+                                )
+                                .await;
                         }
                         if account.signed_out {
                             account = self
@@ -9065,8 +9083,8 @@ impl AccountManager {
                     self.app.ensure_storage_open("NIP-46 adoption")?;
                 }
                 let (existing_account, previous_setup) =
-                    match self.app.account_home().account(&account_id_hex).ok() {
-                        Some(account) => {
+                    match self.app.account_home().account(&account_id_hex) {
+                        Ok(account) => {
                             refuse_unlinked(&account)?;
                             self.setup_records()
                                 .require_onboarding_complete(&account.label)?;
@@ -9087,7 +9105,8 @@ impl AccountManager {
                             }
                             (Some(account), setup)
                         }
-                        None => (None, None),
+                        Err(AccountHomeError::UnknownAccount(_)) => (None, None),
+                        Err(error) => return Err(error.into()),
                     };
                 let origin = match existing_account {
                     None => ExternalSetupOrigin::Created,
@@ -9099,7 +9118,7 @@ impl AccountManager {
                 let mut account = self
                     .app
                     .account_home()
-                    .add_external_signer_account(&public_key)?;
+                    .add_external_signer_for_setup(&public_key)?;
                 self.app.presentation_signals.catalog_changed();
                 let reactivating_existing = account.signed_out;
                 let mut binding = None;
@@ -9108,14 +9127,6 @@ impl AccountManager {
                     binding = self
                         .bind_external_signer(&account, signer_public_key, signer)
                         .await?;
-                    if previous_setup.is_none() {
-                        self.app.account_home().begin_account_setup_with(
-                            &account,
-                            false,
-                            AccountSetupKind::ExternalSigner,
-                            AccountSetupPhase::LocalStateCreated,
-                        )?;
-                    }
                     let network = async {
                         let directory_bootstrap_relays =
                             directory_bootstrap_relays_for_setup(&request);
@@ -9203,73 +9214,111 @@ impl AccountManager {
                         readiness,
                     }),
                     Err(error) => {
+                        if readiness == AccountSetupReadiness::NetworkReady {
+                            return Err(error);
+                        }
+                        let home = self.app.account_home();
                         let restored = if native_adoption.is_some()
                             && reactivating_existing
                             && !account.signed_out
-                            && readiness != AccountSetupReadiness::NetworkReady
                         {
-                            self.app
-                                .account_home()
-                                .set_account_signed_out(&account.label, true)
-                                .map(drop)
+                            home.set_account_signed_out(&account.label, true).map(drop)
                         } else {
                             Ok(())
                         };
-                        let durable_account = self.app.account_home().account(&account.label);
-                        let setup_state =
-                            self.app.account_home().account_setup_state(&account.label);
+                        let durable_account = home.account(&account.label);
+                        let setup_state = home.account_setup_state(&account.label);
                         let credential_existed = binding.as_ref().is_some_and(|binding| {
                             matches!(
                                 &binding.previous,
                                 marmot_account::Nip46SessionWrite::Existing(_)
                             )
                         });
-                        let unpublished = readiness != AccountSetupReadiness::NetworkReady
-                            && setup_state.as_ref().is_ok_and(|state| {
-                                state.as_ref().is_none_or(|state| {
-                                    state.phase == AccountSetupPhase::LocalStateCreated
-                                })
-                            });
-                        let rollback_account =
-                            !reactivating_existing && unpublished && !credential_existed;
-                        if let Some(binding) = binding {
-                            let restore_signer = binding.previous_signer.is_some();
-                            let signed_out = durable_account
-                                .as_ref()
-                                .is_ok_and(|account| account.signed_out);
-                            if readiness != AccountSetupReadiness::NetworkReady
-                                && (restore_signer || signed_out || rollback_account)
-                            {
-                                // Setup owns the handoff: retain committed retry material,
-                                // otherwise restore the prior callback and credential record.
-                                let cleanup = blocking_app_task(move || {
-                                    binding
-                                        .session
-                                        .unbind_account(
-                                            &binding.previous,
-                                            binding.previous_signer,
-                                            binding.generation,
-                                        )
-                                        .map_err(AppError::from)
-                                })
-                                .await;
-                                let reconciliation =
-                                    self.reconcile_nip46_cleanup(&account.account_id_hex).await;
-                                cleanup?;
-                                reconciliation?;
+                        let unpublished = setup_state.as_ref().is_ok_and(|state| {
+                            state.as_ref().is_none_or(|state| {
+                                state.phase == AccountSetupPhase::LocalStateCreated
+                            })
+                        });
+                        let rollback_unpublished_setup = durable_account.is_ok()
+                            && !reactivating_existing
+                            && unpublished
+                            && !credential_existed;
+                        let signed_out = durable_account
+                            .as_ref()
+                            .is_ok_and(|account| account.signed_out);
+                        let journal_cleanup = match (rollback_unpublished_setup, &origin) {
+                            (true, ExternalSetupOrigin::Created) => {
+                                return self
+                                    .rollback_account_setup(&account, None, binding, error)
+                                    .await;
                             }
-                        }
-                        restored?;
-                        durable_account?;
-                        setup_state?;
-                        if rollback_account {
-                            return self.rollback_external_signer_setup(
-                                &account.label,
-                                origin,
-                                error,
-                            );
-                        }
-                        Err(error)
+                            (true, ExternalSetupOrigin::Promoted) => {
+                                let _worker_transaction = self.worker_transactions.lock().await;
+                                let _teardown = match self.quiesce_account_worker(&account).await {
+                                    Ok(teardown) => teardown,
+                                    Err(rollback) => {
+                                        return Err(account_setup_rollback_error(
+                                            error,
+                                            [Err(rollback)],
+                                        ));
+                                    }
+                                };
+                                if let Err(rollback) =
+                                    home.revert_external_signer_upgrade(&account.label)
+                                {
+                                    return Err(account_setup_rollback_error(
+                                        error,
+                                        [Err(rollback.into())],
+                                    ));
+                                }
+                                if previous_setup.is_none() {
+                                    home.complete_account_setup(&account.label)
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                            _ => Ok(()),
+                        };
+                        let (cleanup, reconciliation) = if let Some(binding) = binding
+                            && (binding.previous_signer.is_some()
+                                || signed_out
+                                || rollback_unpublished_setup)
+                        {
+                            let cleanup = blocking_app_task(move || {
+                                let previous = match origin {
+                                    // Home already owns retirement after restoring the public role.
+                                    ExternalSetupOrigin::Promoted if rollback_unpublished_setup => {
+                                        None
+                                    }
+                                    _ => Some(&binding.previous),
+                                };
+                                binding
+                                    .session
+                                    .unbind_account(
+                                        previous,
+                                        binding.previous_signer,
+                                        binding.generation,
+                                    )
+                                    .map_err(AppError::from)
+                            })
+                            .await;
+                            let reconciliation =
+                                self.reconcile_nip46_cleanup(&account.account_id_hex).await;
+                            (cleanup, reconciliation)
+                        } else {
+                            (Ok(()), Ok(()))
+                        };
+                        Err(account_setup_rollback_error(
+                            error,
+                            [
+                                restored.map_err(AppError::from),
+                                durable_account.map(drop).map_err(AppError::from),
+                                setup_state.map(drop).map_err(AppError::from),
+                                journal_cleanup.map_err(AppError::from),
+                                cleanup,
+                                reconciliation,
+                            ],
+                        ))
                     }
                 }
             }
@@ -9402,7 +9451,7 @@ impl AccountManager {
                         binding
                             .session
                             .unbind_account(
-                                &binding.previous,
+                                Some(&binding.previous),
                                 binding.previous_signer,
                                 binding.generation,
                             )
@@ -9417,10 +9466,10 @@ impl AccountManager {
                 } else {
                     self.reconcile_for_account(&account.account_id_hex).await
                 };
-                restored?;
-                cleanup?;
-                reconciliation?;
-                Err(error)
+                Err(account_setup_rollback_error(
+                    error,
+                    [restored.map_err(AppError::from), cleanup, reconciliation],
+                ))
             }
         }
     }
@@ -9631,21 +9680,6 @@ impl AccountManager {
             self.app.spawn_public_indexer_copy(copy);
         }
         Ok((publication.status, Some(publication.profile)))
-    }
-
-    fn setup_failure_can_roll_back(
-        &self,
-        account: &AccountSummary,
-        reactivating_existing: bool,
-    ) -> Result<bool, AppError> {
-        if reactivating_existing {
-            return Ok(false);
-        }
-        Ok(self
-            .app
-            .account_home()
-            .account_setup_state(&account.label)?
-            .is_some_and(|state| state.phase == AccountSetupPhase::LocalStateCreated))
     }
 
     async fn setup_relay_lists_for_account(
@@ -9947,16 +9981,7 @@ impl AccountManager {
         }
         match request.identity.as_deref() {
             Some(value) => {
-                let account = account_home.add_public_account(value)?;
-                if let Err(error) = account_home.begin_account_setup_with(
-                    &account,
-                    false,
-                    AccountSetupKind::PublicIdentity,
-                    AccountSetupPhase::LocalStateCreated,
-                ) {
-                    let _ = account_home.remove_account(&account.label);
-                    return Err(error.into());
-                }
+                let account = account_home.add_public_account_for_setup(value)?;
                 Ok((account, None))
             }
             None => {
@@ -9979,85 +10004,41 @@ impl AccountManager {
         }
     }
 
-    /// Undo a failed external-signer setup — delete a freshly created account, or
-    /// revert the external_signing promotion on a pre-existing tracked account,
-    /// then surface the original error. Without this, a failed public→external
-    /// login leaves a torn account: the promotion applied, but the relay-list and
-    /// KeyPackage setup that should follow it did not.
-    fn rollback_external_signer_setup<T>(
+    async fn rollback_account_setup<T>(
         &self,
-        label: &str,
-        origin: ExternalSetupOrigin,
-        err: AppError,
-    ) -> Result<T, AppError> {
-        match origin {
-            ExternalSetupOrigin::Created => {
-                return self.rollback_account_after_setup_failure(label, err);
-            }
-            ExternalSetupOrigin::Promoted => {
-                self.erase_nip46_session(label, Nip46Removal::Recorded)?;
-                self.app.account_home().complete_account_setup(label)?;
-                self.app
-                    .account_home()
-                    .revert_external_signer_upgrade(label)?;
-            }
-            ExternalSetupOrigin::Existing => {}
-        }
-        Err(err)
-    }
-
-    fn rollback_account_after_setup_failure<T>(
-        &self,
-        account: &str,
+        account: &AccountSummary,
+        private_key_import: Option<&NostrAccountImport>,
+        binding: Option<Nip46Binding>,
         source: AppError,
     ) -> Result<T, AppError> {
-        // Setup probes (e.g. `status()`) may have already cached this account's
-        // storage/directory handles. Evict them before the directory is deleted
-        // so a later re-import does not reuse a handle bound to the now-unlinked
-        // inode. See `drop_account_caches` and mdk#220.
-        self.erase_nip46_session(account, Nip46Removal::Recorded)?;
-        self.app.drop_account_caches(account);
-        if let Err(rollback) = self.app.remove_account_key_package_artifacts(account) {
-            return Err(AppError::RelayDirectory(format!(
-                "failed to roll back account after setup failure: {source}; rollback error: {rollback}"
-            )));
+        let rollback = async {
+            let (_report_fence, _) = self.fence_moderation_reports(&account.label).await;
+            let _worker_transaction = self.worker_transactions.lock().await;
+            self.remove_account_locked(account, private_key_import, binding)
+                .await
         }
-        match self.app.account_home().remove_account(account) {
-            Ok(()) => Err(source),
-            Err(rollback) => Err(AppError::RelayDirectory(format!(
-                "failed to roll back account after setup failure: {source}; rollback error: {rollback}"
-            ))),
-        }
+        .await;
+        Err(account_setup_rollback_error(source, [rollback]))
     }
 
-    fn rollback_import_after_setup_failure<T>(
+    async fn rollback_import_setup<T>(
         &self,
         account: &AccountSummary,
         private_key_import: Option<&NostrAccountImport>,
         source: AppError,
     ) -> Result<T, AppError> {
-        let Some(imported) = private_key_import else {
-            return self.rollback_account_after_setup_failure(&account.label, source);
-        };
-
-        self.app.drop_account_caches(&account.label);
-        if let Err(rollback) = self
-            .app
-            .remove_account_key_package_artifacts(&account.label)
-        {
-            return Err(AppError::RelayDirectory(format!(
-                "failed to roll back account after setup failure: {source}; rollback error: {rollback}"
-            )));
+        if account.signed_out {
+            return Err(source);
         }
-        match self
-            .app
-            .account_home()
-            .rollback_nostr_account_import(imported)
-        {
-            Ok(()) => Err(source),
-            Err(rollback) => Err(AppError::RelayDirectory(format!(
-                "failed to roll back account after setup failure: {source}; rollback error: {rollback}"
-            ))),
+        // Once setup records publication intent, a relay may hold one of its
+        // events. Preserve the journaled identity for a retry.
+        match self.app.account_home().account_setup_state(&account.label) {
+            Ok(Some(state)) if state.phase == AccountSetupPhase::LocalStateCreated => {
+                self.rollback_account_setup(account, private_key_import, None, source)
+                    .await
+            }
+            Ok(_) => Err(source),
+            Err(rollback) => Err(account_setup_rollback_error(source, [Err(rollback.into())])),
         }
     }
 
@@ -10143,6 +10124,25 @@ impl AccountManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear_all();
     }
+}
+
+fn account_setup_rollback_error(
+    source: AppError,
+    cleanup: impl IntoIterator<Item = Result<(), AppError>>,
+) -> AppError {
+    use std::fmt::Write as _;
+
+    let mut failures = cleanup.into_iter().filter_map(Result::err);
+    let Some(first) = failures.next() else {
+        return source;
+    };
+    let mut message = format!(
+        "failed to roll back account after setup failure: {source}; rollback error: {first}"
+    );
+    for error in failures {
+        write!(message, "; {error}").expect("writing to a string cannot fail");
+    }
+    AppError::RelayDirectory(message)
 }
 
 fn debug_identity_field(identity: &Option<String>) -> Option<&str> {

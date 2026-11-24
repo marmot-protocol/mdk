@@ -46,7 +46,7 @@ internal class MemorySecretStore : SecretStore {
         }
         val source = receipts.find { sameSlot(it.record, record) && it.secret != null }
         if (mode == SecretClaimMode.CREATE_ONLY && (source != null || proposedHex == null)) { conflict() }
-        if ((mode == SecretClaimMode.ADOPT_ONLY || mode == SecretClaimMode.MIGRATE_LEGACY) && source == null) { missing() }
+        if (mode == SecretClaimMode.ADOPT_ONLY && source == null) { missing() }
         val secret = source?.secret ?: proposedHex ?: missing()
         if (proposedHex != null && proposedHex != secret) { conflict() }
         if (secret.length != 64 || !secret.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) { conflict() }
