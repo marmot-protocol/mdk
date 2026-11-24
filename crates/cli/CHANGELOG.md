@@ -14,9 +14,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 - `wn` and `wnd` retry pending account-wipe cleanup only while holding the exclusive data-root lease. Forwarded
   commands reuse the daemon's account home without retrying cleanup.
 - Local logout does not open an application runtime.
-- `wn reset --confirm` refuses to delete data while a daemon (even on a custom socket), an account mutation,
-  or a credential update holds a lock. Reset keeps the lock files and their containing directories and does not
-  follow symlinks during deletion. An explicitly empty home is rejected.
+- `wn reset --confirm` checks for daemon, account, and credential coordination locks before deleting data. Reset
+  keeps those locks and their containing directories, including when a nested lock appears during reset. It rejects
+  hard-linked locks and does not follow symlinks during deletion. Use a named home directory, not an empty path,
+  `.` or `/`.
 - Standalone commands accept homes relative to the caller's parent directory, such as `--home ../profile`.
 - Local commands, including logout, reject `WN_DEV_SETTLEMENT_QUIESCENCE_MS` without `test-policy-overrides`.
 

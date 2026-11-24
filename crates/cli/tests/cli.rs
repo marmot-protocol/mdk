@@ -6175,13 +6175,19 @@ fn daemon_socket_path_is_private() {
     assert_eq!(pid_mode, 0o600);
 }
 
-fn run_reset(home: &std::path::Path) -> Output {
-    cli_binary(env!("CARGO_BIN_EXE_wn"))
+fn reset_cli() -> Command {
+    let mut command = cli_binary(env!("CARGO_BIN_EXE_wn"));
+    command
         .env_remove("WN_SOCKET")
         .env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
+        .args(["--json", "reset", "--confirm"]);
+    command
+}
+
+fn run_reset(home: &std::path::Path) -> Output {
+    reset_cli()
         .arg("--home")
         .arg(home)
-        .args(["--json", "reset", "--confirm"])
         .output()
         .expect("local wn reset should start")
 }
@@ -6295,18 +6301,64 @@ fn daemon_refuses_reset_over_socket() {
 
 #[cfg(unix)]
 #[test]
-fn reset_rejects_empty_home() {
+fn reset_rejects_unnamed_home() {
     let cwd = tempfile::tempdir().unwrap();
     let data = cwd.path().join("outside-home");
     std::fs::write(&data, b"keep").unwrap();
 
-    let output = cli_binary(env!("CARGO_BIN_EXE_wn"))
-        .current_dir(cwd.path())
-        .env_remove("WN_SOCKET")
-        .env("WN_HOME", "")
-        .args(["--json", "reset", "--confirm"])
-        .output()
-        .unwrap();
+    for (home, message) in [
+        ("", "home path must not be empty"),
+        (".", "reset requires a named home directory"),
+    ] {
+        let output = reset_cli()
+            .current_dir(cwd.path())
+            .env("WN_HOME", home)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            command_output_summary(&output)
+        );
+        let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(error["error"]["message"], message);
+        assert_eq!(std::fs::read(&data).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(cwd.path()).unwrap().count(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_resolves_only_leading_parent_components() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let base = tempfile::tempdir().unwrap();
+    let physical = base.path().join("physical");
+    let cwd = physical.join("cwd");
+    let logical = base.path().join("logical");
+    let other = base.path().join("other");
+    let home = physical.join("profile");
+    let targets = [home, base.path().join("profile"), other.join("profile")];
+    for path in &targets {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("payload"), b"local data").unwrap();
+    }
+    fs::create_dir(&cwd).unwrap();
+    fs::create_dir(other.join("child")).unwrap();
+    symlink(&cwd, &logical).unwrap();
+    symlink(other.join("child"), physical.join("alias")).unwrap();
+
+    let run = |path| {
+        reset_cli()
+            .current_dir(&logical)
+            .env("PWD", &logical)
+            .args(["--home", path])
+            .output()
+            .unwrap()
+    };
+    let output = run("../alias/../profile");
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -6314,8 +6366,28 @@ fn reset_rejects_empty_home() {
         command_output_summary(&output)
     );
     let error: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(error["error"]["message"], "home path must not be empty");
-    assert_eq!(std::fs::read(&data).unwrap(), b"keep");
+    assert_eq!(error["error"]["code"], "io_error");
+    assert_eq!(
+        error["error"]["message"],
+        "directory path must not contain parent traversal"
+    );
+    for path in &targets {
+        assert_eq!(fs::read(path.join("payload")).unwrap(), b"local data");
+    }
+
+    let output = run("../profile");
+    assert!(
+        output.status.success(),
+        "{}",
+        command_output_summary(&output)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["result"]["deleted"], true);
+    assert_eq!(result["result"]["home"], "../profile");
+    assert!(!targets[0].join("payload").try_exists().unwrap());
+    for path in &targets[1..] {
+        assert_eq!(fs::read(path.join("payload")).unwrap(), b"local data");
+    }
 }
 
 #[cfg(unix)]

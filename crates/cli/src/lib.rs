@@ -539,7 +539,7 @@ async fn execute_inner(
     }
     #[cfg(unix)]
     let home = if root_context.is_none() {
-        normalize_standalone_home(home)?
+        normalize_leading_parents(&home)?.unwrap_or(home)
     } else {
         home
     };
@@ -908,6 +908,7 @@ fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, WnError> {
 
 #[cfg(unix)]
 mod reset_tree {
+    use std::borrow::Cow;
     use std::ffi::{CStr, CString, OsStr};
     use std::io;
     use std::mem::MaybeUninit;
@@ -932,15 +933,30 @@ mod reset_tree {
     ];
 
     pub(super) fn reset_home(home: &Path) -> Result<(), WnError> {
-        if home.as_os_str().is_empty() {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidInput, "home path must not be empty").into(),
-            );
-        }
-        if let Some(root) = fs_private::inspect_directory_path(home)? {
+        let normalized = reset_path(home)?;
+        if let Some(root) = fs_private::inspect_directory_path(&normalized)? {
             ResetPlan::new(root.as_fd(), home)?.delete()?;
         }
         Ok(())
+    }
+
+    fn reset_path(home: &Path) -> io::Result<Cow<'_, Path>> {
+        if home.as_os_str().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "home path must not be empty",
+            ));
+        }
+        if home.file_name().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reset requires a named home directory",
+            ));
+        }
+        Ok(match super::normalize_leading_parents(home)? {
+            Some(path) => Cow::Owned(path),
+            None => Cow::Borrowed(home),
+        })
     }
 
     struct ResetPlan<'a> {
@@ -969,6 +985,7 @@ mod reset_tree {
     struct ResetChildren {
         len: usize,
         survivors: usize,
+        leased: [bool; COORDINATION.len()],
     }
 
     impl<'a> ResetPlan<'a> {
@@ -1001,11 +1018,16 @@ mod reset_tree {
                 entries: Vec::new(),
                 survivors: 0,
             };
-            plan.survivors = plan.scan(root, &mut home.to_path_buf())?;
+            plan.survivors = plan.scan(root, &mut home.to_path_buf())?.survivors;
             Ok(plan)
         }
 
-        fn scan(&mut self, parent: BorrowedFd<'_>, path: &mut PathBuf) -> io::Result<usize> {
+        fn scan(
+            &mut self,
+            parent: BorrowedFd<'_>,
+            path: &mut PathBuf,
+        ) -> io::Result<ResetChildren> {
+            let first_entry = self.entries.len();
             let is_root = parent.as_raw_fd() == self.root.as_raw_fd();
             // Resolve canonical names as the writers do, including on case-insensitive volumes.
             let mut locked = [None; COORDINATION.len()];
@@ -1052,46 +1074,57 @@ mod reset_tree {
                 if stat.directory && !is_lease {
                     let child = self.entries[index].open_dir(parent)?;
                     path.push(file_name);
-                    let child_survivors = self.scan(child.as_fd(), path)?;
+                    let children = self.scan(child.as_fd(), path)?;
                     path.pop();
-                    self.entries[index].kind = ResetEntryKind::Directory(ResetChildren {
-                        len: self.entries.len() - index - 1,
-                        survivors: child_survivors,
-                    });
-                    survivors += usize::from(child_survivors != 0);
+                    survivors += usize::from(children.survivors != 0);
+                    self.entries[index].kind = ResetEntryKind::Directory(children);
                 }
             }
-            Ok(survivors)
+            // A lease first published during enumeration could have entered the plan
+            // as an ordinary file, including under a filesystem-equivalent spelling.
+            let leased = locked.map(|identity| identity.is_some());
+            check_new_leases(parent, &self.lock_names, leased)?;
+            Ok(ResetChildren {
+                len: self.entries.len() - first_entry,
+                survivors,
+                leased,
+            })
         }
 
         fn delete(self) -> io::Result<()> {
-            remove_entries(self.root, &self.entries)?;
+            remove_entries(self.root, &self.entries, &self.lock_names)?;
             check_remaining(self.root, &self.entries, self.survivors)
         }
     }
 
-    impl ResetEntry {
-        fn open_dir(&self, parent: BorrowedFd<'_>) -> io::Result<OwnedFd> {
-            let directory = open_dir_at(parent, &self.name)?;
-            self.check_identity(stat_at(directory.as_fd(), c".")?.identity)?;
-            Ok(directory)
-        }
-
-        fn check_identity(&self, identity: (u64, u64)) -> io::Result<()> {
-            if self.identity == identity {
-                Ok(())
-            } else {
-                Err(io::Error::other(format!(
-                    "reset entry changed: {:?}",
-                    self.name
-                )))
+    fn check_new_leases(
+        parent: BorrowedFd<'_>,
+        lock_names: &[CString; COORDINATION.len()],
+        leased: [bool; COORDINATION.len()],
+    ) -> io::Result<()> {
+        for (name, was_leased) in lock_names.iter().zip(leased) {
+            if !was_leased {
+                match stat_at(parent, name) {
+                    Ok(_) => {
+                        return Err(io::Error::other(format!(
+                            "reset directory gained an unplanned coordination lease: {name:?}"
+                        )));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
+        Ok(())
     }
 
     // Preorder entries encode each directory's descendants in a contiguous span.
     // Reopen only those directories, and never recursively unlink new arrivals.
-    fn remove_entries(parent: BorrowedFd<'_>, mut entries: &[ResetEntry]) -> io::Result<()> {
+    fn remove_entries(
+        parent: BorrowedFd<'_>,
+        mut entries: &[ResetEntry],
+        lock_names: &[CString; COORDINATION.len()],
+    ) -> io::Result<()> {
         while let Some((entry, rest)) = entries.split_first() {
             let flags = match &entry.kind {
                 ResetEntryKind::Lease => {
@@ -1100,8 +1133,9 @@ mod reset_tree {
                 }
                 ResetEntryKind::Directory(children) => {
                     let child = entry.open_dir(parent)?;
+                    check_new_leases(child.as_fd(), lock_names, children.leased)?;
                     let (descendants, siblings) = rest.split_at(children.len);
-                    remove_entries(child.as_fd(), descendants)?;
+                    remove_entries(child.as_fd(), descendants, lock_names)?;
                     entries = siblings;
                     if children.survivors != 0 {
                         check_remaining(child.as_fd(), descendants, children.survivors)?;
@@ -1122,6 +1156,25 @@ mod reset_tree {
             }
         }
         Ok(())
+    }
+
+    impl ResetEntry {
+        fn open_dir(&self, parent: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+            let directory = open_dir_at(parent, &self.name)?;
+            self.check_identity(stat_at(directory.as_fd(), c".")?.identity)?;
+            Ok(directory)
+        }
+
+        fn check_identity(&self, identity: (u64, u64)) -> io::Result<()> {
+            if self.identity == identity {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "reset entry changed: {:?}",
+                    self.name
+                )))
+            }
+        }
     }
 
     // Retained directories do not get the emptiness check from unlinkat.
@@ -1431,6 +1484,13 @@ mod reset_tree {
         }
 
         #[test]
+        fn reset_path_rejects_filesystem_root() {
+            let error = reset_path(Path::new("/")).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), "reset requires a named home directory");
+        }
+
+        #[test]
         fn reset_reports_new_entries() {
             let base = tempfile::tempdir().unwrap();
             let home = base.path().join("home");
@@ -1447,6 +1507,34 @@ mod reset_tree {
                 "reset directory gained an unplanned entry"
             );
             assert_eq!(fs::read(new.join("payload")).unwrap(), b"not in snapshot");
+        }
+
+        #[test]
+        fn reset_preserves_a_writer_arriving_after_planning() {
+            for (name, _) in COORDINATION {
+                let home = tempfile::tempdir().unwrap();
+                let nested = home.path().join("parent/nested");
+                fs::create_dir_all(&nested).unwrap();
+                let payload = nested.join("payload");
+                fs::write(&payload, b"nested writer data").unwrap();
+                let root = fs_private::inspect_directory_path(home.path())
+                    .unwrap()
+                    .unwrap();
+                let plan = ResetPlan::new(root.as_fd(), home.path()).unwrap();
+
+                let lock = nested.join(name);
+                let _writer = fs_private::try_acquire_private_exclusive_file_lease(&lock).unwrap();
+                let before = lock.metadata().unwrap();
+
+                let error = plan.delete().unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!("reset directory gained an unplanned coordination lease: {name:?}")
+                );
+                let after = lock.metadata().unwrap();
+                assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+                assert_eq!(fs::read(&payload).unwrap(), b"nested writer data");
+            }
         }
 
         #[test]
@@ -1942,7 +2030,7 @@ fn resolve_home(home: Option<PathBuf>) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn normalize_standalone_home(home: PathBuf) -> std::io::Result<PathBuf> {
+fn normalize_leading_parents(home: &Path) -> std::io::Result<Option<PathBuf>> {
     use std::path::Component;
 
     let mut parts = home.components().peekable();
@@ -1950,7 +2038,7 @@ fn normalize_standalone_home(home: PathBuf) -> std::io::Result<PathBuf> {
         parts.next();
     }
     if parts.peek() != Some(&Component::ParentDir) {
-        return Ok(home);
+        return Ok(None);
     }
     // Start above the caller's physical cwd; leave the rest to the no-follow walk.
     let mut path = std::env::current_dir()?;
@@ -1958,7 +2046,7 @@ fn normalize_standalone_home(home: PathBuf) -> std::io::Result<PathBuf> {
         path.pop();
     }
     path.extend(parts);
-    Ok(path)
+    Ok(Some(path))
 }
 
 fn default_home() -> PathBuf {

@@ -159,10 +159,14 @@ wn reset --confirm
 - `export-nsec` exists for command-shape compatibility but returns `private_key_export_disabled`; this CLI never prints
   private keys.
 - `accounts create` is kept as a compatibility/repair surface; new setup flows should use `create-identity` or `login`.
-- Stop the daemon and finish any account or credential updates before running `wn reset --confirm`. After stopping a
-  daemon on a custom socket, unset `WN_SOCKET` and omit `--socket`. Keep `--home` pointed at the home you intend to
-  reset. Reset excludes other MDK writers that hold its coordination locks; stop tools that edit the home without
-  those locks. Reset keeps lock files and the directories that contain them. It does not clear the OS keychain.
+- Stop all daemons and finish any account or credential updates in the selected home and its subdirectories before
+  running `wn reset --confirm`. Unset `WN_SOCKET` and omit `--socket`. Use a named home such as `../profile`.
+  Leading `..` is relative to the physical working directory. Reset rejects `..` after a named path component and does
+  not follow symlinks during deletion. It keeps coordination lock files and their parent directories and does not clear
+  the OS keychain.
+- Do not start a writer or edit the home during reset. Reset locks the coordination files it finds before deletion.
+  A writer starting in a subdirectory that had no lock file can still race deletion of data, and reset may stop after
+  deleting only part of the home.
 
 ### KeyPackages
 

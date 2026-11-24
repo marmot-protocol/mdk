@@ -45,8 +45,9 @@ pub struct PrivateExclusiveFileLease {
 
 /// Try to acquire an exclusive, nonblocking advisory lease on `path`.
 ///
-/// The lock file is created at 0600 without following a final symlink and an
-/// existing file is tightened to 0600 before locking. Returns
+/// The lock file is created at 0600 without following a final symlink. An
+/// existing file must be a regular file with one link and is tightened to
+/// 0600 before locking. Returns
 /// [`io::ErrorKind::WouldBlock`] when another process or separately opened
 /// descriptor owns the lease. The function never waits for that owner.
 ///
@@ -161,15 +162,16 @@ fn finish_private_exclusive_file_lease(
     operation: libc::c_int,
 ) -> io::Result<PrivateExclusiveFileLease> {
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
 
     let metadata = file
         .metadata()
         .map_err(|error| io_context("read private lease file metadata", path, error))?;
-    if !metadata.file_type().is_file() {
+    if !metadata.is_file() || metadata.nlink() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "validate private lease file at {}: target must be a regular file",
+                "validate private lease file at {}: target must be a regular file with one link",
                 path.display()
             ),
         ));
@@ -251,7 +253,8 @@ impl PreparedDirectory {
 }
 
 /// Acquire a private, nonblocking exclusive lease beneath an opened directory.
-/// `name` is one filename. The final component must not be a symlink.
+/// `name` is one filename. The final component must not be a symlink. The
+/// opened file must be a regular file with one link.
 /// A held lease returns [`io::ErrorKind::WouldBlock`].
 #[cfg(unix)]
 pub fn try_acquire_lease_at(
@@ -2618,6 +2621,34 @@ mod unix_tests {
         );
         assert_eq!(mode_of(&moved.join(name)), 0o600);
         assert!(!root.join(name).try_exists().unwrap());
+    }
+
+    #[test]
+    fn private_lease_rejects_hard_link_without_chmod() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("home");
+        let prepared =
+            prepare_directory_path(&root, PRIVATE_DIR_MODE, ExistingDirectoryMode::Enforce)
+                .unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"outside data").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let name = std::ffi::OsStr::new(".runtime.lock");
+        let lease = root.join(name);
+        std::fs::hard_link(&outside, &lease).unwrap();
+
+        for error in [
+            try_acquire_lease_at(prepared.as_fd(), name).unwrap_err(),
+            try_acquire_private_exclusive_file_lease(&lease).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error.to_string().contains("regular file with one link"),
+                "{error}"
+            );
+        }
+        assert_eq!(mode_of(&outside), 0o644);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside data");
     }
 
     #[test]
