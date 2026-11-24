@@ -333,8 +333,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
   `send_device_group_message` (`false` means it reached no relay; a feature that records the event's id first builds
   it with `device_group_event` and sends it with `send_device_group_event`), one dispatch by kind in `observe_device_group_event`
-  (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
-  D33). A message from an earlier epoch is read from that epoch's retained anchor, so one older than the retained
+  (add a feature's kinds there), and one sender read, `sending_device`, from the sending leaf's device tag (mdk#2628
+  D33), which `ensure_sent_by` checks against a payload's named sender. A message from an earlier epoch is read from that epoch's retained anchor, so one older than the retained
   anchors has no readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 458, 459, 460,
   461, 473, 475, 476, 477), the one list: `observe_event` drops one received in any other group before the host summary and the
   stored projection, the notification preview refuses it, and the custom path rejects it as reserved. The engine
@@ -630,14 +630,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   of a chat holding a decision waits until the last broadcast was made for that sibling and the chat's decision has
   gone out since (`sibling_holds_decision`, mdk#3556), so the decision is sent ahead of the Welcome. For that to hold,
   decisions are sent before other items and a winning decision read from an update older than the last broadcast's
-  tip is owed again. A decision page the session holds, queued or unacknowledged, counts as sent like any other page,
+  tip is owed again. A decision page the session holds unacknowledged counts as sent like any other page,
   so during a relay outage the Add can go ahead before the decision lands; the device shows the chat as an invitation
   until the session's retry delivers it. Carrying the decision in the Welcome would close that window (mdk#3648).
   Each maintenance pass then sends what is owed: updates split
   to fit 32,768 bytes, each page's items marked sent only after it went out (a duplicate is harmless, a loss is not),
-  and a broadcast request when owed. Updates and requests are read from any member of the trusted device group, never
-  through `ensure_sent_by`. A withdrawn update owes every held item again, whoever sent it, and a withdrawn broadcast
-  request owes a new one; a withdrawn message with no record in the trusted device group owes both. Invitation
+  and a broadcast request when owed. Updates and requests are read only from a leaf that reads, at the message's
+  epoch, as a device the trusted roster lists (`ensure_small_state_sender`, mdk#3680): membership is not enough, as a
+  removed device keeps its last epoch's keys for the app-message window. So a device sends none until its own leaf is
+  tagged, and what it owes waits for the pass after its tag commit. Each send is pinned to the branch the tag was read
+  on (`exchange.pin`), so the engine refuses one whose epoch moved or is about to, and its page stays owed, rather
+  than encrypt it on a branch where that leaf is untagged. A withdrawn update owes every held item again, whoever sent
+  it, and a withdrawn broadcast request owes a new one; a withdrawn message with no record in the trusted device group owes both. Invitation
   decisions it owes again go out on the worker's next turn, as a local answer does, not at the next pass (mdk#3573).
   A winning pin for an archived chat waits, unobserved, until the chat is unarchived.
 - Invitation decisions (`client/invitation_decisions.rs`, mdk#2628 4.3b/D96) are explicit per-admission intent, never

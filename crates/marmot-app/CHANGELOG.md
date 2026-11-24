@@ -55,6 +55,12 @@
 
 ### Fixed
 
+- A device removed from the account can no longer change its siblings' small state (mdk#3680). It kept its last
+  device-group epoch's keys for the app-message window, so until the device group moved five more epochs it could
+  still send updates and broadcast requests, and a decline or read position at the highest version could not be
+  undone. A device now takes a small-state update or broadcast request only from a leaf whose device tag reads, at
+  the message's epoch, as a device its roster lists, and sends its own only once its leaf is tagged: a newly linked
+  device's first broadcast waits for its tag commit instead of going out untagged.
 - A newly linked device no longer waits up to an hour for its siblings' small state, showing a chat the account already
   accepted as an invitation, with an "invited you" notification, when every sibling broadcast within the last hour
   (mdk#3556). A device whose trusted roster lists a device its last broadcast was not made for broadcasts at once, and

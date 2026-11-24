@@ -1834,9 +1834,10 @@ async fn linked_devices() -> (Devices, GroupId) {
         trust(&devices.laptop_app, &group),
         Some(DeviceGroupTrust::Linked)
     );
-    // Each device starts small state (mdk#2628 4.3a), sending the broadcast
-    // request it owes at start, so a test's first maintenance pass publishes
-    // only what that test is about.
+    // Each device starts small state (mdk#2628 4.3a). The phone sends the
+    // broadcast request it owes at start, so a test's first maintenance pass
+    // publishes only what that test is about; the laptop holds its own until
+    // its leaf is tagged (mdk#3680).
     for client in [&mut devices.phone, &mut devices.laptop] {
         boxed(|| client.drive_small_state()).await;
     }
@@ -1848,7 +1849,7 @@ async fn linked_devices() -> (Devices, GroupId) {
 /// it sets its tag signature key; the phone's founding entry carries its key.
 /// Each new KeyPackage is announced before it is published, and both devices
 /// see every roster commit.
-async fn tagging_devices() -> (Devices, GroupId) {
+pub(super) async fn tagging_devices() -> (Devices, GroupId) {
     let (devices, group) = boxed(linked_devices).await;
     boxed(|| tag_linked_devices(devices, group)).await
 }
