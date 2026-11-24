@@ -570,4 +570,286 @@ impl AccountHome {
             .into())
         }
     }
+
+    pub(super) fn add_nonlocal_account(
+        &self,
+        public_key: &str,
+        admission: NonlocalAdmission,
+    ) -> AccountHomeResult<AccountSummary> {
+        let (external_signing, setup_kind) = match admission {
+            NonlocalAdmission::Public => (false, None),
+            NonlocalAdmission::PublicSetup => (false, Some(AccountSetupKind::PublicIdentity)),
+            NonlocalAdmission::External => (true, None),
+            NonlocalAdmission::ExternalSetup => (true, Some(AccountSetupKind::ExternalSigner)),
+        };
+        let account_id_hex = Self::account_id_for_public_key(public_key)?;
+        let _guard = self.mutation_guard()?;
+        let (account, write_record) = if self.account_record_path(&account_id_hex).try_exists()? {
+            let mut account = self.account(&account_id_hex)?;
+            if !external_signing || account.local_signing {
+                return Err(AccountHomeError::AccountExists(account_id_hex));
+            }
+            let promoted = !account.external_signing;
+            if promoted {
+                self.remove_nip46_session_inner(&account, Nip46Removal::IncludingOrphaned)?;
+            }
+            account.external_signing = true;
+            (account, promoted)
+        } else {
+            (
+                AccountSummary {
+                    label: account_id_hex.clone(),
+                    account_id_hex,
+                    local_signing: false,
+                    external_signing,
+                    signed_out: false,
+                    unlinked: false,
+                },
+                true,
+            )
+        };
+        if let Some(kind) = setup_kind {
+            if let Some(state) = self.raw_account_setup_state(&account.label)? {
+                if state.account_id_hex != account.account_id_hex {
+                    return Err(AccountHomeError::AccountIdMismatch);
+                }
+            } else {
+                let state = AccountSetupState {
+                    account_id_hex: account.account_id_hex.clone(),
+                    reused_account_id_credential: false,
+                    kind,
+                    phase: AccountSetupPhase::LocalStateCreated,
+                };
+                self.write_account_setup_state(&account.label, &state)?;
+            }
+        }
+        if write_record {
+            self.write_account_record(&account)?;
+        }
+        Ok(account)
+    }
+
+    /// Undo the `external_signing` promotion that [`Self::add_external_signer_account`]
+    /// applies to a pre-existing public/tracked account, so a failed external-signer
+    /// setup restores that account to its prior tracked state instead of leaving it
+    /// half-configured. Credential retirement follows the public-role commit;
+    /// failures remain pending for retry before another promotion. Local accounts
+    /// are unchanged. Callers must establish that this setup promoted the account.
+    pub(super) fn remove_account_locked(
+        &self,
+        account_ref: &str,
+        expected: Option<&AccountSummary>,
+        removal: SigningKeyRemoval,
+    ) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        if expected.is_some_and(|expected| expected != &account) {
+            return Err(AccountHomeError::AccountExists(account.label));
+        }
+        let manifest = self.manifest_or_legacy(&account)?;
+        let cleanup = self.build_wipe_cleanup(&account, &manifest, removal)?;
+        let live_dir = self.account_dir(&account.label);
+        write_private_json(live_dir.join(WIPE_CLEANUP_FILE), &cleanup)?;
+        if let Some(tombstone) = self.move_account_dir_to_tombstone(&account.label, &live_dir)? {
+            self.finish_wipe_cleanup(&tombstone, Some(cleanup));
+        }
+        Ok(())
+    }
+
+    /// Retry best-effort cleanup of committed account wipes.
+    ///
+    /// Failure to acquire the mutation lease or authorize this home is returned
+    /// before accessing the vault. Individual cleanup failures remain pending.
+    /// The caller must exclusively own the runtime root across processes and
+    /// replay before allowing account mutations. Constructors do not replay.
+    pub fn resume_wipe_cleanup(&self) -> AccountHomeResult<()> {
+        let _guard = self.mutation_guard()?;
+        if self.root.join(HOME_IDENTITY_FILE).try_exists()? {
+            self.home_identity(false)?;
+        }
+        if self.secret_store.reconcile_cleanup().is_err() {
+            tracing::warn!(target: TRACE_TARGET, method = "resume_wipe_cleanup", "vault-side retired receipt cleanup remains pending");
+        }
+        if self.cleanup_abandoned_admissions().is_err() {
+            tracing::warn!(target: TRACE_TARGET, method = "resume_wipe_cleanup", "incomplete account admission cleanup remains pending");
+        }
+        let root = self.root.join(WIPE_TOMBSTONE_DIR);
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            _ => {
+                tracing::warn!(target: TRACE_TARGET, method = "resume_wipe_cleanup", "wipe cleanup container is not an accessible directory");
+                return Ok(());
+            }
+        }
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(_) => {
+                tracing::warn!(target: TRACE_TARGET, method = "resume_wipe_cleanup", "wipe cleanup container cannot be listed");
+                return Ok(());
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            let cleanup = read_private_json_bounded::<WipeCleanup>(
+                &path.join(WIPE_CLEANUP_FILE),
+                MAX_WIPE_CLEANUP_BYTES,
+            )
+            .ok();
+            self.finish_wipe_cleanup(&path, cleanup);
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_wipe_cleanup(&self, tombstone: &Path, mut cleanup: Option<WipeCleanup>) {
+        if crate::io::sync_directory(&self.root)
+            .and_then(|()| match crate::io::sync_directory(&self.accounts_dir()) {
+                // The root sync covers the absence of the former parent.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            })
+            .and_then(|()| crate::io::sync_directory(&self.root.join(WIPE_TOMBSTONE_DIR)))
+            .is_err()
+        {
+            tracing::warn!(target: TRACE_TARGET, method = "finish_wipe_cleanup", "wipe rename durability is uncertain; cleanup remains pending");
+            return;
+        }
+        let mut progress_saved = true;
+        if let Some(cleanup) = &mut cleanup {
+            for index in 0..cleanup.credentials.len() {
+                let Some(CleanupCredential { credential, mode }) = &cleanup.credentials[index]
+                else {
+                    continue;
+                };
+                if cleanup
+                    .account
+                    .as_ref()
+                    .is_none_or(|account| self.check_credential(account, credential).is_err())
+                {
+                    continue;
+                }
+                if self
+                    .secret_store
+                    .release_secret(credential.request(), *mode)
+                    .is_ok_and(|outcome| outcome == SecretReleaseOutcome::Released)
+                {
+                    cleanup.credentials[index] = None;
+                    progress_saved =
+                        write_private_json(tombstone.join(WIPE_CLEANUP_FILE), cleanup).is_ok();
+                }
+            }
+        }
+        let unknown = cleanup.is_none();
+        let mut pending = !progress_saved
+            || cleanup.as_ref().is_none_or(|cleanup| {
+                cleanup.credentials.iter().any(Option::is_some)
+                    || cleanup.legacy.iter().any(Option::is_some)
+            });
+        for name in [ACCOUNT_SECRET_FILE, EXTERNAL_SQLCIPHER_SECRET_FILE] {
+            if scrub_and_remove_local_secret_file(&tombstone.join(name)).is_err() {
+                pending = true;
+            }
+        }
+        match fs::read_dir(tombstone) {
+            Ok(entries) => {
+                for entry in entries {
+                    let result = (|| -> std::io::Result<()> {
+                        let entry = entry?;
+                        let name = entry.file_name();
+                        if name == WIPE_CLEANUP_FILE
+                            || (unknown
+                                && (name == ACCOUNT_RECORD_FILE || name == CREDENTIAL_OWNERS_FILE))
+                        {
+                            return Ok(());
+                        }
+                        if entry.file_type()?.is_dir() {
+                            fs::remove_dir_all(entry.path())
+                        } else {
+                            fs::remove_file(entry.path())
+                        }
+                    })();
+                    if result.is_err() {
+                        pending = true;
+                    }
+                }
+            }
+            Err(_) => pending = true,
+        }
+        if !pending
+            && let Err(error) = fs::remove_file(tombstone.join(WIPE_CLEANUP_FILE))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            pending = true;
+        }
+        if fs::remove_dir(tombstone).is_err() {
+            pending = true;
+        }
+        if pending {
+            tracing::warn!(target: TRACE_TARGET, method = "finish_wipe_cleanup", "wipe committed; credential or file cleanup remains pending");
+        }
+    }
+
+    pub(super) fn admit_external_database_secret(
+        &self,
+        account_ref: &str,
+        mode: ExternalSecretMode,
+    ) -> AccountHomeResult<nostr::prelude::Keys> {
+        let _guard = self.mutation_guard()?;
+        let account = self.account(account_ref)?;
+        if !account.external_signing || account.local_signing {
+            return Err(AccountHomeError::InvalidSecretKey);
+        }
+        let legacy_path = self
+            .account_dir(&account.label)
+            .join(EXTERNAL_SQLCIPHER_SECRET_FILE);
+        let legacy = match read_secret_text(&legacy_path) {
+            Ok(raw) => Some(nostr::prelude::Keys::new(
+                nostr::prelude::SecretKey::from_hex(raw.trim())
+                    .map_err(|_| AccountHomeError::InvalidSecretKey)?,
+            )),
+            Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let keys = if let Some(keys) = &legacy {
+            self.acquire_credential(
+                &account,
+                SecretCredentialKind::ExternalDatabase,
+                SecretClaimMode::CreateOrAdopt,
+                Some(keys),
+            )?
+            .keys
+        } else {
+            match self.load_credential(&account, SecretCredentialKind::ExternalDatabase) {
+                Ok(keys) => keys,
+                Err(error) if missing_secret(&error) && mode == ExternalSecretMode::Create => {
+                    let keys = nostr::prelude::Keys::generate();
+                    self.renew_credential(
+                        &account,
+                        SecretCredentialKind::ExternalDatabase,
+                        Some(&keys),
+                    )?
+                    .keys
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if legacy
+            .as_ref()
+            .is_some_and(|legacy| legacy.secret_key() != keys.secret_key())
+        {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        if legacy.is_some() {
+            scrub_and_remove_local_secret_file(&legacy_path)?;
+        }
+        Ok(keys)
+    }
 }
