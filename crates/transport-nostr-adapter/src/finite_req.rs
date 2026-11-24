@@ -137,6 +137,9 @@ pub struct FiniteReply {
     pub fetched_bytes: u64,
     /// Its EOSE carried NIP-67 `more`.
     pub more: bool,
+    /// Its EOSE carried NIP-67 `auth`: the relay may hold back stored events
+    /// until the client authenticates, so the reply proves nothing absent.
+    pub auth: bool,
     pub end: FiniteEnd,
 }
 
@@ -164,6 +167,7 @@ impl FiniteReply {
             event_bytes: self.event_bytes + retry.event_bytes,
             fetched_bytes: self.fetched_bytes + retry.fetched_bytes,
             more: retry.more,
+            auth: retry.auth,
             end: retry.end,
             ..self
         }
@@ -179,6 +183,7 @@ impl FiniteReply {
             kept_event_bytes: 0,
             fetched_bytes: 0,
             more: false,
+            auth: false,
             end,
         }
     }
@@ -675,6 +680,7 @@ struct Collector<'a> {
     kept_event_bytes: usize,
     fetched_bytes: u64,
     more: bool,
+    auth: bool,
 }
 
 impl<'a> Collector<'a> {
@@ -701,6 +707,7 @@ impl<'a> Collector<'a> {
             kept_event_bytes: 0,
             fetched_bytes: 0,
             more: false,
+            auth: false,
         }
     }
 
@@ -718,7 +725,9 @@ impl<'a> Collector<'a> {
         match message {
             RelayMessage::Event { event, .. } => self.event(event.into_owned(), text.len()).await,
             RelayMessage::EndOfStoredEvents { hints, .. } => {
-                self.more = hints.is_some_and(|hints| hints.contains(&EoseHint::More));
+                let hints = hints.unwrap_or_default();
+                self.more = hints.contains(&EoseHint::More);
+                self.auth = hints.contains(&EoseHint::Auth);
                 Some(FiniteEnd::Eose)
             }
             RelayMessage::Closed { message, .. } => Some(FiniteEnd::Closed(message.into_owned())),
@@ -836,6 +845,7 @@ impl<'a> Collector<'a> {
             kept_event_bytes: self.kept_event_bytes,
             fetched_bytes: self.fetched_bytes,
             more: self.more,
+            auth: self.auth,
             end,
         }
     }
@@ -1355,9 +1365,11 @@ mod tests {
         let filter = Filter::new().kind(Kind::TextNote);
         let reply = collect(&filter, limits(1, 1), &[eose(r#",["auth","more"]"#)]).await;
         assert_eq!(reply.end, FiniteEnd::Eose);
-        assert!(reply.more);
+        assert!(reply.more && reply.auth);
+        let reply = collect(&filter, limits(1, 1), &[eose(r#",["auth","finish"]"#)]).await;
+        assert!(reply.auth && !reply.more);
         let reply = collect(&filter, limits(1, 1), &[eose(r#",["finish"]"#)]).await;
-        assert!(!reply.more);
+        assert!(!reply.more && !reply.auth);
         // The hints are the SDK's own reading of the frame, whatever follows
         // them.
         for (hints, more) in [

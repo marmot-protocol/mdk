@@ -1052,8 +1052,9 @@ pub async fn fetch_public_events(
                 complete = false;
                 continue;
             };
-            // NIP-67 `more`: the relay cut its own answer short.
-            complete &= reply.end == FiniteEnd::Eose && !reply.more;
+            // NIP-67 `more` or `auth`: the relay cut its own answer short, or
+            // holds events back until the client authenticates.
+            complete &= reply.end == FiniteEnd::Eose && !reply.more && !reply.auth;
             for event in reply.events {
                 let from = sources.entry(event.id).or_default();
                 let relay = TransportEndpoint(url.to_string());
@@ -1157,9 +1158,12 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 .fetch_watching(&relay, vec![filter], limits, &cancel, &mut auth)
                 .await;
             match &result.end {
-                // NIP-67 `more`: the relay cut its answer, so a newer event
+                // NIP-67 `more` or `auth`: the relay cut its answer or holds
+                // events back until authentication, so a newer event
                 // may be unread. The inbox probe needs only an answer.
-                FiniteEnd::Eose if result.more && query.kind != 1059 => return Err(Incomplete),
+                FiniteEnd::Eose if (result.more || result.auth) && query.kind != 1059 => {
+                    return Err(Incomplete);
+                }
                 FiniteEnd::Eose => {}
                 FiniteEnd::Closed(reason) => return Err(directory_closed_reason(reason)),
                 FiniteEnd::TimedOut => return Err(TimedOut),
@@ -1480,6 +1484,9 @@ mod tests {
         Eose,
         /// EOSE with NIP-67's `more`: the relay cut its answer short.
         More,
+        /// EOSE with NIP-67's `auth` and `finish`: the relay holds events back
+        /// until the client authenticates.
+        Auth,
         Stalled,
     }
 
@@ -1522,6 +1529,9 @@ mod tests {
                     QueryRelayEnd::Eose => replies.push(serde_json::json!(["EOSE", request[1]])),
                     QueryRelayEnd::More => {
                         replies.push(serde_json::json!(["EOSE", request[1], ["more"]]));
+                    }
+                    QueryRelayEnd::Auth => {
+                        replies.push(serde_json::json!(["EOSE", request[1], ["auth", "finish"]]));
                     }
                     QueryRelayEnd::Stalled => {}
                 }
@@ -1803,22 +1813,25 @@ mod tests {
         let event = EventBuilder::new(Kind::from(1), "kept")
             .finalize(&keys)
             .unwrap();
-        let (relay, server) = spawn_query_relay(vec![event.clone()], QueryRelayEnd::More).await;
-        let fetched = timeout(
-            Duration::from_secs(5),
-            fetch_public_events(
-                std::slice::from_ref(&relay),
-                vec![Filter::new().kind(Kind::from(1)).author(keys.public_key())],
-                8,
-            ),
-        )
-        .await
-        .expect("the relay answers")
-        .unwrap();
-        server.abort();
-        let _ = server.await;
-        assert_eq!(fetched.events, vec![event]);
-        assert!(!fetched.complete);
+        // `auth` too: the relay may hold events back from an anonymous read.
+        for end in [QueryRelayEnd::More, QueryRelayEnd::Auth] {
+            let (relay, server) = spawn_query_relay(vec![event.clone()], end).await;
+            let fetched = timeout(
+                Duration::from_secs(5),
+                fetch_public_events(
+                    std::slice::from_ref(&relay),
+                    vec![Filter::new().kind(Kind::from(1)).author(keys.public_key())],
+                    8,
+                ),
+            )
+            .await
+            .expect("the relay answers")
+            .unwrap();
+            server.abort();
+            let _ = server.await;
+            assert_eq!(fetched.events, vec![event.clone()]);
+            assert!(!fetched.complete);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2618,12 +2631,13 @@ mod tests {
         let note = EventBuilder::new(Kind::TextNote, "kept")
             .finalize(&keys)
             .unwrap();
+        // Only the relay that says `more` holds the note, so it survives only
+        // if that relay's partial page is kept.
         let (more, more_server) = spawn_query_relay(vec![note.clone()], QueryRelayEnd::More).await;
-        let (finished, finished_server) =
-            spawn_query_relay(vec![note.clone()], QueryRelayEnd::Eose).await;
+        let (finished, finished_server) = spawn_query_relay(Vec::new(), QueryRelayEnd::Eose).await;
         let query = DirectoryEventQuery::new(1, vec![keys.public_key().to_hex()], 4);
         let request =
-            DirectoryFetchRequest::new(vec![more, finished.clone()], vec![query]).unwrap();
+            DirectoryFetchRequest::new(vec![more.clone(), finished.clone()], vec![query]).unwrap();
         let outcome = timeout(
             Duration::from_secs(20),
             NostrSdkDirectoryRelayFetcher::standalone()
@@ -2639,13 +2653,14 @@ mod tests {
             panic!("{:?}", outcome.complete_endpoints);
         };
         assert!(crate::same_relay(named.as_str(), finished.as_str()));
-        assert!(
-            outcome
-                .records
-                .iter()
-                .all(|record| record.event.id == note.id.to_hex())
-        );
-        assert!(!outcome.records.is_empty());
+        let [record] = outcome.records.as_slice() else {
+            panic!("{} records", outcome.records.len());
+        };
+        assert_eq!(record.event.id, note.id.to_hex());
+        let [source] = record.endpoints.as_slice() else {
+            panic!("{:?}", record.endpoints);
+        };
+        assert!(crate::same_relay(source.as_str(), more.as_str()));
     }
 
     #[test]
