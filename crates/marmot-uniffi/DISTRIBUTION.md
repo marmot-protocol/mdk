@@ -4,7 +4,9 @@ MarmotKit releases publish generated Swift/Kotlin APIs with matching native libr
 assets. Apple consumers use a binary-target XCFramework ZIP, generated Swift, and a separate SDK privacy manifest.
 Android consumers unpack the Kotlin and JNI bundle into their app build.
 
-The shared Apple Swift asset includes MDK's
+The shared Apple Swift asset forwards Swift task cancellation from throwing async calls to their native futures,
+except calls whose work must finish, such as `shutdownAndClose()`, which still run to completion
+([threading model](README.md#threading-model)). It includes MDK's
 [`nextCancellable()` subscription adapters](API-REFERENCE.md#swift-cancellation-adapters).
 Remove any host-owned copy of `CancellablePresentedChatList.swift` when adopting this asset, or Swift
 will reject the duplicate methods. The existing Swift asset hash covers the generated bindings and adapters together;

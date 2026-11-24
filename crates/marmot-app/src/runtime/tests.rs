@@ -3586,6 +3586,45 @@ async fn open_runtime_local_test_client(
         .expect("open local test client")
 }
 
+/// Running sessions follow the stored audit-log switch, whatever order the
+/// applies of overlapping `set_audit_log_settings` calls reach them in. A
+/// cancelled call keeps running, so an older enable can land after a newer
+/// disable; it must not turn recording back on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_recording_follows_the_stored_switch_when_applies_land_out_of_order() {
+    use marmot_forensics::ForensicRecorder as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home().create_account("alice").unwrap();
+    let runtime = app.runtime();
+    let manager = runtime.accounts();
+    manager.worker_commands("alice").await.unwrap();
+    let recording = || {
+        app.audit_recorder_slot("alice")
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(marmot_forensics::WeakRecorder::upgrade)
+            .is_some_and(|recorder| recorder.is_enabled())
+    };
+
+    runtime
+        .set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .await
+        .unwrap();
+    assert!(recording());
+    // The newer disable is stored; the older enable's apply arrives after it.
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: false })
+        .unwrap();
+    manager.apply_audit_recording_to_workers().await;
+    assert!(
+        !recording(),
+        "a late enable reopened the recorder after a disable"
+    );
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_startup_is_reaped() {
     let dir = tempfile::tempdir().unwrap();

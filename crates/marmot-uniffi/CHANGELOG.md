@@ -4,12 +4,20 @@
 
 ### Breaking changes
 
+- Swift: cancelling a `Task` that awaits a throwing async call, a command or a receive, now cancels its native future
+  and throws `CancellationError` (mdk#3670). Before, the call ran to completion and returned its result. A call that
+  completed first still returns its result, and calls whose work must finish, such as `shutdownAndClose()`,
+  `removeAccount()`, `signOut()`, `signOutAndWipe()` and the `login*` calls, still wait. The four projection `nextCancellable()` adapters now report a native error that
+  completed before the cancel instead of `CancellationError`.
 - `TimelineUpdateTriggerFfi::AgentActivity` becomes `AgentItem` and `AgentOperation` is removed;
   `NotificationTrafficClassFfi::AgentActivity` is removed. An agent item notifies as `Standard` only while it is a
   waiting approval or question, or a failed turn.
 
 ### Added
 
+- Swift `nextCancellable()` / `nextUpdateCancellable()` adapters for the receives generated without `throws`:
+  backup restore, chat list, chats, events, group state, messages, notifications, onboarding, timeline messages and
+  user search subscriptions (mdk#3670).
 - `TimelineMessageRecordFfi::agent_item_first_event_missing`: true for an agent item whose first event this device
   does not hold, such as one that began before the member joined; the row is built from its edits.
 - `TimelineMessageRecordFfi::agent_item` (`AgentItemFfi`, `AgentItemStateFfi`): the latest version of a kind-1201
@@ -22,6 +30,13 @@
 
 ### Fixed
 
+- `sign_out`, `sign_in_account`, `remove_account`, `login`, `login_external_signer`,
+  `login_recovering_incomplete_setup`, `set_audit_log_settings` and `nip46_remove` keep running when their call is
+  cancelled, on Kotlin and Swift (mdk#3670). A cancel between their steps could leave a withdrawn KeyPackage slot on
+  a signed-in account, a paused setup that sign-in never resumed, an account whose moderation reports were already
+  purged, a half-imported account that a retry rejects as existing, a worker still using a removed signer, or running
+  sessions that disagree with the stored audit-log switch. Running sessions now apply the stored audit-log switch, so
+  overlapping `set_audit_log_settings` calls end with the last stored value.
 - An admin's own message deletion now reports `deletionSource: Author`, and a member added back to a chat after being
   removed or leaving gets a "member added" `groupSystem` row naming who added them.
 

@@ -909,8 +909,9 @@ pub(crate) enum AccountWorkerCommand {
         path: std::path::PathBuf,
         respond: oneshot::Sender<Result<bool, AppError>>,
     },
-    SetAuditRecording {
-        enabled: bool,
+    /// Apply the stored audit-log switch. The worker reads it rather than
+    /// taking a value, so overlapping callers end with the last stored one.
+    ApplyAuditLogSetting {
         respond: oneshot::Sender<Result<(), AppError>>,
     },
     #[cfg(test)]
@@ -8106,9 +8107,14 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
             true
         }),
-        AccountWorkerCommand::SetAuditRecording { enabled, respond } => Box::pin(async move {
-            client.set_audit_recording(enabled);
-            let _ = reply(respond, Ok(()), client);
+        AccountWorkerCommand::ApplyAuditLogSetting { respond } => Box::pin(async move {
+            let result = client.app.audit_log_settings().map(|settings| {
+                if marmot_forensics::ForensicRecorder::is_enabled(&client.audit) != settings.enabled
+                {
+                    client.set_audit_recording(settings.enabled);
+                }
+            });
+            let _ = reply(respond, result, client);
             true
         }),
     }

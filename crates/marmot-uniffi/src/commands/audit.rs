@@ -23,7 +23,10 @@ impl Marmot {
     ///
     /// Async because toggling the switch is applied to any already-running
     /// account sessions in place: enabling starts a live recorder, disabling
-    /// stops it and closes the file — no session reopen required.
+    /// stops it and closes the file — no session reopen required. It keeps
+    /// running when the call is cancelled, so running sessions always follow
+    /// the stored switch.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn set_audit_log_settings(
         &self,
         settings: AuditLogSettingsFfi,
