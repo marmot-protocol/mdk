@@ -321,7 +321,7 @@ async fn broadcasts_follow_their_schedule_and_withdrawals_owe_again() {
     let phone_app = devices.phone_app.clone();
     let storage = || phone_app.account_storage("alice").unwrap().app_storage();
     let phone = &mut devices.phone;
-    let (group, _) = phone.trusted_device_roster().unwrap().unwrap();
+    let (group, roster) = phone.trusted_device_roster().unwrap().unwrap();
     let tip = phone_app
         .account_storage("alice")
         .unwrap()
@@ -338,7 +338,11 @@ async fn broadcasts_follow_their_schedule_and_withdrawals_owe_again() {
     phone.begin_small_state_broadcast_when_due(now).unwrap();
     assert_eq!(
         schedule().last_broadcast,
-        Some(SmallStateBroadcast { at: now, tip })
+        Some(SmallStateBroadcast {
+            at: now,
+            tip,
+            devices: crate::small_state::broadcast_devices(&roster),
+        })
     );
     phone.begin_small_state_broadcast_when_due(now + 1).unwrap();
     assert_eq!(schedule().last_broadcast.unwrap().at, now);
@@ -394,6 +398,33 @@ async fn broadcasts_follow_their_schedule_and_withdrawals_owe_again() {
         phone
             .small_state_message_withdrawn(&elsewhere, KIND_SMALL_STATE_UPDATE)
             .is_err()
+    );
+
+    // A decision read from an update sent before the last broadcast began
+    // is owed again: a device that broadcast was made for may have joined
+    // since, and that broadcast did not carry it (mdk#3556). One sent at the
+    // broadcast's tip or later reached every device it was made for.
+    let tip = schedule().last_broadcast.unwrap().tip;
+    let decision = |chat: &str| storage_sqlite::InvitationDecision {
+        group_id_hex: chat.repeat(16),
+        generation: [7; 32],
+        version: 1,
+        declined: false,
+    };
+    let update = |decision| {
+        crate::small_state::encode_invitation_decision_updates(&[decision])
+            .remove(0)
+            .0
+    };
+    phone
+        .receive_small_state_update(&group, tip, &update(decision("0b")))
+        .unwrap();
+    phone
+        .receive_small_state_update(&group, tip - 1, &update(decision("0c")))
+        .unwrap();
+    assert_eq!(
+        storage().unsent_invitation_decisions().unwrap(),
+        vec![decision("0c")]
     );
 }
 
@@ -697,6 +728,7 @@ async fn an_update_that_reached_no_one_is_sent_again() {
 
     devices.phone.run_due_maintenance().await.unwrap();
     assert!(storage().unsent_small_state_items().unwrap().is_empty());
+
     deliver_all(&mut devices.laptop, &devices.relay).await;
     let held = devices
         .laptop

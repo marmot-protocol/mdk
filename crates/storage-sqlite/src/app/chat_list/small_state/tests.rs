@@ -187,7 +187,8 @@ fn nothing_is_recorded_or_applied_before_small_state_starts() {
     assert_eq!(app.small_state_schedule().unwrap(), None);
     app.owe_small_state_broadcast_request().unwrap();
     app.owe_small_state_broadcast_answer().unwrap();
-    app.begin_small_state_broadcast(100, 4).unwrap();
+    app.begin_small_state_broadcast(100, 4, &BTreeMap::new())
+        .unwrap();
     assert_eq!(app.small_state_schedule().unwrap(), None);
 
     // Starting owes a broadcast request, and no broadcast has been made.
@@ -359,27 +360,39 @@ fn a_broadcast_owes_every_item_and_answers_requests_read_before_it() {
         })
     );
 
-    // A broadcast owes every item held, keeps when and at which tip it
-    // began, and answers the request.
-    app.begin_small_state_broadcast(100, 4).unwrap();
+    // A broadcast owes every item held, keeps when, at which tip and for
+    // which devices it began, and answers the request.
+    let phone_and_laptop = BTreeMap::from([([1; 32], 10), ([2; 32], 20)]);
+    app.begin_small_state_broadcast(100, 4, &phone_and_laptop)
+        .unwrap();
     assert_eq!(app.unsent_small_state_items().unwrap().len(), 2);
     assert_eq!(
         app.small_state_schedule().unwrap(),
         Some(SmallStateSchedule {
-            last_broadcast: Some(SmallStateBroadcast { at: 100, tip: 4 }),
+            last_broadcast: Some(SmallStateBroadcast {
+                at: 100,
+                tip: 4,
+                devices: phone_and_laptop,
+            }),
             request_owed: false,
             answer_owed: false,
         })
     );
 
     // A withdrawn request is owed again; a later broadcast replaces the
-    // earlier one.
+    // earlier one, its devices with it.
     app.owe_small_state_broadcast_request().unwrap();
-    app.begin_small_state_broadcast(200, 9).unwrap();
+    let phone_and_relinked_laptop = BTreeMap::from([([1; 32], 10), ([2; 32], 30)]);
+    app.begin_small_state_broadcast(200, 9, &phone_and_relinked_laptop)
+        .unwrap();
     assert_eq!(
         app.small_state_schedule().unwrap(),
         Some(SmallStateSchedule {
-            last_broadcast: Some(SmallStateBroadcast { at: 200, tip: 9 }),
+            last_broadcast: Some(SmallStateBroadcast {
+                at: 200,
+                tip: 9,
+                devices: phone_and_relinked_laptop,
+            }),
             request_owed: true,
             answer_owed: false,
         })

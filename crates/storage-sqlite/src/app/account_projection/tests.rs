@@ -5214,7 +5214,8 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
     let kept_choice = app
         .record_invitation_decision("bb", [4; 32], false)
         .unwrap();
-    app.begin_small_state_broadcast(12, 7).unwrap();
+    app.begin_small_state_broadcast(12, 7, &Default::default())
+        .unwrap();
     app.mark_small_state_sent(&kept_items).unwrap();
     app.mark_invitation_decisions_sent(std::slice::from_ref(&kept_choice))
         .unwrap();

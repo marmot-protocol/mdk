@@ -11,8 +11,10 @@
 //!
 //! Recovery is a broadcast of every item this device holds, as updates: at
 //! start, at least daily, whenever the device group's tip has moved past the
-//! app-payload window since the last one, and in answer to a sibling's
-//! broadcast request. Nothing tracks what a sibling holds.
+//! app-payload window since the last one, at once for a device the roster
+//! lists that the last one was not made for, and in answer to a sibling's
+//! broadcast request. Only which devices the last broadcast was made for is
+//! kept, not what each one holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,8 +25,9 @@ use storage_sqlite::{SmallStateItem, SmallStateItemName};
 use super::AppClient;
 use crate::small_state::{
     BROADCAST_REQUEST, KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE,
-    SmallStateMergeRule, broadcast_due, decode_broadcast_request, decode_invitation_decisions,
-    decode_small_state_update, encode_invitation_decision_updates, encode_small_state_update,
+    SmallStateMergeRule, broadcast_devices, broadcast_due, decode_broadcast_request,
+    decode_invitation_decisions, decode_small_state_update, encode_invitation_decision_updates,
+    encode_small_state_update,
 };
 use crate::{AppError, AppProjectionUpdate, ChatListUpdateTrigger, MarmotApp, unix_now_seconds};
 
@@ -74,16 +77,11 @@ impl AppClient {
             return Ok(());
         };
         let mut sent = 0;
-        for (content, carried) in encode_small_state_update(&storage.unsent_small_state_items()?) {
-            if !self
-                .send_device_group_message(&group_id, KIND_SMALL_STATE_UPDATE, content)
-                .await?
-            {
-                return Ok(());
-            }
-            storage.mark_small_state_sent(&carried)?;
-            sent += 1;
-        }
+        // Invitation decisions first: a sibling Add waits on them (mdk#3556),
+        // and a page of other items no relay takes must not hold them back.
+        // A page the session holds, queued or unacknowledged, counts as sent,
+        // as for other items: while no relay is up the Add can then go ahead
+        // before the decision lands, until the session's retry delivers it.
         for (content, carried) in
             encode_invitation_decision_updates(&storage.unsent_invitation_decisions()?)
         {
@@ -94,6 +92,16 @@ impl AppClient {
                 return Ok(());
             }
             storage.mark_invitation_decisions_sent(&carried)?;
+            sent += 1;
+        }
+        for (content, carried) in encode_small_state_update(&storage.unsent_small_state_items()?) {
+            if !self
+                .send_device_group_message(&group_id, KIND_SMALL_STATE_UPDATE, content)
+                .await?
+            {
+                return Ok(());
+            }
+            storage.mark_small_state_sent(&carried)?;
             sent += 1;
         }
         let requested = schedule.request_owed
@@ -128,7 +136,7 @@ impl AppClient {
         if !self.app.device_groups_enabled() {
             return Ok(());
         }
-        let Some(group_id) = self.trusted_device_group()? else {
+        let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Ok(());
         };
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
@@ -139,8 +147,8 @@ impl AppClient {
             return Ok(());
         };
         let window = CanonicalizationPolicy::default().app_message_past_epoch_limit;
-        if broadcast_due(&schedule, now, tip, window) {
-            storage.begin_small_state_broadcast(now, tip)?;
+        if broadcast_due(&schedule, now, tip, window, &roster) {
+            storage.begin_small_state_broadcast(now, tip, &broadcast_devices(&roster))?;
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "begin_small_state_broadcast_when_due",
@@ -289,23 +297,31 @@ impl AppClient {
         Ok(())
     }
 
-    /// Merge an update's items, from any device of the trusted device group:
-    /// membership is the authentication, so no sender is read.
+    /// Merge an update's items, sent at `epoch` of the device group, from
+    /// any device of the trusted device group: membership is the
+    /// authentication, so no sender is read.
     pub(crate) fn receive_small_state_update(
         &mut self,
         group_id: &GroupId,
+        epoch: u64,
         content: &str,
     ) -> Result<(), AppError> {
         self.ensure_small_state_group(group_id)?;
         let items = decode_small_state_update(content)?;
         let invitations = decode_invitation_decisions(content)?;
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        // An update from before this device's last broadcast began did not
+        // reach a device that joined since, and that broadcast did not carry
+        // what it brings: a winning decision from it is owed again, as a
+        // sibling Add waits on it (mdk#3556).
+        let older_than_broadcast = storage
+            .small_state_schedule()?
+            .and_then(|schedule| schedule.last_broadcast)
+            .is_some_and(|last| epoch < last.tip);
         // A sibling's winning decision is applied on the worker's next turn,
         // not at the next maintenance pass (mdk#3566).
-        self.invitation_decisions_changed |= self
-            .app
-            .account_storage(&self.state.label)?
-            .app_storage()
-            .merge_invitation_decisions(&invitations)?;
+        self.invitation_decisions_changed |=
+            storage.merge_invitation_decisions(&invitations, older_than_broadcast)?;
         self.sync_small_state(&items)
     }
 

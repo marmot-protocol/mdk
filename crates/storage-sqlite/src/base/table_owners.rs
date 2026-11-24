@@ -229,6 +229,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("secure_delete_checkpoint_intents", Side::App),
     ("seen_events", Side::App),
     ("sibling_welcomes_received", Side::App),
+    ("small_state_broadcast_devices", Side::App),
     ("small_state_items", Side::App),
     ("small_state_sync", Side::App),
     ("transport_reconciliation_items", Side::App),
