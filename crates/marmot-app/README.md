@@ -357,7 +357,8 @@ founding requirements, the start returns `AppError::IncompatibleKeyPackage` if r
 both completed. Otherwise it returns `AppError::DirectoryLookupIncomplete`. Either refusal creates no chat. The lookup
 is bounded: discovery reads the peer's relay lists on the configured directory relays and on every outbox the newest
 list names, and KeyPackage reads cover those outboxes plus at most eight more configured directory relays. A
-compatible KeyPackage published only elsewhere is not seen.
+compatible KeyPackage published only elsewhere is not seen. While this device has recorded a KeyPackage of the peer
+that those reads did not return and no deletion request covers, the start returns `AppError::DirectoryLookupIncomplete`.
 `start_direct_conversation` is the same call with default options, which leave disappearing messages disabled.
 
 There is no immutable cross-client DM provenance, so MDK cannot prove legacy groups eligible for automatic admin repair.

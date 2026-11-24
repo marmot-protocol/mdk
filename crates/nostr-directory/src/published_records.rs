@@ -607,31 +607,39 @@ impl KeyPackageJournalFence {
             .all(|replacement| replacement_allows(event_id, created_at, replacement))
     }
 
-    /// Whether the journal knows a publication that replaces this one in its
-    /// slot and knows no deletion of that replacement. Records that lack the
-    /// replacement then say nothing about what the account publishes there.
-    fn replaced_by_a_live_publication(&self, event_id: &str, slot: &str, created_at: u64) -> bool {
-        let replacements = self
-            .replacements
-            .iter()
-            .filter(|replacement| {
-                replacement.key_package_id == slot
-                    && !replacement_allows(event_id, created_at, replacement)
-            })
-            .map(|replacement| (&replacement.event_id_hex, replacement.event_created_at));
+    /// Whether the journal knows a publication, and no deletion of it, that
+    /// `read` holds neither itself nor a replacement of. `read` is each
+    /// publication's slot, event id and time. A lookup that missed one cannot
+    /// say what the account publishes in that slot.
+    fn knows_an_unread_publication(&self, read: &[(&str, &str, u64)]) -> bool {
+        let replacements = self.replacements.iter().map(|replacement| {
+            (
+                replacement.key_package_id.as_str(),
+                replacement.event_id_hex.as_str(),
+                replacement.event_created_at,
+            )
+        });
         // A replacement pruned from the journal's table stays as a barrier.
         let pruned = self
             .barriers
             .iter()
-            .filter(|barrier| {
-                barrier.kind == PublicKeyPackageBarrierKind::Replacement
-                    && barrier.key_package_id == slot
-                    && !barrier_allows(event_id, created_at, barrier)
-            })
-            .map(|barrier| (&barrier.event_id_hex, barrier.event_created_at));
-        replacements
-            .chain(pruned)
-            .any(|(replacement, published_at)| self.allows(replacement, slot, published_at))
+            .filter(|barrier| barrier.kind == PublicKeyPackageBarrierKind::Replacement)
+            .map(|barrier| {
+                (
+                    barrier.key_package_id.as_str(),
+                    barrier.event_id_hex.as_str(),
+                    barrier.event_created_at,
+                )
+            });
+        replacements.chain(pruned).any(|(slot, event_id, at)| {
+            self.allows(event_id, slot, at)
+                && !read.iter().any(|&(read_slot, read_id, read_at)| {
+                    read_slot == slot
+                        && (read_id == event_id
+                            || read_at > at
+                            || (read_at == at && read_id < event_id))
+                })
+        })
     }
 }
 
@@ -679,14 +687,14 @@ pub(crate) fn select_fenced_key_packages(
         newest_error,
         rejected_future,
         legacy_slots,
-        unread_replacement,
+        unread_publication,
     } = slot_candidates(account_id_hex, records, freshness, requirements, fence);
     if candidates.is_empty()
         && let Some(error) = newest_error
     {
         // A rejection describes the account's packages only when the records
-        // hold every slot's current publication.
-        if unread_replacement {
+        // hold every publication the journal knows is current.
+        if unread_publication {
             return Err(DirectoryError::DirectoryLookupIncomplete(
                 account_id_hex.to_owned(),
             ));
@@ -731,8 +739,9 @@ struct SlotCandidates {
     newest_error: Option<DirectoryError>,
     rejected_future: bool,
     legacy_slots: bool,
-    /// The journal knows a live replacement of some slot's newest record.
-    unread_replacement: bool,
+    /// No candidate was found, and the journal knows a current publication
+    /// the records lack.
+    unread_publication: bool,
 }
 
 fn slot_candidates(
@@ -754,7 +763,7 @@ fn slot_candidates(
     let mut newest_error = None;
     let mut slots = BTreeSet::new();
     let mut legacy_slots = false;
-    let mut unread_replacement = false;
+    let mut read = Vec::new();
     let mut candidates = Vec::new();
     for record in records {
         if !freshness.accepts(record) {
@@ -762,6 +771,7 @@ fn slot_candidates(
             continue;
         }
         let slot = record.event.tag_value("d").unwrap_or_default();
+        read.push((slot, record.event.id.as_str(), record.event.created_at));
         if !slot.is_empty() && !slots.insert(slot.to_owned()) {
             continue;
         }
@@ -771,17 +781,9 @@ fn slot_candidates(
             slot,
             record.event.created_at,
             &deletions,
-        ) {
-            continue;
-        }
-        if let Some(fence) = fence
-            && !fence.allows(&record.event.id, slot, record.event.created_at)
+        ) || fence
+            .is_some_and(|fence| !fence.allows(&record.event.id, slot, record.event.created_at))
         {
-            unread_replacement |= fence.replaced_by_a_live_publication(
-                &record.event.id,
-                slot,
-                record.event.created_at,
-            );
             continue;
         }
         let (fetched, metadata) = match key_package_and_metadata_from_borrowed_record(record) {
@@ -819,12 +821,14 @@ fn slot_candidates(
             key_package_ref,
         });
     }
+    let unread_publication = candidates.is_empty()
+        && fence.is_some_and(|fence| fence.knows_an_unread_publication(&read));
     SlotCandidates {
         candidates,
         newest_error,
         rejected_future,
         legacy_slots,
-        unread_replacement,
+        unread_publication,
     }
 }
 
@@ -1403,11 +1407,11 @@ pub(crate) fn watermark_allows(
 mod tests {
     use super::*;
 
-    /// A slot's older publication is hidden by a replacement the journal
-    /// knows, from its table or pruned to a barrier, until the journal also
-    /// knows that replacement deleted.
+    /// A lookup lacks a publication the journal knows, from its table or
+    /// pruned to a barrier, until the lookup reads it or a replacement of it,
+    /// or the journal knows it deleted.
     #[test]
-    fn a_fence_reports_a_replacement_until_it_is_deleted() {
+    fn a_fence_knows_a_publication_until_it_is_read_or_deleted() {
         let account = "aa".repeat(32);
         let (older, newer) = ("11".repeat(32), "22".repeat(32));
         let barrier = |kind, deleted_event_id| PublicKeyPackageBarrierRecord {
@@ -1437,18 +1441,20 @@ mod tests {
             event_id_hex: "33".repeat(32),
             ..barrier(PublicKeyPackageBarrierKind::Deletion, Some(newer.clone()))
         };
-        for (fence, hidden) in [
+        for (fence, unread) in [
             (fence(true, vec![]), true),
             (fence(false, vec![pruned]), true),
             (fence(true, vec![deletion]), false),
             (fence(false, vec![]), false),
         ] {
+            // Missing the slot or holding only an older copy leaves it unread.
+            assert_eq!(fence.knows_an_unread_publication(&[]), unread);
             assert_eq!(
-                fence.replaced_by_a_live_publication(&older, "slot", 10),
-                hidden
+                fence.knows_an_unread_publication(&[("slot", &older, 10), ("other", &newer, 30)]),
+                unread
             );
-            assert!(!fence.replaced_by_a_live_publication(&newer, "slot", 20));
-            assert!(!fence.replaced_by_a_live_publication(&older, "other", 10));
+            assert!(!fence.knows_an_unread_publication(&[("slot", &newer, 20)]));
+            assert!(!fence.knows_an_unread_publication(&[("slot", &older, 21)]));
         }
     }
 }

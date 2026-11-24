@@ -118,6 +118,31 @@ fn signed(
     NostrTransportEvent::from_nostr_event(&signed).unwrap()
 }
 
+/// Opens `account` so it publishes its own KeyPackage now, not when a later
+/// runtime starts, then records every publication the journal knows for it
+/// as deleted. A fixture's relays serve packages built for the test in place
+/// of the account's own, and the journal would otherwise still expect those.
+async fn retire_journaled_key_packages(app: &MarmotApp, account: &AccountSummary) {
+    drop(client_on_app_relay_plane(app, &account.label).await);
+    let storage = app.shared_storage().unwrap();
+    for publication in storage
+        .public_key_package_replacements(&account.account_id_hex)
+        .unwrap()
+    {
+        storage
+            .put_public_key_package_barrier(&storage_sqlite::PublicKeyPackageBarrierRecord {
+                account_id_hex: publication.account_id_hex,
+                key_package_id: publication.key_package_id,
+                event_id_hex: publication.event_id_hex.clone(),
+                deleted_event_id: Some(publication.event_id_hex),
+                event_created_at: publication.event_created_at,
+                observed_at: unix_now_seconds(),
+                kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
+            })
+            .unwrap();
+    }
+}
+
 fn slot_address(account: &AccountSummary, slot: &str) -> Vec<String> {
     vec![
         "a".into(),
@@ -1136,6 +1161,7 @@ async fn direct_start_outbox_fixture() -> (
         ("wss://shared.example".into(), known_records),
         (UPDATED_DIRECT_OUTBOX.into(), new_outbox_records),
     ]);
+    retire_journaled_key_packages(&app, &bob).await;
     (dir, app, bob, fetcher)
 }
 
@@ -1581,10 +1607,10 @@ async fn a_moved_outbox_cannot_revive_a_package_prewarm_saw_replaced() {
     app.close_storage().unwrap();
 }
 
-/// Prewarm sees a compatible package replace a slot. The recipient's outbox
-/// then moves, and the new one serves an older copy of that slot beside an
-/// incompatible slot. The journal bars the older copy, but the replacement it
-/// knows went unread, so the other slot's refusal is no verdict.
+/// Prewarm sees a compatible package in a slot. The recipient's outbox then
+/// moves, and the new one serves an incompatible slot beside an older copy of
+/// that slot, or without that slot at all. The package the journal knows went
+/// unread either way, so the other slot's refusal is no verdict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
@@ -1612,11 +1638,12 @@ async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
             }
         }
     }
+    let older = fresh_key_package_for_account(&app, &bob, false).await;
+    retire_journaled_key_packages(&app, &bob).await;
     app.directory()
         .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    let older = fresh_key_package_for_account(&app, &bob, false).await;
     {
         let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
         let records = by_endpoint.get_mut("wss://directory.example").unwrap();
@@ -1650,21 +1677,32 @@ async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
         updated.push(limited);
     }
     let runtime = MarmotAppRuntime::new(app.clone());
-    let error = runtime
-        .start_direct_conversation_with_options(
-            "alice",
-            &bob.account_id_hex,
-            crate::DirectConversationOptions {
-                disappearing_message_secs: 300,
-            },
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, AppError::DirectoryLookupIncomplete { .. }),
-        "{error}"
-    );
-    assert!(app.groups("alice").unwrap().is_empty());
+    for stale_served in [true, false] {
+        if !stale_served {
+            fetcher
+                .events_by_endpoint
+                .lock()
+                .unwrap()
+                .get_mut(UPDATED_DIRECT_OUTBOX)
+                .unwrap()
+                .retain(|event| event.tag_value("d") != Some("x"));
+        }
+        let error = runtime
+            .start_direct_conversation_with_options(
+                "alice",
+                &bob.account_id_hex,
+                crate::DirectConversationOptions {
+                    disappearing_message_secs: 300,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::DirectoryLookupIncomplete { .. }),
+            "stale copy served: {stale_served}: {error}"
+        );
+        assert!(app.groups("alice").unwrap().is_empty());
+    }
     runtime.shutdown().await;
     app.close_storage().unwrap();
 }
@@ -2430,6 +2468,7 @@ async fn incompatible_slot_is_skipped_for_create_and_invite() {
         .lock()
         .unwrap()
         .extend([white.clone(), fallback.clone()]);
+    retire_journaled_key_packages(&app, bob).await;
     let mut alice = client_on_app_relay_plane(&app, "alice").await;
     let group = alice
         .create_group("compatible creation", &[bob.account_id_hex.as_str()])
@@ -2490,20 +2529,38 @@ async fn incompatible_slot_is_skipped_for_create_and_invite() {
         .lock()
         .unwrap()
         .retain(|event| event.id != fallback.id);
-    let result = alice
-        .invite_members(&no_fallback, &[bob.account_id_hex.as_str()])
-        .await
-        .unwrap();
-    assert_eq!(result.operation, None);
-    assert_eq!(
-        result.member_outcomes,
-        vec![MemberResolutionOutcome {
-            account_id_hex: bob.account_id_hex.clone(),
-            status: MemberResolutionStatus::IncompatibleKeyPackage,
-            selected_device_count: 0,
-        }]
-    );
-    assert_eq!(alice.members(&no_fallback).unwrap().len(), 1);
+    // The journal still knows the package the relay dropped, so the lookup
+    // is incomplete until a deletion request accounts for it.
+    for (deleted, status) in [
+        (false, MemberResolutionStatus::Incomplete),
+        (true, MemberResolutionStatus::IncompatibleKeyPackage),
+    ] {
+        if deleted {
+            fetcher.events.lock().unwrap().push(signed_deletion(
+                &app,
+                bob,
+                vec![
+                    vec!["e".into(), fallback.id.clone()],
+                    vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+                ],
+                unix_now_seconds(),
+            ));
+        }
+        let result = alice
+            .invite_members(&no_fallback, &[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        assert_eq!(result.operation, None);
+        assert_eq!(
+            result.member_outcomes,
+            vec![MemberResolutionOutcome {
+                account_id_hex: bob.account_id_hex.clone(),
+                status,
+                selected_device_count: 0,
+            }]
+        );
+        assert_eq!(alice.members(&no_fallback).unwrap().len(), 1);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
