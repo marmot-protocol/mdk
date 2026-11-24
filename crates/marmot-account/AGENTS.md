@@ -16,7 +16,7 @@ account-device runtime is `marmot-session`'s. It must not own UI projection, not
 `marmot_account::Item` path. Source is split into focused modules:
 
 - `error.rs` — the `AccountHomeError` enum and the `AccountHomeResult` alias.
-- `home.rs` — `AccountHome` and `AccountSummary`; owns the account-record layout and signing-key lifecycle.
+- `home/account.rs` — `AccountHome` and `AccountSummary`; owns the account-record layout and signing-key lifecycle.
 - `nip49_export.rs` — NIP-49 `ncryptsec` export policy (fixed scrypt cost, non-empty passphrase, key-security byte);
   crypto is delegated to the upstream `nostr` crate. Do not hand-roll NIP-49 here.
 - `secret_store.rs` — `AccountSecretStore` trait with `LocalFileSecretStore` and `KeychainSecretStore`.

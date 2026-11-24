@@ -1,3 +1,74 @@
+#[derive(Clone, Copy)]
+enum AcquireFault {
+    BeforeWrite,
+    AfterWrite,
+}
+
+struct FaultAcquireStore {
+    inner: LocalFileSecretStore,
+    fault: Mutex<Option<AcquireFault>>,
+}
+
+impl AccountSecretStore for FaultAcquireStore {
+    fn cleanup_namespace(&self) -> AccountHomeResult<String> {
+        self.inner.cleanup_namespace()
+    }
+
+    fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
+        self.inner.has_secret_for_label(label)
+    }
+
+    fn has_secret_for_account_id(&self, account_id_hex: &str) -> AccountHomeResult<bool> {
+        self.inner.has_secret_for_account_id(account_id_hex)
+    }
+
+    fn acquire_secret(
+        &self,
+        credential: SecretCredential<'_>,
+        mode: SecretClaimMode,
+        proposed: Option<&nostr::prelude::Keys>,
+    ) -> AccountHomeResult<AcquiredSecret> {
+        let fault = if credential.kind == SecretCredentialKind::Nip46Session
+            && mode == SecretClaimMode::CreateOrAdopt
+        {
+            self.fault.lock().unwrap().take()
+        } else {
+            None
+        };
+        if matches!(fault, Some(AcquireFault::BeforeWrite)) {
+            return Err(AccountHomeError::SecretStore(
+                "injected unavailable vault before write".into(),
+            ));
+        }
+        let acquired = self.inner.acquire_secret(credential, mode, proposed)?;
+        if matches!(fault, Some(AcquireFault::AfterWrite)) {
+            return Err(AccountHomeError::SecretStore(
+                "injected unavailable vault after write".into(),
+            ));
+        }
+        Ok(acquired)
+    }
+
+    fn load_secret(
+        &self,
+        credential: SecretCredential<'_>,
+    ) -> AccountHomeResult<nostr::prelude::Keys> {
+        self.inner.load_secret(credential)
+    }
+
+    fn release_secret(
+        &self,
+        credential: SecretCredential<'_>,
+        mode: SecretReleaseMode,
+    ) -> AccountHomeResult<SecretReleaseOutcome> {
+        self.inner.release_secret(credential, mode)
+    }
+
+    fn reconcile_cleanup(&self) -> AccountHomeResult<()> {
+        self.inner.reconcile_cleanup()
+    }
+}
+
 struct MemorySecretStore {
     namespace: String,
     fail_namespace: AtomicBool,
