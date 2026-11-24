@@ -377,11 +377,8 @@ fn proven_records(
     let unproven = |record: &DirectoryRelayEventRecord| {
         freshness.accepts(record) && !proven.contains(&record.event.id)
     };
-    let alternate = records.iter().any(|record| {
-        record.event.kind == KIND_MARMOT_KEY_PACKAGE
-            && record.event.pubkey == account
-            && unproven(record)
-    });
+    // Every record left is one of the account's KeyPackages.
+    let alternate = records.iter().any(unproven);
     records.retain(|record| !unproven(record));
     RecoveredKeyPackageRecords {
         freshness,
