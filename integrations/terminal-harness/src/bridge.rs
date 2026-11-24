@@ -755,45 +755,6 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     };
     let known_session = ctx.sessions.get(&inbound.group_ref).await;
 
-    let goal = known_session
-        .as_ref()
-        .and_then(|record| record.goal.as_deref());
-    // Literal (`//`) forwards keep their exact bytes and carry no reply context.
-    // The turn holds the group lock now, so check the quote as it stands after
-    // any queue wait, for a first attempt and a retry alike.
-    let checked_reply = match inbound
-        .reply_to
-        .as_ref()
-        .filter(|_| add_control_instructions)
-    {
-        Some(snapshot) => {
-            Some(check_reply_target(&ctx, &inbound.account_ref, &inbound.group_ref, snapshot).await)
-        }
-        None => None,
-    };
-    let (rendered_reply, saved_reply) = checked_reply
-        .map(|checked| (checked.rendered, checked.saved))
-        .unzip();
-    let reply_context = rendered_reply.as_ref();
-    let (recovery_prompt, prompt) = prepare_prompt(goal, reply_context, prompt);
-    let recovery_prompt = RecoveryPrompt {
-        text: recovery_prompt,
-        omit_control_instructions: !add_control_instructions,
-        reply_to: saved_reply,
-    };
-
-    info!(
-        target: TRACE_TARGET,
-        method = "handle_message",
-        prompt_bytes = prompt.len(),
-        has_session = known_session
-            .as_ref()
-            .is_some_and(|record| !record.session_id.is_empty()),
-        has_goal = goal.is_some(),
-        has_reply_context = reply_context.is_some(),
-        "handling inbound prompt"
-    );
-
     let attachment_batch = match prepare_attachment_batch(&ctx, &inbound).await {
         Ok(batch) => batch,
         Err(err) => {
@@ -865,6 +826,46 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     let artifact_setup_failed =
         artifact_setup_failed || (artifact_authorization.is_some() && artifact_output.is_none());
     let buffer_text_for_artifacts = artifact_output.is_some();
+    let goal = known_session
+        .as_ref()
+        .and_then(|record| record.goal.as_deref());
+    // Literal (`//`) forwards keep their exact bytes and carry no reply context.
+    // Check the quote at the backend handoff, after any queue wait and after
+    // this turn's attachments are staged, for a first attempt and a retry alike:
+    // the group lock serializes turns, not timeline changes.
+    let checked_reply = match inbound
+        .reply_to
+        .as_ref()
+        .filter(|_| add_control_instructions)
+    {
+        Some(snapshot) => {
+            Some(check_reply_target(&ctx, &inbound.account_ref, &inbound.group_ref, snapshot).await)
+        }
+        None => None,
+    };
+    let (rendered_reply, saved_reply) = checked_reply
+        .map(|checked| (checked.rendered, checked.saved))
+        .unzip();
+    let reply_context = rendered_reply.as_ref();
+    let (recovery_prompt, prompt) = prepare_prompt(goal, reply_context, prompt);
+    let recovery_prompt = RecoveryPrompt {
+        text: recovery_prompt,
+        omit_control_instructions: !add_control_instructions,
+        reply_to: saved_reply,
+    };
+
+    info!(
+        target: TRACE_TARGET,
+        method = "handle_message",
+        prompt_bytes = prompt.len(),
+        has_session = known_session
+            .as_ref()
+            .is_some_and(|record| !record.session_id.is_empty()),
+        has_goal = goal.is_some(),
+        has_reply_context = reply_context.is_some(),
+        "handling inbound prompt"
+    );
+
     let invocation = Invocation {
         timeout: ctx.cfg.backend_timeout,
         idle_timeout: ctx.cfg.backend_idle_timeout,
@@ -3602,6 +3603,60 @@ mod tests {
         Unreachable,
     }
 
+    /// The `TimelineMessageGet` answer `targets` gives for one message.
+    fn timeline_message_answer(
+        targets: &ReplyTargets,
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+    ) -> AgentControlResponse {
+        let target = targets
+            .lock()
+            .unwrap()
+            .get(&message_id_hex)
+            .copied()
+            .unwrap_or(ReplyTargetNow::Available);
+        let availability = match target {
+            ReplyTargetNow::Available => Some(AgentControlTimelineMessageAvailability::Available),
+            ReplyTargetNow::Deleted => Some(AgentControlTimelineMessageAvailability::Deleted),
+            ReplyTargetNow::Invalidated => {
+                Some(AgentControlTimelineMessageAvailability::Invalidated)
+            }
+            ReplyTargetNow::Missing | ReplyTargetNow::Unreachable => None,
+        };
+        if matches!(target, ReplyTargetNow::Unreachable) {
+            AgentControlResponse::Error {
+                code: "unavailable".to_owned(),
+                message: "timeline unavailable".to_owned(),
+                retryable: true,
+            }
+        } else {
+            AgentControlResponse::TimelineMessage {
+                account_id_hex,
+                group_id_hex,
+                message: availability.map(|availability| {
+                    agent_control::AgentControlTimelineMessage {
+                        message_id_hex: message_id_hex.clone(),
+                        sender: test_reply("").sender.unwrap(),
+                        direction: "inbound".to_owned(),
+                        kind: 9,
+                        recorded_at: 1_700_000_000,
+                        observed_at: 1_700_000_000,
+                        availability,
+                        text: None,
+                        text_truncated: false,
+                        reply_to_message_id_hex: None,
+                        attachments: Vec::new(),
+                        attachments_truncated: false,
+                        reactions: Vec::new(),
+                        reactions_truncated: false,
+                    }
+                }),
+                message_id_hex,
+            }
+        }
+    }
+
     /// Answers `SendFinal`, and `TimelineMessageGet` as `targets` says at the
     /// time of the request.
     fn spawn_final_server_with_reply_targets(
@@ -3625,57 +3680,12 @@ mod tests {
                         account_id_hex,
                         group_id_hex,
                         message_id_hex,
-                    } => {
-                        let target = targets
-                            .lock()
-                            .unwrap()
-                            .get(&message_id_hex)
-                            .copied()
-                            .unwrap_or(ReplyTargetNow::Available);
-                        let availability = match target {
-                            ReplyTargetNow::Available => {
-                                Some(AgentControlTimelineMessageAvailability::Available)
-                            }
-                            ReplyTargetNow::Deleted => {
-                                Some(AgentControlTimelineMessageAvailability::Deleted)
-                            }
-                            ReplyTargetNow::Invalidated => {
-                                Some(AgentControlTimelineMessageAvailability::Invalidated)
-                            }
-                            ReplyTargetNow::Missing | ReplyTargetNow::Unreachable => None,
-                        };
-                        if matches!(target, ReplyTargetNow::Unreachable) {
-                            AgentControlResponse::Error {
-                                code: "unavailable".to_owned(),
-                                message: "timeline unavailable".to_owned(),
-                                retryable: true,
-                            }
-                        } else {
-                            AgentControlResponse::TimelineMessage {
-                                account_id_hex,
-                                group_id_hex,
-                                message: availability.map(|availability| {
-                                    agent_control::AgentControlTimelineMessage {
-                                        message_id_hex: message_id_hex.clone(),
-                                        sender: test_reply("").sender.unwrap(),
-                                        direction: "inbound".to_owned(),
-                                        kind: 9,
-                                        recorded_at: 1_700_000_000,
-                                        observed_at: 1_700_000_000,
-                                        availability,
-                                        text: None,
-                                        text_truncated: false,
-                                        reply_to_message_id_hex: None,
-                                        attachments: Vec::new(),
-                                        attachments_truncated: false,
-                                        reactions: Vec::new(),
-                                        reactions_truncated: false,
-                                    }
-                                }),
-                                message_id_hex,
-                            }
-                        }
-                    }
+                    } => timeline_message_answer(
+                        &targets,
+                        account_id_hex,
+                        group_id_hex,
+                        message_id_hex,
+                    ),
                     other => panic!("unexpected control request {other:?}"),
                 };
                 let response = AgentControlEnvelope::request(request.id, payload);
@@ -4596,6 +4606,172 @@ mod tests {
             expected_reply_prompt(&reply, "ordinary task")
         );
         drop(invocations);
+        server.abort();
+    }
+
+    /// Answers `SendFinal` and `TimelineMessageGet` like
+    /// [`spawn_final_server_with_reply_targets`], and serves one media
+    /// download that deletes `deleted_by_staging` while the attachment stages.
+    fn spawn_staging_server(
+        socket: &std::path::Path,
+        download: DownloadedMedia,
+        targets: ReplyTargets,
+        deleted_by_staging: String,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let mut download = Some(download);
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let request: AgentControlEnvelope<AgentControlRequest> =
+                    read_envelope(&mut reader).await.unwrap().unwrap();
+                let payload = match request.payload {
+                    AgentControlRequest::DownloadMedia { .. } => {
+                        targets
+                            .lock()
+                            .unwrap()
+                            .insert(deleted_by_staging.clone(), ReplyTargetNow::Deleted);
+                        let downloaded = download.take().expect("one media download");
+                        AgentControlResponse::MediaDownloaded {
+                            path: downloaded.path.to_string_lossy().into_owned(),
+                            media_type: downloaded.media_type,
+                            file_name: downloaded.file_name,
+                            size_bytes: downloaded.size_bytes,
+                        }
+                    }
+                    AgentControlRequest::SendFinal { .. } => AgentControlResponse::FinalSent {
+                        message_ids_hex: vec!["reply".to_owned()],
+                        maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+                    },
+                    AgentControlRequest::TimelineMessageGet {
+                        account_id_hex,
+                        group_id_hex,
+                        message_id_hex,
+                    } => timeline_message_answer(
+                        &targets,
+                        account_id_hex,
+                        group_id_hex,
+                        message_id_hex,
+                    ),
+                    other => panic!("unexpected control request {other:?}"),
+                };
+                let response = AgentControlEnvelope::request(request.id, payload);
+                write_frame(&mut write_half, &response).await.unwrap();
+            }
+        })
+    }
+
+    /// Records each prompt and how many attachments came with it.
+    #[derive(Default)]
+    struct PromptAndAttachmentsBackend {
+        turns: Mutex<Vec<(String, usize)>>,
+    }
+
+    #[async_trait]
+    impl Backend for PromptAndAttachmentsBackend {
+        async fn run(
+            &self,
+            invocation: Invocation,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            self.turns.lock().await.push((invocation.prompt, 0));
+            Ok(Outcome {
+                observed_session: Some("backend-session".to_owned()),
+                exit_code: Some(0),
+                error_summary: None,
+                no_side_effects_proven: false,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
+
+        async fn run_with_attachments(
+            &self,
+            invocation: Invocation,
+            attachments: Vec<Attachment>,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            self.turns
+                .lock()
+                .await
+                .push((invocation.prompt, attachments.len()));
+            Ok(Outcome {
+                observed_session: Some("backend-session".to_owned()),
+                exit_code: Some(0),
+                error_summary: None,
+                no_side_effects_proven: false,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
+    }
+
+    /// The quoted message is deleted while the reply's own attachment downloads.
+    /// The check runs at the backend handoff, after staging, so the backend gets
+    /// the target's ID and attribution with no excerpt or attachment metadata.
+    #[tokio::test]
+    async fn a_reply_target_deleted_while_attachments_stage_sends_attribution_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let source = root.path().join("source.png");
+        fs::write(&source, b"photo").unwrap();
+        let mut permissions = fs::metadata(&source).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&source, permissions).unwrap();
+        let config = test_config(root.path());
+        let mut reply = test_reply("the secret plan");
+        reply.attachments = vec![agent_control::AgentControlAttachmentSummary {
+            media_type: "image/png".to_owned(),
+            file_name: "diagram.png".to_owned(),
+            dim: None,
+        }];
+        let server = spawn_staging_server(
+            &config.socket,
+            DownloadedMedia {
+                path: source,
+                media_type: "image/png".to_owned(),
+                file_name: "photo.png".to_owned(),
+                size_bytes: 5,
+            },
+            ReplyTargets::default(),
+            reply.message_id_hex.clone(),
+        );
+        let backend = Arc::new(PromptAndAttachmentsBackend::default());
+        let ctx = test_context_with_backend(root.path(), &home, config, backend.clone());
+
+        assert!(
+            dispatch_test_inbound(
+                ctx,
+                "message",
+                "is this the one?",
+                vec![test_media_ref("photo")],
+                Some(reply.clone()),
+            )
+            .await
+        );
+
+        let turns = backend.turns.lock().await;
+        assert_eq!(turns.len(), 1);
+        let (prompt, attachments) = &turns[0];
+        assert_eq!(
+            *attachments, 1,
+            "the reply's own attachment still reaches the backend"
+        );
+        let mut expected = reply;
+        expected.availability = AgentControlReferencedMessageAvailability::Deleted;
+        expected.text_excerpt = None;
+        expected.attachments.clear();
+        assert_eq!(
+            *prompt,
+            expected_reply_prompt(&expected, "is this the one?")
+        );
+        assert!(!prompt.contains("the secret plan") && !prompt.contains("diagram.png"));
+        drop(turns);
         server.abort();
     }
 
