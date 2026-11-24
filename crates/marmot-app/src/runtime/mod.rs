@@ -3934,18 +3934,14 @@ impl MarmotAppRuntime {
     /// Persist the local forensic audit-logging switch and apply it to any
     /// already-running sessions in place (no reopen): enabling installs a live
     /// recorder, disabling swaps in a no-op recorder and closes the file.
+    /// Sessions apply the stored switch, so overlapping calls end with the last
+    /// stored value whatever order their applies reach a session in.
     pub async fn set_audit_log_settings(
         &self,
         settings: AuditLogSettings,
     ) -> Result<AuditLogSettings, AppError> {
-        let previous = self.accounts.app.audit_log_settings().ok();
         let stored = self.accounts.app.set_audit_log_settings(settings)?;
-        let enabled_changed = previous.as_ref().map(|s| s.enabled) != Some(stored.enabled);
-        if enabled_changed {
-            self.accounts
-                .apply_audit_recording_to_workers(stored.enabled)
-                .await;
-        }
+        self.accounts.apply_audit_recording_to_workers().await;
         Ok(stored)
     }
 
@@ -8459,7 +8455,7 @@ impl AccountManager {
     /// next open, and per-worker send/response failures are ignored (the
     /// recorder is a non-fatal debug aid). The global flag is already persisted
     /// by the caller; this only updates live sessions.
-    async fn apply_audit_recording_to_workers(&self, enabled: bool) {
+    async fn apply_audit_recording_to_workers(&self) {
         let commands = {
             let workers = self.workers.lock().await;
             workers
@@ -8470,7 +8466,7 @@ impl AccountManager {
         for command in commands {
             let (respond, response) = oneshot::channel();
             if command
-                .send(AccountWorkerCommand::SetAuditRecording { enabled, respond })
+                .send(AccountWorkerCommand::ApplyAuditLogSetting { respond })
                 .await
                 .is_ok()
             {

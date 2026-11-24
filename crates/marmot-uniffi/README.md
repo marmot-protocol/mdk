@@ -490,9 +490,10 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
   `Dispatchers.Main` does not run MDK work on the UI thread. Cancelling a Kotlin coroutine frees
   the call, which aborts the task at its next suspension point. Calls whose work must finish keep
   running regardless, and their docs say so: `shutdownAndClose()`, `removeAccount()`, `signOut()`,
-  `signOutAndWipe()`, `login()`, `loginExternalSigner()`, `loginRecoveringIncompleteSetup()`,
-  `setAuditLogSettings()`, `releaseAttachmentHandoff()`, `startDirectConversation*`, and Nip46
-  `approvePermissions()` and `logout()`. Cancelling a Swift `Task` awaiting any other throwing call
+  `signOutAndWipe()`, `signInAccount()`, `login()`, `loginExternalSigner()`,
+  `loginRecoveringIncompleteSetup()`, `setAuditLogSettings()`, `nip46Remove()`,
+  `releaseAttachmentHandoff()`, `startDirectConversation*`, and Nip46 `approvePermissions()` and
+  `logout()`. Cancelling a Swift `Task` awaiting any other throwing call
   does the same and throws `CancellationError`. Swift still waits for the result of those must-finish
   calls, even from a cancelled task, and of non-throwing methods: several subscription receives
   (which have throwing [adapters](API-REFERENCE.md#swift-cancellation-adapters)), `relayHealth()`,

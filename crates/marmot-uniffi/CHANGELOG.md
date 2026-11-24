@@ -30,11 +30,13 @@
 
 ### Fixed
 
-- `sign_out`, `remove_account`, `login`, `login_external_signer`, `login_recovering_incomplete_setup` and
-  `set_audit_log_settings` keep running when their call is cancelled, on Kotlin and Swift (mdk#3670). A cancel
-  between their steps could leave a withdrawn KeyPackage slot on a signed-in account, an account whose moderation
-  reports were already purged, a half-imported account that a retry rejects as existing, or running sessions that
-  disagree with the stored audit-log switch.
+- `sign_out`, `sign_in_account`, `remove_account`, `login`, `login_external_signer`,
+  `login_recovering_incomplete_setup`, `set_audit_log_settings` and `nip46_remove` keep running when their call is
+  cancelled, on Kotlin and Swift (mdk#3670). A cancel between their steps could leave a withdrawn KeyPackage slot on
+  a signed-in account, a paused setup that sign-in never resumed, an account whose moderation reports were already
+  purged, a half-imported account that a retry rejects as existing, a worker still using a removed signer, or running
+  sessions that disagree with the stored audit-log switch. Running sessions now apply the stored audit-log switch, so
+  overlapping `set_audit_log_settings` calls end with the last stored value.
 - An admin's own message deletion now reports `deletionSource: Author`, and a member added back to a chat after being
   removed or leaving gets a "member added" `groupSystem` row naming who added them.
 
