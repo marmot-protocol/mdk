@@ -3,49 +3,7 @@ import MarmotKit
 import XCTest
 import marmot_uniffiFFI
 
-// Test-only plaintext storage. Keep the same instance when reopening its root.
-private final class MemorySecretStore: SecretStore, @unchecked Sendable {
-  private struct Credential {
-    let label: String
-    let secret: String
-  }
 
-  private let lock = NSLock()
-  private var credentials: [String: Credential] = [:]
-
-  func hasSecretForLabel(label: String) throws -> Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return credentials.values.contains { $0.label == label }
-  }
-
-  func hasSecretForAccountId(accountIdHex: String) throws -> Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return credentials[accountIdHex] != nil
-  }
-
-  func writeSecret(label: String, accountIdHex: String, secretKeyHex: String) throws {
-    lock.lock()
-    defer { lock.unlock() }
-    credentials[accountIdHex] = Credential(label: label, secret: secretKeyHex)
-  }
-
-  func loadSecret(label: String, accountIdHex: String) throws -> String {
-    lock.lock()
-    defer { lock.unlock() }
-    guard let credential = credentials[accountIdHex], credential.label == label else {
-      throw MarmotKitError.SecretNotFound(details: "Synthetic test credential missing")
-    }
-    return credential.secret
-  }
-
-  func removeSecret(label: String, accountIdHex: String) throws {
-    lock.lock()
-    defer { lock.unlock() }
-    credentials.removeValue(forKey: accountIdHex)
-  }
-}
 
 private enum SmokeError: Error {
   case setup(String)

@@ -7498,7 +7498,6 @@ impl AccountManager {
                 // or async cleanup runs while this account gate is held.
                 let gate = self.shared.local_submission_gate(&account.account_id_hex);
                 let _admission = gate.lock().await;
-                self.erase_nip46_session(&account.label, Nip46Removal::Recorded)?;
                 self.app.drop_account_caches(&account.label);
                 self.app
                     .remove_account_key_package_artifacts(&account.label)?;
@@ -7521,6 +7520,17 @@ impl AccountManager {
                     // new link under this id publishes.
                     self.app
                         .forget_unlinked_publish_stop(&account.account_id_hex);
+                    let session = self
+                        .app
+                        .nip46_sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&account.account_id_hex)
+                        .cloned();
+                    self.app.forget_external_signer(&account.account_id_hex);
+                    if let Some(session) = session {
+                        session.forget_binding()?;
+                    }
                 }
                 removed?;
             }
@@ -7531,12 +7541,6 @@ impl AccountManager {
                 let _ = task.await;
             }
             self.clear_startup_retry(&account.account_id_hex);
-            // The account no longer exists on this device, so the host callback
-            // handle it registered must not outlive it. This runs only after
-            // the removal commit point: a removal that failed leaves the
-            // account live, and a live external-signer account still needs its
-            // signer to reconcile.
-            self.app.forget_external_signer(&account.account_id_hex);
             self.setup.account_removed(&account.account_id_hex);
             Ok(())
         }

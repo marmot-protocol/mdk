@@ -15,8 +15,10 @@ pub(crate) enum RecordKind {
 
 pub(crate) trait VaultStorage: Send + Sync {
     fn read(&self, kind: RecordKind, name: &str) -> AccountHomeResult<Option<Zeroizing<String>>>;
+    // A successful write must be durable. The next step may delete the only other copy.
     fn write(&self, kind: RecordKind, name: &str, value: &str) -> AccountHomeResult<()>;
-    // Providers that publish durably in a single operation need no extra sync.
+    // Replay may find a record from a write that returned an error after publishing it.
+    // Providers that publish durably in one operation need no replay barrier.
     fn sync(&self, _kind: RecordKind) -> AccountHomeResult<()> {
         Ok(())
     }

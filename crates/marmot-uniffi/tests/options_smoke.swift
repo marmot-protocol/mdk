@@ -1,12 +1,6 @@
 import Foundation
 
-private final class OptionsStore: SecretStore, @unchecked Sendable {
-    func hasSecretForLabel(label: String) throws -> Bool { label == "probe" }
-    func hasSecretForAccountId(accountIdHex: String) throws -> Bool { false }
-    func writeSecret(label: String, accountIdHex: String, secretKeyHex: String) throws {}
-    func loadSecret(label: String, accountIdHex: String) throws -> String { "callback-probe" }
-    func removeSecret(label: String, accountIdHex: String) throws {}
-}
+
 
 @main
 struct OptionsSmoke {
@@ -35,6 +29,9 @@ struct OptionsSmoke {
             relayPolicy: .allowLoopbackRelaysAndBlobs,
             cursorPersistence: .frozen,
             clientName: "whitenoise",
+            iosOptions: IosOptionsFfi(
+                appGroupIdentifiers: ["group.example.smoke"], keychainAccessGroup: "TEAM.example.smoke"
+            ),
             deployment: marmotDeploymentWhiteNoise()
         )
         var copy = try FfiConverterTypeMarmotOptions.lift(FfiConverterTypeMarmotOptions.lower(options))
@@ -43,7 +40,7 @@ struct OptionsSmoke {
         precondition(copy.deployment.keychainService == "com.marmot.whitenoise")
         // Foreign callback handles must cross into Rust; local lower/lift is
         // only valid here while the callback field is nil.
-        copy.secretStore = OptionsStore()
+        copy.secretStore = MemorySecretStore()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let kit = try Marmot.newWithConfiguration(

@@ -561,7 +561,7 @@ use crate::secret_store as host_abi;
 
 #[cfg(test)]
 #[allow(dead_code)]
-#[path = "../tests/support/owned_store.rs"]
+#[path = "../../tests/support/owned_store.rs"]
 pub(crate) mod fixture;
 
 #[cfg(test)]

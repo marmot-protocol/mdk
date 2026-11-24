@@ -3,14 +3,13 @@
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use marmot_c::commands::{
     marmot_account_id_hex, marmot_default_profile_pseudonym, marmot_normalize_member_ref,
     marmot_random_profile_pseudonym,
 };
-use marmot_c::secret_store::{MarmotSecretStore, MarmotSecretStoreStatus};
+use marmot_c::secret_store::MarmotSecretStore;
 use marmot_c::types::group::{MarmotMemberRef, marmot_member_ref_free};
 use marmot_c::{
     MarmotClient, MarmotStatus, marmot_client_free, marmot_client_new_with_secret_store,
@@ -23,89 +22,19 @@ include!(concat!(
     "/../marmot-app/tests/support/identity_reference_vectors.rs"
 ));
 
-static ENTRIES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+use marmot_c::secret_store as host_abi;
+#[allow(dead_code)]
+#[path = "support/owned_store.rs"]
+mod owned_store;
+
 static DESTROYED: AtomicBool = AtomicBool::new(false);
-
-unsafe extern "C" fn has(_user_data: *mut c_void, key: *const c_char, out: *mut u8) -> u32 {
-    let key = unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_owned();
-    let present = ENTRIES.lock().unwrap().iter().any(|(k, _)| *k == key);
-    unsafe { out.write(u8::from(present)) };
-    MarmotSecretStoreStatus::Ok as u32
-}
-
-unsafe extern "C" fn write_secret(
-    _user_data: *mut c_void,
-    label: *const c_char,
-    _account: *const c_char,
-    secret: *const c_char,
-) -> u32 {
-    let label = unsafe { CStr::from_ptr(label) }
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let secret = unsafe { CStr::from_ptr(secret) }
-        .to_str()
-        .unwrap()
-        .to_owned();
-    ENTRIES.lock().unwrap().push((label, secret));
-    MarmotSecretStoreStatus::Ok as u32
-}
-
-unsafe extern "C" fn load_secret(
-    _user_data: *mut c_void,
-    label: *const c_char,
-    _account: *const c_char,
-    out: *mut *mut c_char,
-) -> u32 {
-    let label = unsafe { CStr::from_ptr(label) }
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let found = ENTRIES
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(k, _)| *k == label)
-        .map(|(_, secret)| secret.clone());
-    let Some(secret) = found else {
-        return MarmotSecretStoreStatus::NotFound as u32;
-    };
-    unsafe { out.write(CString::new(secret).unwrap().into_raw()) };
-    MarmotSecretStoreStatus::Ok as u32
-}
-
-unsafe extern "C" fn remove_secret(
-    _user_data: *mut c_void,
-    label: *const c_char,
-    _account: *const c_char,
-) -> u32 {
-    let label = unsafe { CStr::from_ptr(label) }
-        .to_str()
-        .unwrap()
-        .to_owned();
-    ENTRIES.lock().unwrap().retain(|(k, _)| *k != label);
-    MarmotSecretStoreStatus::Ok as u32
-}
-
-unsafe extern "C" fn free_secret(_user_data: *mut c_void, secret: *mut c_char) {
-    drop(unsafe { CString::from_raw(secret) });
-}
-
-unsafe extern "C" fn destroy(_user_data: *mut c_void) {
+unsafe extern "C" fn destroy(_: *mut c_void) {
     DESTROYED.store(true, Ordering::SeqCst);
 }
-
 fn host_store() -> MarmotSecretStore {
-    MarmotSecretStore {
-        user_data: ptr::null_mut(),
-        has_secret_for_label: Some(has),
-        has_secret_for_account_id: Some(has),
-        write_secret: Some(write_secret),
-        load_secret: Some(load_secret),
-        remove_secret: Some(remove_secret),
-        free_secret: Some(free_secret),
-        destroy: Some(destroy),
-    }
+    let mut store = owned_store::MemoryVault::global().table();
+    store.destroy = Some(destroy);
+    store
 }
 
 fn open_client(root: &tempfile::TempDir) -> *mut MarmotClient {

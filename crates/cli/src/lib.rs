@@ -1257,7 +1257,11 @@ fn open_account_home(
 ) -> Result<AccountHome, WnError> {
     match secret_store {
         SecretStoreKind::File => Ok(AccountHome::open(home)),
-        SecretStoreKind::Keychain => Ok(AccountHome::open_with_keychain(home, keychain_service)?),
+        SecretStoreKind::Keychain => Ok(AccountHome::open_with_keychain(
+            home,
+            keychain_service,
+            marmot_account::IosOptions::default(),
+        )?),
     }
 }
 

@@ -2200,6 +2200,14 @@ impl MarmotApp {
         network_proxy::socks5_proxy().map_err(network_proxy::config_error)?;
         let root = root.as_ref().to_path_buf();
         let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
+        // An externally supplied home may belong to another root's owner.
+        if let (Ok(root), Ok(home)) = (
+            std::fs::canonicalize(&root),
+            std::fs::canonicalize(account_home.root()),
+        ) && root == home
+        {
+            account_home.resume_wipe_cleanup()?;
+        }
         audit_log::cleanup_legacy_audit_logs(&root);
         let app =
             Self::with_relays_and_account_home_and_config(&root, relay_urls, account_home, config);

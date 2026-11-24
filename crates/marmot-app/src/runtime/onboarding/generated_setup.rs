@@ -658,13 +658,15 @@ impl MarmotAppRuntime {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    use marmot_account::{IosOptions, LocalFileSecretStore};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sign_in_keeps_fresh_selection() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open_with_secret_store(
             dir.path(),
-            Arc::new(marmot_account::LocalFileSecretStore::new(dir.path())),
+            Arc::new(LocalFileSecretStore::new(dir.path(), IosOptions::default())),
+            IosOptions::default(),
         );
         let runtime = MarmotAppRuntime::new(MarmotApp::with_relays_and_account_home(
             dir.path(),

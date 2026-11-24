@@ -15,6 +15,7 @@ impl Marmot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use marmot_account::{IosOptions, LocalFileSecretStore};
     /// Exercise capture before startup with an isolated local test home, without an OS credential service.
     #[test]
     fn startup_capture_is_disabled_until_explicitly_enabled() {
@@ -23,9 +24,11 @@ mod tests {
             root.path().to_string_lossy().into_owned(),
             vec![],
             marmot_app::MarmotAppConfig::white_noise(),
-            Some(std::sync::Arc::new(
-                marmot_account::LocalFileSecretStore::new(root.path()),
-            )),
+            Some(std::sync::Arc::new(LocalFileSecretStore::new(
+                root.path(),
+                IosOptions::default(),
+            ))),
+            IosOptions::default(),
         )
         .unwrap();
         assert!(!marmot.startup_diagnostics_snapshot().unwrap().enabled);

@@ -33,6 +33,7 @@ pub mod file_media;
 pub(crate) mod macros;
 pub mod memory;
 pub mod nip46;
+#[path = "secret_store/receipts.rs"]
 pub mod secret_store;
 pub mod status;
 pub mod subscriptions;
@@ -137,7 +138,7 @@ impl MarmotClient {
 
 /// Drive `fut` to completion on `handle`, blocking the calling thread.
 ///
-/// Callbacks run on the embedded runtime's worker threads, so a C consumer
+/// Subscription callbacks run on runtime workers, so a C consumer
 /// calling any blocking `marmot_*` function from a callback re-enters the
 /// runtime — where a bare `block_on` panics. `block_in_place` hands the
 /// worker's remaining tasks to another thread first, which makes the
@@ -337,9 +338,10 @@ pub unsafe extern "C" fn marmot_client_new_with_cursor_persistence(
 /// call takes no ownership and never invokes `destroy`; reclaiming
 /// `user_data` stays the caller's job.
 ///
-/// The callbacks run on runtime worker threads, possibly concurrently, and
-/// must not call any `marmot_*` function on this client — see the
-/// `MarmotSecretStore` documentation for the full contract.
+/// Opening a root can replay pending wipes before this call returns.
+/// Secret-store callbacks can run on the constructor's calling thread during
+/// replay and can also run on runtime workers. See `MarmotSecretStore` for
+/// synchronization and re-entry rules.
 ///
 /// # Safety
 /// `root_path` must be a valid NUL-terminated UTF-8 string; `relay_urls`
@@ -457,6 +459,31 @@ pub unsafe extern "C" fn marmot_client_new_with_client_name(
     })
 }
 
+/// Borrowed iOS host configuration. The constructor copies the strings.
+#[repr(C)]
+pub struct MarmotIosOptions {
+    /// Array of non-NULL, NUL-terminated UTF-8 App Group identifiers.
+    /// NULL is allowed when app_group_identifiers_len is zero.
+    pub app_group_identifiers: *const *const c_char,
+    pub app_group_identifiers_len: usize,
+    /// Optional NUL-terminated UTF-8 access group for managed receipts in the
+    /// native iOS Keychain. NULL uses the captured provider's default.
+    pub keychain_access_group: *const c_char,
+}
+
+impl MarmotIosOptions {
+    /// # Safety
+    /// The array and strings must be readable for this call.
+    unsafe fn to_ffi(&self) -> Result<marmot_uniffi::IosOptionsFfi, MarmotStatus> {
+        Ok(marmot_uniffi::IosOptionsFfi {
+            app_group_identifiers: unsafe {
+                str_array(self.app_group_identifiers, self.app_group_identifiers_len)
+            }?,
+            keychain_access_group: unsafe { optional_str(self.keychain_access_group) }?,
+        })
+    }
+}
+
 /// Borrowed construction options. Zero initialization selects public-only
 /// endpoints, an advancing cursor, no client label or device platform, and the
 /// platform keychain (under the deployment's keychain service). The deployment
@@ -478,6 +505,9 @@ pub struct MarmotClientOptions {
     /// "iOS", for this device's entry on the account's Devices screen; NULL,
     /// blank or over 64 bytes leaves it out.
     pub device_platform: *const c_char,
+    /// Optional iOS host configuration, also used for App Group identity
+    /// with a callback store. NULL leaves iOS options unset.
+    pub ios_options: *const MarmotIosOptions,
 }
 
 /// Create a client with combined relay, cursor, label and secret-storage
@@ -491,6 +521,8 @@ pub struct MarmotClientOptions {
 /// Same root, relay and output pointer contracts as marmot_client_new.
 /// Non-NULL options must point to a readable MarmotClientOptions for this call;
 /// its label and store pointers obey marmot_client_new_with_client_name's contract.
+/// A non-NULL ios_options record and its array and strings must remain readable
+/// until the call returns. The library does not retain or free those pointers.
 /// deployment must be a live handle from marmot_deployment_white_noise or
 /// marmot_deployment_neutral; NULL is MARMOT_STATUS_NULL_POINTER.
 #[unsafe(no_mangle)]
@@ -576,6 +608,7 @@ unsafe fn open_client_with_configuration(
         client_name: std::ptr::null(),
         store: std::ptr::null(),
         device_platform: std::ptr::null(),
+        ios_options: std::ptr::null(),
     };
     let options = unsafe { options.as_ref() }.unwrap_or(&defaults);
     let policy = match options.relay_policy {
@@ -606,6 +639,11 @@ unsafe fn open_client_with_configuration(
         Ok(platform) => platform,
         Err(status) => return status,
     };
+    let ios_options =
+        match unsafe { options.ios_options.as_ref().map(|options| options.to_ffi()) }.transpose() {
+            Ok(options) => options,
+            Err(status) => return status,
+        };
     let store = if store.is_null() {
         None
     } else {
@@ -627,6 +665,7 @@ unsafe fn open_client_with_configuration(
                     client_name: name,
                     device_platform: platform,
                     secret_store: store,
+                    ios_options,
                     moderation_report_config: None,
                     deployment,
                 };

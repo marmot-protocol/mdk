@@ -1,6 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use cgka_traits::{MemberId, TransportAdapterError};
+use marmot_account::IosOptions;
 use nostr::prelude::{FinalizeEvent, ToBech32};
 use parking_lot::Mutex as FixtureMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +15,12 @@ struct Network {
     public_indexer_events: FixtureMutex<Vec<NostrTransportEvent>>,
     attempts: FixtureMutex<Vec<NostrTransportEvent>>,
     published_endpoints: FixtureMutex<Vec<Vec<String>>>,
+    held_fetch: FixtureMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     fail_reads: AtomicBool,
     return_off_filter_events: AtomicBool,
     fail_index_only: AtomicBool,
@@ -42,6 +49,11 @@ impl DirectoryRelayFetcher for Network {
                 .iter()
                 .all(|e| e.policy == RelayEndpointPolicy::Allowed)
         );
+        let held = self.held_fetch.lock().take();
+        if let Some((entered, proceed)) = held {
+            entered.send(()).unwrap();
+            proceed.await.expect("release held directory fetch");
+        }
         if self.fail_reads.load(Ordering::SeqCst)
             || request
                 .endpoints
@@ -8727,8 +8739,7 @@ enum GeneratedSetupRemoval {
     Directory,
 }
 
-/// A local file secret store that records every account it writes a secret
-/// for, so a test sees an identity even if setup rolls it back at once.
+/// Records signing receipt acquisitions, including identities setup rolls back.
 struct RecordingSecretStore {
     inner: marmot_account::LocalFileSecretStore,
     written: FixtureMutex<Vec<String>>,
@@ -8742,7 +8753,7 @@ fn generated_setup_runtime(
     let mut app = MarmotApp::with_relays_and_account_home(
         path,
         vec!["wss://default.example".into()],
-        AccountHome::open_with_secret_store(path, secrets),
+        AccountHome::open_with_secret_store(path, secrets, IosOptions::default()),
     )
     .with_test_relay_client(network.clone());
     app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
@@ -8762,7 +8773,7 @@ fn generated_setup_fixture() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let secrets = Arc::new(RecordingSecretStore {
-        inner: marmot_account::LocalFileSecretStore::new(dir.path()),
+        inner: marmot_account::LocalFileSecretStore::new(dir.path(), IosOptions::default()),
         written: FixtureMutex::new(Vec::new()),
     });
     let network = Arc::new(Network::default());
@@ -8781,25 +8792,41 @@ fn generated_setup_request() -> AccountSetupRequest {
 }
 
 impl marmot_account::AccountSecretStore for RecordingSecretStore {
+    fn cleanup_namespace(&self) -> marmot_account::AccountHomeResult<String> {
+        self.inner.cleanup_namespace()
+    }
+
     fn has_secret_for_label(&self, label: &str) -> marmot_account::AccountHomeResult<bool> {
         self.inner.has_secret_for_label(label)
     }
-    fn write_secret(
+    fn acquire_secret(
         &self,
-        account: &AccountSummary,
-        keys: &nostr::prelude::Keys,
-    ) -> marmot_account::AccountHomeResult<()> {
-        self.written.lock().push(account.account_id_hex.clone());
-        self.inner.write_secret(account, keys)
+        credential: marmot_account::SecretCredential<'_>,
+        mode: marmot_account::SecretClaimMode,
+        proposed: Option<&nostr::prelude::Keys>,
+    ) -> marmot_account::AccountHomeResult<marmot_account::AcquiredSecret> {
+        if credential.kind == marmot_account::SecretCredentialKind::Signing {
+            self.written
+                .lock()
+                .push(credential.account_id_hex.to_owned());
+        }
+        self.inner.acquire_secret(credential, mode, proposed)
     }
     fn load_secret(
         &self,
-        account: &AccountSummary,
+        credential: marmot_account::SecretCredential<'_>,
     ) -> marmot_account::AccountHomeResult<nostr::prelude::Keys> {
-        self.inner.load_secret(account)
+        self.inner.load_secret(credential)
     }
-    fn remove_secret(&self, account: &AccountSummary) -> marmot_account::AccountHomeResult<()> {
-        self.inner.remove_secret(account)
+    fn release_secret(
+        &self,
+        credential: marmot_account::SecretCredential<'_>,
+        mode: marmot_account::SecretReleaseMode,
+    ) -> marmot_account::AccountHomeResult<marmot_account::SecretReleaseOutcome> {
+        self.inner.release_secret(credential, mode)
+    }
+    fn reconcile_cleanup(&self) -> marmot_account::AccountHomeResult<()> {
+        self.inner.reconcile_cleanup()
     }
 }
 
@@ -8825,7 +8852,7 @@ fn assert_setup_stayed_removed(
     assert_eq!(
         *secrets.written.lock(),
         expected_writes,
-        "stale setup must not write a replacement secret, even if it later rolls back"
+        "stale setup must not acquire a replacement identity, even if it later rolls back"
     );
     assert!(!home.account_dir(&original.label).exists());
     assert!(matches!(
@@ -8963,7 +8990,7 @@ async fn stale_startup_stays_gone() {
 
 struct GeneratedSetupRemovalRun {
     account_id_hex: String,
-    /// Every account a secret was ever written for, in order.
+    /// Every signing identity acquired, in order.
     secrets_written: Vec<String>,
     /// Every event publication attempted, in order.
     published: Vec<NostrTransportEvent>,

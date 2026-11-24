@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,6 @@ use std::time::Duration;
 use futures::StreamExt;
 use marmot_c::commands::*;
 use marmot_c::nip46::*;
-use marmot_c::secret_store::{MarmotSecretStore, MarmotSecretStoreStatus};
 use marmot_c::subscriptions::*;
 use marmot_c::types::account::*;
 use marmot_c::types::chat_list::marmot_chat_list_row_free;
@@ -67,91 +66,16 @@ fn check(status: MarmotStatus, operation: &str) {
     }
 }
 
-// Ephemeral host key storage for local signing and namespaced device database secrets.
-static SECRETS: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
+use marmot_c::secret_store as host_abi;
+#[allow(dead_code)]
+#[path = "../tests/support/owned_store.rs"]
+mod owned_store;
+
 unsafe fn input(value: *const c_char) -> String {
     unsafe { CStr::from_ptr(value) }
-        .to_string_lossy()
-        .into_owned()
-}
-unsafe extern "C" fn has_secret(_: *mut c_void, key: *const c_char, out: *mut u8) -> u32 {
-    let key = unsafe { input(key) };
-    let Ok(entries) = SECRETS.lock() else {
-        return MarmotSecretStoreStatus::Failed as u32;
-    };
-    unsafe {
-        out.write(u8::from(
-            entries
-                .iter()
-                .any(|(label, account, _)| label == &key || account == &key),
-        ))
-    };
-    MarmotSecretStoreStatus::Ok as u32
-}
-unsafe extern "C" fn write_secret(
-    _: *mut c_void,
-    label: *const c_char,
-    account: *const c_char,
-    secret: *const c_char,
-) -> u32 {
-    let (label, account, secret) = unsafe { (input(label), input(account), input(secret)) };
-    let Ok(mut entries) = SECRETS.lock() else {
-        return MarmotSecretStoreStatus::Failed as u32;
-    };
-    entries.retain(|(_, id, _)| id != &account);
-    entries.push((label, account, secret));
-    MarmotSecretStoreStatus::Ok as u32
-}
-unsafe extern "C" fn load_secret(
-    _: *mut c_void,
-    label: *const c_char,
-    account: *const c_char,
-    out: *mut *mut c_char,
-) -> u32 {
-    let (label, account) = unsafe { (input(label), input(account)) };
-    let Ok(entries) = SECRETS.lock() else {
-        return MarmotSecretStoreStatus::Failed as u32;
-    };
-    match entries
-        .iter()
-        .find(|(l, a, _)| l == &label || a == &account)
-    {
-        Some((_, _, secret)) => {
-            let Ok(secret) = CString::new(secret.as_str()) else {
-                return MarmotSecretStoreStatus::Failed as u32;
-            };
-            unsafe { out.write(secret.into_raw()) };
-            MarmotSecretStoreStatus::Ok as u32
-        }
-        None => MarmotSecretStoreStatus::NotFound as u32,
-    }
-}
-unsafe extern "C" fn remove_secret(
-    _: *mut c_void,
-    label: *const c_char,
-    account: *const c_char,
-) -> u32 {
-    let (label, account) = unsafe { (input(label), input(account)) };
-    let Ok(mut entries) = SECRETS.lock() else {
-        return MarmotSecretStoreStatus::Failed as u32;
-    };
-    entries.retain(|(l, a, _)| l != &label && a != &account);
-    MarmotSecretStoreStatus::Ok as u32
-}
-unsafe extern "C" fn free_secret(_: *mut c_void, value: *mut c_char) {
-    drop(unsafe { CString::from_raw(value) });
-}
-fn host_store() -> MarmotSecretStore {
-    MarmotSecretStore {
-        user_data: ptr::null_mut(),
-        has_secret_for_label: Some(has_secret),
-        has_secret_for_account_id: Some(has_secret),
-        write_secret: Some(write_secret),
-        load_secret: Some(load_secret),
-        remove_secret: Some(remove_secret),
-        free_secret: Some(free_secret),
-        destroy: None,
-    }
+        .to_str()
+        .expect("UTF-8 C output")
+        .to_owned()
 }
 
 #[derive(Clone, Copy)]
@@ -160,26 +84,30 @@ struct Handle(*mut MarmotClient);
 unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
 impl Handle {
-    fn open(root: &tempfile::TempDir, relay: &str) -> Self {
+    fn open(root: &tempfile::TempDir, relay: &str, vault: Arc<owned_store::MemoryVault>) -> Self {
         let root = c(root.path().to_str().expect("UTF-8 temporary path"));
         let relay = c(relay);
         let relays = [relay.as_ptr()];
-        let store = host_store();
+        let mut store = vault.table();
+        let data = Arc::into_raw(vault).cast_mut().cast();
+        store.user_data = data;
+        store.destroy = Some(owned_store::MemoryVault::destroy_arc);
         let mut client = ptr::null_mut();
-        check(
-            unsafe {
-                marmot_client_new_with_options(
-                    root.as_ptr(),
-                    relays.as_ptr(),
-                    1,
-                    MarmotRelayPolicy::AllowLoopback as u32,
-                    &store,
-                    marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
-                    &mut client,
-                )
-            },
-            "client_new",
-        );
+        let status = unsafe {
+            marmot_client_new_with_options(
+                root.as_ptr(),
+                relays.as_ptr(),
+                1,
+                MarmotRelayPolicy::AllowLoopback as u32,
+                &store,
+                marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
+                &mut client,
+            )
+        };
+        if status != MarmotStatus::Ok {
+            unsafe { owned_store::MemoryVault::destroy_arc(data) };
+        }
+        check(status, "client_new");
         Self(client)
     }
     fn profile(self, account: &str, name: &str) -> MarmotStatus {
@@ -1031,7 +959,10 @@ fn main() -> Result<()> {
     assert_ne!(fixture_a.bunker.public_key(), fixture_b.bunker.public_key());
     assert_ne!(fixture_a.user.public_key(), fixture_b.user.public_key());
     let root = tempfile::tempdir()?;
-    let owner = ClientOwner(Handle::open(&root, &relay_url));
+    let vault_directory = tempfile::tempdir()?;
+    let vault_file = vault_directory.path().join("host-vault.json");
+    let vault = Arc::new(owned_store::MemoryVault::open(&vault_file)?);
+    let owner = ClientOwner(Handle::open(&root, &relay_url, vault.clone()));
     let client = owner.0;
 
     let relay_c = c(&relay_url);
@@ -1151,7 +1082,7 @@ fn main() -> Result<()> {
     );
     welcome_and_message(client, &local_id, &account_a, &fixture_a)?;
     {
-        let secrets = SECRETS.lock().expect("host store mutex");
+        let secrets = vault.snapshot().expect("read durable host receipts");
         assert_eq!(
             secrets.len(),
             5,
@@ -1446,7 +1377,9 @@ fn main() -> Result<()> {
     drop(session_a);
     drop(session_b);
     drop(owner);
-    let owner = ClientOwner(Handle::open(&root, &relay_url));
+    drop(vault);
+    let vault = Arc::new(owned_store::MemoryVault::open(&vault_file)?);
+    let owner = ClientOwner(Handle::open(&root, &relay_url, vault.clone()));
     let client = owner.0;
     fixture_a.controls.offline.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
@@ -1631,6 +1564,14 @@ fn main() -> Result<()> {
         "PASS one-session cancel and unacknowledged logout preserve local/other remote accounts"
     );
 
+    const PAIRING_PREFIX: &str = ".nip46-client/";
+    let b_label = format!("{PAIRING_PREFIX}{account_b}");
+    let b_pairing = vault
+        .snapshot()
+        .expect("read B's durable pairing")
+        .into_iter()
+        .find(|(label, _, _)| label == &b_label)
+        .expect("B must own a durable communication credential before A's retry");
     let retry = Session::new(client, &export_a);
     assert_eq!(retry.connect(), account_a);
     let mut refused = ptr::dangling_mut();
@@ -1653,15 +1594,24 @@ fn main() -> Result<()> {
     );
     assert!(refused.is_null());
     assert_eq!(retry.state()["state"], "disconnected");
-    assert_eq!(
-        SECRETS
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(label, _, _)| label.starts_with(".nip46-client/"))
-            .count(),
-        1,
-        "failed reactivation retained account A's communication credential"
+    let mut active_pairings = vault
+        .snapshot()
+        .expect("read durable host receipts")
+        .into_iter()
+        .filter(|(label, _, _)| label.starts_with(PAIRING_PREFIX));
+    assert!(
+        active_pairings.next().as_ref() == Some(&b_pairing),
+        "account B must keep its exact communication credential"
+    );
+    assert!(
+        active_pairings.next().is_none(),
+        "only account B may have an active communication credential"
+    );
+    assert!(
+        !vault
+            .has_preserved_pairing(&format!("{PAIRING_PREFIX}{account_a}"))
+            .expect("read durable preservation holds"),
+        "failed reactivation preserved account A's communication credential"
     );
     assert_accounts(client, &local_id, &account_a, &account_b, true);
     assert_ready(client, &account_a);

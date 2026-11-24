@@ -46,6 +46,7 @@ mod errors;
 mod external_signer;
 mod markdown;
 mod nip46;
+#[path = "secret_store/receipts.rs"]
 mod secret_store;
 pub mod subscriptions;
 mod tokio_runtime;
@@ -65,7 +66,10 @@ pub use markdown::{
 pub use nip46::{
     Nip46ErrorFfi, Nip46PermissionsFfi, Nip46SessionFfi, Nip46StateFfi, Nip46StatusFfi,
 };
-pub use secret_store::SecretStore;
+pub use secret_store::{
+    AcquiredSecret, SecretClaimMode, SecretCredential, SecretCredentialKind, SecretOrigin,
+    SecretReleaseMode, SecretReleaseOutcome, SecretStore,
+};
 pub use subscriptions::{ConversationWindowSubscription, RelayLivenessSubscription};
 
 uniffi::setup_scaffolding!();
@@ -234,6 +238,24 @@ pub(crate) fn timeline_query_from_ffi(
     })
 }
 
+/// iOS host configuration for app-group identity and native Keychain access.
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct IosOptionsFfi {
+    /// App Groups whose entitled containers may hold the account home.
+    pub app_group_identifiers: Vec<String>,
+    /// Access group for managed receipts in the native iOS Keychain.
+    pub keychain_access_group: Option<String>,
+}
+
+impl From<IosOptionsFfi> for marmot_account::IosOptions {
+    fn from(options: IosOptionsFfi) -> Self {
+        Self {
+            app_group_identifiers: options.app_group_identifiers,
+            keychain_access_group: options.keychain_access_group,
+        }
+    }
+}
+
 /// Composable runtime construction options. The deployment is required.
 /// Omitted policies use public-only endpoints and an advancing cursor.
 /// Omitted labels stay untagged; omitted secret storage uses the platform
@@ -253,6 +275,9 @@ pub struct MarmotOptions {
     pub device_platform: Option<String>,
     #[uniffi(default = None)]
     pub secret_store: Option<Arc<dyn SecretStore>>,
+    /// iOS host configuration, including when a callback secret store is used.
+    #[uniffi(default = None)]
+    pub ios_options: Option<IosOptionsFfi>,
     #[uniffi(default = None)]
     pub attachment_acquisition_mode: Option<AttachmentAcquisitionModeFfi>,
     /// Destination for private moderation reports (`submit_moderation_report`). Set per
@@ -277,6 +302,7 @@ impl MarmotOptions {
             client_name: None,
             device_platform: None,
             secret_store: None,
+            ios_options: None,
             attachment_acquisition_mode: None,
             moderation_report_config: None,
             deployment,
@@ -567,11 +593,12 @@ impl Marmot {
         options: MarmotOptions,
     ) -> Result<Arc<Self>, MarmotKitError> {
         let config = options.app_config();
+        let ios_options = options.ios_options.map(Into::into).unwrap_or_default();
         let store = options.secret_store.map(|store| {
             Arc::new(secret_store::ForeignSecretStore::new(store))
                 as Arc<dyn marmot_account::AccountSecretStore>
         });
-        Self::open(root_path, relay_urls, config, store)
+        Self::open(root_path, relay_urls, config, store, ios_options)
     }
 
     /// Account home backed by the host store or deployment's platform keychain.
@@ -580,16 +607,20 @@ impl Marmot {
         relay_urls: Vec<String>,
         config: MarmotAppConfig,
         secret_store: Option<Arc<dyn marmot_account::AccountSecretStore>>,
+        ios_options: marmot_account::IosOptions,
     ) -> Result<Arc<Self>, MarmotKitError> {
         // Opening can spawn relay-plane tasks (`Handle::try_current` users);
         // they belong on the runtime the exports will run on.
         let tokio_handle = tokio_runtime::handle()?;
         let _entered = tokio_handle.enter();
         let account_home = match secret_store {
-            Some(store) => marmot_account::AccountHome::open_with_secret_store(&root_path, store),
+            Some(store) => {
+                marmot_account::AccountHome::open_with_secret_store(&root_path, store, ios_options)
+            }
             None => marmot_account::AccountHome::open_with_keychain(
                 &root_path,
                 config.deployment.keychain_service.clone(),
+                ios_options,
             )
             .map_err(marmot_app::AppError::from)?,
         };

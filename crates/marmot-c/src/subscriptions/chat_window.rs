@@ -297,41 +297,8 @@ pub unsafe extern "C" fn marmot_chat_list_window_subscription_return_to_top(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use marmot_uniffi::{Marmot, MarmotKitError, SecretStore};
-    use std::{collections::HashMap, ffi::CString, ptr};
-    #[derive(Default)]
-    struct Store(StdMutex<HashMap<String, String>>);
-    impl SecretStore for Store {
-        fn has_secret_for_label(&self, label: String) -> Result<bool, MarmotKitError> {
-            Ok(self.0.lock().unwrap().contains_key(&label))
-        }
-        fn has_secret_for_account_id(&self, _: String) -> Result<bool, MarmotKitError> {
-            Ok(false)
-        }
-        fn write_secret(
-            &self,
-            label: String,
-            _: String,
-            secret: String,
-        ) -> Result<(), MarmotKitError> {
-            self.0.lock().unwrap().insert(label, secret);
-            Ok(())
-        }
-        fn load_secret(&self, label: String, _: String) -> Result<String, MarmotKitError> {
-            self.0
-                .lock()
-                .unwrap()
-                .get(&label)
-                .cloned()
-                .ok_or(MarmotKitError::SecretNotFound {
-                    details: "test".into(),
-                })
-        }
-        fn remove_secret(&self, label: String, _: String) -> Result<(), MarmotKitError> {
-            self.0.lock().unwrap().remove(&label);
-            Ok(())
-        }
-    }
+    use marmot_uniffi::Marmot;
+    use std::{ffi::CString, ptr};
     #[test]
     fn c_screen_handles_preflight_timeout_concurrent_commands_and_close() {
         let _guard = crate::memory::audit::test_lock();
@@ -349,7 +316,7 @@ mod tests {
             dir.path().to_str().unwrap().into(),
             vec![url.clone()],
             marmot_uniffi::RelayPolicyFfi::AllowLoopback,
-            Some(Arc::new(Store::default())),
+            Some(crate::secret_store::fixture_store()),
             marmot_uniffi::marmot_deployment_white_noise(),
         )
         .unwrap();
@@ -509,7 +476,7 @@ mod tests {
             dir.path().to_str().unwrap().into(),
             vec![url.clone()],
             marmot_uniffi::RelayPolicyFfi::AllowLoopback,
-            Some(Arc::new(Store::default())),
+            Some(crate::secret_store::fixture_store()),
             marmot_uniffi::marmot_deployment_white_noise(),
         )
         .unwrap();
@@ -756,7 +723,7 @@ mod tests {
             dir.path().to_str().unwrap().into(),
             vec![url.clone()],
             marmot_uniffi::RelayPolicyFfi::AllowLoopback,
-            Some(Arc::new(Store::default())),
+            Some(crate::secret_store::fixture_store()),
             marmot_uniffi::marmot_deployment_white_noise(),
         )
         .unwrap();

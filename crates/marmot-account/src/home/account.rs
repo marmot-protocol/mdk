@@ -1549,12 +1549,13 @@ impl AccountHome {
     /// rename leaves the account payload and credentials intact. Once renamed,
     /// the account is absent from [`AccountHome::account`] and [`AccountHome::accounts`].
     ///
-    /// After that commit, ordinary credential or filesystem failures do not
-    /// change success or skip the remaining secret-file scrubs and payload cleanup.
-    /// Failed work retains a private record containing the label and account ID
-    /// for [`AccountHome::resume_wipe_cleanup`]. Unproven raw legacy entries are
-    /// not erased; their identifying intent may remain indefinitely. Replay
-    /// releases original receipts, not credentials adopted by a new live account.
+    /// After that commit, cleanup waits for the parent directories to sync.
+    /// If sync fails, replay retries it before releasing credentials or cleaning
+    /// up local files. Once sync succeeds, a vault failure does not stop local
+    /// cleanup. A private record retains the label and account ID for
+    /// [`AccountHome::resume_wipe_cleanup`]. Replay releases original receipts,
+    /// not credentials adopted by a new live account. Ambiguous independent
+    /// legacy vault entries are not erased; their identifying intent may remain.
     pub fn remove_account(&self, account_ref: &str) -> AccountHomeResult<()> {
         self.remove_account_inner(account_ref, None, SigningKeyRemoval::Delete)
     }

@@ -27,7 +27,6 @@ use crate::MarmotKitError;
 /// secret-key hex crosses it in both directions; whatever protection the
 /// key gets (encryption, an OS keystore, a password-derived seal) is the
 /// implementation's responsibility.
-#[uniffi::export(with_foreign)]
 pub trait SecretStore: Send + Sync {
     /// Whether a credential is stored under `label`.
     fn has_secret_for_label(&self, label: String) -> Result<bool, MarmotKitError>;

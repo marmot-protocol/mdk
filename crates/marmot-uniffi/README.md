@@ -234,6 +234,32 @@ fails, and MDK retries neither. Retrying fails the same way while the group's re
 a plain retry. A send that relays refused themselves still fails as `Publish`, and a send waiting for a relay to
 come back is not an error: MDK keeps sending it.
 
+### Host secret-store identity
+
+Host `SecretStore` implementations must implement `cleanupNamespace()`. Return a stable, nonsecret identity for the
+physical vault and credential namespace, including the service or tenant when either changes where keys are stored.
+Keep it stable across restarts and vault lock/unlock; do not return an account id, a constant shared by different vaults,
+or a fresh per-process id. Report an error if the identity cannot be established.
+One store object must keep the same credential target for its lifetime; switching vaults or tenants requires a new object.
+
+Pending account wipes retain this identity and retry credential deletion only through the same vault. Opening the root
+with another store leaves the original intent pending.
+
+Implement `acquireSecret(record, mode, proposedHex)`, `loadSecret(record)`, `releaseSecret(record, mode)`, and
+`reconcileCleanup()`; there are no unowned write or remove callbacks. `SecretCredential` carries the label, account ID,
+home ID, owner ID, and `SecretCredentialKind`. Store an immutable copy per owner before returning
+`AcquiredSecret(secretKeyHex, origin)`. Retries must preserve the original key and `SecretOrigin`. Signing discovery is
+shared by account ID across homes; auxiliary discovery is home-scoped. Ordinary claims use managed sources only;
+`SecretClaimMode::MigrateLegacy` explicitly permits independent legacy lookup and retains its pending cleanup pointer.
+
+`SecretReleaseMode::Preserve` keeps a discoverable hold until a new owner has its own copy. Retire owners before deletion,
+keep retirement metadata, and never let old releases resurrect consumed holds or delete other owners' copies.
+Return `SecretReleaseOutcome::PendingLegacy` for retained ambiguous legacy material; it does not claim physical erasure.
+Replay cleanup at `reconcileCleanup()`, including when no account wipe remains. Keep the read-only signing presence probes.
+Callbacks may run synchronously during construction, so do not wait for the UI thread or re-enter mutations on the same root.
+The host owns callback-side secret protection and temporary-copy clearing. The [native host fixtures](NATIVE-HOST-TESTS.md)
+provide synchronized, explicitly in-memory examples, not persistent vault implementations.
+
 ### Screen snapshots, paging and ownership
 
 Prepared list/conversation updates are complete replacements for their bounded window.

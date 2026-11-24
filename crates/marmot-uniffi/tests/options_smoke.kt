@@ -3,13 +3,7 @@ package dev.ipf.marmotkit
 import java.nio.file.Files
 import kotlinx.coroutines.runBlocking
 
-private class OptionsStore : SecretStore {
-    override fun hasSecretForLabel(label: String): Boolean = label == "probe"
-    override fun hasSecretForAccountId(accountIdHex: String): Boolean = false
-    override fun writeSecret(label: String, accountIdHex: String, secretKeyHex: String) {}
-    override fun loadSecret(label: String, accountIdHex: String): String = "callback-probe"
-    override fun removeSecret(label: String, accountIdHex: String) {}
-}
+
 
 fun main(args: Array<String>) = runBlocking {
     val findings = listOf(
@@ -39,6 +33,9 @@ fun main(args: Array<String>) = runBlocking {
         relayPolicy = RelayPolicyFfi.ALLOW_LOOPBACK_RELAYS_AND_BLOBS,
         cursorPersistence = CursorPersistenceFfi.FROZEN,
         clientName = "whitenoise",
+        iosOptions = IosOptionsFfi(
+            appGroupIdentifiers = listOf("group.example.smoke"), keychainAccessGroup = "TEAM.example.smoke",
+        ),
         deployment = marmotDeploymentWhiteNoise(),
     )
     val copy = FfiConverterTypeMarmotOptions.lift(FfiConverterTypeMarmotOptions.lower(options))
@@ -46,7 +43,7 @@ fun main(args: Array<String>) = runBlocking {
     check(copy.clientName == "whitenoise")
     check(copy.deployment.keychainService == "com.marmot.whitenoise")
     // Foreign callbacks are lowered into Rust by the constructor, not locally lifted.
-    copy.secretStore = OptionsStore()
+    copy.secretStore = MemorySecretStore()
     val root = Files.createTempDirectory("marmot-options-").toFile()
     try {
         Marmot.newWithConfiguration(root.path, listOf("ws://127.0.0.1:1"), copy).use { kit ->

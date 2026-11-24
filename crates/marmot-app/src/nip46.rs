@@ -248,6 +248,7 @@ enum Operation {
 
 enum BindingCleanup<'a> {
     Revoke,
+    Forget,
     Rollback {
         previous: &'a Nip46SessionWrite,
         signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
@@ -697,6 +698,9 @@ impl Nip46Session {
     pub fn erase_local(&self) -> Result<()> {
         self.clear_binding(BindingCleanup::Revoke)
     }
+    pub(crate) fn forget_binding(&self) -> Result<()> {
+        self.clear_binding(BindingCleanup::Forget)
+    }
     pub(crate) fn unbind_account(
         &self,
         previous: &Nip46SessionWrite,
@@ -756,9 +760,10 @@ impl Nip46Session {
                             .map(drop)
                             .map_err(|_| Nip46Error::Storage)
                     }),
+                BindingCleanup::Forget => Ok(()),
             })
             .transpose();
-        if matches!(&cleanup, BindingCleanup::Revoke) {
+        if matches!(&cleanup, BindingCleanup::Revoke | BindingCleanup::Forget) {
             data.keys = None;
             data.secret = None;
         }
@@ -769,14 +774,14 @@ impl Nip46Session {
         }
         // Retired bindings still undo storage, but no longer own a newer transport.
         let owns_control = match &cleanup {
-            BindingCleanup::Revoke => true,
+            BindingCleanup::Revoke | BindingCleanup::Forget => true,
             BindingCleanup::Rollback { generation, .. } => data.status.generation == *generation,
         };
         if owns_control {
             data.verified = false;
             data.status.generation = data.status.generation.wrapping_add(1);
             data.status.state = match &cleanup {
-                BindingCleanup::Revoke => Nip46State::LoggedOut,
+                BindingCleanup::Revoke | BindingCleanup::Forget => Nip46State::LoggedOut,
                 BindingCleanup::Rollback { .. }
                     if matches!(
                         data.status.state,
@@ -808,7 +813,7 @@ impl Nip46Session {
                 && let Some(current) = lock(&signers).get(id)
             {
                 let previous = match cleanup {
-                    BindingCleanup::Revoke => None,
+                    BindingCleanup::Revoke | BindingCleanup::Forget => None,
                     BindingCleanup::Rollback { signer, .. } => signer,
                 };
                 current.restore_if(&registration, previous);

@@ -59,6 +59,7 @@ impl Marmot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use marmot_account::{IosOptions, LocalFileSecretStore};
 
     #[test]
     fn runtime_config_rejects_choices_for_non_enum_properties() {
@@ -67,9 +68,11 @@ mod tests {
             root.path().to_string_lossy().into_owned(),
             vec![],
             marmot_app::MarmotAppConfig::default(),
-            Some(std::sync::Arc::new(
-                marmot_account::LocalFileSecretStore::new(root.path()),
-            )),
+            Some(std::sync::Arc::new(LocalFileSecretStore::new(
+                root.path(),
+                IosOptions::default(),
+            ))),
+            IosOptions::default(),
         )
         .unwrap();
         let config = |kind, choices| ProductAnalyticsRuntimeConfigFfi {

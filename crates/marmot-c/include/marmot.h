@@ -20,8 +20,10 @@
  *    C enum or _Bool would be undefined behavior before any check runs.
  *  - Required out-pointers are validated and cleared before the call does
  *    any work, so a rejected call never leaves a side effect behind.
- *  - Callbacks run on runtime worker threads; item pointers passed to a
- *    callback are borrowed and valid only for the duration of the call.
+ *  - Subscription callbacks run on runtime worker threads. Their event
+ *    payloads, secret-store credential inputs, and secret-store output slots
+ *    are borrowed only for the callback. See MarmotSecretStore for callback
+ *    threading, user_data lifetime, and returned buffer ownership.
  */
 
 #pragma once
@@ -1733,8 +1735,8 @@ typedef enum MarmotCursorPersistence {
 /**
  * Status a [`MarmotSecretStore`] callback returns. Crosses as
  * `uint32_t`. An out-of-range value is rejected, and surfaces to the
- * caller as the store failure it is (`MARMOT_STATUS_RUNTIME`, detail
- * text in `marmot_last_error_message`) — a callback's return travels
+ * caller as a store failure, with detail in `marmot_last_error_message`.
+ * A callback's return travels
  * back through the runtime's typed errors, so it cannot become
  * `MARMOT_STATUS_INVALID_ARGUMENT`, which is reserved for values the
  * caller passes *in*.
@@ -1745,9 +1747,8 @@ typedef enum MarmotSecretStoreStatus {
    */
   MARMOT_SECRET_STORE_STATUS_OK,
   /**
-   * No credential is stored for this account. Only `load_secret`
-   * should report it; `remove_secret` on a missing credential
-   * succeeds.
+   * No credential or discoverable source exists. Releasing an
+   * already retired receipt succeeds.
    */
   MARMOT_SECRET_STORE_STATUS_NOT_FOUND,
   /**
@@ -1760,6 +1761,61 @@ typedef enum MarmotSecretStoreStatus {
    */
   MARMOT_SECRET_STORE_STATUS_FAILED,
 } MarmotSecretStoreStatus;
+
+/**
+ * Credential purpose. Fields and callback arguments cross as uint32_t.
+ */
+typedef enum MarmotSecretCredentialKind {
+  MARMOT_SECRET_CREDENTIAL_KIND_SIGNING,
+  MARMOT_SECRET_CREDENTIAL_KIND_EXTERNAL_DATABASE,
+  MARMOT_SECRET_CREDENTIAL_KIND_NIP46_SESSION,
+} MarmotSecretCredentialKind;
+
+/**
+ * Whether acquisition creates material, adopts it, or permits either.
+ */
+typedef enum MarmotSecretClaimMode {
+  /**
+   * Require a proposal and reject discoverable material.
+   */
+  MARMOT_SECRET_CLAIM_MODE_CREATE_ONLY,
+  /**
+   * Require an existing managed source; any proposal must match it.
+   */
+  MARMOT_SECRET_CLAIM_MODE_ADOPT_ONLY,
+  /**
+   * Adopt matching managed material, or create from a proposal.
+   */
+  MARMOT_SECRET_CLAIM_MODE_CREATE_OR_ADOPT,
+  /**
+   * Explicitly permit legacy lookup and retain its cleanup pointer.
+   */
+  MARMOT_SECRET_CLAIM_MODE_MIGRATE_LEGACY,
+} MarmotSecretClaimMode;
+
+/**
+ * Original acquisition result, unchanged by same-owner retries.
+ */
+typedef enum MarmotSecretOrigin {
+  MARMOT_SECRET_ORIGIN_CREATED,
+  MARMOT_SECRET_ORIGIN_EXISTING,
+} MarmotSecretOrigin;
+
+/**
+ * Retire and delete this receipt, or preserve it until a new adoption.
+ */
+typedef enum MarmotSecretReleaseMode {
+  MARMOT_SECRET_RELEASE_MODE_DELETE_IF_UNOWNED,
+  MARMOT_SECRET_RELEASE_MODE_PRESERVE,
+} MarmotSecretReleaseMode;
+
+/**
+ * PendingLegacy confirms managed retirement/deletion; only raw legacy cleanup is unresolved.
+ */
+typedef enum MarmotSecretReleaseOutcome {
+  MARMOT_SECRET_RELEASE_OUTCOME_RELEASED,
+  MARMOT_SECRET_RELEASE_OUTCOME_PENDING_LEGACY,
+} MarmotSecretReleaseOutcome;
 
 /**
  * Host-side operation a UI can time and report back.
@@ -2027,40 +2083,83 @@ typedef struct MarmotTimelineSubscription MarmotTimelineSubscription;
 typedef struct MarmotUserSearchSubscription MarmotUserSearchSubscription;
 
 /**
+ * Return the vault's stable, nonsecret UTF-8 identity, including while locked.
+ * Different vaults/services require different IDs, preserved across restarts.
+ * Keep the credential target fixed until `destroy`; switching vaults/tenants
+ * requires a new store context with a different namespace.
+ * Write an owned NUL-terminated string to `out_namespace`; the library returns
+ * every non-NULL output through `free_secret`, even on failure.
+ */
+typedef uint32_t (*MarmotSecretStoreCleanupNamespaceFn)(void *user_data, char **out_namespace);
+
+/**
  * `has_secret_for_label` / `has_secret_for_account_id`: write nonzero to
  * `out_present` when a credential exists.
  */
 typedef uint32_t (*MarmotSecretStoreHasFn)(void *user_data, const char *key, uint8_t *out_present);
 
 /**
- * `write_secret`: persist `secret_key_hex`, replacing any existing
- * credential for this account.
+ * Borrowed receipt identity. All strings and this record are valid only
+ * during the callback and must not be retained. `kind` is a
+ * MarmotSecretCredentialKind discriminant, not a C enum field.
  */
-typedef uint32_t (*MarmotSecretStoreWriteFn)(void *user_data,
-                                             const char *label,
-                                             const char *account_id_hex,
-                                             const char *secret_key_hex);
+typedef struct MarmotSecretCredential {
+  const char *label;
+  const char *account_id_hex;
+  const char *home_id;
+  const char *owner_id;
+  uint32_t kind;
+} MarmotSecretCredential;
 
 /**
- * `load_secret`: write a NUL-terminated secret-key hex string to
- * `out_secret_key_hex`. The library copies it and returns the buffer to
- * `free_secret`.
+ * Acquire an immutable owner receipt. NULL `proposed_hex` means no proposal.
+ * Write an allocated secret and MarmotSecretOrigin tag on success. Every
+ * non-NULL secret output is returned through free_secret on every status.
+ * Same-owner retries preserve material and origin. Retired owners cannot
+ * acquire again. Signing secrets must derive the requested account ID.
+ * Signing discovery is shared by account ID; auxiliary discovery is scoped
+ * to the home and account. Ordinary modes must not inspect raw legacy keys.
+ * Return MARMOT_SECRET_STORE_STATUS_NOT_FOUND only if there is no usable
+ * source and no committed or pending receipt for this owner. If a lookup or
+ * write is uncertain, return a different failure so the runtime keeps the
+ * owner for recovery.
+ */
+typedef uint32_t (*MarmotSecretStoreAcquireFn)(void *user_data,
+                                               const struct MarmotSecretCredential *credential,
+                                               uint32_t claim_mode,
+                                               const char *proposed_hex,
+                                               char **out_secret_key_hex,
+                                               uint32_t *out_origin);
+
+/**
+ * Load only this active owner's copy; return NOT_FOUND when absent, including retired owners.
+ * Write allocated NUL-terminated secret-key hex to `out_secret_key_hex`. The library returns
+ * every non-NULL output to `free_secret`, including failure and decode errors.
  */
 typedef uint32_t (*MarmotSecretStoreLoadFn)(void *user_data,
-                                            const char *label,
-                                            const char *account_id_hex,
+                                            const struct MarmotSecretCredential *credential,
                                             char **out_secret_key_hex);
 
 /**
- * `remove_secret`: drop this account's credential. Removing a missing
- * credential succeeds.
+ * Retire only this receipt. Preserve retains a source until a new owner
+ * durably adopts it; repeating an old release cannot resurrect that source.
+ * Write a MarmotSecretReleaseOutcome tag on success.
+ * PendingLegacy requires completed managed retirement and deletion. Return a
+ * failure status for uncertain or failed managed deletion, not PendingLegacy.
  */
-typedef uint32_t (*MarmotSecretStoreRemoveFn)(void *user_data,
-                                              const char *label,
-                                              const char *account_id_hex);
+typedef uint32_t (*MarmotSecretStoreReleaseFn)(void *user_data,
+                                               const struct MarmotSecretCredential *credential,
+                                               uint32_t release_mode,
+                                               uint32_t *out_outcome);
 
 /**
- * `free_secret`: release a buffer this store returned from `load_secret`.
+ * Replay durable retirement cleanup without deleting another owner's copy.
+ */
+typedef uint32_t (*MarmotSecretStoreReconcileFn)(void *user_data);
+
+/**
+ * `free_secret`: release a buffer returned by `acquire_secret`, `load_secret` or
+ * `cleanup_namespace`. Namespace buffers contain no secret material.
  */
 typedef void (*MarmotSecretStoreFreeSecretFn)(void *user_data, char *secret_key_hex);
 
@@ -2075,20 +2174,26 @@ typedef void (*MarmotSecretStoreDestroyFn)(void *user_data);
  * retained or freed by the library. Every function pointer except
  * `destroy` is required.
  *
- * See the module documentation for the thread-safety, re-entry, and
- * ownership rules a host must honor.
+ * Callbacks can run on runtime workers or synchronously on a calling thread,
+ * including during pending wipe replay in a constructor. Callbacks may run
+ * concurrently. Synchronize access to `user_data` and do not call `marmot_*`
+ * functions on this client or mutate the same account root from a callback.
+ * The library returns every non-NULL namespace or secret buffer to
+ * `free_secret`, even if the callback reports failure.
  */
 typedef struct MarmotSecretStore {
   /**
-   * Opaque host context passed to every callback. Must outlive the
-   * client; released by `destroy`.
+   * Opaque host context passed to every callback. On successful open, keep
+   * it valid until the last runtime reference to the store is released.
    */
   void *user_data;
+  MarmotSecretStoreCleanupNamespaceFn cleanup_namespace;
   MarmotSecretStoreHasFn has_secret_for_label;
   MarmotSecretStoreHasFn has_secret_for_account_id;
-  MarmotSecretStoreWriteFn write_secret;
+  MarmotSecretStoreAcquireFn acquire_secret;
   MarmotSecretStoreLoadFn load_secret;
-  MarmotSecretStoreRemoveFn remove_secret;
+  MarmotSecretStoreReleaseFn release_secret;
+  MarmotSecretStoreReconcileFn reconcile_cleanup;
   MarmotSecretStoreFreeSecretFn free_secret;
   /**
    * Optional; invoked once when the last runtime reference to the store
@@ -2096,6 +2201,23 @@ typedef struct MarmotSecretStore {
    */
   MarmotSecretStoreDestroyFn destroy;
 } MarmotSecretStore;
+
+/**
+ * Borrowed iOS host configuration. The constructor copies the strings.
+ */
+typedef struct MarmotIosOptions {
+  /**
+   * Array of non-NULL, NUL-terminated UTF-8 App Group identifiers.
+   * NULL is allowed when app_group_identifiers_len is zero.
+   */
+  const char *const *app_group_identifiers;
+  uintptr_t app_group_identifiers_len;
+  /**
+   * Optional NUL-terminated UTF-8 access group for managed receipts in the
+   * native iOS Keychain. NULL uses the captured provider's default.
+   */
+  const char *keychain_access_group;
+} MarmotIosOptions;
 
 /**
  * Borrowed construction options. Zero initialization selects public-only
@@ -2131,6 +2253,11 @@ typedef struct MarmotClientOptions {
    * blank or over 64 bytes leaves it out.
    */
   const char *device_platform;
+  /**
+   * Optional iOS host configuration, also used for App Group identity
+   * with a callback store. NULL leaves iOS options unset.
+   */
+  const struct MarmotIosOptions *ios_options;
 } MarmotClientOptions;
 
 /**
@@ -7995,9 +8122,10 @@ MarmotStatus marmot_client_new_with_cursor_persistence(const char *root_path,
  * call takes no ownership and never invokes `destroy`; reclaiming
  * `user_data` stays the caller's job.
  *
- * The callbacks run on runtime worker threads, possibly concurrently, and
- * must not call any `marmot_*` function on this client — see the
- * `MarmotSecretStore` documentation for the full contract.
+ * Opening a root can replay pending wipes before this call returns.
+ * Secret-store callbacks can run on the constructor's calling thread during
+ * replay and can also run on runtime workers. See `MarmotSecretStore` for
+ * synchronization and re-entry rules.
  *
  * # Safety
  * `root_path` must be a valid NUL-terminated UTF-8 string; `relay_urls`
@@ -8047,6 +8175,8 @@ MarmotStatus marmot_client_new_with_client_name(const char *root_path,
  * Same root, relay and output pointer contracts as marmot_client_new.
  * Non-NULL options must point to a readable MarmotClientOptions for this call;
  * its label and store pointers obey marmot_client_new_with_client_name's contract.
+ * A non-NULL ios_options record and its array and strings must remain readable
+ * until the call returns. The library does not retain or free those pointers.
  * deployment must be a live handle from marmot_deployment_white_noise or
  * marmot_deployment_neutral; NULL is MARMOT_STATUS_NULL_POINTER.
  */

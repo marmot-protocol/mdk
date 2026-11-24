@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Once};
 
-use marmot_account::AccountHome;
+use marmot_account::{AccountHome, IosOptions};
 use marmot_uniffi::{
     AuditLogSettingsFfi, AuditLogSourceFfi, CursorPersistenceFfi, Marmot, MarmotKitError,
     MediaAttachmentReferenceFfi, MediaLocatorFfi, MediaUploadAttachmentRequestFfi,
@@ -239,6 +239,7 @@ async fn remove_account_updates_list_accounts() {
     let account = AccountHome::open_with_keychain(
         tmp.path(),
         marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+        IosOptions::default(),
     )
     .expect("open account home")
     .create_nostr_account()
@@ -286,6 +287,7 @@ async fn account_unread_summary_reports_local_accounts_without_session_load() {
     let account = AccountHome::open_with_keychain(
         tmp.path(),
         marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+        IosOptions::default(),
     )
     .expect("open account home")
     .create_nostr_account()
@@ -426,6 +428,7 @@ async fn create_group_rejects_malformed_member_as_invalid_identity() {
     let account = AccountHome::open_with_keychain(
         tmp.path(),
         marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+        IosOptions::default(),
     )
     .expect("open account home")
     .create_nostr_account()
@@ -986,6 +989,7 @@ fn audit_log_binding_lists_local_jsonl_logs() {
     let account = AccountHome::open_with_keychain(
         tmp.path(),
         marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+        IosOptions::default(),
     )
     .expect("open account home")
     .create_nostr_account()
@@ -993,6 +997,7 @@ fn audit_log_binding_lists_local_jsonl_logs() {
     let audit_path = AccountHome::open_with_keychain(
         tmp.path(),
         marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+        IosOptions::default(),
     )
     .expect("reopen account home")
     .account_dir(&account.label)
@@ -1107,6 +1112,7 @@ async fn timeline_binding_methods_are_public_and_validate_inputs() {
     let account = AccountHome::open_with_keychain(
         tmp.path(),
         marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+        IosOptions::default(),
     )
     .unwrap()
     .create_nostr_account()

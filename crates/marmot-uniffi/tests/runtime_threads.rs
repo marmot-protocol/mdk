@@ -31,48 +31,194 @@ const ASYNC_COMPAT_THREAD: &str = "async-compat";
 
 #[derive(Default)]
 struct MemorySecretStore {
-    secrets: Mutex<BTreeMap<String, String>>,
+    namespace: std::sync::OnceLock<String>,
+    receipts: Mutex<Vec<MemoryReceipt>>,
+}
+
+struct MemoryReceipt {
+    record: marmot_uniffi::SecretCredential,
+    secret: Option<zeroize::Zeroizing<String>>,
+    origin: marmot_uniffi::SecretOrigin,
+    release: Option<marmot_uniffi::SecretReleaseMode>,
+}
+
+fn same_slot(a: &marmot_uniffi::SecretCredential, b: &marmot_uniffi::SecretCredential) -> bool {
+    a.kind == b.kind
+        && a.account_id_hex == b.account_id_hex
+        && (a.kind == marmot_uniffi::SecretCredentialKind::Signing || a.home_id == b.home_id)
+}
+
+fn fixture_error() -> MarmotKitError {
+    MarmotKitError::Runtime {
+        details: "in-memory credential ownership conflict".into(),
+    }
+}
+
+fn fixture_missing() -> MarmotKitError {
+    MarmotKitError::SecretNotFound {
+        details: "in-memory credential missing".into(),
+    }
 }
 
 impl SecretStore for MemorySecretStore {
-    fn has_secret_for_label(&self, _label: String) -> Result<bool, MarmotKitError> {
-        Ok(false)
+    fn cleanup_namespace(&self) -> Result<String, MarmotKitError> {
+        Ok(self
+            .namespace
+            .get_or_init(|| nostr::prelude::Keys::generate().public_key().to_hex())
+            .clone())
+    }
+
+    fn has_secret_for_label(&self, label: String) -> Result<bool, MarmotKitError> {
+        Ok(self.receipts.lock().unwrap().iter().any(|entry| {
+            entry.record.kind == marmot_uniffi::SecretCredentialKind::Signing
+                && entry.record.label == label
+                && entry.secret.is_some()
+        }))
     }
 
     fn has_secret_for_account_id(&self, account_id_hex: String) -> Result<bool, MarmotKitError> {
-        Ok(self.secrets.lock().unwrap().contains_key(&account_id_hex))
+        Ok(self.receipts.lock().unwrap().iter().any(|entry| {
+            entry.record.kind == marmot_uniffi::SecretCredentialKind::Signing
+                && entry.record.account_id_hex == account_id_hex
+                && entry.secret.is_some()
+        }))
     }
 
-    fn write_secret(
+    fn acquire_secret(
         &self,
-        _label: String,
-        account_id_hex: String,
-        secret_key_hex: String,
-    ) -> Result<(), MarmotKitError> {
-        self.secrets
-            .lock()
-            .unwrap()
-            .insert(account_id_hex, secret_key_hex);
-        Ok(())
+        record: marmot_uniffi::SecretCredential,
+        mode: marmot_uniffi::SecretClaimMode,
+        proposed_hex: Option<String>,
+    ) -> Result<marmot_uniffi::AcquiredSecret, MarmotKitError> {
+        use marmot_uniffi::{
+            SecretClaimMode, SecretCredentialKind, SecretOrigin, SecretReleaseMode,
+        };
+        let proposed = proposed_hex.map(zeroize::Zeroizing::new);
+        let mut entries = self.receipts.lock().unwrap();
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.record.owner_id == record.owner_id)
+        {
+            if entry.record != record || entry.release.is_some() {
+                return Err(fixture_error());
+            }
+            let secret = entry.secret.as_ref().ok_or_else(fixture_missing)?;
+            if proposed
+                .as_ref()
+                .is_some_and(|value| value.as_str() != secret.as_str())
+            {
+                return Err(fixture_error());
+            }
+            return Ok(marmot_uniffi::AcquiredSecret {
+                secret_key_hex: secret.to_string(),
+                origin: entry.origin,
+            });
+        }
+        let source = entries
+            .iter()
+            .find(|entry| same_slot(&entry.record, &record) && entry.secret.is_some());
+        if mode == SecretClaimMode::CreateOnly && (source.is_some() || proposed.is_none()) {
+            return Err(fixture_error());
+        }
+        if matches!(
+            mode,
+            SecretClaimMode::AdoptOnly | SecretClaimMode::MigrateLegacy
+        ) && source.is_none()
+        {
+            return Err(fixture_missing());
+        }
+        let origin = if source.is_some() {
+            SecretOrigin::Existing
+        } else {
+            SecretOrigin::Created
+        };
+        let secret = source
+            .and_then(|entry| entry.secret.as_ref())
+            .or(proposed.as_ref())
+            .ok_or_else(fixture_missing)?;
+        if proposed
+            .as_ref()
+            .is_some_and(|value| value.as_str() != secret.as_str())
+        {
+            return Err(fixture_error());
+        }
+        if secret.len() != 64 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(fixture_error());
+        }
+        let keys = nostr::prelude::Keys::parse(secret.as_str()).map_err(|_| fixture_error())?;
+        if record.kind == SecretCredentialKind::Signing
+            && keys.public_key().to_hex() != record.account_id_hex
+        {
+            return Err(fixture_error());
+        }
+        let secret = secret.to_string();
+        entries.push(MemoryReceipt {
+            record: record.clone(),
+            secret: Some(zeroize::Zeroizing::new(secret.clone())),
+            origin,
+            release: None,
+        });
+        for entry in entries.iter_mut().filter(|entry| {
+            same_slot(&entry.record, &record) && entry.release == Some(SecretReleaseMode::Preserve)
+        }) {
+            entry.secret = None;
+        }
+        Ok(marmot_uniffi::AcquiredSecret {
+            secret_key_hex: secret,
+            origin,
+        })
     }
 
     fn load_secret(
         &self,
-        _label: String,
-        account_id_hex: String,
+        record: marmot_uniffi::SecretCredential,
     ) -> Result<String, MarmotKitError> {
-        self.secrets
+        self.receipts
             .lock()
             .unwrap()
-            .get(&account_id_hex)
-            .cloned()
-            .ok_or(MarmotKitError::SecretNotFound {
-                details: account_id_hex,
-            })
+            .iter()
+            .find(|entry| entry.record == record && entry.release.is_none())
+            .and_then(|entry| entry.secret.as_ref())
+            .map(|secret| secret.to_string())
+            .ok_or_else(fixture_missing)
     }
 
-    fn remove_secret(&self, _label: String, account_id_hex: String) -> Result<(), MarmotKitError> {
-        self.secrets.lock().unwrap().remove(&account_id_hex);
+    fn release_secret(
+        &self,
+        record: marmot_uniffi::SecretCredential,
+        mode: marmot_uniffi::SecretReleaseMode,
+    ) -> Result<marmot_uniffi::SecretReleaseOutcome, MarmotKitError> {
+        let mut entries = self.receipts.lock().unwrap();
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.record.owner_id == record.owner_id)
+        {
+            if entry.record != record {
+                return Err(fixture_error());
+            }
+            if entry.release.is_none() {
+                entry.release = Some(mode);
+                if mode == marmot_uniffi::SecretReleaseMode::DeleteIfUnowned {
+                    entry.secret = None;
+                }
+            }
+        } else {
+            entries.push(MemoryReceipt {
+                record,
+                secret: None,
+                origin: marmot_uniffi::SecretOrigin::Existing,
+                release: Some(mode),
+            });
+        }
+        Ok(marmot_uniffi::SecretReleaseOutcome::Released)
+    }
+
+    fn reconcile_cleanup(&self) -> Result<(), MarmotKitError> {
+        for entry in self.receipts.lock().unwrap().iter_mut() {
+            if entry.release == Some(marmot_uniffi::SecretReleaseMode::DeleteIfUnowned) {
+                entry.secret = None;
+            }
+        }
         Ok(())
     }
 }

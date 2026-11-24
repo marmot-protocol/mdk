@@ -20,8 +20,12 @@ account-device runtime is `marmot-session`'s. It must not own UI projection, not
 - `nip49_export.rs` — NIP-49 `ncryptsec` export policy (fixed scrypt cost, non-empty passphrase, key-security byte);
   crypto is delegated to the upstream `nostr` crate. Do not hand-roll NIP-49 here.
 - `secret_store.rs` — `AccountSecretStore` trait with `LocalFileSecretStore` and `KeychainSecretStore`.
-- `keyring.rs` — platform keyring entry construction, iOS service versioning and secret writes, store init (per-OS
-  `#[cfg]` cascade), and keyring-error mapping.
+- `ownership.rs` — credential receipt identity, acquisition origin, and release contracts.
+- `owned_vault.rs` — immutable owner copies, preserved-copy adoption, terminal retirements, and legacy provenance.
+- `native_vault.rs` — checked Secret Service, macOS/iOS Keychain, and Windows Credential Manager operations.
+- `android_vault.rs` — JNI-backed Android Keystore keys and AES-GCM receipt files; replaces `native_vault.rs` on Android.
+- `location.rs` — iOS host options, authorized mobile-container identity, and desktop root hashing.
+- `keyring.rs` — platform default-store initialization and keyring-error mapping.
 - `io.rs` — JSON read/write helpers, atomic private- and secret-file writes, and account-label validation.
 
 Tests: `tests/home.rs` (account home).

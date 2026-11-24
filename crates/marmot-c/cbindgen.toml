@@ -26,8 +26,10 @@ header = """/*
  *    C enum or _Bool would be undefined behavior before any check runs.
  *  - Required out-pointers are validated and cleared before the call does
  *    any work, so a rejected call never leaves a side effect behind.
- *  - Callbacks run on runtime worker threads; item pointers passed to a
- *    callback are borrowed and valid only for the duration of the call.
+ *  - Subscription callbacks run on runtime worker threads. Their event
+ *    payloads, secret-store credential inputs, and secret-store output slots
+ *    are borrowed only for the callback. See MarmotSecretStore for callback
+ *    threading, user_data lifetime, and returned buffer ownership.
  */"""
 
 [export]
@@ -49,6 +51,11 @@ include = [
     "MarmotNotificationWakeSource",
     "MarmotCursorPersistence",
     "MarmotSecretStoreStatus",
+    "MarmotSecretCredentialKind",
+    "MarmotSecretClaimMode",
+    "MarmotSecretOrigin",
+    "MarmotSecretReleaseMode",
+    "MarmotSecretReleaseOutcome",
     "MarmotHostPerformanceOperation",
     "MarmotHostPerformanceOutcome",
     "MarmotModerationReportOrigin",

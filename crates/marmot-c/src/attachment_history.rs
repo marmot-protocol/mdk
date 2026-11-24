@@ -246,41 +246,8 @@ pub unsafe extern "C" fn marmot_attachment_history_version_change_since(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use marmot_uniffi::{Marmot, MarmotKitError, SecretStore};
-    use std::{collections::HashMap, ffi::CString, ptr, sync::Mutex};
-    #[derive(Default)]
-    struct Store(Mutex<HashMap<String, String>>);
-    impl SecretStore for Store {
-        fn has_secret_for_label(&self, label: String) -> Result<bool, MarmotKitError> {
-            Ok(self.0.lock().unwrap().contains_key(&label))
-        }
-        fn has_secret_for_account_id(&self, _: String) -> Result<bool, MarmotKitError> {
-            Ok(false)
-        }
-        fn write_secret(
-            &self,
-            label: String,
-            _: String,
-            key: String,
-        ) -> Result<(), MarmotKitError> {
-            self.0.lock().unwrap().insert(label, key);
-            Ok(())
-        }
-        fn load_secret(&self, label: String, _: String) -> Result<String, MarmotKitError> {
-            self.0
-                .lock()
-                .unwrap()
-                .get(&label)
-                .cloned()
-                .ok_or(MarmotKitError::SecretNotFound {
-                    details: "test".into(),
-                })
-        }
-        fn remove_secret(&self, label: String, _: String) -> Result<(), MarmotKitError> {
-            self.0.lock().unwrap().remove(&label);
-            Ok(())
-        }
-    }
+    use marmot_uniffi::Marmot;
+    use std::{ffi::CString, ptr};
     // A real upload supplies the local provenance that an outbound reference needs.
     async fn upload_sink() -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -352,7 +319,7 @@ mod tests {
             dir.path().to_str().unwrap().into(),
             vec![url.clone()],
             marmot_uniffi::RelayPolicyFfi::AllowLoopbackRelaysAndBlobs,
-            Some(Arc::new(Store::default())),
+            Some(crate::secret_store::fixture_store()),
             marmot_uniffi::marmot_deployment_white_noise(),
         )
         .unwrap();

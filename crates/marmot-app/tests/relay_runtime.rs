@@ -15,7 +15,9 @@ use cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, TransportEndpoint};
-use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
+use marmot_account::{
+    AccountHome, AccountHomeError, AccountSecretStore, IosOptions, KeychainSecretStore,
+};
 #[cfg(feature = "test-policy-overrides")]
 use marmot_app::AccountKeyPackageLocalState;
 use marmot_app::audit_otlp_sender::AuditOtlpSender;
@@ -1854,7 +1856,9 @@ async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() 
     };
     let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
 
-    let first_home = AccountHome::open_with_keychain(dir.path(), service_name.clone()).unwrap();
+    let first_home =
+        AccountHome::open_with_keychain(dir.path(), service_name.clone(), IosOptions::default())
+            .unwrap();
     let first_app = MarmotApp::with_relays_and_account_home_and_config(
         dir.path(),
         vec![url.clone()],
@@ -1882,7 +1886,8 @@ async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() 
     std::fs::remove_dir_all(dir.path()).unwrap();
     std::fs::create_dir_all(dir.path()).unwrap();
 
-    let recovered_home = AccountHome::open_with_keychain(dir.path(), service_name).unwrap();
+    let recovered_home =
+        AccountHome::open_with_keychain(dir.path(), service_name, IosOptions::default()).unwrap();
     let recovered_app = MarmotApp::with_relays_and_account_home_and_config(
         dir.path(),
         vec![url],
@@ -2363,8 +2368,12 @@ async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychai
         ..AccountSetupRequest::default()
     };
 
-    let first_home =
-        AccountHome::open_with_keychain(dir.path(), recovered_service.clone()).unwrap();
+    let first_home = AccountHome::open_with_keychain(
+        dir.path(),
+        recovered_service.clone(),
+        IosOptions::default(),
+    )
+    .unwrap();
     let first_app = MarmotApp::with_relays_and_account_home_and_config(
         dir.path(),
         vec![url.clone()],
@@ -2390,8 +2399,12 @@ async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychai
     std::fs::remove_dir_all(dir.path()).unwrap();
     std::fs::create_dir_all(dir.path()).unwrap();
 
-    let recovered_home =
-        AccountHome::open_with_keychain(dir.path(), recovered_service.clone()).unwrap();
+    let recovered_home = AccountHome::open_with_keychain(
+        dir.path(),
+        recovered_service.clone(),
+        IosOptions::default(),
+    )
+    .unwrap();
     let recovered_app = MarmotApp::with_relays_and_account_home_and_config(
         dir.path(),
         vec![url.clone()],
@@ -2411,7 +2424,7 @@ async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychai
     ));
     assert!(recovered_home.accounts().unwrap().is_empty());
     assert!(
-        KeychainSecretStore::new(recovered_service)
+        KeychainSecretStore::new(recovered_service, &IosOptions::default())
             .unwrap()
             .has_secret_for_account_id(&recovered_account_id)
             .unwrap(),
@@ -2422,7 +2435,9 @@ async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychai
     let new_account_id = new_keys.public_key().to_hex();
     let new_service = format!("com.marmot.test.runtime-rollback-new-{new_account_id}");
     let new_dir = tempfile::tempdir().unwrap();
-    let new_home = AccountHome::open_with_keychain(new_dir.path(), new_service.clone()).unwrap();
+    let new_home =
+        AccountHome::open_with_keychain(new_dir.path(), new_service.clone(), IosOptions::default())
+            .unwrap();
     let new_app = MarmotApp::with_relays_and_account_home_and_config(
         new_dir.path(),
         vec![url],
@@ -2443,13 +2458,21 @@ async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychai
         Err(AppError::MissingDefaultRelays)
     ));
     assert!(new_home.accounts().unwrap().is_empty());
-    assert!(
-        !KeychainSecretStore::new(new_service)
-            .unwrap()
-            .has_secret_for_account_id(&new_account_id)
-            .unwrap(),
-        "rollback must still delete a signing credential created by failed setup"
-    );
+    let service_hash = hex::encode(Sha256::digest(new_service.as_bytes()));
+    let receipt_service = format!("mdk-owned-receipt-v1-{service_hash}");
+    let keyring = keyring_core::get_default_store().unwrap();
+    for receipt in keyring
+        .search(&HashMap::from([("service", receipt_service.as_str())]))
+        .unwrap()
+    {
+        let (service, _) = receipt.get_specifiers().unwrap();
+        if service == receipt_service {
+            assert!(
+                matches!(receipt.get_password(), Err(keyring_core::Error::NoEntry)),
+                "rollback must delete the signing receipt from the Keychain"
+            );
+        }
+    }
 
     recovered_runtime.shutdown().await;
     new_runtime.shutdown().await;

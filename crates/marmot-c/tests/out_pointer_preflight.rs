@@ -18,118 +18,11 @@ use marmot_c::subscriptions::{
 };
 use marmot_c::{MarmotClient, MarmotStatus, marmot_client_free, marmot_client_shutdown};
 
-use marmot_c::secret_store::MarmotSecretStoreStatus as StoreStatus;
-
-// All ownership here is a private host fixture in the existing binary.
-// No platform keystore and no assertion-skipping constructor path.
-#[derive(Default)]
-struct Vault(std::sync::Mutex<std::collections::HashMap<(String, String), String>>);
-unsafe fn input_text(value: *const std::ffi::c_char) -> Result<String, u32> {
-    if value.is_null() {
-        return Err(marmot_c::secret_store::MarmotSecretStoreStatus::Failed as u32);
-    }
-    unsafe { std::ffi::CStr::from_ptr(value) }
-        .to_str()
-        .map(str::to_owned)
-        .map_err(|_| marmot_c::secret_store::MarmotSecretStoreStatus::Failed as u32)
-}
-unsafe extern "C" fn has_label(
-    data: *mut std::ffi::c_void,
-    key: *const std::ffi::c_char,
-    out: *mut u8,
-) -> u32 {
-    let Ok(key) = (unsafe { input_text(key) }) else {
-        return StoreStatus::Failed as u32;
-    };
-    let vault = unsafe { &*(data as *const Vault) };
-    let Ok(entries) = vault.0.lock() else {
-        return StoreStatus::Failed as u32;
-    };
-    unsafe { out.write(u8::from(entries.keys().any(|(label, _)| label == &key))) };
-    StoreStatus::Ok as u32
-}
-unsafe extern "C" fn has_account(
-    data: *mut std::ffi::c_void,
-    key: *const std::ffi::c_char,
-    out: *mut u8,
-) -> u32 {
-    let Ok(key) = (unsafe { input_text(key) }) else {
-        return StoreStatus::Failed as u32;
-    };
-    let vault = unsafe { &*(data as *const Vault) };
-    let Ok(entries) = vault.0.lock() else {
-        return StoreStatus::Failed as u32;
-    };
-    unsafe { out.write(u8::from(entries.keys().any(|(_, account)| account == &key))) };
-    StoreStatus::Ok as u32
-}
-unsafe extern "C" fn store_write(
-    data: *mut std::ffi::c_void,
-    label: *const std::ffi::c_char,
-    account: *const std::ffi::c_char,
-    secret: *const std::ffi::c_char,
-) -> u32 {
-    let (Ok(label), Ok(account), Ok(secret)) = (
-        unsafe { input_text(label) },
-        unsafe { input_text(account) },
-        unsafe { input_text(secret) },
-    ) else {
-        return StoreStatus::Failed as u32;
-    };
-    let vault = unsafe { &*(data as *const Vault) };
-    let Ok(mut entries) = vault.0.lock() else {
-        return StoreStatus::Failed as u32;
-    };
-    entries.insert((label, account), secret);
-    StoreStatus::Ok as u32
-}
-unsafe extern "C" fn store_load(
-    data: *mut std::ffi::c_void,
-    label: *const std::ffi::c_char,
-    account: *const std::ffi::c_char,
-    out: *mut *mut std::ffi::c_char,
-) -> u32 {
-    let (Ok(label), Ok(account)) = (unsafe { input_text(label) }, unsafe { input_text(account) })
-    else {
-        return StoreStatus::Failed as u32;
-    };
-    let vault = unsafe { &*(data as *const Vault) };
-    let Ok(entries) = vault.0.lock() else {
-        return StoreStatus::Failed as u32;
-    };
-    let Some(secret) = entries.get(&(label, account)) else {
-        return StoreStatus::NotFound as u32;
-    };
-    let Ok(secret) = CString::new(secret.as_str()) else {
-        return StoreStatus::Failed as u32;
-    };
-    unsafe { out.write(secret.into_raw()) };
-    StoreStatus::Ok as u32
-}
-unsafe extern "C" fn store_remove(
-    data: *mut std::ffi::c_void,
-    label: *const std::ffi::c_char,
-    account: *const std::ffi::c_char,
-) -> u32 {
-    let (Ok(label), Ok(account)) = (unsafe { input_text(label) }, unsafe { input_text(account) })
-    else {
-        return StoreStatus::Failed as u32;
-    };
-    let vault = unsafe { &*(data as *const Vault) };
-    let Ok(mut entries) = vault.0.lock() else {
-        return StoreStatus::Failed as u32;
-    };
-    entries.remove(&(label, account));
-    StoreStatus::Ok as u32
-}
-unsafe extern "C" fn store_free(_: *mut std::ffi::c_void, value: *mut std::ffi::c_char) {
-    if !value.is_null() {
-        drop(unsafe { CString::from_raw(value) });
-    }
-}
-unsafe extern "C" fn store_destroy(data: *mut std::ffi::c_void) {
-    drop(unsafe { Box::from_raw(data as *mut Vault) });
-}
+use marmot_c::secret_store as host_abi;
+#[allow(dead_code)]
+#[path = "support/owned_store.rs"]
+mod owned_store;
+use owned_store::MemoryVault as Vault;
 
 struct ClientFixture {
     client: *mut MarmotClient,
@@ -155,16 +48,9 @@ impl ClientFixture {
         let home = tempfile::tempdir().unwrap();
         let path = CString::new(home.path().to_str().unwrap()).unwrap();
         let data = Box::into_raw(Box::new(Vault::default()));
-        let store = marmot_c::secret_store::MarmotSecretStore {
-            user_data: data.cast(),
-            has_secret_for_label: Some(has_label),
-            has_secret_for_account_id: Some(has_account),
-            write_secret: Some(store_write),
-            load_secret: Some(store_load),
-            remove_secret: Some(store_remove),
-            free_secret: Some(store_free),
-            destroy: Some(store_destroy),
-        };
+        let mut store = unsafe { &*data }.table();
+        store.user_data = data.cast();
+        store.destroy = Some(Vault::destroy_box);
         let relays = [relay_url.as_ptr()];
         let mut client = std::ptr::null_mut();
         let status = unsafe {
@@ -180,7 +66,7 @@ impl ClientFixture {
         };
         if status != MarmotStatus::Ok {
             // Failed constructors explicitly leave this context with the host.
-            unsafe { store_destroy(data.cast()) };
+            unsafe { Vault::destroy_box(data.cast()) };
             panic!("host-memory constructor: {status:?}");
         }
         let fixture = Self {

@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 
@@ -40,20 +40,40 @@ pub(crate) fn read_private_json<T: for<'de> Deserialize<'de>>(
 /// steady-state reads free of inode metadata writes. `after_open` lets tests
 /// replace the file inside that window.
 fn read_tightened_private_file(path: &Path, after_open: impl FnOnce()) -> io::Result<Vec<u8>> {
-    read_private_file_bounded(path, u64::MAX, after_open)
+    read_private_file_bounded(path, u64::MAX, PrivateRead::Tighten, after_open)
 }
 
 pub(crate) fn read_private_json_bounded<T: for<'de> Deserialize<'de>>(
     path: &Path,
     max_bytes: u64,
 ) -> AccountHomeResult<T> {
-    let bytes = read_private_file_bounded(path, max_bytes, || {})?;
+    let bytes = read_private_file_bounded(path, max_bytes, PrivateRead::Tighten, || {})?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+pub(crate) fn read_immutable_json<T: for<'de> Deserialize<'de>>(
+    path: impl AsRef<Path>,
+) -> AccountHomeResult<T> {
+    read_immutable_json_bounded(path.as_ref(), u64::MAX)
+}
+
+pub(crate) fn read_immutable_json_bounded<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    max_bytes: u64,
+) -> AccountHomeResult<T> {
+    let bytes = read_private_file_bounded(path, max_bytes, PrivateRead::Immutable, || {})?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+enum PrivateRead {
+    Tighten,
+    Immutable,
 }
 
 fn read_private_file_bounded(
     path: &Path,
     max_bytes: u64,
+    mode: PrivateRead,
     after_open: impl FnOnce(),
 ) -> io::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
@@ -72,11 +92,27 @@ fn read_private_file_bounded(
             "private record must be a regular file",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    match mode {
+        PrivateRead::Tighten => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                }
+            }
+        }
+        PrivateRead::Immutable => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "private record needs a permission upgrade under writer admission",
+                    ));
+                }
+            }
         }
     }
     let mut bytes = Vec::new();
@@ -98,10 +134,7 @@ pub(crate) fn read_secret_json<T: for<'de> Deserialize<'de>>(
     Ok(serde_json::from_slice(bytes.as_slice())?)
 }
 
-#[cfg(all(test, unix))]
-fn read_secret_text(path: &Path) -> AccountHomeResult<Zeroizing<String>> {
-    use zeroize::Zeroize;
-
+pub(crate) fn read_secret_text(path: &Path) -> AccountHomeResult<Zeroizing<String>> {
     let mut bytes = read_linked_secret(path, || {})?;
     let bytes = std::mem::take(&mut *bytes);
     String::from_utf8(bytes)
@@ -181,6 +214,10 @@ pub(crate) fn write_private_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> Accou
     write_file_atomically(path.as_ref(), bytes, FileMode::Private)
 }
 
+pub(crate) fn write_secret_bytes(path: &Path, bytes: &[u8]) -> AccountHomeResult<()> {
+    write_file_atomically(path, bytes, FileMode::Secret)
+}
+
 pub(crate) fn create_durable_private_dir(path: &Path) -> io::Result<()> {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_dir() => return fs_private::create_dir_all_private(path),
@@ -215,6 +252,7 @@ pub(crate) fn create_durable_private_dir(path: &Path) -> io::Result<()> {
 }
 
 /// Key material only: read it back with [`read_secret_json`].
+#[cfg(test)]
 pub(crate) fn write_secret_json<T: Serialize>(
     path: impl AsRef<Path>,
     value: &T,
@@ -483,6 +521,11 @@ fn windows_move_path(path: &Path) -> io::Result<Vec<u16>> {
     }
     wide.push(0);
     Ok(wide)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn rename_for_commit(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
 }
 
 #[cfg(unix)]

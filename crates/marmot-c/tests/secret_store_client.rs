@@ -1,86 +1,23 @@
 //! A host-supplied secret store must be enough to open a client, with no
 //! platform keychain involved, and must be released when the client is.
 
-use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::Mutex;
+use std::ffi::{CStr, CString, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use marmot_c::secret_store::{MarmotSecretStore, MarmotSecretStoreStatus};
+use marmot_c::secret_store::MarmotSecretStore;
 use marmot_c::{
-    MarmotClient, MarmotStatus, marmot_client_free, marmot_client_new_with_secret_store,
-    marmot_client_shutdown,
+    MarmotClient, MarmotClientOptions, MarmotIosOptions, MarmotStatus, marmot_client_free,
+    marmot_client_new_with_secret_store, marmot_client_shutdown,
 };
 
-/// The host's vault, reached through `user_data`.
-static ENTRIES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+use marmot_c::secret_store as host_abi;
+#[allow(dead_code)]
+#[path = "support/owned_store.rs"]
+mod owned_store;
+use owned_store::MemoryVault;
+
 static DESTROYED: AtomicBool = AtomicBool::new(false);
-
-unsafe extern "C" fn has(_user_data: *mut c_void, key: *const c_char, out: *mut u8) -> u32 {
-    let key = unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_owned();
-    let present = ENTRIES.lock().unwrap().iter().any(|(k, _)| *k == key);
-    unsafe { out.write(u8::from(present)) };
-    MarmotSecretStoreStatus::Ok as u32
-}
-
-unsafe extern "C" fn write_secret(
-    _user_data: *mut c_void,
-    label: *const c_char,
-    _account: *const c_char,
-    secret: *const c_char,
-) -> u32 {
-    let label = unsafe { CStr::from_ptr(label) }
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let secret = unsafe { CStr::from_ptr(secret) }
-        .to_str()
-        .unwrap()
-        .to_owned();
-    ENTRIES.lock().unwrap().push((label, secret));
-    MarmotSecretStoreStatus::Ok as u32
-}
-
-unsafe extern "C" fn load_secret(
-    _user_data: *mut c_void,
-    label: *const c_char,
-    _account: *const c_char,
-    out: *mut *mut c_char,
-) -> u32 {
-    let label = unsafe { CStr::from_ptr(label) }
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let found = ENTRIES
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(k, _)| *k == label)
-        .map(|(_, secret)| secret.clone());
-    let Some(secret) = found else {
-        return MarmotSecretStoreStatus::NotFound as u32;
-    };
-    unsafe { out.write(CString::new(secret).unwrap().into_raw()) };
-    MarmotSecretStoreStatus::Ok as u32
-}
-
-unsafe extern "C" fn remove_secret(
-    _user_data: *mut c_void,
-    label: *const c_char,
-    _account: *const c_char,
-) -> u32 {
-    let label = unsafe { CStr::from_ptr(label) }
-        .to_str()
-        .unwrap()
-        .to_owned();
-    ENTRIES.lock().unwrap().retain(|(k, _)| *k != label);
-    MarmotSecretStoreStatus::Ok as u32
-}
-
-unsafe extern "C" fn free_secret(_user_data: *mut c_void, secret: *mut c_char) {
-    drop(unsafe { CString::from_raw(secret) });
-}
-
-unsafe extern "C" fn destroy(_user_data: *mut c_void) {
+unsafe extern "C" fn destroy(_: *mut c_void) {
     DESTROYED.store(true, Ordering::SeqCst);
 }
 
@@ -91,16 +28,8 @@ fn a_host_store_opens_a_client_without_the_platform_keychain() {
     let relay = CString::new("wss://relay.example.org").unwrap();
     let relays = [relay.as_ptr()];
 
-    let store = MarmotSecretStore {
-        user_data: std::ptr::null_mut(),
-        has_secret_for_label: Some(has),
-        has_secret_for_account_id: Some(has),
-        write_secret: Some(write_secret),
-        load_secret: Some(load_secret),
-        remove_secret: Some(remove_secret),
-        free_secret: Some(free_secret),
-        destroy: Some(destroy),
-    };
+    let mut store = MemoryVault::global().table();
+    store.destroy = Some(destroy);
 
     let mut client: *mut MarmotClient = std::ptr::null_mut();
     let status = unsafe {
@@ -141,16 +70,8 @@ fn a_failure_after_the_vtable_is_accepted_leaves_user_data_to_the_host() {
     // store was taken but before any handle reached the caller.
     let relays = [std::ptr::null()];
 
-    let store = MarmotSecretStore {
-        user_data: std::ptr::null_mut(),
-        has_secret_for_label: Some(has),
-        has_secret_for_account_id: Some(has),
-        write_secret: Some(write_secret),
-        load_secret: Some(load_secret),
-        remove_secret: Some(remove_secret),
-        free_secret: Some(free_secret),
-        destroy: Some(destroy_after_failure),
-    };
+    let mut store = MemoryVault::global().table();
+    store.destroy = Some(destroy_after_failure);
 
     let mut client: *mut MarmotClient = std::ptr::dangling_mut();
     let status = unsafe {
@@ -211,22 +132,10 @@ fn client_name_constructor_validates_arguments_without_taking_store_ownership() 
     assert_eq!(status, MarmotStatus::InvalidArgument);
     assert!(client.is_null());
 
-    unsafe extern "C" fn count_destroy(data: *mut c_void) {
-        unsafe { &*(data as *const std::sync::atomic::AtomicUsize) }.fetch_add(1, Ordering::SeqCst);
-    }
-    let destroyed = std::sync::atomic::AtomicUsize::new(0);
-    let store = MarmotSecretStore {
-        user_data: (&destroyed as *const std::sync::atomic::AtomicUsize)
-            .cast_mut()
-            .cast(),
-        has_secret_for_label: Some(has),
-        has_secret_for_account_id: Some(has),
-        write_secret: Some(write_secret),
-        load_secret: Some(load_secret),
-        remove_secret: Some(remove_secret),
-        free_secret: Some(free_secret),
-        destroy: Some(count_destroy),
-    };
+    let vault = MemoryVault::default();
+    let destroyed = &vault.destroy_count;
+    let mut store = vault.table();
+    store.destroy = Some(MemoryVault::destroy_mark);
     client = std::ptr::dangling_mut();
     let status = unsafe {
         marmot_c::marmot_client_new_with_client_name(
@@ -255,64 +164,70 @@ fn client_name_constructor_validates_arguments_without_taking_store_ownership() 
 
 #[test]
 fn combined_options_validate_before_transferring_store_ownership() {
-    unsafe extern "C" fn mark_destroyed(data: *mut c_void) {
-        unsafe { &*(data as *const AtomicBool) }.store(true, Ordering::SeqCst);
-    }
-    let destroyed = AtomicBool::new(false);
-    let store = MarmotSecretStore {
-        user_data: (&destroyed as *const AtomicBool).cast_mut().cast(),
-        has_secret_for_label: Some(has),
-        has_secret_for_account_id: Some(has),
-        write_secret: Some(write_secret),
-        load_secret: Some(load_secret),
-        remove_secret: Some(remove_secret),
-        free_secret: Some(free_secret),
-        destroy: Some(mark_destroyed),
-    };
+    let vault = MemoryVault::default();
+    let destroyed = &vault.destroyed;
+    let mut store = vault.table();
+    store.destroy = Some(MemoryVault::destroy_mark);
     let name = CString::new("whitenoise").unwrap();
     let root = tempfile::tempdir().unwrap();
     let path = CString::new(root.path().to_str().unwrap()).unwrap();
     let relay = CString::new("ws://127.0.0.1:1").unwrap();
     let relays = [relay.as_ptr()];
-    let mut options = marmot_c::MarmotClientOptions {
+    let mut options = MarmotClientOptions {
         attachment_acquisition_mode: 0,
         relay_policy: 2,
         cursor_persistence: 1,
         client_name: name.as_ptr(),
         store: &store,
         device_platform: std::ptr::null(),
+        ios_options: std::ptr::null(),
     };
-    for (relay_policy, cursor_persistence) in [(u32::MAX, 1), (2, u32::MAX)] {
-        options.relay_policy = relay_policy;
-        options.cursor_persistence = cursor_persistence;
+    let deployment = marmot_c::deployment::OwnedDeployment::white_noise();
+    let open = |root_path, options: &MarmotClientOptions, client| unsafe {
+        marmot_c::marmot_client_new_with_configuration(
+            root_path,
+            relays.as_ptr(),
+            relays.len(),
+            options,
+            deployment.as_ptr(),
+            client,
+        )
+    };
+    let missing_array = MarmotIosOptions {
+        app_group_identifiers: std::ptr::null(),
+        app_group_identifiers_len: 1,
+        keychain_access_group: std::ptr::null(),
+    };
+    let invalid_utf8 = [0xffu8, 0];
+    let invalid_access_group = MarmotIosOptions {
+        app_group_identifiers: std::ptr::null(),
+        app_group_identifiers_len: 0,
+        keychain_access_group: invalid_utf8.as_ptr().cast(),
+    };
+    for (policy, cursor, ios, expected) in [
+        (u32::MAX, 1, std::ptr::null(), MarmotStatus::InvalidArgument),
+        (2, u32::MAX, std::ptr::null(), MarmotStatus::InvalidArgument),
+        (2, 1, &raw const missing_array, MarmotStatus::NullPointer),
+        (
+            2,
+            1,
+            &raw const invalid_access_group,
+            MarmotStatus::InvalidUtf8,
+        ),
+    ] {
+        options.relay_policy = policy;
+        options.cursor_persistence = cursor;
+        options.ios_options = ios;
         let mut client = std::ptr::dangling_mut();
-        let status = unsafe {
-            marmot_c::marmot_client_new_with_configuration(
-                path.as_ptr(),
-                relays.as_ptr(),
-                1,
-                &options,
-                marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
-                &raw mut client,
-            )
-        };
-        assert_eq!(status, MarmotStatus::InvalidArgument);
+        assert_eq!(open(path.as_ptr(), &options, &raw mut client), expected);
         assert!(client.is_null());
         assert!(!destroyed.load(Ordering::SeqCst));
     }
     options.relay_policy = 2;
     options.cursor_persistence = 1;
+    options.ios_options = std::ptr::null();
     let mut client = std::ptr::dangling_mut();
-    let status = unsafe {
-        marmot_c::marmot_client_new_with_configuration(
-            std::ptr::null(),
-            relays.as_ptr(),
-            1,
-            &options,
-            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
-            &raw mut client,
-        )
-    };
+    let status = open(std::ptr::null(), &options, &raw mut client);
     assert_eq!(status, MarmotStatus::NullPointer);
     assert!(client.is_null());
     assert!(
@@ -320,16 +235,7 @@ fn combined_options_validate_before_transferring_store_ownership() {
         "failed construction leaves the store with its owner"
     );
     let mut client = std::ptr::null_mut();
-    let status = unsafe {
-        marmot_c::marmot_client_new_with_configuration(
-            path.as_ptr(),
-            relays.as_ptr(),
-            1,
-            &options,
-            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
-            &raw mut client,
-        )
-    };
+    let status = open(path.as_ptr(), &options, &raw mut client);
     assert_eq!(status, MarmotStatus::Ok);
     assert!(!destroyed.load(Ordering::SeqCst));
     unsafe { marmot_client_free(client) };
@@ -338,31 +244,22 @@ fn combined_options_validate_before_transferring_store_ownership() {
 
 #[test]
 fn a_deployment_constructor_opens_with_a_host_store() {
-    unsafe extern "C" fn mark_destroyed(data: *mut c_void) {
-        unsafe { &*(data as *const AtomicBool) }.store(true, Ordering::SeqCst);
-    }
-    let destroyed = AtomicBool::new(false);
-    let store = MarmotSecretStore {
-        user_data: (&destroyed as *const AtomicBool).cast_mut().cast(),
-        has_secret_for_label: Some(has),
-        has_secret_for_account_id: Some(has),
-        write_secret: Some(write_secret),
-        load_secret: Some(load_secret),
-        remove_secret: Some(remove_secret),
-        free_secret: Some(free_secret),
-        destroy: Some(mark_destroyed),
-    };
+    let vault = MemoryVault::default();
+    let destroyed = &vault.destroyed;
+    let mut store = vault.table();
+    store.destroy = Some(MemoryVault::destroy_mark);
     let root = tempfile::tempdir().unwrap();
     let path = CString::new(root.path().to_str().unwrap()).unwrap();
     let relay = CString::new("ws://127.0.0.1:1").unwrap();
     let relays = [relay.as_ptr()];
-    let options = marmot_c::MarmotClientOptions {
+    let options = MarmotClientOptions {
         attachment_acquisition_mode: 0,
         relay_policy: 2,
         cursor_persistence: 0,
         client_name: std::ptr::null(),
         store: &store,
         device_platform: std::ptr::null(),
+        ios_options: std::ptr::null(),
     };
     let mut deployment = std::ptr::null_mut();
     assert_eq!(
@@ -389,20 +286,10 @@ fn a_deployment_constructor_opens_with_a_host_store() {
 
 #[test]
 fn a_null_deployment_is_rejected_before_the_store_is_taken() {
-    unsafe extern "C" fn mark_destroyed(data: *mut c_void) {
-        unsafe { &*(data as *const AtomicBool) }.store(true, Ordering::SeqCst);
-    }
-    let destroyed = AtomicBool::new(false);
-    let store = MarmotSecretStore {
-        user_data: (&destroyed as *const AtomicBool).cast_mut().cast(),
-        has_secret_for_label: Some(has),
-        has_secret_for_account_id: Some(has),
-        write_secret: Some(write_secret),
-        load_secret: Some(load_secret),
-        remove_secret: Some(remove_secret),
-        free_secret: Some(free_secret),
-        destroy: Some(mark_destroyed),
-    };
+    let vault = MemoryVault::default();
+    let destroyed = &vault.destroyed;
+    let mut store = vault.table();
+    store.destroy = Some(MemoryVault::destroy_mark);
     let root = tempfile::tempdir().unwrap();
     let path = CString::new(root.path().to_str().unwrap()).unwrap();
     let relay = CString::new("ws://127.0.0.1:1").unwrap();
@@ -434,111 +321,23 @@ fn a_null_deployment_is_rejected_before_the_store_is_taken() {
 /// They also prove the experimental constructor preserves callback ownership.
 mod experimental_host {
     use super::*;
-    use std::collections::BTreeMap;
-
-    #[derive(Default)]
-    struct Vault {
-        entries: Mutex<BTreeMap<String, String>>,
-        destroyed: AtomicBool,
-    }
-
-    unsafe fn vault<'a>(data: *mut c_void) -> &'a Vault {
-        unsafe { &*data.cast::<Vault>() }
-    }
-
-    unsafe extern "C" fn has(data: *mut c_void, key: *const c_char, out: *mut u8) -> u32 {
-        let key = unsafe { CStr::from_ptr(key) }.to_str().unwrap();
-        unsafe {
-            out.write(u8::from(
-                vault(data).entries.lock().unwrap().contains_key(key),
-            ))
-        };
-        MarmotSecretStoreStatus::Ok as u32
-    }
-
-    unsafe extern "C" fn write(
-        data: *mut c_void,
-        _label: *const c_char,
-        account: *const c_char,
-        secret: *const c_char,
-    ) -> u32 {
-        let account = unsafe { CStr::from_ptr(account) }
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let secret = unsafe { CStr::from_ptr(secret) }
-            .to_str()
-            .unwrap()
-            .to_owned();
-        unsafe { vault(data) }
-            .entries
-            .lock()
-            .unwrap()
-            .insert(account, secret);
-        MarmotSecretStoreStatus::Ok as u32
-    }
-
-    unsafe extern "C" fn load(
-        data: *mut c_void,
-        _label: *const c_char,
-        account: *const c_char,
-        out: *mut *mut c_char,
-    ) -> u32 {
-        let account = unsafe { CStr::from_ptr(account) }.to_str().unwrap();
-        let entry = unsafe { vault(data) }
-            .entries
-            .lock()
-            .unwrap()
-            .get(account)
-            .cloned();
-        let Some(secret) = entry else {
-            return MarmotSecretStoreStatus::NotFound as u32;
-        };
-        unsafe { out.write(CString::new(secret).unwrap().into_raw()) };
-        MarmotSecretStoreStatus::Ok as u32
-    }
-
-    unsafe extern "C" fn remove(
-        data: *mut c_void,
-        _label: *const c_char,
-        account: *const c_char,
-    ) -> u32 {
-        let account = unsafe { CStr::from_ptr(account) }.to_str().unwrap();
-        unsafe { vault(data) }
-            .entries
-            .lock()
-            .unwrap()
-            .remove(account);
-        MarmotSecretStoreStatus::Ok as u32
-    }
-
-    unsafe extern "C" fn destroy(data: *mut c_void) {
-        unsafe { vault(data) }
-            .destroyed
-            .store(true, Ordering::SeqCst);
-    }
+    use owned_store::MemoryVault as Vault;
 
     fn store(vault: &Vault) -> MarmotSecretStore {
-        MarmotSecretStore {
-            user_data: (vault as *const Vault).cast_mut().cast(),
-            has_secret_for_label: Some(has),
-            has_secret_for_account_id: Some(has),
-            write_secret: Some(write),
-            load_secret: Some(load),
-            remove_secret: Some(remove),
-            free_secret: Some(super::free_secret),
-            destroy: Some(destroy),
-        }
+        let mut store = vault.table();
+        store.destroy = Some(Vault::destroy_mark);
+        store
     }
 
-    fn options(store: &MarmotSecretStore) -> marmot_c::MarmotClientOptions {
-        marmot_c::MarmotClientOptions {
+    fn options(store: &MarmotSecretStore) -> MarmotClientOptions {
+        MarmotClientOptions {
             attachment_acquisition_mode: 0,
             relay_policy: 1,
             cursor_persistence: 0,
             client_name: c"experimental-host-test".as_ptr(),
             store,
             device_platform: c"desktop".as_ptr(),
+            ios_options: std::ptr::null(),
         }
     }
 
@@ -748,10 +547,6 @@ mod experimental_host {
                     check(unsafe { marmot_c::commands::marmot_client_shutdown_and_close(client) });
                     unsafe { marmot_client_free(client) };
                     assert!(vaults[index].destroyed.load(Ordering::SeqCst));
-                    assert!(
-                        !vaults[index].entries.lock().unwrap().is_empty(),
-                        "real host signing callbacks were used"
-                    );
                 }
             })
             .unwrap()

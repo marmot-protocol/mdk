@@ -1298,40 +1298,73 @@ async fn an_unlinked_device_stops_its_account_for_good() {
     runtime.shutdown().await;
 }
 
-/// The wipe of an unlinked account commits its removal, then fails to remove
-/// its secret. The account is gone all the same, so its publish stop goes
-/// with it: the same account linked again here publishes (mdk#2628 D67).
+/// An unlinked wipe reports its commit despite a secret-store cleanup failure.
+/// Its publish stop goes with the account: a new link publishes (mdk#2628 D67).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() {
+async fn unlinked_wipe_failure_relinks() {
     use marmot_account::{
-        AccountHomeResult, AccountSecretStore, AccountSummary, LocalFileSecretStore,
+        AccountHomeResult, AccountSecretStore, AcquiredSecret, IosOptions, LocalFileSecretStore,
+        SecretClaimMode, SecretCredential, SecretReleaseMode, SecretReleaseOutcome,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    struct FailSecretRemoval(LocalFileSecretStore);
+    struct FailSecretRemoval {
+        files: LocalFileSecretStore,
+        root: std::path::PathBuf,
+        fail_release: AtomicBool,
+    }
     impl AccountSecretStore for FailSecretRemoval {
+        fn cleanup_namespace(&self) -> AccountHomeResult<String> {
+            self.files.cleanup_namespace()
+        }
+
         fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
-            self.0.has_secret_for_label(label)
+            self.files.has_secret_for_label(label)
         }
-        fn write_secret(
+        fn acquire_secret(
             &self,
-            account: &AccountSummary,
-            keys: &nostr::prelude::Keys,
-        ) -> AccountHomeResult<()> {
-            self.0.write_secret(account, keys)
+            credential: SecretCredential<'_>,
+            mode: SecretClaimMode,
+            proposed: Option<&nostr::prelude::Keys>,
+        ) -> AccountHomeResult<AcquiredSecret> {
+            self.files.acquire_secret(credential, mode, proposed)
         }
-        fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::prelude::Keys> {
-            self.0.load_secret(account)
+        fn load_secret(
+            &self,
+            credential: SecretCredential<'_>,
+        ) -> AccountHomeResult<nostr::prelude::Keys> {
+            self.files.load_secret(credential)
         }
-        fn remove_secret(&self, _account: &AccountSummary) -> AccountHomeResult<()> {
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        fn release_secret(
+            &self,
+            credential: SecretCredential<'_>,
+            mode: SecretReleaseMode,
+        ) -> AccountHomeResult<SecretReleaseOutcome> {
+            if self.fail_release.load(Ordering::SeqCst) {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into());
+            }
+            assert!(
+                matches!(
+                    crate::MarmotRootRuntimeLease::try_acquire(&self.root),
+                    Err(AppError::RuntimeBusy)
+                ),
+                "replay must hold the root lease while deleting the old credential"
+            );
+            self.files.release_secret(credential, mode)
+        }
+        fn reconcile_cleanup(&self) -> AccountHomeResult<()> {
+            self.files.reconcile_cleanup()
         }
     }
 
     let root = tempfile::tempdir().unwrap();
-    let home = AccountHome::open_with_secret_store(
-        root.path(),
-        Arc::new(FailSecretRemoval(LocalFileSecretStore::new(root.path()))),
-    );
+    let store = Arc::new(FailSecretRemoval {
+        files: LocalFileSecretStore::new(root.path(), IosOptions::default()),
+        root: root.path().to_owned(),
+        fail_release: AtomicBool::new(true),
+    });
+    let home =
+        AccountHome::open_with_secret_store(root.path(), store.clone(), IosOptions::default());
     home.create_account("alice").unwrap();
     let keys = home.load_signing_keys("alice").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -1359,11 +1392,24 @@ async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() 
     .expect("the runtime deactivates the account");
 
     let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
-    assert!(!outcome.local_cleanup.completed, "the secret is kept");
+    assert!(outcome.local_cleanup.completed, "the local wipe committed");
     assert!(app.account_home().accounts().unwrap().is_empty());
+    let tombstones = root.path().join(".wipe-tombstones");
+    let tombstone = std::fs::read_dir(&tombstones)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let intent = tombstone.join(".wipe-cleanup.json");
+    assert!(
+        intent.is_file(),
+        "the failed release must remain replayable"
+    );
 
     let attempted = relay.attempted_events().len();
-    app.account_home()
+    let relinked = app
+        .account_home()
         .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
         .unwrap();
     runtime.reconcile_accounts().await.unwrap();
@@ -1374,7 +1420,48 @@ async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() 
     })
     .await
     .expect("the account linked again publishes");
-    runtime.shutdown().await;
+    assert!(
+        intent.is_file(),
+        "relinking must not discard the old release"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+    drop(runtime);
+    drop(app);
+
+    store.fail_release.store(false, Ordering::SeqCst);
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root.path(),
+        vec!["wss://unlink.example".to_owned()],
+        AccountHome::open_with_secret_store(root.path(), store, IosOptions::default()),
+        crate::MarmotAppConfig::white_noise().with_dev_settlement_quiescence_ms(0),
+    )
+    .unwrap()
+    .with_test_relay_client(relay);
+    assert_eq!(std::fs::read_dir(tombstones).unwrap().count(), 0);
+    assert_eq!(
+        app.account_home()
+            .load_signing_keys(&relinked.account().label)
+            .unwrap()
+            .public_key(),
+        keys.public_key(),
+        "replaying the old release must not delete the relinked owner's credential",
+    );
+    let runtime = app.runtime();
+    timeout(Duration::from_secs(10), async {
+        runtime.reconcile_accounts().await.unwrap();
+        assert!(
+            runtime
+                .diagnostic_key_package_maintenance_status(&relinked.account().label)
+                .await
+                .unwrap()
+                .is_some(),
+            "the reopened runtime must serve the relinked account on its worker"
+        );
+    })
+    .await
+    .expect("the relinked worker must reopen");
+    runtime.shutdown_and_close().await.unwrap();
+    drop(crate::MarmotRootRuntimeLease::try_acquire(root.path()).unwrap());
 }
 
 /// Signing out on a single device keeps its leaf in a chat its account is

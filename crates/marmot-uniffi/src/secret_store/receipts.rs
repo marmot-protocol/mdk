@@ -84,6 +84,7 @@ impl From<marmot_account::SecretCredential<'_>> for SecretCredential {
 ///
 /// Plaintext secret-key hex crosses this boundary in both directions. Hosts
 /// provide encryption and credential protection, and clear temporary secret copies.
+#[uniffi::export(with_foreign)]
 pub trait SecretStore: Send + Sync {
     /// Stable, nonsecret identity of the physical vault and credential namespace,
     /// including service or tenant. Keep it stable across restarts and lock/unlock.
