@@ -308,6 +308,8 @@ where
                 },
             };
             self.record_v5_welcome_withdrawn(v5, reason, size_class.map(v5_size_class));
+            // The watch ends here: a host reads its settled state.
+            self.note_welcome_delivery_changed(welcome_id);
             self.watched_welcomes
                 .retain(|watched| watched != welcome_id);
         }

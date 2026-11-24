@@ -590,6 +590,11 @@ struct TwoInboxInvite {
 }
 
 async fn two_inbox_invite(dir: &std::path::Path) -> TwoInboxInvite {
+    inbox_invite(dir, &[FAST_INBOX, SLOW_INBOX]).await
+}
+
+/// [`two_inbox_invite`] with carol's inbox relays `inboxes`.
+async fn inbox_invite(dir: &std::path::Path, inboxes: &[&str]) -> TwoInboxInvite {
     let key = SqlCipherKey::new(DETACHED_KEY).unwrap();
     let mut alice =
         current_nostr_welcome_session(dir.join("alice.sqlite"), &key, b"alice-two-inbox");
@@ -616,10 +621,10 @@ async fn two_inbox_invite(dir: &std::path::Path) -> TwoInboxInvite {
             )
             .with_inbox_route(
                 carol.self_id(),
-                vec![
-                    TransportEndpoint(FAST_INBOX.into()),
-                    TransportEndpoint(SLOW_INBOX.into()),
-                ],
+                inboxes
+                    .iter()
+                    .map(|inbox| TransportEndpoint((*inbox).into()))
+                    .collect(),
             );
     let wall = Arc::new(TestWallClock::new(300_000));
     let mut runtime = detached_runtime(alice, &adapter, &policy, &wall);
@@ -864,42 +869,83 @@ async fn a_remaining_pass_cut_short_keeps_the_settled_acceptance() {
     );
 }
 
-/// A late acceptance after the first pass's record could not be saved
-/// counts and dates the attempt it ends: the stored record never shows an
-/// accepted relay with no attempt.
+/// A remaining pass after the first pass's record could not be saved
+/// records that whole attempt: each relay the first pass asked is counted
+/// and dated once, with what it answered. So the fast relay's acceptance,
+/// which only the unsaved record held, is kept, the Welcome is marked
+/// delivered, and its delivery counts both relays, whether the slow relay
+/// then accepts or refuses.
 #[tokio::test]
-async fn a_late_acceptance_after_a_failed_first_record_counts_its_attempt() {
-    let dir = relaxed_storage_dir().unwrap();
-    let TwoInboxInvite {
-        mut runtime,
-        adapter,
-        ..
-    } = two_inbox_invite(dir.path()).await;
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    *adapter.inner.endpoint_gate.lock().unwrap() =
-        Some((TransportEndpoint(SLOW_INBOX.into()), gate.clone()));
-    let task = the_wave(&mut runtime);
-    let welcome = task.message_ids()[0].clone();
-    let mut completed = tokio::time::timeout(Duration::from_secs(5), task.run())
-        .await
-        .expect("the wave returns at the fast relay's acceptance");
-    let remaining = completed.take_remaining().unwrap();
-    runtime.arm_finish_stage_failure(welcome.clone());
-    assert!(
-        runtime.finish_welcome_publish_task(completed).await.is_err(),
-        "the first pass's record is not saved"
-    );
-    // Only another message's record fails from here.
-    runtime.arm_finish_stage_failure(MessageId::new(vec![0; 32]));
+async fn a_late_answer_after_a_failed_first_record_records_the_whole_attempt() {
+    for slow_refuses in [false, true] {
+        let dir = relaxed_storage_dir().unwrap();
+        let TwoInboxInvite {
+            mut runtime,
+            adapter,
+            ..
+        } = two_inbox_invite(dir.path()).await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *adapter.inner.endpoint_gate.lock().unwrap() =
+            Some((TransportEndpoint(SLOW_INBOX.into()), gate.clone()));
+        let task = the_wave(&mut runtime);
+        let welcome = task.message_ids()[0].clone();
+        let mut completed = tokio::time::timeout(Duration::from_secs(5), task.run())
+            .await
+            .expect("the wave returns at the fast relay's acceptance");
+        let remaining = completed.take_remaining().unwrap();
+        runtime.arm_finish_stage_failure(welcome.clone());
+        assert!(
+            runtime.finish_welcome_publish_task(completed).await.is_err(),
+            "the first pass's record is not saved"
+        );
+        // Only another message's record fails from here.
+        runtime.arm_finish_stage_failure(MessageId::new(vec![0; 32]));
+        if slow_refuses {
+            adapter.refuse_at_endpoints(
+                vec![TransportEndpoint(SLOW_INBOX.into())],
+                TransportEndpointFailureKind::TerminalRejected,
+                TransportEndpointRejectionCategory::Blocked,
+            );
+        }
 
-    gate.add_permits(1);
-    runtime
-        .finish_welcome_publish_task(remaining.run().await)
-        .await
-        .unwrap();
+        gate.add_permits(1);
+        runtime
+            .finish_welcome_publish_task(remaining.run().await)
+            .await
+            .unwrap();
 
-    assert_eq!(
-        inbox_target(&runtime, &welcome, SLOW_INBOX),
-        (cgka_traits::TransportFanoutAttemptState::Accepted, 1)
-    );
+        let slow_state = if slow_refuses {
+            cgka_traits::TransportFanoutAttemptState::AttemptedFailed
+        } else {
+            cgka_traits::TransportFanoutAttemptState::Accepted
+        };
+        assert_eq!(
+            inbox_target(&runtime, &welcome, FAST_INBOX),
+            (cgka_traits::TransportFanoutAttemptState::Accepted, 1),
+            "slow refuses: {slow_refuses}"
+        );
+        assert_eq!(
+            inbox_target(&runtime, &welcome, SLOW_INBOX),
+            (slow_state, 1),
+            "slow refuses: {slow_refuses}"
+        );
+        let delivery = delivery_of_id(&runtime, &welcome);
+        assert_eq!(
+            delivery.state,
+            WelcomeDeliveryState::RelayAccepted,
+            "slow refuses: {slow_refuses}"
+        );
+        assert_eq!(delivery.record.attempts, 1, "slow refuses: {slow_refuses}");
+        assert_eq!(
+            delivery.record.relays,
+            WelcomeRelayCounts {
+                total: 2,
+                accepted: if slow_refuses { 1 } else { 2 },
+                refused: u32::from(slow_refuses),
+                ..WelcomeRelayCounts::default()
+            },
+            "slow refuses: {slow_refuses}"
+        );
+        assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
+    }
 }

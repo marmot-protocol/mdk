@@ -1548,6 +1548,18 @@ pub enum MarmotAppEvent {
         /// stays once per process/Welcome; query pending deliveries for later causes.
         size_class: Option<cgka_traits::EventSizeClass>,
     },
+    /// The delivery state of an invite of this account changed (mdk#1706):
+    /// `delivery` is the invited account's answer for its group as it stands
+    /// now, as [`MarmotAppRuntime::invite_deliveries`] would read it. Its
+    /// `RelayAccepted` means a relay stored the Welcome, not that the
+    /// recipient received it or joined. The query is the source of truth: a
+    /// missed, late or repeated event is harmless, since a host can always
+    /// read it again.
+    InviteDeliveryChanged {
+        account_id_hex: String,
+        account_label: String,
+        delivery: crate::InviteDelivery,
+    },
     /// This device has armed `arms` epoch-gap backfills for `group_id` without
     /// catching up: it is still stalled at `stalled_epoch` while the group has
     /// moved on, and full-history replay is not repairing it. Emitted once per
@@ -4595,6 +4607,19 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<Vec<PendingWelcomeDelivery>, AppError> {
         self.accounts.pending_welcome_deliveries(account_ref).await
+    }
+
+    /// Whether each of this account's invites reached the invited account's
+    /// inbox relays (mdk#1706): one answer per group and invited account, for
+    /// `group_id` or every group, read from durable records. `RelayAccepted`
+    /// means a relay stored the Welcome, not that the recipient received it
+    /// or joined. [`MarmotAppEvent::InviteDeliveryChanged`] reports changes.
+    pub async fn invite_deliveries(
+        &self,
+        account_ref: &str,
+        group_id: Option<&GroupId>,
+    ) -> Result<Vec<crate::InviteDelivery>, AppError> {
+        self.accounts.invite_deliveries(account_ref, group_id).await
     }
 
     /// Re-publish a previously undelivered welcome (identified by its stored MLS

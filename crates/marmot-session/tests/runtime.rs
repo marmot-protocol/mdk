@@ -410,6 +410,7 @@ struct RecordingAdapterInner {
     accept_policy: Mutex<Option<Vec<TransportEndpoint>>>,
     error_endpoints: Mutex<Vec<TransportEndpoint>>,
     error_kind: Mutex<Option<TransportEndpointFailureKind>>,
+    error_category: Mutex<Option<TransportEndpointRejectionCategory>>,
     error_reasons: Mutex<Vec<(TransportEndpoint, String)>>,
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
@@ -502,7 +503,20 @@ impl RecordingAdapter {
     ) {
         *self.inner.error_endpoints.lock().unwrap() = endpoints;
         *self.inner.error_kind.lock().unwrap() = Some(kind);
+        *self.inner.error_category.lock().unwrap() = None;
         self.inner.error_reasons.lock().unwrap().clear();
+    }
+
+    /// Like [`Self::fail_endpoints_as`], as the relays' own refusal of
+    /// `category`.
+    fn refuse_at_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        kind: TransportEndpointFailureKind,
+        category: TransportEndpointRejectionCategory,
+    ) {
+        self.fail_endpoints_as(endpoints, kind);
+        *self.inner.error_category.lock().unwrap() = Some(category);
     }
 
     /// Like [`Self::fail_endpoints_as`], with a fixed adapter reason phrase
@@ -760,7 +774,7 @@ impl TransportAdapter for RecordingAdapter {
                                 ),
                             endpoint,
                             kind,
-                            rejection_category: None,
+                            rejection_category: *self.inner.error_category.lock().unwrap(),
                         })
                         .collect();
                     let message_id = self
@@ -8357,3 +8371,4 @@ async fn a_published_key_package_with_a_refused_relay_is_due_at_its_backoff() {
     assert_eq!(due.at, Some(cgka_traits::Timestamp(100_030)), "{due:?}");
     assert!(!due.retry_while_owed, "{due:?}");
 }
+include!("runtime/welcome_delivery_record.rs");

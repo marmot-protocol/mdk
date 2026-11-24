@@ -44,6 +44,195 @@ impl From<marmot_app::PendingWelcomeDelivery> for PendingWelcomeDeliveryFfi {
     }
 }
 
+/// Whether an invite reached the invited account's inbox relays (mdk#1706):
+/// one answer per group and invited account, as its newest invite left it.
+/// Each invited device gets its own Welcome; `state` is `RelayAccepted` once
+/// a relay stored any device's Welcome, else the first still-sending device's
+/// `Sending`, else `Waiting` while one waits for its commit, else the first
+/// device's settled state. Show it with the device counts ("1 of 2 devices").
+/// An account invited and then refused before its commit reached anyone shows
+/// as `Cancelled { Withdrawn }`; check the roster for who is a member.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct InviteDeliveryFfi {
+    pub group_id_hex: String,
+    /// The invited account.
+    pub recipient_hex: String,
+    /// The commit that added the account, hex; `None` for a group's founding
+    /// members.
+    pub invite_id_hex: Option<String>,
+    pub state: InviteDeliveryStateFfi,
+    pub device_count: u32,
+    /// Devices whose Welcome a relay stored.
+    pub accepted_device_count: u32,
+    pub devices: Vec<InviteDeviceDeliveryFfi>,
+}
+
+/// One invited device's Welcome. Times are Unix seconds.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct InviteDeviceDeliveryFfi {
+    /// The Welcome's id.
+    pub delivery_id_hex: String,
+    pub state: InviteDeliveryStateFfi,
+    pub created_at: u64,
+    /// When MDK stops sending it; `None` when it has no deadline.
+    pub deliver_until: Option<u64>,
+    /// Publish attempts, including those that found no inbox relay.
+    pub attempt_count: u32,
+    pub last_attempt_at: Option<u64>,
+    /// When a relay first stored it.
+    pub accepted_at: Option<u64>,
+    pub relays: InviteRelayCountsFfi,
+}
+
+/// How the Welcome's inbox relays answered, as counts, never names: `total`
+/// relays it is sent to and `accepted` that stored it; of the rest, by the
+/// latest attempt, `refused` answered and said no for any reason (including
+/// rate-limited and auth-required), `unreachable` gave no answer, `untried`
+/// were not tried. A count of refused relays is not the `RefusedByRelays`
+/// cause of `Undeliverable`, which a later release gives only for permanent
+/// refusals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct InviteRelayCountsFfi {
+    pub total: u32,
+    pub accepted: u32,
+    pub refused: u32,
+    pub unreachable: u32,
+    pub untried: u32,
+}
+
+/// Where an invite's delivery stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum InviteDeliveryStateFfi {
+    /// Its commit is not confirmed yet, so nothing sends it.
+    Waiting,
+    /// Being sent; `last_problem` is why the latest attempt did not reach a
+    /// relay, `None` before any attempt finished. It can briefly show an
+    /// accepted relay: a relay's acceptance is saved before MDK marks the
+    /// Welcome delivered, and until that mark (the same pass, or the next
+    /// maintenance pass if it failed) MDK may still send it.
+    Sending {
+        last_problem: Option<InviteDeliveryProblemFfi>,
+    },
+    /// A relay stored the Welcome: it met its configured acknowledgement
+    /// count (one relay today) and MDK recorded it delivered. This is not
+    /// proof that the recipient received it or joined.
+    RelayAccepted,
+    /// It will not be sent again. Not yet produced for an invite: invites
+    /// have no delivery deadline yet.
+    Undeliverable { cause: InviteDeliveryProblemFfi },
+    /// No longer owed.
+    Cancelled { reason: InviteCancelReasonFfi },
+}
+
+/// Why an invite has not reached a relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum InviteDeliveryProblemFfi {
+    /// No usable inbox relay is known for the recipient.
+    NoInboxRelays,
+    /// Every relay tried answered and said no, for any reason. As a
+    /// `Sending` problem it may be temporary (rate-limited, auth-required).
+    RefusedByRelays,
+    /// No relay tried gave an answer: unreachable, timed out or unknown.
+    RelaysUnreachable,
+    /// Some relays refused it and the others could not be reached.
+    Mixed,
+    /// It fits none of the recipient's inbox relays. Not yet produced.
+    TooLarge,
+    /// The recipient no longer holds the KeyPackage it answers. Not yet
+    /// produced.
+    KeyPackageRetired,
+}
+
+/// Why an invite is no longer owed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum InviteCancelReasonFfi {
+    /// The group change that added the recipient lost to another change.
+    SupersededByGroupChange,
+    /// Withdrawn, or retired with a group change that was rolled back before
+    /// it reached anyone.
+    Withdrawn,
+}
+
+impl From<marmot_app::InviteDelivery> for InviteDeliveryFfi {
+    fn from(value: marmot_app::InviteDelivery) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            recipient_hex: value.recipient_hex,
+            invite_id_hex: value.invite_id_hex,
+            state: value.state.into(),
+            device_count: value.device_count,
+            accepted_device_count: value.accepted_device_count,
+            devices: value.devices.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<marmot_app::InviteDeviceDelivery> for InviteDeviceDeliveryFfi {
+    fn from(value: marmot_app::InviteDeviceDelivery) -> Self {
+        let relays = value.relays;
+        Self {
+            delivery_id_hex: value.delivery_id_hex,
+            state: value.state.into(),
+            created_at: value.created_at,
+            deliver_until: value.deliver_until,
+            attempt_count: value.attempt_count,
+            last_attempt_at: value.last_attempt_at,
+            accepted_at: value.accepted_at,
+            relays: InviteRelayCountsFfi {
+                total: relays.total,
+                accepted: relays.accepted,
+                refused: relays.refused,
+                unreachable: relays.unreachable,
+                untried: relays.untried,
+            },
+        }
+    }
+}
+
+impl From<marmot_app::WelcomeDeliveryState> for InviteDeliveryStateFfi {
+    fn from(value: marmot_app::WelcomeDeliveryState) -> Self {
+        use marmot_app::WelcomeDeliveryState as State;
+        match value {
+            State::Waiting => Self::Waiting,
+            State::Sending { last_problem } => Self::Sending {
+                last_problem: last_problem.map(Into::into),
+            },
+            State::RelayAccepted => Self::RelayAccepted,
+            State::Undeliverable { cause } => Self::Undeliverable {
+                cause: cause.into(),
+            },
+            State::Cancelled { reason } => Self::Cancelled {
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+impl From<marmot_app::WelcomeDeliveryProblem> for InviteDeliveryProblemFfi {
+    fn from(value: marmot_app::WelcomeDeliveryProblem) -> Self {
+        use marmot_app::WelcomeDeliveryProblem as Problem;
+        match value {
+            Problem::NoInboxRelays => Self::NoInboxRelays,
+            Problem::RefusedByRelays => Self::RefusedByRelays,
+            Problem::RelaysUnreachable => Self::RelaysUnreachable,
+            Problem::Mixed => Self::Mixed,
+            Problem::TooLarge => Self::TooLarge,
+            Problem::KeyPackageRetired => Self::KeyPackageRetired,
+        }
+    }
+}
+
+impl From<marmot_app::WelcomeCancelReason> for InviteCancelReasonFfi {
+    fn from(value: marmot_app::WelcomeCancelReason) -> Self {
+        match value {
+            marmot_app::WelcomeCancelReason::SupersededByGroupChange => {
+                Self::SupersededByGroupChange
+            }
+            marmot_app::WelcomeCancelReason::Withdrawn => Self::Withdrawn,
+        }
+    }
+}
+
 /// A group change of yours that was not applied (mdk#2332): its call
 /// answered `CompletionUnknown`, or `AcceptedPending` for a queued change, and
 /// MDK then gave its commit up. Nothing reached members and nothing sends it

@@ -33,7 +33,7 @@ per feature.
   [history may be incomplete notices](#history-may-be-incomplete-notices), [blocked leaves](#blocked-leaves),
   [group reporting](#group-reporting),
   [turning on account devices](#turning-on-account-devices),
-  [undelivered Welcomes](#undelivered-welcomes),
+  [undelivered Welcomes](#undelivered-welcomes), [invite delivery](#invite-delivery),
   [backup recovery](#backup-recovery),
   [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [audit source metadata and legacy files](#audit-source-metadata-and-legacy-files)
 - [Smoke test and example](#smoke-test-and-example)
@@ -502,6 +502,20 @@ It returns an owned `MarmotPendingWelcomeDeliveryList`; release the whole result
 `marmot_pending_welcome_delivery_list_free`. In records and the `MARMOT_EVENT_WELCOME_DELIVERY_PENDING` payload, read
 `size_class` only when `has_size_class` is true; false means Unknown. The event payload layout changes, so
 rebuild against the matching header and library. Each list owns its strings; do not free individual fields.
+
+## Invite delivery
+
+Use `marmot_invite_deliveries` for the [shared invite delivery contract](../marmot-uniffi/README.md#invite-delivery);
+pass NULL `group_id_hex` for every group. Only invites sent after the device upgraded are listed; an older Welcome
+stays visible through `marmot_pending_welcome_deliveries`. It returns an owned `MarmotInviteDeliveryList`; release the whole result
+with `marmot_invite_delivery_list_free`. `MARMOT_EVENT_INVITE_DELIVERY_CHANGED` embeds the same
+`MarmotInviteDelivery`, released with the event. `MarmotInviteDeliveryState` is flattened: read `problem` only when
+`has_problem` is true (`Sending`'s latest problem, or `Undeliverable`'s cause), and `cancel_reason` only when `kind`
+is `Cancelled`. `RelayAccepted` means a relay stored the Welcome (it met its configured acknowledgement count, one
+relay today, and MDK recorded it delivered), not that the recipient received it or joined. The
+query is the source of truth; a missed, late or repeated event is harmless. The relay counts mean what the shared
+contract says: `refused` relays answered and said no for any reason, `unreachable` relays gave no answer. `Sending`
+can briefly show an accepted relay until MDK marks the Welcome delivered.
 
 ## Selected chat-list presentation
 

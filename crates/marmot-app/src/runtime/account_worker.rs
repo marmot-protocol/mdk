@@ -814,6 +814,10 @@ pub(crate) enum AccountWorkerCommand {
     PendingWelcomeDeliveries {
         respond: ReadReply<Result<Vec<PendingWelcomeDelivery>, AppError>>,
     },
+    InviteDeliveries {
+        group_id: Option<GroupId>,
+        respond: ReadReply<Result<Vec<crate::InviteDelivery>, AppError>>,
+    },
     RedeliverWelcome {
         message_id_hex: String,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
@@ -987,6 +991,7 @@ impl AccountWorkerCommand {
                 | Self::BackupSettings { .. }
                 | Self::GroupCommitDelivery { .. }
                 | Self::PendingWelcomeDeliveries { .. }
+                | Self::InviteDeliveries { .. }
                 | Self::KeyPackageMaintenanceStatus { .. }
                 | Self::DurablyOwnedKeyPackages { .. }
                 | Self::MaintenanceStatus { .. }
@@ -7892,6 +7897,11 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
             true
         }),
+        AccountWorkerCommand::InviteDeliveries { group_id, respond } => Box::pin(async move {
+            let result = client.invite_deliveries(group_id.as_ref());
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
+            true
+        }),
         AccountWorkerCommand::RedeliverWelcome {
             message_id_hex,
             respond,
@@ -9779,6 +9789,18 @@ fn publish_pending_welcome_delivery_events(
                 message_id_hex: pending.message_id_hex,
                 recipient_hex: pending.recipient_hex,
                 size_class: pending.size_class,
+            },
+        );
+    }
+    // Invite delivery changes ride the same drains (mdk#1706).
+    for delivery in client.take_invite_delivery_changes() {
+        let _ = emit(
+            Emit::Quiescent(client),
+            events,
+            MarmotAppEvent::InviteDeliveryChanged {
+                account_id_hex: account_id_hex.to_owned(),
+                account_label: account_label.to_owned(),
+                delivery,
             },
         );
     }

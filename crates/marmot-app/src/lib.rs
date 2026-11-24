@@ -107,6 +107,7 @@ mod history_notices;
 pub use history_notices::{AccountRecoveryStatus, HistoryNotice, HistoryNoticeCause};
 mod ids;
 mod image_inspect;
+mod invite_deliveries;
 mod key_package_records;
 #[cfg(test)]
 mod local_open_test_gate;
@@ -305,6 +306,10 @@ pub use groups::{
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
+};
+pub use invite_deliveries::{
+    InviteDelivery, InviteDeviceDelivery, WelcomeCancelReason, WelcomeDeliveryProblem,
+    WelcomeDeliveryState, WelcomeRelayCounts,
 };
 pub use marmot_observability::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
@@ -2568,6 +2573,7 @@ impl MarmotApp {
             test_fail_push_announce_owed_write: false,
             pending_welcome_delivery_events: Vec::new(),
             announced_welcome_failures: HashSet::new(),
+            announced_invite_deliveries: HashMap::new(),
             sibling_welcome_carriers: HashSet::new(),
             sibling_welcome_retirement_cursor: None,
             pending_superseded_change_events: Vec::new(),

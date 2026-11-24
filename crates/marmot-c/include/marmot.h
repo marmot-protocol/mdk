@@ -722,6 +722,40 @@ typedef enum MarmotGroupPendingCommitState {
 } MarmotGroupPendingCommitState;
 
 /**
+ * Which `MarmotInviteDeliveryState` this is. `RelayAccepted` means a relay
+ * stored the Welcome, not that the recipient received it or joined.
+ * `Undeliverable` is not produced for invites yet.
+ */
+typedef enum MarmotInviteDeliveryStateKind {
+  MARMOT_INVITE_DELIVERY_STATE_KIND_WAITING,
+  MARMOT_INVITE_DELIVERY_STATE_KIND_SENDING,
+  MARMOT_INVITE_DELIVERY_STATE_KIND_RELAY_ACCEPTED,
+  MARMOT_INVITE_DELIVERY_STATE_KIND_UNDELIVERABLE,
+  MARMOT_INVITE_DELIVERY_STATE_KIND_CANCELLED,
+} MarmotInviteDeliveryStateKind;
+
+/**
+ * Why an invite has not reached a relay (mdk#1706). `TooLarge` and
+ * `KeyPackageRetired` are not produced yet.
+ */
+typedef enum MarmotInviteDeliveryProblem {
+  MARMOT_INVITE_DELIVERY_PROBLEM_NO_INBOX_RELAYS,
+  MARMOT_INVITE_DELIVERY_PROBLEM_REFUSED_BY_RELAYS,
+  MARMOT_INVITE_DELIVERY_PROBLEM_RELAYS_UNREACHABLE,
+  MARMOT_INVITE_DELIVERY_PROBLEM_MIXED,
+  MARMOT_INVITE_DELIVERY_PROBLEM_TOO_LARGE,
+  MARMOT_INVITE_DELIVERY_PROBLEM_KEY_PACKAGE_RETIRED,
+} MarmotInviteDeliveryProblem;
+
+/**
+ * Why an invite is no longer owed.
+ */
+typedef enum MarmotInviteCancelReason {
+  MARMOT_INVITE_CANCEL_REASON_SUPERSEDED_BY_GROUP_CHANGE,
+  MARMOT_INVITE_CANCEL_REASON_WITHDRAWN,
+} MarmotInviteCancelReason;
+
+/**
  * Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`; a
  * rejoin emits `BeforeRejoin`. Other labels preserve compatibility, so
  * keep exhaustive switches: `UnprovenHistory` is no longer emitted, and
@@ -3329,6 +3363,84 @@ typedef struct MarmotPendingWelcomeDeliveryList {
   struct MarmotPendingWelcomeDelivery *items;
   uintptr_t len;
 } MarmotPendingWelcomeDeliveryList;
+
+/**
+ * Where an invite's delivery stands. `problem` is read only when
+ * `has_problem` is true: `Sending`'s latest problem, or `Undeliverable`'s
+ * cause, which is always set. `cancel_reason` is read only for `Cancelled`.
+ */
+typedef struct MarmotInviteDeliveryState {
+  enum MarmotInviteDeliveryStateKind kind;
+  bool has_problem;
+  enum MarmotInviteDeliveryProblem problem;
+  enum MarmotInviteCancelReason cancel_reason;
+} MarmotInviteDeliveryState;
+
+/**
+ * How an invite's inbox relays answered, as counts, never names: of the
+ * relays not `accepted`, by the latest attempt, `refused` answered and
+ * said no for any reason (including rate-limited and auth-required),
+ * `unreachable` gave no answer, `untried` were not tried.
+ */
+typedef struct MarmotInviteRelayCounts {
+  uint32_t total;
+  uint32_t accepted;
+  uint32_t refused;
+  uint32_t unreachable;
+  uint32_t untried;
+} MarmotInviteRelayCounts;
+
+/**
+ * One invited device's Welcome. Times are Unix seconds.
+ */
+typedef struct MarmotInviteDeviceDelivery {
+  char *delivery_id_hex;
+  struct MarmotInviteDeliveryState state;
+  uint64_t created_at;
+  bool has_deliver_until;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t deliver_until;
+  uint32_t attempt_count;
+  bool has_last_attempt_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t last_attempt_at;
+  bool has_accepted_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t accepted_at;
+  struct MarmotInviteRelayCounts relays;
+} MarmotInviteDeviceDelivery;
+
+/**
+ * Whether an invite reached the invited account's inbox relays (mdk#1706),
+ * one per group and invited account: `RelayAccepted` once a relay stored
+ * any device's Welcome, read with the device counts. `invite_id_hex` is
+ * NULL for a group's founding members. Requires the matching library and
+ * header.
+ */
+typedef struct MarmotInviteDelivery {
+  char *group_id_hex;
+  char *recipient_hex;
+  char *invite_id_hex;
+  struct MarmotInviteDeliveryState state;
+  uint32_t device_count;
+  uint32_t accepted_device_count;
+  struct MarmotInviteDeviceDelivery *devices;
+  uintptr_t devices_len;
+} MarmotInviteDelivery;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotInviteDeliveryList {
+  struct MarmotInviteDelivery *items;
+  uintptr_t len;
+} MarmotInviteDeliveryList;
 
 /**
  * Embedded replacement offer; show the authenticated inviter before confirmation.
@@ -7071,6 +7183,12 @@ typedef enum MarmotEvent_Tag {
    */
   MARMOT_EVENT_WELCOME_DELIVERY_PENDING,
   /**
+   * An invite's delivery state changed (mdk#1706): `delivery` is the
+   * invited account's answer now. `RelayAccepted` means a relay stored the
+   * Welcome, not that the recipient received it or joined.
+   */
+  MARMOT_EVENT_INVITE_DELIVERY_CHANGED,
+  /**
    * This device armed `arms` epoch-gap backfills with no catch-up in
    * between: the group cannot catch up; re-syncing is recommended.
    */
@@ -7205,6 +7323,12 @@ typedef struct MarmotEvent_WelcomeDeliveryPending_Body {
   enum MarmotEventSizeClass size_class;
 } MarmotEvent_WelcomeDeliveryPending_Body;
 
+typedef struct MarmotEvent_InviteDeliveryChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+  struct MarmotInviteDelivery delivery;
+} MarmotEvent_InviteDeliveryChanged_Body;
+
 typedef struct MarmotEvent_EpochStallEscalated_Body {
   char *account_id_hex;
   char *account_label;
@@ -7278,6 +7402,7 @@ typedef struct MarmotEvent {
     MarmotEvent_GroupEvent_Body GROUP_EVENT;
     MarmotEvent_AccountError_Body ACCOUNT_ERROR;
     MarmotEvent_WelcomeDeliveryPending_Body WELCOME_DELIVERY_PENDING;
+    MarmotEvent_InviteDeliveryChanged_Body INVITE_DELIVERY_CHANGED;
     MarmotEvent_EpochStallEscalated_Body EPOCH_STALL_ESCALATED;
     MarmotEvent_GroupChangeSuperseded_Body GROUP_CHANGE_SUPERSEDED;
     MarmotEvent_HistoryNoticesChanged_Body HISTORY_NOTICES_CHANGED;
@@ -9390,6 +9515,25 @@ MarmotStatus marmot_acknowledge_change_not_delivered(const struct MarmotClient *
 MarmotStatus marmot_pending_welcome_deliveries(const struct MarmotClient *client,
                                                const char *account_ref,
                                                struct MarmotPendingWelcomeDeliveryList **out);
+
+/**
+ * Whether each invite reached the invited account's inbox relays
+ * (mdk#1706), one per group and invited account, for `group_id_hex` or,
+ * when NULL, every group. `RelayAccepted` means a relay stored the
+ * Welcome, not that the recipient received it or joined. Only invites sent
+ * after this device upgraded are listed. Local read.
+ * Free the list with marmot_invite_delivery_list_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_invite_deliveries(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *group_id_hex,
+                                      struct MarmotInviteDeliveryList **out);
 
 /**
  * Query advisory membership health and pending rejoin offers.
@@ -15996,6 +16140,15 @@ void marmot_group_invite_free(struct MarmotGroupInviteResult *ptr);
  * library.
  */
 void marmot_pending_welcome_delivery_list_free(struct MarmotPendingWelcomeDeliveryList *list);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_invite_delivery_list_free(struct MarmotInviteDeliveryList *list);
 
 /**
  * Free a list returned by this library. NULL is a no-op.

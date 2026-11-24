@@ -1838,6 +1838,7 @@ pub(crate) fn notification_update_from_event_cached(
         MarmotAppEvent::GroupStateUpdated { .. }
         | MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::InviteDeliveryChanged { .. }
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
