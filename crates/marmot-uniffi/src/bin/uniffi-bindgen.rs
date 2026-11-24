@@ -7,8 +7,13 @@
 //! and gives every throwing call site its cancel function. Non-throwing sites
 //! cannot report `CancellationError`, so they keep waiting for the native result;
 //! `swift-support/CancellableSubscriptions.swift` adds throwing receives for them.
+//! Exports whose work must finish keep waiting too (`swift_awaits_completion.rs`).
 
 use std::path::{Path, PathBuf};
+
+#[path = "../swift_awaits_completion.rs"]
+mod swift_awaits_completion;
+use swift_awaits_completion::SWIFT_AWAITS_COMPLETION;
 
 /// UniFFI 0.29.4's helper as generated for this crate. Generation fails if it
 /// changes, so a UniFFI upgrade cannot silently drop cancellation.
@@ -46,8 +51,9 @@ const UPSTREAM_RUST_CALL_ASYNC: &str = r#"fileprivate func uniffiRustCallAsync<F
 "#;
 
 const CANCELLABLE_RUST_CALL_ASYNC: &str = r#"// MarmotKit: with `cancelFunc`, cancelling the awaiting Task cancels the native
-// future and the call throws CancellationError, even if a result raced it. The
-// future is freed either way, which releases the native references it holds.
+// future and the call throws CancellationError. A result that completed first is
+// returned instead, so nothing it owns is dropped. The future is freed either
+// way, which releases the native references it holds.
 fileprivate func uniffiRustCallAsync<F, T>(
     rustFutureFunc: () -> UInt64,
     pollFunc: (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
@@ -86,15 +92,8 @@ fileprivate func uniffiRustCallAsync<F, T>(
     if callStatus.code == CALL_CANCELLED {
         throw CancellationError()
     }
-    // Lift before checking cancellation so a discarded result is still released.
-    let result = Result<T, Swift.Error>(catching: {
-        try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
-        return try liftFunc(returnedVal)
-    })
-    if cancelFunc != nil {
-        try Task.checkCancellation()
-    }
-    return try result.get()
+    try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
+    return try liftFunc(returnedVal)
 }
 
 // The lock keeps a late cancellation from using the handle after it is freed.
@@ -149,6 +148,10 @@ fn swift_out_dir(args: impl Iterator<Item = String>) -> Option<PathBuf> {
     while let Some(arg) = iter.next() {
         let (flag, inline) = match arg.split_once('=') {
             Some((flag, value)) => (flag, Some(value.to_owned())),
+            // Short flags also take an attached value: `-lswift`, `-o/tmp/out`.
+            None if arg.len() > 2 && (arg.starts_with("-l") || arg.starts_with("-o")) => {
+                (&arg[..2], Some(arg[2..].to_owned()))
+            }
             None => (arg.as_str(), None),
         };
         let mut value = || inline.clone().or_else(|| iter.next().cloned());
@@ -175,18 +178,30 @@ fn forward_cancellation(source: &str) -> Result<String, String> {
     }
     let source = source.replace(UPSTREAM_RUST_CALL_ASYNC, CANCELLABLE_RUST_CALL_ASYNC);
 
-    let (mut output, mut throwing, mut call_sites, mut cancellable) =
+    // `forward` is set inside a call site: whether it gets a cancel function.
+    let (mut output, mut forward, mut call_sites, mut cancellable) =
         (String::with_capacity(source.len()), None, 0, 0);
+    let mut awaited = Vec::new();
     for line in source.split_inclusive('\n') {
         output.push_str(line);
         let code = line.trim_start();
         if code.contains("await uniffiRustCallAsync(") {
-            if throwing.replace(!code.starts_with("try!")).is_some() {
+            if forward.replace(!code.starts_with("try!")).is_some() {
                 return Err(format!("async call site {call_sites} has no freeFunc"));
             }
             call_sites += 1;
+        } else if let Some(symbol) = SWIFT_AWAITS_COMPLETION
+            .iter()
+            .find(|symbol| {
+                code.strip_prefix(**symbol)
+                    .is_some_and(|rest| rest.starts_with('('))
+            })
+            .filter(|_| forward.is_some())
+        {
+            forward = Some(false);
+            awaited.push(*symbol);
         } else if let Some(suffix) = code.strip_prefix(FREE_FUNC) {
-            match throwing.take() {
+            match forward.take() {
                 Some(true) => {
                     let indent = &line[..line.len() - code.len()];
                     output.push_str(&format!(
@@ -199,7 +214,13 @@ fn forward_cancellation(source: &str) -> Result<String, String> {
             }
         }
     }
-    if call_sites == 0 || throwing.is_some() {
+    awaited.sort_unstable();
+    if awaited != sorted(SWIFT_AWAITS_COMPLETION) {
+        return Err(format!(
+            "expected one async call site for each of {SWIFT_AWAITS_COMPLETION:?}"
+        ));
+    }
+    if call_sites == 0 || forward.is_some() {
         return Err(format!(
             "expected a freeFunc in each of {call_sites} async call sites"
         ));
@@ -208,4 +229,10 @@ fn forward_cancellation(source: &str) -> Result<String, String> {
         "Swift cancellation: {cancellable} of {call_sites} async calls forward Task cancellation"
     );
     Ok(output)
+}
+
+fn sorted(symbols: &[&'static str]) -> Vec<&'static str> {
+    let mut symbols = symbols.to_vec();
+    symbols.sort_unstable();
+    symbols
 }

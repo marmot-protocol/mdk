@@ -253,11 +253,15 @@ private struct SubscriptionCancellationSmoke {
     try await expectPrecancelled { _ = try await events.nextCancellable() }
     try await expectPrecancelled { _ = try await notifications.nextCancellable() }
     try await expectPrecancelled { _ = try await search.nextUpdateCancellable() }
-    // Generated throwing commands forward cancellation too, not only receives.
+    // Generated throwing commands forward cancellation too, not only receives,
+    // and a command cancelled before it starts does nothing.
+    let chatCount = try kit.chatList(accountRef: account.label, includeArchived: true).count
     try await expectPrecancelled {
       _ = try await kit.createGroup(
         accountRef: account.label, name: "Cancelled before start", memberRefs: [], description: nil)
     }
+    let chatCountAfter = try kit.chatList(accountRef: account.label, includeArchived: true).count
+    precondition(chatCountAfter == chatCount, "pre-cancelled createGroup created a chat")
 
     // A public receive cancelled while it waits ends promptly (the watchdog
     // bounds "promptly"), whether the cancel lands before or after its poll.
@@ -405,6 +409,8 @@ private struct SubscriptionCancellationSmoke {
         FfiConverterTypeConversationPageDirectionFfi_lower(.older), 1, 0
       )
       await awaitNativeReady(readyError)
+      // A call that completed before its task was cancelled reports what it
+      // returned, so nothing a completed result owns is dropped.
       withUnsafeCurrentTask { $0!.cancel() }
       do {
         let _: ConversationWindowSnapshotFfi? = try await generatedReceive(
@@ -413,16 +419,19 @@ private struct SubscriptionCancellationSmoke {
             preconditionFailure("cancelled ready error decoded a successful payload")
           })
         preconditionFailure("cancelled ready error returned normally")
-      } catch is CancellationError {
       } catch MarmotKitError.ConversationWindowWrongGeneration {
-        preconditionFailure("completed native error took priority over task cancellation")
       }
     }.value
 
     await conversation.cancel()
     let closedConversation = try await conversation.nextCancellable()
     precondition(closedConversation == nil)
-    try await kit.shutdownAndClose()
+    // Work that must finish ignores cancellation: even a pre-cancelled caller
+    // returns only once storage is closed.
+    try await Task.detached {
+      withUnsafeCurrentTask { $0!.cancel() }
+      try await kit.shutdownAndClose()
+    }.value
     precondition(kit.storageIsClosed())
     let closedPresented = try await presented.nextCancellable()
     let closedList = try await list.nextCancellable()

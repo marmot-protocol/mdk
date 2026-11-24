@@ -12,7 +12,8 @@ UniFFI bindings (MarmotKit) for the Marmot app runtime. For integration concepts
 - `src/markdown.rs` (Markdown display DTOs), `src/secret_store.rs` and
   `src/external_signer.rs` (host callback traits), `src/bin/uniffi-bindgen.rs` (binding generator; it rewrites
   UniFFI's Swift async helper so throwing calls forward task cancellation, and fails generation if that helper
-  changes). `swift-support/CancellableSubscriptions.swift` adds throwing receives for the non-throwing ones.
+  changes). `swift-support/CancellableSubscriptions.swift` adds throwing receives for the non-throwing ones;
+  `src/swift_awaits_completion.rs` lists the `survives_cancellation` exports Swift still awaits to completion.
 - `src/tokio_runtime.rs`: MarmotKit's process-wide multi-thread Tokio runtime and `spawn_export`, which every async
   export runs through (see `crates/marmot-uniffi-macros`).
 - `kotlin-support/`: hand-written `MarmotAndroid` and keyring JNI shim copied next to generated Kotlin.

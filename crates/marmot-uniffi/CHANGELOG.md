@@ -5,9 +5,10 @@
 ### Breaking changes
 
 - Swift: cancelling a `Task` that awaits a throwing async call, a command or a receive, now cancels its native future
-  and throws `CancellationError`, even when a result raced the cancel (mdk#3670). Before, the call ran to completion
-  and returned its result. A cancelled caller of `shutdownAndClose()` or `signOutAndWipe()` now returns before that
-  work finishes; await them from a task you do not cancel when you need completion.
+  and throws `CancellationError` (mdk#3670). Before, the call ran to completion and returned its result. A call that
+  completed first still returns its result, and calls whose work must finish, such as `shutdownAndClose()` and
+  `signOutAndWipe()`, still wait. The four projection `nextCancellable()` adapters now report a native error that
+  completed before the cancel instead of `CancellationError`.
 - `TimelineUpdateTriggerFfi::AgentActivity` becomes `AgentItem` and `AgentOperation` is removed;
   `NotificationTrafficClassFfi::AgentActivity` is removed. An agent item notifies as `Standard` only while it is a
   waiting approval or question, or a failed turn.

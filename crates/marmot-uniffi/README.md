@@ -253,9 +253,10 @@ In Swift, cancelling the task that awaits a throwing async call cancels its nati
 `CancellationError`, for commands and receives alike. Subscription receives generated without
 `throws` cannot report cancellation, so observation tasks use their throwing `nextCancellable()` or
 `nextUpdateCancellable()` adapters. Cancellation does not close the subscription. Keep one receive
-active per subscription, and cancel and await the old task before starting another. Cancellation
-racing with a completed call can discard its result: refresh state a cancelled command may have
-changed. See the [Swift adapter signatures](API-REFERENCE.md#swift-cancellation-adapters).
+active per subscription, and cancel and await the old task before starting another. A call that
+completed before the cancel took effect returns its result or error instead; after
+`CancellationError`, refresh state a cancelled command may have changed. See the
+[Swift adapter signatures](API-REFERENCE.md#swift-cancellation-adapters).
 
 ### Localization, privacy and diagnostics
 Native startup investigation can explicitly call `set_startup_diagnostics_enabled(true)` before the first account query, then read `startup_diagnostics_snapshot()` while a call remains unfinished. The snapshot uses independent bounded memory and fixed phases, including key lookup, database-open waiting and migration numbers; it contains no paths, account identifiers or error text. Keep normal builds disabled, bound host serialization separately, and revoke capture with `false` when it is no longer needed. Neither method changes upload consent or database state. See the [API reference](API-REFERENCE.md).
@@ -489,10 +490,12 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
   `Dispatchers.Main` does not run MDK work on the UI thread. Cancelling a Kotlin coroutine frees
   the call, which aborts the task at its next suspension point; `shutdownAndClose()` and
   `signOutAndWipe()` keep running regardless. Cancelling a Swift `Task` awaiting a throwing call does the
-  same and throws `CancellationError`, so a cancelled caller of those two returns before they finish.
-  Non-throwing Swift methods still wait for the call: several subscription receives (which have
-  throwing [adapters](API-REFERENCE.md#swift-cancellation-adapters)), `relayHealth()`, `shutdown()`
-  and `ConversationWindowSubscription.cancel()`.
+  same and throws `CancellationError`. Swift still waits for the result of the calls whose work must
+  finish (`shutdownAndClose()`, `signOutAndWipe()`, `releaseAttachmentHandoff()`, `startDirectConversation*`,
+  and Nip46 `approvePermissions()` and `logout()`), even from a cancelled task, and of non-throwing
+  methods: several subscription receives (which have throwing
+  [adapters](API-REFERENCE.md#swift-cancellation-adapters)), `relayHealth()`, `shutdown()` and
+  `ConversationWindowSubscription.cancel()`.
 - **Subscription receives** (`next()`, `nextUpdate()`) are the exception: they wait on the calling
   thread, with the runtime entered, because a receive that ran ahead on the runtime could consume
   an update that a cancelled caller never collects. They only wait and convert; the work that
