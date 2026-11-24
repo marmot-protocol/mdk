@@ -269,7 +269,8 @@ pub struct MemberKeyPackageResolutionStats {
 /// accounts. Each selected account counts its deciding read: its
 /// single-author batch, or its single-author fallback read. Selection uses
 /// what an incomplete read returned (D12), so a device whose only package
-/// sat on a relay that did not answer is left out without a trace.
+/// sat on a relay that did not answer is left out; these counts bound how
+/// often a selection could have missed one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemberKeyPackageReadCoverage {
     /// Selected accounts whose read heard every relay it asked to the end of
