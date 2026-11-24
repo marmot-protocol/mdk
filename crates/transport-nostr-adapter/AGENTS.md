@@ -259,7 +259,8 @@ for reconnect/backoff and relay status mechanics.
   EVENT the SDK would drop can shorten a page unseen. Each request's queue holds its byte budget plus one frame, which covers an ordinary
   page's envelopes however slow the caller; only rejected events or more than a frame of padding can fill it, and
   that ends the request as a cut. The collector applies the builder's relay limits (frame, event size, tags; a frame
-  never past the queue's 5 MiB ceiling), expiry, the filter,
+  never past the queue's 5 MiB ceiling; a relay's own `add_relay(..).limits(..)` override is not applied, since the
+  SDK cannot read it back, so do not set one), expiry, the filter,
   the event id and signature of the supplied bytes, the client database's deletion check and the builder's admission
   policy, none of which saves or notifies anything; an id and signature pair it verified before skips only the
   signature check. It honours cancellation and its deadline between frames, mid-page included. A request the

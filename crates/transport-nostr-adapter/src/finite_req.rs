@@ -205,7 +205,9 @@ struct Registry {
     policy: Option<Arc<dyn AdmitPolicy>>,
     database: Arc<dyn NostrDatabase>,
     /// The client's relay limits on a frame and on an event, which the SDK
-    /// applies to subscription input before admitting it.
+    /// applies to subscription input before admitting it. Limits set on one
+    /// relay (`add_relay(..).limits(..)`) are not applied: nostr-sdk offers no
+    /// way to read them back, and nothing in MDK sets them.
     max_frame: usize,
     event_limits: RelayEventLimits,
     next_id: AtomicU64,
@@ -351,12 +353,6 @@ impl FiniteRequests {
             requests: Mutex::default(),
             verified: Mutex::default(),
         }))
-    }
-
-    /// How many requests this client has sent.
-    #[cfg(test)]
-    pub(crate) fn sent(&self) -> u64 {
-        self.0.next_id.load(Ordering::Relaxed)
     }
 
     /// `transport`, with this client's finite requests' replies taken off it.
@@ -647,7 +643,9 @@ impl<'a> Collector<'a> {
 
     /// Read one frame; the request's end, when this frame ends it.
     async fn frame(&mut self, text: &str) -> Option<FiniteEnd> {
-        let Ok(message) = RelayMessage::from_json(text) else {
+        // The SDK parses the trimmed frame; the counts keep its whole length.
+        let json = text.trim();
+        let Ok(message) = RelayMessage::from_json(json) else {
             if head_verb(text).as_deref() == Some("EVENT") {
                 self.raw_items += 1;
                 self.fetched_bytes += text.len() as u64;
@@ -659,7 +657,7 @@ impl<'a> Collector<'a> {
             RelayMessage::EndOfStoredEvents(_) => {
                 // An EOSE the SDK takes but serde_json cannot read whole (a
                 // trailing number out of range) may say `more`: it does.
-                self.more = serde_json::from_str::<Value>(text)
+                self.more = serde_json::from_str::<Value>(json)
                     .map_or(true, |frame| says_more(frame.get(2)));
                 Some(FiniteEnd::Eose)
             }
@@ -1284,6 +1282,19 @@ mod tests {
             reply.end,
             FiniteEnd::Closed("rate-limited: slow".to_owned())
         );
+        // The SDK trims Unicode whitespace before it parses a frame.
+        let keys = Keys::generate();
+        let kept = note(&keys, "padded");
+        let pad = |frame: String| format!("\u{2003}\n{frame}\u{2003}");
+        let reply = collect(
+            &filter,
+            limits(2, 1 << 20),
+            &[pad(event_frame(&kept)), pad(eose(r#",["more"]"#))],
+        )
+        .await;
+        assert_eq!(reply.end, FiniteEnd::Eose);
+        assert!(reply.more);
+        assert_eq!(reply.events, vec![kept]);
         assert!(is_auth_required("auth-required: sign in"));
         assert!(is_auth_required("ERROR: auth-required: sign in"));
         assert!(!is_auth_required("restricted: auth-required: no"));

@@ -7002,39 +7002,38 @@ mod tests {
     /// request and its reply.
     #[tokio::test]
     async fn spellings_of_one_relay_share_one_request() {
-        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
-        let url = relay.url().await;
+        let mut wire = ReplayWire::new().await;
         let keys = Keys::generate();
         let event = EventBuilder::new(Kind::TextNote, "shared")
             .finalize(&keys)
             .unwrap();
-        relay.add_event(event.clone()).await.unwrap();
         let sdk = NostrSdkRelayClient::from_builder(crate::network_proxy::nostr_builder(Ok(None)));
-        let spelled = url.to_string();
-        let other = match spelled.strip_suffix('/') {
-            Some(bare) => bare.to_owned(),
-            None => format!("{spelled}/"),
-        };
         let mut request = acquisition_request(
             MemberId::new(keys.public_key().to_bytes().to_vec()),
-            url,
+            RelayUrl::parse(wire.endpoint.as_str()).unwrap(),
             vec![event.id.to_bytes()],
             4,
             100_000,
         );
-        request.endpoints.push(TransportEndpoint(other));
+        request
+            .endpoints
+            .push(TransportEndpoint(format!("{}/", wire.endpoint.0)));
         request.limits.max_endpoints = 2;
-        let report = sdk
-            .acquire_history(request, NostrAcquisitionCancellation::new())
-            .await
-            .unwrap();
+        let acquisition =
+            tokio::spawn(async move { sdk.acquire_history(request, Default::default()).await });
+        let id = wire.recv_kind("REQ").await[1].clone();
+        wire.send(serde_json::json!(["EVENT", id, event])).await;
+        wire.send(serde_json::json!(["EOSE", id])).await;
+        let report = acquisition.await.unwrap().unwrap();
         assert_eq!(report.endpoints.len(), 2);
         for endpoint in &report.endpoints {
             assert_eq!(endpoint.end, NostrAcquisitionEnd::RequestPolicySatisfied);
             assert_eq!(endpoint.events.len(), 1);
         }
-        assert_eq!(sdk.finite_requests.as_ref().unwrap().sent(), 1);
-        relay.shutdown();
+        assert!(
+            !std::iter::from_fn(|| wire.received.try_recv().ok()).any(|frame| frame[0] == "REQ"),
+            "one REQ answers both spellings"
+        );
     }
 
     /// A relay's refusal keeps its kind: a machine-readable prefix rejects,
