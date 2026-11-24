@@ -4,12 +4,19 @@
 
 ### Breaking changes
 
+- Swift: cancelling a `Task` that awaits a throwing async call, a command or a receive, now cancels its native future
+  and throws `CancellationError`, even when a result raced the cancel (mdk#3670). Before, the call ran to completion
+  and returned its result. A cancelled caller of `shutdownAndClose()` or `signOutAndWipe()` now returns before that
+  work finishes; await them from a task you do not cancel when you need completion.
 - `TimelineUpdateTriggerFfi::AgentActivity` becomes `AgentItem` and `AgentOperation` is removed;
   `NotificationTrafficClassFfi::AgentActivity` is removed. An agent item notifies as `Standard` only while it is a
   waiting approval or question, or a failed turn.
 
 ### Added
 
+- Swift `nextCancellable()` / `nextUpdateCancellable()` adapters for the receives generated without `throws`:
+  backup restore, chat list, chats, events, group state, messages, notifications, onboarding, timeline messages and
+  user search subscriptions (mdk#3670).
 - `TimelineMessageRecordFfi::agent_item_first_event_missing`: true for an agent item whose first event this device
   does not hold, such as one that began before the member joined; the row is built from its edits.
 - `TimelineMessageRecordFfi::agent_item` (`AgentItemFfi`, `AgentItemStateFfi`): the latest version of a kind-1201

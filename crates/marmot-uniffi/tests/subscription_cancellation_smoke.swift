@@ -71,7 +71,7 @@ private func expectPrecancelled(_ next: @escaping @Sendable () async throws -> V
     withUnsafeCurrentTask { $0!.cancel() }
     do {
       try await next()
-      preconditionFailure("pre-cancelled public nextCancellable returned normally")
+      preconditionFailure("pre-cancelled public call returned normally")
     } catch is CancellationError {
     }
   }.value
@@ -113,7 +113,7 @@ private enum NativeCancelCallback {
 private func cancelNativePending<Value>(
   _ name: String,
   makeHandle: @escaping @Sendable () -> UInt64,
-  read: @escaping @Sendable (inout (data: Data, offset: Data.Index)) throws -> Value,
+  lift: @escaping @Sendable (RustBuffer) throws -> Value?,
   callback: NativeCancelCallback = .cancelledOrWoken
 ) async throws {
   try await Task.detached {
@@ -124,7 +124,7 @@ private func cancelNativePending<Value>(
         if let result = probe.result {
           if result == 1 { continue }
           precondition(result == 0, "invalid native poll result")
-          let value = try await cancellableProjectionNext(handle, read: read)
+          let value = try await generatedReceive(handle, lift: lift)
           precondition(value != nil, "subscription closed before cancellation proof")
           break
         }
@@ -132,9 +132,9 @@ private func cancelNativePending<Value>(
         // until another poll. Cancel before the helper can perform that poll.
         withUnsafeCurrentTask { $0!.cancel() }
         do {
-          let _: Value? = try await cancellableProjectionNext(
+          let _: Value? = try await generatedReceive(
             handle,
-            read: { _ in
+            lift: { _ in
               preconditionFailure("cancelled pending native receive decoded a value")
             })
           preconditionFailure("cancelled native receive returned normally")
@@ -151,6 +151,23 @@ private func cancelNativePending<Value>(
       }
     }
   }.value
+}
+
+// The generated cancellable path every throwing async call takes, applied to a
+// future this smoke already polled itself.
+private func generatedReceive<Value>(
+  _ handle: UInt64,
+  lift: (RustBuffer) throws -> Value?
+) async throws -> Value? {
+  try await uniffiRustCallAsync(
+    rustFutureFunc: { handle },
+    pollFunc: ffi_marmot_uniffi_rust_future_poll_rust_buffer,
+    completeFunc: ffi_marmot_uniffi_rust_future_complete_rust_buffer,
+    freeFunc: ffi_marmot_uniffi_rust_future_free_rust_buffer,
+    cancelFunc: ffi_marmot_uniffi_rust_future_cancel_rust_buffer,
+    liftFunc: lift,
+    errorHandler: FfiConverterTypeMarmotKitError_lift
+  )
 }
 
 private func receiveMatching<Value>(
@@ -222,42 +239,65 @@ private struct SubscriptionCancellationSmoke {
     precondition(attentionInitial.accounts.contains { $0.accountIdHex == account.accountIdHex })
     precondition(conversationInitial.draft.draft == nil)
 
-    // These check the five public prechecks. Native-pending cancellation is
-    // checked separately below; pre-cancellation alone cannot prove it.
+    // Public pre-cancellation. Native-pending cancellation is checked
+    // separately below; pre-cancellation alone cannot prove it.
+    let events = kit.subscribeEvents()
+    let notifications = try await kit.subscribeNotifications()
+    let search = try await kit.searchUsers(
+      accountIdHex: account.accountIdHex, query: "cancellation smoke", radiusStart: 1, radiusEnd: 1)
     try await expectPrecancelled { _ = try await presented.nextCancellable() }
     try await expectPrecancelled { _ = try await list.nextCancellable() }
     try await expectPrecancelled { _ = try await attention.nextCancellable() }
     try await expectPrecancelled { _ = try await conversation.nextCancellable() }
     try await expectPrecancelled { _ = try await blocks.nextCancellable() }
+    try await expectPrecancelled { _ = try await events.nextCancellable() }
+    try await expectPrecancelled { _ = try await notifications.nextCancellable() }
+    try await expectPrecancelled { _ = try await search.nextUpdateCancellable() }
+    // Generated throwing commands forward cancellation too, not only receives.
+    try await expectPrecancelled {
+      _ = try await kit.createGroup(
+        accountRef: account.label, name: "Cancelled before start", memberRefs: [], description: nil)
+    }
+
+    // A public receive cancelled while it waits ends promptly (the watchdog
+    // bounds "promptly"), whether the cancel lands before or after its poll.
+    let waitingEvent = Task.detached { try await events.nextCancellable() }
+    try await Task.sleep(nanoseconds: 100_000_000)
+    waitingEvent.cancel()
+    do {
+      _ = try await waitingEvent.value
+      preconditionFailure("cancelled events receive returned normally")
+    } catch is CancellationError {
+    }
 
     try await cancelNativePending(
       "PresentedChatListSubscription",
       makeHandle: {
         uniffi_marmot_uniffi_fn_method_presentedchatlistsubscription_next(
           presented.uniffiClonePointer())
-      }, read: { try FfiConverterTypePresentedChatListUpdateFfi.read(from: &$0) })
+      }, lift: { try FfiConverterOptionTypePresentedChatListUpdateFfi.lift($0) })
     try await cancelNativePending(
       "ChatListWindowSubscription",
       makeHandle: {
         uniffi_marmot_uniffi_fn_method_chatlistwindowsubscription_next(list.uniffiClonePointer())
-      }, read: { try FfiConverterTypeChatListWindowSnapshotFfi.read(from: &$0) })
+      }, lift: { try FfiConverterOptionTypeChatListWindowSnapshotFfi.lift($0) })
     try await cancelNativePending(
       "AccountAttentionSubscription",
       makeHandle: {
         uniffi_marmot_uniffi_fn_method_accountattentionsubscription_next(
           attention.uniffiClonePointer())
-      }, read: { try FfiConverterTypeAccountAttentionSnapshotFfi.read(from: &$0) })
+      }, lift: { try FfiConverterOptionTypeAccountAttentionSnapshotFfi.lift($0) })
     try await cancelNativePending(
       "ConversationWindowSubscription",
       makeHandle: {
         uniffi_marmot_uniffi_fn_method_conversationwindowsubscription_next(
           conversation.uniffiClonePointer())
-      }, read: { try FfiConverterTypeConversationWindowSnapshotFfi.read(from: &$0) })
+      }, lift: { try FfiConverterOptionTypeConversationWindowSnapshotFfi.lift($0) })
     try await cancelNativePending(
       "BlockListSubscription",
       makeHandle: {
         uniffi_marmot_uniffi_fn_method_blocklistsubscription_next(blocks.uniffiClonePointer())
-      }, read: { try FfiConverterTypeBlockListSnapshotFfi.read(from: &$0) }, callback: .cancelled)
+      }, lift: { try FfiConverterOptionTypeBlockListSnapshotFfi.lift($0) }, callback: .cancelled)
 
     _ = try kit.setChatManuallyUnread(
       accountRef: account.label, groupIdHex: group, manuallyUnread: true)
@@ -301,8 +341,8 @@ private struct SubscriptionCancellationSmoke {
     var pendingProbe = queuedProbe
     while let result = pendingProbe.result {
       if result == 0 {
-        let value = try await cancellableProjectionNext(
-          pendingHandle, read: FfiConverterTypeConversationWindowSnapshotFfi.read)
+        let value = try await generatedReceive(
+          pendingHandle, lift: { try FfiConverterOptionTypeConversationWindowSnapshotFfi.lift($0) })
         precondition(value != nil)
         pendingHandle = uniffi_marmot_uniffi_fn_method_conversationwindowsubscription_next(
           conversation.uniffiClonePointer())
@@ -322,9 +362,9 @@ private struct SubscriptionCancellationSmoke {
     try await Task.detached {
       withUnsafeCurrentTask { $0!.cancel() }
       do {
-        let _: ConversationWindowSnapshotFfi? = try await cancellableProjectionNext(
+        let _: ConversationWindowSnapshotFfi? = try await generatedReceive(
           handleToCancel,
-          read: { _ in
+          lift: { _ in
             preconditionFailure("cancelled native future consumed the queued draft")
           })
         preconditionFailure("cancelled queued receive returned normally")
@@ -349,9 +389,9 @@ private struct SubscriptionCancellationSmoke {
       FfiConverterTypeConversationPageDirectionFfi_lower(.older), 1, 0
     )
     do {
-      let _: ConversationWindowSnapshotFfi? = try await cancellableProjectionNext(
+      let _: ConversationWindowSnapshotFfi? = try await generatedReceive(
         errorHandle,
-        read: { _ in
+        lift: { _ in
           preconditionFailure("wrong generation returned a successful native payload")
         })
       preconditionFailure("wrong generation did not propagate a typed native error")
@@ -367,9 +407,9 @@ private struct SubscriptionCancellationSmoke {
       await awaitNativeReady(readyError)
       withUnsafeCurrentTask { $0!.cancel() }
       do {
-        let _: ConversationWindowSnapshotFfi? = try await cancellableProjectionNext(
+        let _: ConversationWindowSnapshotFfi? = try await generatedReceive(
           readyError,
-          read: { _ in
+          lift: { _ in
             preconditionFailure("cancelled ready error decoded a successful payload")
           })
         preconditionFailure("cancelled ready error returned normally")

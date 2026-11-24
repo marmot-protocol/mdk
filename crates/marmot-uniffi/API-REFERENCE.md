@@ -50,18 +50,32 @@ hard-coded in these pages.
 
 The published `MarmotKit.swift` includes these Swift-only methods from
 [`CancellableSubscriptions.swift`](swift-support/CancellableSubscriptions.swift).
-Each has the same result and native errors as its object's `next()`, but forwards Swift task cancellation
-to the native future and throws `CancellationError`. Cancellation does not close the subscription.
+Each has the same result as the generated receive it names, but forwards Swift task cancellation to the
+native future and throws `CancellationError`; those receives are generated without `throws`, so they cannot.
+The last four generated `next()` methods throw and already forward cancellation; their adapters are the
+same call, kept for existing hosts. Cancellation does not close the subscription.
 These are not new Rust exports or Kotlin methods. See
 [subscription ownership](README.md#screen-snapshots-paging-and-ownership) for concurrent receive and cancellation races.
 
 | Subscription | Swift signature |
 | --- | --- |
+| `BackupRestoreSubscription` | `func nextCancellable() async throws -> BackupRestoreStatusFfi?` |
+| `BlockListSubscription` | `func nextCancellable() async throws -> BlockListSnapshotFfi?` |
+| `ChatListSubscription` | `func nextCancellable() async throws -> ChatListRowFfi?` |
+| `ChatListSubscription` | `func nextUpdateCancellable() async throws -> ChatListSubscriptionUpdateFfi?` |
+| `ChatsSubscription` | `func nextCancellable() async throws -> AppGroupRecordFfi?` |
+| `EventsSubscription` | `func nextCancellable() async throws -> MarmotEventFfi?` |
+| `GroupStateSubscription` | `func nextCancellable() async throws -> AppGroupRecordFfi?` |
+| `MessagesSubscription` | `func nextCancellable() async throws -> MessageUpdateFfi?` |
+| `NotificationsSubscription` | `func nextCancellable() async throws -> NotificationUpdateFfi?` |
+| `OnboardingSubscription` | `func nextCancellable() async throws -> OnboardingSnapshotFfi?` |
+| `TimelineMessagesSubscription` | `func nextCancellable() async throws -> TimelinePageFfi?` |
+| `TimelineMessagesSubscription` | `func nextUpdateCancellable() async throws -> TimelineSubscriptionUpdateFfi?` |
+| `UserSearchSubscription` | `func nextUpdateCancellable() async throws -> UserSearchUpdateFfi?` |
 | `PresentedChatListSubscription` | `func nextCancellable() async throws -> PresentedChatListUpdateFfi?` |
 | `ChatListWindowSubscription` | `func nextCancellable() async throws -> ChatListWindowSnapshotFfi?` |
 | `AccountAttentionSubscription` | `func nextCancellable() async throws -> AccountAttentionSnapshotFfi?` |
 | `ConversationWindowSubscription` | `func nextCancellable() async throws -> ConversationWindowSnapshotFfi?` |
-| `BlockListSubscription` | `func nextCancellable() async throws -> BlockListSnapshotFfi?` |
 
 ## Methods by source module
 
