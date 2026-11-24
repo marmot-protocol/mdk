@@ -73,6 +73,13 @@
   only acknowledgement came from a relay that accepts gift wraps but cannot serve them back no longer depends on a
   retry 30 seconds later, which a closed app never ran. `redeliver_welcome` and runtimes that publish Welcomes inline
   still stop at the first acknowledgement.
+- An invite's Welcome whose recipient has no usable inbox relay no longer retries, and records a routing failure, on
+  every maintenance pass while it is owed (mdk#2261, in part). Its recipient is retried 10 minutes later, then at
+  doubling intervals up to 6 hours; the pacing is kept in memory, so each app start still makes one attempt. Each
+  retry uses the recipient's inbox route as the account last loaded it from the local directory cache: MDK does not
+  look the recipient's relay list up again, so such a Welcome still goes out only once a new list reaches the cache
+  and the route table, in practice through a new invite to that person. The audit records why no route was found:
+  `no_eligible_route` for an empty or unusable list, `route_resolution_failed` for no list known.
 - A newly linked device no longer waits up to an hour for its siblings' small state, showing a chat the account already
   accepted as an invitation, with an "invited you" notification, when every sibling broadcast within the last hour
   (mdk#3556). A device whose trusted roster lists a device its last broadcast was not made for broadcasts at once, and

@@ -680,8 +680,9 @@ where
     /// Publish each watched Welcome that is owed and that no attempt record
     /// holds. A Welcome stays watched until its row is settled. While a stored
     /// fanout or a detached wave holds it, that record retries it;
-    /// once none does, as after a publish that found no route or a fanout that
-    /// expired, the next pass publishes it again, as the startup pass would.
+    /// once none does, as after a fanout that expired, the next pass publishes
+    /// it again, as the startup pass would. One whose last publish found no
+    /// route waits for its recipient's paced retry (`welcome_routes`).
     pub(super) async fn deliver_watched_welcomes(
         &mut self,
         output: &mut AccountDeviceEffects,
@@ -689,6 +690,8 @@ where
         self.read_welcome_store()?;
         let mut due: Vec<(GroupId, Vec<TransportMessage>)> = Vec::new();
         let mut watching = Vec::with_capacity(self.watched_welcomes.len());
+        // The recipients of every owed Welcome, unless a status read failed.
+        let mut owed_recipients = Some(HashSet::new());
         for id in std::mem::take(&mut self.watched_welcomes) {
             let status = self
                 .session
@@ -716,9 +719,17 @@ where
                         watching.push(id);
                     }
                 }
-                Ok((OutboundWelcomeStatus::Waiting, _) | (_, true)) => watching.push(id),
-                Ok((OutboundWelcomeStatus::Owed { group_id, message }, false)) => {
+                Ok((OutboundWelcomeStatus::Waiting, _)) => watching.push(id),
+                Ok((OutboundWelcomeStatus::Owed { group_id, message }, held)) => {
                     watching.push(id);
+                    if let (Some(owed), Some(recipient)) =
+                        (owed_recipients.as_mut(), welcome_recipient(&message))
+                    {
+                        owed.insert(recipient);
+                    }
+                    if held || self.welcome_route_retry_holds(&message) {
+                        continue;
+                    }
                     match due.iter_mut().find(|(group, _)| *group == group_id) {
                         Some((_, welcomes)) => welcomes.push(message),
                         None => due.push((group_id, vec![message])),
@@ -731,11 +742,15 @@ where
                         transient = error.is_transient(),
                         "watched Welcome status unreadable"
                     );
+                    owed_recipients = None;
                     watching.push(id);
                 }
             }
         }
         self.watched_welcomes = watching;
+        if let Some(owed) = owed_recipients {
+            self.retain_welcome_route_retries(&owed);
+        }
         for (group_id, welcomes) in due {
             self.publish_welcome_fanout(welcomes, Some(group_id), output, None, false)
                 .await?;
