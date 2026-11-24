@@ -2964,6 +2964,7 @@ fn app_error_kind(error: &AppError) -> &str {
         return &remote.kind;
     }
     match error {
+        AppError::AccountSetupRollback { rollback, .. } => app_error_kind(rollback),
         AppError::AccountSessionBusy => "account_session_busy",
         AppError::AccountWorkerBusy => "account_worker_busy",
         AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
@@ -3020,6 +3021,9 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
 }
 
 fn app_error_retryable(error: &AppError) -> bool {
+    if let AppError::AccountSetupRollback { rollback, .. } = error {
+        return app_error_retryable(rollback);
+    }
     if let AppError::Io(error) = error
         && let Some(remote) = error
             .get_ref()
@@ -3060,6 +3064,7 @@ fn app_error(error: AppError) -> SubjectError {
         );
     }
     let category = match error {
+        AppError::AccountSetupRollback { rollback, .. } => return app_error(*rollback),
         AppError::Nip46(ref error) => match error {
             Nip46Error::Invalid => SubjectFailureCategory::Protocol,
             Nip46Error::ProxyConfig | Nip46Error::Storage => SubjectFailureCategory::Environment,
