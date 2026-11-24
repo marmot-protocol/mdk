@@ -1,7 +1,7 @@
 ---
 title: "Nostr Bounded Acquisition Interface"
 created: 2026-09-23
-updated: 2026-11-15
+updated: 2026-11-23
 tags: [marmot, nostr, recovery, transport]
 status: overview
 ---
@@ -27,7 +27,11 @@ operation; see
 - `NostrRelayClient::notification_loss` and `notification_loss_for_account` return a `watch` receiver for the
   cumulative loss watermark described under [Loss scope](#loss-scope).
 
-The production `NostrSdkRelayClient` implements both operations.
+The production `NostrSdkRelayClient` implements both operations. It sends each endpoint's request under a reserved
+subscription id that nostr-sdk never registers, and takes the replies off the connection before the SDK's reader, so
+history never delays live delivery; the caller's task applies the SDK's event checks, the client's admission policy
+and its deletions. Only a client built with `NostrSdkRelayClient::from_builder` can do this; one built with `new`
+returns `Unsupported`.
 
 ## Request
 
@@ -60,9 +64,9 @@ the caller.
 `received_items` and `serialized_event_bytes` include duplicates and the event that trips a budget. The retained
 high-water values count only distinct retained events and their serialized JSON bytes.
 
-These budgets are not total memory or wire-byte bounds. They exclude SDK notification queues, WebSocket and parser
-buffers, temporary serialization, filter and ID input, event object overhead, in-flight frames and other concurrent
-requests. Callers bound concurrency and admission work separately. The interface provides no pagination cursor and
+These budgets are not total memory or wire-byte bounds. Each endpoint's reply queue may hold its byte budget plus one
+maximum-size frame, and WebSocket and parser buffers, temporary serialization, filter and ID input, event object
+overhead and other concurrent requests are outside them. Callers bound concurrency and admission work separately. The interface provides no pagination cursor and
 makes no exhaustive-history claim.
 
 ## Outcomes
@@ -75,13 +79,12 @@ endpoint.
 The fixed request exit policy is EOSE from each endpoint, and only `RequestPolicySatisfied` reports that this EOSE
 arrived. Every other end means that endpoint did not finish the request:
 
-- `UnexpectedExitLimit`: an SDK exit-count condition fired despite the fixed policy;
 - `ItemLimitReached`, `ByteLimitReached` and `Deadline`: a declared budget ran out;
 - `Cancelled`: the request-local token fired;
 - `Disconnected`, `RelayClosed`, `Rejected`, `AuthenticationFailed` and `SetupFailed`: the relay or request setup
-  failed;
-- `ReceiveLoss` and `ReceiverClosed`: the SDK receiver lagged or closed. `receiver_skipped_notifications` is this
-  request's count, separate from the lifetime watermark under [Loss scope](#loss-scope).
+  failed; `Rejected` is a `CLOSED` with a machine-readable prefix, `RelayClosed` one without, and
+  `AuthenticationFailed` an `auth-required:` refusal that outlasted one retry after NIP-42 authentication;
+- `InvalidMessage`: a frame that may have been this request's could not be read, so the page cannot be proven.
 
 EOSE and request completion prove neither historical coverage nor durable admission, decryption or engine readiness.
 `session_generation` is network evidence for rejecting stale observations; it is distinct from durable retry,

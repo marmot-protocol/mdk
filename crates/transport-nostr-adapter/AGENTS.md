@@ -247,9 +247,9 @@ for reconnect/backoff and relay status mechanics.
   only off the wire, where a misread `finish` would skip history while a misread `more` only costs requests, so an
   EOSE the SDK takes whose hints cannot be read counts as `more`. Do not
   add a hint-based `SliceProof` until nostr-sdk surfaces hints itself.
-- Every `SdkSweepRelay` REQ is a finite request (`src/finite_req.rs`), which `NostrSdkRelayClient::from_builder`
-  installs under the builder's transport; a client built with `new` cannot make one, and its sweep relays read as
-  unreachable. A finite request's id starts with `ID_PREFIX`, which no SDK or adapter id does. Its REQ goes out through
+- Every `SdkSweepRelay` REQ and every `acquire_history` request is a finite request (`src/finite_req.rs`), which
+  `NostrSdkRelayClient::from_builder` installs under the builder's transport; a client built with `new` cannot make
+  one: its sweep relays read as unreachable and `acquire_history` returns `Unsupported`. A finite request's id starts with `ID_PREFIX`, which no SDK or adapter id does. Its REQ goes out through
   `Relay::send_msg`, so the SDK never registers or resends it, and binds to the connection that sends it. The wrapper
   takes every EVENT, EOSE and CLOSED frame under a finite id off the connection, whether or not its request is still
   registered: a relay keeps answering until it reads the CLOSE, and those frames must never reach the SDK. It never
@@ -258,13 +258,16 @@ for reconnect/backoff and relay status mechanics.
   character included), or any binary frame, passes on and ends that connection's requests `InvalidMessage`, so no
   EVENT the SDK would drop can shorten a page unseen. Each request's queue holds its byte budget plus one frame, which covers an ordinary
   page's envelopes however slow the caller; only rejected events or more than a frame of padding can fill it, and
-  that ends the request as a cut. The collector applies the SDK's message and tag ceilings, expiry, the filter,
+  that ends the request as a cut. The collector applies the builder's relay limits (frame, event size, tags; a frame
+  never past the queue's 5 MiB ceiling; a relay's own `add_relay(..).limits(..)` override is not applied, since the
+  SDK cannot read it back, so do not set one), expiry, the filter,
   the event id and signature of the supplied bytes, the client database's deletion check and the builder's admission
   policy, none of which saves or notifies anything; an id and signature pair it verified before skips only the
   signature check. It honours cancellation and its deadline between frames, mid-page included. A request the
   collector ends (EOSE, CLOSED, a budget) charges nothing past that frame; one something else ends (cancellation,
   deadline, connection) charges every EVENT frame it was sent and did not read. An
-  `auth-required:` refusal is retried once under a new id after the client authenticates.
+  `auth-required:` refusal is retried once under a new id after the client authenticates; the retry spends what the
+  refused attempt left of the budget, and the reply keeps both attempts' events and counts.
 - The client's wire tap (`src/sweep/hint_tap.rs`) counts, per REQ, the EVENT frames its relay sends before that
   REQ's EOSE, valid or not, on the connection the REQ went out on (`ReplyCounts`). `dispatch_sdk_notification` asks
   `NostrRelayClient::reply_sent_nothing` once as it dispatches each EOSE, and each ask answers only the oldest EOSE

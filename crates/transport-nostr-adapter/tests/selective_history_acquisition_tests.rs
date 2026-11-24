@@ -299,7 +299,7 @@ async fn large_retained_history_and_sparse_gap_use_finite_bounded_acquisition() 
     let (left_url, left_counts) = counted_proxy(left.url().await.to_string()).await;
     let (right_url, right_counts) = counted_proxy(right.url().await.to_string()).await;
     let urls = vec![left_url, right_url];
-    let sdk = NostrSdkRelayClient::new(Client::builder().build());
+    let sdk = NostrSdkRelayClient::from_builder(Client::builder());
     for url in &urls {
         sdk.client().add_relay(url.as_str()).await.unwrap();
     }
@@ -499,7 +499,7 @@ async fn large_gap_of_small_events_recovers_with_batched_requests() {
     left_counts.latency_ms.store(40, Ordering::SeqCst);
     right_counts.latency_ms.store(40, Ordering::SeqCst);
     let urls = vec![left_url, right_url];
-    let sdk = NostrSdkRelayClient::new(Client::builder().build());
+    let sdk = NostrSdkRelayClient::from_builder(Client::builder());
     for url in &urls {
         sdk.client().add_relay(url.as_str()).await.unwrap();
     }
@@ -611,7 +611,7 @@ fn relay_database() -> MemoryDatabase {
 }
 
 async fn sdk_on(urls: &[String]) -> NostrSdkRelayClient {
-    let sdk = NostrSdkRelayClient::new(Client::builder().build());
+    let sdk = NostrSdkRelayClient::from_builder(Client::builder());
     for url in urls {
         sdk.client().add_relay(url.as_str()).await.unwrap();
     }
@@ -789,7 +789,7 @@ async fn deferred_event_leads_across_disjoint_relays(cached: bool) {
                 .await
                 .unwrap();
         }
-        let sdk = NostrSdkRelayClient::new(Client::builder().database(sdk_database).build());
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder().database(sdk_database));
         for url in &urls {
             sdk.client().add_relay(url.as_str()).await.unwrap();
         }
@@ -1549,7 +1549,7 @@ async fn a_cached_event_over_the_ceiling_cannot_hold_a_narrow_window() {
     let relay = LocalRelay::new(RelayBuilder::default().database(relay_db));
     relay.run().await.unwrap();
     let (url, _) = counted_proxy(relay.url().await.to_string()).await;
-    let sdk = NostrSdkRelayClient::new(Client::builder().database(sdk_db).build());
+    let sdk = NostrSdkRelayClient::from_builder(Client::builder().database(sdk_db));
     sdk.client().add_relay(url.as_str()).await.unwrap();
     sdk.client().connect().await;
     let route = subscription(&[url]);
@@ -1941,7 +1941,7 @@ async fn one_missing_event_fixture() -> (
     let (left_url, left_counts) = counted_proxy(left.url().await.to_string()).await;
     let (right_url, right_counts) = counted_proxy(right.url().await.to_string()).await;
     let urls = vec![left_url, right_url];
-    let sdk = NostrSdkRelayClient::new(Client::builder().build());
+    let sdk = NostrSdkRelayClient::from_builder(Client::builder());
     for url in &urls {
         sdk.client().add_relay(url.as_str()).await.unwrap();
     }
@@ -2019,7 +2019,7 @@ async fn cached_fixture(
     let (left_url, left_counts) = counted_proxy(left.url().await.to_string()).await;
     let (right_url, right_counts) = counted_proxy(right.url().await.to_string()).await;
     let urls = vec![left_url, right_url];
-    let sdk = NostrSdkRelayClient::new(Client::builder().database(sdk_database).build());
+    let sdk = NostrSdkRelayClient::from_builder(Client::builder().database(sdk_database));
     for url in &urls {
         sdk.client().add_relay(url.as_str()).await.unwrap();
     }
@@ -2687,7 +2687,7 @@ async fn endpoint_with_nothing_missing_succeeds_while_a_silent_peer_fails() {
     let (right_url, right_counts) = counted_proxy(right.url().await.to_string()).await;
     left_counts.drop_requests.store(true, Ordering::SeqCst);
     let urls = vec![left_url.clone(), right_url];
-    let sdk = NostrSdkRelayClient::new(Client::builder().build());
+    let sdk = NostrSdkRelayClient::from_builder(Client::builder());
     for url in &urls {
         sdk.client().add_relay(url.as_str()).await.unwrap();
     }

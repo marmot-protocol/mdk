@@ -175,7 +175,7 @@ async fn acquire_exact_with_client(
     NostrSdkRelayClient,
     transport_nostr_adapter::NostrAcquisitionResult,
 ) {
-    let sdk = NostrSdkRelayClient::new(SdkClient::builder().build());
+    let sdk = NostrSdkRelayClient::from_builder(SdkClient::builder());
     let request = NostrAcquisitionRequest {
         account_id: cgka_traits::MemberId::new(vec![7; 32]),
         scope: NostrAcquisitionScope::KnownEventIds(vec![id]),
