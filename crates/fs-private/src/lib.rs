@@ -11,6 +11,8 @@
 
 use std::fs::OpenOptions;
 use std::io;
+#[cfg(unix)]
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -213,6 +215,13 @@ pub struct PreparedDirectory {
 }
 
 #[cfg(unix)]
+impl AsFd for PreparedDirectory {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.directory.as_fd()
+    }
+}
+
+#[cfg(unix)]
 impl PreparedDirectory {
     #[must_use]
     pub fn mode(&self) -> u32 {
@@ -235,46 +244,55 @@ impl PreparedDirectory {
         &self,
         name: &std::ffi::OsStr,
     ) -> io::Result<PrivateExclusiveFileLease> {
-        use std::ffi::CString;
-        use std::os::fd::{AsRawFd, FromRawFd};
-        use std::os::unix::ffi::OsStrExt;
-
-        let mut name_components = Path::new(name).components();
-        let single_normal = matches!(
-            (name_components.next(), name_components.next()),
-            (Some(std::path::Component::Normal(_)), None)
-        );
-        if !single_normal {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "private lease name must be one non-empty path component",
-            ));
-        }
-        let name_c = CString::new(name.as_bytes()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "private lease name contains a NUL byte",
-            )
-        })?;
-        let path = self.path.join(name);
-        let descriptor = unsafe {
-            libc::openat(
-                self.directory.as_raw_fd(),
-                name_c.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                libc::c_uint::try_from(PRIVATE_FILE_MODE).expect("0600 fits c_uint"),
-            )
-        };
-        if descriptor < 0 {
-            return Err(io_context(
-                "open private lease file relative to prepared directory",
-                &path,
-                io::Error::last_os_error(),
-            ));
-        }
-        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
-        finish_private_exclusive_file_lease(file, &path, libc::LOCK_EX | libc::LOCK_NB)
+        try_acquire_lease_at(self.as_fd(), name).map_err(|error| {
+            io_context("acquire private lease beneath directory", &self.path, error)
+        })
     }
+}
+
+/// Acquire a private, nonblocking exclusive lease beneath an opened directory.
+/// `name` is one filename. The final component must not be a symlink.
+/// A held lease returns [`io::ErrorKind::WouldBlock`].
+#[cfg(unix)]
+pub fn try_acquire_lease_at(
+    directory: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+) -> io::Result<PrivateExclusiveFileLease> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = name.as_bytes();
+    if matches!(bytes, b"" | b"." | b"..") || bytes.contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private lease name must be one non-empty path component",
+        ));
+    }
+    let name_c = CString::new(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private lease name contains a NUL byte",
+        )
+    })?;
+    let path = Path::new(name);
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::c_uint::try_from(PRIVATE_FILE_MODE).expect("0600 fits c_uint"),
+        )
+    };
+    if descriptor < 0 {
+        return Err(io_context(
+            "open private lease file relative to directory",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    finish_private_exclusive_file_lease(file, path, libc::LOCK_EX | libc::LOCK_NB)
 }
 
 /// Open or create `path` while refusing symlinks.
@@ -2586,17 +2604,20 @@ mod unix_tests {
         assert_eq!(mode_of(&root), 0o700);
         assert_eq!(mode_of(&root.join(name)), 0o600);
 
-        let blocked = prepared
-            .try_acquire_private_exclusive_file_lease(name)
-            .expect_err("second owner must not block");
+        let moved = dir.path().join("original");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let blocked = try_acquire_lease_at(prepared.as_fd(), name)
+            .expect_err("borrowed descriptor shares the prepared directory's lease");
         assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
+        assert!(!root.join(name).try_exists().unwrap());
 
         drop(first);
         drop(
-            prepared
-                .try_acquire_private_exclusive_file_lease(name)
-                .expect("released lease can be reacquired"),
+            try_acquire_lease_at(prepared.as_fd(), name).expect("released lease can be reacquired"),
         );
+        assert_eq!(mode_of(&moved.join(name)), 0o600);
+        assert!(!root.join(name).try_exists().unwrap());
     }
 
     #[test]
@@ -2615,6 +2636,7 @@ mod unix_tests {
             "",
             ".",
             "..",
+            "lock/",
             "child/lock",
             "/etc/passwd",
             "../escape",

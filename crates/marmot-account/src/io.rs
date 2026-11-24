@@ -15,6 +15,7 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Bound on re-reads of a secret file that keeps being replaced mid-read.
 const SECRET_READ_ATTEMPTS: usize = 8;
+const MAX_SECRET_FILE_BYTES: u64 = 16 * 1024;
 
 pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(
     path: impl AsRef<Path>,
@@ -60,21 +61,20 @@ fn read_private_file_bounded(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
     after_open();
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private record must be a regular file",
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "private record must be a regular file",
-            ));
-        }
         if metadata.permissions().mode() & 0o077 != 0 {
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
@@ -98,6 +98,20 @@ pub(crate) fn read_secret_json<T: for<'de> Deserialize<'de>>(
     Ok(serde_json::from_slice(bytes.as_slice())?)
 }
 
+#[cfg(all(test, unix))]
+fn read_secret_text(path: &Path) -> AccountHomeResult<Zeroizing<String>> {
+    use zeroize::Zeroize;
+
+    let mut bytes = read_linked_secret(path, || {})?;
+    let bytes = std::mem::take(&mut *bytes);
+    String::from_utf8(bytes)
+        .map(Zeroizing::new)
+        .map_err(|error| {
+            error.into_bytes().zeroize();
+            io::Error::new(io::ErrorKind::InvalidData, "credential record is not UTF-8").into()
+        })
+}
+
 /// Read key material that a concurrent [`FileMode::Secret`] replacement or
 /// [`remove_file_then_scrub`] may race.
 ///
@@ -108,10 +122,31 @@ pub(crate) fn read_secret_json<T: for<'de> Deserialize<'de>>(
 /// yielding a key. `after_open` lets tests replace the file inside that window.
 fn read_linked_secret(path: &Path, mut after_open: impl FnMut()) -> io::Result<Zeroizing<Vec<u8>>> {
     for _ in 0..SECRET_READ_ATTEMPTS {
-        let mut file = File::open(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = options.open(path)?;
         after_open();
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "credential record must be a regular file",
+            ));
+        }
         let mut bytes = Zeroizing::new(Vec::new());
-        file.read_to_end(&mut bytes)?;
+        (&mut file)
+            .take(MAX_SECRET_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_SECRET_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "credential record exceeds size limit",
+            ));
+        }
         if still_linked(&file)? {
             return Ok(bytes);
         }
@@ -146,6 +181,39 @@ pub(crate) fn write_private_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> Accou
     write_file_atomically(path.as_ref(), bytes, FileMode::Private)
 }
 
+pub(crate) fn create_durable_private_dir(path: &Path) -> io::Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => return fs_private::create_dir_all_private(path),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private directory must not be a symlink or file",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match fs::metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private directory parent is not a directory",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_durable_private_dir(parent)?
+        }
+        Err(error) => return Err(error),
+    }
+    fs_private::create_dir_all_private(path)?;
+    sync_directory(parent)
+}
+
 /// Key material only: read it back with [`read_secret_json`].
 pub(crate) fn write_secret_json<T: Serialize>(
     path: impl AsRef<Path>,
@@ -155,9 +223,8 @@ pub(crate) fn write_secret_json<T: Serialize>(
     write_file_atomically(path.as_ref(), bytes.as_slice(), FileMode::Secret)
 }
 
-/// Every mode publishes by renaming a synced owner-only temp file over the
-/// target, so on Unix a reader sees the complete previous file or the complete
-/// new one.
+/// Private records publish by replacing the live name with a synced owner-only
+/// temp file. Secret replacement also detaches the previous file for scrubbing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileMode {
     /// Owner-only. The replaced inode is left intact for readers that still
@@ -173,7 +240,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
     let parent = parent.unwrap_or_else(|| Path::new("."));
-    fs_private::create_dir_all_private(parent)?;
+    create_durable_private_dir(parent)?;
 
     let (mut file, temp_path) = create_temp_file(parent, path)?;
     let result = (|| -> AccountHomeResult<()> {
@@ -200,8 +267,16 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
         } else {
             None
         };
-        replace_file(&temp_path, path)?;
-        // The handle still refers to the replaced inode after the atomic rename,
+        match mode {
+            #[cfg(windows)]
+            FileMode::Private => {
+                use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
+
+                windows_move_for_commit(&temp_path, path, MOVEFILE_REPLACE_EXISTING)?;
+            }
+            _ => replace_file(&temp_path, path)?,
+        }
+        // The handle still refers to the replaced file after publication,
         // so scrub it without creating a window where the live secret path is
         // zeroed if replacement fails. Best-effort, matching secret deletion.
         if let Some(file) = &mut replaced_secret_file {
@@ -330,8 +405,8 @@ fn create_temp_file(parent: &Path, path: &Path) -> AccountHomeResult<(File, Path
     .into())
 }
 
-/// Windows: the caller may still hold the old file open (the secret scrub
-/// handle). Deleting it and renaming onto its name then only works with
+/// Replace a Windows secret file while retaining its open scrub handle.
+/// Deleting it and renaming onto its name only works with
 /// POSIX delete semantics (NTFS on Windows 10 1903 and later); elsewhere the
 /// name stays delete-pending and the rename is denied. Moving the old file
 /// aside keeps open handles attached to the old file. A failed install attempts
@@ -347,13 +422,15 @@ fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
         TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let aside = path.with_file_name(aside);
-    match fs::rename(path, &aside) {
+    match rename_for_commit(path, &aside) {
         Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return fs::rename(temp_path, path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return rename_for_commit(temp_path, path);
+        }
         Err(err) => return Err(err),
     }
-    if let Err(err) = fs::rename(temp_path, path) {
-        let _ = fs::rename(&aside, path);
+    if let Err(err) = rename_for_commit(temp_path, path) {
+        let _ = rename_for_commit(&aside, path);
         return Err(err);
     }
     // The new file is live; the caller scrubs the old bytes through its open
@@ -368,13 +445,53 @@ fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
     fs::rename(temp_path, path)
 }
 
+#[cfg(windows)]
+pub(crate) fn rename_for_commit(from: &Path, to: &Path) -> io::Result<()> {
+    windows_move_for_commit(from, to, 0)
+}
+
+#[cfg(windows)]
+fn windows_move_for_commit(from: &Path, to: &Path, flags: u32) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let from = windows_move_path(from)?;
+    let to = windows_move_path(to)?;
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags | MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_move_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "rename path has no filename")
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let absolute = parent.canonicalize()?.join(name);
+    let mut wide: Vec<_> = absolute.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename path contains NUL",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -398,6 +515,53 @@ pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn fifo_reads_do_not_block() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::Command;
+
+        const FIFO_PROBE: &str = "MDK_ACCOUNT_FIFO_PROBE";
+        if let Some(path) = std::env::var_os(FIFO_PROBE) {
+            // Kill only the probe if a reader blocks opening the FIFO.
+            unsafe { libc::alarm(5) };
+            let path = Path::new(&path);
+            for result in [
+                read_private_json_bounded::<serde_json::Value>(path, 128).map(|_| ()),
+                read_secret_text(path).map(|_| ()),
+            ] {
+                assert!(matches!(result,
+                    Err(AccountHomeError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput));
+            }
+            unsafe { libc::alarm(0) };
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("record");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "io::tests::fifo_reads_do_not_block",
+                "--nocapture",
+            ])
+            .env(FIFO_PROBE, &fifo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "FIFO reader child failed: {}; {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "FIFO probe did not run: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 
     #[test]
     fn secret_write_creates_account_directory_owner_only() {

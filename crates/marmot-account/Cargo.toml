@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 fs-private.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 keyring-core.workspace = true
 libc.workspace = true
@@ -24,14 +25,28 @@ tempfile.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+core-foundation = "0.10"
+security-framework = "3.7"
+security-framework-sys = "2.17"
+
 [target.'cfg(target_os = "ios")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["protected"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSFileManager", "NSPathUtilities", "NSString", "NSURL"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = "1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Threading"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
+zbus = { version = "5.14", features = ["blocking-api"] }
+crypto-bigint = { version = "0.7.11", default-features = false, features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
+cbc = { version = "0.1", features = ["block-padding", "zeroize"] }
+hkdf.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-native-keyring-store = "1"
+jni = "0.21"
+ndk-context = "0.1"
