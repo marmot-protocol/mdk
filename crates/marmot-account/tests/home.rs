@@ -3370,6 +3370,13 @@ fn wipe_vault_failure_restarts() {
             home.remove_account(&account.label).unwrap();
             assert!(home.accounts_strict().unwrap().is_empty());
             assert!(!path.exists());
+            let tombstone_root = dir.path().join(".wipe-tombstones");
+            let pending = std::fs::read_dir(&tombstone_root)
+                .unwrap()
+                .next()
+                .expect("failed release must leave cleanup pending")
+                .unwrap();
+            assert!(pending.path().join(".wipe-cleanup.json").is_file());
             #[cfg(unix)]
             for mut handle in handles {
                 let mut bytes = Vec::new();
@@ -3386,7 +3393,7 @@ fn wipe_vault_failure_restarts() {
             );
             reopened.resume_wipe_cleanup().unwrap();
             assert!(reopened.accounts_strict().unwrap().is_empty());
-            let tombstones: Vec<_> = std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+            let tombstones: Vec<_> = std::fs::read_dir(&tombstone_root)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .collect();
@@ -3625,7 +3632,7 @@ fn file_vault_keeps_other_root() {
     let intent: serde_json::Value =
         serde_json::from_slice(&std::fs::read(intent).unwrap()).unwrap();
     assert_eq!(intent["legacy"][0]["account"]["label"], original.label);
-    assert!(intent["credentials"][0].is_null());
+    assert_eq!(intent["credentials"].get(0), Some(&serde_json::Value::Null));
     assert!(first.accounts_strict().unwrap().is_empty());
     assert_eq!(file_receipts(vault.path()).len(), 1);
     assert_eq!(
@@ -3891,7 +3898,12 @@ fn wipe_retry_rejects_nonowners() {
             );
             recovered.resume_wipe_cleanup().unwrap();
             assert_eq!(recovered.account(&replacement.label).unwrap(), replacement);
-            assert!(!store.keys.lock().unwrap().contains_key(&old.label));
+            let signed_slot = if account_id_keys {
+                &old.account_id_hex
+            } else {
+                &old.label
+            };
+            assert!(!store.keys.lock().unwrap().contains_key(signed_slot));
             if let Some(database) = database {
                 assert_eq!(
                     *recovered
