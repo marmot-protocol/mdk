@@ -1,6 +1,8 @@
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use jni::objects::{GlobalRef, JByteArray, JObject, JString, JValue};
@@ -20,13 +22,19 @@ const TAG_LEN: usize = 16;
 const MAX_CIPHER: usize = MAGIC.len() + IV_LEN + MAX_VALUE + TAG_LEN;
 const MAX_LEGACY_XML: usize = 8 * 1024 * 1024;
 const UNPUBLISHED: &str = ".unpublished-";
+const MANAGED_ROOT: &CStr = c"marmot-owned-vault-v1";
+const RECEIPTS: &CStr = c"receipts";
+const RETIREMENTS: &CStr = c"retirements";
 const PROVIDER: &str = "AndroidKeyStore";
 const TRANSFORM: &str = "AES/GCM/NoPadding";
 
 pub(crate) struct NativeVault {
     vm: JavaVM,
     _context: GlobalRef,
-    root: PathBuf,
+    no_backup: File,
+    lease_name: String,
+    service_dir: CString,
+    directories: RecordDirectories,
     namespace: String,
     legacy_scope: String,
     alias_prefix: String,
@@ -76,17 +84,26 @@ impl NativeVault {
             "mdk.owned.v1.{}.",
             hex::encode(Sha256::digest(namespace.as_bytes()))
         );
-        let managed = context.no_backup.join("marmot-owned-vault-v1");
-        private_directory(&managed)?;
-        let root = managed.join(service_hash);
-        private_directory(&root)?;
-        for child in ["receipts", "retirements"] {
-            private_directory(&root.join(child))?;
+        let no_backup = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&context.no_backup)?;
+        if no_backup.metadata()?.uid() != unsafe { libc::geteuid() } {
+            return Err(failure("Android no-backup container ownership is invalid"));
         }
+        // The OS-selected container outlives individual service directories.
+        // Every handle for these Keystore aliases takes the same lease first.
+        let lease_name = format!(".mdk-owned-vault-v1-{service_hash}.lock");
+        let service_dir = CString::new(service_hash).expect("service hash has no NUL");
+        let _lease = fs_private::try_acquire_lease_at(no_backup.as_fd(), OsStr::new(&lease_name))?;
+        let directories = RecordDirectories::open(&no_backup, &service_dir, true)?;
         Ok(Self {
             vm: context.vm,
             _context: context.context,
-            root,
+            no_backup,
+            lease_name,
+            service_dir,
+            directories,
             namespace,
             legacy_scope,
             alias_prefix,
@@ -106,6 +123,23 @@ impl NativeVault {
 
     pub(crate) fn legacy_scope(&self) -> Option<&str> {
         Some(&self.legacy_scope)
+    }
+
+    pub(crate) fn with_mutation<T>(
+        &self,
+        operation: impl FnOnce(&NativeVaultMutation<'_>) -> AccountHomeResult<T>,
+    ) -> AccountHomeResult<T> {
+        let _lease =
+            fs_private::try_acquire_lease_at(self.no_backup.as_fd(), OsStr::new(&self.lease_name))?;
+        self.check_current_directories()?;
+        let result = operation(&NativeVaultMutation(self))?;
+        self.check_current_directories()?;
+        Ok(result)
+    }
+
+    fn check_current_directories(&self) -> AccountHomeResult<()> {
+        let current = RecordDirectories::open(&self.no_backup, &self.service_dir, false)?;
+        self.directories.check_match(&current)
     }
 
     pub(crate) fn legacy_secret(
@@ -167,13 +201,6 @@ impl NativeVault {
         })
     }
 
-    fn directory(&self, kind: RecordKind) -> PathBuf {
-        self.root.join(match kind {
-            RecordKind::Receipt => "receipts",
-            RecordKind::Retirement => "retirements",
-        })
-    }
-
     fn alias(&self, name: &str) -> AccountHomeResult<String> {
         let alias = format!("{}{name}", self.alias_prefix);
         if alias == self.legacy_file {
@@ -182,12 +209,6 @@ impl NativeVault {
             ));
         }
         Ok(alias)
-    }
-
-    fn lease(&self) -> AccountHomeResult<fs_private::PrivateExclusiveFileLease> {
-        Ok(fs_private::try_acquire_private_exclusive_file_lease(
-            &self.root.join(crate::CREDENTIAL_STORE_LOCK_FILE),
-        )?)
     }
 
     fn aad(&self, name: &str) -> Vec<u8> {
@@ -286,85 +307,68 @@ impl NativeVault {
     }
 }
 
-impl VaultStorage for NativeVault {
+pub(crate) struct NativeVaultMutation<'a>(&'a NativeVault);
+
+impl VaultStorage for NativeVaultMutation<'_> {
     fn read(&self, kind: RecordKind, name: &str) -> AccountHomeResult<Option<Zeroizing<String>>> {
         validate_name(name)?;
-        let directory = self.directory(kind);
-        let path = directory.join(name);
+        let directory = self.0.directories.get(kind);
+        let filename = CString::new(name).expect("validated record name has no NUL");
         match kind {
-            RecordKind::Receipt => read_record(&path, MAX_CIPHER)?
-                .map(|bytes| self.decrypt(name, &bytes))
+            RecordKind::Receipt => read_record(directory, &filename, MAX_CIPHER)?
+                .map(|bytes| self.0.decrypt(name, &bytes))
                 .transpose(),
-            RecordKind::Retirement => read_record(&path, MAX_VALUE)?
+            RecordKind::Retirement => read_record(directory, &filename, MAX_VALUE)?
                 .map(|bytes| secret_string(&bytes))
                 .transpose(),
         }
     }
 
     fn write(&self, kind: RecordKind, name: &str, value: &str) -> AccountHomeResult<()> {
-        let _lease = self.lease()?;
-        sync_directory(&self.root)?;
         validate_name(name)?;
         if value.is_empty() || value.len() > MAX_VALUE {
             return Err(failure("Android vault record exceeds size limit"));
         }
-        let directory = self.directory(kind);
+        let directory = self.0.directories.get(kind);
+        let filename = CString::new(name).expect("validated record name has no NUL");
         match kind {
-            RecordKind::Retirement => publish_record(&directory, name, value.as_bytes()),
+            RecordKind::Retirement => publish_record(directory, &filename, value.as_bytes()),
             RecordKind::Receipt => {
-                if let Some(bytes) = read_record(&directory.join(name), MAX_CIPHER)? {
-                    if self.decrypt(name, &bytes)?.as_str() != value {
+                if let Some(bytes) = read_record(directory, &filename, MAX_CIPHER)? {
+                    if self.0.decrypt(name, &bytes)?.as_str() != value {
                         return Err(failure("Android receipt is immutable"));
                     }
-                    return sync_directory(&directory);
+                    return Ok(directory.sync_all()?);
                 }
-                let bytes = self.encrypt(name, value)?;
-                publish_record(&directory, name, &bytes)
+                self.0.check_current_directories()?;
+                let bytes = self.0.encrypt(name, value)?;
+                publish_record(directory, &filename, &bytes)
             }
         }
     }
 
     fn remove(&self, kind: RecordKind, name: &str) -> AccountHomeResult<()> {
         validate_name(name)?;
-        let _lease = self.lease()?;
-        let directory = self.directory(kind);
-        let mut result = remove_record(&directory.join(name));
-        let unpublished = remove_record(&directory.join(format!("{UNPUBLISHED}{name}")));
-        result = combine_errors(result, unpublished);
-        result = combine_errors(result, sync_directory(&directory));
+        let directory = self.0.directories.get(kind);
+        let filename = CString::new(name).expect("validated record name has no NUL");
+        let files = combine_errors(
+            remove_record(directory, &filename),
+            remove_record(directory, &unpublished(&filename)),
+        );
+        combine_errors(files, directory.sync_all().map_err(Into::into))?;
         if matches!(kind, RecordKind::Receipt) {
-            result = combine_errors(result, self.delete_key(name));
+            self.0.check_current_directories()?;
+            self.0.delete_key(name)?;
         }
-        result
+        Ok(())
     }
 
     fn names(&self, kind: RecordKind) -> AccountHomeResult<Vec<String>> {
-        let mut names = Vec::new();
-        for entry in fs::read_dir(self.directory(kind))? {
-            let entry = entry?;
-            let filename = entry.file_name();
-            let name = filename
-                .to_str()
-                .ok_or_else(|| failure("Android vault record name is not UTF-8"))?;
-            if let Some(unpublished) = name.strip_prefix(UNPUBLISHED) {
-                validate_name(unpublished)?;
-                continue;
-            }
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            check_file(&metadata)?;
-            validate_name(name)?;
-            names.push(name.to_owned());
-        }
-        names.sort_unstable();
-        Ok(names)
+        record_names(self.0.directories.get(kind))
     }
 
     fn sync(&self, kind: RecordKind) -> AccountHomeResult<()> {
-        sync_directory(&self.directory(kind))
+        Ok(self.0.directories.get(kind).sync_all()?)
     }
 }
 
@@ -715,26 +719,102 @@ fn validate_name(name: &str) -> AccountHomeResult<()> {
     Ok(())
 }
 
-fn private_directory(path: &Path) -> AccountHomeResult<()> {
-    fs_private::create_dir_all_private(path)?;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(failure("Android vault directory ownership is invalid"));
+struct RecordDirectories {
+    service: File,
+    receipts: File,
+    retirements: File,
+}
+
+impl RecordDirectories {
+    fn open(container: &File, service_dir: &CStr, create: bool) -> AccountHomeResult<Self> {
+        let managed = open_private_directory(container, MANAGED_ROOT, create)?;
+        let service = open_private_directory(&managed, service_dir, create)?;
+        let receipts = open_private_directory(&service, RECEIPTS, create)?;
+        let retirements = open_private_directory(&service, RETIREMENTS, create)?;
+        if create {
+            // Retry the whole publication barrier after an interrupted first open.
+            receipts.sync_all()?;
+            retirements.sync_all()?;
+            service.sync_all()?;
+            managed.sync_all()?;
+            container.sync_all()?;
+        }
+        Ok(Self {
+            service,
+            receipts,
+            retirements,
+        })
     }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+
+    fn get(&self, kind: RecordKind) -> &File {
+        match kind {
+            RecordKind::Receipt => &self.receipts,
+            RecordKind::Retirement => &self.retirements,
+        }
     }
-    sync_directory(path)?;
-    if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
+
+    fn check_match(&self, current: &Self) -> AccountHomeResult<()> {
+        for (opened, current) in [
+            (&self.service, &current.service),
+            (&self.receipts, &current.receipts),
+            (&self.retirements, &current.retirements),
+        ] {
+            let opened = opened.metadata()?;
+            let current = current.metadata()?;
+            if (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+                return Err(failure("Android vault directory changed after capture"));
+            }
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+fn open_private_directory(parent: &File, name: &CStr, create: bool) -> AccountHomeResult<File> {
+    let directory = match openat(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+        Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error.into());
+                }
+            }
+            openat(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
+        }
+        result => result?,
+    };
+    let metadata = directory.metadata()?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        return Err(failure(
+            "Android vault directory ownership or permissions are invalid",
+        ));
+    }
+    Ok(directory)
+}
+
+fn openat(
+    directory: &File,
+    name: &CStr,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> io::Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 fn check_file(metadata: &fs::Metadata) -> AccountHomeResult<()> {
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.mode() & 0o077 != 0
     {
         return Err(failure(
             "Android vault file ownership or permissions are invalid",
@@ -743,12 +823,26 @@ fn check_file(metadata: &fs::Metadata) -> AccountHomeResult<()> {
     Ok(())
 }
 
-fn read_record(path: &Path, limit: usize) -> AccountHomeResult<Option<Zeroizing<Vec<u8>>>> {
-    read_file(path, limit, check_file)
+fn open_record(directory: &File, filename: &CStr) -> AccountHomeResult<Option<File>> {
+    match openat(directory, filename, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_record(
+    directory: &File,
+    filename: &CStr,
+    limit: usize,
+) -> AccountHomeResult<Option<Zeroizing<Vec<u8>>>> {
+    open_record(directory, filename)?
+        .map(|file| read_open_file(&file, limit, check_file))
+        .transpose()
 }
 
 fn check_legacy_file(metadata: &fs::Metadata) -> AccountHomeResult<()> {
-    let mode = metadata.permissions().mode();
+    let mode = metadata.mode();
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || mode & 0o017 != 0
@@ -762,26 +856,16 @@ fn check_legacy_file(metadata: &fs::Metadata) -> AccountHomeResult<()> {
 }
 
 fn read_legacy(path: &Path) -> AccountHomeResult<Option<Zeroizing<Vec<u8>>>> {
-    read_file(path, MAX_LEGACY_XML, check_legacy_file)
-}
-
-fn read_file(
-    path: &Path,
-    limit: usize,
-    validate: impl FnOnce(&fs::Metadata) -> AccountHomeResult<()>,
-) -> AccountHomeResult<Option<Zeroizing<Vec<u8>>>> {
-    open_file(path)?
-        .map(|file| read_open_file(&file, limit, validate))
-        .transpose()
-}
-
-fn open_file(path: &Path) -> AccountHomeResult<Option<File>> {
     match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
-        Ok(file) => Ok(Some(file)),
+        Ok(file) => Ok(Some(read_open_file(
+            &file,
+            MAX_LEGACY_XML,
+            check_legacy_file,
+        )?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -805,36 +889,90 @@ fn read_open_file(
     Ok(bytes)
 }
 
-fn publish_record(directory: &Path, name: &str, bytes: &[u8]) -> AccountHomeResult<()> {
-    let unpublished = directory.join(format!("{UNPUBLISHED}{name}"));
-    remove_record(&unpublished)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&unpublished)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&unpublished, directory.join(name))?;
-    sync_directory(directory)
+fn unpublished(name: &CStr) -> CString {
+    let mut bytes = Vec::with_capacity(UNPUBLISHED.len() + name.to_bytes_with_nul().len());
+    bytes.extend_from_slice(UNPUBLISHED.as_bytes());
+    bytes.extend_from_slice(name.to_bytes_with_nul());
+    CString::from_vec_with_nul(bytes).expect("validated temporary record name")
 }
 
-fn remove_record(path: &Path) -> AccountHomeResult<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+fn publish_record(directory: &File, name: &CStr, bytes: &[u8]) -> AccountHomeResult<()> {
+    let unpublished = unpublished(name);
+    remove_record(directory, &unpublished)?;
+    let mut file = openat(
+        directory,
+        &unpublished,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let fd = directory.as_raw_fd();
+    if unsafe { libc::renameat(fd, unpublished.as_ptr(), fd, name.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(directory.sync_all()?)
+}
+
+fn remove_record(directory: &File, name: &CStr) -> AccountHomeResult<()> {
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+struct DirectoryStream(*mut libc::DIR);
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.0) };
     }
 }
 
-fn sync_directory(path: &Path) -> AccountHomeResult<()> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)?;
-    file.sync_all()?;
-    Ok(())
+fn record_names(directory: &File) -> AccountHomeResult<Vec<String>> {
+    // Open a separate file description so each enumeration starts at offset zero.
+    let file = openat(directory, c".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let stream = unsafe { libc::fdopendir(file.as_raw_fd()) };
+    if stream.is_null() {
+        return Err(io::Error::last_os_error().into());
+    }
+    let _ = file.into_raw_fd(); // fdopendir now owns the descriptor.
+    let stream = DirectoryStream(stream);
+    let mut names = Vec::new();
+    loop {
+        let entry = unsafe {
+            *libc::__errno() = 0;
+            libc::readdir(stream.0)
+        };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(0) {
+                return Err(error.into());
+            }
+            break;
+        }
+        let filename = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name = filename
+            .to_str()
+            .map_err(|_| failure("Android vault record name is not UTF-8"))?;
+        if matches!(name, "." | "..") {
+            continue;
+        }
+        if let Some(name) = name.strip_prefix(UNPUBLISHED) {
+            validate_name(name)?;
+            continue;
+        }
+        validate_name(name)?;
+        if let Some(file) = open_record(directory, filename)? {
+            check_file(&file.metadata()?)?;
+            names.push(name.to_owned());
+        }
+    }
+    names.sort_unstable();
+    Ok(names)
 }
 
 fn combine_errors(

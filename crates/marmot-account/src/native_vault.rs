@@ -69,6 +69,14 @@ impl NativeVault {
         self.legacy_scope.as_deref()
     }
 
+    pub(crate) fn with_mutation<T>(
+        &self,
+        operation: impl FnOnce(&NativeVaultMutation<'_>) -> AccountHomeResult<T>,
+    ) -> AccountHomeResult<T> {
+        self.backend
+            .with_mutation(|| operation(&NativeVaultMutation(self)))
+    }
+
     pub(crate) fn legacy_secret(
         &self,
         account_id: &str,
@@ -79,12 +87,17 @@ impl NativeVault {
         #[cfg(target_os = "ios")]
         {
             let current = format!("{}.after-first-unlock-v1", self.service);
-            let mut secret = self.backend.legacy_secret(&current, account_id)?;
-            merge_secret(
-                &mut secret,
-                self.backend.legacy_secret(&self.service, account_id)?,
-            )?;
-            Ok(secret)
+            if let Some(preferred) = self.backend.legacy_secret(&current, account_id)? {
+                return Ok(Some(preferred));
+            }
+            let legacy = self.backend.legacy_secret(&self.service, account_id)?;
+            #[cfg(not(test))]
+            if legacy.is_none()
+                && let Backend::Native(backend) = &self.backend
+            {
+                backend.confirm_legacy_absence()?;
+            }
+            Ok(legacy)
         }
         #[cfg(not(target_os = "ios"))]
         {
@@ -100,10 +113,12 @@ impl NativeVault {
     }
 }
 
-impl VaultStorage for NativeVault {
+pub(crate) struct NativeVaultMutation<'a>(&'a NativeVault);
+
+impl VaultStorage for NativeVaultMutation<'_> {
     fn read(&self, kind: RecordKind, name: &str) -> AccountHomeResult<Option<Zeroizing<String>>> {
         check_name(name)?;
-        self.backend.read(self.service(&kind), name)
+        self.0.backend.read(self.0.service(&kind), name)
     }
 
     fn write(&self, kind: RecordKind, name: &str, value: &str) -> AccountHomeResult<()> {
@@ -111,25 +126,25 @@ impl VaultStorage for NativeVault {
         if value.len() > 4096 {
             return Err(vault_error("native vault value exceeds 4096 bytes"));
         }
-        let service = self.service(&kind);
+        let service = self.0.service(&kind);
         if matches!(kind, RecordKind::Receipt)
-            && let Some(existing) = self.backend.read(service, name)?
+            && let Some(existing) = self.0.backend.read(service, name)?
         {
             if existing.as_str() == value {
                 return Ok(());
             }
             return Err(vault_error("native receipt is immutable"));
         }
-        self.backend.write(service, name, value)
+        self.0.backend.write(service, name, value)
     }
 
     fn remove(&self, kind: RecordKind, name: &str) -> AccountHomeResult<()> {
         check_name(name)?;
-        self.backend.remove(self.service(&kind), name)
+        self.0.backend.remove(self.0.service(&kind), name)
     }
 
     fn names(&self, kind: RecordKind) -> AccountHomeResult<Vec<String>> {
-        let mut names = self.backend.names(self.service(&kind))?;
+        let mut names = self.0.backend.names(self.0.service(&kind))?;
         for name in &names {
             check_name(name)?;
         }
@@ -195,17 +210,15 @@ fn decode_secret(bytes: Vec<u8>) -> AccountHomeResult<Zeroizing<String>> {
     }
 }
 
-#[cfg(any(
-    target_os = "ios",
-    all(
-        not(test),
-        any(
-            target_os = "linux",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly"
-        )
+#[cfg(all(
+    not(test),
+    any(
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
     )
 ))]
 fn merge_secret(
@@ -255,6 +268,24 @@ impl Backend {
             Self::ExplicitMock(backend) => backend.target(),
             #[cfg(not(test))]
             Self::Native(backend) => backend.target(),
+        }
+    }
+
+    fn with_mutation<T>(
+        &self,
+        operation: impl FnOnce() -> AccountHomeResult<T>,
+    ) -> AccountHomeResult<T> {
+        match self {
+            // The explicit in-memory provider is never shared across processes.
+            Self::ExplicitMock(_) => {
+                static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                let _guard = LOCK
+                    .lock()
+                    .map_err(|_| vault_error("mock vault lock poisoned"))?;
+                operation()
+            }
+            #[cfg(not(test))]
+            Self::Native(backend) => backend.with_mutation(operation),
         }
     }
 
@@ -537,7 +568,7 @@ mod platform {
     }
 
     pub(super) struct Backend {
-        state: Mutex<State>,
+        state: State,
         marker: Marker,
         target: String,
     }
@@ -551,8 +582,48 @@ mod platform {
         connection: Connection,
         owner: String,
         collection: OwnedObjectPath,
+        lease: String,
+        admission: Mutex<()>,
         session: OwnedObjectPath,
         key: Zeroizing<[u8; 16]>,
+    }
+
+    struct MutationLease<'a> {
+        bus: Proxy<'a>,
+        name: &'a str,
+        held: bool,
+    }
+
+    impl MutationLease<'_> {
+        fn release(&mut self) -> AccountHomeResult<()> {
+            let released: ReleaseNameReply = self
+                .bus
+                .call("ReleaseName", &(self.name,))
+                .map_err(native_error)?;
+            self.held = false;
+            if released != ReleaseNameReply::Released {
+                return Err(vault_error("Secret Service collection lease was lost"));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for MutationLease<'_> {
+        fn drop(&mut self) {
+            if self.held {
+                let _ = self.release();
+            }
+        }
+    }
+
+    fn bus(connection: &Connection) -> AccountHomeResult<Proxy<'_>> {
+        Proxy::new(
+            connection,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )
+        .map_err(native_error)
     }
 
     impl State {
@@ -560,19 +631,22 @@ mod platform {
             Proxy::new(&self.connection, self.owner.as_str(), path, interface).map_err(native_error)
         }
 
-        fn collection(&self) -> AccountHomeResult<Proxy<'_>> {
-            let proxy = self.proxy(self.collection.as_str(), COLLECTION)?;
-            if proxy.get_property::<bool>("Locked").map_err(native_error)? {
+        fn require_unlocked(collection: &Proxy<'_>) -> AccountHomeResult<()> {
+            if collection
+                .get_property::<bool>("Locked")
+                .map_err(native_error)?
+            {
                 return Err(AccountHomeError::SecretStoreUnavailable(
                     "pinned Secret Service collection is locked; unlock it in your system keyring and retry"
                         .into(),
                 ));
             }
-            Ok(proxy)
+            Ok(())
         }
 
         fn managed(&self, marker: &Marker) -> AccountHomeResult<Proxy<'_>> {
-            let collection = self.collection()?;
+            let collection = self.proxy(self.collection.as_str(), COLLECTION)?;
+            Self::require_unlocked(&collection)?;
             if !self
                 .read_marker(&collection)?
                 .is_some_and(|current| current.path == marker.path && current.id == marker.id)
@@ -616,47 +690,69 @@ mod platform {
                 .transpose()
         }
 
-        fn init_marker(&self, bus: &Proxy<'_>) -> AccountHomeResult<Marker> {
-            let collection = self.collection()?;
+        fn init_marker(&self) -> AccountHomeResult<Marker> {
+            // Lookup attributes are public even while the collection's secrets are locked.
+            let collection = self.proxy(self.collection.as_str(), COLLECTION)?;
             if let Some(marker) = self.read_marker(&collection)? {
                 return Ok(marker);
             }
+            Self::require_unlocked(&collection)?;
+            self.with_mutation(|| match self.read_marker(&collection)? {
+                Some(marker) => Ok(marker),
+                None => self.create_marker(&collection),
+            })
+        }
 
-            let mut hash = Sha256::new();
-            hash.update(self.owner.as_bytes());
-            hash.update([0]);
-            hash.update(self.collection.as_str().as_bytes());
-            let lease = format!(
-                "org.marmot_protocol.Mdk.CollectionInit.h{}",
-                hex::encode(hash.finalize())
-            );
+        fn with_mutation<T>(
+            &self,
+            operation: impl FnOnce() -> AccountHomeResult<T>,
+        ) -> AccountHomeResult<T> {
+            // Keep local users of this connection out until ReleaseName has finished.
+            let _local = self.admission.try_lock().map_err(|_| {
+                AccountHomeError::SecretStoreUnavailable(
+                    "MDK Secret Service collection is busy or unavailable".into(),
+                )
+            })?;
+            let bus = bus(&self.connection)?;
+            // Use the same connection for the lease and every provider request.
             let acquired: RequestNameReply = bus
-                .call("RequestName", &(lease.as_str(), RequestNameFlags::DoNotQueue as u32))
+                .call("RequestName", &(self.lease.as_str(), RequestNameFlags::DoNotQueue as u32))
                 .map_err(|error| AccountHomeError::SecretStoreUnavailable(format!(
-                    "cannot initialize MDK Secret Service collection identity: allow temporary org.marmot_protocol.Mdk.CollectionInit names on the session bus and reopen the account home ({error})"
+                    "cannot lock the MDK Secret Service collection: allow temporary org.marmot_protocol.Mdk.CollectionInit names on the session bus ({error})"
                 )))?;
             if acquired != RequestNameReply::PrimaryOwner {
                 return Err(AccountHomeError::SecretStoreUnavailable(
-                    "Secret Service collection identity initialization is busy; reopen the account home and retry".into(),
+                    "MDK Secret Service collection is busy; retry the operation".into(),
                 ));
             }
-            // Failed construction drops this connection and its name ownership.
-            let marker = match self.read_marker(&collection)? {
-                Some(marker) => marker,
-                None => self.create_marker(&collection)?,
+            let mut lease = MutationLease {
+                bus,
+                name: &self.lease,
+                held: true,
             };
-            let released: ReleaseNameReply = bus
-                .call("ReleaseName", &(lease.as_str(),))
-                .map_err(native_error)?;
-            if released != ReleaseNameReply::Released {
-                return Err(vault_error(
-                    "Secret Service collection initialization lease was lost",
-                ));
+            let result = (|| {
+                let owner: String = lease
+                    .bus
+                    .call("GetNameOwner", &(SERVICE,))
+                    .map_err(native_error)?;
+                if owner != self.owner {
+                    return Err(AccountHomeError::SecretStoreUnavailable(
+                        "Secret Service provider changed; reopen the account home".into(),
+                    ));
+                }
+                operation()
+            })();
+            match (result, lease.release()) {
+                (result, Ok(())) => result,
+                (Ok(_), Err(error)) => Err(error),
+                (Err(original), Err(error)) => {
+                    Err(native_error(format_args!("{original}; {error}")))
+                }
             }
-            Ok(marker)
         }
 
         fn create_marker(&self, collection: &Proxy<'_>) -> AccountHomeResult<Marker> {
+            Self::require_unlocked(collection)?;
             let items: Vec<OwnedObjectPath> =
                 collection.get_property("Items").map_err(native_error)?;
             for path in items {
@@ -747,13 +843,7 @@ mod platform {
                 return Err(vault_error("unsupported captured Secret Service provider"));
             }
             let connection = Connection::session().map_err(native_error)?;
-            let bus = Proxy::new(
-                &connection,
-                "org.freedesktop.DBus",
-                "/org/freedesktop/DBus",
-                "org.freedesktop.DBus",
-            )
-            .map_err(native_error)?;
+            let bus = bus(&connection)?;
             // A running provider need not have a D-Bus activation descriptor.
             // Resolve it once; every vault call uses that captured unique owner.
             let owner: String = match bus
@@ -800,18 +890,26 @@ mod platform {
             let (session, key) = open_session(&root)?;
             drop(root);
             drop(peer);
+            drop(bus);
+            // A replacement provider on this bus must not bypass a lease for the
+            // same collection path held by an operation on the previous owner.
+            let lease = format!(
+                "org.marmot_protocol.Mdk.CollectionInit.h{}",
+                hex::encode(Sha256::digest(collection.as_str().as_bytes()))
+            );
             let state = State {
-                connection: connection.clone(),
+                connection,
                 owner,
                 collection,
+                lease,
+                admission: Mutex::new(()),
                 session,
                 key,
             };
-            let marker = state.init_marker(&bus)?;
-            drop(bus);
+            let marker = state.init_marker()?;
             let target = format!("secret-service:{machine}:{uid}:{SERVICE}:{}", marker.id);
             Ok(Self {
-                state: Mutex::new(state),
+                state,
                 marker,
                 target,
             })
@@ -821,15 +919,19 @@ mod platform {
             &self.target
         }
 
+        pub(super) fn with_mutation<T>(
+            &self,
+            operation: impl FnOnce() -> AccountHomeResult<T>,
+        ) -> AccountHomeResult<T> {
+            self.state.with_mutation(operation)
+        }
+
         pub(super) fn read(
             &self,
             service: &str,
             name: &str,
         ) -> AccountHomeResult<Option<Zeroizing<String>>> {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| vault_error("native vault lock poisoned"))?;
+            let state = &self.state;
             let mut result = None;
             for path in find_items(&state.managed(&self.marker)?, service, Some(name))? {
                 merge_secret(&mut result, Some(state.read_item(&path)?))?;
@@ -842,10 +944,7 @@ mod platform {
             service: &str,
             name: &str,
         ) -> AccountHomeResult<Option<Zeroizing<String>>> {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| vault_error("native vault lock poisoned"))?;
+            let state = &self.state;
             let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = state
                 .proxy(ROOT, "org.freedesktop.Secret.Service")?
                 .call(
@@ -872,20 +971,14 @@ mod platform {
             name: &str,
             value: &str,
         ) -> AccountHomeResult<()> {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| vault_error("native vault lock poisoned"))?;
+            let state = &self.state;
             let collection = state.managed(&self.marker)?;
             let paths = find_items(&collection, service, Some(name))?;
             state.write_items(&collection, service, name, value, &paths)
         }
 
         pub(super) fn remove(&self, service: &str, name: &str) -> AccountHomeResult<()> {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| vault_error("native vault lock poisoned"))?;
+            let state = &self.state;
             for path in find_items(&state.managed(&self.marker)?, service, Some(name))? {
                 let prompt: OwnedObjectPath = state
                     .proxy(path.as_str(), ITEM)?
@@ -901,10 +994,7 @@ mod platform {
         }
 
         pub(super) fn names(&self, service: &str) -> AccountHomeResult<Vec<String>> {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| vault_error("native vault lock poisoned"))?;
+            let state = &self.state;
             let mut names = Vec::new();
             for path in find_items(&state.managed(&self.marker)?, service, None)? {
                 let mut attrs: HashMap<String, String> = state
@@ -991,10 +1081,16 @@ mod platform {
 mod platform {
     use super::*;
     use core_foundation::base::TCFType;
-    use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+    use security_framework::item::{ItemClass, ItemSearchOptions, Limit, SearchResult};
     use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
     use security_framework::os::macos::passwords::find_generic_password;
-    use security_framework_sys::base::SecKeychainRef;
+    use security_framework_sys::base::{SecKeychainRef, errSecItemNotFound};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    const MARKER_SERVICE: &str = "mdk-owned-keychain-v1";
+    const LEASE: &str = ".mdk-owned-keychains-v1.lock";
 
     #[link(name = "Security", kind = "framework")]
     unsafe extern "C" {
@@ -1007,7 +1103,90 @@ mod platform {
 
     pub(super) struct Backend {
         keychain: SecKeychain,
+        directory: fs_private::PreparedDirectory,
+        marker: String,
         target: String,
+    }
+
+    fn marker_error(problem: &str) -> AccountHomeError {
+        AccountHomeError::SecretStoreUnavailable(format!(
+            "MDK macOS keychain identity is {problem}; restore the original keychain and identity item"
+        ))
+    }
+
+    fn marker(keychain: &SecKeychain) -> AccountHomeResult<Option<String>> {
+        let items = search(keychain, Some(MARKER_SERVICE))?;
+        let [item] = items.as_slice() else {
+            return if items.is_empty() {
+                Ok(None)
+            } else {
+                Err(marker_error("duplicated"))
+            };
+        };
+        let mut attrs = item
+            .simplify_dict()
+            .ok_or_else(|| marker_error("invalid"))?;
+        if attrs.get("svce").map(String::as_str) != Some(MARKER_SERVICE) {
+            return Err(marker_error("invalid"));
+        }
+        attrs
+            .remove("acct")
+            .filter(|id| {
+                id.len() == 64
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .map(Some)
+            .ok_or_else(|| marker_error("invalid"))
+    }
+
+    fn init_marker(keychain: &SecKeychain) -> AccountHomeResult<String> {
+        if let Some(marker) = marker(keychain)? {
+            return Ok(marker);
+        }
+        for item in search(keychain, None)? {
+            let attrs = item
+                .simplify_dict()
+                .ok_or_else(|| marker_error("unreadable"))?;
+            if attrs
+                .get("svce")
+                .is_some_and(|service| service.starts_with("mdk-owned-"))
+            {
+                return Err(marker_error("missing from a keychain with managed records"));
+            }
+        }
+        let mut bytes = [0; 32];
+        getrandom::fill(&mut bytes).map_err(native_error)?;
+        let id = hex::encode(bytes);
+        keychain
+            .add_generic_password(MARKER_SERVICE, &id, b"")
+            .map_err(native_error)?;
+        if marker(keychain)?.as_deref() != Some(id.as_str()) {
+            return Err(marker_error("not published as requested"));
+        }
+        Ok(id)
+    }
+
+    fn search(
+        keychain: &SecKeychain,
+        service: Option<&str>,
+    ) -> AccountHomeResult<Vec<SearchResult>> {
+        let mut options = ItemSearchOptions::new();
+        options
+            .keychains(std::slice::from_ref(keychain))
+            .class(ItemClass::generic_password())
+            .limit(Limit::All)
+            .load_attributes(true)
+            .skip_authenticated_items(false);
+        if let Some(service) = service {
+            options.service(service);
+        }
+        match options.search() {
+            Ok(items) => Ok(items),
+            Err(error) if error.code() == errSecItemNotFound => Ok(Vec::new()),
+            Err(error) => Err(native_error(error)),
+        }
     }
 
     impl Backend {
@@ -1056,18 +1235,50 @@ mod platform {
             if path.is_empty() || path.contains(&0) {
                 return Err(vault_error("macOS returned an invalid keychain path"));
             }
-            // Keychain commits can replace the backing inode at the same path.
+            let canonical = std::fs::canonicalize(Path::new(OsStr::from_bytes(path)))?;
+            let parent = canonical
+                .parent()
+                .ok_or_else(|| vault_error("macOS keychain has no parent directory"))?;
+            let directory = fs_private::inspect_directory_path(parent)?
+                .ok_or_else(|| vault_error("macOS keychain directory is missing"))?;
+            if directory.mode() & 0o022 != 0 {
+                return Err(vault_error(
+                    "macOS keychain directory is not private to its owner",
+                ));
+            }
+            // The directory lock survives ordinary keychain file replacement and
+            // is shared by every preferences domain that selects this keychain.
+            let _lease = directory.try_acquire_private_exclusive_file_lease(OsStr::new(LEASE))?;
+            let marker = init_marker(&keychain)?;
             let target = format!(
-                "macos-keychain:{}:{}:{}",
+                "macos-keychain:{}:{}:{}:{marker}",
                 unsafe { libc::geteuid() },
                 domain as i32,
                 hex::encode(path)
             );
-            Ok(Self { keychain, target })
+            Ok(Self {
+                keychain,
+                directory,
+                marker,
+                target,
+            })
         }
 
         pub(super) fn target(&self) -> &str {
             &self.target
+        }
+
+        pub(super) fn with_mutation<T>(
+            &self,
+            operation: impl FnOnce() -> AccountHomeResult<T>,
+        ) -> AccountHomeResult<T> {
+            let _lease = self
+                .directory
+                .try_acquire_private_exclusive_file_lease(OsStr::new(LEASE))?;
+            if marker(&self.keychain)?.as_deref() != Some(self.marker.as_str()) {
+                return Err(marker_error("changed"));
+            }
+            operation()
         }
 
         pub(super) fn legacy_secret(
@@ -1133,32 +1344,17 @@ mod platform {
         }
 
         pub(super) fn names(&self, service: &str) -> AccountHomeResult<Vec<String>> {
-            let keychains = [self.keychain.clone()];
-            let mut options = ItemSearchOptions::new();
-            options
-                .keychains(&keychains)
-                .class(ItemClass::generic_password())
-                .service(service)
-                .limit(Limit::All)
-                .load_attributes(true)
-                .skip_authenticated_items(false);
-            let items = match options.search() {
-                Ok(items) => items,
-                Err(error) if error.code() == -25300 => return Ok(Vec::new()),
-                Err(error) => return Err(native_error(error)),
-            };
-            items
+            search(&self.keychain, Some(service))?
                 .into_iter()
                 .map(|item| {
-                    let attrs = item
+                    let mut attrs = item
                         .simplify_dict()
                         .ok_or_else(|| vault_error("macOS credential has no attributes"))?;
                     if attrs.get("svce").map(String::as_str) != Some(service) {
                         return Err(vault_error("macOS returned a mismatched service"));
                     }
                     attrs
-                        .get("acct")
-                        .cloned()
+                        .remove("acct")
                         .ok_or_else(|| vault_error("macOS credential has no account"))
                 })
                 .collect()
@@ -1176,19 +1372,29 @@ mod platform {
     use core_foundation::dictionary::{CFDictionary, CFMutableDictionary};
     use core_foundation::string::CFString;
     use keyring_core::api::CredentialApi;
+    use objc2_foundation::{NSBundle, NSFileManager, NSHomeDirectory, NSString};
     use security_framework::access_control::{ProtectionMode, SecAccessControl};
     use security_framework::base::Error;
     use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+    use security_framework_sys::base::{errSecDuplicateItem, errSecItemNotFound};
     use security_framework_sys::item::{
         kSecAttrAccessControl, kSecAttrAccessGroup, kSecAttrAccount, kSecAttrService,
         kSecAttrSynchronizable, kSecClass, kSecClassGenericPassword, kSecReturnAttributes,
         kSecUseDataProtectionKeychain, kSecValueData,
     };
     use security_framework_sys::keychain_item::{SecItemAdd, SecItemDelete};
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    const LOCK_SERVICE: &str = "mdk-owned-lock-scope-v1";
+    const LOCK_ACCOUNT: &str = "container";
 
     pub(super) struct Backend {
         group: String,
+        lease: MutationLease,
         legacy_group: Option<String>,
+        legacy_authorized: OnceLock<()>,
         target: String,
         legacy_target: Option<String>,
     }
@@ -1197,20 +1403,9 @@ mod platform {
         !group.is_empty() && !group.contains('*') && !group.contains('\0')
     }
 
-    fn probe_group(requested: Option<&str>) -> AccountHomeResult<String> {
-        if requested.is_some_and(|group| !explicit_group(group)) {
-            return Err(vault_error("keychain access group must be explicit"));
-        }
-
-        let mut nonce = [0; 16];
-        getrandom::fill(&mut nonce).map_err(native_error)?;
-        let service = CFString::new("mdk-ios-keychain-group-probe-v1");
-        let account = CFString::new(&hex::encode(nonce));
-        let protection = SecAccessControl::create_with_protection(
-            Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
-            0,
-        )
-        .map_err(native_error)?;
+    fn local_item_query(service: &str, account: &str, group: Option<&str>) -> CFMutableDictionary {
+        let service = CFString::new(service);
+        let account = CFString::new(account);
         let mut query: CFMutableDictionary = unsafe {
             CFMutableDictionary::from_CFType_pairs(&[
                 (kSecClass.cast(), kSecClassGenericPassword.cast()),
@@ -1226,42 +1421,68 @@ mod platform {
                 ),
             ])
         };
-        if let Some(group) = requested {
+        if let Some(group) = group {
             query.set(
                 unsafe { kSecAttrAccessGroup }.cast(),
                 CFString::new(group).as_CFTypeRef(),
             );
         }
+        query
+    }
 
+    fn add_local_item(
+        mut query: CFMutableDictionary,
+        value: &[u8],
+        return_attributes: bool,
+    ) -> Result<Option<CFType>, Error> {
+        let protection = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
+            0,
+        )?;
         let mut attributes = std::ptr::null();
         let status = unsafe {
             query.set(kSecAttrAccessControl.cast(), protection.as_CFTypeRef());
             query.set(
                 kSecValueData.cast(),
-                CFData::from_buffer(&[0]).as_CFTypeRef(),
+                CFData::from_buffer(value).as_CFTypeRef(),
             );
-            query.set(
-                kSecReturnAttributes.cast(),
-                CFBoolean::true_value().as_CFTypeRef(),
-            );
-            SecItemAdd(query.as_concrete_TypeRef(), &mut attributes)
+            let output = if return_attributes {
+                query.set(
+                    kSecReturnAttributes.cast(),
+                    CFBoolean::true_value().as_CFTypeRef(),
+                );
+                &mut attributes
+            } else {
+                std::ptr::null_mut()
+            };
+            SecItemAdd(query.as_concrete_TypeRef(), output)
         };
         let attributes =
             (!attributes.is_null()).then(|| unsafe { CFType::wrap_under_create_rule(attributes) });
-        if status != 0 {
-            return Err(native_error(format_args!(
-                "adding iOS keychain group probe: {}",
-                Error::from_code(status)
-            )));
+        if status == 0 {
+            Ok(attributes)
+        } else {
+            Err(Error::from_code(status))
+        }
+    }
+
+    fn probe_group(requested: Option<&str>) -> AccountHomeResult<String> {
+        if requested.is_some_and(|group| !explicit_group(group)) {
+            return Err(vault_error("keychain access group must be explicit"));
         }
 
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(native_error)?;
+        let service = "mdk-ios-keychain-group-probe-v1";
+        let account = hex::encode(nonce);
+        let attributes = add_local_item(local_item_query(service, &account, requested), &[0], true)
+            .map_err(|error| {
+                native_error(format_args!("adding iOS keychain group probe: {error}"))
+            })?;
+
         // Delete by the probe's unique key even if the returned attributes cannot be decoded.
-        let status = unsafe {
-            query.remove(kSecAttrAccessControl.cast());
-            query.remove(kSecValueData.cast());
-            query.remove(kSecReturnAttributes.cast());
-            SecItemDelete(query.as_concrete_TypeRef())
-        };
+        let query = local_item_query(service, &account, requested);
+        let status = unsafe { SecItemDelete(query.as_concrete_TypeRef()) };
         if status != 0 {
             return Err(native_error(format_args!(
                 "deleting iOS keychain group probe: {}",
@@ -1286,6 +1507,118 @@ mod platform {
         Ok(group)
     }
 
+    fn bundle_id() -> AccountHomeResult<String> {
+        NSBundle::mainBundle()
+            .bundleIdentifier()
+            .map(|id| id.to_string())
+            .filter(|id| explicit_group(id))
+            .ok_or_else(|| vault_error("missing explicit iOS bundle identifier"))
+    }
+
+    fn container(scope: &str) -> AccountHomeResult<PathBuf> {
+        if let Some(group) = scope
+            .strip_prefix("app-group:")
+            .filter(|group| explicit_group(group))
+        {
+            let url = NSFileManager::defaultManager()
+                .containerURLForSecurityApplicationGroupIdentifier(&NSString::from_str(group))
+                .ok_or_else(|| {
+                    vault_error("iOS denied the managed keychain lock's App Group container")
+                })?;
+            let path = url
+                .path()
+                .ok_or_else(|| vault_error("iOS App Group container has no file path"))?;
+            return Ok(PathBuf::from(path.to_string()).canonicalize()?);
+        }
+        if let Some(bundle) = scope.strip_prefix("bundle:")
+            && bundle == bundle_id()?
+        {
+            return Ok(PathBuf::from(NSHomeDirectory().to_string()).canonicalize()?);
+        }
+        Err(vault_error(
+            "iOS managed keychain has no lock container accessible to this app",
+        ))
+    }
+
+    fn read_lock_scope(group: &str) -> AccountHomeResult<Option<Zeroizing<String>>> {
+        let entry = Cred::build(
+            LOCK_SERVICE,
+            LOCK_ACCOUNT,
+            AccessPolicy::AfterFirstUnlockThisDeviceOnly,
+            Some(group.to_owned()),
+            false,
+        )
+        .map_err(map_keyring_error)?;
+        match entry.get_secret() {
+            Ok(bytes) => Ok(Some(decode_secret(bytes)?)),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
+            Err(error) => Err(map_keyring_error(error)),
+        }
+    }
+
+    struct MutationLease {
+        directory: fs_private::PreparedDirectory,
+        name: String,
+        scope: Option<Zeroizing<String>>,
+    }
+
+    impl MutationLease {
+        fn new(group: &str, options: &IosOptions) -> AccountHomeResult<Self> {
+            // A managed App Group already has one shared container. A Keychain
+            // Sharing-only group needs a binding so hosts cannot choose different locks.
+            let (root, scope) = if group.starts_with("group.") {
+                (container(&format!("app-group:{group}"))?, None)
+            } else {
+                let scope = match read_lock_scope(group)? {
+                    Some(scope) => scope,
+                    None => {
+                        let proposed = match options.app_group_identifiers.first() {
+                            Some(group) => format!("app-group:{group}"),
+                            None => format!("bundle:{}", bundle_id()?),
+                        };
+                        container(&proposed)?;
+                        match add_local_item(
+                            local_item_query(LOCK_SERVICE, LOCK_ACCOUNT, Some(group)),
+                            proposed.as_bytes(),
+                            false,
+                        ) {
+                            Ok(_) => {}
+                            Err(error) if error.code() == errSecDuplicateItem => {}
+                            Err(error) => return Err(native_error(error)),
+                        }
+                        read_lock_scope(group)?.ok_or_else(|| {
+                            vault_error("iOS managed keychain lock scope was not published")
+                        })?
+                    }
+                };
+                (container(scope.as_str())?, Some(scope))
+            };
+            let directory = fs_private::inspect_directory_path(&root)?
+                .ok_or_else(|| vault_error("iOS managed keychain lock container is missing"))?;
+            let name = format!(
+                ".mdk-owned-keychain-v1-{}.lock",
+                hex::encode(Sha256::digest(group.as_bytes()))
+            );
+            Ok(Self {
+                directory,
+                name,
+                scope,
+            })
+        }
+
+        fn acquire(&self, group: &str) -> AccountHomeResult<fs_private::PrivateExclusiveFileLease> {
+            let lease = self
+                .directory
+                .try_acquire_private_exclusive_file_lease(OsStr::new(&self.name))?;
+            if let Some(scope) = &self.scope
+                && read_lock_scope(group)?.as_deref().map(String::as_str) != Some(scope.as_str())
+            {
+                return Err(vault_error("iOS managed keychain lock scope changed"));
+            }
+            Ok(lease)
+        }
+    }
+
     impl Backend {
         pub(super) fn new(
             store: Arc<keyring_core::api::CredentialStore>,
@@ -1308,14 +1641,8 @@ mod platform {
             }
             let legacy_group = cred.access_group.as_deref();
             let configured_group = ios_options.keychain_access_group.as_deref();
-            if let (Some(captured), Some(configured)) = (legacy_group, configured_group)
-                && captured != configured
-            {
-                return Err(vault_error(
-                    "configured iOS access group conflicts with captured provider",
-                ));
-            }
             let group = probe_group(configured_group.or(legacy_group))?;
+            let lease = MutationLease::new(&group, ios_options)?;
             let uid = unsafe { libc::geteuid() };
             let target = format!(
                 "ios-protected-local:{}",
@@ -1329,7 +1656,9 @@ mod platform {
                 .transpose()?;
             Ok(Self {
                 group,
+                lease,
                 legacy_group: cred.access_group.clone(),
+                legacy_authorized: OnceLock::new(),
                 target,
                 legacy_target,
             })
@@ -1341,6 +1670,26 @@ mod platform {
 
         pub(super) fn legacy_target(&self) -> Option<&str> {
             self.legacy_target.as_deref()
+        }
+
+        pub(super) fn with_mutation<T>(
+            &self,
+            operation: impl FnOnce() -> AccountHomeResult<T>,
+        ) -> AccountHomeResult<T> {
+            let _lease = self.lease.acquire(&self.group)?;
+            operation()
+        }
+
+        pub(super) fn confirm_legacy_absence(&self) -> AccountHomeResult<()> {
+            // An unauthorized explicit group's search can also report not found.
+            if let Some(group) = self.legacy_group.as_deref()
+                && group != self.group
+                && self.legacy_authorized.get().is_none()
+            {
+                probe_group(Some(group))?;
+                let _ = self.legacy_authorized.set(());
+            }
+            Ok(())
         }
 
         fn entries(
@@ -1365,7 +1714,7 @@ mod platform {
             }
             let items = match options.search() {
                 Ok(items) => items,
-                Err(error) if error.code() == -25300 => return Ok(Vec::new()),
+                Err(error) if error.code() == errSecItemNotFound => return Ok(Vec::new()),
                 Err(error) => return Err(native_error(error)),
             };
             items
@@ -1472,8 +1821,10 @@ mod platform {
 #[cfg(all(not(test), target_os = "windows"))]
 mod platform {
     use super::*;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_NO_TOKEN, ERROR_NOT_FOUND, ERROR_SUCCESS, GetLastError,
+        CloseHandle, ERROR_NO_TOKEN, ERROR_NOT_FOUND, ERROR_SUCCESS, GetLastError, WAIT_ABANDONED,
+        WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Credentials::{
         CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_MAX_GENERIC_TARGET_NAME_LENGTH,
@@ -1488,7 +1839,8 @@ mod platform {
         HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
+        CreateMutexW, GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
+        ReleaseMutex, WaitForSingleObject,
     };
     use windows_sys::core::w;
     use zeroize::Zeroize;
@@ -1501,7 +1853,47 @@ mod platform {
         delimiters: [String; 3],
         service_no_divider: bool,
         target: String,
+        mutex_name: Vec<u16>,
         legacy_target: String,
+    }
+
+    struct MutationLease(OwnedHandle, bool);
+
+    impl MutationLease {
+        fn acquire(name: &[u16]) -> AccountHomeResult<Self> {
+            let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+            if handle.is_null() {
+                return Err(win_error());
+            }
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+            match unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } {
+                // The abandoned mutex is ours; the operation rereads persistent state.
+                WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(handle, true)),
+                WAIT_TIMEOUT => Err(AccountHomeError::SecretStoreUnavailable(
+                    "MDK Windows credential vault is busy; retry the operation".into(),
+                )),
+                WAIT_FAILED => Err(win_error()),
+                _ => Err(vault_error(
+                    "unexpected Windows credential vault wait result",
+                )),
+            }
+        }
+
+        fn release(&mut self) -> AccountHomeResult<()> {
+            if unsafe { ReleaseMutex(self.0.as_raw_handle()) } == 0 {
+                return Err(win_error());
+            }
+            self.1 = false;
+            Ok(())
+        }
+    }
+
+    impl Drop for MutationLease {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = self.release();
+            }
+        }
     }
 
     fn win_error() -> AccountHomeError {
@@ -1666,6 +2058,11 @@ mod platform {
             let machine = std::str::from_utf8(&machine).map_err(native_error)?;
             let sid_hex = hex::encode(&sid);
             let target = format!("windows-credential-local:{machine}:{sid_hex}");
+            // Local-machine credentials are visible to other logon sessions of this SID.
+            let mutex_name = wide(&format!(
+                "Global\\MarmotProtocol.Mdk.NativeVault.v1.{}",
+                hex::encode(Sha256::digest(target.as_bytes()))
+            ))?;
             let legacy_target = format!(
                 "windows-credential-enterprise:{machine}:{sid_hex}:{:?}:{}",
                 store.delimiters, store.service_no_divider
@@ -1676,6 +2073,7 @@ mod platform {
                 delimiters: store.delimiters.clone(),
                 service_no_divider: store.service_no_divider,
                 target,
+                mutex_name,
                 legacy_target,
             })
         }
@@ -1686,6 +2084,22 @@ mod platform {
 
         pub(super) fn legacy_target(&self) -> &str {
             &self.legacy_target
+        }
+
+        pub(super) fn with_mutation<T>(
+            &self,
+            operation: impl FnOnce() -> AccountHomeResult<T>,
+        ) -> AccountHomeResult<T> {
+            self.check_user()?;
+            let mut lease = MutationLease::acquire(&self.mutex_name)?;
+            let result = operation();
+            match (result, lease.release()) {
+                (result, Ok(())) => result,
+                (Ok(_), Err(error)) => Err(error),
+                (Err(original), Err(error)) => {
+                    Err(native_error(format_args!("{original}; {error}")))
+                }
+            }
         }
 
         fn check_user(&self) -> AccountHomeResult<()> {
@@ -1864,6 +2278,13 @@ mod platform {
     pub(super) enum Backend {}
 
     impl Backend {
+        pub(super) fn with_mutation<T>(
+            &self,
+            _operation: impl FnOnce() -> AccountHomeResult<T>,
+        ) -> AccountHomeResult<T> {
+            match *self {}
+        }
+
         pub(super) fn new(
             _store: Arc<keyring_core::api::CredentialStore>,
             _ios_options: &IosOptions,

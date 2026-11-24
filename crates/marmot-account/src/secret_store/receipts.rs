@@ -516,17 +516,19 @@ impl AccountSecretStore for KeychainSecretStore {
         if self.legacy_keys(account_id_hex)?.is_some() {
             return Ok(true);
         }
-        owned_vault::has_managed(
-            self.vault.as_ref(),
-            SecretCredential {
-                label: "",
-                account_id_hex,
-                home_id: "",
-                owner_id: "",
-                kind: SecretCredentialKind::Signing,
-            },
-            Addressing::AccountId,
-        )
+        self.vault.with_mutation(|storage| {
+            owned_vault::has_managed(
+                storage,
+                SecretCredential {
+                    label: "",
+                    account_id_hex,
+                    home_id: "",
+                    owner_id: "",
+                    kind: SecretCredentialKind::Signing,
+                },
+                Addressing::AccountId,
+            )
+        })
     }
 
     fn acquire_secret(
@@ -535,25 +537,28 @@ impl AccountSecretStore for KeychainSecretStore {
         mode: SecretClaimMode,
         proposed: Option<&nostr::prelude::Keys>,
     ) -> AccountHomeResult<AcquiredSecret> {
-        owned_vault::acquire(
-            self.vault.as_ref(),
-            credential,
-            Addressing::AccountId,
-            mode,
-            proposed,
-            || {
-                Ok(self
-                    .legacy_keys(credential.account_id_hex)?
-                    .map(|keys| (keys, self.vault.legacy_scope().map(str::to_owned))))
-            },
-        )
+        self.vault.with_mutation(|storage| {
+            owned_vault::acquire(
+                storage,
+                credential,
+                Addressing::AccountId,
+                mode,
+                proposed,
+                || {
+                    Ok(self
+                        .legacy_keys(credential.account_id_hex)?
+                        .map(|keys| (keys, self.vault.legacy_scope().map(str::to_owned))))
+                },
+            )
+        })
     }
 
     fn load_secret(
         &self,
         credential: SecretCredential<'_>,
     ) -> AccountHomeResult<nostr::prelude::Keys> {
-        owned_vault::load(self.vault.as_ref(), credential, Addressing::AccountId)
+        self.vault
+            .with_mutation(|storage| owned_vault::load(storage, credential, Addressing::AccountId))
     }
 
     fn release_secret(
@@ -561,21 +566,24 @@ impl AccountSecretStore for KeychainSecretStore {
         credential: SecretCredential<'_>,
         mode: SecretReleaseMode,
     ) -> AccountHomeResult<SecretReleaseOutcome> {
-        owned_vault::release(
-            self.vault.as_ref(),
-            credential,
-            Addressing::AccountId,
-            mode,
-            || Ok(self.vault.legacy_scope()),
-            |legacy| {
-                self.legacy_keys(&legacy.account_id_hex)
-                    .map(|keys| keys.is_some())
-            },
-        )
+        self.vault.with_mutation(|storage| {
+            owned_vault::release(
+                storage,
+                credential,
+                Addressing::AccountId,
+                mode,
+                || Ok(self.vault.legacy_scope()),
+                |legacy| {
+                    self.legacy_keys(&legacy.account_id_hex)
+                        .map(|keys| keys.is_some())
+                },
+            )
+        })
     }
 
     fn reconcile_cleanup(&self) -> AccountHomeResult<()> {
-        owned_vault::reconcile(self.vault.as_ref())
+        self.vault
+            .with_mutation(|storage| owned_vault::reconcile(storage))
     }
 }
 
