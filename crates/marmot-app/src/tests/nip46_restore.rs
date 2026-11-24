@@ -2036,12 +2036,14 @@ async fn nip46_bind_failure_stays_gated() {
                 None
             }
         };
+        // Keep the network future pending so it cannot begin publication on
+        // a poll that was already in progress when disconnect fired.
         session.disconnect();
-        fetch_release.notify_one();
         let result = tokio::time::timeout(Duration::from_secs(10), login)
             .await
             .unwrap()
             .unwrap();
+        fetch_release.notify_one();
         drop(lease);
         assert_eq!(binding_readiness, AccountSetupReadiness::Initializing);
         assert!(
@@ -2049,6 +2051,10 @@ async fn nip46_bind_failure_stays_gated() {
         );
 
         if matches!(fault, Fault::Release) {
+            assert!(
+                matches!(result, Err(AppError::Nip46(Nip46Error::Disconnected))),
+                "{result:?}"
+            );
             match origin {
                 Origin::Created => {
                     assert!(matches!(
@@ -2078,10 +2084,6 @@ async fn nip46_bind_failure_stays_gated() {
                     );
                 }
             }
-            assert!(matches!(
-                result,
-                Err(AppError::Nip46(Nip46Error::Disconnected))
-            ));
         } else {
             let retained = home.account(&id).unwrap();
             assert!(matches!(result, Err(AppError::RelayDirectory(error))

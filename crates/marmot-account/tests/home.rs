@@ -829,7 +829,9 @@ fn nip46_secret_isolation() {
                 & 0o777,
             0o700
         );
-        for secret in file_receipts(dir.path()) {
+        let receipts = file_receipts(dir.path());
+        assert_eq!(receipts.len(), 3, "signing, database and NIP-46 receipts");
+        for secret in receipts {
             assert_eq!(
                 std::fs::metadata(secret).unwrap().permissions().mode() & 0o777,
                 0o600
