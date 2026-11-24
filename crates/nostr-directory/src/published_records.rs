@@ -29,7 +29,7 @@ use crate::error::{DirectoryError, MissingKeyPackageReason};
 use crate::{DirectoryKeyPackage, UserDirectoryRecord};
 use storage_sqlite::{
     PublicKeyPackageBarrierKind, PublicKeyPackageBarrierRecord, PublicKeyPackageEvidenceSnapshot,
-    PublicKeyPackageReplacementRecord,
+    PublicKeyPackageReplacementRecord, public_key_package_evidence_retained,
 };
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
@@ -585,9 +585,15 @@ struct RankedKeyPackage {
 /// What the shared KeyPackage journal knows about an account's slot
 /// replacements and deletions. Selection applies it to every candidate, so a
 /// relay that no longer serves a replacement or deletion cannot revive what it
-/// barred. Eviction markers only say evidence is missing, so they bar nothing.
-/// A selection that finds no candidate also checks that the lookup accounted
-/// for every publication the journal knows ([`FencedLookup`]).
+/// barred. A selection that finds no candidate also checks that the lookup
+/// accounted for every publication the journal still keeps
+/// ([`FencedLookup`]).
+///
+/// Past the journal's size limits an account keeps one eviction marker. While
+/// it names an evicted replacement, or an evicted deletion of a slot's
+/// address, it is that barrier still, for its slot. A marker for an evicted
+/// deletion of one event has lost its target, and the marker with no account
+/// names none: they only say evidence is missing, so they bar nothing.
 pub(crate) struct KeyPackageJournalFence {
     replacements: Vec<PublicKeyPackageReplacementRecord>,
     barriers: Vec<PublicKeyPackageBarrierRecord>,
@@ -603,9 +609,15 @@ pub(crate) struct FencedLookup<'a> {
 
 impl KeyPackageJournalFence {
     pub(crate) fn new(snapshot: PublicKeyPackageEvidenceSnapshot) -> Self {
+        let mut barriers = snapshot.barriers;
+        barriers.extend(
+            snapshot
+                .watermark
+                .filter(|marker| marker.kind != PublicKeyPackageBarrierKind::ExactDeletion),
+        );
         Self {
             replacements: snapshot.replacements,
-            barriers: snapshot.barriers,
+            barriers,
         }
     }
 
@@ -629,11 +641,22 @@ impl KeyPackageJournalFence {
 }
 
 impl FencedLookup<'_> {
-    /// Whether the journal knows a publication the lookup did not account
+    /// Whether the journal keeps a publication the lookup did not account
     /// for. A publication is accounted for when what the lookup observed
     /// holds it, a replacement of it or a deletion request covering it, or
     /// when the journal knows it deleted. A lookup that missed one cannot say
     /// what the account publishes in that slot.
+    ///
+    /// A package past selection's freshness window can still be the one
+    /// selected, so a row counts for as long as the journal retains it. Only
+    /// a write prunes the journal, so that bound is applied here too.
+    ///
+    /// The journal's memory is bounded. Past its size limits it keeps one
+    /// evicted barrier per account, which the fence still holds: an evicted
+    /// publication counts, and an evicted address deletion still accounts
+    /// for what it covers. Beyond that only markers without a target remain,
+    /// which can do neither. A publication with no `d` slot is never a
+    /// candidate, so it does not count either.
     fn misses_a_journaled_publication(self, account: &str, freshness: DirectoryFreshness) -> bool {
         let Self { fence, seen } = self;
         let replacements = fence.replacements.iter().map(|replacement| {
@@ -657,7 +680,9 @@ impl FencedLookup<'_> {
             });
         let deletions = verified_deletions(account, seen);
         replacements.chain(pruned).any(|(slot, event_id, at)| {
-            fence.allows(event_id, slot, at)
+            !slot.is_empty()
+                && public_key_package_evidence_retained(at, freshness.now)
+                && fence.allows(event_id, slot, at)
                 && !package_is_deleted(account, event_id, slot, at, &deletions)
                 && !seen.iter().any(|record| {
                     let read = &record.event;
@@ -1458,8 +1483,9 @@ mod tests {
     }
 
     /// The journal's publication counts against a lookup until the lookup
-    /// reads it or a replacement of it, observes its deletion request, or the
-    /// journal knows it deleted.
+    /// reads it or a replacement of it, observes its deletion request, the
+    /// journal knows it deleted, or the journal's retention bound passes. It
+    /// still counts past selection's freshness window.
     #[test]
     fn a_journaled_publication_counts_until_the_lookup_accounts_for_it() {
         let keys = Keys::generate();
@@ -1502,11 +1528,62 @@ mod tests {
             )
             .unwrap(),
         };
-        let fresh = DirectoryFreshness::at(40, Duration::ZERO);
+        let at = |now| DirectoryFreshness::at(now, Duration::ZERO);
+        let fresh = at(40);
+        // Past selection's freshness window, inside the journal's retention.
+        let stale = at(20 + KEY_PACKAGE_FRESHNESS.as_secs() + 60);
+        let expired = at(20 + KEY_PACKAGE_FRESHNESS.as_secs() + 5 * 60);
+        // Evicted past the journal's size limits, a barrier survives as the
+        // account's marker: a publication, or a deletion of the slot's
+        // address at that time. A deletion of one event loses its target.
+        let evicted = |replaced: bool, kind| {
+            KeyPackageJournalFence::new(PublicKeyPackageEvidenceSnapshot {
+                replacements: fence(replaced, Vec::new()).replacements,
+                global_eviction: None,
+                barriers: Vec::new(),
+                watermark: Some(barrier(kind, None)),
+                revision: 0,
+            })
+        };
+        let marker = |kind| evicted(false, kind);
+        // A publication with no slot is never a candidate.
+        let slotless = KeyPackageJournalFence {
+            replacements: vec![PublicKeyPackageReplacementRecord {
+                account_id_hex: account.clone(),
+                key_package_id: String::new(),
+                event_id_hex: newer.clone(),
+                event_created_at: 20,
+                observed_at: 30,
+            }],
+            barriers: Vec::new(),
+        };
+        // An evicted replacement still bars an older copy of its slot, as
+        // its barrier did, and nothing else. An evicted address deletion
+        // still bars what it covered, the publication at its time included.
+        let replacement = marker(PublicKeyPackageBarrierKind::Replacement);
+        assert!(!replacement.allows(&older, "slot", 10));
+        assert!(replacement.allows(&newer, "slot", 20));
+        assert!(replacement.allows(&older, "other", 10));
+        let address_deletion = marker(PublicKeyPackageBarrierKind::Deletion);
+        assert!(!address_deletion.allows(&newer, "slot", 20));
+        assert!(address_deletion.allows(&older, "slot", 21));
+        assert!(address_deletion.allows(&newer, "other", 20));
+        assert!(marker(PublicKeyPackageBarrierKind::ExactDeletion).allows(&older, "slot", 10));
         for (fence, journaled) in [
             (fence(true, vec![]), true),
-            (fence(false, vec![pruned]), true),
+            (fence(false, vec![pruned.clone()]), true),
+            (marker(PublicKeyPackageBarrierKind::Replacement), true),
             (fence(true, vec![deletion]), false),
+            (marker(PublicKeyPackageBarrierKind::Deletion), false),
+            (marker(PublicKeyPackageBarrierKind::ExactDeletion), false),
+            // The journal's row is covered by the evicted address deletion,
+            // but not by a marker that lost its target.
+            (evicted(true, PublicKeyPackageBarrierKind::Deletion), false),
+            (
+                evicted(true, PublicKeyPackageBarrierKind::ExactDeletion),
+                true,
+            ),
+            (slotless, false),
             (fence(false, vec![]), false),
         ] {
             let misses = |seen: &[RelayEventRecord], freshness| {
@@ -1529,14 +1606,24 @@ mod tests {
             assert!(!misses(&[package(&account, "slot", &newer, 20)], fresh));
             assert!(!misses(&[package(&account, "slot", &older, 21)], fresh));
             assert!(!misses(std::slice::from_ref(&observed_deletion), fresh));
+            assert_eq!(misses(&[], stale), journaled);
+            assert!(!misses(&[], expired));
             // An empty selection is then incomplete, or the account having
             // no package.
-            let empty =
-                select_fenced_key_packages(&account, &[], fresh, None, Some(fence.over(&[])));
-            assert_eq!(
-                matches!(empty, Err(DirectoryError::DirectoryLookupIncomplete(_))),
-                journaled
-            );
+            let empty = |freshness| {
+                select_fenced_key_packages(&account, &[], freshness, None, Some(fence.over(&[])))
+                    .map(|selection| selection.value.len())
+            };
+            for freshness in [fresh, stale] {
+                assert_eq!(
+                    matches!(
+                        empty(freshness),
+                        Err(DirectoryError::DirectoryLookupIncomplete(_))
+                    ),
+                    journaled
+                );
+            }
+            assert!(matches!(empty(expired), Ok(0)));
         }
     }
 }

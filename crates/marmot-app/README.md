@@ -361,7 +361,9 @@ compatible KeyPackage published only elsewhere is not seen. A start that finds n
 `AppError::DirectoryLookupIncomplete` while this device's KeyPackage journal keeps a publication of the peer in a `d`
 slot that the lookup did not account for: its reads returned neither that publication nor a newer one in the same slot
 (not counting one dated past the clock-skew allowance), the journal knows no newer one there either, and no deletion
-request covers it.
+request covers it. The journal keeps a publication for 30 days and five minutes from its creation and holds a bounded
+number of publications and deletion requests. A publication it has dropped no longer blocks a verdict, and a deletion
+request it has dropped no longer accounts for one.
 `start_direct_conversation` is the same call with default options, which leave disappearing messages disabled.
 
 There is no immutable cross-client DM provenance, so MDK cannot prove legacy groups eligible for automatic admin repair.

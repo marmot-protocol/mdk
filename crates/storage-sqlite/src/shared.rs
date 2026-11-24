@@ -122,6 +122,19 @@ const KEY_PACKAGE_REPLACEMENT_CAP: i64 = 500;
 const KEY_PACKAGE_EVIDENCE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 const KEY_PACKAGE_EVIDENCE_FUTURE_SKEW_SECS: i64 = 5 * 60;
 
+/// The newest creation time whose KeyPackage evidence a prune at `now` drops.
+fn key_package_evidence_stale_before(now: i64) -> i64 {
+    now.saturating_sub(KEY_PACKAGE_EVIDENCE_MAX_AGE_SECS + KEY_PACKAGE_EVIDENCE_FUTURE_SKEW_SECS)
+}
+
+/// Whether the KeyPackage journal still keeps evidence of a publication
+/// created at `event_created_at`. Only a write prunes what this rejects, so a
+/// reader can meet a row past the bound and must not count it.
+pub fn public_key_package_evidence_retained(event_created_at: u64, now: u64) -> bool {
+    let stale_before = key_package_evidence_stale_before(i64::try_from(now).unwrap_or(i64::MAX));
+    i64::try_from(event_created_at).is_ok_and(|created_at| created_at > stale_before)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredRelayTelemetrySettings {
     pub export_enabled: bool,
@@ -1073,8 +1086,7 @@ fn bump_key_package_revision(tx: &Transaction<'_>, account_id_hex: &str) -> Stor
 }
 
 fn prune_key_package_replacements(tx: &Transaction<'_>) -> StorageResult<()> {
-    let stale_before = unix_now_seconds_i64()
-        .saturating_sub(KEY_PACKAGE_EVIDENCE_MAX_AGE_SECS + KEY_PACKAGE_EVIDENCE_FUTURE_SKEW_SECS);
+    let stale_before = key_package_evidence_stale_before(unix_now_seconds_i64());
     tx.execute_cached(
         "DELETE FROM directory_key_package_replacements WHERE event_created_at <= ?1",
         [stale_before],
@@ -1133,8 +1145,7 @@ fn prune_key_package_replacements(tx: &Transaction<'_>) -> StorageResult<()> {
 }
 
 fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<()> {
-    let stale_before = now
-        .saturating_sub(KEY_PACKAGE_EVIDENCE_MAX_AGE_SECS + KEY_PACKAGE_EVIDENCE_FUTURE_SKEW_SECS);
+    let stale_before = key_package_evidence_stale_before(now);
     for statement in [
         "DELETE FROM public_key_package_barriers
          WHERE (deleted_event_id IS NOT NULL AND observed_at <= ?1)

@@ -1766,6 +1766,96 @@ async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
     app.close_storage().unwrap();
 }
 
+/// A package the journal knows stays selectable past the 30-day freshness
+/// window, as the single fallback, and the journal keeps its row a little
+/// longer. When the recipient's outbox moves and the reads omit it, it still
+/// blocks a verdict. Served again, it starts the chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_journaled_package_past_the_freshness_window_still_blocks_a_verdict() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let aged = signed(
+        &app,
+        &bob,
+        candidate(
+            &bob,
+            fresh_key_package_for_account(&app, &bob, false).await,
+            "aged",
+            None,
+            unix_now_seconds() - nostr_directory::KEY_PACKAGE_FRESHNESS.as_secs() - 60,
+        ),
+    );
+    retire_journaled_key_packages(&app, &bob).await;
+    for endpoint in ["wss://directory.example", "wss://shared.example"] {
+        fetcher
+            .events_by_endpoint
+            .lock()
+            .unwrap()
+            .get_mut(endpoint)
+            .unwrap()
+            .push(aged.clone());
+    }
+    app.directory()
+        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert!(
+        app.shared_storage()
+            .unwrap()
+            .public_key_package_replacements(&bob.account_id_hex)
+            .unwrap()
+            .iter()
+            .any(|publication| publication.event_id_hex == aged.id)
+    );
+    advertise_updated_direct_outbox(&fetcher, &bob, &[UPDATED_DIRECT_OUTBOX]);
+    let serve = |events: Vec<NostrTransportEvent>| {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let updated = by_endpoint.get_mut(UPDATED_DIRECT_OUTBOX).unwrap();
+        updated.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        updated.extend(events);
+    };
+    let limited = {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let records = by_endpoint.get_mut("wss://directory.example").unwrap();
+        let limited = records
+            .iter()
+            .find(|event| {
+                event.kind == KIND_MARMOT_KEY_PACKAGE && event.tag_value("d") == Some("limited")
+            })
+            .unwrap()
+            .clone();
+        records.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        limited
+    };
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let start = || {
+        runtime.start_direct_conversation_with_options(
+            "alice",
+            &bob.account_id_hex,
+            crate::DirectConversationOptions {
+                disappearing_message_secs: 300,
+            },
+        )
+    };
+    for (served, events) in [
+        ("a newer incompatible package", vec![limited.clone()]),
+        ("nothing", vec![]),
+    ] {
+        serve(events);
+        let error = start().await.unwrap_err();
+        assert!(
+            matches!(error, AppError::DirectoryLookupIncomplete { .. }),
+            "new outbox serves {served}: {error}"
+        );
+        assert!(app.groups("alice").unwrap().is_empty());
+    }
+    // Served beside the incompatible package, the aged one is selected.
+    serve(vec![limited, aged]);
+    start().await.unwrap();
+    assert_eq!(app.groups("alice").unwrap().len(), 1);
+    runtime.shutdown().await;
+    app.close_storage().unwrap();
+}
+
 /// A deletion request dated past the clock-skew allowance still removes its
 /// package from selection, but the journal does not record the request. The
 /// lookup holds it, so the journal's row for the package is accounted for,
@@ -1912,6 +2002,180 @@ async fn a_deletion_only_the_proof_read_finds_accounts_for_another_slot() {
             .iter()
             .all(|barrier| barrier.event_id_hex != deletion_id)
     );
+    app.close_storage().unwrap();
+}
+
+/// The journal's size limits evict a recipient's package to a barrier and
+/// then to the account's eviction marker, which still names it. Whether the
+/// reads return no KeyPackage or an older copy of that slot, which the marker
+/// still bars, the lookup is incomplete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_package_evicted_to_the_journals_marker_still_blocks_a_verdict() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let bob = &accounts[0];
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    let storage = app.shared_storage().unwrap();
+    let now = unix_now_seconds();
+    let evicted = "cd".repeat(32);
+    storage
+        .put_public_key_package_replacement(&storage_sqlite::PublicKeyPackageReplacementRecord {
+            account_id_hex: bob.account_id_hex.clone(),
+            key_package_id: "evicted".into(),
+            event_id_hex: evicted.clone(),
+            event_created_at: now,
+            observed_at: now - 100,
+        })
+        .unwrap();
+    // Other accounts' newer evidence fills the replacement table, then the
+    // barrier table.
+    for other in 1..=1_000u64 {
+        let id = format!("{other:064x}");
+        storage
+            .put_public_key_package_replacement(
+                &storage_sqlite::PublicKeyPackageReplacementRecord {
+                    account_id_hex: id.clone(),
+                    key_package_id: "slot".into(),
+                    event_id_hex: id,
+                    event_created_at: now,
+                    observed_at: now,
+                },
+            )
+            .unwrap();
+    }
+    for other in 1_001..=2_000u64 {
+        let id = format!("{other:064x}");
+        storage
+            .put_public_key_package_barrier(&storage_sqlite::PublicKeyPackageBarrierRecord {
+                account_id_hex: id.clone(),
+                key_package_id: "slot".into(),
+                event_id_hex: id.clone(),
+                deleted_event_id: Some(id),
+                event_created_at: now,
+                observed_at: now,
+                kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
+            })
+            .unwrap();
+    }
+    let snapshot = storage
+        .key_package_evidence_snapshot(&bob.account_id_hex)
+        .unwrap();
+    assert!(snapshot.replacements.is_empty() && snapshot.barriers.is_empty());
+    assert_eq!(
+        snapshot.watermark.map(|marker| marker.event_id_hex),
+        Some(evicted)
+    );
+    let older = candidate(
+        bob,
+        fresh_key_package_for_account(&app, bob, false).await,
+        "evicted",
+        None,
+        now - 1,
+    );
+    for served in ["nothing", "an older copy of the slot"] {
+        if served != "nothing" {
+            fetcher.events.lock().unwrap().push(older.clone());
+        }
+        let error = app
+            .directory()
+            .resolve_member_key_packages(&[bob.account_id_hex.as_str()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                DirectoryError::DirectoryLookupIncomplete(account) if account == &bob.account_id_hex
+            ),
+            "relays serve {served}: {error:?}"
+        );
+    }
+    app.close_storage().unwrap();
+}
+
+/// The journal's size limits evict a deletion of a slot's address to the
+/// account's eviction marker, which still names the slot and the request's
+/// time, while the journal keeps the publication it covered. The marker
+/// settles the slot: the recipient has no KeyPackage, whether the relays
+/// serve nothing or serve the deleted publication again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_evicted_address_deletion_still_settles_its_slot() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let bob = &accounts[0];
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    let storage = app.shared_storage().unwrap();
+    let now = unix_now_seconds();
+    let deleted = candidate(
+        bob,
+        fresh_key_package_for_account(&app, bob, false).await,
+        "deleted",
+        None,
+        now - 1,
+    );
+    storage
+        .put_public_key_package_replacement(&storage_sqlite::PublicKeyPackageReplacementRecord {
+            account_id_hex: bob.account_id_hex.clone(),
+            key_package_id: "deleted".into(),
+            event_id_hex: deleted.id.clone(),
+            event_created_at: now - 1,
+            observed_at: now,
+        })
+        .unwrap();
+    storage
+        .put_public_key_package_barrier(&storage_sqlite::PublicKeyPackageBarrierRecord {
+            account_id_hex: bob.account_id_hex.clone(),
+            key_package_id: "deleted".into(),
+            event_id_hex: "ef".repeat(32),
+            deleted_event_id: None,
+            event_created_at: now,
+            observed_at: now - 100,
+            kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
+        })
+        .unwrap();
+    // Other accounts' newer barriers fill the barrier table.
+    for other in 1..=1_000u64 {
+        let id = format!("{other:064x}");
+        storage
+            .put_public_key_package_barrier(&storage_sqlite::PublicKeyPackageBarrierRecord {
+                account_id_hex: id.clone(),
+                key_package_id: "slot".into(),
+                event_id_hex: id.clone(),
+                deleted_event_id: Some(id),
+                event_created_at: now,
+                observed_at: now,
+                kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
+            })
+            .unwrap();
+    }
+    let snapshot = storage
+        .key_package_evidence_snapshot(&bob.account_id_hex)
+        .unwrap();
+    assert_eq!(snapshot.replacements.len(), 1);
+    assert!(snapshot.barriers.is_empty());
+    assert_eq!(
+        snapshot.watermark.map(|marker| marker.kind),
+        Some(storage_sqlite::PublicKeyPackageBarrierKind::Deletion)
+    );
+    for served in ["nothing", "the deleted publication"] {
+        if served != "nothing" {
+            fetcher.events.lock().unwrap().push(deleted.clone());
+        }
+        let error = app
+            .directory()
+            .resolve_member_key_packages(&[bob.account_id_hex.as_str()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, DirectoryError::MissingKeyPackage { .. }),
+            "relays serve {served}: {error:?}"
+        );
+    }
     app.close_storage().unwrap();
 }
 
