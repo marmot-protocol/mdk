@@ -2522,6 +2522,7 @@ impl MarmotApp {
             accepted_push_announces: Default::default(),
             push_repairs: Default::default(),
             pending_failed_sync_summary: SyncSummary::default(),
+            unannounced_summary: SyncSummary::default(),
             pending_native_sync_summary: SyncSummary::default(),
             native_sync_deliveries: 0,
             pending_convergence_groups: std::collections::HashSet::new(),

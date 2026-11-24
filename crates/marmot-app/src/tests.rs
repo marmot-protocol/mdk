@@ -1,5 +1,6 @@
 #[cfg(feature = "test-policy-overrides")]
 mod account_devices_advertising;
+mod announce_after_save;
 mod audit_ownership;
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;

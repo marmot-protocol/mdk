@@ -1418,9 +1418,9 @@ async fn run_app_runtime_account_worker(
     let sync_started_at = Instant::now();
     let startup_stage_telemetry = shared.observer.performance().clone();
     let mut startup_explicit_shutdown = false;
-    let publish_startup_summary = |client: &AppClient, summary: &SyncSummary| {
+    let publish_startup_summary = |client: &mut AppClient, summary: &SyncSummary| {
         publish_app_runtime_summary_with_v5_at(
-            Emit::Unpublished(Unpublished::DrainProgress),
+            Some(Unpublished::DrainProgress),
             client,
             &events,
             &account_id_hex,
@@ -1538,7 +1538,7 @@ async fn run_app_runtime_account_worker(
     let catch_up_result = match startup_sync_result {
         Ok(summary) => {
             publish_app_runtime_summary_with_v5(
-                &client,
+                &mut client,
                 &events,
                 &account_id_hex,
                 &account_label,
@@ -1563,7 +1563,7 @@ async fn run_app_runtime_account_worker(
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
-                &client,
+                &mut client,
                 &events,
                 &account_id_hex,
                 &account_label,
@@ -1598,7 +1598,7 @@ async fn run_app_runtime_account_worker(
             match client.drain_pending_session_events().await {
                 Ok(summary) => {
                     publish_app_runtime_summary_with_v5(
-                        &client,
+                        &mut client,
                         &events,
                         &account_id_hex,
                         &account_label,
@@ -1970,7 +1970,7 @@ async fn run_app_runtime_account_worker(
         let admitted = client.take_pending_applied_sync_summary();
         let native_received = client.take_native_receive_need();
         publish_app_runtime_summary_with_v5(
-            &client,
+            &mut client,
             &events,
             &account_id_hex,
             &account_label,
@@ -2508,7 +2508,7 @@ async fn run_app_runtime_account_worker(
                                 );
                                 match result {
                                     Ok(summary) => {
-                                        publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
+                                        publish_app_runtime_summary_with_v5(&mut client, &events, &account_id_hex, &account_label, &summary);
                                         // A pass that superseded one of this
                                         // device's own commits reports it
                                         // through the client's pending
@@ -2700,7 +2700,7 @@ async fn run_app_runtime_account_worker(
                 match result {
                     Ok(summary) => {
                         reconnect_backoff.reset();
-                        publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
+                        publish_app_runtime_summary_with_v5(&mut client, &events, &account_id_hex, &account_label, &summary);
                         // An inline convergence pass on a delivered rival can
                         // supersede one of this device's own commits; the
                         // report waits in the client's pending buffer and this
@@ -2962,7 +2962,7 @@ async fn run_app_runtime_account_worker(
                                         .await;
                                     match reopened.drain_pending_session_events().await {
                                         Ok(summary) => {
-                                            publish_app_runtime_summary_with_v5(&reopened,
+                                            publish_app_runtime_summary_with_v5(&mut reopened,
                                                 &events,
                                                 &account_id_hex,
                                                 &account_label,
@@ -9117,7 +9117,7 @@ fn publish_join_errors(
 }
 
 fn publish_sync_summary_with_audit(
-    client: &AppClient,
+    client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
@@ -9376,14 +9376,14 @@ fn record_runtime_publication(
 }
 
 fn publish_app_runtime_summary_with_v5(
-    client: &AppClient,
+    client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
     summary: &SyncSummary,
 ) {
     publish_app_runtime_summary_with_v5_at(
-        Emit::Quiescent(client),
+        None,
         client,
         events,
         account_id_hex,
@@ -9392,20 +9392,27 @@ fn publish_app_runtime_summary_with_v5(
     );
 }
 
+/// Every summary the worker broadcasts passes here, so this is where output
+/// about a chat whose record a save has not committed is kept back
+/// (mdk#3359). `unpublished` names why the events go out without publishing
+/// A first; `None` publishes it.
 fn publish_app_runtime_summary_with_v5_at(
-    at: Emit<'_>,
-    client: &AppClient,
+    unpublished: Option<Unpublished>,
+    client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
     summary: &SyncSummary,
 ) {
+    let summary = client.announceable_summary(summary);
+    let client = &*client;
+    let at = unpublished.map_or(Emit::Quiescent(client), Emit::Unpublished);
     let publication =
-        publish_app_runtime_summary(at, events, account_id_hex, account_label, summary);
+        publish_app_runtime_summary(at, events, account_id_hex, account_label, &summary);
     record_runtime_publication(
         client,
         marmot_forensics::v5::RuntimePublicationCategory::SyncSummary,
-        runtime_summary_message_ref(summary),
+        runtime_summary_message_ref(&summary),
         publication,
     );
 }

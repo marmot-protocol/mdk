@@ -39,7 +39,7 @@ pub(crate) use native_ingress::MAX_NATIVE_ADMISSION_PER_TURN;
 
 /// The worker consumes committed output; direct clients retain full summaries.
 pub(crate) struct CommittedSyncProgress<'a> {
-    pub(crate) publish: &'a (dyn Fn(&AppClient, &SyncSummary) + Send + Sync),
+    pub(crate) publish: &'a (dyn Fn(&mut AppClient, &SyncSummary) + Send + Sync),
     pub(crate) post_join_errors: &'a (dyn Fn(Option<AppError>, Option<AppError>) + Send + Sync),
 }
 
@@ -389,6 +389,14 @@ fn unknown_group_id(error: &AppError) -> Option<GroupId> {
         EngineError::UnknownGroup(group_id) => Some(group_id.clone()),
         _ => None,
     }
+}
+
+/// Move the items `hold` picks from `items` to the end of `held`, keeping
+/// their order.
+fn hold_back<T>(items: &mut Vec<T>, held: &mut Vec<T>, hold: impl Fn(&T) -> bool) {
+    let (kept, rest): (Vec<T>, Vec<T>) = std::mem::take(items).into_iter().partition(hold);
+    held.extend(kept);
+    *items = rest;
 }
 
 /// Skip a deferred group's event that is not yet projected. Engine-outbox
@@ -2189,6 +2197,7 @@ impl AppClient {
         for summary in [
             &mut self.pending_applied_sync_summary,
             &mut self.pending_failed_sync_summary,
+            &mut self.unannounced_summary,
         ] {
             summary.joined_groups.retain(|group| group != group_id);
             summary
@@ -2309,6 +2318,48 @@ impl AppClient {
     /// seam that published the command's response.
     pub(crate) fn take_pending_applied_sync_summary(&mut self) -> SyncSummary {
         std::mem::take(&mut self.pending_applied_sync_summary)
+    }
+
+    /// What of `summary` hosts may be told now: a chat's output goes out only
+    /// once its record holds no change a save has not committed, so a host
+    /// that reads the chat on hearing of it finds it (mdk#3359). Output kept
+    /// back waits on the client and goes out, ahead of later output, at the
+    /// first announcement after the save.
+    pub(crate) fn announceable_summary<'a>(
+        &mut self,
+        summary: &'a SyncSummary,
+    ) -> std::borrow::Cow<'a, SyncSummary> {
+        let unsaved = &self.pending_group_projection_updates;
+        if unsaved.is_empty() && self.unannounced_summary == SyncSummary::default() {
+            return std::borrow::Cow::Borrowed(summary);
+        }
+        let mut announced = std::mem::take(&mut self.unannounced_summary);
+        announced.merge(summary.clone());
+        let held = &mut self.unannounced_summary;
+        let unsaved_hex = |group_id_hex: &str| unsaved.contains(group_id_hex);
+        let unsaved_group = |group_id: &GroupId| unsaved_hex(&hex::encode(group_id.as_slice()));
+        hold_back(
+            &mut announced.joined_groups,
+            &mut held.joined_groups,
+            |group_id| unsaved_group(group_id),
+        );
+        hold_back(&mut announced.messages, &mut held.messages, |message| {
+            unsaved_group(&message.group_id)
+        });
+        hold_back(&mut announced.events, &mut held.events, |event| {
+            event_group_id(event).is_some_and(unsaved_group)
+        });
+        hold_back(
+            &mut announced.projection_updates,
+            &mut held.projection_updates,
+            |update| unsaved_hex(&update.group_id_hex),
+        );
+        hold_back(
+            &mut announced.epoch_stall_escalations,
+            &mut held.epoch_stall_escalations,
+            |escalation| unsaved_group(&escalation.group_id),
+        );
+        std::borrow::Cow::Owned(announced)
     }
 
     /// Build an [`EventGroupProjection`] for `group_id`, returning `None` if any
