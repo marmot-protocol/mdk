@@ -2319,6 +2319,7 @@ async fn a_lost_early_package_decides_only_when_no_relay_was_skipped() {
             .recover_then_lose_selection_for_test(
                 &bob.account_id_hex,
                 observed.clone(),
+                Vec::new(),
                 true,
                 skipped
                     .map(|relay| TransportEndpoint(relay.into()))
@@ -2348,6 +2349,44 @@ async fn a_lost_early_package_decides_only_when_no_relay_was_skipped() {
             );
         }
     }
+    app.close_storage().unwrap();
+}
+
+/// An earlier read returned an incompatible package that no completed read
+/// served again, and recovery proved another relay's compatible package
+/// undeleted. Losing that package at final selection leaves the earlier one
+/// unconfirmed, so the lookup is incomplete rather than empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_proven_package_decides_nothing_beside_an_unserved_hint() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let hint = RelayEventRecord {
+        event: fetcher.events_by_endpoint.lock().unwrap()["wss://directory.example"]
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap()
+            .clone(),
+        endpoints: vec![],
+    };
+    let result = app
+        .directory()
+        .recover_then_lose_selection_for_test(
+            &bob.account_id_hex,
+            Vec::new(),
+            vec![hint],
+            true,
+            vec![TransportEndpoint(UPDATED_DIRECT_OUTBOX.into())],
+            &requirements,
+        )
+        .await;
+    assert!(
+        matches!(
+            &result,
+            Err(DirectoryError::DirectoryLookupIncomplete(account))
+                if account == &bob.account_id_hex
+        ),
+        "{result:?}"
+    );
     app.close_storage().unwrap();
 }
 

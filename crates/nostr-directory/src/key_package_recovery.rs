@@ -257,7 +257,12 @@ impl<R: DirectoryResources> Directory<R> {
                 .cloned()
             else {
                 return Ok(proven_records(
-                    account, observed, &deletions, freshness, &proven,
+                    account,
+                    observed,
+                    &deletions,
+                    freshness,
+                    &proven,
+                    verdict_coverage,
                 ));
             };
             if !package_coverage || routes.is_empty() || revocations == RECOVERY_CANDIDATE_LIMIT {
@@ -351,13 +356,15 @@ impl<R: DirectoryResources> Directory<R> {
 /// revalidates MLS lifetime on the real wall clock. It may reject a proven
 /// identity after a slow deletion read, but must never select a different
 /// fresh slot whose deletion was not read. Rejected-future metadata stays for
-/// the diagnostic cache fallback, whose exact target was checked.
+/// the diagnostic cache fallback, whose exact target was checked. `complete`
+/// says whether losing the proven candidates is a verdict.
 fn proven_records(
     account: &str,
     observed: Vec<DirectoryRelayEventRecord>,
     deletions: &[DirectoryRelayEventRecord],
     freshness: DirectoryFreshness,
     proven: &BTreeSet<String>,
+    complete: bool,
 ) -> RecoveredKeyPackageRecords {
     let (mut records, evidence) =
         without_revoked_slot_winners(account, observed, deletions, freshness);
@@ -366,8 +373,7 @@ fn proven_records(
         freshness,
         records,
         cache_evidence: Some(evidence),
-        // Proving a candidate requires complete KeyPackage coverage.
-        complete: true,
+        complete,
     }
 }
 
@@ -509,6 +515,7 @@ mod tests {
             &deletions,
             directory.directory_freshness(),
             &BTreeSet::new(),
+            true,
         );
         assert!(recovered.records.is_empty());
         let barriers = shared.public_key_package_barriers(&account).unwrap();

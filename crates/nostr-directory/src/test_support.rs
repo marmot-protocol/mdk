@@ -237,13 +237,14 @@ impl<R: DirectoryResources> Directory<R> {
         self.empty_directory_record(account_id_hex)
     }
 
-    /// Runs recovery over `observed` with `discovery` as its supplementary
-    /// relays, then final selection after losing the packages recovery
-    /// selected, as wall-clock revalidation can.
+    /// Runs recovery over `observed` and an earlier read's `hints`, with
+    /// `discovery` as its supplementary relays, then final selection after
+    /// losing the packages recovery selected, as wall-clock revalidation can.
     pub async fn recover_then_lose_selection_for_test(
         &self,
         account_id_hex: &str,
         observed: Vec<DirectoryRelayEventRecord>,
+        hints: Vec<DirectoryRelayEventRecord>,
         primary_complete: bool,
         discovery: Vec<TransportEndpoint>,
         requirements: &cgka_engine::key_package::KeyPackageRequirements,
@@ -253,7 +254,7 @@ impl<R: DirectoryResources> Directory<R> {
                 account: account_id_hex,
                 searched: &[],
                 observed,
-                hints: Vec::new(),
+                hints,
                 primary_complete,
                 discovery: &discovery,
                 requirements: Some(requirements),
