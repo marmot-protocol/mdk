@@ -1,15 +1,19 @@
 //! Filesystem JSON read/write helpers and account-label validation.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{AccountHomeError, AccountHomeResult};
+
+pub(crate) mod record_directory;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -236,6 +240,7 @@ pub(crate) fn write_private_bytes(
     write_file_atomically(owned_root, path.as_ref(), bytes, FileMode::Private)
 }
 
+#[cfg(test)]
 pub(crate) fn write_secret_bytes(
     owned_root: &Path,
     path: &Path,
@@ -247,6 +252,10 @@ pub(crate) fn write_secret_bytes(
 /// Create or tighten directories in the owned tree. On Unix, sync every
 /// owned directory on retry. Sync above the root only when bootstrapping it.
 pub(crate) fn create_durable_private_dir(owned_root: &Path, path: &Path) -> io::Result<()> {
+    open_durable_private_dir(owned_root, path).map(drop)
+}
+
+pub(crate) fn open_durable_private_dir(owned_root: &Path, path: &Path) -> io::Result<File> {
     let relative = path.strip_prefix(owned_root).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -268,36 +277,41 @@ pub(crate) fn create_durable_private_dir(owned_root: &Path, path: &Path) -> io::
     }
     #[cfg(not(unix))]
     {
-        let mut directory = match owned_root.canonicalize() {
-            Ok(root) => root,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(containing_dir(owned_root))?;
-                owned_root.to_path_buf()
-            }
-            Err(error) => return Err(error),
-        };
-        create_private_directory(&directory)?;
+        let mut directory = open_or_create_root(owned_root)?;
         for part in relative {
-            directory.push(part);
-            create_private_directory(&directory)?;
+            directory = record_directory::create_dir(&directory, part)?;
         }
-        Ok(())
+        Ok(directory)
+    }
+}
+
+#[cfg(not(unix))]
+fn open_or_create_root(path: &Path) -> io::Result<File> {
+    match path.canonicalize() {
+        Ok(root) => record_directory::open_root(&root),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let name = path.file_name().ok_or(error)?;
+            let parent = open_or_create_root(containing_dir(path))?;
+            record_directory::create_dir(&parent, name)
+        }
+        Err(error) => Err(error),
     }
 }
 
 #[cfg(unix)]
 mod unix_directory {
     use super::*;
-    use std::ffi::{CString, OsStr};
+    use std::borrow::Cow;
+    use std::ffi::{CStr, CString, OsStr};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
     pub(super) fn create(
         root: &Path,
         relative: &Path,
         mut sync: impl FnMut(&File, &Path) -> io::Result<()>,
-    ) -> io::Result<()> {
+    ) -> io::Result<File> {
         let (directory, mut path) = bootstrap(root, &mut sync)?;
         tighten(&directory)?;
         sync_tree(directory, &mut path, relative.iter(), &mut sync)
@@ -311,22 +325,17 @@ mod unix_directory {
     ) -> io::Result<(File, PathBuf)> {
         match path.canonicalize() {
             Ok(path) => {
-                let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW;
-                #[cfg(target_vendor = "apple")]
-                let flags = flags | libc::O_NOFOLLOW_ANY;
-                let directory = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(flags)
-                    .open(&path)?;
+                let directory = record_directory::open_root(&path)?;
                 Ok((directory, path))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let name = path.file_name().ok_or(error)?;
                 let (parent, mut parent_path) = bootstrap(containing_dir(path), sync)?;
-                let name_c = component_name(name)?;
+                let mut buffer = [0; 256];
+                let name_c = component_name(name, &mut buffer)?;
                 let created = mkdir_at(&parent, &name_c)?;
                 let result = (|| -> io::Result<File> {
-                    let directory = open_at(&parent, &name_c)?;
+                    let directory = open_directory_at(&parent, &name_c)?;
                     if created {
                         tighten(&directory)?;
                     }
@@ -354,36 +363,63 @@ mod unix_directory {
         path: &mut PathBuf,
         mut remaining: std::path::Iter<'_>,
         sync: &mut impl FnMut(&File, &Path) -> io::Result<()>,
-    ) -> io::Result<()> {
-        if let Some(component) = remaining.next() {
-            let name = component_name(component)?;
-            let child = match open_at(&directory, &name) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    mkdir_at(&directory, &name)?;
-                    open_at(&directory, &name)?
-                }
-                result => result?,
-            };
-            tighten(&child)?;
+    ) -> io::Result<File> {
+        let leaf = if let Some(component) = remaining.next() {
+            let mut buffer = [0; 256];
+            let name = component_name(component, &mut buffer)?;
+            let child = create_child(&directory, &name)?;
             path.push(component);
-            sync_tree(child, path, remaining, sync)?;
+            let leaf = sync_tree(child, path, remaining, sync)?;
             path.pop();
-        }
-        // Sync even if all entries were already present. A previous attempt
-        // can have failed after creating the tree but before syncing it.
-        sync(&directory, path)
+            leaf
+        } else {
+            sync(&directory, path)?;
+            return Ok(directory);
+        };
+        // A previous attempt can have failed before syncing an existing edge.
+        sync(&directory, path)?;
+        Ok(leaf)
     }
 
-    fn component_name(name: &OsStr) -> io::Result<CString> {
-        CString::new(name.as_bytes()).map_err(|_| {
-            io::Error::new(
+    pub(super) fn create_child(parent: &File, name: &CStr) -> io::Result<File> {
+        let child = match open_directory_at(parent, name) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                mkdir_at(parent, name)?;
+                open_directory_at(parent, name)?
+            }
+            result => result?,
+        };
+        tighten(&child)?;
+        Ok(child)
+    }
+
+    pub(super) fn component_name<'a>(
+        name: &OsStr,
+        buffer: &'a mut [u8],
+    ) -> io::Result<Cow<'a, CStr>> {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || name == ".." || bytes.contains(&b'/') || bytes.contains(&0) {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "private directory name contains NUL",
-            )
-        })
+                "invalid record component",
+            ));
+        }
+        if let Some(buffer) = buffer.get_mut(..=bytes.len()) {
+            buffer[..bytes.len()].copy_from_slice(bytes);
+            buffer[bytes.len()] = 0;
+            // SAFETY: The name has no NUL and the buffer ends with one.
+            Ok(Cow::Borrowed(unsafe {
+                CStr::from_bytes_with_nul_unchecked(buffer)
+            }))
+        } else {
+            // SAFETY: The name has no NUL. CString adds the terminator.
+            Ok(Cow::Owned(unsafe {
+                CString::from_vec_unchecked(bytes.to_vec())
+            }))
+        }
     }
 
-    fn mkdir_at(parent: &File, name: &CString) -> io::Result<bool> {
+    fn mkdir_at(parent: &File, name: &CStr) -> io::Result<bool> {
         // SAFETY: The parent handle and component remain live for the call.
         if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
             return Ok(true);
@@ -396,22 +432,27 @@ mod unix_directory {
         }
     }
 
-    fn open_at(parent: &File, name: &CString) -> io::Result<File> {
-        // O_NOFOLLOW without O_DIRECTORY preserves ELOOP (EMLINK on FreeBSD)
-        // for a symlink. O_NONBLOCK keeps a FIFO from blocking the type check.
+    pub(super) fn open_at(parent: &File, name: &CStr, flags: libc::c_int) -> io::Result<File> {
+        // O_NONBLOCK keeps a FIFO from blocking the type check.
         // SAFETY: The parent handle and component remain live for the call.
         let fd = unsafe {
             libc::openat(
                 parent.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                0o600_i32,
             )
         };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: openat returned a new, owned descriptor.
-        let file = unsafe { File::from_raw_fd(fd) };
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn open_directory_at(parent: &File, name: &CStr) -> io::Result<File> {
+        // Do not combine O_DIRECTORY with O_NOFOLLOW: retain the symlink error.
+        let file = open_at(parent, name, libc::O_RDONLY)?;
         if !file.metadata()?.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotADirectory,
@@ -427,35 +468,6 @@ mod unix_directory {
         }
         Ok(())
     }
-}
-
-#[cfg(not(unix))]
-fn create_private_directory(path: &Path) -> io::Result<()> {
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "private directory target must not be a reparse point",
-            ));
-        }
-    }
-    if !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotADirectory,
-            "private directory target is not a directory",
-        ));
-    }
-    Ok(())
 }
 
 fn containing_dir(path: &Path) -> &Path {
@@ -498,69 +510,71 @@ fn write_file_atomically(
     bytes: &[u8],
     mode: FileMode,
 ) -> AccountHomeResult<()> {
-    let parent = containing_dir(path);
-    create_durable_private_dir(owned_root, parent)?;
-
-    let (file, temp_path) = create_temp_file(parent, path, mode)?;
-    write_staged_file(file, &temp_path, path, bytes, mode)
+    let name = record_name(path)?;
+    let parent = open_durable_private_dir(owned_root, containing_dir(path))?;
+    write_record(&parent, name, bytes, mode)
 }
 
-fn write_staged_file(
-    mut file: File,
-    temp_path: &Path,
-    path: &Path,
+pub(crate) fn write_private_record(
+    parent: &File,
+    name: &OsStr,
+    bytes: &[u8],
+) -> AccountHomeResult<()> {
+    write_record(parent, name, bytes, FileMode::Private)
+}
+
+pub(crate) fn write_secret_record(
+    parent: &File,
+    name: &OsStr,
+    bytes: &[u8],
+) -> AccountHomeResult<()> {
+    write_record(parent, name, bytes, FileMode::Secret)
+}
+
+fn write_record(
+    parent: &File,
+    name: &OsStr,
     bytes: &[u8],
     mode: FileMode,
 ) -> AccountHomeResult<()> {
-    let result = (|| -> AccountHomeResult<()> {
+    let (file, stage_name) = create_temp_file(parent, name)?;
+    write_staged_file(parent, file, &stage_name, name, bytes, mode)
+}
+
+fn write_staged_file(
+    parent: &File,
+    mut file: File,
+    stage_name: &OsStr,
+    name: &OsStr,
+    bytes: &[u8],
+    mode: FileMode,
+) -> AccountHomeResult<()> {
+    let published = (|| -> io::Result<()> {
         file.write_all(bytes)?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            let mut permissions = file.metadata()?.permissions();
-            permissions.set_mode(0o600);
-            file.set_permissions(permissions)?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
 
         file.sync_all()?;
-        if mode == FileMode::Private {
-            #[cfg(windows)]
-            replace_open_file_for_commit(&file, path)?;
-            #[cfg(not(windows))]
-            {
-                drop(file);
-                replace_file_for_commit(temp_path, path)?;
-            }
-            return Ok(());
+        match mode {
+            FileMode::Private => record_directory::replace(parent, &file, stage_name, name),
+            FileMode::Secret => record_directory::replace_secret(parent, &file, stage_name, name),
         }
-
-        drop(file);
-        let mut replaced_secret_file = match open_file_for_zero_overwrite(path) {
-            Ok(file) => Some(file),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-            Err(err) => return Err(err.into()),
-        };
-        replace_secret_file(temp_path, path)?;
-        // The handle still refers to the replaced file after publication,
-        // so scrub it without creating a window where the live secret path is
-        // zeroed if replacement fails. Best-effort, matching secret deletion.
-        if let Some(file) = &mut replaced_secret_file {
-            let _ = overwrite_open_file_with_zeros(file);
-        }
-        sync_directory(containing_dir(path))?;
-        Ok(())
     })();
 
-    if result.is_err() {
+    if let Err(error) = published {
         if mode == FileMode::Secret {
-            let _ = overwrite_file_with_zeros(temp_path);
+            let _ = overwrite_open_file_with_zeros(&mut file);
         }
-        let _ = fs::remove_file(temp_path);
+        let _ = record_directory::discard_stage(parent, &file, stage_name);
+        return Err(error.into());
     }
-
-    result
+    // A failed durability barrier leaves the published record intact for retry.
+    Ok(record_directory::sync(parent)?)
 }
 
 /// Unlink `path`, then zero the removed inode through a handle opened first.
@@ -586,9 +600,7 @@ pub(crate) fn remove_file_then_scrub(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Best-effort in-place zero overwrite used before unlinking files that may
-/// contain plaintext key material and that no reader opens, such as a failed
-/// write's temp file. Live paths go through [`remove_file_then_scrub`].
+#[cfg(test)]
 pub(crate) fn overwrite_file_with_zeros(path: &Path) -> io::Result<()> {
     let mut file = open_file_for_zero_overwrite(path)?;
     overwrite_open_file_with_zeros(&mut file)
@@ -603,6 +615,11 @@ fn open_file_for_zero_overwrite(path: &Path) -> io::Result<File> {
         options.custom_flags(libc::O_NOFOLLOW);
     }
     let file = options.open(path)?;
+    check_scrubbable(&file)?;
+    Ok(file)
+}
+
+fn check_scrubbable(file: &File) -> io::Result<()> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -620,107 +637,55 @@ fn open_file_for_zero_overwrite(path: &Path) -> io::Result<File> {
             ));
         }
     }
-    Ok(file)
+    Ok(())
 }
 
 fn overwrite_open_file_with_zeros(file: &mut File) -> io::Result<()> {
-    let len = file.metadata()?.len();
-    if len > 0 {
-        let zeros = vec![0u8; len as usize];
+    let mut remaining = file.metadata()?.len();
+    if remaining > 0 {
+        let zeros = [0; 4096];
         file.seek(SeekFrom::Start(0))?;
-        file.write_all(&zeros)?;
+        while remaining > 0 {
+            let count = remaining.min(zeros.len() as u64) as usize;
+            file.write_all(&zeros[..count])?;
+            remaining -= count as u64;
+        }
         file.sync_all()?;
     }
     Ok(())
 }
 
-fn create_temp_file(
-    parent: &Path,
-    path: &Path,
-    mode: FileMode,
-) -> AccountHomeResult<(File, PathBuf)> {
-    let file_name = path.file_name().ok_or_else(|| {
+fn record_name(path: &Path) -> io::Result<&OsStr> {
+    path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "atomic write target must name a file",
         )
-    })?;
+    })
+}
 
+fn temporary_name(name: &OsStr, purpose: &str) -> OsString {
+    let attempt = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut temporary = OsString::from(".");
+    temporary.push(name);
+    temporary.push(format!(".{purpose}.{}.{attempt}", std::process::id()));
+    temporary
+}
+
+fn create_temp_file(parent: &File, name: &OsStr) -> io::Result<(File, OsString)> {
     for _ in 0..32 {
-        let attempt = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut temp_name = OsString::from(".");
-        temp_name.push(file_name);
-        temp_name.push(format!(".tmp.{}.{}", std::process::id(), attempt));
-        let temp_path = parent.join(temp_name);
-
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        #[cfg(windows)]
-        if mode == FileMode::Private {
-            use windows_sys::Win32::Foundation::GENERIC_WRITE;
-            windows_rename_options(&mut options, GENERIC_WRITE);
-        }
-        #[cfg(not(windows))]
-        let _ = mode;
-
-        match options.open(&temp_path) {
-            Ok(file) => return Ok((file, temp_path)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err.into()),
+        let temporary = temporary_name(name, "tmp");
+        match record_directory::create_stage(parent, &temporary) {
+            Ok(file) => return Ok((file, temporary)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
         }
     }
 
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
         "could not allocate unique atomic write temp file",
-    )
-    .into())
-}
-
-/// Replace a Windows secret file while retaining its open scrub handle.
-/// Deleting it and renaming onto its name only works with
-/// POSIX delete semantics (NTFS on Windows 10 1903 and later); elsewhere the
-/// name stays delete-pending and the rename is denied. Moving the old file
-/// aside keeps open handles attached to the old file. A failed install attempts
-/// to restore the old name. Unlike Unix replacement, readers can observe a
-/// missing live path between the two renames.
-#[cfg(windows)]
-fn replace_secret_file(temp_path: &Path, path: &Path) -> io::Result<()> {
-    let mut aside = OsString::from(".");
-    aside.push(path.file_name().unwrap_or_default());
-    aside.push(format!(
-        ".old.{}.{}",
-        std::process::id(),
-        TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let aside = path.with_file_name(aside);
-    match rename_for_commit(path, &aside) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return rename_for_commit(temp_path, path);
-        }
-        Err(err) => return Err(err),
-    }
-    if let Err(err) = rename_for_commit(temp_path, path) {
-        let _ = rename_for_commit(&aside, path);
-        return Err(err);
-    }
-    // The new file is live; the caller scrubs the old bytes through its open
-    // handle, and the name goes once that handle closes. Best-effort, like
-    // the rest of secret deletion: failing here must not fail the write.
-    let _ = fs::remove_file(&aside);
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_secret_file(temp_path: &Path, path: &Path) -> io::Result<()> {
-    fs::rename(temp_path, path)
+    ))
 }
 
 /// Publish an already-synced file, replacing the old entry in the same directory.
@@ -732,120 +697,9 @@ pub(crate) fn replace_file_for_commit(from: &Path, to: &Path) -> io::Result<()> 
             "private replacement requires the same directory",
         ));
     }
-    #[cfg(unix)]
-    {
-        fs::rename(from, to)?;
-        sync_directory(parent)
-    }
-    #[cfg(windows)]
-    {
-        let mut options = OpenOptions::new();
-        windows_rename_options(&mut options, 0);
-        let file = options.open(from)?;
-        replace_open_file_for_commit(&file, to)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "durable private replacement requires Unix or Windows",
-        ))
-    }
-}
-
-#[cfg(windows)]
-fn windows_rename_options(options: &mut OpenOptions, access: u32) {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_READ_ATTRIBUTES,
-    };
-
-    options
-        .access_mode(access | DELETE | FILE_READ_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_WRITE_THROUGH | FILE_FLAG_OPEN_REPARSE_POINT);
-}
-
-#[cfg(windows)]
-fn replace_open_file_for_commit(file: &File, to: &Path) -> io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    use std::os::windows::io::AsRawHandle;
-    use std::ptr;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_RENAME_INFO, FileRenameInfoEx,
-        GetVolumeInformationByHandleW, SetFileInformationByHandle,
-    };
-
-    // winbase.h and winnt.h constants outside our windows-sys feature set.
-    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 1;
-    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 2;
-    const FILE_SUPPORTS_POSIX_UNLINK_RENAME: u32 = 0x400;
-
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "private replacement source must be a regular file",
-        ));
-    }
-
-    // CreateFileW documents rename metadata write-through for NTFS. Do not
-    // publish where we cannot rely on that or fall back to a two-step rename.
-    let handle = file.as_raw_handle();
-    let mut filesystem = [0u16; 32];
-    let mut flags = 0;
-    // SAFETY: The file handle and writable output buffers remain live for the call.
-    if unsafe {
-        GetVolumeInformationByHandleW(
-            handle,
-            ptr::null_mut(),
-            0,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut flags,
-            filesystem.as_mut_ptr(),
-            filesystem.len() as u32,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if !filesystem.starts_with(&[b'N' as u16, b'T' as u16, b'F' as u16, b'S' as u16, 0])
-        || flags & FILE_SUPPORTS_POSIX_UNLINK_RENAME == 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "durable private replacement requires NTFS with POSIX rename support",
-        ));
-    }
-
-    let name = windows_move_path(to)?;
-    let name_bytes = (name.len() - 1) * size_of::<u16>();
-    let size = size_of::<FILE_RENAME_INFO>() + name_bytes;
-    let size_u32 = u32::try_from(size).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "private replacement path is too long",
-        )
-    })?;
-    let mut buffer = vec![0usize; size.div_ceil(size_of::<usize>())];
-    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: usize provides the header's pointer alignment. The zeroed
-    // buffer contains the header and space for the wide name and terminator.
-    unsafe {
-        (*info).Anonymous.Flags =
-            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
-        (*info).FileNameLength = name_bytes as u32;
-        let filename = buffer
-            .as_mut_ptr()
-            .cast::<u8>()
-            .add(std::mem::offset_of!(FILE_RENAME_INFO, FileName))
-            .cast();
-        ptr::copy_nonoverlapping(name.as_ptr(), filename, name.len());
-        if SetFileInformationByHandle(handle, FileRenameInfoEx, info.cast(), size_u32) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
+    let directory = record_directory::open_root(&parent.canonicalize()?)?;
+    record_directory::replace_existing_stage(&directory, record_name(from)?, record_name(to)?)?;
+    record_directory::sync(&directory)
 }
 
 #[cfg(windows)]
@@ -1059,19 +913,28 @@ mod tests {
     #[test]
     fn failed_secret_atomic_write_scrubs_temp_before_unlink() {
         let root = tempfile::tempdir().unwrap();
-        let destination = root.path().join("secret");
-        fs::create_dir(&destination).unwrap();
-        let (staged, path) = create_temp_file(root.path(), &destination, FileMode::Secret).unwrap();
-        let mut reader = File::open(&path).unwrap();
+        let directory = root.path().join("records");
+        let moved = root.path().join("moved");
+        let name = OsStr::new("secret");
+        fs::create_dir_all(directory.join(name)).unwrap();
+        let parent = open_durable_private_dir(root.path(), &directory).unwrap();
+        let (staged, stage_name) = create_temp_file(&parent, name).unwrap();
+        let mut reader = File::open(directory.join(&stage_name)).unwrap();
+        fs::rename(&directory, &moved).unwrap();
+        fs::create_dir(&directory).unwrap();
+        let replacement_stage = directory.join(&stage_name);
+        fs::write(&replacement_stage, b"replacement stage").unwrap();
         const BYTES: &[u8] = b"unpublished secret";
 
-        let error =
-            write_staged_file(staged, &path, &destination, BYTES, FileMode::Secret).unwrap_err();
+        let error = write_staged_file(&parent, staged, &stage_name, name, BYTES, FileMode::Secret)
+            .unwrap_err();
         assert!(
             matches!(error, AccountHomeError::Io(error) if error.raw_os_error() == Some(libc::EISDIR))
         );
-        assert!(destination.is_dir());
-        assert!(!path.exists());
+        assert!(moved.join(name).is_dir());
+        assert!(!moved.join(stage_name).exists());
+        assert!(!directory.join(name).exists());
+        assert_eq!(fs::read(replacement_stage).unwrap(), b"replacement stage");
         let mut contents = Vec::new();
         reader.read_to_end(&mut contents).unwrap();
         assert_eq!(contents, [0; BYTES.len()]);
@@ -1352,13 +1215,25 @@ mod windows_tests {
     fn failed_replace_restores_target() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("secret.json");
+        let stage = root.path().join("staged.tmp");
         fs::write(&path, b"old-key").unwrap();
+        fs::write(&stage, b"new-key").unwrap();
         let reader = File::open(&path).unwrap();
+        let parent = record_directory::open_root(root.path()).unwrap();
+        // A stage without DELETE access fails the install after the old name moved aside.
+        let restricted_stage = File::open(&stage).unwrap();
 
-        let error = replace_secret_file(&root.path().join("missing.tmp"), &path).unwrap_err();
+        let error = record_directory::replace_secret(
+            &parent,
+            &restricted_stage,
+            record_name(&stage).unwrap(),
+            record_name(&path).unwrap(),
+        )
+        .unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(fs::read(&path).unwrap(), b"old-key");
+        assert_eq!(fs::read(&stage).unwrap(), b"new-key");
         drop(reader);
     }
 }

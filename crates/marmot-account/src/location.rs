@@ -179,8 +179,15 @@ pub(crate) mod android {
         Ok(PathBuf::from(object_string(
             env,
             &value,
-            "getCanonicalPath",
+            "getAbsolutePath",
         )?))
+    }
+
+    pub(crate) fn no_backup_dir(
+        env: &mut JNIEnv<'_>,
+        context: &JObject<'_>,
+    ) -> AccountHomeResult<PathBuf> {
+        directory(env, context, "getNoBackupFilesDir")
     }
 
     fn data_field(
@@ -246,7 +253,7 @@ pub(crate) mod android {
             } else {
                 data_field(env, &info, "dataDir")?
             };
-            let no_backup = directory(env, &supplied, "getNoBackupFilesDir")?;
+            let no_backup = no_backup_dir(env, &supplied)?;
             let other = if sdk < 24 {
                 None
             } else {

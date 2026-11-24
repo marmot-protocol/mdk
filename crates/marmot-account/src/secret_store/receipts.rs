@@ -1,5 +1,6 @@
 //! Account secret stores and their owned credential receipts.
 
+use std::ffi::OsStr;
 use std::fs::File;
 #[cfg(any(unix, windows))]
 use std::io::Write;
@@ -14,8 +15,8 @@ use crate::IosOptions;
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::home::{ACCOUNT_SECRET_FILE, LOCAL_FILE_SECRET_BACKEND};
 use crate::io::{
-    read_secret_json, read_secret_text_with, remove_file_then_scrub, sync_directory,
-    write_private_bytes, write_secret_bytes,
+    open_durable_private_dir, read_secret_json, read_secret_text_with, record_directory,
+    remove_file_then_scrub, write_private_record, write_secret_record,
 };
 use crate::native_vault::NativeVault;
 use crate::owned_vault::{self, Addressing, RecordKind, StoredSecretKeyHex, VaultStorage};
@@ -84,6 +85,8 @@ pub trait AccountSecretStore: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct LocalFileSecretStore {
     root: PathBuf,
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    ios_options: IosOptions,
     directory: Arc<OnceLock<FileVaultDirectory>>,
 }
 
@@ -104,14 +107,25 @@ impl FileVaultDirectory {
         Ok(&self.path)
     }
 
-    fn open_record(&self, kind: RecordKind, name: &str) -> io::Result<File> {
-        let owned = open_vault_child(&self.handle, OWNED_SECRET_DIR, true)?;
-        let records = open_vault_child(&owned, record_directory_name(kind), true)?;
-        open_vault_child(&records, name, false)
+    fn open_records(&self, kind: RecordKind) -> io::Result<File> {
+        let owned = record_directory::open_dir(&self.handle, OsStr::new(OWNED_SECRET_DIR))?;
+        record_directory::open_dir(&owned, OsStr::new(record_directory_name(kind)))
+    }
+
+    fn create_records(&self, kind: RecordKind) -> io::Result<File> {
+        let owned = record_directory::create_dir(&self.handle, OsStr::new(OWNED_SECRET_DIR))?;
+        let records =
+            record_directory::create_dir(&owned, OsStr::new(record_directory_name(kind)))?;
+        // Re-sync existing edges too: an earlier attempt may have failed before syncing them.
+        record_directory::sync(&records)?;
+        record_directory::sync(&owned)?;
+        record_directory::sync(&self.handle)?;
+        Ok(records)
     }
 
     fn read_marker(&self) -> AccountHomeResult<Option<[u8; VAULT_ID_LEN]>> {
-        let mut file = match open_vault_child(&self.handle, VAULT_ID_FILE, false) {
+        let mut file = match record_directory::open_record(&self.handle, OsStr::new(VAULT_ID_FILE))
+        {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -170,7 +184,7 @@ impl FileVaultDirectory {
 
         // Unpublished drafts wrote managed records without a marker. The old
         // pathname-derived namespace cannot verify which directory held them.
-        match open_vault_child(&self.handle, OWNED_SECRET_DIR, true) {
+        match record_directory::open_dir(&self.handle, OsStr::new(OWNED_SECRET_DIR)) {
             Ok(_) => {
                 return Err(AccountHomeError::SecretStore(
                     "file vault identity marker is missing over managed credential storage".into(),
@@ -203,164 +217,36 @@ fn marker_temp_name(marker: &[u8; VAULT_ID_LEN]) -> String {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn publish_vault_marker(parent: &File, marker: &[u8; VAULT_ID_LEN]) -> io::Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(windows)]
+    record_directory::require_ntfs(parent, false)?;
 
-    let temp = std::ffi::CString::new(marker_temp_name(marker)).expect("encoded marker filename");
-    let leaf = std::ffi::CString::new(VAULT_ID_FILE).expect("marker filename");
-    let directory = parent.as_raw_fd();
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // The directory and NUL-terminated filename outlive openat.
-    let fd = unsafe {
-        libc::openat(
-            directory,
-            temp.as_ptr(),
-            flags,
-            libc::c_uint::from(0o600u16),
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // A successful openat owns this descriptor.
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let result = (|| {
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let temporary = marker_temp_name(marker);
+    let stage = OsStr::new(&temporary);
+    let name = OsStr::new(VAULT_ID_FILE);
+    let mut file = record_directory::create_stage(parent, stage)?;
+    let published = (|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(marker)?;
         file.sync_all()?;
-        // linkat publishes the synced inode without replacing an existing name.
-        // Both names are live C strings relative to the same held directory.
-        if unsafe { libc::linkat(directory, temp.as_ptr(), directory, leaf.as_ptr(), 0) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        #[cfg(unix)]
+        let result = record_directory::link_new(parent, stage, name);
+        #[cfg(windows)]
+        let result = record_directory::publish_new(parent, &file, name);
+        result
     })();
-    // Remove only the staging name, even if publication failed.
-    let removed = if unsafe { libc::unlinkat(directory, temp.as_ptr(), 0) } < 0 {
-        Err(io::Error::last_os_error())
+    // POSIX publishes a second link. Windows renames the staging file itself.
+    let removed = if cfg!(unix) || published.is_err() {
+        record_directory::discard_stage(parent, &file, stage)
     } else {
         Ok(())
     };
-    result.and(removed).and(parent.sync_all())
-}
-
-#[cfg(windows)]
-fn publish_vault_marker(parent: &File, marker: &[u8; VAULT_ID_LEN]) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use std::ptr::null_mut;
-    use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_DISPOSITION_INFORMATION, FILE_RENAME_INFORMATION, FILE_WRITE_THROUGH,
-        FileDispositionInformation, FileRenameInformation, NtSetInformationFile,
-    };
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_GENERIC_WRITE, GetVolumeInformationByHandleW,
-    };
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-
-    let mut filesystem = [0u16; 32];
-    // Only the filesystem-name output is requested; its buffer and the handle are live.
-    if unsafe {
-        GetVolumeInformationByHandleW(
-            parent.as_raw_handle(),
-            null_mut(),
-            0,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            filesystem.as_mut_ptr(),
-            filesystem.len() as u32,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    // NTFS applies write-through to rename metadata as well as file content.
-    if !filesystem.starts_with(&[b'N' as u16, b'T' as u16, b'F' as u16, b'S' as u16, 0]) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "durable file vault markers require NTFS",
-        ));
-    }
-
-    let temp = marker_temp_name(marker);
-    let mut file = open_windows_vault_child(
-        parent,
-        &temp,
-        false,
-        FILE_GENERIC_WRITE | DELETE,
-        FILE_CREATE,
-        FILE_WRITE_THROUGH,
-        0,
-    )?;
-    let mut status_block = IO_STATUS_BLOCK::default();
-    if let Err(error) = file.write_all(marker).and_then(|()| file.sync_all()) {
-        let disposition = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
-        // This handle still names staging, owns DELETE access, and closes after the call.
-        unsafe {
-            NtSetInformationFile(
-                file.as_raw_handle(),
-                &mut status_block,
-                (&raw const disposition).cast(),
-                size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
-                FileDispositionInformation,
-            )
-        };
-        return Err(error);
-    }
-    // A simple name with a null RootDirectory is a same-directory rename.
-    // The staging handle pins that directory even if its pathname moved.
-    #[repr(C)]
-    struct Rename {
-        flags: u32,
-        root: HANDLE,
-        length: u32,
-        name: [u16; VAULT_ID_FILE.len() + 4],
-    }
-    const NAME_BYTES: usize = VAULT_ID_FILE.len() * size_of::<u16>();
-    const {
-        assert!(
-            std::mem::offset_of!(Rename, name)
-                == std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName)
-        );
-        assert!(size_of::<Rename>() >= size_of::<FILE_RENAME_INFORMATION>() + NAME_BYTES);
-    }
-    let mut rename = Rename {
-        flags: 0, // ReplaceIfExists = FALSE.
-        root: null_mut(),
-        length: NAME_BYTES as u32,
-        name: [0; VAULT_ID_FILE.len() + 4],
-    };
-    for (unit, byte) in rename.name.iter_mut().zip(VAULT_ID_FILE.bytes()) {
-        *unit = u16::from(byte);
-    }
-    // The rename buffer and synchronous, write-through handle remain valid for the call.
-    let status = unsafe {
-        NtSetInformationFile(
-            file.as_raw_handle(),
-            &mut status_block,
-            (&raw const rename).cast(),
-            size_of::<Rename>() as u32,
-            FileRenameInformation,
-        )
-    };
-    let result = check_nt_status(status);
-    if matches!(&result, Err(error) if error.kind() == io::ErrorKind::AlreadyExists) {
-        let disposition = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
-        // On a collision, the handle still names staging and closes after this call.
-        unsafe {
-            NtSetInformationFile(
-                file.as_raw_handle(),
-                &mut status_block,
-                (&raw const disposition).cast(),
-                size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
-                FileDispositionInformation,
-            )
-        };
-    }
-    result
+    published.and(removed).and(record_directory::sync(parent))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -394,213 +280,6 @@ fn is_vault_directory(_handle: &std::fs::File, _path: &Path) -> std::io::Result<
     ))
 }
 
-#[cfg(unix)]
-fn open_vault_directory(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    File::options()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_vault_directory(_path: &Path) -> io::Result<File> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "file vault requires stable directory identity",
-    ))
-}
-
-#[cfg(windows)]
-fn open_vault_directory(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_TRAVERSE,
-    };
-
-    let file = File::options()
-        .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    check_vault_object(&file, true)?;
-    Ok(file)
-}
-
-#[cfg(unix)]
-fn open_vault_child(parent: &File, name: &str, directory: bool) -> io::Result<File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-
-    let mut component = [0; RECORD_NAME_LEN + 1];
-    component[..name.len()].copy_from_slice(name.as_bytes());
-    let flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let directory_access = libc::O_PATH;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let directory_access = libc::O_RDONLY;
-    let flags = flags
-        | if directory {
-            libc::O_DIRECTORY | directory_access
-        } else {
-            libc::O_RDONLY
-        };
-    // `name` is a fixed vault component or a validated record name. The stack
-    // buffer is NUL-terminated and `parent` stays open for the call.
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), component.as_ptr().cast(), flags) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // openat returned a new descriptor owned by this call.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-#[cfg(windows)]
-fn open_vault_child(parent: &File, name: &str, directory: bool) -> io::Result<File> {
-    use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_READ_DATA, FILE_TRAVERSE};
-
-    let access = if directory {
-        FILE_TRAVERSE
-    } else {
-        FILE_READ_DATA
-    };
-    open_windows_vault_child(
-        parent,
-        name,
-        directory,
-        access,
-        FILE_OPEN,
-        0,
-        WINDOWS_VAULT_SHARE,
-    )
-}
-
-#[cfg(windows)]
-const WINDOWS_VAULT_SHARE: u32 = {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-};
-
-#[cfg(windows)]
-fn open_windows_vault_child(
-    parent: &File,
-    name: &str,
-    directory: bool,
-    access: u32,
-    disposition: u32,
-    options: u32,
-    share: u32,
-) -> io::Result<File> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
-    use std::ptr::{null, null_mut};
-    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-    use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
-        NtCreateFile,
-    };
-    use windows_sys::Win32::Foundation::{OBJ_CASE_INSENSITIVE, UNICODE_STRING};
-    use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE};
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-
-    let mut component = [0u16; RECORD_NAME_LEN];
-    for (unit, byte) in component.iter_mut().zip(name.bytes()) {
-        *unit = u16::from(byte);
-    }
-    let length = (name.len() * size_of::<u16>()) as u16;
-    let name = UNICODE_STRING {
-        Length: length,
-        MaximumLength: length,
-        Buffer: component.as_mut_ptr(),
-    };
-    let attributes = OBJECT_ATTRIBUTES {
-        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: parent.as_raw_handle(),
-        ObjectName: &name,
-        Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: null(),
-        SecurityQualityOfService: null(),
-    };
-    let access = access | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-    let options = options
-        | FILE_SYNCHRONOUS_IO_NONALERT
-        | FILE_OPEN_REPARSE_POINT
-        | if directory {
-            0
-        } else {
-            FILE_NON_DIRECTORY_FILE
-        };
-    let mut handle = null_mut();
-    let mut status_block = IO_STATUS_BLOCK::default();
-    // Each call opens one component, without following a final reparse point.
-    // The borrowed directory, name buffer and out pointers live through the call.
-    let status = unsafe {
-        NtCreateFile(
-            &mut handle,
-            access,
-            &attributes,
-            &mut status_block,
-            null(),
-            0,
-            share,
-            disposition,
-            options,
-            null(),
-            0,
-        )
-    };
-    check_nt_status(status)?;
-    // A successful open returned a new owned handle.
-    let file = unsafe { File::from_raw_handle(handle) };
-    check_vault_object(&file, directory)?;
-    Ok(file)
-}
-
-#[cfg(windows)]
-fn check_nt_status(status: windows_sys::Win32::Foundation::NTSTATUS) -> io::Result<()> {
-    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
-
-    if status < 0 {
-        // The function accepts an NTSTATUS value and returns a Win32 error code.
-        Err(io::Error::from_raw_os_error(
-            unsafe { RtlNtStatusToDosError(status) } as i32,
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-fn check_vault_object(file: &File, directory: bool) -> io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    let metadata = file.metadata()?;
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || if directory {
-            !metadata.is_dir()
-        } else {
-            !metadata.is_file()
-        }
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid file vault entry",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_vault_child(_parent: &File, _name: &str, _directory: bool) -> io::Result<File> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "file vault requires relative file opens",
-    ))
-}
-
 #[cfg(windows)]
 fn is_vault_directory(handle: &std::fs::File, path: &Path) -> std::io::Result<bool> {
     fn file_id(file: &std::fs::File) -> std::io::Result<(u64, [u8; 16])> {
@@ -625,7 +304,7 @@ fn is_vault_directory(handle: &std::fs::File, path: &Path) -> std::io::Result<bo
         Ok((info.VolumeSerialNumber, info.FileId.Identifier))
     }
 
-    let current = open_vault_directory(path)?;
+    let current = record_directory::open_root(path)?;
     Ok(file_id(handle)? == file_id(&current)?)
 }
 
@@ -655,14 +334,14 @@ fn acquire_vault_lease(dir: &File) -> io::Result<FileVaultGuard> {
     };
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
-    let file = open_windows_vault_child(
+    let file = record_directory::open_child(
         dir,
-        CREDENTIAL_STORE_LOCK_FILE,
+        OsStr::new(CREDENTIAL_STORE_LOCK_FILE),
         false,
         FILE_READ_DATA | FILE_WRITE_DATA,
         FILE_OPEN_IF,
         0,
-        WINDOWS_VAULT_SHARE,
+        record_directory::WINDOWS_SHARE,
     )?;
     let mut range = OVERLAPPED::default();
     // Lock the same whole-file range as fs-private. The synchronous handle and
@@ -696,9 +375,13 @@ fn acquire_vault_lease(_dir: &File) -> io::Result<FileVaultGuard> {
 }
 
 impl LocalFileSecretStore {
-    pub fn new(root: impl AsRef<Path>, _ios_options: IosOptions) -> Self {
+    pub fn new(root: impl AsRef<Path>, ios_options: IosOptions) -> Self {
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        let _ = ios_options;
         Self {
             root: root.as_ref().to_path_buf(),
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            ios_options,
             directory: Arc::new(OnceLock::new()),
         }
     }
@@ -708,27 +391,40 @@ impl LocalFileSecretStore {
             directory.verify()?;
             return Ok(directory);
         }
-        let root = match self.root.canonicalize() {
-            Ok(root) => root,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                crate::io::create_durable_private_dir(&self.root, &self.root)?;
-                self.root.canonicalize()?
+        let (root, handle) = match self.root.canonicalize() {
+            Ok(root) => {
+                #[cfg(any(target_os = "ios", target_os = "android"))]
+                crate::location::root_hash(&root, &self.ios_options)?;
+                let handle = record_directory::open_root(&root)?;
+                (root, handle)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let root = canonical_storage_candidate(&self.root)?;
+                #[cfg(any(target_os = "ios", target_os = "android"))]
+                crate::location::root_hash(&root, &self.ios_options)?;
+                let handle = open_durable_private_dir(&root, &root)?;
+                if root.canonicalize()? != root || !is_vault_directory(&handle, &root)? {
+                    return Err(AccountHomeError::SecretStore(
+                        "file vault directory changed during creation".into(),
+                    ));
+                }
+                (root, handle)
             }
             Err(error) => return Err(error.into()),
         };
-        let handle = open_vault_directory(&root)?;
-        if !handle.metadata()?.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotADirectory,
-                "file vault root must be a directory",
-            )
-            .into());
-        }
-        let directory = self.directory.get_or_init(|| FileVaultDirectory {
+        // Authorize the location independently of the random marker identity.
+        let selected = FileVaultDirectory {
             path: root,
             handle,
             namespace: OnceLock::new(),
-        });
+        };
+        selected.verify()?;
+        let directory = self.directory.get_or_init(|| selected);
+        if directory.path != self.root.canonicalize()? {
+            return Err(AccountHomeError::SecretStore(
+                "file vault directory changed during selection".into(),
+            ));
+        }
         directory.verify()?;
         Ok(directory)
     }
@@ -745,16 +441,14 @@ impl LocalFileSecretStore {
             .join(ACCOUNT_SECRET_FILE))
     }
 
-    fn owned_dir(&self, kind: RecordKind) -> AccountHomeResult<PathBuf> {
+    #[cfg(test)]
+    fn owned_path(&self, kind: RecordKind, name: &str) -> AccountHomeResult<PathBuf> {
+        validate_record_name(name)?;
         Ok(self
             .storage_root()?
             .join(OWNED_SECRET_DIR)
-            .join(record_directory_name(kind)))
-    }
-
-    fn owned_path(&self, kind: RecordKind, name: &str) -> AccountHomeResult<PathBuf> {
-        validate_record_name(name)?;
-        Ok(self.owned_dir(kind)?.join(name))
+            .join(record_directory_name(kind))
+            .join(name))
     }
 
     fn lock_directory(directory: &FileVaultDirectory) -> AccountHomeResult<FileVaultGuard> {
@@ -782,36 +476,16 @@ impl LocalFileSecretStore {
         if names.is_empty() {
             return Ok(());
         }
-        let directory = self.owned_dir(RecordKind::Receipt)?;
-        let mut result = Ok(());
         for name in names {
-            let name = name.as_ref();
-            validate_record_name(name)?;
-            result = result.and(scrub_and_remove_local_secret_file(&directory.join(name)));
+            validate_record_name(name.as_ref())?;
         }
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return result,
-            Err(error) => return result.and(Err(error.into())),
+        let directory = self.storage_directory()?;
+        let records = match directory.open_records(RecordKind::Receipt) {
+            Ok(records) => records,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
         };
-        let mut temporaries = Vec::new();
-        for entry in entries {
-            result = result.and((|| {
-                let entry = entry?;
-                if let Some(target) = entry.file_name().to_str().and_then(temporary_target)
-                    && names
-                        .binary_search_by(|name| name.as_ref().cmp(target))
-                        .is_ok()
-                {
-                    temporaries.push(entry.path());
-                }
-                Ok(())
-            })());
-        }
-        for temporary in temporaries {
-            result = result.and(scrub_and_remove_local_secret_file(&temporary));
-        }
-        result
+        Ok(remove_receipt_records(&records, names)?)
     }
 
     fn legacy_keys(&self, label: &str) -> AccountHomeResult<Option<nostr::prelude::Keys>> {
@@ -828,6 +502,51 @@ impl LocalFileSecretStore {
         nostr::prelude::Keys::parse(secret.secret_key_hex.as_str())
             .map(Some)
             .map_err(|_| AccountHomeError::InvalidSecretKey)
+    }
+}
+
+fn canonical_storage_candidate(path: &Path) -> io::Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let name = path.file_name().ok_or(error)?;
+            let parent = path.parent().filter(|part| !part.as_os_str().is_empty());
+            Ok(canonical_storage_candidate(parent.unwrap_or_else(|| Path::new(".")))?.join(name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_receipt_records(records: &File, names: &[impl AsRef<str>]) -> io::Result<()> {
+    let mut result = Ok(());
+    for name in names {
+        result = result.and(record_directory::remove_secret(
+            records,
+            OsStr::new(name.as_ref()),
+        ));
+    }
+    let mut temporaries = Vec::new();
+    result = result.and(record_directory::visit_entries(records, |name, _| {
+        if let Some(target) = name.to_str().and_then(temporary_target)
+            && names
+                .binary_search_by(|name| name.as_ref().cmp(target))
+                .is_ok()
+        {
+            temporaries.push(name.to_os_string());
+        }
+        Ok(())
+    }));
+    for temporary in temporaries {
+        result = result.and(record_directory::remove_secret(records, &temporary));
+    }
+    result.and(record_directory::sync(records))
+}
+
+fn read_owned_record(records: &File, name: &OsStr) -> AccountHomeResult<Option<Zeroizing<String>>> {
+    match read_secret_text_with(|| record_directory::open_record(records, name)) {
+        Ok(value) => Ok(Some(value)),
+        Err(AccountHomeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -854,36 +573,38 @@ impl VaultStorage for LocalFileSecretStore {
     fn read(&self, kind: RecordKind, name: &str) -> AccountHomeResult<Option<Zeroizing<String>>> {
         validate_record_name(name)?;
         let directory = self.storage_directory()?;
-        let value = read_secret_text_with(|| directory.open_record(kind, name));
+        let value = match directory.open_records(kind) {
+            Ok(records) => read_owned_record(&records, OsStr::new(name)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        };
         directory.verify()?;
-        match value {
-            Ok(value) => Ok(Some(value)),
-            Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
+        value
     }
 
     fn write(&self, kind: RecordKind, name: &str, value: &str) -> AccountHomeResult<()> {
-        let path = self.owned_path(kind, name)?;
-        let root = self.storage_root()?;
+        validate_record_name(name)?;
+        let directory = self.storage_directory()?;
+        let records = directory.create_records(kind)?;
+        let name = OsStr::new(name);
         if matches!(kind, RecordKind::Receipt) {
-            if let Some(existing) = self.read(kind, name)? {
+            if let Some(existing) = read_owned_record(&records, name)? {
                 if existing.as_str() == value {
-                    return self.sync(kind);
+                    return Ok(());
                 }
                 return Err(AccountHomeError::SecretStore(
                     "owned credential receipts are immutable".into(),
                 ));
             }
-            return write_secret_bytes(root, &path, value.as_bytes());
+            return write_secret_record(&records, name, value.as_bytes());
         }
-        write_private_bytes(root, &path, value.as_bytes())
+        write_private_record(&records, name, value.as_bytes())
     }
 
     fn sync(&self, kind: RecordKind) -> AccountHomeResult<()> {
-        Ok(sync_directory(&self.owned_dir(kind)?)?)
+        Ok(record_directory::sync(
+            &self.storage_directory()?.open_records(kind)?,
+        )?)
     }
 
     fn remove(&self, kind: RecordKind, name: &str) -> AccountHomeResult<()> {
@@ -900,29 +621,30 @@ impl VaultStorage for LocalFileSecretStore {
     }
 
     fn names(&self, kind: RecordKind) -> AccountHomeResult<Vec<String>> {
-        let entries = match std::fs::read_dir(self.owned_dir(kind)?) {
-            Ok(entries) => entries,
+        let directory = self.storage_directory()?;
+        let records = match directory.open_records(kind) {
+            Ok(records) => records,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
         let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
+        record_directory::visit_entries(&records, |name, regular| -> AccountHomeResult<()> {
+            if !regular {
                 return Err(AccountHomeError::SecretStore(
                     "owned credential record must be a regular file".into(),
                 ));
             }
-            let name = entry.file_name().into_string().map_err(|_| {
+            let name = name.to_str().ok_or_else(|| {
                 AccountHomeError::SecretStore("invalid owned credential filename".into())
             })?;
-            if let Some(target) = temporary_target(&name) {
-                self.owned_path(kind, target)?;
-                continue;
+            if let Some(target) = temporary_target(name) {
+                validate_record_name(target)?;
+            } else {
+                validate_record_name(name)?;
+                names.push(name.to_owned());
             }
-            self.owned_path(kind, &name)?;
-            names.push(name);
-        }
+            Ok(())
+        })?;
         Ok(names)
     }
 }
@@ -1273,10 +995,12 @@ mod tests {
         assert_ne!(other.as_str(), original.as_str());
 
         // Move the pathname after obtaining the directory, but before opening the record.
-        let pinned =
-            read_secret_text_with(|| held_directory.open_record(RecordKind::Receipt, &name))
-                .unwrap();
+        let records = held_directory.open_records(RecordKind::Receipt).unwrap();
+        let pinned = read_owned_record(&records, OsStr::new(&name))
+            .unwrap()
+            .unwrap();
         assert_eq!(pinned.as_str(), original.as_str());
+        drop(records);
 
         let reopened = LocalFileSecretStore::new(&moved, IosOptions::default());
         assert_eq!(reopened.cleanup_namespace().unwrap(), namespace);
@@ -1318,6 +1042,99 @@ mod tests {
         assert_eq!(held.read_marker().unwrap(), Some(original_id));
         assert_eq!(replacement.cleanup_namespace().unwrap(), namespace);
         drop(replacement_lease);
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn owned_record_io_stays_in_the_selected_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSecretStore::new(dir.path(), IosOptions::default());
+        let (_guard, _) = store.store_guard().unwrap();
+        let name = format!("{}-{}", "a".repeat(64), "b".repeat(64));
+        let path = store.owned_path(RecordKind::Receipt, &name).unwrap();
+        let records_path = path.parent().unwrap();
+        let held = store
+            .storage_directory()
+            .unwrap()
+            .create_records(RecordKind::Receipt)
+            .unwrap();
+        let moved = dir.path().join("original-receipts");
+        fs::rename(records_path, &moved).unwrap();
+        fs::create_dir(records_path).unwrap();
+        let stage = format!(".{name}.tmp.0.0");
+        fs::write(&path, b"replacement record").unwrap();
+        fs::write(records_path.join(&stage), b"replacement stage").unwrap();
+
+        write_secret_record(&held, OsStr::new(&name), b"original record").unwrap();
+        fs::write(moved.join(&stage), b"unpublished original record").unwrap();
+        assert_eq!(fs::read(moved.join(&name)).unwrap(), b"original record");
+
+        remove_receipt_records(&held, &[name]).unwrap();
+
+        assert!(fs::read_dir(&moved).unwrap().next().is_none());
+        assert_eq!(fs::read(&path).unwrap(), b"replacement record");
+        assert_eq!(
+            fs::read(records_path.join(stage)).unwrap(),
+            b"replacement stage"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reconcile_refuses_symlinked_retired_receipts_and_stages() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSecretStore::new(dir.path(), IosOptions::default());
+        let keys = nostr::prelude::Keys::generate();
+        let account_id = keys.public_key().to_hex();
+        let credential = SecretCredential {
+            label: "retired",
+            account_id_hex: &account_id,
+            home_id: &"11".repeat(32),
+            owner_id: &"22".repeat(32),
+            kind: SecretCredentialKind::Signing,
+        };
+        store
+            .acquire_secret(credential, SecretClaimMode::CreateOnly, Some(&keys))
+            .unwrap();
+        store
+            .release_secret(credential, SecretReleaseMode::DeleteIfUnowned)
+            .unwrap();
+        let name = receipt_name(credential);
+        let receipt = store.owned_path(RecordKind::Receipt, &name).unwrap();
+        let records = receipt.parent().unwrap();
+        let stage = format!(".{name}.tmp.0.0");
+        let external = dir.path().join("outside-receipts");
+        fs::rename(records, &external).unwrap();
+        let outside_receipt = external.join(&name);
+        let outside_stage = external.join(&stage);
+        fs::write(&outside_receipt, b"outside receipt").unwrap();
+        fs::write(&outside_stage, b"outside stage").unwrap();
+        let expects_refusal = || {
+            assert!(
+                matches!(store.reconcile_cleanup(), Err(AccountHomeError::Io(error))
+                if error.raw_os_error() == Some(libc::ELOOP))
+            );
+        };
+
+        symlink(&external, records).unwrap();
+        expects_refusal();
+        fs::remove_file(records).unwrap();
+
+        fs::create_dir(records).unwrap();
+        let staged_receipt = records.join(stage);
+        for (link, target) in [
+            (&receipt, &outside_receipt),
+            (&staged_receipt, &outside_stage),
+        ] {
+            symlink(target, link).unwrap();
+            expects_refusal();
+            assert_eq!(fs::read_link(link).unwrap(), *target);
+            fs::remove_file(link).unwrap();
+        }
+        assert_eq!(fs::read(&outside_receipt).unwrap(), b"outside receipt");
+        assert_eq!(fs::read(&outside_stage).unwrap(), b"outside stage");
     }
 
     #[test]

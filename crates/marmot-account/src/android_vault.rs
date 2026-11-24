@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
-use crate::location::android::{capture, checked, object_string, with_vm};
+use crate::location::android::{capture, checked, no_backup_dir, object_string, with_vm};
 use crate::owned_vault::{RecordKind, VaultStorage};
 
 const MAX_VALUE: usize = 8192;
@@ -30,7 +30,7 @@ const TRANSFORM: &str = "AES/GCM/NoPadding";
 
 pub(crate) struct NativeVault {
     vm: JavaVM,
-    _context: GlobalRef,
+    context: GlobalRef,
     no_backup: File,
     lease_name: String,
     service_dir: CString,
@@ -96,10 +96,12 @@ impl NativeVault {
         let lease_name = format!(".mdk-owned-vault-v1-{service_hash}.lock");
         let service_dir = CString::new(service_hash).expect("service hash has no NUL");
         let _lease = fs_private::try_acquire_lease_at(no_backup.as_fd(), OsStr::new(&lease_name))?;
+        check_root_entry(&no_backup, &context.no_backup)?;
         let directories = RecordDirectories::open(&no_backup, &service_dir, true)?;
+        check_no_backup(&context.vm, &context.context, &no_backup)?;
         Ok(Self {
             vm: context.vm,
-            _context: context.context,
+            context: context.context,
             no_backup,
             lease_name,
             service_dir,
@@ -139,7 +141,8 @@ impl NativeVault {
 
     fn check_current_directories(&self) -> AccountHomeResult<()> {
         let current = RecordDirectories::open(&self.no_backup, &self.service_dir, false)?;
-        self.directories.check_match(&current)
+        self.directories.check_match(&current)?;
+        check_no_backup(&self.vm, &self.context, &self.no_backup)
     }
 
     pub(crate) fn legacy_secret(
@@ -719,6 +722,21 @@ fn validate_name(name: &str) -> AccountHomeResult<()> {
     Ok(())
 }
 
+fn check_no_backup(vm: &JavaVM, context: &GlobalRef, opened: &File) -> AccountHomeResult<()> {
+    with_vm(vm, |env| {
+        check_root_entry(opened, &no_backup_dir(env, context.as_obj())?)
+    })
+}
+
+fn check_root_entry(opened: &File, path: &Path) -> AccountHomeResult<()> {
+    let current = fs::metadata(path)?;
+    let opened = opened.metadata()?;
+    if !current.is_dir() || (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+        return Err(failure("Android no-backup directory changed after capture"));
+    }
+    Ok(())
+}
+
 struct RecordDirectories {
     service: File,
     receipts: File,
@@ -984,5 +1002,28 @@ fn combine_errors(
         (Err(first), Err(second)) => {
             Err(AccountHomeError::SecretStore(format!("{first}; {second}")))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moved_no_backup_root_is_not_current() {
+        let host = tempfile::tempdir().unwrap();
+        let root = host.path().join("no_backup");
+        fs::create_dir(&root).unwrap();
+        let captured = File::open(&root).unwrap();
+        check_root_entry(&captured, &root).unwrap();
+
+        fs::rename(&root, host.path().join("moved")).unwrap();
+        fs::create_dir(&root).unwrap();
+
+        assert!(matches!(
+            check_root_entry(&captured, &root),
+            Err(AccountHomeError::SecretStore(message))
+                if message == "Android no-backup directory changed after capture"
+        ));
     }
 }

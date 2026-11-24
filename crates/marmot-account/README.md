@@ -84,12 +84,14 @@ On Android, the service lease lives outside the receipt directory. Reads and wri
 that lease. A write syncs its unpublished file, renames it atomically, and syncs the directory before returning.
 An invalid final receipt remains an error. A retry reuses its owner's Keystore key. Exact-owner removal deletes the
 unpublished file, final receipt, and key.
+Before reporting success, the vault checks that the OS-selected no-backup directory still matches the open directory.
 Windows managed copies use local-machine persistence and bind to the user SID and MachineGuid, not the computer
 name; they do not roam. Durable private record replacement on Windows requires NTFS with POSIX rename support.
 macOS checks a persistent marker in the captured keychain as well as its selected domain and path.
 The development file store keeps plaintext receipts under `.owned-secrets-v1` with private permissions.
 It checks a nonsecret ID in the pinned directory. Moving the vault with that ID keeps its identity; creating another
-vault at the old path does not. Keep the ID with the vault when restoring a backup.
+vault at the old path does not. Back up and restore the original `.credential-store-id-v1` from the vault root along
+with `.owned-secrets-v1`. MDK refuses to create a replacement marker over existing managed records.
 
 On Linux and BSD, select the intended Secret Service collection as the default before first use or legacy migration.
 MDK binds managed receipts to a nonsecret identity item in that collection. This identity survives keyring updates
