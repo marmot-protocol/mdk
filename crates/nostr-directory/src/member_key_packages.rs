@@ -261,6 +261,44 @@ pub struct MemberKeyPackagePrewarmSummary {
 pub struct MemberKeyPackageResolutionStats {
     pub(crate) requested_members: usize,
     pub unique_members: usize,
+    /// How completely relays answered the reads behind the selected accounts.
+    pub key_package_reads: MemberKeyPackageReadCoverage,
+}
+
+/// How completely relays answered the KeyPackage reads that selected
+/// accounts. Each selected account counts its deciding read: its
+/// single-author batch, or its single-author fallback read. Selection uses
+/// what an incomplete read returned (D12), so a device whose only package
+/// sat on a relay that did not answer is left out without a trace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemberKeyPackageReadCoverage {
+    /// Selected accounts whose read heard every relay it asked to the end of
+    /// its stored events.
+    pub complete_reads: usize,
+    /// Selected accounts whose read did not.
+    pub incomplete_reads: usize,
+    /// Relays those reads asked.
+    pub relays_asked: usize,
+    /// Relays among them whose own read finished.
+    pub relays_answered: usize,
+}
+
+impl MemberKeyPackageReadCoverage {
+    fn of_read(asked: usize, outcome: &DirectoryFetchOutcome) -> Self {
+        Self {
+            complete_reads: usize::from(outcome.complete),
+            incomplete_reads: usize::from(!outcome.complete),
+            relays_asked: asked,
+            relays_answered: outcome.complete_endpoints.len().min(asked),
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        self.complete_reads += other.complete_reads;
+        self.incomplete_reads += other.incomplete_reads;
+        self.relays_asked += other.relays_asked;
+        self.relays_answered += other.relays_answered;
+    }
 }
 
 impl From<MemberKeyPackageResolutionStats> for MemberKeyPackagePrewarmSummary {
@@ -551,6 +589,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let mut outcomes = (0..targets.len())
             .map(|_| None)
             .collect::<Vec<Option<Result<Vec<KeyPackage>, DirectoryError>>>>();
+        let mut read_coverage = vec![None; targets.len()];
         // Even a valid, unexpired cached package may have been consumed on
         // another device. Every purpose, including composition prewarm, must
         // fetch current relay publications; only discovery routes are reused.
@@ -623,6 +662,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             &targets,
                             &key_package_unresolved,
                             &mut outcomes,
+                            &mut read_coverage,
                             purpose,
                             requirements,
                             cut_offs.map(|cut_offs| cut_offs.key_package_batches),
@@ -740,7 +780,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let unique_members = targets.len();
         let mut key_packages = Vec::with_capacity(unique_members);
         let mut member_outcomes = Vec::with_capacity(unique_members);
-        for (target, outcome) in targets.into_iter().zip(outcomes) {
+        let mut key_package_reads = MemberKeyPackageReadCoverage::default();
+        for ((target, outcome), coverage) in targets.into_iter().zip(outcomes).zip(read_coverage) {
             let outcome = outcome.unwrap_or_else(|| {
                 Err(DirectoryError::MissingKeyPackage {
                     account: target.account_id_hex.clone(),
@@ -751,6 +792,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 Ok(packages) => {
                     let device_count = packages.len() as u32;
                     key_packages.extend(packages);
+                    key_package_reads.add(coverage.unwrap_or_default());
                     (MemberResolutionStatus::Selected, device_count)
                 }
                 Err(error) => {
@@ -776,6 +818,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             stats: MemberKeyPackageResolutionStats {
                 requested_members: member_refs.len(),
                 unique_members,
+                key_package_reads,
             },
         })
     }
@@ -1149,6 +1192,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         targets: &[MemberTarget],
         unresolved: &[usize],
         outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
+        read_coverage: &mut [Option<MemberKeyPackageReadCoverage>],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         batch_cut_off: Option<tokio::time::Instant>,
@@ -1215,11 +1259,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .map(move |(indices, endpoints, queries)| {
                 let directory = directory.clone();
                 started_before(batch_cut_off, async move {
+                    let asked = endpoints.len();
                     let result = directory
                         .relay_plane
                         .fetch_directory_events_with_completion(endpoints, queries)
                         .await
-                        .map(|outcome| outcome.records)
+                        .map(|outcome| {
+                            let coverage = MemberKeyPackageReadCoverage::of_read(asked, &outcome);
+                            (outcome.records, coverage)
+                        })
                         .map_err(DirectoryError::RelayDirectory);
                     (indices, result)
                 })
@@ -1234,7 +1282,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         // Members whose batch read could not decide them, with what it saw.
         let mut fallback_records = BTreeMap::new();
         while let Some((indices, result)) = next_before(&mut batches, batch_cut_off).await {
-            let records = result?;
+            let (records, coverage) = result?;
             let multiple_authors = indices.len() > 1;
             let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
             for record in records {
@@ -1275,6 +1323,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             selected,
                             &targets[index].relay_lists,
                         ));
+                        read_coverage[index] = Some(coverage);
                     }
                     // Bounded multi-author results can hide some of an
                     // account's slots or their deletion requests. Relays may
@@ -1334,12 +1383,17 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     let directory = directory.clone();
                     async move {
                         let queries = key_package_queries(vec![target.account_id_hex.clone()]);
+                        let mut coverage = None;
                         let result = async {
                             let fetched = directory
                                 .relay_plane
                                 .fetch_directory_events_with_completion(endpoints.clone(), queries)
                                 .await
                                 .map_err(DirectoryError::RelayDirectory)?;
+                            coverage = Some(MemberKeyPackageReadCoverage::of_read(
+                                endpoints.len(),
+                                &fetched,
+                            ));
                             let mut records = fetched.records;
                             // This supplementary lookup must not discard a
                             // valid package observed in this call's batch.
@@ -1380,15 +1434,16 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             .into_value_or_missing(&target.account_id_hex)
                         }
                         .await;
-                        (index, result)
+                        (index, result, coverage)
                     }
                 });
         let mut fallback_results =
             stream::iter(work).buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY);
-        while let Some((index, result)) = fallback_results.next().await {
+        while let Some((index, result, coverage)) = fallback_results.next().await {
             outcomes[index] = Some(result.and_then(|selected| {
                 self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)
             }));
+            read_coverage[index] = coverage;
         }
         Ok(())
     }

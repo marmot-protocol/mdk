@@ -739,6 +739,10 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     pub(super) failing_single_author: std::sync::Mutex<Option<String>>,
     pub(crate) stalled_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
+    /// A relay whose reads never finish, inside completion reads that the
+    /// request's other relays answer: it returns nothing and is left out of
+    /// the read's complete endpoints.
+    unanswered_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_query_kind: std::sync::Mutex<Option<u64>>,
     failing_endpoint: std::sync::Mutex<Option<String>>,
     failing_endpoint_kind: std::sync::Mutex<Option<u64>>,
@@ -791,6 +795,11 @@ impl MemberResolutionDirectoryFetcher {
     pub(crate) fn fail_all_fetches(&self) {
         self.fail_all
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Leave `endpoint` unanswered in every later completion read.
+    pub(crate) fn leave_unanswered(&self, endpoint: &str) {
+        *self.unanswered_endpoint.lock().unwrap() = Some(endpoint.to_owned());
     }
 
     pub(crate) fn incomplete_key_packages(&self) {
@@ -1003,7 +1012,13 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         });
         let mut retained = Vec::<transport_nostr::DirectoryRelayEventRecord>::new();
         let mut complete = complete;
-        for endpoint in &endpoints {
+        let unanswered = self.unanswered_endpoint.lock().unwrap().clone();
+        let answered = endpoints
+            .iter()
+            .filter(|endpoint| unanswered.as_ref() != Some(&endpoint.0))
+            .cloned()
+            .collect::<Vec<_>>();
+        for endpoint in &answered {
             for query in &queries {
                 // Apply full filters before relay limits, and count unique ids.
                 let mut seen = std::collections::BTreeSet::new();
@@ -1032,8 +1047,8 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         }
         Ok(transport_nostr::DirectoryFetchOutcome {
             records: retained,
-            complete,
-            complete_endpoints: if complete { endpoints } else { Vec::new() },
+            complete: complete && answered.len() == endpoints.len(),
+            complete_endpoints: if complete { answered } else { Vec::new() },
         })
     }
 }

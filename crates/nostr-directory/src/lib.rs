@@ -37,9 +37,9 @@ pub use ids::{
     parse_account_id_hex, validate_relay_urls,
 };
 pub use member_key_packages::{
-    MemberKeyPackagePrewarmSummary, MemberKeyPackageResolutionStats, MemberResolutionOutcome,
-    MemberResolutionPolicy, MemberResolutionPurpose, MemberResolutionStatus,
-    ResolvedMemberKeyPackages,
+    MemberKeyPackagePrewarmSummary, MemberKeyPackageReadCoverage, MemberKeyPackageResolutionStats,
+    MemberResolutionOutcome, MemberResolutionPolicy, MemberResolutionPurpose,
+    MemberResolutionStatus, ResolvedMemberKeyPackages,
 };
 pub use observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 pub use previews::{MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead};

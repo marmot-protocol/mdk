@@ -45,6 +45,12 @@ site, and absence of a row does not establish that an operation never occurred.
   after relay acknowledgement. Startup repair-index reconstruction is silent.
   Retry attempts are bounded retry invocations; a batch may contain multiple
   Welcomes. Neither measurement proves recipient receipt or decryption.
+- Welcome `process/attempt` is one inbox delivery this device ingested.
+  `duplicate` is a copy it already had or its own echo. `absent` is a Welcome
+  naming another KeyPackage of this account, a sibling device's delivery: it
+  reached the account but not this device, which cannot join from it. Rows
+  count deliveries, not invitations: `absent` without a matching `success`
+  points at devices that saw only their siblings' Welcomes.
 - Generated account setup records the full local-ready phase once and network-ready
   attempts separately; the local handoff remains an OTLP-only submeasurement.
   Local notification settings and native push settings have separate operations.

@@ -509,7 +509,10 @@ impl AppClient {
                         .await;
                     resolution.finish(&resolved);
                     let resolved = match resolved {
-                        Ok(resolved) => resolved.key_packages,
+                        Ok(resolved) => {
+                            self.record_key_package_read_coverage(resolved.stats.key_package_reads);
+                            resolved.key_packages
+                        }
                         Err(_) => break,
                     };
                     let refs = |package: &cgka_traits::engine::KeyPackage| {
