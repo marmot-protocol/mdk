@@ -1827,10 +1827,14 @@ impl SqliteAppStorage {
             conn.execute_cached("DELETE FROM account_recovery_epoch_gap_retries", [])
                 .storage()?;
             conn.execute_cached(
-                "UPDATE account_recovery_obligations SET eligibility=0,parked_at_ms=NULL,revision=revision+1
+                "UPDATE account_recovery_obligations
+                 SET eligibility=0, parked_at_ms=NULL,
+                     evidence_floor_epoch=CASE WHEN eligibility=4 THEN stalled_epoch ELSE evidence_floor_epoch END,
+                     revision=revision+1
                  WHERE cause=1 AND state=0",
                 [],
-            ).storage()?;
+            )
+            .storage()?;
             Ok(rearmed)
         })
     }

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Added
+
+- `Engine::deferred_stall_evidence_since` returns deferred stall evidence for rows whose arrival epoch falls in
+  `min_epoch..=group.epoch`, for active epoch-gap handoffs across partial advances.
+
+### Changed
+
+- Budget-expired deferred-peel evictions delete the deferred row from `cgka_messages` directly instead of calling
+  `release_message_for_replay`, so storage hosts are no longer notified via the release journal for budget-expired
+  rows, avoiding false epoch-gap arms, `seen_events` retirement, and relay bounce-backs.
+
+### Fixed
+
+- Re-deferring an unopenable `PeelDeferred` row across an epoch sweep preserves its original arrival epoch instead of
+  restamping it to the tip epoch.
+- Deferred-peel sweeps at the retry-budget or residence-budget cutoff attempt a newly arrived peel context once before
+  deleting the row, so a commit that unlocks the row on the cutoff sweep decrypts instead of being discarded.
+
 ## 0.19.0 - 2026-11-22
 
 ### Breaking changes

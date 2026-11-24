@@ -1981,7 +1981,31 @@ async fn deferred_peel_redeferral_records_no_self_transition() {
     assert!(carol_peeler.attempts_for(&stuck_app.id) > attempts_before);
     let record = carol_storage.get_message(&stuck_app.id).unwrap();
     assert_eq!(record.state, MessageState::PeelDeferred);
-    assert_eq!(record.epoch, EpochId(2), "the retry restamped the row");
+    assert_eq!(
+        record.epoch,
+        EpochId(1),
+        "re-deferral preserves the arrival epoch"
+    );
+    let at_tip = carol.deferred_stall_evidence(&group_id, 8).unwrap();
+    assert_eq!(at_tip.epoch, EpochId(2));
+    assert!(
+        at_tip.rows.is_empty(),
+        "prior-epoch deferred rows must not look like fresh stall evidence at epoch 2"
+    );
+    let since_arrival = carol
+        .deferred_stall_evidence_since(&group_id, EpochId(1), 8)
+        .unwrap();
+    assert_eq!(since_arrival.epoch, EpochId(2));
+    assert_eq!(since_arrival.rows.len(), 1);
+    assert_eq!(since_arrival.rows[0].message_id, stuck_app.id);
+    assert!(
+        carol
+            .deferred_stall_evidence_since(&group_id, EpochId(2), 8)
+            .unwrap()
+            .rows
+            .is_empty(),
+        "deferred_stall_evidence_since excludes rows older than min_epoch"
+    );
 
     drop(carol);
     let stuck_hex = hex::encode(stuck_app.id.as_slice());
@@ -2030,8 +2054,9 @@ async fn deferred_peel_retry_budget_refuses_without_terminal_dedup() {
         MessageState::PeelDeferred
     );
 
-    // The epoch-2 commit changes the context; the next sweep finds the row
-    // over budget and releases it without another peel attempt.
+    // The epoch-2 commit changes the context; the next sweep gives the new
+    // context one final attempt and, when it still cannot peel, releases the
+    // over-budget row.
     carol.ingest(commit2.clone()).await.unwrap();
     carol
         .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
@@ -4988,6 +5013,9 @@ async fn advancing_live_epoch_spends_the_retry_budget_once_per_epoch() {
     let (mut alice, mut carol, carol_storage, _peeler, group_id, commit2, commit3) =
         carol_behind_two_epochs().await;
 
+    // A message from epoch 3 (which `commit3` will unlock at the cutoff sweep).
+    let readable_at_cutoff = send_app(&mut alice, &group_id, "unlocks-at-cutoff").await;
+
     // One more alice-only epoch, so the stuck row stays unreadable at every
     // epoch carol reaches.
     let (mut frank, _frank_storage) = build_client(b"frank-beyond-every-epoch");
@@ -5006,14 +5034,16 @@ async fn advancing_live_epoch_spends_the_retry_budget_once_per_epoch() {
 
     carol.set_deferred_peel_retry_budget(2);
     let stuck_app = send_app(&mut alice, &group_id, "ahead of every epoch carol reaches").await;
-    assert!(matches!(
-        carol.ingest(stuck_app.clone()).await.unwrap(),
-        IngestOutcome::TransportDeferred { .. }
-    ));
+    for msg in [&readable_at_cutoff, &stuck_app] {
+        assert!(matches!(
+            carol.ingest(msg.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
 
-    let attempts = |storage: &SqliteAccountStorage| {
+    let attempts = |storage: &SqliteAccountStorage, id: &MessageId| {
         storage
-            .get_message(&stuck_app.id)
+            .get_message(id)
             .unwrap()
             .deferred_peel
             .expect("deferred lifecycle persisted")
@@ -5026,7 +5056,8 @@ async fn advancing_live_epoch_spends_the_retry_budget_once_per_epoch() {
         .await
         .unwrap();
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
-    assert_eq!(attempts(&carol_storage), 1);
+    assert_eq!(attempts(&carol_storage, &stuck_app.id), 1);
+    assert_eq!(attempts(&carol_storage, &readable_at_cutoff.id), 1);
 
     // Live context 2: epoch 2.
     carol.ingest(commit2).await.unwrap();
@@ -5035,9 +5066,12 @@ async fn advancing_live_epoch_spends_the_retry_budget_once_per_epoch() {
         .await
         .unwrap();
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
-    assert_eq!(attempts(&carol_storage), 2);
+    assert_eq!(attempts(&carol_storage, &stuck_app.id), 2);
+    assert_eq!(attempts(&carol_storage, &readable_at_cutoff.id), 2);
 
-    // Live context 3: epoch 3 — the row is over budget and refused.
+    // Live context 3: epoch 3 — both rows are at the retry cutoff, so each
+    // gets one bounded attempt in the new context: `readable_at_cutoff`
+    // decrypts while `stuck_app` still fails and is refused.
     carol.drain_events();
     carol.ingest(commit3).await.unwrap();
     carol
@@ -5045,6 +5079,14 @@ async fn advancing_live_epoch_spends_the_retry_budget_once_per_epoch() {
         .await
         .unwrap();
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(
+        carol_storage
+            .get_message(&readable_at_cutoff.id)
+            .unwrap()
+            .state,
+        MessageState::Processed,
+        "a row unlocked by the cutoff commit must decrypt instead of being discarded"
+    );
     assert!(
         matches!(
             carol_storage.get_message(&stuck_app.id),
@@ -5052,8 +5094,17 @@ async fn advancing_live_epoch_spends_the_retry_budget_once_per_epoch() {
         ),
         "a row a live-context advance can never open must still be refused"
     );
+    let events = carol.drain_events();
     assert!(
-        carol.drain_events().iter().any(|event| matches!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::MessageReceived { payload, .. }
+                if String::from_utf8_lossy(payload).contains("unlocks-at-cutoff")
+        )),
+        "the unlocked row must deliver its application message"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
             event,
             GroupEvent::TransportObjectResourceRefused {
                 message_id,
@@ -5062,6 +5113,108 @@ async fn advancing_live_epoch_spends_the_retry_budget_once_per_epoch() {
             } if *message_id == stuck_app.id
         )),
         "the refusal must name the retry budget, not residence or capacity"
+    );
+}
+
+/// If a commit unlocks a deferred row right as its residence deadline elapses,
+/// the sweep gives the newly arrived peel context one bounded attempt so the
+/// readable message decrypts while an unreadable row at the same deadline is
+/// still released with `TransportDeferredResidenceBudget`.
+#[tokio::test]
+async fn deferred_peel_residence_expiry_tries_new_context_before_releasing() {
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let carol_client =
+        build_counting_client_with_storage_and_clock(b"carol", storage.clone(), clock.clone());
+    let (mut alice, mut carol, carol_storage, _peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs_with(carol_client).await;
+
+    // Epoch-3 message unlocked once `commit2` and `commit3` apply.
+    let readable_at_deadline = send_app(&mut alice, &group_id, "unlocks-at-residence").await;
+
+    // Advance Alice to epoch 4 so `stuck_app` remains unreadable at epoch 3.
+    let (mut frank, _frank_storage) = build_client(b"frank-res-cutoff");
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let (_withheld, pending) = evolution(
+        alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![frank_kp],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(pending).await.unwrap();
+    let stuck_app = send_app(&mut alice, &group_id, "still-unreadable-at-residence").await;
+
+    carol.set_deferred_peel_residence_ms(1_000);
+    for msg in [&readable_at_deadline, &stuck_app] {
+        assert!(matches!(
+            carol.ingest(msg.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+
+    // First sweep at epoch 1 records `last_context_fingerprint` before expiry.
+    carol.retry_deferred_peels(&group_id).await.unwrap();
+    assert_eq!(
+        carol_storage
+            .get_message(&readable_at_deadline.id)
+            .unwrap()
+            .state,
+        MessageState::PeelDeferred
+    );
+    assert_eq!(
+        carol_storage.get_message(&stuck_app.id).unwrap().state,
+        MessageState::PeelDeferred
+    );
+
+    // Advance past the residence deadline right as the unlocking commits land.
+    clock.advance_ms(1_500);
+    carol.drain_events();
+    carol.ingest(commit2).await.unwrap();
+    carol.ingest(commit3).await.unwrap();
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_005)
+        .await
+        .unwrap();
+
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(
+        carol_storage
+            .get_message(&readable_at_deadline.id)
+            .unwrap()
+            .state,
+        MessageState::Processed,
+        "a row unlocked right as its residence deadline elapses must decrypt"
+    );
+    assert!(
+        matches!(
+            carol_storage.get_message(&stuck_app.id),
+            Err(StorageError::NotFound)
+        ),
+        "an unreadable row at the residence deadline must still be released"
+    );
+    let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::MessageReceived { payload, .. }
+                if String::from_utf8_lossy(payload).contains("unlocks-at-residence")
+        )),
+        "the unlocked row must deliver its application message"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::TransportObjectResourceRefused {
+                message_id,
+                resource: InboundResourceLimit::TransportDeferredResidenceBudget,
+                ..
+            } if *message_id == stuck_app.id
+        )),
+        "the still-unreadable row must be refused under the residence budget"
     );
 }
 

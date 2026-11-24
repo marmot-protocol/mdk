@@ -874,14 +874,9 @@ async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
     );
 }
 
-/// The application's release journal honours the same decision (mdk#3536).
-///
-/// Consuming the journal on the next receipt sync or account open arms an
-/// epoch gap from each release it holds, the durable twin of the refusal
-/// event. A row that may predate this copy's Welcome must not arm one there
-/// either, or the newly linked device reports it cannot catch up and holds the
-/// device-group work its KeyPackage handoff waits on (mdk#3535). The release
-/// is otherwise unchanged: the id still comes back for redelivery.
+/// A budget-expired deferred row that predates this copy's Welcome deletes its
+/// engine row without journaling a replay release or arming an epoch gap
+/// (mdk#3536, mdk#3535).
 #[tokio::test]
 async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
     let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"journal").await;
@@ -922,9 +917,8 @@ async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
         bob.ingest(predating.clone()).await.unwrap(),
         IngestOutcome::TransportDeferred { .. }
     ));
-    // The app places a retained delivery in its recovery inventory. Once the
-    // row is released, that inventory row re-owes the message; an epoch gap
-    // re-owes only a release that has none.
+    // The app places a retained delivery in its recovery inventory. Budget
+    // expiry preserves that inventory row and arms no epoch gap.
     bob_storage
         .app_storage()
         .record_reconciliation_items(std::iter::once((
@@ -947,10 +941,12 @@ async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
         "the row is released"
     );
 
-    assert_eq!(
-        bob_storage.consume_released_transport_receipts().unwrap(),
-        vec![predating.id],
-        "and its id comes back for redelivery"
+    assert!(
+        bob_storage
+            .consume_released_transport_receipts()
+            .unwrap()
+            .is_empty(),
+        "budget expiry does not journal a replay release"
     );
     assert!(
         bob_storage
@@ -958,7 +954,7 @@ async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
             .pending_epoch_backfill_intents()
             .unwrap()
             .is_empty(),
-        "but it arms no epoch gap"
+        "and it arms no epoch gap"
     );
 }
 fn unix_seconds_now() -> u64 {
@@ -1082,5 +1078,132 @@ async fn deferred_stall_evidence_lists_current_epoch_rows_newer_than_the_welcome
             .len(),
         1,
         "the limit bounds the rows returned"
+    );
+}
+
+/// Evicting an old `PeelDeferred` row on its residence or retry budget deletes
+/// the engine row without journaling a replay release, retiring `seen_events`,
+/// deleting recovery inventory, uncovering coverage, or arming an epoch gap
+/// (even when the row has no inventory record, e.g. after 30-day retention).
+#[tokio::test]
+async fn expired_deferred_row_arms_no_epoch_gap_and_keeps_inventory() {
+    let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"expired").await;
+
+    let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
+    bob.join_welcome(welcome).await.unwrap();
+    bob.drain_events();
+    bob_storage
+        .app_storage()
+        .ensure_account_projection("bob")
+        .unwrap();
+    assert!(
+        bob_storage
+            .consume_released_transport_receipts()
+            .unwrap()
+            .is_empty()
+    );
+
+    let _withheld = evolve(
+        &mut alice,
+        SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        },
+    )
+    .await;
+    let route = storage_sqlite::TransportReconciliationRoute::Group([9; 32]);
+    let with_inventory = TransportMessage {
+        id: MessageId::new(vec![0x61; 32]),
+        ..route_at(
+            chat(&mut alice, &group_id, "post-welcome with inventory").await,
+            &group_id,
+            PAST_THE_WELCOME_MARGIN + 60,
+        )
+    };
+    let without_inventory = TransportMessage {
+        id: MessageId::new(vec![0x62; 32]),
+        ..route_at(
+            chat(&mut alice, &group_id, "post-welcome without inventory").await,
+            &group_id,
+            PAST_THE_WELCOME_MARGIN + 120,
+        )
+    };
+    bob.set_deferred_peel_residence_ms(0);
+    for msg in [&with_inventory, &without_inventory] {
+        assert!(matches!(
+            bob.ingest(msg.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+    let item_ts = unix_seconds_now();
+    bob_storage
+        .app_storage()
+        .record_reconciliation_items(std::iter::once((
+            &route,
+            &storage_sqlite::TransportReconciliationItem {
+                event_id: with_inventory.id.as_slice().try_into().unwrap(),
+                created_at: item_ts,
+            },
+        )))
+        .unwrap();
+    let seen_ids = [
+        hex::encode(with_inventory.id.as_slice()),
+        hex::encode(without_inventory.id.as_slice()),
+    ];
+    let mut projection = bob_storage
+        .app_storage()
+        .load_account_projection_state("bob", 100)
+        .unwrap();
+    projection.seen_events.extend(seen_ids.iter().cloned());
+    bob_storage
+        .app_storage()
+        .save_account_projection_state(&projection, 100, item_ts)
+        .unwrap();
+
+    for _ in 0..8 {
+        bob.retry_deferred_peels(&group_id).await.unwrap();
+        if deferred_rows(&bob_storage, &group_id) == 0 {
+            break;
+        }
+    }
+    assert_eq!(deferred_rows(&bob_storage, &group_id), 0);
+
+    assert!(
+        bob_storage
+            .consume_released_transport_receipts()
+            .unwrap()
+            .is_empty(),
+        "budget-expired rows must not journal a replay release or retire seen_events"
+    );
+    let seen_after = bob_storage
+        .app_storage()
+        .load_account_projection_state("bob", 100)
+        .unwrap()
+        .seen_events;
+    for id_hex in &seen_ids {
+        assert!(
+            seen_after.contains(id_hex),
+            "seen_events receipt must survive budget expiry"
+        );
+    }
+    assert!(
+        bob_storage
+            .app_storage()
+            .pending_epoch_backfill_intents()
+            .unwrap()
+            .is_empty(),
+        "budget-expired deferred rows must arm no epoch gap even without inventory"
+    );
+    let kept = bob_storage
+        .app_storage()
+        .transport_reconciliation_inventory(&route, 0)
+        .unwrap();
+    assert_eq!(
+        kept.items.len(),
+        1,
+        "budget-expired deferred rows must keep their recovery inventory so the runner does not bounce them back"
+    );
+    assert_eq!(
+        kept.items[0].event_id.as_slice(),
+        with_inventory.id.as_slice()
     );
 }

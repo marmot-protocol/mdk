@@ -425,6 +425,8 @@ mod migration_0221_agent_item_expired_targets;
 mod migration_0222_small_state_broadcast_devices;
 #[path = "migrations/0223_local_deletion_invitation.rs"]
 mod migration_0223_local_deletion_invitation;
+#[path = "migrations/0224_epoch_gap_evidence_floor.rs"]
+mod migration_0224_epoch_gap_evidence_floor;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1617,6 +1619,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0223_local_deletion_invitation",
         suspend_foreign_keys: &[],
         apply: migration_0223_local_deletion_invitation::apply,
+    },
+    Migration {
+        version: 224,
+        name: "0224_epoch_gap_evidence_floor",
+        suspend_foreign_keys: &[],
+        apply: migration_0224_epoch_gap_evidence_floor::apply,
     },
 ];
 

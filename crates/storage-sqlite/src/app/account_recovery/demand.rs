@@ -129,6 +129,33 @@ impl SqliteAppStorage {
         })
     }
 
+    /// Return the earliest deferred-row arrival epoch that still counts as
+    /// stall evidence when handing off an active `EpochGap` obligation at
+    /// `(group_id, stalled_epoch)`.
+    ///
+    /// Returns `Ok(None)` when the obligation is absent or parked
+    /// (`NeedsDeepRepair`), so only brand-new undecryptable rows at the new tip
+    /// epoch can re-arm.
+    pub fn active_epoch_gap_evidence_floor(
+        &self,
+        group_id: &[u8],
+        stalled_epoch: u64,
+    ) -> StorageResult<Option<u64>> {
+        let floor: Option<i64> = self
+            .lock()?
+            .query_row_cached(
+                "SELECT COALESCE(evidence_floor_epoch, stalled_epoch)
+                 FROM account_recovery_obligations
+                 WHERE cause = 1 AND state = 0 AND eligibility != 4
+                   AND group_id = ?1 AND stalled_epoch = ?2",
+                params![group_id, crate::base::codec::u64_to_i64(stalled_epoch)?],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()?;
+        floor.map(i64_to_u64).transpose()
+    }
+
     pub fn pending_recovery_demands(&self) -> StorageResult<Vec<RecoveryDemand>> {
         let conn = self.lock()?;
         let rows = conn
@@ -285,5 +312,76 @@ mod tests {
                 == loss
         );
         assert!(!app.retire_terminal_group_recovery(&group).unwrap());
+    }
+
+    #[test]
+    fn active_epoch_gap_evidence_floor_preserves_active_and_resets_after_park() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        let group = gid(2);
+        app.ensure_account_projection("alice").unwrap();
+        store.put_group(&sample_group(group.clone(), 5, 0)).unwrap();
+
+        let arm = |epoch| {
+            app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(group.as_slice()),
+                stalled_epoch: epoch,
+            }])
+            .unwrap();
+        };
+
+        // Initial arm sets evidence_floor_epoch = stalled_epoch.
+        arm(2);
+        assert_eq!(
+            app.active_epoch_gap_evidence_floor(group.as_slice(), 2)
+                .unwrap(),
+            Some(2)
+        );
+        // Active handoff preserves the original floor across newer stalled epochs.
+        arm(3);
+        assert_eq!(
+            app.active_epoch_gap_evidence_floor(group.as_slice(), 3)
+                .unwrap(),
+            Some(2)
+        );
+
+        // Parking the gap makes the active-floor lookup return None.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE account_recovery_obligations SET eligibility = 4 WHERE group_id = ?1 AND cause = 1",
+                [group.as_slice()],
+            )
+            .unwrap();
+        assert_eq!(
+            app.active_epoch_gap_evidence_floor(group.as_slice(), 3)
+                .unwrap(),
+            None
+        );
+
+        // Explicit unpark resets the floor to stalled_epoch instead of keeping the old floor.
+        app.rearm_all_recovery_units().unwrap();
+        assert_eq!(
+            app.active_epoch_gap_evidence_floor(group.as_slice(), 3)
+                .unwrap(),
+            Some(3)
+        );
+
+        // Parking again and re-arming at a higher epoch resets the floor to the new epoch.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE account_recovery_obligations SET eligibility = 4 WHERE group_id = ?1 AND cause = 1",
+                [group.as_slice()],
+            )
+            .unwrap();
+        arm(5);
+        assert_eq!(
+            app.active_epoch_gap_evidence_floor(group.as_slice(), 5)
+                .unwrap(),
+            Some(5)
+        );
     }
 }
