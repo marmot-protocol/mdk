@@ -48,6 +48,13 @@
 
 ### Changed
 
+- Usage diagnostics count a Welcome naming another KeyPackage of this account (`NotAddressedToThisDevice`) as
+  `mdk_welcome_summary` `process` `absent`, no longer `duplicate`: a device that sees only its siblings' Welcomes cannot
+  join, and counting them as copies hid it. No outcome value is added, so saved consent stays accepted.
+- Relay telemetry adds `app_runtime_member_key_package_read_*` and `app_runtime_member_key_package_relay_read_*`:
+  for each member a create, invite or invite recovery selects, whether its KeyPackage read heard every relay it asked,
+  and how many of those relays answered. `MemberKeyPackageResolutionStats::key_package_reads` carries the same counts.
+  Selection is unchanged.
 - Group creation, invites and direct-chat starts always discover the members' current relay routes after
   `prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm no longer
   makes them skip discovery. An `IncompatibleKeyPackage` verdict needs that discovery to complete.
@@ -73,6 +80,10 @@
   added them, the same row the adder's timeline shows.
 - The README now states that chat history imported from another device, and backups, leave out group system rows
   and deleted-message placeholders, and why.
+- A locally deleted chat that a newer message brings back keeps the invitation standing it had (mdk#3555): an
+  unanswered invitation comes back pending with its inviter, and a sibling Add forwards it as pending, instead of
+  showing a chat the user never accepted. A sibling's accept or decline that arrived while the chat was deleted is
+  re-applied when it comes back. A chat deleted before this release comes back accepted, as before.
 
 ## 0.19.0 - 2026-11-22
 

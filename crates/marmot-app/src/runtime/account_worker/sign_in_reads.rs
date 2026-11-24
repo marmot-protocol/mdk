@@ -370,7 +370,7 @@ impl AccountWorkerCommand {
             | Self::RemovePushRegistration { .. }
             | Self::ReconnectRelay { .. }
             | Self::DeleteAuditLog { .. }
-            | Self::SetAuditRecording { .. } => true,
+            | Self::ApplyAuditLogSetting { .. } => true,
         }
     }
 }

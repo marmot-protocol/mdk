@@ -778,3 +778,70 @@ fn partial_resolution_passes_a_held_key_package_batch() {
         assert_ends_at(elapsed, KEY_PACKAGE_BATCH_CUT_OFF);
     });
 }
+
+/// A member's KeyPackage read that one of its two relays leaves unfinished
+/// still selects the package the other relay returned (D12), and counts as
+/// incomplete, one relay of two answered. A read every relay answers counts
+/// as complete. Create and invite both count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_a_relay_left_unfinished_still_selects_and_counts_incomplete() {
+    use crate::RuntimePerformanceOperation as Op;
+
+    let (_directory, app, accounts, fetcher) =
+        crate::tests::member_resolution_fixture(3, false).await;
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|event| {
+            event.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST
+                && event.pubkey == accounts[1].account_id_hex
+        })
+        .unwrap()
+        .tags
+        .push(vec!["r".into(), "wss://unanswered.example".into()]);
+    fetcher.leave_unanswered("wss://unanswered.example");
+    let mut client = crate::tests::client_on_app_relay_plane(&app, &accounts[0].label).await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    client.runtime_telemetry = Some(telemetry.clone());
+    let counts = |operation: Op| {
+        let snapshot = telemetry
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == operation)
+            .unwrap();
+        (snapshot.successes, snapshot.failures)
+    };
+
+    let created = client
+        .create_group("coverage", &[accounts[1].account_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert_eq!(
+        created.member_outcomes,
+        vec![outcome(
+            &accounts[1].account_id_hex,
+            MemberResolutionStatus::Selected
+        )]
+    );
+    let group = created.operation.expect("the answering relay's package");
+    assert_eq!(counts(Op::MemberKeyPackageRead), (0, 1));
+    assert_eq!(counts(Op::MemberKeyPackageRelayRead), (1, 1));
+
+    let invited = client
+        .invite_members(&group, &[accounts[2].account_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert_eq!(
+        invited.member_outcomes,
+        vec![outcome(
+            &accounts[2].account_id_hex,
+            MemberResolutionStatus::Selected
+        )]
+    );
+    assert!(invited.operation.is_some());
+    assert_eq!(counts(Op::MemberKeyPackageRead), (1, 1));
+    assert_eq!(counts(Op::MemberKeyPackageRelayRead), (2, 1));
+}

@@ -3968,6 +3968,152 @@ fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() 
 }
 
 #[test]
+fn delete_local_group_data_keeps_the_invitation_standing_on_its_frontier() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut pending = group("aa", "pending invitation");
+    pending.pending_confirmation = true;
+    pending.welcomer_account_id_hex = Some("11".repeat(32));
+    pending.via_welcome_message_id_hex = Some("22".repeat(32));
+    let mut accepted = group("bb", "accepted invitation");
+    accepted.welcomer_account_id_hex = Some("33".repeat(32));
+    accepted.via_welcome_message_id_hex = Some("44".repeat(32));
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![pending, accepted, group("cc", "founded here")],
+    };
+    store
+        .app_storage()
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    for (marker, id) in [([0xaa_u8], "aa"), ([0xbb], "bb"), ([0xcc], "cc")] {
+        insert_protocol_group_marker(&store, &marker);
+        assert!(store.delete_local_group_data(id).unwrap().did_delete());
+    }
+
+    let standing = |id: &str| {
+        store
+            .app_storage()
+            .local_group_deletion_invitation(id)
+            .unwrap()
+    };
+    let invitation = |pending: bool, welcomer: Option<String>, welcome: Option<String>| {
+        Some(LocalGroupDeletionInvitation {
+            pending_confirmation: pending,
+            welcomer_account_id_hex: welcomer,
+            via_welcome_message_id_hex: welcome,
+        })
+    };
+    assert_eq!(
+        standing("aa"),
+        invitation(true, Some("11".repeat(32)), Some("22".repeat(32)))
+    );
+    assert_eq!(
+        standing("bb"),
+        invitation(false, Some("33".repeat(32)), Some("44".repeat(32)))
+    );
+    assert_eq!(standing("cc"), invitation(false, None, None));
+
+    // A repeat delete finds no row and keeps what the first one recorded.
+    store.delete_local_group_data("aa").unwrap();
+    assert_eq!(
+        standing("aa"),
+        invitation(true, Some("11".repeat(32)), Some("22".repeat(32)))
+    );
+
+    // No frontier, or one written before the standing was kept: unknown.
+    assert_eq!(standing("dd"), None);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO local_group_deletion_frontiers (group_id_hex, message_insert_order)
+             VALUES ('ee', 0)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(standing("ee"), None);
+
+    // If a replacement Welcome committed in MLS while its app checkpoint
+    // failed, the queued `GroupJoined` in `pending_application_events`
+    // establishes the frontier's standing instead of the stale accepted row
+    // (including when no `cgka_invitation_admissions` row exists).
+    let mut stale = group("ff", "stale accepted row");
+    stale.pending_confirmation = false;
+    stale.welcomer_account_id_hex = Some("55".repeat(32));
+    stale.via_welcome_message_id_hex = Some("66".repeat(32));
+    let mut replayed = group("fe", "replayed accepted row");
+    replayed.pending_confirmation = false;
+    replayed.welcomer_account_id_hex = Some("55".repeat(32));
+    replayed.via_welcome_message_id_hex = Some("66".repeat(32));
+    let stale_state = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![stale, replayed],
+    };
+    store
+        .app_storage()
+        .save_account_projection_state(&stale_state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    insert_protocol_group_marker(&store, &[0xff]);
+    insert_protocol_group_marker(&store, &[0xfe]);
+    let replacement_welcome = cgka_traits::MessageId::new(vec![0x88; 32]);
+    let replayed_welcome = cgka_traits::MessageId::new(vec![0x66; 32]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 1, 1, x'00'), (?3, ?4, 1, 1, x'00')",
+            params![
+                replacement_welcome.as_slice(),
+                &[0xff_u8][..],
+                replayed_welcome.as_slice(),
+                &[0xfe_u8][..],
+            ],
+        )
+        .unwrap();
+    cgka_traits::storage::MessageStorage::put_pending_application_event(
+        &store,
+        &cgka_traits::engine::GroupEvent::GroupJoined {
+            group_id: cgka_traits::GroupId::new(vec![0xff]),
+            via_welcome: replacement_welcome,
+            welcomer: Some(cgka_traits::MemberId::new(vec![0x99; 32])),
+            explicitly_confirmed: false,
+            forwarded: cgka_traits::engine::ForwardedInvitation {
+                inviter: Some([0x77; 32]),
+                confirmed: false,
+            },
+        },
+    )
+    .unwrap();
+    cgka_traits::storage::MessageStorage::put_pending_application_event(
+        &store,
+        &cgka_traits::engine::GroupEvent::GroupJoined {
+            group_id: cgka_traits::GroupId::new(vec![0xfe]),
+            via_welcome: replayed_welcome,
+            welcomer: Some(cgka_traits::MemberId::new(vec![0x99; 32])),
+            explicitly_confirmed: false,
+            forwarded: cgka_traits::engine::ForwardedInvitation::default(),
+        },
+    )
+    .unwrap();
+    assert!(store.delete_local_group_data("ff").unwrap().did_delete());
+    assert_eq!(
+        standing("ff"),
+        invitation(true, Some("77".repeat(32)), Some("88".repeat(32)))
+    );
+    // A queued replay of the already-accepted Welcome preserves acceptance.
+    assert!(store.delete_local_group_data("fe").unwrap().did_delete());
+    assert_eq!(
+        standing("fe"),
+        invitation(false, Some("55".repeat(32)), Some("66".repeat(32)))
+    );
+}
+
+#[test]
 fn delete_local_group_data_rejects_blank_group_id() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let err = store

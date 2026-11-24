@@ -30,7 +30,7 @@ use crate::published_records::{
     relay_list_state_from_event, select_fenced_key_packages,
 };
 use crate::{AccountRelayListStatus, FetchedKeyPackage};
-use transport_nostr::DirectoryEventQuery;
+use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome};
 
 /// Maximum authors placed in one Nostr directory filter.
 pub(crate) const MEMBER_RESOLUTION_AUTHORS_PER_QUERY: usize = 32;
@@ -144,6 +144,34 @@ mod tests {
                 reason: MissingKeyPackageReason::ObsoleteOnly,
             }),
             Some(MemberResolutionStatus::ObsoleteKeyPackage)
+        );
+    }
+
+    /// One relay listed under two spellings is one relay asked: the
+    /// transport reads twins once, so a read every relay answered must not
+    /// count a relay as unanswered.
+    #[test]
+    fn a_relay_listed_twice_is_asked_once() {
+        let endpoint = |url: &str| TransportEndpoint(url.to_owned());
+        let outcome = DirectoryFetchOutcome {
+            records: Vec::new(),
+            complete: true,
+            complete_endpoints: vec![endpoint("wss://relay.example")],
+        };
+        assert_eq!(
+            MemberKeyPackageReadCoverage::of_read(
+                &[
+                    endpoint("wss://relay.example"),
+                    endpoint("wss://relay.example/")
+                ],
+                &outcome,
+            ),
+            MemberKeyPackageReadCoverage {
+                complete_reads: 1,
+                incomplete_reads: 0,
+                relays_asked: 1,
+                relays_answered: 1,
+            }
         );
     }
 }
@@ -262,7 +290,62 @@ pub struct MemberKeyPackagePrewarmSummary {
 pub struct MemberKeyPackageResolutionStats {
     pub(crate) requested_members: usize,
     pub unique_members: usize,
+    /// How completely relays answered the reads behind the selected accounts.
+    pub key_package_reads: MemberKeyPackageReadCoverage,
 }
+
+/// How completely relays answered the KeyPackage reads that selected
+/// accounts. Each selected account counts its deciding read of its own
+/// relays: its single-author batch, or its single-author fallback read, not
+/// the discovery relays recovery may add. Selection uses what an incomplete
+/// read returned (D12), so a device whose only package sat on a relay that
+/// did not answer is left out; these counts show how often a selection was
+/// made from such a read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemberKeyPackageReadCoverage {
+    /// Selected accounts whose read heard every relay it asked to the end of
+    /// its stored events.
+    pub complete_reads: usize,
+    /// Selected accounts whose read did not.
+    pub incomplete_reads: usize,
+    /// Relays those reads asked.
+    pub relays_asked: usize,
+    /// Relays among them whose own read finished.
+    pub relays_answered: usize,
+}
+
+impl MemberKeyPackageReadCoverage {
+    fn of_read(asked: &[TransportEndpoint], outcome: &DirectoryFetchOutcome) -> Self {
+        // Relays, not spellings: the transport reads a relay listed twice
+        // once, and names the endpoints it completed in its own spelling.
+        let relays = |endpoints: &[TransportEndpoint]| {
+            endpoints
+                .iter()
+                .map(|endpoint| transport_nostr::canonical_relay(endpoint.as_str()))
+                .collect::<BTreeSet<_>>()
+        };
+        let asked = relays(asked);
+        Self {
+            complete_reads: usize::from(outcome.complete),
+            incomplete_reads: usize::from(!outcome.complete),
+            relays_asked: asked.len(),
+            relays_answered: relays(&outcome.complete_endpoints)
+                .intersection(&asked)
+                .count(),
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        self.complete_reads += other.complete_reads;
+        self.incomplete_reads += other.incomplete_reads;
+        self.relays_asked += other.relays_asked;
+        self.relays_answered += other.relays_answered;
+    }
+}
+
+/// One member's selected packages, with the coverage of the read that
+/// selected them.
+type MemberSelection = (Vec<KeyPackage>, MemberKeyPackageReadCoverage);
 
 impl From<MemberKeyPackageResolutionStats> for MemberKeyPackagePrewarmSummary {
     fn from(stats: MemberKeyPackageResolutionStats) -> Self {
@@ -560,7 +643,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
 
         let mut outcomes = (0..targets.len())
             .map(|_| None)
-            .collect::<Vec<Option<Result<Vec<KeyPackage>, DirectoryError>>>>();
+            .collect::<Vec<Option<Result<MemberSelection, DirectoryError>>>>();
         // Even a valid, unexpired cached package may have been consumed on
         // another device. Every purpose, including composition prewarm, must
         // fetch current relay publications. A commit takes prewarmed routes
@@ -690,7 +773,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 }
                 result => result,
             };
-            *outcome = Some(result.and_then(|packages| {
+            *outcome = Some(result.and_then(|(packages, coverage)| {
                 if packages.is_empty() {
                     return Err(DirectoryError::MissingKeyPackage {
                         account: target.account_id_hex.clone(),
@@ -718,7 +801,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .map_err(|_| {
                         DirectoryError::DirectoryLookupIncomplete(target.account_id_hex.clone())
                     })?;
-                Ok(packages)
+                Ok((packages, coverage))
             }));
         }
         match purpose {
@@ -766,6 +849,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let unique_members = targets.len();
         let mut key_packages = Vec::with_capacity(unique_members);
         let mut member_outcomes = Vec::with_capacity(unique_members);
+        let mut key_package_reads = MemberKeyPackageReadCoverage::default();
         for (target, outcome) in targets.into_iter().zip(outcomes) {
             let outcome = outcome.unwrap_or_else(|| {
                 Err(DirectoryError::MissingKeyPackage {
@@ -774,9 +858,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 })
             });
             let (status, selected_device_count) = match outcome {
-                Ok(packages) => {
+                Ok((packages, coverage)) => {
                     let device_count = packages.len() as u32;
                     key_packages.extend(packages);
+                    key_package_reads.add(coverage);
                     (MemberResolutionStatus::Selected, device_count)
                 }
                 Err(error) => {
@@ -802,6 +887,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             stats: MemberKeyPackageResolutionStats {
                 requested_members: member_refs.len(),
                 unique_members,
+                key_package_reads,
             },
         })
     }
@@ -1290,7 +1376,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         &self,
         targets: &[MemberTarget],
         unresolved: &[usize],
-        outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
+        outcomes: &mut [Option<Result<MemberSelection, DirectoryError>>],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         batch_cut_off: Option<tokio::time::Instant>,
@@ -1357,11 +1443,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .map(move |(indices, endpoints, queries)| {
                 let directory = directory.clone();
                 started_before(batch_cut_off, async move {
+                    let asked = endpoints.clone();
                     let result = directory
                         .relay_plane
                         .fetch_directory_events_with_completion(endpoints.clone(), queries)
                         .await
-                        .map(|outcome| outcome.records)
+                        .map(|outcome| {
+                            let coverage = MemberKeyPackageReadCoverage::of_read(&asked, &outcome);
+                            (outcome.records, coverage)
+                        })
                         .map_err(DirectoryError::RelayDirectory);
                     (indices, endpoints, result)
                 })
@@ -1379,7 +1469,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         while let Some((indices, endpoints, result)) =
             next_before(&mut batches, batch_cut_off).await
         {
-            let records = result?;
+            let (records, coverage) = result?;
             let multiple_authors = indices.len() > 1;
             let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
             for record in records {
@@ -1412,11 +1502,14 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 || !multiple_authors)
                             && !key_package_read_page_full(account_id, &account_records) =>
                     {
-                        outcomes[index] = Some(self.accept_fetched_key_packages(
-                            purpose,
-                            selected,
-                            &targets[index].relay_lists,
-                        ));
+                        outcomes[index] = Some(
+                            self.accept_fetched_key_packages(
+                                purpose,
+                                selected,
+                                &targets[index].relay_lists,
+                            )
+                            .map(|packages| (packages, coverage)),
+                        );
                     }
                     // Bounded multi-author results can hide some of an
                     // account's slots or their deletion requests. Relays may
@@ -1469,6 +1562,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 .fetch_directory_events_with_completion(endpoints.clone(), queries)
                                 .await
                                 .map_err(DirectoryError::RelayDirectory)?;
+                            let coverage =
+                                MemberKeyPackageReadCoverage::of_read(&endpoints, &fetched);
                             // The batch already journaled what it observed.
                             let fence = directory
                                 .key_package_journal_fence(&account, &fetched.records)
@@ -1495,7 +1590,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             // Recovery journaled everything it read. Reread the
                             // journal before admitting what it found.
                             let fence = directory.key_package_journal_fence(&account, &[]).await?;
-                            records.select(&account, requirements, Some(&fence))
+                            records
+                                .select(&account, requirements, Some(&fence))
+                                .map(|selected| (selected, coverage))
                         }
                         .await;
                         (index, result)
@@ -1504,14 +1601,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let mut fallback_results =
             stream::iter(work).buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY);
         while let Some((index, result)) = fallback_results.next().await {
-            let result = result.and_then(|selected| {
+            let result = result.and_then(|(selected, coverage)| {
                 self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)
+                    .map(|packages| (packages, coverage))
             });
             // Decided as each member's result is stored, so a deadline that
             // cancels the remaining members cannot lose it.
             let absent = match &result {
                 Err(DirectoryError::MissingKeyPackage { .. }) => true,
-                Ok(packages) => packages.is_empty(),
+                Ok((packages, _)) => packages.is_empty(),
                 Err(_) => false,
             };
             outcomes[index] = Some(if absent && tie_unread.contains(&index) {

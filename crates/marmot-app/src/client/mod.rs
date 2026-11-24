@@ -991,6 +991,11 @@ pub struct AppClient {
     /// successful checkpoint. A reopened client recovers the same outputs from
     /// the durable engine outbox instead.
     pub(crate) pending_failed_sync_summary: crate::SyncSummary,
+    /// Output about a chat whose record had changes no save had committed
+    /// when the worker went to announce it, one entry per announcement, in
+    /// order. Only announcing touches it, so a cancelled receive or sync
+    /// cannot lose it (mdk#3359).
+    pub(crate) unannounced_summaries: Vec<crate::SyncSummary>,
     /// Native checkpoints already committed; retained across drain cancellation.
     pub(super) pending_native_sync_summary: crate::SyncSummary,
     pub(super) native_sync_deliveries: u64,
@@ -1362,6 +1367,43 @@ impl AppClient {
                 .as_ref()
                 .map(|telemetry| telemetry.observe(operation)),
         )
+    }
+
+    /// Count how completely relays answered the KeyPackage read behind each
+    /// member selection a lookup returned, before the create or invite that
+    /// asked for it is known to succeed.
+    fn record_key_package_read_coverage(
+        &self,
+        reads: nostr_directory::MemberKeyPackageReadCoverage,
+    ) {
+        use crate::RuntimePerformanceOperation as Op;
+        use marmot_observability::Outcome;
+        let Some(telemetry) = self.runtime_telemetry.as_ref() else {
+            return;
+        };
+        let unanswered = reads.relays_asked - reads.relays_answered;
+        for (operation, outcome, count) in [
+            (
+                Op::MemberKeyPackageRead,
+                Outcome::Success,
+                reads.complete_reads,
+            ),
+            (
+                Op::MemberKeyPackageRead,
+                Outcome::Failure,
+                reads.incomplete_reads,
+            ),
+            (
+                Op::MemberKeyPackageRelayRead,
+                Outcome::Success,
+                reads.relays_answered,
+            ),
+            (Op::MemberKeyPackageRelayRead, Outcome::Failure, unanswered),
+        ] {
+            for _ in 0..count {
+                telemetry.record_runtime(operation, Duration::ZERO, outcome);
+            }
+        }
     }
 }
 
@@ -2495,6 +2537,7 @@ impl AppClient {
             key_packages.is_ok(),
         );
         let resolved = key_packages?;
+        self.record_key_package_read_coverage(resolved.stats.key_package_reads);
         if resolved.stats.unique_members > 0 {
             record_app_performance(
                 telemetry,
@@ -3198,8 +3241,9 @@ impl AppClient {
         let nostr_directory::ResolvedMemberKeyPackages {
             key_packages,
             member_outcomes,
-            ..
+            stats,
         } = key_packages?;
+        self.record_key_package_read_coverage(stats.key_package_reads);
         if !member_refs.is_empty() && key_packages.is_empty() {
             return Ok(crate::GroupMemberResult {
                 operation: None,

@@ -315,6 +315,49 @@ mod tests {
         );
     }
 
+    /// Generated Swift must not cancel work that has to finish, so every
+    /// `survives_cancellation` export is on the list the binding generator
+    /// leaves uncancellable, and nothing else is.
+    #[test]
+    fn swift_awaits_every_export_that_survives_cancellation() {
+        fn visit(dir: &Path, marked: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, marked);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    let mut lines = source.lines().map(str::trim);
+                    while let Some(line) = lines.next() {
+                        if line == "#[marmot_uniffi_macros::survives_cancellation]" {
+                            let export = lines.next().unwrap();
+                            let name = export.strip_prefix("pub async fn ").unwrap();
+                            marked.push(name.split('(').next().unwrap().to_owned());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut marked = Vec::new();
+        visit(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut marked,
+        );
+        marked.sort();
+        let mut listed: Vec<String> = crate::swift_awaits_completion::SWIFT_AWAITS_COMPLETION
+            .iter()
+            .map(|symbol| {
+                let object_method = symbol
+                    .strip_prefix("uniffi_marmot_uniffi_fn_method_")
+                    .unwrap();
+                object_method.split_once('_').unwrap().1.to_owned()
+            })
+            .collect();
+        listed.sort();
+        assert_eq!(marked, listed);
+    }
+
     /// Async exports must go through `on_tokio_runtime`; `async_runtime =
     /// "tokio"` would bring back `async_compat`'s single fallback thread.
     #[test]

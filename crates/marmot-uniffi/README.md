@@ -251,11 +251,13 @@ UniFFI handles after cancelling/joining consumers. C hosts use only the matching
 never free handles during concurrent use. Returned plaintext and copies made by host decoders
 remain the host's responsibility, including removal of downstream copies after local deletion.
 
-For Swift observation tasks, use `nextCancellable()` on presented chat lists, chat-list windows,
-account attention, conversation windows, and block lists. Cancelling the task cancels its native
-wait and throws `CancellationError`; it does not close the subscription. Keep one receive active
-per subscription, and cancel and await the old task before starting another. Cancellation racing
-with a completed receive can discard that returned update. See the
+In Swift, cancelling the task that awaits a throwing async call cancels its native future and throws
+`CancellationError`, for commands and receives alike. Subscription receives generated without
+`throws` cannot report cancellation, so observation tasks use their throwing `nextCancellable()` or
+`nextUpdateCancellable()` adapters. Cancellation does not close the subscription. Keep one receive
+active per subscription, and cancel and await the old task before starting another. A call that
+completed before the cancel took effect returns its result or error instead; after
+`CancellationError`, refresh state a cancelled command may have changed. See the
 [Swift adapter signatures](API-REFERENCE.md#swift-cancellation-adapters).
 
 ### Localization, privacy and diagnostics
@@ -488,10 +490,16 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
 - **Async methods** run their work as a task on that runtime. The Swift task or Kotlin coroutine
   awaiting the call only waits for the task to finish, so awaiting from the main actor or
   `Dispatchers.Main` does not run MDK work on the UI thread. Cancelling a Kotlin coroutine frees
-  the call, which aborts the task at its next suspension point; `shutdownAndClose()` and
-  `signOutAndWipe()` keep running regardless. Generated Swift waits for the call to finish even when its `Task` is
-  cancelled. The five Swift `nextCancellable()` subscription adapters explicitly forward cancellation
-  to the native future; ordinary generated `next()` methods keep their UniFFI behavior.
+  the call, which aborts the task at its next suspension point. Calls whose work must finish keep
+  running regardless, and their docs say so: `shutdownAndClose()`, `removeAccount()`, `signOut()`,
+  `signOutAndWipe()`, `signInAccount()`, `login()`, `loginExternalSigner()`,
+  `loginRecoveringIncompleteSetup()`, `setAuditLogSettings()`, `nip46Remove()`,
+  `releaseAttachmentHandoff()`, `startDirectConversation*`, and Nip46 `approvePermissions()` and
+  `logout()`. Cancelling a Swift `Task` awaiting any other throwing call
+  does the same and throws `CancellationError`. Swift still waits for the result of those must-finish
+  calls, even from a cancelled task, and of non-throwing methods: several subscription receives
+  (which have throwing [adapters](API-REFERENCE.md#swift-cancellation-adapters)), `relayHealth()`,
+  `shutdown()` and `ConversationWindowSubscription.cancel()`.
 - **Subscription receives** (`next()`, `nextUpdate()`) are the exception: they wait on the calling
   thread, with the runtime entered, because a receive that ran ahead on the runtime could consume
   an update that a cancelled caller never collects. They only wait and convert; the work that
@@ -2194,8 +2202,9 @@ The generated Swift file is platform-independent: `output/MarmotKit.swift` and `
 same UniFFI surface, and releases publish it once. The Kotlin binding is generated from the same host library metadata,
 so it exposes the same `Marmot` object, subscription objects, records, enums, and error variants.
 
-Direct `uniffi-bindgen` output does not include the Swift cancellation adapters. Use the packaged
-`MarmotKit.swift`, or concatenate the generated Swift and the matching support source into one file.
+Generate Swift with this crate's `uniffi-bindgen`: it rewrites UniFFI's async helper so throwing calls forward task
+cancellation, which UniFFI's own generator does not. Its output still lacks the Swift cancellation adapters. Use the
+packaged `MarmotKit.swift`, or concatenate the generated Swift and the matching support source into one file.
 Run `bash crates/marmot-uniffi/subscription-cancellation-smoke.sh` to exercise Swift cancellation against
 real native subscription futures. It builds the native library with `--release`, matching the Apple artifacts,
 and requires `swiftc` and the native build prerequisites above.

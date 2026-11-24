@@ -312,6 +312,9 @@ impl Marmot {
     }
 
     /// Remove the account-scoped signer credentials and detach the shared session.
+    /// It keeps running when the call is cancelled, so the account worker always
+    /// stops using the removed signer.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn nip46_remove(&self, account_ref: String) -> Result<(), MarmotKitError> {
         self.runtime.nip46_remove(&account_ref).await?;
         Ok(())

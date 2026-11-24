@@ -251,6 +251,15 @@ impl fmt::Debug for StoredAccountGroup {
     }
 }
 
+/// A locally deleted chat's invitation standing, kept on its deletion frontier
+/// for the row a newer message recreates (mdk#3555).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalGroupDeletionInvitation {
+    pub pending_confirmation: bool,
+    pub welcomer_account_id_hex: Option<String>,
+    pub via_welcome_message_id_hex: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredNostrRoute {
     pub nostr_group_id_hex: String,
@@ -1484,6 +1493,39 @@ impl SqliteAppStorage {
                     .map_err(|error| StorageError::Serialization(error.to_string()))
             })
             .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    /// Return the invitation standing a deliberate local deletion recorded:
+    /// whether the chat's invitation still awaited acceptance, who sent it and
+    /// which Welcome it came by. `None` when there is no frontier, or when it
+    /// predates this record or had no row to read it from.
+    pub fn local_group_deletion_invitation(
+        &self,
+        group_id_hex: &str,
+    ) -> StorageResult<Option<LocalGroupDeletionInvitation>> {
+        Ok(self
+            .lock()?
+            .query_row_cached(
+                "SELECT pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex
+                 FROM local_group_deletion_frontiers
+                 WHERE group_id_hex = ?1",
+                params![group_id_hex],
+                |row| {
+                    let pending_confirmation = row.get::<_, Option<bool>>(0)?;
+                    let welcomer_account_id_hex = row.get(1)?;
+                    let via_welcome_message_id_hex = row.get(2)?;
+                    Ok(pending_confirmation.map(|pending_confirmation| {
+                        LocalGroupDeletionInvitation {
+                            pending_confirmation,
+                            welcomer_account_id_hex,
+                            via_welcome_message_id_hex,
+                        }
+                    }))
+                },
+            )
+            .optional()
+            .storage()?
+            .flatten())
     }
 
     /// Retain exact routing coordinates observed while a locally deleted MLS

@@ -48,6 +48,8 @@ mod markdown;
 mod nip46;
 mod secret_store;
 pub mod subscriptions;
+#[cfg(test)]
+mod swift_awaits_completion;
 mod tokio_runtime;
 
 pub use conversions::conversation_window::*;

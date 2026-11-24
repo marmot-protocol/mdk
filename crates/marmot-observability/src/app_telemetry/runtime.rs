@@ -119,6 +119,12 @@ operations! {
     // step-3 PR moves to a lane, so its wait stays visible once it moves.
     SendPublication => "send_publication",
     KeyPackageResolution => "key_package_resolution",
+    // Zero-duration counts per member a create, invite or invite recovery
+    // selected: its KeyPackage read heard every relay it asked (success) or
+    // not (failure), and each relay that read asked answered (success) or
+    // not (failure).
+    MemberKeyPackageRead => "member_key_package_read",
+    MemberKeyPackageRelayRead => "member_key_package_relay_read",
     SignInSlotRead => "sign_in_slot_read",
     RelayLimitLookup => "relay_limit_lookup",
     RouteRefresh => "route_refresh",

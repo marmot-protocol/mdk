@@ -20,9 +20,10 @@ pub enum NostrAcquisitionScope {
 /// Per-endpoint received-item and serialized-event-JSON byte budgets, plus an
 /// overall elapsed wall-clock deadline. Item/byte counters include duplicates
 /// and events rejected at the budget boundary. These are not wire-byte or
-/// process-memory ceilings; SDK queues, WebSocket/parser buffers, temporary
-/// serialization, event/object overhead, in-flight data, and concurrent
-/// requests remain outside them.
+/// process-memory ceilings: each endpoint's reply queue may hold its byte
+/// budget plus one maximum-size frame, and WebSocket/parser buffers,
+/// temporary serialization, event/object overhead and concurrent requests
+/// remain outside them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NostrAcquisitionLimits {
     pub max_endpoints: usize,
@@ -36,8 +37,8 @@ pub struct NostrAcquisitionLimits {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrAcquisitionRequest {
-    /// Selects the account's authentication context and inbox recipient.
-    /// The caller keeps its durable attempt, scope token, and revision fence.
+    /// Selects the account's authentication context. The caller keeps its
+    /// durable attempt, scope token, and revision fence.
     pub account_id: MemberId,
     pub scope: NostrAcquisitionScope,
     pub endpoints: Vec<TransportEndpoint>,
@@ -93,18 +94,13 @@ pub enum NostrAcquisitionError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NostrAcquisitionEnd {
     RequestPolicySatisfied,
-    /// An SDK exit-count policy fired despite this interface's EOSE policy.
-    /// Incomplete and never coverage evidence.
-    UnexpectedExitLimit,
     ItemLimitReached,
     ByteLimitReached,
     Cancelled,
     Deadline,
     Disconnected,
-    ReceiveLoss,
     /// Rejected connection input prevents proving a complete request page.
     InvalidMessage,
-    ReceiverClosed,
     AuthenticationFailed,
     Rejected,
     RelayClosed,
@@ -113,17 +109,14 @@ pub enum NostrAcquisitionEnd {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NostrAcquisitionStats {
-    /// Parsed EVENTs for this request before SDK event filtering, including
-    /// duplicates and the first raw item-budget overflow frame.
+    /// EVENT frames read for this request before any check, including
+    /// duplicates and the first item-budget overflow frame.
     pub raw_received_items: usize,
     pub received_items: usize,
     pub serialized_event_bytes: usize,
     pub duplicates: usize,
     pub retained_high_water_items: usize,
     pub retained_high_water_event_bytes: usize,
-    /// This request's `ReceiveLoss(u64)` skipped notifications, not unique
-    /// missing events. Distinct from the lifetime-cumulative loss watch below.
-    pub receiver_skipped_notifications: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

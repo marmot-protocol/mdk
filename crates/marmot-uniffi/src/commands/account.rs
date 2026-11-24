@@ -59,7 +59,9 @@ impl Marmot {
             .collect())
     }
 
-    /// Remove a local-signing account from this device.
+    /// Remove a local-signing account from this device. It keeps running when
+    /// the call is cancelled, so the account is either removed or left intact.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn remove_account(&self, account_ref: String) -> Result<(), MarmotKitError> {
         self.runtime.accounts().remove_account(&account_ref).await?;
         Ok(())
@@ -103,7 +105,9 @@ impl Marmot {
     /// after this returns. The returned `SignOutOutcomeFfi` surfaces per-relay
     /// KeyPackage cleanup failures. These are the final best-effort results for
     /// this call; the runtime does not persist a remote-deletion retry queue
-    /// (mdk#477).
+    /// (mdk#477). It keeps running when the call is cancelled, so a withdrawn
+    /// KeyPackage slot is always followed by local deactivation.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn sign_out(
         &self,
         account_ref: String,
@@ -212,7 +216,11 @@ impl Marmot {
     ///
     /// `inbox_relays` (default empty) sets the kind-10050 inbox list
     /// separately; empty declares `default_relays` in both lists.
+    ///
+    /// It keeps running when the call is cancelled, so an interrupted setup
+    /// still completes or rolls back.
     #[uniffi::method(default(inbox_relays = []))]
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn login(
         &self,
         identity: String,
@@ -270,7 +278,11 @@ impl Marmot {
     ///
     /// `inbox_relays` (default empty) sets the kind-10050 inbox list
     /// separately; empty declares `default_relays` in both lists.
+    ///
+    /// It keeps running when the call is cancelled, so an interrupted setup
+    /// still completes or rolls back.
     #[uniffi::method(default(inbox_relays = []))]
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn login_recovering_incomplete_setup(
         &self,
         nsec: String,
@@ -319,7 +331,12 @@ impl Marmot {
     ///
     /// `inbox_relays` (default empty) sets the kind-10050 inbox list
     /// separately; empty declares `default_relays` in both lists.
+    ///
+    /// It keeps running when the call is cancelled, so an interrupted setup
+    /// still completes or rolls back. It can then still ask the signer to sign;
+    /// declining rolls the setup back.
     #[uniffi::method(default(inbox_relays = []))]
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn login_external_signer(
         &self,
         public_key: String,
@@ -373,7 +390,9 @@ impl Marmot {
     /// Re-activate a non-destructively signed-out local account. This clears
     /// the durable signed-out marker and starts the account worker again; relay
     /// list/key-package repair can still be driven by the existing publish
-    /// commands after sign-in.
+    /// commands after sign-in. It keeps running when the call is cancelled, so
+    /// a setup the sign-out paused always carries on.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn sign_in_account(
         &self,
         account_ref: String,

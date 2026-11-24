@@ -2580,6 +2580,7 @@ impl AccountSetup<'_> {
                         Restricted => OnboardingIssue::AccessRestricted,
                         Unreachable => OnboardingIssue::Unreachable,
                         InvalidRequest => OnboardingIssue::InvalidRelay,
+                        Incomplete => OnboardingIssue::DiscoveryIncomplete,
                     };
                     failures.push(OnboardingFinding {
                         endpoint: Some(endpoint),

@@ -681,7 +681,7 @@ async fn unsupported_endpoint_is_reprobed_after_connection_generation_changes() 
         .unwrap();
     let left = switching_relay(left_backend.url().await.to_string(), None).await;
     let right = switching_relay(right_backend.url().await.to_string(), None).await;
-    let sdk = NostrSdkRelayClient::new(SdkClient::builder().build());
+    let sdk = NostrSdkRelayClient::from_builder(SdkClient::builder());
     for url in [&left.url, &right.url] {
         sdk.client().add_relay(url.as_str()).await.unwrap();
     }

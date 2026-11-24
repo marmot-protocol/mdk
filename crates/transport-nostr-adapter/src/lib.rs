@@ -72,6 +72,11 @@ mod acquisition;
 pub mod compare;
 #[cfg(feature = "sdk")]
 mod finite_req;
+/// Finite history requests whose replies never reach nostr-sdk's reader, for
+/// SDK clients the relay plane builds itself.
+#[cfg(feature = "sdk")]
+#[doc(hidden)]
+pub use finite_req::{AuthWatch, FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests};
 mod key_package;
 #[cfg(feature = "sdk")]
 #[doc(hidden)]
