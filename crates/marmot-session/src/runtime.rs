@@ -91,6 +91,7 @@ mod welcome_audit;
 mod welcome_delivery;
 mod welcome_outcomes;
 mod welcome_relays;
+mod welcome_routes;
 use welcome_audit::{InviteRefusal, V5WelcomePass};
 pub use welcome_outcomes::{INVITE_DELIVERY_RETENTION_SECS, WelcomeDeliveryOutcome};
 use welcome_relays::{
@@ -779,6 +780,10 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// The `(group, recipient)` pairs whose Welcome delivery state changed
     /// and that no host has taken yet (`take_welcome_delivery_changes`).
     welcome_delivery_changes: std::sync::Mutex<Vec<(GroupId, MemberId)>>,
+    /// Recipients whose last Welcome publish found no inbox route, paced so
+    /// maintenance does not prepare their Welcomes on every pass (see
+    /// `welcome_routes`).
+    welcome_route_retries: std::sync::Mutex<welcome_routes::WelcomeRouteRetries>,
     /// Whether the store has been read for `watched_welcomes`: the startup
     /// pass reads it, or else the first maintenance pass.
     welcome_store_read: bool,
@@ -858,6 +863,7 @@ where
             v5_prepared_welcomes: HashSet::new(),
             v5_withdrawn_welcomes: std::sync::Mutex::new(HashSet::new()),
             welcome_delivery_changes: std::sync::Mutex::new(Vec::new()),
+            welcome_route_retries: std::sync::Mutex::default(),
             welcome_store_read: false,
             unread_welcome_groups: Vec::new(),
             finish_stage_failure: None,
@@ -7407,12 +7413,14 @@ where
         let target = if let Some(fanout) = existing_fanout.as_ref() {
             fanout.target.clone()
         } else {
-            match self.routing.publish_target(&message) {
+            let routed = self.routing.publish_target(&message);
+            self.note_welcome_route(&message, routed.as_ref().map(|_| ()));
+            match routed {
                 Ok(target) => target,
                 Err(e) => {
                     self.record_v5_welcome_not_started(
                         welcome_facts.clone(),
-                        audit_v5::NotStartedReason::RouteResolutionFailed,
+                        welcome_routes::route_not_started_reason(&e),
                     );
                     if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
                         self.record_welcome_route_failure(&message.id);

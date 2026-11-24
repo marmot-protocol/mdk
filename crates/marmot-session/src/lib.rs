@@ -29,7 +29,9 @@ pub use key_package::{
     NoopKeyPackagePublisher,
 };
 pub use recovery_key::seal_to_recovery_key;
-pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
+pub use routing::{
+    MissingInboxRouteCause, StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy,
+};
 pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,
     CompletedWelcomePublishTask, DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport,

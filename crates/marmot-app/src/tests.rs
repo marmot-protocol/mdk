@@ -49,6 +49,7 @@ mod small_state;
 mod suspension_close;
 mod unreachable_group_relays;
 mod user_blocks;
+mod welcome_routes;
 
 use super::*;
 use async_trait::async_trait;
@@ -14856,12 +14857,14 @@ fn recovery_selected_inbox_only() {
             recipient: recipient.clone(),
         },
     };
-    routing.replace_inbox_route(other, Some(vec![endpoint.clone()]));
+    routing.replace_inbox_route(other, Ok(vec![endpoint.clone()]));
     assert!(matches!(
         routing.publish_target(&message),
-        Err(TransportRoutingError::MissingInboxRoute)
+        Err(TransportRoutingError::MissingInboxRoute(
+            MissingInboxRouteCause::NoList
+        ))
     ));
-    routing.replace_inbox_route(recipient.clone(), Some(vec![endpoint.clone()]));
+    routing.replace_inbox_route(recipient.clone(), Ok(vec![endpoint.clone()]));
     assert_eq!(
         routing.publish_target(&message).unwrap(),
         TransportPublishTarget::Inbox {

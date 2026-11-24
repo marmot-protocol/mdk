@@ -47,8 +47,8 @@ use marmot_account::{AccountHome, AccountHomeError, AccountSetupKind, AccountSum
 use marmot_session::{
     AccountDeviceRuntime, CanonicalizationPolicy, FeatureRegistry, KeyPackageEventDeletion,
     KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
-    KeyPackageSlotWithdrawal, SessionConfig, TransportRoutingError, TransportRoutingPolicy,
-    key_package_metadata,
+    KeyPackageSlotWithdrawal, MissingInboxRouteCause, SessionConfig, TransportRoutingError,
+    TransportRoutingPolicy, key_package_metadata,
 };
 use nostr_sdk::prelude::{
     EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
@@ -5677,29 +5677,17 @@ impl MarmotApp {
         for profile in self.profiles()? {
             inbox_routes.insert(
                 MemberId::new(hex::decode(profile.account_id_hex)?),
-                profile
+                Ok(profile
                     .inbox_endpoints
                     .into_iter()
                     .map(TransportEndpoint)
-                    .collect(),
+                    .collect()),
             );
         }
         for entry in self.directory().directory_entries()? {
-            let endpoints = self.retain_safe_discovered_endpoints(
-                entry
-                    .relay_lists
-                    .inbox
-                    .relays
-                    .into_iter()
-                    .map(TransportEndpoint)
-                    .collect(),
-                "directory inbox routing",
-            );
-            if !endpoints.is_empty() {
-                inbox_routes
-                    .entry(MemberId::new(hex::decode(entry.account_id_hex)?))
-                    .or_insert(endpoints);
-            }
+            inbox_routes
+                .entry(MemberId::new(hex::decode(&entry.account_id_hex)?))
+                .or_insert_with(|| self.discovered_inbox_route(entry.relay_lists.inbox));
         }
 
         let account = self.account_home().account(&state.label)?;
@@ -5754,10 +5742,7 @@ impl MarmotApp {
 
     /// One member's inbox route, by the same precedence as `routing_for`: a
     /// local account's own inbox, else the safe inbox of its directory entry.
-    fn member_inbox_route(
-        &self,
-        account_id_hex: &str,
-    ) -> Result<Option<Vec<TransportEndpoint>>, AppError> {
+    fn member_inbox_route(&self, account_id_hex: &str) -> Result<InboxRoute, AppError> {
         let local = self
             .account_home()
             .accounts()?
@@ -5765,31 +5750,42 @@ impl MarmotApp {
             .find(|account| account.account_id_hex == account_id_hex);
         if let Some(account) = local {
             let profile = self.profile_for_account(account);
-            return Ok(Some(
-                profile
-                    .inbox_endpoints
-                    .into_iter()
-                    .map(TransportEndpoint)
-                    .collect(),
-            ));
-        }
-        let Some(entry) = self
-            .directory()
-            .directory_entry_for_account_id(account_id_hex)?
-        else {
-            return Ok(None);
-        };
-        let endpoints = self.retain_safe_discovered_endpoints(
-            entry
-                .relay_lists
-                .inbox
-                .relays
+            return Ok(Ok(profile
+                .inbox_endpoints
                 .into_iter()
                 .map(TransportEndpoint)
-                .collect(),
+                .collect()));
+        }
+        Ok(self
+            .directory()
+            .directory_entry_for_account_id(account_id_hex)?
+            .map_or(Err(MissingInboxRouteCause::NoList), |entry| {
+                self.discovered_inbox_route(entry.relay_lists.inbox)
+            }))
+    }
+
+    /// The route a directory entry's inbox list gives: its relays that pass
+    /// the host-safety rule and the retired-relay denylist, or why there are
+    /// none.
+    fn discovered_inbox_route(&self, list: AccountRelayListState) -> InboxRoute {
+        if list.relays.is_empty() {
+            // A signed list that names no relay is known empty; with no event
+            // behind it, nothing is known.
+            return Err(if list.created_at > 0 {
+                MissingInboxRouteCause::EmptyList
+            } else {
+                MissingInboxRouteCause::NoList
+            });
+        }
+        let endpoints = self.retain_safe_discovered_endpoints(
+            list.relays.into_iter().map(TransportEndpoint).collect(),
             "directory inbox routing",
         );
-        Ok((!endpoints.is_empty()).then_some(endpoints))
+        if endpoints.is_empty() {
+            Err(MissingInboxRouteCause::NoneUsable)
+        } else {
+            Ok(endpoints)
+        }
     }
 
     fn latest_key_package(&self, label: &str) -> Result<KeyPackage, AppError> {
@@ -8803,11 +8799,14 @@ pub(crate) fn ledger_route_pairs<'a>(
         .collect()
 }
 
+/// A member's inbox route, or why a Welcome to them has none.
+type InboxRoute = Result<Vec<TransportEndpoint>, MissingInboxRouteCause>;
+
 #[derive(Clone, Debug)]
 struct AppRoutingState {
     local_inbox_endpoints: Vec<TransportEndpoint>,
     key_package_endpoints: Vec<TransportEndpoint>,
-    inbox_routes: HashMap<MemberId, Vec<TransportEndpoint>>,
+    inbox_routes: HashMap<MemberId, InboxRoute>,
     group_routes: Vec<TransportGroupSubscription>,
     required_acks: usize,
 }
@@ -8978,17 +8977,9 @@ impl AppTransportRouting {
         self.read().clone()
     }
 
-    /// Replace one member's inbox route; `None` removes it.
-    fn replace_inbox_route(&self, member: MemberId, endpoints: Option<Vec<TransportEndpoint>>) {
-        let mut state = self.write();
-        match endpoints {
-            Some(endpoints) => {
-                state.inbox_routes.insert(member, endpoints);
-            }
-            None => {
-                state.inbox_routes.remove(&member);
-            }
-        }
+    /// Replace one member's inbox route, or why there is none.
+    fn replace_inbox_route(&self, member: MemberId, route: InboxRoute) {
+        self.write().inbox_routes.insert(member, route);
     }
 
     fn replace(&self, state: AppRoutingState) {
@@ -9097,7 +9088,8 @@ impl TransportRoutingPolicy for AppTransportRouting {
                     .inbox_routes
                     .get(recipient)
                     .cloned()
-                    .ok_or(TransportRoutingError::MissingInboxRoute)?;
+                    .unwrap_or(Err(MissingInboxRouteCause::NoList))
+                    .map_err(TransportRoutingError::MissingInboxRoute)?;
                 Ok(TransportPublishTarget::Inbox {
                     recipient: recipient.clone(),
                     endpoints,

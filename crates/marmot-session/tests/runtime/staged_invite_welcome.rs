@@ -479,15 +479,34 @@ async fn staged_invite_welcome_goes_out_once_its_group_is_hydrated() {
     assert_eq!(sent[0].id, welcome_id);
 }
 
-/// A maintenance send that reaches no relay, here for want of a route, keeps
-/// the Welcome watched, so the next pass sends it once a route exists.
+/// A maintenance send that finds no route stores no retry record, so the
+/// runtime paces the recipient instead (mdk#2261): a pass inside the wait
+/// prepares nothing, records no failure, leaves the Welcome's delivery
+/// record alone and tells the host nothing, even once a route exists. Each
+/// paced attempt that finds no route is counted on that record once, and the
+/// first pass after a wait that finds a route sends the Welcome on it.
 #[tokio::test]
-async fn staged_invite_welcome_goes_out_after_a_send_that_found_no_route() {
+async fn staged_invite_welcome_without_a_route_waits_for_its_paced_retry() {
     let dir = relaxed_storage_dir().unwrap();
     let mut invite = retained_invite(dir.path()).await;
     let welcome_id = invite.welcome.id.clone();
+    let carol_changed = vec![(invite.group_id.clone(), invite.carol_id.clone())];
+    let attempts = |invite: &RetainedInvite| {
+        let record = invite
+            .runtime
+            .session()
+            .welcome_delivery_record(&welcome_id)
+            .unwrap()
+            .expect("a watched Welcome has a delivery record");
+        assert_eq!(
+            record.last_problem,
+            Some(cgka_traits::maintenance::WelcomeDeliveryProblem::NoInboxRelays)
+        );
+        record.attempts
+    };
     invite.route_carol(false);
     invite.confirm_commit().await;
+    invite.runtime.take_welcome_delivery_changes();
 
     let unrouted = invite.runtime.run_due_maintenance().await.unwrap();
     assert!(
@@ -506,8 +525,41 @@ async fn staged_invite_welcome_goes_out_after_a_send_that_found_no_route() {
             .is_none(),
         "a send that found no route leaves no retry record"
     );
+    let first = attempts(&invite);
+    assert_eq!(invite.runtime.take_welcome_delivery_changes(), carol_changed);
+
+    invite.wall.set(300_100 + 599);
+    let held = invite.runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        !held
+            .failures
+            .iter()
+            .any(|failure| failure.message_id == welcome_id),
+        "a pass inside the wait records no failure"
+    );
+    assert_eq!(attempts(&invite), first, "nor counts an attempt");
+    assert!(
+        invite.runtime.take_welcome_delivery_changes().is_empty(),
+        "nor tells the host of one"
+    );
+
+    // The paced attempt still finds no route: counted once, and the next
+    // wait is twice as long.
+    invite.wall.set(300_100 + 600);
+    invite.runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(attempts(&invite), first + 1);
+    assert_eq!(invite.runtime.take_welcome_delivery_changes(), carol_changed);
 
     invite.route_carol(true);
+    invite.wall.set(300_700 + 1_199);
+    invite.runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        staged_welcome_publishes(&invite.adapter).is_empty(),
+        "a pass inside the wait does not send it"
+    );
+    assert_eq!(attempts(&invite), first + 1);
+
+    invite.wall.set(300_700 + 1_200);
     invite.runtime.run_due_maintenance().await.unwrap();
     let sent = staged_welcome_publishes(&invite.adapter);
     assert_eq!(sent.len(), 1);

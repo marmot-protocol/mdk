@@ -1074,7 +1074,9 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
         let transport_group_id = match &message.envelope {
             TransportEnvelope::GroupMessage { transport_group_id } => transport_group_id.clone(),
             TransportEnvelope::Welcome { .. } => {
-                return Err(TransportRoutingError::MissingInboxRoute);
+                return Err(TransportRoutingError::MissingInboxRoute(
+                    marmot_session::MissingInboxRouteCause::NoList,
+                ));
             }
         };
         Ok(TransportPublishTarget::Group {

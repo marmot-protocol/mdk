@@ -21,10 +21,26 @@ pub trait TransportRoutingPolicy: Send + Sync {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportRoutingError {
-    #[error("missing inbox route for recipient")]
-    MissingInboxRoute,
+    #[error("missing inbox route for recipient: {0}")]
+    MissingInboxRoute(MissingInboxRouteCause),
     #[error("missing group route for transport group id")]
     MissingGroupRoute,
+}
+
+/// Why a Welcome's recipient has no inbox route: what the routing policy
+/// knows of the recipient's inbox endpoint list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MissingInboxRouteCause {
+    /// No inbox list is known for the recipient.
+    #[error("no list")]
+    NoList,
+    /// The recipient's inbox list names no endpoint.
+    #[error("empty list")]
+    EmptyList,
+    /// The list names endpoints, and this device's endpoint policy refuses
+    /// every one of them.
+    #[error("none usable")]
+    NoneUsable,
 }
 
 #[derive(Clone, Debug)]
@@ -101,11 +117,9 @@ impl TransportRoutingPolicy for StaticTransportRouting {
     ) -> Result<TransportPublishTarget, TransportRoutingError> {
         match &message.envelope {
             TransportEnvelope::Welcome { recipient } => {
-                let endpoints = self
-                    .inbox_routes
-                    .get(recipient)
-                    .cloned()
-                    .ok_or(TransportRoutingError::MissingInboxRoute)?;
+                let endpoints = self.inbox_routes.get(recipient).cloned().ok_or(
+                    TransportRoutingError::MissingInboxRoute(MissingInboxRouteCause::NoList),
+                )?;
                 Ok(TransportPublishTarget::Inbox {
                     recipient: recipient.clone(),
                     endpoints,
