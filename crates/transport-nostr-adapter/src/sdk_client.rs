@@ -5941,7 +5941,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
             };
             Some(
                 finite
-                    .fetch(&relay, filter.clone(), limits, &cancellation)
+                    .fetch(&relay, vec![filter.clone()], limits, &cancellation)
                     .await,
             )
         }))

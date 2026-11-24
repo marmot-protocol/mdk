@@ -2,7 +2,7 @@
 //!
 //! nostr-sdk reads each connection's frames one at a time and verifies every
 //! EVENT before it reads the next, so a history reply delays every live
-//! message queued behind it. A finite request (one filter, read until its
+//! message queued behind it. A finite request (one REQ, read until its
 //! EOSE) goes out instead through `Relay::send_msg` under an id in a reserved
 //! namespace ([`ID_PREFIX`]), which the SDK never registers or resends.
 //! [`DivertTransport`], installed under the SDK's transport, takes that id's
@@ -42,7 +42,7 @@ use std::fmt;
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -84,17 +84,17 @@ const MATCH: MatchEventOptions = MatchEventOptions::new().nip50(false);
 
 /// What one request may take from its relay.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct FiniteLimits {
+pub struct FiniteLimits {
     /// EVENT frames, valid or not, before the request is cut.
-    pub(crate) max_items: usize,
+    pub max_items: usize,
     /// Serialized JSON of valid events, duplicates included, before it is cut.
-    pub(crate) max_event_bytes: usize,
-    pub(crate) timeout: Duration,
+    pub max_event_bytes: usize,
+    pub timeout: Duration,
 }
 
 /// How a request ended. Only `Eose` is a complete reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FiniteEnd {
+pub enum FiniteEnd {
     Eose,
     /// The relay sent more EVENT frames than `max_items`.
     ItemLimit,
@@ -115,29 +115,29 @@ pub(crate) enum FiniteEnd {
 
 /// What one request read.
 #[derive(Debug)]
-pub(crate) struct FiniteReply {
+pub struct FiniteReply {
     /// Distinct valid events within the budgets, in the order they came.
-    pub(crate) events: Vec<Event>,
+    pub events: Vec<Event>,
     /// EVENT frames read for the request, valid or not, duplicates and the
     /// first one over the item budget included.
-    pub(crate) raw_items: usize,
+    pub raw_items: usize,
     /// Valid copies read, duplicates and the first one over a budget
     /// included.
-    pub(crate) received_items: usize,
+    pub received_items: usize,
     /// Valid copies of an event already kept.
-    pub(crate) duplicates: usize,
+    pub duplicates: usize,
     /// Serialized JSON of every valid copy read, duplicates and the first one
     /// over a budget included: what the byte budget counts.
-    pub(crate) event_bytes: usize,
+    pub event_bytes: usize,
     /// Serialized JSON of the events kept.
-    pub(crate) kept_event_bytes: usize,
+    pub kept_event_bytes: usize,
     /// Event bytes the relay sent for the request: the serialized JSON of
     /// each valid copy, and the whole frame of every other EVENT taken off
     /// the wire for it, read or not. A cut or cancelled reply reports them too.
-    pub(crate) fetched_bytes: u64,
+    pub fetched_bytes: u64,
     /// Its EOSE carried NIP-67 `more`.
-    pub(crate) more: bool,
-    pub(crate) end: FiniteEnd,
+    pub more: bool,
+    pub end: FiniteEnd,
 }
 
 impl FiniteReply {
@@ -188,7 +188,7 @@ impl FiniteReply {
 /// transport. Build it with the client, and install [`Self::transport`]
 /// under the SDK's transport.
 #[derive(Clone)]
-pub(crate) struct FiniteRequests(Arc<Registry>);
+pub struct FiniteRequests(Arc<Registry>, Option<Arc<AtomicUsize>>);
 
 impl fmt::Debug for FiniteRequests {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -335,24 +335,46 @@ impl Slot {
 }
 
 impl FiniteRequests {
+    /// `builder` with finite requests installed under its transport, and
+    /// those requests, for a client that is not a `NostrSdkRelayClient`.
+    pub fn install(builder: ClientBuilder) -> (ClientBuilder, Self) {
+        let finite = Self::for_builder(&builder);
+        let transport = Arc::new(finite.transport(builder.websocket_transport.clone()));
+        (builder.websocket_transport(transport), finite)
+    }
+
+    /// These requests, keeping at most `max_kept_event_bytes` of events
+    /// between every request made through the copy returned: one read's
+    /// budget, however its relays' replies divide it. A request that would
+    /// keep more ends [`FiniteEnd::ByteLimit`].
+    pub fn sharing(&self, max_kept_event_bytes: usize) -> Self {
+        Self(
+            self.0.clone(),
+            Some(Arc::new(AtomicUsize::new(max_kept_event_bytes))),
+        )
+    }
+
     /// The finite requests of the client `builder` builds, under its
     /// authenticator, admission policy and database.
     pub(crate) fn for_builder(builder: &ClientBuilder) -> Self {
-        Self(Arc::new(Registry {
-            can_authenticate: builder.authenticator.is_some(),
-            policy: builder.admit_policy.clone(),
-            database: builder.database.clone(),
-            max_frame: builder
-                .relay_limits
-                .messages
-                .max_size
-                .map_or(MAX_FRAME_BYTES, |max| (max as usize).min(MAX_FRAME_BYTES)),
-            event_limits: builder.relay_limits.events.clone(),
-            next_id: AtomicU64::new(0),
-            next_connection: AtomicU64::new(0),
-            requests: Mutex::default(),
-            verified: Mutex::default(),
-        }))
+        Self(
+            Arc::new(Registry {
+                can_authenticate: builder.authenticator.is_some(),
+                policy: builder.admit_policy.clone(),
+                database: builder.database.clone(),
+                max_frame: builder
+                    .relay_limits
+                    .messages
+                    .max_size
+                    .map_or(MAX_FRAME_BYTES, |max| (max as usize).min(MAX_FRAME_BYTES)),
+                event_limits: builder.relay_limits.events.clone(),
+                next_id: AtomicU64::new(0),
+                next_connection: AtomicU64::new(0),
+                requests: Mutex::default(),
+                verified: Mutex::default(),
+            }),
+            None,
+        )
     }
 
     /// `transport`, with this client's finite requests' replies taken off it.
@@ -363,32 +385,60 @@ impl FiniteRequests {
         }
     }
 
+    /// `relay`'s authentication outcomes from now on, for [`Self::fetch_watching`];
+    /// `None` when this client cannot authenticate.
+    pub fn watch_auth(&self, relay: &Relay) -> Option<AuthWatch> {
+        self.0
+            .can_authenticate
+            .then(|| AuthWatch(relay.notifications_with_gaps()))
+    }
+
     /// Ask `relay` for `filter`'s events until its EOSE, within `limits`. A
     /// relay that requires NIP-42 authentication is asked once more under a
     /// new id after the client authenticates, within what the refused attempt
     /// left of `limits`; the reply carries both attempts' events and counts.
-    pub(crate) async fn fetch(
+    pub async fn fetch(
         &self,
         relay: &Relay,
-        filter: Filter,
+        filters: Vec<Filter>,
         limits: FiniteLimits,
         cancel: &CancellationToken,
     ) -> FiniteReply {
-        let deadline = Instant::now() + limits.timeout;
         // Subscribed before the REQ, so an authentication the SDK finishes
         // while the relay answers is still in the stream.
-        let mut notifications = self
-            .0
-            .can_authenticate
-            .then(|| relay.notifications_with_gaps());
-        let first = self.request(relay, &filter, limits, deadline, cancel).await;
+        let mut auth = self.watch_auth(relay);
+        self.fetch_watching(relay, filters, limits, cancel, &mut auth)
+            .await
+    }
+
+    /// [`Self::fetch`], reading the authentication outcome from `auth`, a
+    /// watch the caller started earlier (before connecting, say, to see an
+    /// authentication that finished then). A retry takes the watch, so a
+    /// later refusal under it is final.
+    pub async fn fetch_watching(
+        &self,
+        relay: &Relay,
+        filters: Vec<Filter>,
+        limits: FiniteLimits,
+        cancel: &CancellationToken,
+        auth: &mut Option<AuthWatch>,
+    ) -> FiniteReply {
+        let deadline = Instant::now() + limits.timeout;
+        let first = self
+            .request(relay, &filters, limits, deadline, cancel)
+            .await;
         let auth_required =
             matches!(&first.end, FiniteEnd::Closed(reason) if is_auth_required(reason));
-        let Some(notifications) = notifications.as_mut().filter(|_| auth_required) else {
+        let Some(mut watch) = auth.take_if(|_| auth_required && self.0.can_authenticate) else {
             return first;
         };
-        if !authenticated(notifications, deadline, cancel).await {
-            return first;
+        match authenticated(&mut watch.0, deadline, cancel).await {
+            Ok(()) => {}
+            // The refusal stands.
+            Err(None) => return first,
+            // Authentication was still under way: the request is undecided,
+            // not refused.
+            Err(Some(end)) => return FiniteReply { end, ..first },
         }
         // The retry spends what the refused attempt left of the budget.
         let left = FiniteLimits {
@@ -396,14 +446,14 @@ impl FiniteRequests {
             max_event_bytes: limits.max_event_bytes.saturating_sub(first.event_bytes),
             ..limits
         };
-        let retry = self.request(relay, &filter, left, deadline, cancel).await;
+        let retry = self.request(relay, &filters, left, deadline, cancel).await;
         first.then(retry)
     }
 
     async fn request(
         &self,
         relay: &Relay,
-        filter: &Filter,
+        filters: &[Filter],
         limits: FiniteLimits,
         deadline: Instant,
         cancel: &CancellationToken,
@@ -420,8 +470,8 @@ impl FiniteRequests {
             .new_slot(<&Url>::from(relay.url()).as_str().to_owned(), limits);
         let registered = Registered::new(&self.0, id.clone(), slot.clone(), relay.clone());
         let subscription_id = SubscriptionId::new(&id);
-        let req = ClientMessage::req(subscription_id.clone(), vec![filter.clone()]);
-        let mut collector = Collector::new(filter, limits, &self.0, relay.url(), &subscription_id);
+        let req = ClientMessage::req(subscription_id.clone(), filters.to_vec());
+        let mut collector = Collector::new(filters, limits, self, relay.url(), &subscription_id);
         let mut deadline = std::pin::pin!(tokio::time::sleep_until(deadline));
         let queued = tokio::select! {
             biased;
@@ -492,31 +542,41 @@ pub(crate) fn is_auth_required(reason: &str) -> bool {
 }
 
 /// Wait until `deadline` for the SDK to authenticate to the relay whose
-/// notifications these are. True when it did, or when lost notifications may
-/// have hidden it.
+/// notifications these are. Ok when it did, or when lost notifications may
+/// have hidden it; `Err(None)` when it failed or no longer can, and the
+/// request's end when the wait was cut first.
 async fn authenticated(
     notifications: &mut (impl Stream<Item = NotificationUpdate<RelayNotification>> + Unpin),
     deadline: Instant,
     cancel: &CancellationToken,
-) -> bool {
+) -> Result<(), Option<FiniteEnd>> {
     let wait = async {
         while let Some(update) = notifications.next().await {
             match update {
                 NotificationUpdate::Notification(RelayNotification::Authenticated)
-                | NotificationUpdate::Lagged { .. } => return true,
+                | NotificationUpdate::Lagged { .. } => return Ok(()),
                 NotificationUpdate::Notification(RelayNotification::AuthenticationFailed) => {
-                    return false;
+                    return Err(None);
                 }
                 NotificationUpdate::Notification(_) => {}
             }
         }
-        false
+        Err(None)
     };
     tokio::select! {
         biased;
-        () = cancel.cancelled() => false,
-        () = tokio::time::sleep_until(deadline) => false,
+        () = cancel.cancelled() => Err(Some(FiniteEnd::Cancelled)),
+        () = tokio::time::sleep_until(deadline) => Err(Some(FiniteEnd::TimedOut)),
         authenticated = wait => authenticated,
+    }
+}
+
+/// A relay's authentication outcomes, from [`FiniteRequests::watch_auth`].
+pub struct AuthWatch(Pin<Box<dyn Stream<Item = NotificationUpdate<RelayNotification>> + Send>>);
+
+impl fmt::Debug for AuthWatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthWatch").finish_non_exhaustive()
     }
 }
 
@@ -599,9 +659,11 @@ impl Drop for Registered {
 
 /// Reads one request's frames in order.
 struct Collector<'a> {
-    filter: &'a Filter,
+    filters: &'a [Filter],
     limits: FiniteLimits,
     registry: &'a Registry,
+    /// What the requests sharing a budget may still keep, when they do.
+    kept_left: Option<&'a AtomicUsize>,
     relay: &'a RelayUrl,
     subscription_id: &'a SubscriptionId,
     seen: HashSet<EventId>,
@@ -617,16 +679,17 @@ struct Collector<'a> {
 
 impl<'a> Collector<'a> {
     fn new(
-        filter: &'a Filter,
+        filters: &'a [Filter],
         limits: FiniteLimits,
-        registry: &'a Registry,
+        finite: &'a FiniteRequests,
         relay: &'a RelayUrl,
         subscription_id: &'a SubscriptionId,
     ) -> Self {
         Self {
-            filter,
+            filters,
             limits,
-            registry,
+            registry: &finite.0,
+            kept_left: finite.1.as_deref(),
             relay,
             subscription_id,
             seen: HashSet::new(),
@@ -683,12 +746,22 @@ impl<'a> Collector<'a> {
         if self.event_bytes > self.limits.max_event_bytes {
             return Some(FiniteEnd::ByteLimit);
         }
-        if self.seen.insert(event.id) {
-            self.kept_event_bytes += bytes;
-            self.events.push(event);
-        } else {
+        if self.seen.contains(&event.id) {
             self.duplicates += 1;
+            return None;
         }
+        let charged = self.kept_left.is_none_or(|left| {
+            left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(bytes)
+            })
+            .is_ok()
+        });
+        if !charged {
+            return Some(FiniteEnd::ByteLimit);
+        }
+        self.seen.insert(event.id);
+        self.kept_event_bytes += bytes;
+        self.events.push(event);
         None
     }
 
@@ -702,7 +775,10 @@ impl<'a> Collector<'a> {
                 .get_max_num_tags(&event.kind)
                 .is_some_and(|max| event.tags.len() > usize::from(max))
             || event.is_expired()
-            || !self.filter.match_event(event, MATCH)
+            || !self
+                .filters
+                .iter()
+                .any(|filter| filter.match_event(event, MATCH))
             || !event.verify_id()
         {
             return false;
@@ -1061,7 +1137,8 @@ mod tests {
         frames: &[String],
     ) -> FiniteReply {
         let (relay, id) = (relay_url(), SubscriptionId::new("~f0"));
-        let mut collector = Collector::new(filter, limits, &finite.0, &relay, &id);
+        let mut collector =
+            Collector::new(std::slice::from_ref(filter), limits, finite, &relay, &id);
         for frame in frames {
             if let Some(end) = collector.frame(frame).await {
                 return collector.reply(end);
@@ -1179,7 +1256,13 @@ mod tests {
         let finite = requests();
         let filter = Filter::new().kind(Kind::TextNote);
         let (relay, id) = (relay_url(), SubscriptionId::new("~f0"));
-        let collector = Collector::new(&filter, limits(10, 1 << 20), &finite.0, &relay, &id);
+        let collector = Collector::new(
+            std::slice::from_ref(&filter),
+            limits(10, 1 << 20),
+            &finite,
+            &relay,
+            &id,
+        );
         assert!(collector.checked(&good, good.as_json().len()));
         assert!(
             finite
@@ -1258,6 +1341,24 @@ mod tests {
         assert_eq!(reply.end, FiniteEnd::Eose);
         assert_eq!(reply.raw_items, 3);
         assert_eq!(reply.events, vec![kept]);
+    }
+
+    /// A shared allowance bounds what its requests keep between them,
+    /// whichever request takes it.
+    #[tokio::test]
+    async fn requests_sharing_an_allowance_keep_no_more_between_them() {
+        let keys = Keys::generate();
+        let (first, second) = (note(&keys, "first"), note(&keys, "second"));
+        let bytes = first.as_json().len();
+        let finite = requests().sharing(bytes + bytes / 2);
+        let filter = Filter::new().kind(Kind::TextNote);
+        let frames = |event: &Event| [event_frame(event), event_frame(event), eose("")];
+        let reply = collect_with(&finite, &filter, limits(4, 1 << 20), &frames(&first)).await;
+        assert_eq!(reply.end, FiniteEnd::Eose);
+        assert_eq!((reply.events, reply.duplicates), (vec![first], 1));
+        let reply = collect_with(&finite, &filter, limits(4, 1 << 20), &frames(&second)).await;
+        assert_eq!(reply.end, FiniteEnd::ByteLimit);
+        assert!(reply.events.is_empty());
     }
 
     #[tokio::test]
@@ -1669,7 +1770,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let filter = Filter::new().kind(Kind::TextNote);
         let mut fetch =
-            std::pin::pin!(finite.fetch(&sdk_relay, filter, limits(1_000, 1 << 24), &cancel));
+            std::pin::pin!(finite.fetch(&sdk_relay, vec![filter], limits(1_000, 1 << 24), &cancel));
         // One poll queues the REQ; the caller then stops reading.
         assert!(futures::poll!(fetch.as_mut()).is_pending());
 
@@ -1786,7 +1887,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let filter = Filter::new().kind(Kind::TextNote);
         let mut fetch =
-            std::pin::pin!(finite.fetch(&sdk_relay, filter, limits(1_000, 1 << 24), &cancel));
+            std::pin::pin!(finite.fetch(&sdk_relay, vec![filter], limits(1_000, 1 << 24), &cancel));
         tokio::select! {
             reply = &mut fetch => panic!("ended before its first admission: {reply:?}"),
             () = started.notified() => {}
@@ -1826,7 +1927,7 @@ mod tests {
             let reply = finite
                 .fetch(
                     &relay,
-                    Filter::new().kind(Kind::TextNote),
+                    vec![Filter::new().kind(Kind::TextNote)],
                     limits(max_items, 1 << 20),
                     &CancellationToken::new(),
                 )
@@ -1934,7 +2035,12 @@ mod tests {
         let (finite, client) = client_on(Some(keys.clone()), &url).await;
         let sdk_relay = client.relay(&url).await.unwrap().unwrap();
         let reply = finite
-            .fetch(&sdk_relay, filter.clone(), limits(10, 1 << 20), &cancel)
+            .fetch(
+                &sdk_relay,
+                vec![filter.clone()],
+                limits(10, 1 << 20),
+                &cancel,
+            )
             .await;
         assert_eq!(reply.end, FiniteEnd::Eose);
         assert_eq!(reply.events, vec![stored]);
@@ -1944,7 +2050,7 @@ mod tests {
         let sdk_relay = client.relay(&url).await.unwrap().unwrap();
         let started = Instant::now();
         let reply = finite
-            .fetch(&sdk_relay, filter, limits(10, 1 << 20), &cancel)
+            .fetch(&sdk_relay, vec![filter], limits(10, 1 << 20), &cancel)
             .await;
         assert!(matches!(&reply.end, FiniteEnd::Closed(reason) if is_auth_required(reason)));
         assert!(started.elapsed() < Duration::from_secs(5));

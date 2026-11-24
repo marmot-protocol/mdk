@@ -173,7 +173,7 @@ impl SdkSweepRelay {
             timeout: self.request_timeout,
         };
         let reply = finite
-            .fetch(&relay, filter, limits, &self.interrupted)
+            .fetch(&relay, vec![filter], limits, &self.interrupted)
             .await;
         self.fetched_bytes
             .fetch_add(reply.fetched_bytes, Ordering::Relaxed);
