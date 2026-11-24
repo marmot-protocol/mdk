@@ -36,7 +36,7 @@
   theirs named a usable outbox that no KeyPackage read covered.
 - Group creation, invites and direct-chat starts always discover the members' current relay routes after
   `prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm no longer
-  skips discovery.
+  makes them skip discovery.
 
 ### Fixed
 

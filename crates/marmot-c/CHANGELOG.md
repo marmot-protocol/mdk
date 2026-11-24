@@ -37,7 +37,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   theirs named a usable outbox that no KeyPackage read covered.
 - Group creation, invites and direct-chat starts always discover the members' current relay routes after
   `marmot_prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm
-  no longer skips discovery.
+  no longer makes them skip discovery.
 
 ## [0.19.0] - 2026-11-22
 
