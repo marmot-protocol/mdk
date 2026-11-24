@@ -42,7 +42,7 @@ use std::fmt;
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -188,7 +188,7 @@ impl FiniteReply {
 /// transport. Build it with the client, and install [`Self::transport`]
 /// under the SDK's transport.
 #[derive(Clone)]
-pub struct FiniteRequests(Arc<Registry>);
+pub struct FiniteRequests(Arc<Registry>, Option<Arc<AtomicUsize>>);
 
 impl fmt::Debug for FiniteRequests {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -343,24 +343,38 @@ impl FiniteRequests {
         (builder.websocket_transport(transport), finite)
     }
 
+    /// These requests, keeping at most `max_kept_event_bytes` of events
+    /// between every request made through the copy returned: one read's
+    /// budget, however its relays' replies divide it. A request that would
+    /// keep more ends [`FiniteEnd::ByteLimit`].
+    pub fn sharing(&self, max_kept_event_bytes: usize) -> Self {
+        Self(
+            self.0.clone(),
+            Some(Arc::new(AtomicUsize::new(max_kept_event_bytes))),
+        )
+    }
+
     /// The finite requests of the client `builder` builds, under its
     /// authenticator, admission policy and database.
     pub(crate) fn for_builder(builder: &ClientBuilder) -> Self {
-        Self(Arc::new(Registry {
-            can_authenticate: builder.authenticator.is_some(),
-            policy: builder.admit_policy.clone(),
-            database: builder.database.clone(),
-            max_frame: builder
-                .relay_limits
-                .messages
-                .max_size
-                .map_or(MAX_FRAME_BYTES, |max| (max as usize).min(MAX_FRAME_BYTES)),
-            event_limits: builder.relay_limits.events.clone(),
-            next_id: AtomicU64::new(0),
-            next_connection: AtomicU64::new(0),
-            requests: Mutex::default(),
-            verified: Mutex::default(),
-        }))
+        Self(
+            Arc::new(Registry {
+                can_authenticate: builder.authenticator.is_some(),
+                policy: builder.admit_policy.clone(),
+                database: builder.database.clone(),
+                max_frame: builder
+                    .relay_limits
+                    .messages
+                    .max_size
+                    .map_or(MAX_FRAME_BYTES, |max| (max as usize).min(MAX_FRAME_BYTES)),
+                event_limits: builder.relay_limits.events.clone(),
+                next_id: AtomicU64::new(0),
+                next_connection: AtomicU64::new(0),
+                requests: Mutex::default(),
+                verified: Mutex::default(),
+            }),
+            None,
+        )
     }
 
     /// `transport`, with this client's finite requests' replies taken off it.
@@ -457,7 +471,7 @@ impl FiniteRequests {
         let registered = Registered::new(&self.0, id.clone(), slot.clone(), relay.clone());
         let subscription_id = SubscriptionId::new(&id);
         let req = ClientMessage::req(subscription_id.clone(), filters.to_vec());
-        let mut collector = Collector::new(filters, limits, &self.0, relay.url(), &subscription_id);
+        let mut collector = Collector::new(filters, limits, self, relay.url(), &subscription_id);
         let mut deadline = std::pin::pin!(tokio::time::sleep_until(deadline));
         let queued = tokio::select! {
             biased;
@@ -648,6 +662,8 @@ struct Collector<'a> {
     filters: &'a [Filter],
     limits: FiniteLimits,
     registry: &'a Registry,
+    /// What the requests sharing a budget may still keep, when they do.
+    kept_left: Option<&'a AtomicUsize>,
     relay: &'a RelayUrl,
     subscription_id: &'a SubscriptionId,
     seen: HashSet<EventId>,
@@ -665,14 +681,15 @@ impl<'a> Collector<'a> {
     fn new(
         filters: &'a [Filter],
         limits: FiniteLimits,
-        registry: &'a Registry,
+        finite: &'a FiniteRequests,
         relay: &'a RelayUrl,
         subscription_id: &'a SubscriptionId,
     ) -> Self {
         Self {
             filters,
             limits,
-            registry,
+            registry: &finite.0,
+            kept_left: finite.1.as_deref(),
             relay,
             subscription_id,
             seen: HashSet::new(),
@@ -729,12 +746,22 @@ impl<'a> Collector<'a> {
         if self.event_bytes > self.limits.max_event_bytes {
             return Some(FiniteEnd::ByteLimit);
         }
-        if self.seen.insert(event.id) {
-            self.kept_event_bytes += bytes;
-            self.events.push(event);
-        } else {
+        if self.seen.contains(&event.id) {
             self.duplicates += 1;
+            return None;
         }
+        let charged = self.kept_left.is_none_or(|left| {
+            left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(bytes)
+            })
+            .is_ok()
+        });
+        if !charged {
+            return Some(FiniteEnd::ByteLimit);
+        }
+        self.seen.insert(event.id);
+        self.kept_event_bytes += bytes;
+        self.events.push(event);
         None
     }
 
@@ -1111,7 +1138,7 @@ mod tests {
     ) -> FiniteReply {
         let (relay, id) = (relay_url(), SubscriptionId::new("~f0"));
         let mut collector =
-            Collector::new(std::slice::from_ref(filter), limits, &finite.0, &relay, &id);
+            Collector::new(std::slice::from_ref(filter), limits, finite, &relay, &id);
         for frame in frames {
             if let Some(end) = collector.frame(frame).await {
                 return collector.reply(end);
@@ -1232,7 +1259,7 @@ mod tests {
         let collector = Collector::new(
             std::slice::from_ref(&filter),
             limits(10, 1 << 20),
-            &finite.0,
+            &finite,
             &relay,
             &id,
         );
@@ -1314,6 +1341,24 @@ mod tests {
         assert_eq!(reply.end, FiniteEnd::Eose);
         assert_eq!(reply.raw_items, 3);
         assert_eq!(reply.events, vec![kept]);
+    }
+
+    /// A shared allowance bounds what its requests keep between them,
+    /// whichever request takes it.
+    #[tokio::test]
+    async fn requests_sharing_an_allowance_keep_no_more_between_them() {
+        let keys = Keys::generate();
+        let (first, second) = (note(&keys, "first"), note(&keys, "second"));
+        let bytes = first.as_json().len();
+        let finite = requests().sharing(bytes + bytes / 2);
+        let filter = Filter::new().kind(Kind::TextNote);
+        let frames = |event: &Event| [event_frame(event), event_frame(event), eose("")];
+        let reply = collect_with(&finite, &filter, limits(4, 1 << 20), &frames(&first)).await;
+        assert_eq!(reply.end, FiniteEnd::Eose);
+        assert_eq!((reply.events, reply.duplicates), (vec![first], 1));
+        let reply = collect_with(&finite, &filter, limits(4, 1 << 20), &frames(&second)).await;
+        assert_eq!(reply.end, FiniteEnd::ByteLimit);
+        assert!(reply.events.is_empty());
     }
 
     #[tokio::test]

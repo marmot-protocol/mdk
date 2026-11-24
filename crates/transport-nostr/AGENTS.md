@@ -56,9 +56,10 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   relay's REQ as one of the adapter's finite requests, on an owned client built with `FiniteRequests::install`: each
   relay's reply keeps its own end (EOSE, CLOSED reason, cut, deadline), and a relay that requires NIP-42 is asked once
   more after the signer authenticates. Authentication still under way at the deadline is `TimedOut`, not a refusal;
-  inspection watches authentication from before the dial, so a refusal on connect still decides a later close. A
-  read's relays share its byte budget. A plain directory read sets no item cap (a relay's every EVENT frame would count,
-  matching or not); a public read past `max_events`, cut, or ending on NIP-67 `more` is incomplete.
+  inspection watches authentication from before the dial, so a refusal on connect still decides a later close, and an
+  EOSE with NIP-67 `more` is `Incomplete` (not for the inbox probe). Each query's relays share one byte budget
+  (`FiniteRequests::sharing`); directory and public reads set no item cap, since a relay's every EVENT frame would count,
+  matching or not. A public read past `max_events`, cut, or ending on `more` is incomplete.
 - Recovery debt, retry selection and native input qualification belong to the app's recovery runner.
   Bridge the runner's fence plans and borrowed source guards; never fetch history of the plane's own or schedule quiet-period
   repair here. Import actual loss before cursor authorization and retain placement/spill locking through the owner's

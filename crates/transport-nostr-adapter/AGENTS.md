@@ -269,8 +269,9 @@ for reconnect/backoff and relay status mechanics.
   `auth-required:` refusal is retried once under a new id after the client authenticates; the retry spends what the
   refused attempt left of the budget, and the reply keeps both attempts' events and counts. Authentication still
   under way at the deadline ends the request `TimedOut` (undecided), never as the refusal. The relay plane's own
-  one-shot clients get finite requests through `FiniteRequests::install`; keep that surface to `install`, `fetch` and
-  their types.
+  one-shot clients get finite requests through `FiniteRequests::install`; keep that surface to `install`, `fetch`,
+  `fetch_watching` with `watch_auth` (an authentication watch started before the dial), `sharing` (one byte budget
+  for a read's relays, charged per kept event) and their types.
 - The client's wire tap (`src/sweep/hint_tap.rs`) counts, per REQ, the EVENT frames its relay sends before that
   REQ's EOSE, valid or not, on the connection the REQ went out on (`ReplyCounts`). `dispatch_sdk_notification` asks
   `NostrRelayClient::reply_sent_nothing` once as it dispatches each EOSE, and each ask answers only the oldest EOSE
