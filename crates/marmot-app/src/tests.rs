@@ -9547,6 +9547,7 @@ async fn direct_requires_ready_peer() {
         .lock()
         .unwrap()
         .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    key_package_selection::retire_journaled_key_packages(&app, &accounts[0]).await;
     let runtime = app.runtime();
     let result = runtime
         .start_direct_conversation(&creator.label, &accounts[0].account_id_hex)
@@ -9926,7 +9927,9 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .err()
             .expect("future-only discovery must fail closed");
         assert!(
-            matches!(error, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            // The journal knows the packages the first lookup selected, and
+            // no completed read returned them, so absence is not established.
+            matches!(error, DirectoryError::DirectoryLookupIncomplete(id) if id == members[0])
         );
         assert!(
             fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -9944,7 +9947,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .await
             .unwrap_err();
         assert!(
-            matches!(ordinary, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            matches!(ordinary, DirectoryError::DirectoryLookupIncomplete(id) if id == members[0])
         );
         let prewarm = app
             .directory()
@@ -9952,7 +9955,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .await
             .unwrap_err();
         assert!(
-            matches!(prewarm, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            matches!(prewarm, DirectoryError::DirectoryLookupIncomplete(id) if id == members[0])
         );
     }
 }

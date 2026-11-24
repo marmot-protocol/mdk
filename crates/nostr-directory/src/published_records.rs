@@ -689,16 +689,17 @@ pub(crate) fn select_fenced_key_packages(
         legacy_slots,
         unread_publication,
     } = slot_candidates(account_id_hex, records, freshness, requirements, fence);
+    // Finding no candidate, by rejection or by absence, describes the
+    // account's packages only when the records hold every publication the
+    // journal knows is current.
+    if unread_publication {
+        return Err(DirectoryError::DirectoryLookupIncomplete(
+            account_id_hex.to_owned(),
+        ));
+    }
     if candidates.is_empty()
         && let Some(error) = newest_error
     {
-        // A rejection describes the account's packages only when the records
-        // hold every publication the journal knows is current.
-        if unread_publication {
-            return Err(DirectoryError::DirectoryLookupIncomplete(
-                account_id_hex.to_owned(),
-            ));
-        }
         return Err(error);
     }
     candidates.sort_by(|a, b| {

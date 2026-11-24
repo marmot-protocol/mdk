@@ -122,7 +122,7 @@ fn signed(
 /// runtime starts, then records every publication the journal knows for it
 /// as deleted. A fixture's relays serve packages built for the test in place
 /// of the account's own, and the journal would otherwise still expect those.
-async fn retire_journaled_key_packages(app: &MarmotApp, account: &AccountSummary) {
+pub(super) async fn retire_journaled_key_packages(app: &MarmotApp, account: &AccountSummary) {
     drop(client_on_app_relay_plane(app, &account.label).await);
     let storage = app.shared_storage().unwrap();
     for publication in storage
@@ -1523,7 +1523,8 @@ async fn a_relay_list_naming_an_unread_outbox_decides_no_incompatibility() {
 
 /// Prewarm reads the old outbox and journals a slot's newest publication.
 /// When the recipient moves outboxes and the new one serves only an older copy
-/// of that slot, the journal still bars it, so no chat is created.
+/// of that slot, the journal still bars it, so no chat is created. The
+/// publication the journal knows went unread, so the lookup is incomplete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_moved_outbox_cannot_revive_a_package_prewarm_saw_replaced() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
@@ -1590,7 +1591,7 @@ async fn a_moved_outbox_cannot_revive_a_package_prewarm_saw_replaced() {
         .unwrap_err();
     // The new outbox was read, but its only copy was superseded.
     assert!(
-        matches!(error, AppError::MissingKeyPackage { .. }),
+        matches!(error, AppError::DirectoryLookupIncomplete { .. }),
         "{error}"
     );
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -1609,8 +1610,9 @@ async fn a_moved_outbox_cannot_revive_a_package_prewarm_saw_replaced() {
 
 /// Prewarm sees a compatible package in a slot. The recipient's outbox then
 /// moves, and the new one serves an incompatible slot beside an older copy of
-/// that slot, or without that slot at all. The package the journal knows went
-/// unread either way, so the other slot's refusal is no verdict.
+/// that slot, the incompatible slot alone, or no KeyPackage at all. The
+/// package the journal knows went unread each time, so neither the other
+/// slot's refusal nor the empty reply is a verdict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
@@ -1677,16 +1679,18 @@ async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
         updated.push(limited);
     }
     let runtime = MarmotAppRuntime::new(app.clone());
-    for stale_served in [true, false] {
-        if !stale_served {
-            fetcher
-                .events_by_endpoint
-                .lock()
-                .unwrap()
-                .get_mut(UPDATED_DIRECT_OUTBOX)
-                .unwrap()
-                .retain(|event| event.tag_value("d") != Some("x"));
-        }
+    for served in ["an older copy and another slot", "another slot", "nothing"] {
+        fetcher
+            .events_by_endpoint
+            .lock()
+            .unwrap()
+            .get_mut(UPDATED_DIRECT_OUTBOX)
+            .unwrap()
+            .retain(|event| match served {
+                "another slot" => event.tag_value("d") != Some("x"),
+                "nothing" => event.kind != KIND_MARMOT_KEY_PACKAGE,
+                _ => true,
+            });
         let error = runtime
             .start_direct_conversation_with_options(
                 "alice",
@@ -1699,7 +1703,7 @@ async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
             .unwrap_err();
         assert!(
             matches!(error, AppError::DirectoryLookupIncomplete { .. }),
-            "stale copy served: {stale_served}: {error}"
+            "new outbox serves {served}: {error}"
         );
         assert!(app.groups("alice").unwrap().is_empty());
     }
