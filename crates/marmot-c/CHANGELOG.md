@@ -29,8 +29,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - A member's `MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPATIBLE_KEY_PACKAGE` now requires completed relay-list discovery
   and complete KeyPackage reads. If either is incomplete, the status is `MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPLETE`.
-- A member with no usable KeyPackage is `MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPLETE`, not missing or incompatible,
-  while this device has recorded a KeyPackage of theirs that the reads did not return and no deletion request covers.
+- A member with no usable KeyPackage is `MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPLETE`, not missing or incompatible, while
+  this device's KeyPackage journal keeps a publication of theirs that the lookup did not account for. The shared API
+  guidance for `marmot_start_direct_chat_with_options` states what accounts for one and how long the journal keeps
+  it.
 - Group creation, invites and direct-chat starts always discover the members' current relay routes after
   `marmot_prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm
   no longer skips discovery.

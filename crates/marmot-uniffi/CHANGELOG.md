@@ -29,7 +29,9 @@
 - A member's `MemberResolutionStatusFfi::IncompatibleKeyPackage` now requires completed relay-list discovery
   and complete KeyPackage reads. If either is incomplete, the status is `MemberResolutionStatusFfi::Incomplete`.
 - A member with no usable KeyPackage is `MemberResolutionStatusFfi::Incomplete`, not missing or incompatible, while
-  this device has recorded a KeyPackage of theirs that the reads did not return and no deletion request covers.
+  this device's KeyPackage journal keeps a publication of theirs that the lookup did not account for. The API
+  reference for `start_direct_conversation_with_options` states what accounts for one and how long the journal keeps
+  it.
 - Group creation, invites and direct-chat starts always discover the members' current relay routes after
   `prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm no longer
   skips discovery.

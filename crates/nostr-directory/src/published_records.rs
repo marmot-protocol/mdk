@@ -586,9 +586,19 @@ struct RankedKeyPackage {
 /// replacements and deletions. Selection applies it to every candidate, so a
 /// relay that no longer serves a replacement or deletion cannot revive what it
 /// barred. Eviction markers only say evidence is missing, so they bar nothing.
+/// A selection that finds no candidate also checks that the lookup accounted
+/// for every publication the journal knows ([`FencedLookup`]).
 pub(crate) struct KeyPackageJournalFence {
     replacements: Vec<PublicKeyPackageReplacementRecord>,
     barriers: Vec<PublicKeyPackageBarrierRecord>,
+}
+
+/// A journal fence with everything one lookup observed: the account's
+/// KeyPackages and deletion requests from every read, used or not.
+#[derive(Clone, Copy)]
+pub(crate) struct FencedLookup<'a> {
+    fence: &'a KeyPackageJournalFence,
+    seen: &'a [RelayEventRecord],
 }
 
 impl KeyPackageJournalFence {
@@ -597,6 +607,11 @@ impl KeyPackageJournalFence {
             replacements: snapshot.replacements,
             barriers: snapshot.barriers,
         }
+    }
+
+    /// This fence beside what a lookup observed.
+    pub(crate) fn over<'a>(&'a self, seen: &'a [RelayEventRecord]) -> FencedLookup<'a> {
+        FencedLookup { fence: self, seen }
     }
 
     /// Whether the journal knows neither a replacement nor a deletion of this
@@ -611,13 +626,17 @@ impl KeyPackageJournalFence {
             .filter(|replacement| replacement.key_package_id == slot)
             .all(|replacement| replacement_allows(event_id, created_at, replacement))
     }
+}
 
-    /// Whether the journal knows a publication, and no deletion of it, that
-    /// `read` holds neither itself nor a replacement of. `read` is each
-    /// publication's slot, event id and time. A lookup that missed one cannot
-    /// say what the account publishes in that slot.
-    fn knows_an_unread_publication(&self, read: &[(&str, &str, u64)]) -> bool {
-        let replacements = self.replacements.iter().map(|replacement| {
+impl FencedLookup<'_> {
+    /// Whether the journal knows a publication the lookup did not account
+    /// for. A publication is accounted for when what the lookup observed
+    /// holds it, a replacement of it or a deletion request covering it, or
+    /// when the journal knows it deleted. A lookup that missed one cannot say
+    /// what the account publishes in that slot.
+    fn misses_a_journaled_publication(self, account: &str, freshness: DirectoryFreshness) -> bool {
+        let Self { fence, seen } = self;
+        let replacements = fence.replacements.iter().map(|replacement| {
             (
                 replacement.key_package_id.as_str(),
                 replacement.event_id_hex.as_str(),
@@ -625,7 +644,7 @@ impl KeyPackageJournalFence {
             )
         });
         // A replacement pruned from the journal's table stays as a barrier.
-        let pruned = self
+        let pruned = fence
             .barriers
             .iter()
             .filter(|barrier| barrier.kind == PublicKeyPackageBarrierKind::Replacement)
@@ -636,13 +655,19 @@ impl KeyPackageJournalFence {
                     barrier.event_created_at,
                 )
             });
+        let deletions = verified_deletions(account, seen);
         replacements.chain(pruned).any(|(slot, event_id, at)| {
-            self.allows(event_id, slot, at)
-                && !read.iter().any(|&(read_slot, read_id, read_at)| {
-                    read_slot == slot
-                        && (read_id == event_id
-                            || read_at > at
-                            || (read_at == at && read_id < event_id))
+            fence.allows(event_id, slot, at)
+                && !package_is_deleted(account, event_id, slot, at, &deletions)
+                && !seen.iter().any(|record| {
+                    let read = &record.event;
+                    read.kind == KIND_MARMOT_KEY_PACKAGE
+                        && read.pubkey == account
+                        && freshness.accepts(record)
+                        && read.tag_value("d").unwrap_or_default() == slot
+                        && (read.id == event_id
+                            || read.created_at > at
+                            || (read.created_at == at && read.id.as_str() < event_id))
                 })
         })
     }
@@ -678,14 +703,16 @@ pub fn select_key_packages_from_records(
     select_fenced_key_packages(account_id_hex, records, freshness, requirements, None)
 }
 
-/// [`select_key_packages_from_records`], skipping every publication `fence`
-/// knows was replaced or deleted.
+/// [`select_key_packages_from_records`], skipping every publication the
+/// journal knows was replaced or deleted. When that leaves no candidate and
+/// the journal keeps a publication the lookup did not account for, the lookup
+/// is incomplete.
 pub(crate) fn select_fenced_key_packages(
     account_id_hex: &str,
     records: &[RelayEventRecord],
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-    fence: Option<&KeyPackageJournalFence>,
+    fence: Option<FencedLookup<'_>>,
 ) -> Result<KeyPackageSelection, DirectoryError> {
     let SlotCandidates {
         mut candidates,
@@ -695,8 +722,8 @@ pub(crate) fn select_fenced_key_packages(
         unread_publication,
     } = slot_candidates(account_id_hex, records, freshness, requirements, fence);
     // Finding no candidate, by rejection or by absence, describes the
-    // account's packages only when the records hold every publication the
-    // journal knows is current.
+    // account's packages only when the lookup accounted for every
+    // publication the journal keeps.
     if unread_publication {
         return Err(DirectoryError::DirectoryLookupIncomplete(
             account_id_hex.to_owned(),
@@ -745,8 +772,8 @@ struct SlotCandidates {
     newest_error: Option<DirectoryError>,
     rejected_future: bool,
     legacy_slots: bool,
-    /// No candidate was found, and the journal knows a current publication
-    /// the records lack.
+    /// No candidate was found, and the journal keeps a publication the
+    /// lookup did not account for.
     unread_publication: bool,
 }
 
@@ -755,7 +782,7 @@ fn slot_candidates(
     records: &[RelayEventRecord],
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-    fence: Option<&KeyPackageJournalFence>,
+    fence: Option<FencedLookup<'_>>,
 ) -> SlotCandidates {
     let deletions = verified_deletions(account_id_hex, records);
     let mut records = records
@@ -769,7 +796,6 @@ fn slot_candidates(
     let mut newest_error = None;
     let mut slots = BTreeSet::new();
     let mut legacy_slots = false;
-    let mut read = Vec::new();
     let mut candidates = Vec::new();
     for record in records {
         if !freshness.accepts(record) {
@@ -777,7 +803,6 @@ fn slot_candidates(
             continue;
         }
         let slot = record.event.tag_value("d").unwrap_or_default();
-        read.push((slot, record.event.id.as_str(), record.event.created_at));
         if !slot.is_empty() && !slots.insert(slot.to_owned()) {
             continue;
         }
@@ -787,9 +812,11 @@ fn slot_candidates(
             slot,
             record.event.created_at,
             &deletions,
-        ) || fence
-            .is_some_and(|fence| !fence.allows(&record.event.id, slot, record.event.created_at))
-        {
+        ) || fence.is_some_and(|lookup| {
+            !lookup
+                .fence
+                .allows(&record.event.id, slot, record.event.created_at)
+        }) {
             continue;
         }
         let (fetched, metadata) = match key_package_and_metadata_from_borrowed_record(record) {
@@ -828,7 +855,8 @@ fn slot_candidates(
         });
     }
     let unread_publication = candidates.is_empty()
-        && fence.is_some_and(|fence| fence.knows_an_unread_publication(&read));
+        && fence
+            .is_some_and(|lookup| lookup.misses_a_journaled_publication(account_id_hex, freshness));
     SlotCandidates {
         candidates,
         newest_error,
@@ -1412,13 +1440,30 @@ pub(crate) fn watermark_allows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
-    /// A lookup lacks a publication the journal knows, from its table or
-    /// pruned to a barrier, until the lookup reads it or a replacement of it,
-    /// or the journal knows it deleted.
+    fn package(account: &str, slot: &str, id: &str, created_at: u64) -> RelayEventRecord {
+        let mut event = NostrTransportEvent::new_unsigned_at(
+            account.to_owned(),
+            KIND_MARMOT_KEY_PACKAGE,
+            vec![vec!["d".into(), slot.into()]],
+            String::new(),
+            created_at,
+        );
+        event.id = id.to_owned();
+        RelayEventRecord {
+            endpoints: Vec::new(),
+            event,
+        }
+    }
+
+    /// The journal's publication counts against a lookup until the lookup
+    /// reads it or a replacement of it, observes its deletion request, or the
+    /// journal knows it deleted.
     #[test]
-    fn a_fence_knows_a_publication_until_it_is_read_or_deleted() {
-        let account = "aa".repeat(32);
+    fn a_journaled_publication_counts_until_the_lookup_accounts_for_it() {
+        let keys = Keys::generate();
+        let account = keys.public_key().to_hex();
         let (older, newer) = ("11".repeat(32), "22".repeat(32));
         let barrier = |kind, deleted_event_id| PublicKeyPackageBarrierRecord {
             account_id_hex: account.clone(),
@@ -1447,20 +1492,51 @@ mod tests {
             event_id_hex: "33".repeat(32),
             ..barrier(PublicKeyPackageBarrierKind::Deletion, Some(newer.clone()))
         };
-        for (fence, unread) in [
+        let observed_deletion = RelayEventRecord {
+            endpoints: Vec::new(),
+            event: NostrTransportEvent::from_nostr_event(
+                &EventBuilder::new(Kind::from(5), "")
+                    .tags([Tag::custom("e", [newer.clone()])])
+                    .finalize(&keys)
+                    .unwrap(),
+            )
+            .unwrap(),
+        };
+        let fresh = DirectoryFreshness::at(40, Duration::ZERO);
+        for (fence, journaled) in [
             (fence(true, vec![]), true),
             (fence(false, vec![pruned]), true),
             (fence(true, vec![deletion]), false),
             (fence(false, vec![]), false),
         ] {
+            let misses = |seen: &[RelayEventRecord], freshness| {
+                fence
+                    .over(seen)
+                    .misses_a_journaled_publication(&account, freshness)
+            };
             // Missing the slot or holding only an older copy leaves it unread.
-            assert_eq!(fence.knows_an_unread_publication(&[]), unread);
+            assert_eq!(misses(&[], fresh), journaled);
             assert_eq!(
-                fence.knows_an_unread_publication(&[("slot", &older, 10), ("other", &newer, 30)]),
-                unread
+                misses(
+                    &[
+                        package(&account, "slot", &older, 10),
+                        package(&account, "other", &newer, 30),
+                    ],
+                    fresh
+                ),
+                journaled
             );
-            assert!(!fence.knows_an_unread_publication(&[("slot", &newer, 20)]));
-            assert!(!fence.knows_an_unread_publication(&[("slot", &older, 21)]));
+            assert!(!misses(&[package(&account, "slot", &newer, 20)], fresh));
+            assert!(!misses(&[package(&account, "slot", &older, 21)], fresh));
+            assert!(!misses(std::slice::from_ref(&observed_deletion), fresh));
+            // An empty selection is then incomplete, or the account having
+            // no package.
+            let empty =
+                select_fenced_key_packages(&account, &[], fresh, None, Some(fence.over(&[])));
+            assert_eq!(
+                matches!(empty, Err(DirectoryError::DirectoryLookupIncomplete(_))),
+                journaled
+            );
         }
     }
 }

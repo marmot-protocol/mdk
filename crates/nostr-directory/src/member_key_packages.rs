@@ -1364,7 +1364,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     &account_records,
                     self.directory_freshness(),
                     requirements,
-                    Some(&fence),
+                    Some(fence.over(&account_records)),
                 )
                 .map(|selection| selection.value);
                 // Batch results prove no coverage; every absence or rejection

@@ -30,6 +30,9 @@ pub(super) struct RecoveredKeyPackageRecords {
     /// deletion lookup must never admit a different, unchecked candidate.
     pub(super) freshness: DirectoryFreshness,
     pub(super) records: Vec<DirectoryRelayEventRecord>,
+    /// Everything the lookup observed, when `records` is only part of it.
+    /// Final selection checks the journal against this.
+    seen: Option<Vec<DirectoryRelayEventRecord>>,
     pub(super) cache_evidence: Option<KeyPackageRecoveryEvidence>,
     /// Every KeyPackage read behind `records` completed.
     pub(super) complete: bool,
@@ -39,19 +42,20 @@ impl RecoveredKeyPackageRecords {
     /// The final selection, which revalidates each package on the wall clock.
     /// A non-empty selection may still leave out a device (D12). After a
     /// complete read, an empty one or a refusal is the verdict, unless
-    /// `fence` knows a publication the records lack.
+    /// `fence` keeps a publication the lookup did not account for.
     pub(super) fn select(
         &self,
         account: &str,
         requirements: Option<&KeyPackageRequirements>,
         fence: Option<&KeyPackageJournalFence>,
     ) -> Result<Vec<FetchedKeyPackage>, DirectoryError> {
+        let seen = self.seen.as_deref().unwrap_or(&self.records);
         match select_fenced_key_packages(
             account,
             &self.records,
             self.freshness,
             requirements,
-            fence,
+            fence.map(|fence| fence.over(seen)),
         ) {
             Ok(selection) if !selection.value.is_empty() => Ok(selection.value),
             // Losing an incomplete read's package to revalidation says
@@ -138,8 +142,14 @@ impl<R: DirectoryResources> Directory<R> {
         let freshness = self.directory_freshness();
         // What the read found is used even when the read was incomplete:
         // every device is sought, not guaranteed (mdk#2628, D12).
-        if select_fenced_key_packages(account, &observed, freshness, requirements, fence)
-            .is_ok_and(|selection| !selection.value.is_empty())
+        if select_fenced_key_packages(
+            account,
+            &observed,
+            freshness,
+            requirements,
+            fence.map(|fence| fence.over(&observed)),
+        )
+        .is_ok_and(|selection| !selection.value.is_empty())
         {
             // Losing this package decides nothing if a supplementary read was
             // skipped or an earlier read's package went unserved.
@@ -149,6 +159,7 @@ impl<R: DirectoryResources> Directory<R> {
             return Ok(RecoveredKeyPackageRecords {
                 freshness,
                 records: observed,
+                seen: None,
                 cache_evidence: None,
                 complete,
             });
@@ -221,7 +232,7 @@ impl<R: DirectoryResources> Directory<R> {
                         &records,
                         freshness,
                         requirements,
-                        journal,
+                        journal.map(|fence| fence.over(&observed)),
                     ) {
                         Err(DirectoryError::KeyPackageRequirements(error))
                             if !verdict_coverage(&deletions, journal)
@@ -253,6 +264,7 @@ impl<R: DirectoryResources> Directory<R> {
                         return Ok(RecoveredKeyPackageRecords {
                             freshness,
                             records,
+                            seen: Some(observed),
                             cache_evidence: Some(evidence),
                             complete: true,
                         });
@@ -297,9 +309,13 @@ impl<R: DirectoryResources> Directory<R> {
                     .fetch_directory_events_with_completion(endpoints.to_vec(), queries.clone())
                     .await
                     .map_err(DirectoryError::RelayDirectory)?;
+                let scoped = deletions.len();
                 deletion_coverage &= self
                     .record_recovery_deletion_outcome(account, outcome, &mut deletions)
                     .await?;
+                // A request this read returns can cover more than its target,
+                // so it joins what the journal check sees.
+                observed.extend(deletions[scoped..].iter().cloned());
                 let (_, gathered) =
                     without_revoked_slot_winners(account, observed.clone(), &deletions, freshness);
                 // A verified positive is sufficient to reject a candidate,
@@ -373,7 +389,7 @@ fn proven_records(
     complete: bool,
 ) -> RecoveredKeyPackageRecords {
     let (mut records, evidence) =
-        without_revoked_slot_winners(account, observed, deletions, freshness);
+        without_revoked_slot_winners(account, observed.clone(), deletions, freshness);
     let unproven = |record: &DirectoryRelayEventRecord| {
         freshness.accepts(record) && !proven.contains(&record.event.id)
     };
@@ -383,6 +399,7 @@ fn proven_records(
     RecoveredKeyPackageRecords {
         freshness,
         records,
+        seen: Some(observed),
         cache_evidence: Some(evidence),
         complete: complete && !alternate,
     }

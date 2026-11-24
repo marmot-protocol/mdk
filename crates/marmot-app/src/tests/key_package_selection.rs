@@ -1589,7 +1589,8 @@ async fn a_moved_outbox_cannot_revive_a_package_prewarm_saw_replaced() {
         )
         .await
         .unwrap_err();
-    // The new outbox was read, but its only copy was superseded.
+    // The new outbox was read, but its only copy was superseded and the
+    // publication the journal knows went unread.
     assert!(
         matches!(error, AppError::DirectoryLookupIncomplete { .. }),
         "{error}"
@@ -1612,7 +1613,8 @@ async fn a_moved_outbox_cannot_revive_a_package_prewarm_saw_replaced() {
 /// moves, and the new one serves an incompatible slot beside an older copy of
 /// that slot, the incompatible slot alone, or no KeyPackage at all. The
 /// package the journal knows went unread each time, so neither the other
-/// slot's refusal nor the empty reply is a verdict.
+/// slot's refusal nor the empty reply is a verdict. Once a deletion request
+/// accounts for that package, the same replies are verdicts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
@@ -1646,7 +1648,7 @@ async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
         .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    {
+    let limited = {
         let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
         let records = by_endpoint.get_mut("wss://directory.example").unwrap();
         let limited = records
@@ -1676,9 +1678,19 @@ async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
         let updated = by_endpoint.get_mut(UPDATED_DIRECT_OUTBOX).unwrap();
         updated.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
         updated.push(stale);
-        updated.push(limited);
-    }
+        updated.push(limited.clone());
+        limited
+    };
     let runtime = MarmotAppRuntime::new(app.clone());
+    let start = || {
+        runtime.start_direct_conversation_with_options(
+            "alice",
+            &bob.account_id_hex,
+            crate::DirectConversationOptions {
+                disappearing_message_secs: 300,
+            },
+        )
+    };
     for served in ["an older copy and another slot", "another slot", "nothing"] {
         fetcher
             .events_by_endpoint
@@ -1691,23 +1703,215 @@ async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
                 "nothing" => event.kind != KIND_MARMOT_KEY_PACKAGE,
                 _ => true,
             });
-        let error = runtime
-            .start_direct_conversation_with_options(
-                "alice",
-                &bob.account_id_hex,
-                crate::DirectConversationOptions {
-                    disappearing_message_secs: 300,
-                },
-            )
-            .await
-            .unwrap_err();
+        let error = start().await.unwrap_err();
         assert!(
             matches!(error, AppError::DirectoryLookupIncomplete { .. }),
             "new outbox serves {served}: {error}"
         );
         assert!(app.groups("alice").unwrap().is_empty());
     }
+    // Discovery and the reads were complete all along: once deletion requests
+    // account for what the journal knows, the refusal and then the empty
+    // reply each decide.
+    let serve = |event: NostrTransportEvent| {
+        fetcher
+            .events_by_endpoint
+            .lock()
+            .unwrap()
+            .get_mut(UPDATED_DIRECT_OUTBOX)
+            .unwrap()
+            .push(event)
+    };
+    let deletion_of_journaled = |slot: &str| {
+        let journaled = app
+            .shared_storage()
+            .unwrap()
+            .public_key_package_replacements(&bob.account_id_hex)
+            .unwrap()
+            .into_iter()
+            .find(|publication| publication.key_package_id == slot)
+            .unwrap();
+        signed_deletion(
+            &app,
+            &bob,
+            vec![
+                vec!["e".into(), journaled.event_id_hex],
+                vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+            ],
+            unix_now_seconds(),
+        )
+    };
+    serve(deletion_of_journaled("x"));
+    serve(limited.clone());
+    let error = start().await.unwrap_err();
+    assert!(
+        matches!(error, AppError::IncompatibleKeyPackage(_)),
+        "{error}"
+    );
+    fetcher
+        .events_by_endpoint
+        .lock()
+        .unwrap()
+        .get_mut(UPDATED_DIRECT_OUTBOX)
+        .unwrap()
+        .retain(|event| event.id != limited.id);
+    serve(deletion_of_journaled("limited"));
+    let error = start().await.unwrap_err();
+    assert!(
+        matches!(error, AppError::MissingKeyPackage { .. }),
+        "{error}"
+    );
+    assert!(app.groups("alice").unwrap().is_empty());
     runtime.shutdown().await;
+    app.close_storage().unwrap();
+}
+
+/// A deletion request dated past the clock-skew allowance still removes its
+/// package from selection, but the journal does not record the request. The
+/// lookup holds it, so the journal's row for the package is accounted for,
+/// both when the relays still serve the package and when they serve the
+/// request alone, and the recipient has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_package_the_lookup_read_and_dropped_is_not_an_unread_one() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let bob = &accounts[0];
+    let now = unix_now_seconds();
+    let package = signed(
+        &app,
+        bob,
+        candidate(
+            bob,
+            fresh_key_package_for_account(&app, bob, false).await,
+            "only",
+            None,
+            now,
+        ),
+    );
+    let deletion = signed_deletion(
+        &app,
+        bob,
+        vec![
+            vec!["e".into(), package.id.clone()],
+            vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+        ],
+        now + 24 * 60 * 60,
+    );
+    {
+        let mut events = fetcher.events.lock().unwrap();
+        events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        events.extend([package.clone(), deletion]);
+    }
+    // First the relays serve the package beside its deletion request, then
+    // the request alone, which accounts for the row the journal now holds.
+    for served in ["the package and its deletion", "the deletion alone"] {
+        let error = app
+            .directory()
+            .resolve_member_key_packages(&[bob.account_id_hex.as_str()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, DirectoryError::MissingKeyPackage { .. }),
+            "relays serve {served}: {error:?}"
+        );
+        // The journal holds the package and no deletion of it.
+        let storage = app.shared_storage().unwrap();
+        assert!(
+            storage
+                .public_key_package_replacements(&bob.account_id_hex)
+                .unwrap()
+                .iter()
+                .any(|publication| publication.event_id_hex == package.id)
+        );
+        assert!(
+            storage
+                .public_key_package_barriers(&bob.account_id_hex)
+                .unwrap()
+                .is_empty()
+        );
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .retain(|event| event.id != package.id);
+    }
+    app.close_storage().unwrap();
+}
+
+/// The proof read for one package returns a deletion request that also covers
+/// a slot the journal knows and no read returned. The request is dated past
+/// the clock-skew allowance, so the journal records nothing for it, but the
+/// lookup holds it: the recipient has no KeyPackage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deletion_only_the_proof_read_finds_accounts_for_another_slot() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let now = unix_now_seconds();
+    app.shared_storage()
+        .unwrap()
+        .put_public_key_package_replacement(&storage_sqlite::PublicKeyPackageReplacementRecord {
+            account_id_hex: bob.account_id_hex.clone(),
+            key_package_id: "unread".into(),
+            event_id_hex: "cd".repeat(32),
+            event_created_at: now,
+            observed_at: now,
+        })
+        .unwrap();
+    let served = candidate(
+        &bob,
+        fresh_key_package_for_account(&app, &bob, false).await,
+        "served",
+        None,
+        now,
+    );
+    // Without a `k` tag only the proof read's reference queries match it.
+    let deletion = signed_deletion(
+        &app,
+        &bob,
+        vec![
+            vec!["e".into(), served.id.clone()],
+            slot_address(&bob, "unread"),
+        ],
+        now + 24 * 60 * 60,
+    );
+    let deletion_id = deletion.id.clone();
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        for relay in ["wss://shared.example", "wss://directory.example"] {
+            by_endpoint
+                .get_mut(relay)
+                .unwrap()
+                .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        }
+        // The outbox holds nothing, so recovery's read of the directory
+        // relay finds the package and proves it.
+        by_endpoint
+            .get_mut("wss://directory.example")
+            .unwrap()
+            .extend([served, deletion]);
+    }
+    let result = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DirectoryError::MissingKeyPackage { .. })),
+        "{:?}",
+        result.err()
+    );
+    // The journal recorded nothing for the request.
+    assert!(
+        app.shared_storage()
+            .unwrap()
+            .public_key_package_barriers(&bob.account_id_hex)
+            .unwrap()
+            .iter()
+            .all(|barrier| barrier.event_id_hex != deletion_id)
+    );
     app.close_storage().unwrap();
 }
 
@@ -2179,7 +2383,8 @@ async fn what_only_an_unfinished_batch_returned_decides_nothing() {
     );
 
     // A deletion request the completed retry returns accounts for that
-    // package, so the recipient has none.
+    // package, so the recipient has none. The journal records this request
+    // too; the post-dated one below is the case only the lookup holds.
     let deletion = signed_deletion(
         &app,
         bob,
@@ -2247,6 +2452,44 @@ async fn what_only_an_unfinished_batch_returned_decides_nothing() {
         matches!(barred, Err(DirectoryError::MissingKeyPackage { .. })),
         "{:?}",
         barred.err()
+    );
+
+    // And so does a request selection honors but the journal does not
+    // record, because it is dated past the clock-skew allowance.
+    let postdated = signed(
+        &app,
+        bob,
+        candidate(
+            bob,
+            fresh_key_package_for_account(&app, bob, true).await,
+            "postdated",
+            None,
+            unix_now_seconds(),
+        ),
+    );
+    let deletion = signed_deletion(
+        &app,
+        bob,
+        vec![
+            vec!["e".into(), postdated.id.clone()],
+            vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+        ],
+        unix_now_seconds() + 24 * 60 * 60,
+    );
+    fetcher
+        .events_only_in_single_author
+        .lock()
+        .unwrap()
+        .insert(deletion.id.clone());
+    *fetcher.events_only_in_multi_author.lock().unwrap() = [postdated.id.clone()].into();
+    for events in fetcher.events_by_endpoint.lock().unwrap().values_mut() {
+        events.extend([postdated.clone(), deletion.clone()]);
+    }
+    let unrecorded = resolve().await;
+    assert!(
+        matches!(unrecorded, Err(DirectoryError::MissingKeyPackage { .. })),
+        "{:?}",
+        unrecorded.err()
     );
     app.close_storage().unwrap();
 }
