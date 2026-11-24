@@ -119,18 +119,21 @@ impl RejectedFrame {
         if !fields.get("type").is_some_and(serde_json::Value::is_string) {
             return Err(Self::invalid(id, "request has no string \"type\" field"));
         }
-        serde_json::from_value(frame).map_err(|err| {
-            // serde names an unrecognized tag "unknown variant `...`".
-            if err.to_string().starts_with("unknown variant") {
-                Self {
-                    id,
-                    code: "unknown_request",
-                    message: "unknown request type",
-                }
-            } else {
-                Self::invalid(id, "request fields do not match its type")
-            }
-        })
+        // Decode the `type` on its own first, so a known type with a bad field
+        // value (which serde also reports as an unknown variant) stays an
+        // invalid request. serde names an unrecognized tag "unknown variant".
+        let type_only = serde_json::json!({ "type": fields["type"] });
+        if serde_json::from_value::<AgentControlRequest>(type_only)
+            .is_err_and(|err| err.to_string().starts_with("unknown variant"))
+        {
+            return Err(Self {
+                id,
+                code: "unknown_request",
+                message: "unknown request type",
+            });
+        }
+        serde_json::from_value(frame)
+            .map_err(|_| Self::invalid(id, "request fields do not match its type"))
     }
 }
 

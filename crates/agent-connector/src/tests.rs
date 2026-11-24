@@ -273,6 +273,15 @@ async fn rejected_control_frames_get_an_error_response() {
             Some("f"),
             "invalid_request",
         ),
+        // A known type with a bad field value is invalid, not unknown.
+        (
+            format!(
+                r#"{{"marmot_agent_control":"{v2}","id":"g","type":"invite_policy_set","account_id_hex":"{}","policy":"bogus"}}"#,
+                "ab".repeat(32)
+            ),
+            Some("g"),
+            "invalid_request",
+        ),
         ("hello".to_owned(), None, "invalid_request"),
         ("[1,2]".to_owned(), None, "invalid_request"),
         (
