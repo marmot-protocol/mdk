@@ -69,9 +69,124 @@ impl AccountSecretStore for FaultAcquireStore {
     }
 }
 
+const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct VaultCheckpoint {
+    entered: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
+}
+
+struct VaultPause {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl VaultCheckpoint {
+    fn new() -> (Self, VaultPause) {
+        let (signal_entry, entered) = mpsc::channel();
+        let (release, await_release) = mpsc::channel();
+        (
+            Self { entered, release },
+            VaultPause {
+                entered: signal_entry,
+                release: Mutex::new(await_release),
+            },
+        )
+    }
+
+    fn wait_for_entry(&self) {
+        self.entered
+            .recv_timeout(CHECKPOINT_TIMEOUT)
+            .expect("worker did not reach the vault checkpoint");
+    }
+
+    fn before_release<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (finished, result) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = finished.send(operation());
+        });
+        result
+            .recv_timeout(CHECKPOINT_TIMEOUT)
+            .expect("competing operation did not finish while the vault was paused")
+    }
+
+    fn release(self) {
+        self.release.send(()).expect("paused worker exited");
+    }
+}
+
+impl VaultPause {
+    fn wait(&self) {
+        if self.entered.send(()).is_ok() {
+            // Dropping the checkpoint on failure disconnects the waiting worker.
+            match self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(CHECKPOINT_TIMEOUT)
+            {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!("vault checkpoint was not released"),
+            }
+        }
+    }
+}
+
+struct PausedReadStore {
+    inner: Arc<dyn AccountSecretStore>,
+    pause: VaultPause,
+}
+
+impl AccountSecretStore for PausedReadStore {
+    fn cleanup_namespace(&self) -> AccountHomeResult<String> {
+        self.inner.cleanup_namespace()
+    }
+
+    fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
+        self.inner.has_secret_for_label(label)
+    }
+
+    fn has_secret_for_account_id(&self, account_id_hex: &str) -> AccountHomeResult<bool> {
+        self.inner.has_secret_for_account_id(account_id_hex)
+    }
+
+    fn acquire_secret(
+        &self,
+        credential: SecretCredential<'_>,
+        mode: SecretClaimMode,
+        proposed: Option<&nostr::prelude::Keys>,
+    ) -> AccountHomeResult<AcquiredSecret> {
+        self.inner.acquire_secret(credential, mode, proposed)
+    }
+
+    fn load_secret(
+        &self,
+        credential: SecretCredential<'_>,
+    ) -> AccountHomeResult<nostr::prelude::Keys> {
+        self.pause.wait();
+        self.inner.load_secret(credential)
+    }
+
+    fn release_secret(
+        &self,
+        credential: SecretCredential<'_>,
+        mode: SecretReleaseMode,
+    ) -> AccountHomeResult<SecretReleaseOutcome> {
+        self.inner.release_secret(credential, mode)
+    }
+
+    fn reconcile_cleanup(&self) -> AccountHomeResult<()> {
+        self.inner.reconcile_cleanup()
+    }
+}
+
 struct MemorySecretStore {
     namespace: String,
     fail_namespace: AtomicBool,
+    pause: Mutex<Option<StorePause>>,
     keys: Mutex<HashMap<String, String>>,
     ownership: Mutex<MemoryOwnership>,
     account_id_keys: AtomicBool,
@@ -126,11 +241,17 @@ struct MemoryOwner {
     origin: SecretOrigin,
 }
 
+struct StorePause {
+    operation: &'static str,
+    pause: VaultPause,
+}
+
 impl Default for MemorySecretStore {
     fn default() -> Self {
         Self {
             namespace: nostr::prelude::Keys::generate().public_key().to_hex(),
             fail_namespace: AtomicBool::default(),
+            pause: Mutex::default(),
             keys: Mutex::default(),
             ownership: Mutex::default(),
             account_id_keys: AtomicBool::default(),
@@ -184,6 +305,29 @@ impl MemorySecretStore {
         Ok(())
     }
 
+    fn pause_once(&self, operation: &'static str) -> VaultCheckpoint {
+        let (checkpoint, pause) = VaultCheckpoint::new();
+        *self.pause.lock().unwrap() = Some(StorePause { operation, pause });
+        checkpoint
+    }
+
+    fn pause_operation(&self, operation: &str) {
+        let pause = {
+            let mut pause = self.pause.lock().unwrap();
+            if pause
+                .as_ref()
+                .is_some_and(|pause| pause.operation == operation)
+            {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.pause.wait();
+        }
+    }
+
     fn credential_key(&self, credential: SecretCredential<'_>) -> String {
         let key = if self.account_id_keys.load(Ordering::SeqCst) {
             credential.account_id_hex
@@ -208,6 +352,7 @@ impl AccountSecretStore for MemorySecretStore {
         Ok(self.namespace.clone())
     }
     fn has_secret_for_account_id(&self, id: &str) -> AccountHomeResult<bool> {
+        self.pause_operation("has_id");
         if self.fail_id_lookup.load(Ordering::SeqCst) {
             return Err(AccountHomeError::SecretStore(
                 "injected account-id lookup failure".into(),
@@ -232,6 +377,7 @@ impl AccountSecretStore for MemorySecretStore {
         mode: SecretClaimMode,
         proposed: Option<&nostr::prelude::Keys>,
     ) -> AccountHomeResult<AcquiredSecret> {
+        self.pause_operation("write");
         if proposed.is_some() {
             assert!(
                 !self.interrupt_before_write.load(Ordering::SeqCst),
@@ -362,6 +508,7 @@ impl AccountSecretStore for MemorySecretStore {
         credential: SecretCredential<'_>,
         mode: SecretReleaseMode,
     ) -> AccountHomeResult<SecretReleaseOutcome> {
+        self.pause_operation("remove");
         if self.fail_remove.load(Ordering::SeqCst) {
             return Err(AccountHomeError::SecretStore(
                 "injected removal failure".into(),

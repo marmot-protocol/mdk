@@ -16,6 +16,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   renumbers the later variants; `MarmotNotificationTrafficClass` loses `AgentActivity`. Rebuild clients with the
   matching header and library.
 
+- `MarmotSecretStore` replaces raw secret mutation with receipt-aware acquire,
+  load, release, and reconciliation callbacks, plus `cleanup_namespace` (#819).
+  Hosts must persist owner provenance and retirement independently of account
+  records. Its layout changed: rebuild with the matching header and library.
+  Return callback buffers through `free_secret`.
+  See [the ownership contract](README.md#host-secret-store-identity).
+- `MarmotClientOptions` appends a nullable `ios_options` pointer to borrowed `MarmotIosOptions` (#819).
+  Rebuild clients with the matching header and library. Leave the pointer NULL to keep the default iOS options.
+
 ### Added
 
 - `MarmotAgentItem` and `MarmotAgentItemState`: the latest version of a kind-1201 agent item on its timeline row.

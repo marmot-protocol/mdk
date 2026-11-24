@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, mpsc};
+use std::time::Duration;
 
 use marmot_account::{
     AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore, AccountSetupKind,
@@ -126,6 +127,170 @@ fn account_home_create_lists_and_reopens_generated_account_without_exposing_secr
             .to_hex(),
         created.account_id_hex
     );
+}
+
+#[test]
+fn managed_reads_are_concurrent() {
+    for file_backed in [false, true] {
+        for kind in [
+            SecretCredentialKind::Signing,
+            SecretCredentialKind::ExternalDatabase,
+            SecretCredentialKind::Nip46Session,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store: Arc<dyn AccountSecretStore> = if file_backed {
+                Arc::new(LocalFileSecretStore::new(
+                    directory.path(),
+                    IosOptions::default(),
+                ))
+            } else {
+                Arc::new(MemorySecretStore::default())
+            };
+            let home = AccountHome::open_with_secret_store(
+                directory.path(),
+                store.clone(),
+                IosOptions::default(),
+            );
+            let user = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
+            let account = if kind == SecretCredentialKind::Signing {
+                home.import_account("reader", &user.secret_key().to_secret_hex())
+                    .unwrap()
+            } else {
+                home.add_external_signer_account(&user.public_key().to_hex())
+                    .unwrap()
+            };
+            match kind {
+                SecretCredentialKind::Signing => {}
+                SecretCredentialKind::ExternalDatabase => {
+                    std::fs::write(
+                        home.account_dir(&account.label)
+                            .join(marmot_account::EXTERNAL_SQLCIPHER_SECRET_FILE),
+                        "02".repeat(32),
+                    )
+                    .unwrap();
+                    home.external_database_secret(&account.label, ExternalSecretMode::Existing)
+                        .unwrap();
+                }
+                SecretCredentialKind::Nip46Session => {
+                    let client = nostr::prelude::Keys::parse(&"02".repeat(32)).unwrap();
+                    home.store_nip46_session(
+                        &account.label,
+                        &client,
+                        &nip46_record(&user, &client),
+                    )
+                    .unwrap();
+                }
+            }
+            let expected = vec![
+                if kind == SecretCredentialKind::Signing {
+                    1
+                } else {
+                    2
+                };
+                32
+            ];
+            let identity = std::fs::read(directory.path().join(".account-home-id.json")).unwrap();
+            let ownership_path = home
+                .account_dir(&account.label)
+                .join(".credential-ownership.json");
+            let ownership = std::fs::read(&ownership_path).unwrap();
+            drop(home);
+            std::fs::remove_file(directory.path().join(".account-mutation.lock")).unwrap();
+
+            let (checkpoint, pause) = VaultCheckpoint::new();
+            let paused = Arc::new(PausedReadStore {
+                inner: store.clone(),
+                pause,
+            });
+            let first = AccountHome::open_with_secret_store(
+                directory.path(),
+                paused,
+                IosOptions::default(),
+            );
+            let second_store = if file_backed {
+                Arc::new(LocalFileSecretStore::new(
+                    directory.path(),
+                    IosOptions::default(),
+                )) as Arc<dyn AccountSecretStore>
+            } else {
+                store
+            };
+            let second = AccountHome::open_with_secret_store(
+                directory.path(),
+                second_store,
+                IosOptions::default(),
+            );
+            let vault_writer = file_backed.then(|| {
+                fs_private::try_acquire_private_exclusive_file_lease(
+                    &directory.path().join(".credential-store.lock"),
+                )
+                .unwrap()
+            });
+            let label = account.label.clone();
+            let reading = std::thread::spawn(move || read_managed_material(&first, &label, kind));
+            checkpoint.wait_for_entry();
+            let label = account.label.clone();
+            let concurrent = checkpoint.before_release({
+                let second = second.clone();
+                move || read_managed_material(&second, &label, kind)
+            });
+            checkpoint.release();
+            let initial = reading.join().unwrap();
+
+            assert_eq!(concurrent.unwrap(), expected, "{file_backed:?} {kind:?}");
+            assert_eq!(initial.unwrap(), expected, "{file_backed:?} {kind:?}");
+            assert!(!directory.path().join(".account-mutation.lock").exists());
+            assert_eq!(
+                std::fs::read(directory.path().join(".account-home-id.json")).unwrap(),
+                identity
+            );
+            assert_eq!(std::fs::read(&ownership_path).unwrap(), ownership);
+            drop(vault_writer);
+
+            let index = match kind {
+                SecretCredentialKind::Signing => 0,
+                SecretCredentialKind::ExternalDatabase => 1,
+                SecretCredentialKind::Nip46Session => 2,
+            };
+            let mut pending: serde_json::Value = serde_json::from_slice(&ownership).unwrap();
+            pending["credentials"][index]["origin"] = serde_json::Value::Null;
+            let pending = serde_json::to_vec(&pending).unwrap();
+            fs_private::write_private(&ownership_path, &pending).unwrap();
+            let _root_writer = fs_private::try_acquire_private_exclusive_file_lease(
+                &directory.path().join(".account-mutation.lock"),
+            )
+            .unwrap();
+            assert!(
+                matches!(read_managed_material(&second, &account.label, kind),
+                Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            assert_eq!(std::fs::read(&ownership_path).unwrap(), pending);
+        }
+    }
+}
+
+fn read_managed_material(
+    home: &AccountHome,
+    label: &str,
+    kind: SecretCredentialKind,
+) -> AccountHomeResult<Vec<u8>> {
+    match kind {
+        SecretCredentialKind::Signing => Ok(home
+            .load_signing_keys(label)?
+            .secret_key()
+            .as_secret_bytes()
+            .to_vec()),
+        SecretCredentialKind::ExternalDatabase => Ok(home
+            .external_database_secret(label, ExternalSecretMode::Existing)?
+            .to_vec()),
+        SecretCredentialKind::Nip46Session => Ok(home
+            .load_nip46_session(label)?
+            .expect("stored session")
+            .0
+            .secret_key()
+            .as_secret_bytes()
+            .to_vec()),
+    }
 }
 
 #[test]
@@ -255,6 +420,82 @@ fn runtime_import_recovers_journal_before_secret_or_account_record() {
         home.load_signing_keys(&account_id).unwrap().public_key(),
         keys.public_key()
     );
+}
+
+#[test]
+fn generated_setup_admission() {
+    for fail_write in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemorySecretStore::default());
+        store
+            .fail_write_after_commit
+            .store(fail_write, Ordering::SeqCst);
+        let home =
+            AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+        let other =
+            AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+        let checkpoint = store.pause_once("write");
+        let create = std::thread::spawn(move || home.create_nostr_account_for_setup());
+        checkpoint.wait_for_entry();
+        let directories = std::fs::read_dir(dir.path().join("accounts"))
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let journal = directories
+            .first()
+            .and_then(|path| std::fs::read(path.join(".account-setup.json")).ok())
+            .and_then(|bytes| serde_json::from_slice::<AccountSetupState>(&bytes).ok());
+        let (visible, credentials) = checkpoint.before_release({
+            let other = other.clone();
+            let store = store.clone();
+            move || (other.accounts(), store.keys.lock().unwrap().len())
+        });
+        checkpoint.release();
+        let result = create.join().unwrap();
+
+        assert_eq!(directories.len(), 1);
+        assert!(visible.unwrap().is_empty());
+        assert_eq!(credentials, 0);
+        let account = if fail_write {
+            assert!(matches!(result, Err(AccountHomeError::SecretStore(error))
+                if error == "injected write failure"));
+            assert!(other.accounts().unwrap().is_empty());
+            store.fail_lookup.store(true, Ordering::SeqCst);
+            let ownership_path = directories[0].join(".credential-ownership.json");
+            let ownership = std::fs::read(&ownership_path).unwrap();
+            *store.load_error.lock().unwrap() = Some(AccountHomeError::SecretStore(
+                "exact receipt temporarily unavailable".into(),
+            ));
+            assert!(matches!(other.resumable_generated_account_setup(),
+                Err(AccountHomeError::SecretStore(error)) if error == "exact receipt temporarily unavailable"));
+            assert_eq!(std::fs::read(ownership_path).unwrap(), ownership);
+            assert!(directories[0].join(".account-setup.json").is_file());
+            other.resumable_generated_account_setup().unwrap().unwrap()
+        } else {
+            result.unwrap()
+        };
+        assert_eq!(
+            journal,
+            Some(AccountSetupState {
+                account_id_hex: account.account_id_hex.clone(),
+                reused_account_id_credential: false,
+                kind: AccountSetupKind::GeneratedIdentity,
+                phase: AccountSetupPhase::LocalStateCreated,
+            })
+        );
+        assert_eq!(other.account(&account.label).unwrap(), account);
+        assert_eq!(
+            other
+                .load_signing_keys(&account.label)
+                .unwrap()
+                .public_key()
+                .to_hex(),
+            account.account_id_hex
+        );
+    }
 }
 
 #[test]

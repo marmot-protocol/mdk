@@ -1,7 +1,7 @@
 //! A host-supplied secret store must be enough to open a client, with no
 //! platform keychain involved, and must be released when the client is.
 
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use marmot_c::secret_store::MarmotSecretStore;
@@ -315,6 +315,307 @@ fn a_null_deployment_is_rejected_before_the_store_is_taken() {
         std::fs::read_dir(root.path()).unwrap().next().is_none(),
         "nothing opens without a deployment"
     );
+}
+
+mod host_output_failures {
+    use super::*;
+    use host_abi::{MarmotSecretCredential, MarmotSecretStoreStatus as StoreStatus};
+    use marmot_c::commands::{marmot_list_accounts, marmot_login, marmot_reveal_nsec};
+    use marmot_c::types::account::{marmot_account_summary_free, marmot_account_summary_list_free};
+    use nostr::prelude::{Keys, ToBech32};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Clone, Copy)]
+    struct Failure {
+        status: u32,
+        invalid_utf8: bool,
+        origin: u32,
+        detail: &'static str,
+    }
+
+    #[repr(C)]
+    struct Host {
+        vault: MemoryVault,
+        failure: Option<Failure>,
+        fail_load: AtomicBool,
+        secret: CString,
+        outstanding: Mutex<Vec<usize>>,
+        freed: AtomicUsize,
+    }
+    impl Host {
+        fn new(keys: &Keys, failure: Option<Failure>) -> Self {
+            Self {
+                vault: MemoryVault::default(),
+                failure,
+                fail_load: AtomicBool::new(false),
+                secret: CString::new(keys.secret_key().to_secret_hex()).unwrap(),
+                outstanding: Mutex::default(),
+                freed: AtomicUsize::new(0),
+            }
+        }
+        fn table(&self) -> MarmotSecretStore {
+            let mut table = self.vault.table();
+            table.user_data = (self as *const Self).cast_mut().cast();
+            table.acquire_secret = Some(Self::acquire);
+            table.load_secret = Some(Self::load);
+            table.free_secret = Some(Self::free);
+            table
+        }
+        unsafe fn output(&self, invalid_utf8: bool, out: *mut *mut c_char) {
+            let secret = if invalid_utf8 {
+                CString::new(vec![0xff]).unwrap()
+            } else {
+                self.secret.clone()
+            }
+            .into_raw();
+            self.outstanding.lock().unwrap().push(secret as usize);
+            unsafe { out.write(secret) };
+        }
+        unsafe extern "C" fn acquire(
+            data: *mut c_void,
+            credential: *const MarmotSecretCredential,
+            mode: u32,
+            proposed: *const c_char,
+            out: *mut *mut c_char,
+            origin: *mut u32,
+        ) -> u32 {
+            let host = unsafe { &*data.cast::<Self>() };
+            if let Some(failure) = host.failure {
+                unsafe {
+                    host.output(failure.invalid_utf8, out);
+                    origin.write(failure.origin);
+                }
+                failure.status
+            } else {
+                let table = host.vault.table();
+                unsafe {
+                    table.acquire_secret.unwrap()(
+                        table.user_data,
+                        credential,
+                        mode,
+                        proposed,
+                        out,
+                        origin,
+                    )
+                }
+            }
+        }
+        unsafe extern "C" fn load(
+            data: *mut c_void,
+            credential: *const MarmotSecretCredential,
+            out: *mut *mut c_char,
+        ) -> u32 {
+            let host = unsafe { &*data.cast::<Self>() };
+            if host.fail_load.load(Ordering::SeqCst) {
+                unsafe { host.output(false, out) };
+                StoreStatus::Failed as u32
+            } else {
+                let table = host.vault.table();
+                unsafe { table.load_secret.unwrap()(table.user_data, credential, out) }
+            }
+        }
+        unsafe extern "C" fn free(data: *mut c_void, value: *mut c_char) {
+            let host = unsafe { &*data.cast::<Self>() };
+            let mut outstanding = host.outstanding.lock().unwrap();
+            if let Some(index) = outstanding
+                .iter()
+                .position(|pointer| *pointer == value as usize)
+            {
+                outstanding.swap_remove(index);
+                host.freed.fetch_add(1, Ordering::SeqCst);
+            }
+            unsafe { MemoryVault::free(data, value) };
+        }
+    }
+
+    struct Client(*mut MarmotClient);
+    impl Client {
+        fn open(root: &tempfile::TempDir, host: &Host, relay: &CStr, policy: u32) -> Self {
+            let path = CString::new(root.path().to_str().unwrap()).unwrap();
+            let relays = [relay.as_ptr()];
+            let store = host.table();
+            let deployment = marmot_c::deployment::OwnedDeployment::white_noise();
+            assert_eq!(
+                unsafe {
+                    marmot_c::deployment::marmot_deployment_set_discovery_indexer_relays(
+                        deployment.as_ptr().cast_mut(),
+                        relays.as_ptr(),
+                        relays.len(),
+                    )
+                },
+                MarmotStatus::Ok
+            );
+            let mut client = std::ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    marmot_c::marmot_client_new_with_options(
+                        path.as_ptr(),
+                        relays.as_ptr(),
+                        1,
+                        policy,
+                        &store,
+                        deployment.as_ptr(),
+                        &mut client,
+                    )
+                },
+                MarmotStatus::Ok
+            );
+            Self(client)
+        }
+        fn login(
+            &self,
+            keys: &Keys,
+            relay: &CStr,
+        ) -> (
+            MarmotStatus,
+            *mut marmot_c::types::account::MarmotAccountSummary,
+        ) {
+            let identity = CString::new(keys.secret_key().to_bech32().unwrap()).unwrap();
+            let relays = [relay.as_ptr()];
+            let mut summary = std::ptr::dangling_mut();
+            let status = unsafe {
+                marmot_login(
+                    self.0,
+                    identity.as_ptr(),
+                    relays.as_ptr(),
+                    1,
+                    relays.as_ptr(),
+                    1,
+                    relays.as_ptr(),
+                    1,
+                    &mut summary,
+                )
+            };
+            (status, summary)
+        }
+        fn account_ids(&self) -> Vec<String> {
+            let mut accounts = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { marmot_list_accounts(self.0, &mut accounts) },
+                MarmotStatus::Ok
+            );
+            let list = unsafe { &*accounts };
+            let ids = (0..list.len)
+                .map(|index| unsafe {
+                    CStr::from_ptr((*list.items.add(index)).account_id_hex)
+                        .to_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            unsafe { marmot_account_summary_list_free(accounts) };
+            ids
+        }
+    }
+    impl Drop for Client {
+        fn drop(&mut self) {
+            unsafe {
+                marmot_client_shutdown(self.0);
+                marmot_client_free(self.0);
+            }
+        }
+    }
+    fn last_error() -> String {
+        let error = marmot_c::marmot_last_error_message();
+        let text = unsafe { CStr::from_ptr(error) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { marmot_c::marmot_string_free(error) };
+        text
+    }
+
+    #[test]
+    fn host_acquire_outputs_fail_without_admitting_an_account() {
+        let cases = [
+            Failure {
+                status: StoreStatus::Failed as u32,
+                invalid_utf8: false,
+                origin: 0,
+                detail: "host secret store failed (acquire_secret)",
+            },
+            Failure {
+                status: StoreStatus::Unavailable as u32,
+                invalid_utf8: false,
+                origin: 0,
+                detail: "host secret store unavailable (acquire_secret)",
+            },
+            Failure {
+                status: u32::MAX,
+                invalid_utf8: false,
+                origin: 0,
+                detail: "out of range (acquire_secret)",
+            },
+            Failure {
+                status: StoreStatus::Ok as u32,
+                invalid_utf8: true,
+                origin: 0,
+                detail: "host secret store returned non-UTF-8 hex",
+            },
+            Failure {
+                status: StoreStatus::Ok as u32,
+                invalid_utf8: false,
+                origin: u32::MAX,
+                detail: "host secret store returned an invalid origin tag",
+            },
+        ];
+        for failure in cases {
+            let keys = Keys::generate();
+            let host = Host::new(&keys, Some(failure));
+            let root = tempfile::tempdir().unwrap();
+            let client = Client::open(&root, &host, c"wss://relay.example.org", 0);
+            let (status, summary) = client.login(&keys, c"wss://relay.example.org");
+            assert_eq!(status, MarmotStatus::KeystoreUnavailable);
+            assert!(summary.is_null());
+            assert!(last_error().contains(failure.detail));
+            assert_eq!(host.freed.load(Ordering::SeqCst), 1);
+            assert!(host.outstanding.lock().unwrap().is_empty());
+            assert_eq!(client.account_ids(), Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn host_load_failure_frees_output_without_replacing_account() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let relay = runtime
+            .block_on(nostr_relay_builder::MockRelay::run())
+            .unwrap();
+        let relay_url = CString::new(runtime.block_on(relay.url()).to_string()).unwrap();
+        let keys = Keys::generate();
+        let host = Host::new(&keys, None);
+        let root = tempfile::tempdir().unwrap();
+        let client = Client::open(
+            &root,
+            &host,
+            &relay_url,
+            marmot_c::MarmotRelayPolicy::AllowLoopback as u32,
+        );
+        assert_eq!(
+            unsafe { marmot_c::marmot_client_start(client.0) },
+            MarmotStatus::Ok
+        );
+        let (status, summary) = client.login(&keys, &relay_url);
+        assert_eq!(status, MarmotStatus::Ok);
+        unsafe { marmot_account_summary_free(summary) };
+        assert_eq!(client.account_ids(), vec![keys.public_key().to_hex()]);
+        host.fail_load.store(true, Ordering::SeqCst);
+        let account = CString::new(keys.public_key().to_hex()).unwrap();
+        let mut output = std::ptr::dangling_mut();
+        assert_eq!(
+            unsafe { marmot_reveal_nsec(client.0, account.as_ptr(), &mut output) },
+            MarmotStatus::KeystoreUnavailable
+        );
+        assert!(output.is_null());
+        assert!(last_error().contains("host secret store failed (load_secret)"));
+        assert_eq!(host.freed.load(Ordering::SeqCst), 1);
+        assert!(host.outstanding.lock().unwrap().is_empty());
+        assert_eq!(client.account_ids(), vec![keys.public_key().to_hex()]);
+    }
 }
 
 /// These callbacks use each host's own vault rather than process-global state.

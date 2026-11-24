@@ -17,9 +17,10 @@ account-device runtime is `marmot-session`'s. It must not own UI projection, not
 
 - `error.rs` — the `AccountHomeError` enum and the `AccountHomeResult` alias.
 - `home/account.rs` — `AccountHome` and `AccountSummary`; owns the account-record layout and signing-key lifecycle.
+- `home/credential_ownership.rs` — credential admission, retirement, and wipe replay.
 - `nip49_export.rs` — NIP-49 `ncryptsec` export policy (fixed scrypt cost, non-empty passphrase, key-security byte);
   crypto is delegated to the upstream `nostr` crate. Do not hand-roll NIP-49 here.
-- `secret_store.rs` — `AccountSecretStore` trait with `LocalFileSecretStore` and `KeychainSecretStore`.
+- `secret_store/receipts.rs` — `AccountSecretStore` trait with `LocalFileSecretStore` and `KeychainSecretStore`.
 - `ownership.rs` — credential receipt identity, acquisition origin, and release contracts.
 - `owned_vault.rs` — immutable owner copies, preserved-copy adoption, terminal retirements, and legacy provenance.
 - `native_vault.rs` — checked Secret Service, macOS/iOS Keychain, and Windows Credential Manager operations.

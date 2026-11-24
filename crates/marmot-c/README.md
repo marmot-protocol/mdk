@@ -257,10 +257,14 @@ records retain ordinary strings and do not use this C-only encoding.
 ## Runtime construction
 
 `marmot_client_new_with_configuration` takes a `MarmotClientOptions` struct combining relay policy, cursor
-persistence, client label, secret store, attachment acquisition mode and device platform; NULL options or zero initialization selects
-the same defaults as the Swift/Kotlin `MarmotOptions` (see the
+persistence, client label, secret store, attachment acquisition mode, device platform, and iOS host options.
+NULL options or zero initialization selects the same defaults as the Swift/Kotlin `MarmotOptions` (see the
 [shared contract](../marmot-uniffi/README.md#runtime-options-and-client-label)). Use the matching header and library
 for that struct's layout. `marmot_client_new_with_client_name` is the older label-only constructor.
+
+To configure iOS, point `MarmotClientOptions.ios_options` at a `MarmotIosOptions` record. Keep the record, its
+App Group string array, and all its strings readable through the constructor call. The library copies the strings.
+A NULL array is valid with a zero count. A NULL access group uses the captured Keychain provider's default.
 
 Every `marmot_client_new*` constructor takes a required `MarmotDeployment` just before `out_client`: the
 deployment's recovery relays, discovery indexers, media and image servers, Open Ranking, moderation label namespace,
@@ -275,6 +279,18 @@ For private integration fixtures, `marmot_client_new_with_options` accepts
 an explicit loopback relay policy and an optional host secret-store vtable.
 Existing constructors keep their public-only policy. Neither permits private or
 link-local endpoints.
+
+### Host secret-store identity
+
+`MarmotSecretStore` requires every callback except `destroy`.
+See the [shared secret-store contract](../marmot-uniffi/README.md#host-secret-store-identity)
+for namespace identity, receipt ownership, and cleanup policy. Older vtables with unowned write and delete
+callbacks do not match this layout.
+
+The credential record and its strings are borrowed only for the callback. Copy identifiers needed for persistence;
+do not retain their pointers. Return namespace and secret buffers as allocated, NUL-terminated strings. MDK passes
+each non-NULL buffer back to the host's `free_secret` callback, even on a failure status.
+The header defines the integer tags for claim mode, origin, release mode, and release outcome.
 
 <a id="experimental-device-group-test-builds"></a>
 

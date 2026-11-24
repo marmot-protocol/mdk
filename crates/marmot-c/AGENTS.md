@@ -39,8 +39,8 @@ across the boundary. That deserves its own focused design + tests rather than a 
   are hand-written.
 - `src/memory.rs` is the only allocation chokepoint; the `alloc-audit` test feature counts live allocations so tests
   can prove deep-free completeness.
-- `src/status.rs` owns `MarmotStatus` and the thread-local last-error channel. `src/secret_store.rs` (host secret-store
-  callback vtable) and `src/attachment_{access,controls,history}.rs`
+- `src/status.rs` owns `MarmotStatus` and the thread-local last-error channel. `src/secret_store/receipts.rs`
+  (host secret-store callback vtable) and `src/attachment_{access,controls,history}.rs`
   hold hand-written surfaces outside `commands.rs`. `src/subscriptions/` holds the chat-window,
   conversation-window and attachment-control handles.
 - `src/types/backups.rs` owns allocation-audited backup output deep frees, including the embedded Device/Backup

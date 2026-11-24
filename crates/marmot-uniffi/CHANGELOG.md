@@ -8,6 +8,14 @@
   `NotificationTrafficClassFfi::AgentActivity` is removed. An agent item notifies as `Standard` only while it is a
   waiting approval or question, or a failed turn.
 
+- Host `SecretStore` implementations replace raw secret mutation with
+  `acquireSecret`, `loadSecret`, `releaseSecret`, and `reconcileCleanup`, plus a
+  stable `cleanupNamespace()` (#819). Persist owner provenance and retirement
+  independently of account records. Regenerate Swift/Kotlin bindings and
+  migrate host implementations; see [the ownership contract](README.md#host-secret-store-identity).
+- `MarmotOptions` gains optional `iosOptions` for iOS App Group identifiers and the native Keychain access group
+  for managed receipts (#819).
+
 ### Added
 
 - `TimelineMessageRecordFfi::agent_item_first_event_missing`: true for an agent item whose first event this device

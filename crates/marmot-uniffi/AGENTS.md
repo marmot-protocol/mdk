@@ -9,7 +9,7 @@ UniFFI bindings (MarmotKit) for the Marmot app runtime. For integration concepts
 - `src/commands/`: `#[uniffi::export] impl Marmot` blocks, one module per feature family.
 - `src/conversions/`: `…Ffi` records/enums and their conversions from `marmot-app` types, one module per family.
 - `src/subscriptions.rs`, `src/subscriptions/`: subscription objects and screen-window handles.
-- `src/markdown.rs` (Markdown display DTOs), `src/secret_store.rs` and
+- `src/markdown.rs` (Markdown display DTOs), `src/secret_store/receipts.rs` and
   `src/external_signer.rs` (host callback traits), `src/bin/uniffi-bindgen.rs` (binding generator).
 - `src/tokio_runtime.rs`: MarmotKit's process-wide multi-thread Tokio runtime and `spawn_export`, which every async
   export runs through (see `crates/marmot-uniffi-macros`).

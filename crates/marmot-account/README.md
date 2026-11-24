@@ -13,12 +13,28 @@ account identity.
   external-signer account records.
 - Stores signing keys behind an injectable `AccountSecretStore`: a platform keychain/credential-store backend
   (patterned after White Noise) and a local file backend for deterministic tests and development.
+- Secret stores supply a stable, nonsecret `cleanup_namespace` identifying the physical vault and credential namespace.
+  Pending wipes retry only through that namespace; switching stores does not discard the original deletion intent.
+- Each credential owner has a durable receipt. Shared vaults discover signing keys by account ID and retain
+  independent copies, so one home's wipe cannot delete another owner's credential.
 - Persists NIP-46 communication keys separately from user signing keys and database credentials, with
   crash-discoverable metadata and retryable local removal. Atomic stores return `Nip46SessionWrite`,
   distinguishing new credentials from the existing record retained on setup rollback.
+  Removal retires exact owners without first acquiring raw keys. Once the managed copy is retired, local removal
+  completes even if raw legacy cleanup remains pending. Explicit pairing or removal durably closes new legacy
+  admission before publishing a new session or discarding its owner reference. Reopening or retrying cannot
+  reactivate retained raw keys; pending acquisition keeps its original claim mode.
+  Promotion rollback restores the public role before retiring its session credential. A release failure leaves
+  exact-owner cleanup pending; another promotion or pairing completes that removal before storing new keys.
   The protocol and permission approval live in
   `marmot-app`; see [external signer accounts](../../docs/external-signer-accounts.md#nip-46-sessions).
 - Journals account setup and onboarding so an interrupted setup can resume or be cancelled cleanly.
+- Commits local wipes by moving the account out of the live catalog. Later cleanup failures do not abort secret-file
+  scrubbing or payload deletion. A private, nonsecret tombstone record retains failed credential deletion for retry
+  under exclusive root ownership. Retries release the original receipt, not the current occupant of an account label.
+  Ambiguous legacy vault entries remain untouched, with explicit pending cleanup metadata.
+  Untracked raw intent survives replacement or deletion of a managed owner and cannot block its cleanup.
+  Tombstones without readable deletion intent retain their account and ownership metadata.
 - Exports a signing key as a NIP-49 `ncryptsec` backup.
 
 ## Account home
@@ -27,11 +43,86 @@ account identity.
 
 - `create_nostr_account`, `import_nostr_account`, and `add_public_account` use the Nostr public key as the record label
   for product-facing app surfaces. The older label-taking helpers remain for deterministic lab setup.
+- When beginning runtime setup, use `add_public_account_for_setup` or `add_external_signer_for_setup` instead of
+  creating a bare record and journaling afterward. They persist the setup journal before a new record or promotion
+  becomes visible, under one mutation lease. The bare methods do not begin setup.
 - Real app surfaces should use `AccountHome::open_with_keychain` with their deployment's keychain service name
-  (`MarmotDeployment::keychain_service` in `marmot-app`; this crate compiles in no default). Tests and local labs
-  can use `AccountHome::open`, which uses the local file secret store.
+  (`MarmotDeployment::keychain_service` in `marmot-app`; this crate compiles in no default) and `IosOptions`.
+  Other platforms pass `IosOptions::default()`. Tests and local labs can use `AccountHome::open`, which uses the
+  local file secret store.
+- Opening an account home does not run destructive recovery. After acquiring exclusive cross-process ownership of
+  the home, call `resume_wipe_cleanup` to retry pending wipes. `MarmotApp` performs this after acquiring its matching
+  root lease. Handle its result before admitting mutations. A lower-level caller must retain exclusive ownership
+  for the entire replay.
+- Credential lifecycle mutations hold a private root mutation lease, including independently opened homes.
+  Contention between independent handles returns an I/O `WouldBlock` before mutation, including replay admission.
+  Keep the lock file in place: deleting it would allow two owners to lock different files.
 - Relay-list discovery and repair belong above this crate in the Nostr account transport / app-runtime layer. CLI
   account selection belongs in presentation surfaces such as `wn`.
+
+## Secret-store ownership
+
+`AccountSecretStore` implementations persist `SecretCredential` receipts identified by credential kind,
+home ID, and owner ID. AccountHome writes the ownership reference before calling the backend and publishes
+a signing account only after acquisition succeeds. Owner IDs are random and never reused after retirement.
+
+- `acquire_secret` persists an independent owner copy and returns `Created` or `Existing`. Retrying the same
+  owner returns the original material and origin. `MigrateLegacy` explicitly permits copying an old raw credential.
+  `SecretNotFound` guarantees no source and no committed or pending receipt for that owner. Uncertain lookup or
+  write failures must return another error, so recovery retains the same owner.
+- `load_secret` reads that owner's active receipt. It does not substitute a label's newest credential.
+  Existing receipt reads do not take a writer lease; migration and permission upgrades still require admission.
+- `release_secret` retires that receipt before deleting its material. `Preserve` leaves a durable store-side hold
+  even after rollback removes the account record. Adoption persists a new copy before consuming that hold.
+- `reconcile_cleanup` retries retired copies without consulting the live account catalog. Retirement metadata
+  remains durable; deleting it would permit an old operation to recreate a retired owner.
+
+Native backends store one protected copy per owner. Android uses AES-GCM encrypted files and per-receipt
+Android Keystore keys on API 23 or later. SharedPreferences is read only for legacy migration.
+On Android, writes and removals take the vault lease. A write syncs its unpublished file, renames it atomically
+to the final path, and returns success only after syncing the directory. Reads and listings see only final files
+and do not take the lease. An invalid final receipt remains an error. A retry by the same owner reuses its Keystore
+key, and exact-owner removal deletes the unpublished file, final receipt, and key.
+Windows managed copies use local-machine persistence and bind to the user SID and MachineGuid, not the computer
+name; they do not roam. macOS binds to the selected keychain domain and path, not the replaceable file inode.
+The development file store keeps plaintext receipts under `.owned-secrets-v1` with private permissions.
+It pins the directory on first use and rejects operations if the canonical path later names another directory.
+
+On Linux and BSD, select the intended Secret Service collection as the default before first use or legacy migration.
+MDK binds managed receipts to a nonsecret identity item in that collection. This identity survives keyring updates
+and service restarts. First use needs permission to create the item and take a temporary name on the session bus.
+Reopening a collection with an existing identity does not need those permissions.
+
+If you change the default collection, restore the original as the default and reopen the account home. Keep the
+identity item with its collection when restoring a backup. MDK does not recreate a missing identity over existing
+managed records. If a collection or item is locked, unlock it in the OS keyring and retry. Unattended cleanup does
+not prompt for an unlock. Legacy lookup still searches all collections, so a managed identity cannot prove that
+a raw legacy item is absent.
+
+Managed namespaces identify protected storage separately from raw legacy lookup options. On iOS, the OS resolves
+the default managed access group. Sharing across applications requires `IosOptions.keychain_access_group` set to
+an authorized common group, or a shared host store. Group selection does not narrow the captured provider's
+historical raw-credential lookup; a broad raw lookup has unknown provenance and remains pending after migration.
+
+For iOS app-group roots, pass authorized group identifiers in `IosOptions.app_group_identifiers` to both the home
+and any `LocalFileSecretStore`. Foundation validates access to each container; the SDK does not inspect private
+entitlement APIs. Default options support app-private roots. C and UniFFI hosts supply the same configuration
+through the existing client options record's optional `ios_options` field.
+
+Legacy raw vault entries have no complete ownership history. They are copied when needed but never automatically
+deleted. `PendingLegacy` retains cleanup intent when such an entry exists or its absence cannot be established.
+A migrated receipt retains its original legacy lookup scope. A different or unknown scope remains pending,
+even if the current lookup finds nothing.
+A successful local wipe means the account is absent, not that every vault or storage medium has erased its bytes.
+
+> [!WARNING]
+> On iOS and Android, ownership binds to the OS container identity and the root's relative path, so an app-container
+> relocation preserves existing credentials. Roots must be inside an authorized app or app-group container.
+> Elsewhere, ownership binds to the canonical root path. A copy or move to a different logical root is rejected.
+> Once credential access establishes an `AccountHome`'s root identity, credential operations and guarded mutations
+> reject a path that resolves to a different root. Catalog reads such as `account()` do not check that identity.
+> To change logical roots, create a fresh home and reimport the signing identity.
+> Copied databases retain their original device-local key; a fresh home does not rebind them.
 
 ## What it does not do
 

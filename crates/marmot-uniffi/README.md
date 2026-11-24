@@ -395,7 +395,7 @@ The reference's names, signatures and source-line links are checked against sour
 
 ## Runtime options and client label
 
-`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, `devicePlatform`, `secretStore` and
+`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, `devicePlatform`, `secretStore`, `iosOptions` and
 `attachmentAcquisitionMode` with the required [`deployment`](#deployment) in `Marmot.newWithConfiguration`.
 Every other field is optional in generated Swift/Kotlin: omitted policies mean public-only endpoints and an advancing cursor;
 an omitted label stays untagged, omitted storage uses the platform keychain, and an omitted
@@ -404,6 +404,15 @@ acquisition mode keeps native automatic acquisition (see
 Existing constructors take the deployment as their last argument and delegate to this
 same configuration path. Use the options constructor when combining a label with a
 custom relay policy.
+
+On iOS, set `iosOptions.appGroupIdentifiers` when the account root is in a shared App Group container.
+Pass the entitled identifiers on each open, including when you supply a `secretStore` callback.
+With the native Keychain store, `iosOptions.keychainAccessGroup` selects the access group for managed receipts.
+An explicit group must be authorized by iOS and must not conflict with the captured Keychain provider's group.
+Omitting it uses the captured provider's default. The option does not change how the provider looks up legacy entries.
+Hosts with extensions or changing entitlements should always set the group explicitly; if the OS default changes,
+select the previous group to reopen existing credentials.
+
 C hosts use `marmot_client_new_with_configuration` and a `MarmotClientOptions`
 struct; zero initialization selects the same defaults. Use the matching header
 and library for that struct's layout.
@@ -534,7 +543,7 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
   Each account's worker still handles its own commands one at a time, in order, so a slow
   operation delays that account's later worker-routed calls but not other accounts.
 - **Host callbacks** (`SecretStore`, `ExternalAccountSignerFfi`) can be invoked from runtime
-  threads or the calling thread, possibly concurrently. Implementations must be thread-safe and
+  threads or synchronously on the calling thread, including during construction, possibly concurrently. Implementations must be thread-safe and
   must not wait for the main thread.
 
 The C bindings block the calling thread on a runtime owned by each client; see
@@ -2287,8 +2296,9 @@ report does not by itself prove an app's Play Console result.
 
 ### Android initialization (required before the first `Marmot(...)`)
 
-`Marmot(...)` constructs the Android-native keyring store, which talks to the Android Keystore over JNI and needs the
-`ndk-context` initialized with the application `Context` first. The build copies two hand-written helpers
+Android account ownership uses the application identity and storage container, including with file or host-provided
+secret stores. Initialize `ndk-context` with the application `Context` first. The native store also uses Android
+Keystore over JNI. The build copies two hand-written helpers
 (`kotlin-support/`) next to the generated binding:
 
 - `dev.ipf.marmotkit.MarmotAndroid` — the call consumers use.
@@ -2296,7 +2306,7 @@ report does not by itself prove an app's Play Console result.
   `libmarmot_uniffi.so`, so its symbol is exported from that library).
 
 Android consumers MUST call `MarmotAndroid.initialize(this)` from `Application.onCreate` before constructing `Marmot`,
-otherwise the first constructor crashes with `android context was not initialized`:
+otherwise construction or credential access fails:
 
 ```kotlin
 class MarmotApplication : Application() {

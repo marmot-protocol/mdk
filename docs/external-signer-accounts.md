@@ -105,9 +105,12 @@ interrupts adoption's network waits; local binding and persistence settle before
 the owned work ends. Adoption keeps the session generation captured at admission
 through gate waits, binding, and network work. A disconnect between phases still
 retires it; a later explicit reconnect cannot resume that older adoption.
-Rollback still removes or restores its credential record and restores the prior
-callback. It does not reset transport state or cancel requests belonging to a
-newer generation.
+Binding-only rollback restores the prior credential record and callback without
+disturbing a newer transport generation. Account-owned rollback fences worker
+replacement and waits for active or retiring workers to release their storage
+handles. It commits catalog removal or public-role restoration before retiring
+the session credential. Failed retirement keeps exact-owner intent; another
+promotion or pairing completes it before accepting new keys.
 Shutdown interrupts and settles owned adoption before it
 closes storage. Local removal, sign-out, and wipe interrupt earlier admitted
 adoption for that account. Explicit reactivation waits for adoption to settle,
@@ -122,12 +125,14 @@ is restored. Journal cleanup errors do not revoke a network-ready account.
 Cancelling early provisioning can roll back the new account. Local removal then
 returns `UnknownAccount`, not a credential-store failure.
 Account setup transactions share the app's signer-registry scope across runtime handles.
-Account deletion holds that same transaction through credential erasure and removal.
+Account deletion holds that transaction through the catalog commit and attempted
+credential cleanup. A rejected precommit wipe keeps its live NIP-46 binding.
 Concurrent session resume waits, then reports the removed account instead of retaining
 a session that blocks a fresh pairing's login.
 
-MDK stores the communication secret through `AccountSecretStore` under
-`.nip46-client/<account label>`, with a separate SHA-256-derived credential id.
+AccountHome stores the communication secret as a NIP-46 owner receipt through
+`AccountSecretStore`. Legacy lookup uses `.nip46-client/<account label>` and its
+SHA-256-derived credential id; ambiguous raw entries remain intact.
 The private `.nip46-session.json` contains public keys, relays, a client name,
 and the approved permission snapshot, never the secret or one-use bunker token.
 The communication key, SQLCipher credential, and user's signing key are distinct.
@@ -181,14 +186,15 @@ remote result. Account sign-out, session removal, and wipe erase the key without
 requiring the signer; encrypted history and its database credential remain on
 reversible sign-out. `shutdown_and_close` cancels actors but preserves stored
 sessions. Delete any host-owned credential backups on logout too.
-If vault deletion fails, signing stays stopped and cleanup ownership remains
-retryable. Retry local erasure or `nip46_remove` after the vault recovers; pending
+Once local revocation or account removal commits, vault deletion failure leaves
+signing stopped and cleanup ownership retryable. Retry local erasure or
+`nip46_remove` after the vault recovers; pending
 removal cannot restore or authorize a signer.
 
-Generic host-callback/NIP-55 sign-out does not query the NIP-46 credential
-namespace when no session record exists; generic account wipe follows the same rule.
-Explicit NIP-46 removal also revokes an orphaned communication key if its metadata
-was lost, retaining a removal intent when vault deletion fails.
+Generic sign-out does not acquire raw NIP-46 keys merely to remove an absent
+session. Account wipe retires known session receipts even when metadata is missing,
+while ambiguous raw cleanup remains pending. Explicit NIP-46 removal also retires
+an orphaned owner, retaining removal intent when managed deletion fails.
 
 Every signer relay passes the shared retired-relay and endpoint policy and uses
 the configured process proxy. It retains the documented

@@ -16,7 +16,7 @@ The script builds the debug native library, binding generator, and relay example
 
 ## Use the checked Swift test
 
-[`tests/native_host_smoke.swift`](tests/native_host_smoke.swift) is the runnable recipe, including the store, configuration, bounded waits, assertions, and teardown. Keep host adaptations based on that source rather than copying an independent lifecycle example. [`tests/runtime_threads.rs`](tests/runtime_threads.rs) is the existing Rust fixture for the same MockRelay/injected-store approach and separately checks runtime thread ownership and file closure; it does not execute generated Swift.
+[`tests/native_host_smoke.swift`](tests/native_host_smoke.swift) is the runnable recipe, using the shared [memory vault](tests/memory_secret_store.swift), configuration, bounded waits, assertions, and teardown. Keep host adaptations based on those sources rather than copying an independent lifecycle example. [`tests/runtime_threads.rs`](tests/runtime_threads.rs) is the existing Rust fixture for the same MockRelay/injected-store approach and separately checks runtime thread ownership and file closure; it does not execute generated Swift.
 
 The Swift test follows this sequence:
 
@@ -29,7 +29,7 @@ The Swift test follows this sequence:
 
 ### Keep secret storage alive with its root
 
-The test's `MemorySecretStore` keeps plaintext secret-key hex only in memory. It protects every callback with `NSLock`; `@unchecked Sendable` alone would not make the dictionary safe. Callbacks may run concurrently on native worker threads and must not wait for the UI thread. The callback boundary passes plaintext keys in both directions; it provides no encryption or OS credential protection.
+The test's `MemorySecretStore` keeps plaintext secret-key hex only in memory. It protects mutable receipt state with `NSLock`; `@unchecked Sendable` alone would not make that state safe. Callbacks may run synchronously on a constructor's calling thread or concurrently on native worker threads. They must not wait for the UI thread or re-enter account-home mutations on the same root, including through another client. The runtime retains the callback object while it uses it. The callback boundary passes plaintext keys in both directions; it provides no encryption or OS credential protection.
 
 Retain the store for the whole test, including same-root reopening. The encrypted account files and the signing keys are separate state. The same root plus the retained store preserves usable keys; a fresh empty store requires a fresh test root. Opening persisted files with an empty replacement store does not recover the account's credentials. Do not use real imported identities or production account directories in this recipe.
 
@@ -47,43 +47,9 @@ Platform-keychain integration is a separate test boundary. A host using the plat
 
 Use the matching generated Kotlin and native library. Android must call `MarmotAndroid.initialize(context)` before constructing `Marmot`, including when a test injects its own store. See [Kotlin / Android](README.md#kotlin--android) for packaging and JNI setup. The local relay must be reachable from the Android test process; emulator loopback is not the development machine's loopback. `MDK_SMOKE_RELAY_URL` is supplied to the desktop child process, not automatically to a device.
 
-This test-only store implements the generated callback signatures. The methods synchronize on one monitor, key credentials by account ID, and retain the label for lookup:
+Use the test-only [Kotlin memory vault](tests/memory_secret_store.kt) in the same package as the generated binding and your test. The [Swift memory vault](tests/memory_secret_store.swift) implements the same receipt lifecycle and is staged by the checked Swift smoke runners. Both serialize callbacks, store distinct immutable owner copies, share signing discovery across roots, and scope auxiliary discovery to the home. They preserve released material until a new owner has acquired its own copy, consume that hold once, and retain retired owner metadata so old releases cannot resurrect it. They contain no independent legacy entries.
 
-```kotlin
-import dev.ipf.marmotkit.*
-
-private class MemorySecretStore : SecretStore {
-    private data class Credential(val label: String, val secret: String)
-    private val credentials = mutableMapOf<String, Credential>()
-
-    @Synchronized
-    override fun hasSecretForLabel(label: String): Boolean =
-        credentials.values.any { it.label == label }
-
-    @Synchronized
-    override fun hasSecretForAccountId(accountIdHex: String): Boolean =
-        credentials.containsKey(accountIdHex)
-
-    @Synchronized
-    override fun writeSecret(label: String, accountIdHex: String, secretKeyHex: String) {
-        credentials[accountIdHex] = Credential(label, secretKeyHex)
-    }
-
-    @Synchronized
-    override fun loadSecret(label: String, accountIdHex: String): String {
-        val credential = credentials[accountIdHex]
-        if (credential == null || credential.label != label) {
-            throw MarmotKitException.SecretNotFound("Synthetic test credential missing")
-        }
-        return credential.secret
-    }
-
-    @Synchronized
-    override fun removeSecret(label: String, accountIdHex: String) {
-        credentials.remove(accountIdHex)
-    }
-}
-```
+These are plaintext, process-memory fixtures, not persistent vaults. They check proposal consistency and hex shape; the Rust callback adapter validates the returned key and signing account identity. Swift and Kotlin strings do not provide guaranteed secret-buffer erasure. A production host needs checked durable receipt and retirement writes, credential encryption, a stable physical-vault namespace, explicit legacy migration, and temporary-secret handling appropriate to its platform.
 
 In an Android test's suspending setup, use this configuration. `context` is the Android test host's authorized context, `root` is a unique test-owned directory beneath its private storage, and `relay` is the reachable MockRelay WebSocket URL:
 
