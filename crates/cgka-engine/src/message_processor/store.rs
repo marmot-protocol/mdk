@@ -1061,10 +1061,14 @@ impl<S: StorageProvider> Engine<S> {
         // Traffic older than this copy's Welcome is recorded under
         // `PredatesLocalCopy` and does not emit `TransportObjectResourceRefused`,
         // because this copy's epochs begin at the commit that minted its Welcome.
-        // Regardless of timestamp, a budget-expired deferred row is released via
-        // `release_expired_deferred_message`, which retires seen-event dedup so
-        // explicit redelivery remains possible without deleting recovery
-        // inventory, uncovering coverage, or arming an epoch gap.
+        // Regardless of timestamp, a budget-expired deferred row is simply
+        // deleted from `cgka_messages` (never marked `Failed` or added to
+        // `cgka_processed_transport_ids`, so engine-level redelivery still
+        // works). Unlike `release_message_for_replay`, this does not journal a
+        // replay release, clear the app's `seen_events`, delete reconciliation
+        // inventory, uncover coverage, or arm an epoch gap — keeping every
+        // automatic recovery path from re-admitting rows that already exhausted
+        // their full local retry or residence budget.
         let predates_this_copy = self.released_row_predates_local_copy(record);
         let released_as = if predates_this_copy {
             crate::message_disposition::MessageDisposition::PredatesLocalCopy
@@ -1091,7 +1095,7 @@ impl<S: StorageProvider> Engine<S> {
                 .max(self.convergence_now().wall_ms)
                 .saturating_sub(lifecycle.first_observed_wall_ms)
         });
-        self.storage.release_expired_deferred_message(record)?;
+        self.storage.delete_message(&record.id)?;
         let release_reason = released_as.tag();
         tracing::info!(
             target: "cgka_engine::message_processor",

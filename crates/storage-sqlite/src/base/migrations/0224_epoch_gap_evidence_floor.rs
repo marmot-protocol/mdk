@@ -27,7 +27,7 @@ mod tests {
     #[test]
     fn upgrade_leaves_existing_epoch_gap_floor_nullable() {
         let mut conn = Connection::open_in_memory().unwrap();
-        run_through(&mut conn, 224).unwrap();
+        run_through(&mut conn, 223).unwrap();
         conn.execute_batch(
             "INSERT INTO cgka_groups (id,epoch,record) VALUES (x'0a',7,x'00');
              INSERT INTO account_recovery_obligations
@@ -35,7 +35,7 @@ mod tests {
              VALUES ('epoch:0a',1,x'0a',7,1000,1000);",
         )
         .unwrap();
-        run_through(&mut conn, 225).unwrap();
+        run_through(&mut conn, 224).unwrap();
         let floor: Option<i64> = conn
             .query_row(
                 "SELECT evidence_floor_epoch FROM account_recovery_obligations WHERE demand_key='epoch:0a'",

@@ -313,4 +313,75 @@ mod tests {
         );
         assert!(!app.retire_terminal_group_recovery(&group).unwrap());
     }
+
+    #[test]
+    fn active_epoch_gap_evidence_floor_preserves_active_and_resets_after_park() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        let group = gid(2);
+        app.ensure_account_projection("alice").unwrap();
+        store.put_group(&sample_group(group.clone(), 5, 0)).unwrap();
+
+        let arm = |epoch| {
+            app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(group.as_slice()),
+                stalled_epoch: epoch,
+            }])
+            .unwrap();
+        };
+
+        // Initial arm sets evidence_floor_epoch = stalled_epoch.
+        arm(2);
+        assert_eq!(
+            app.active_epoch_gap_evidence_floor(group.as_slice(), 2)
+                .unwrap(),
+            Some(2)
+        );
+        // Active handoff preserves the original floor across newer stalled epochs.
+        arm(3);
+        assert_eq!(
+            app.active_epoch_gap_evidence_floor(group.as_slice(), 3)
+                .unwrap(),
+            Some(2)
+        );
+
+        // Parking the gap makes the active-floor lookup return None.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE account_recovery_obligations SET eligibility = 4 WHERE group_id = ?1 AND cause = 1",
+                [group.as_slice()],
+            )
+            .unwrap();
+        assert_eq!(
+            app.active_epoch_gap_evidence_floor(group.as_slice(), 3)
+                .unwrap(),
+            None
+        );
+
+        // Explicit unpark resets the floor to stalled_epoch instead of keeping the old floor.
+        app.rearm_all_recovery_units().unwrap();
+        assert_eq!(
+            app.active_epoch_gap_evidence_floor(group.as_slice(), 3)
+                .unwrap(),
+            Some(3)
+        );
+
+        // Parking again and re-arming at a higher epoch resets the floor to the new epoch.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE account_recovery_obligations SET eligibility = 4 WHERE group_id = ?1 AND cause = 1",
+                [group.as_slice()],
+            )
+            .unwrap();
+        arm(5);
+        assert_eq!(
+            app.active_epoch_gap_evidence_floor(group.as_slice(), 5)
+                .unwrap(),
+            Some(5)
+        );
+    }
 }

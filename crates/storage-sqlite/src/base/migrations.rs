@@ -425,10 +425,8 @@ mod migration_0221_agent_item_expired_targets;
 mod migration_0222_small_state_broadcast_devices;
 #[path = "migrations/0223_local_deletion_invitation.rs"]
 mod migration_0223_local_deletion_invitation;
-#[path = "migrations/0224_released_receipt_reopen_recovery.rs"]
-mod migration_0224_released_receipt_reopen_recovery;
-#[path = "migrations/0225_epoch_gap_evidence_floor.rs"]
-mod migration_0225_epoch_gap_evidence_floor;
+#[path = "migrations/0224_epoch_gap_evidence_floor.rs"]
+mod migration_0224_epoch_gap_evidence_floor;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1624,15 +1622,9 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 224,
-        name: "0224_released_receipt_reopen_recovery",
+        name: "0224_epoch_gap_evidence_floor",
         suspend_foreign_keys: &[],
-        apply: migration_0224_released_receipt_reopen_recovery::apply,
-    },
-    Migration {
-        version: 225,
-        name: "0225_epoch_gap_evidence_floor",
-        suspend_foreign_keys: &[],
-        apply: migration_0225_epoch_gap_evidence_floor::apply,
+        apply: migration_0224_epoch_gap_evidence_floor::apply,
     },
 ];
 

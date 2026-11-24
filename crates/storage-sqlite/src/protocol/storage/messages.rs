@@ -93,39 +93,26 @@ impl SqliteAccountStorage {
         }
         let consume = || {
             let conn = self.lock()?;
-            let rows = conn
-                .prepare_cached(
-                    "SELECT id, inventory_invalidated, reopen_recovery
-                     FROM cgka_released_transport_receipts
-                     ORDER BY id",
-                )
+            let ids = conn
+                .prepare_cached("SELECT id FROM cgka_released_transport_receipts ORDER BY id")
                 .storage()?
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, bool>(1)?,
-                        row.get::<_, bool>(2)?,
-                    ))
-                })
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
                 .storage()?;
             let mut unknown_bounds = false;
-            for (id, invalidated, reopen_recovery) in &rows {
-                let message_id = MessageId::new(id.clone());
-                if *reopen_recovery {
-                    let removed =
-                        crate::cross::release::retire_transport_receipts(&conn, &message_id)?;
-                    unknown_bounds |= removed == 0 && !invalidated;
-                } else {
-                    crate::cross::release::retire_seen_event(&conn, &message_id)?;
-                    crate::cross::release::mark_expired_deferred(&conn, &message_id)?;
-                }
+            for id in &ids {
+                let invalidated:bool=conn.query_row_cached("SELECT inventory_invalidated FROM cgka_released_transport_receipts WHERE id=?1",[id],|r|r.get(0)).storage()?;
+                let removed = crate::cross::release::retire_transport_receipts(
+                    &conn,
+                    &MessageId::new(id.clone()),
+                )?;
+                unknown_bounds |= removed == 0 && !invalidated;
             }
-            // Every release above retires its seen-ring claim, but only one
-            // that was stall evidence arms its group's epoch gap: budget-expired
-            // deferred evictions and traffic predating this copy's Welcome
-            // (mdk#3536) cannot prove missing history this copy can open.
+            // Every release above is retired, but only one that was stall
+            // evidence arms its group's epoch gap: the engine judged the rest
+            // (traffic that may predate this copy's Welcome, mdk#3536) unable
+            // to show history this copy could open.
             let groups = conn
                 .prepare_cached(
                     "SELECT group_id, MAX(epoch) FROM cgka_released_transport_receipts
@@ -151,10 +138,7 @@ impl SqliteAccountStorage {
             }
             conn.execute_cached("DELETE FROM cgka_released_transport_receipts", [])
                 .storage()?;
-            Ok(rows
-                .into_iter()
-                .map(|(id, _, _)| MessageId::new(id))
-                .collect())
+            Ok(ids.into_iter().map(MessageId::new).collect())
         };
         retry_on_busy(|| self.connection.with_transaction(consume))
     }
@@ -324,17 +308,14 @@ impl SqliteAccountStorage {
             // gap an earlier one owes.
             let recorded = conn
                 .execute_cached(
-                    "INSERT INTO cgka_released_transport_receipts(
-                        id, group_id, epoch, stall_evidence, reopen_recovery
-                     )
-                 SELECT ?1, ?2, ?3, ?5, 1 WHERE
+                    "INSERT INTO cgka_released_transport_receipts(id, group_id, epoch, stall_evidence)
+                 SELECT ?1, ?2, ?3, ?5 WHERE
                     (SELECT count(*) FROM cgka_released_transport_receipts) < ?4
                     OR EXISTS(SELECT 1 FROM cgka_released_transport_receipts WHERE id = ?1)
                  ON CONFLICT(id) DO UPDATE SET
                     epoch = CASE WHEN excluded.stall_evidence >= stall_evidence
                         THEN excluded.epoch ELSE epoch END,
-                    stall_evidence = MAX(stall_evidence, excluded.stall_evidence),
-                    reopen_recovery = 1",
+                    stall_evidence = MAX(stall_evidence, excluded.stall_evidence)",
                     params![
                         record.id.as_slice(),
                         record.group_id.as_slice(),
@@ -372,49 +353,6 @@ impl SqliteAccountStorage {
                 [record.id.as_slice()],
             )
             .storage()?;
-            delete_message_on_connection(&conn, &record.id)
-        };
-        if self.connection.is_current_thread_transaction_owner() {
-            release()
-        } else {
-            retry_on_busy(|| self.connection.with_transaction(release))
-        }
-    }
-
-    /// Release a budget-expired deferred row: journal seen-ring eviction for an
-    /// app owner without deleting recovery inventory, uncovering coverage, or
-    /// arming an epoch gap. Preserves any earlier replay-owed journal entry for
-    /// the same id.
-    fn release_expired_deferred(&self, record: &MessageRecord) -> StorageResult<()> {
-        let release = || {
-            let conn = self.lock()?;
-            if !crate::cross::release::app_owns_released_messages(&conn)? {
-                return delete_message_on_connection(&conn, &record.id);
-            }
-            let recorded = conn
-                .execute_cached(
-                    "INSERT INTO cgka_released_transport_receipts(
-                        id, group_id, epoch, stall_evidence, reopen_recovery
-                     )
-                     SELECT ?1, ?2, ?3, 0, 0 WHERE
-                        (SELECT count(*) FROM cgka_released_transport_receipts) < ?4
-                        OR EXISTS(SELECT 1 FROM cgka_released_transport_receipts WHERE id = ?1)
-                     ON CONFLICT(id) DO UPDATE SET id = id",
-                    params![
-                        record.id.as_slice(),
-                        record.group_id.as_slice(),
-                        epoch_to_i64(record.epoch)?,
-                        RELEASED_TRANSPORT_RECEIPT_CAPACITY,
-                    ],
-                )
-                .storage()?;
-            if recorded == 0 {
-                return Err(StorageError::Backend(
-                    "released transport receipt journal is full".into(),
-                ));
-            }
-            crate::cross::release::retire_seen_event(&conn, &record.id)?;
-            crate::cross::release::mark_expired_deferred(&conn, &record.id)?;
             delete_message_on_connection(&conn, &record.id)
         };
         if self.connection.is_current_thread_transaction_owner() {
@@ -480,10 +418,6 @@ impl MessageStorage for SqliteAccountStorage {
         record: &MessageRecord,
     ) -> StorageResult<()> {
         self.release_for_replay(record, false)
-    }
-
-    fn release_expired_deferred_message(&self, record: &MessageRecord) -> StorageResult<()> {
-        self.release_expired_deferred(record)
     }
 
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
@@ -1870,150 +1804,6 @@ mod tests {
             .map(|intent| intent.stalled_epoch)
             .collect();
         assert_eq!(armed, vec![3]);
-    }
-
-    #[test]
-    fn expired_deferred_release_retires_seen_event_without_reopening_recovery_or_arming_gap() {
-        use crate::protocol::storage::write_contention::SharedDatabase;
-
-        let db = SharedDatabase::new();
-        let store = db.open();
-        store.put_group(&sample_group(gid(1), 5, 0)).unwrap();
-        store
-            .app_storage()
-            .ensure_account_projection("app-owner")
-            .unwrap();
-
-        let with_inv_id = MessageId::new(vec![0x11; 32]);
-        let without_inv_id = MessageId::new(vec![0x22; 32]);
-        let mut with_inv = sample_message(with_inv_id.clone(), gid(1), 2);
-        with_inv.state = MessageState::PeelDeferred;
-        let mut without_inv = sample_message(without_inv_id.clone(), gid(1), 2);
-        without_inv.state = MessageState::PeelDeferred;
-        store.put_message(&with_inv).unwrap();
-        store.put_message(&without_inv).unwrap();
-        inventory(&store, &with_inv_id);
-        for id in [&with_inv_id, &without_inv_id] {
-            store
-                .lock()
-                .unwrap()
-                .execute(
-                    "INSERT INTO seen_events(event_id, seen_at) VALUES (?1, 1)",
-                    params![hex::encode(id.as_slice())],
-                )
-                .unwrap();
-        }
-
-        store.release_expired_deferred_message(&with_inv).unwrap();
-        store
-            .release_expired_deferred_message(&without_inv)
-            .unwrap();
-
-        assert!(matches!(
-            store.get_message(&with_inv_id),
-            Err(StorageError::NotFound)
-        ));
-        assert!(matches!(
-            store.get_message(&without_inv_id),
-            Err(StorageError::NotFound)
-        ));
-        // Simulate a stale in-memory seen-ring checkpoint landing before consume.
-        store
-            .lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO seen_events(event_id, seen_at) VALUES (?1, 1)",
-                params![hex::encode(with_inv_id.as_slice())],
-            )
-            .unwrap();
-        drop(store);
-
-        let reopened = db.open();
-        let consumed = reopened.consume_released_transport_receipts().unwrap();
-        assert_eq!(consumed, vec![with_inv_id.clone(), without_inv_id]);
-        let seen_count: i64 = reopened
-            .lock()
-            .unwrap()
-            .query_row("SELECT count(*) FROM seen_events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(seen_count, 0, "seen_events must be retired on consume");
-        let route = crate::TransportReconciliationRoute::Group([7; 32]);
-        let kept = reopened
-            .app_storage()
-            .transport_reconciliation_inventory(&route, 0)
-            .unwrap();
-        assert_eq!(
-            kept.items.len(),
-            1,
-            "inventory row must remain intact so recovery does not re-download the evicted message"
-        );
-        assert_eq!(kept.items[0].event_id.as_slice(), with_inv_id.as_slice());
-        assert!(
-            reopened
-                .app_storage()
-                .pending_epoch_backfill_intents()
-                .unwrap()
-                .is_empty(),
-            "expired deferred releases must arm no epoch gap even without inventory"
-        );
-    }
-
-    #[test]
-    fn expired_deferred_release_preserves_replay_release_in_either_order() {
-        for replay_first in [true, false] {
-            let store = SqliteAccountStorage::in_memory().unwrap();
-            store
-                .app_storage()
-                .ensure_account_projection("app-owner")
-                .unwrap();
-            store.put_group(&sample_group(gid(1), 6, 0)).unwrap();
-            let id = MessageId::new(vec![0x33; 32]);
-            let mut replay_rec = sample_message(id.clone(), gid(1), 3);
-            replay_rec.state = MessageState::PeelDeferred;
-            let mut expired_rec = sample_message(id.clone(), gid(1), 6);
-            expired_rec.state = MessageState::PeelDeferred;
-
-            if replay_first {
-                store.put_message(&replay_rec).unwrap();
-                inventory(&store, &id);
-                store.release_message_for_replay(&replay_rec).unwrap();
-                store.put_message(&expired_rec).unwrap();
-                store
-                    .release_expired_deferred_message(&expired_rec)
-                    .unwrap();
-            } else {
-                store.put_message(&expired_rec).unwrap();
-                inventory(&store, &id);
-                store
-                    .release_expired_deferred_message(&expired_rec)
-                    .unwrap();
-                store.put_message(&replay_rec).unwrap();
-                store.release_message_for_replay(&replay_rec).unwrap();
-            }
-
-            assert_eq!(
-                store.consume_released_transport_receipts().unwrap(),
-                vec![id]
-            );
-            let armed: Vec<_> = store
-                .app_storage()
-                .pending_epoch_backfill_intents()
-                .unwrap()
-                .into_iter()
-                .map(|intent| intent.stalled_epoch)
-                .collect();
-            assert_eq!(armed, vec![3], "replay_first={replay_first}");
-            let route = crate::TransportReconciliationRoute::Group([7; 32]);
-            assert!(
-                store
-                    .app_storage()
-                    .transport_reconciliation_inventory(&route, 0)
-                    .unwrap()
-                    .items
-                    .is_empty(),
-                "replay_first={replay_first}: replay release must still retire inventory"
-            );
-        }
     }
 
     #[test]

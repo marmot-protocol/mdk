@@ -17,32 +17,6 @@ pub(crate) fn app_owns_released_messages(conn: &rusqlite::Connection) -> Storage
     .storage()
 }
 
-/// Forgets a released message's seen-ring entry so explicit redelivery is not
-/// dropped as a duplicate, without touching recovery inventory or coverage.
-pub(crate) fn retire_seen_event(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
-    conn.execute_cached(
-        "DELETE FROM seen_events WHERE event_id = ?1",
-        params![hex::encode(id.as_slice())],
-    )
-    .storage()?;
-    Ok(())
-}
-
-/// Marks any reconciliation inventory row for `id` as expired-deferred so
-/// ordinary recovery sweeps skip it without deleting the inventory row or
-/// uncovering coverage.
-pub(crate) fn mark_expired_deferred(
-    conn: &rusqlite::Connection,
-    id: &MessageId,
-) -> StorageResult<()> {
-    conn.execute_cached(
-        "UPDATE transport_reconciliation_items SET expired_deferred = 1 WHERE event_id = ?1",
-        params![id.as_slice()],
-    )
-    .storage()?;
-    Ok(())
-}
-
 /// Forgets a released message's transport receipts: its seen-ring entry and
 /// its recovery inventory rows, whose seconds the coverage ledger stops
 /// covering. Returns the inventory rows deleted.
@@ -50,7 +24,11 @@ pub(crate) fn retire_transport_receipts(
     conn: &rusqlite::Connection,
     id: &MessageId,
 ) -> StorageResult<usize> {
-    retire_seen_event(conn, id)?;
+    conn.execute_cached(
+        "DELETE FROM seen_events WHERE event_id = ?1",
+        params![hex::encode(id.as_slice())],
+    )
+    .storage()?;
     crate::app::recovery_coverage::uncover_released_event_tx(conn, id.as_slice())?;
     crate::app::account_recovery::delete_inventory_tx(conn, "event_id = ?1", params![id.as_slice()])
 }

@@ -11,8 +11,8 @@
 
 - Re-deferring an unopenable `PeelDeferred` row across an epoch sweep preserves its original arrival epoch instead of
   restamping it to the tip epoch.
-- Budget-expired deferred-peel evictions call `MessageStorage::release_expired_deferred_message` instead of
-  `release_message_for_replay`, avoiding false epoch-gap arms and relay bounce-backs.
+- Budget-expired deferred-peel evictions delete the deferred row from `cgka_messages` directly instead of calling
+  `release_message_for_replay`, avoiding false epoch-gap arms, `seen_events` retirement, and relay bounce-backs.
 
 ## 0.19.0 - 2026-11-22
 

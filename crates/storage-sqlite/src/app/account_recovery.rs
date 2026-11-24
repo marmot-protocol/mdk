@@ -482,7 +482,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO transport_reconciliation_items(route_kind, route_id, event_id, created_at) VALUES (0,x'',zeroblob(32),?1)",
+                "INSERT INTO transport_reconciliation_items VALUES (0,x'',zeroblob(32),?1)",
                 [(now - TRANSPORT_RECONCILIATION_RETENTION_SECS - 1) as i64],
             )
             .unwrap();

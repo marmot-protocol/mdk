@@ -874,9 +874,9 @@ async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
     );
 }
 
-/// A budget-expired deferred row that predates this copy's Welcome still clears
-/// seen-event dedup so explicit redelivery remains possible, and arms no epoch
-/// gap when the release journal is consumed (mdk#3536, mdk#3535).
+/// A budget-expired deferred row that predates this copy's Welcome deletes its
+/// engine row without journaling a replay release or arming an epoch gap
+/// (mdk#3536, mdk#3535).
 #[tokio::test]
 async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
     let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"journal").await;
@@ -941,10 +941,12 @@ async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
         "the row is released"
     );
 
-    assert_eq!(
-        bob_storage.consume_released_transport_receipts().unwrap(),
-        vec![predating.id],
-        "and its id comes back for redelivery"
+    assert!(
+        bob_storage
+            .consume_released_transport_receipts()
+            .unwrap()
+            .is_empty(),
+        "budget expiry does not journal a replay release"
     );
     assert!(
         bob_storage
@@ -952,7 +954,7 @@ async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
             .pending_epoch_backfill_intents()
             .unwrap()
             .is_empty(),
-        "but it arms no epoch gap"
+        "and it arms no epoch gap"
     );
 }
 fn unix_seconds_now() -> u64 {
@@ -1079,10 +1081,10 @@ async fn deferred_stall_evidence_lists_current_epoch_rows_newer_than_the_welcome
     );
 }
 
-/// Evicting an old `PeelDeferred` row on its residence or retry budget clears
-/// `seen_events` so explicit redelivery still works, without deleting recovery
-/// inventory, reopening coverage, or arming an epoch gap (even when the row
-/// has no inventory record, e.g. after 30-day inventory retention).
+/// Evicting an old `PeelDeferred` row on its residence or retry budget deletes
+/// the engine row without journaling a replay release, retiring `seen_events`,
+/// deleting recovery inventory, uncovering coverage, or arming an epoch gap
+/// (even when the row has no inventory record, e.g. after 30-day retention).
 #[tokio::test]
 async fn expired_deferred_row_arms_no_epoch_gap_and_keeps_inventory() {
     let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"expired").await;
@@ -1152,13 +1154,12 @@ async fn expired_deferred_row_arms_no_epoch_gap_and_keeps_inventory() {
     }
     assert_eq!(deferred_rows(&bob_storage, &group_id), 0);
 
-    let mut released = bob_storage.consume_released_transport_receipts().unwrap();
-    released.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
-    let mut expected = vec![with_inventory.id.clone(), without_inventory.id.clone()];
-    expected.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
-    assert_eq!(
-        released, expected,
-        "expired rows still return their ids so hosts clear in-memory seen state"
+    assert!(
+        bob_storage
+            .consume_released_transport_receipts()
+            .unwrap()
+            .is_empty(),
+        "budget-expired rows must not journal a replay release or retire seen_events"
     );
     assert!(
         bob_storage

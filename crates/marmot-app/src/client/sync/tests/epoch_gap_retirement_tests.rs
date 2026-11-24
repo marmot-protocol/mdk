@@ -399,16 +399,17 @@ async fn budget_refusal_events_arm_no_epoch_gap_body() {
         );
     }
 
-    // Deferred-capacity overflow is still real active-stall pressure and must arm.
-    let mut capacity_effects = marmot_session::AccountDeviceEffects::default();
-    capacity_effects.events.push(
-        cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+    // Deferred-capacity overflow on the real ingest-outcome path is active-stall
+    // pressure and must arm an epoch gap.
+    alice.detect_epoch_stall(
+        Some(group.clone()),
+        &hex::encode([0x78u8; 32]),
+        &IngestOutcome::ResourceRefused {
             group_id: group.clone(),
-            message_id: MessageId::new(vec![0x78; 32]),
             resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
         },
+        Timestamp(crate::unix_now_seconds()),
     );
-    alice.observe_recovery_evidence(&capacity_effects);
     assert!(
         alice.has_pending_epoch_backfill(),
         "TransportDeferredCapacity must still arm an epoch gap"

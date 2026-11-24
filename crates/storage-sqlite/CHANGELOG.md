@@ -35,14 +35,10 @@
 - `delete_local_group_data` keeps the deleted row's invitation standing on the group's deletion frontier, and
   `SqliteAppStorage::local_group_deletion_invitation` returns it as `LocalGroupDeletionInvitation` (mdk#3555). A
   frontier written before schema 223, or by a delete that found no row, returns `None`.
-- Account migration 0224 adds `reopen_recovery` to `cgka_released_transport_receipts` and `expired_deferred` to
-  `transport_reconciliation_items` so `MessageStorage::release_expired_deferred_message` retires only `seen_events`
-  without deleting reconciliation inventory, uncovering coverage, or arming an epoch gap, while ordinary recovery
-  staging skips `expired_deferred = 1` rows. Older binaries refuse schema 224; downgrade is unsupported.
-- Account migration 0225 adds `evidence_floor_epoch` to `account_recovery_obligations` and
+- Account migration 0224 adds `evidence_floor_epoch` to `account_recovery_obligations` and
   `SqliteAppStorage::active_epoch_gap_evidence_floor` so active epoch-gap handoffs keep their original arrival-epoch
-  floor across multi-step partial advances and restarts while parked gaps retire cleanly. Older binaries refuse
-  schema 225; downgrade is unsupported.
+  floor across multi-step partial advances and restarts while parked gaps retire cleanly (and explicit unparks reset
+  the floor to `stalled_epoch`). Older binaries refuse schema 224; downgrade is unsupported.
 
 ### Fixed
 
