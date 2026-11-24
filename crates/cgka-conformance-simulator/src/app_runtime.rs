@@ -3529,12 +3529,20 @@ mod tests {
     #[test]
     fn app_errors_are_classified_without_serializing_inner_details() {
         let marker = "private-storage-path";
-        let incomplete = AppError::DirectoryLookupIncomplete(marker.into());
-        assert!(app_error_retryable(&incomplete));
-        assert_eq!(app_error_kind(&incomplete), "directory_lookup_incomplete");
-        let incomplete = app_error(incomplete);
-        assert_eq!(incomplete.category, SubjectFailureCategory::Resource);
-        assert!(!incomplete.message.contains(marker));
+        for error in [
+            AppError::DirectoryLookupIncomplete(marker.into()),
+            AppError::AccountSetupRollback {
+                setup: Box::new(AppError::InvalidGroupProfile(marker.into())),
+                rollback: Box::new(AppError::DirectoryLookupIncomplete(marker.into())),
+                additional: Vec::new(),
+            },
+        ] {
+            assert!(app_error_retryable(&error));
+            assert_eq!(app_error_kind(&error), "directory_lookup_incomplete");
+            let classified = app_error(error);
+            assert_eq!(classified.category, SubjectFailureCategory::Resource);
+            assert!(!classified.message.contains(marker));
+        }
         let environment = app_error(AppError::SqlcipherKeyDerivation(marker.into()));
         assert_eq!(environment.category, SubjectFailureCategory::Environment);
         assert!(!environment.message.contains(marker));
