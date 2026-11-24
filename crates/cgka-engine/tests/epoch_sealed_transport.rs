@@ -874,14 +874,9 @@ async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
     );
 }
 
-/// The application's release journal honours the same decision (mdk#3536).
-///
-/// Consuming the journal on the next receipt sync or account open arms an
-/// epoch gap from each release it holds, the durable twin of the refusal
-/// event. A row that may predate this copy's Welcome must not arm one there
-/// either, or the newly linked device reports it cannot catch up and holds the
-/// device-group work its KeyPackage handoff waits on (mdk#3535). The release
-/// is otherwise unchanged: the id still comes back for redelivery.
+/// A budget-expired deferred row that predates this copy's Welcome still clears
+/// seen-event dedup so explicit redelivery remains possible, and arms no epoch
+/// gap when the release journal is consumed (mdk#3536, mdk#3535).
 #[tokio::test]
 async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
     let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"journal").await;
@@ -922,9 +917,8 @@ async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
         bob.ingest(predating.clone()).await.unwrap(),
         IngestOutcome::TransportDeferred { .. }
     ));
-    // The app places a retained delivery in its recovery inventory. Once the
-    // row is released, that inventory row re-owes the message; an epoch gap
-    // re-owes only a release that has none.
+    // The app places a retained delivery in its recovery inventory. Budget
+    // expiry preserves that inventory row and arms no epoch gap.
     bob_storage
         .app_storage()
         .record_reconciliation_items(std::iter::once((

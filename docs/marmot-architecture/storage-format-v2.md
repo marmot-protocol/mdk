@@ -69,8 +69,19 @@ whether each release is stall evidence: the engine releases a row that may
 predate this copy's Welcome through
 `release_message_for_replay_without_stall_evidence`, and consumption retires it
 like any other but arms no backfill from it, unless no recovery inventory row
-placed it: that backfill is then all that re-owes its redelivery. An id released again before
-consumption counts if either release did, at that release's epoch. The caller
+placed it: that backfill is then all that re-owes its redelivery. Migration
+`0224_released_receipt_reopen_recovery` adds `reopen_recovery` to
+`cgka_released_transport_receipts` and `expired_deferred` to
+`transport_reconciliation_items` so budget-expired deferred-peel evictions
+(`MessageStorage::release_expired_deferred_message`,
+`stall_evidence = 0, reopen_recovery = 0`) retire only `seen_events` (keeping
+explicit direct redelivery possible) and mark their inventory row
+`expired_deferred = 1` without deleting `transport_reconciliation_items`,
+uncovering coverage, invalidating inventory, or arming an epoch gap; ordinary
+recovery sweep staging skips `expired_deferred = 1` rows so sweeps do not bounce
+evicted rows back into the deferred backlog. An id released again before
+consumption keeps replay-owed behavior and stall evidence if any of its releases
+demanded it. The caller
 then clears its in-memory seen ring/index synchronously, before any await or
 fallible operation. Process death before
 consumption leaves the journal; death after acknowledgment leaves clean disk

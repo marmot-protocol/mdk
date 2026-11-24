@@ -914,25 +914,18 @@ impl AppClient {
                 .remove(group);
             return Ok(());
         }
-        // An active epoch gap that partially advances (e.g. 1 -> 2 while
-        // epoch-3 rows arrived at epoch 1, mdk#3558) still considers rows from
-        // `stalled_epoch..=record.epoch` so it hands off to the new tip without
-        // carrying older pre-stall rows forever. A parked gap
-        // (`NeedsDeepRepair`) already exhausted recovery for `stalled_epoch`,
-        // so only brand-new undecryptable rows at `record.epoch` can re-arm it.
-        let is_parked = self
+        // An active epoch gap that partially advances (including across
+        // multiple commits or restarts, mdk#3558) preserves its original
+        // `evidence_floor_epoch` so rows deferred when the gap began still hand
+        // off until the missing commits arrive or the gap parks. A parked gap
+        // (`NeedsDeepRepair`) returns `None`, so only brand-new undecryptable
+        // rows at `record.epoch` can re-arm it.
+        let min_epoch = self
             .app
             .account_storage(&self.state.label)?
             .app_storage()
-            .pending_recovery_demands()?
-            .into_iter()
-            .any(|demand| {
-                demand.cause == storage_sqlite::RecoveryCause::EpochGap
-                    && demand.group_id.as_deref() == Some(group.as_slice())
-                    && demand.stalled_epoch == Some(stalled_epoch)
-                    && demand.eligibility == storage_sqlite::RecoveryEligibility::NeedsDeepRepair
-            });
-        let min_epoch = (!is_parked).then_some(cgka_traits::EpochId(stalled_epoch));
+            .active_epoch_gap_evidence_floor(group.as_slice(), stalled_epoch)?
+            .map(cgka_traits::EpochId);
         if self.seed_group_stall_from_rows(group, min_epoch)? == StallAssessment::Deferred {
             return Ok(());
         }

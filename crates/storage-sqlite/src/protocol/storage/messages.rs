@@ -119,6 +119,7 @@ impl SqliteAccountStorage {
                     unknown_bounds |= removed == 0 && !invalidated;
                 } else {
                     crate::cross::release::retire_seen_event(&conn, &message_id)?;
+                    crate::cross::release::mark_expired_deferred(&conn, &message_id)?;
                 }
             }
             // Every release above retires its seen-ring claim, but only one
@@ -413,6 +414,7 @@ impl SqliteAccountStorage {
                 ));
             }
             crate::cross::release::retire_seen_event(&conn, &record.id)?;
+            crate::cross::release::mark_expired_deferred(&conn, &record.id)?;
             delete_message_on_connection(&conn, &record.id)
         };
         if self.connection.is_current_thread_transaction_owner() {

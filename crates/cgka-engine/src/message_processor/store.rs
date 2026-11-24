@@ -1058,21 +1058,13 @@ impl<S: StorageProvider> Engine<S> {
         resource: InboundResourceLimit,
         disposition: crate::message_disposition::MessageDisposition,
     ) -> Result<(), EngineError> {
-        // The application reads `TransportObjectResourceRefused` as evidence
-        // that this device is missing history it was served, and arms a
-        // full-history backfill from it. Traffic older than this copy's Welcome
-        // is the one shape where that is knowably wasted work: the copy's own
-        // epochs begin at the commit that minted its Welcome, so a re-fetch can
-        // only bring back more of what it already cannot open. The release
-        // itself is unchanged — only the announcement and its durable twin, the
-        // release journal's backfill arm, are dropped, which is why
-        // a timestamp is allowed to decide it at all. It is a compose-time
-        // value for application messages and this seam cannot tell those from
-        // commits, so being wrong here must lose nothing, and it does not: the
-        // row is released either way, the id stays eligible for redelivery,
-        // and the host still re-owes it (through the recovery inventory, or
-        // the journal's arm where none placed it). A wrong guess can only
-        // delay a stall's detection until traffic past the margin arrives.
+        // Traffic older than this copy's Welcome is recorded under
+        // `PredatesLocalCopy` and does not emit `TransportObjectResourceRefused`,
+        // because this copy's epochs begin at the commit that minted its Welcome.
+        // Regardless of timestamp, a budget-expired deferred row is released via
+        // `release_expired_deferred_message`, which retires seen-event dedup so
+        // explicit redelivery remains possible without deleting recovery
+        // inventory, uncovering coverage, or arming an epoch gap.
         let predates_this_copy = self.released_row_predates_local_copy(record);
         let released_as = if predates_this_copy {
             crate::message_disposition::MessageDisposition::PredatesLocalCopy
@@ -1099,11 +1091,6 @@ impl<S: StorageProvider> Engine<S> {
                 .max(self.convergence_now().wall_ms)
                 .saturating_sub(lifecycle.first_observed_wall_ms)
         });
-        // Retry-budget and residence-budget evictions drop rows that already
-        // failed to peel across their full local budget. Retire their
-        // seen-event claim so explicit redelivery remains possible, without
-        // deleting recovery inventory, uncovering coverage, or arming an epoch
-        // gap (which would immediately bounce evicted rows back from relays).
         self.storage.release_expired_deferred_message(record)?;
         let release_reason = released_as.tag();
         tracing::info!(
@@ -1112,7 +1099,7 @@ impl<S: StorageProvider> Engine<S> {
             retry_count,
             residence_ms,
             release_reason,
-            "deferred transport row released for replay"
+            "deferred transport row released on budget expiry"
         );
         self.audit_group(
             &record.group_id,

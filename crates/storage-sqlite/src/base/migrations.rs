@@ -427,6 +427,8 @@ mod migration_0222_small_state_broadcast_devices;
 mod migration_0223_local_deletion_invitation;
 #[path = "migrations/0224_released_receipt_reopen_recovery.rs"]
 mod migration_0224_released_receipt_reopen_recovery;
+#[path = "migrations/0225_epoch_gap_evidence_floor.rs"]
+mod migration_0225_epoch_gap_evidence_floor;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1625,6 +1627,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0224_released_receipt_reopen_recovery",
         suspend_foreign_keys: &[],
         apply: migration_0224_released_receipt_reopen_recovery::apply,
+    },
+    Migration {
+        version: 225,
+        name: "0225_epoch_gap_evidence_floor",
+        suspend_foreign_keys: &[],
+        apply: migration_0225_epoch_gap_evidence_floor::apply,
     },
 ];
 

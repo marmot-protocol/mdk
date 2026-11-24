@@ -414,3 +414,89 @@ async fn budget_refusal_events_arm_no_epoch_gap_body() {
         "TransportDeferredCapacity must still arm an epoch gap"
     );
 }
+
+#[test]
+fn active_gap_survives_two_partial_advances_across_restart() {
+    run_composed_app_runtime_test(
+        "two-partial-advances",
+        active_gap_survives_two_partial_advances_across_restart_body,
+    );
+}
+
+async fn active_gap_survives_two_partial_advances_across_restart_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let (app, mut alice, mut bob, group) = pair(&dir, relay.clone()).await;
+    let account_storage = app.account_storage("alice").unwrap();
+    let storage = account_storage.app_storage();
+    let old_epoch = alice.runtime.group_record(&group).unwrap().epoch.0;
+
+    // Bob creates three successive commits (old -> +1 -> +2 -> +3) and speaks
+    // at old+3. Alice receives the old+3 messages while still at `old_epoch`.
+    let c1_cursor = relay.attempted_events().len();
+    self_update(&mut bob, &group).await;
+    let commit1 = group_events(&relay, c1_cursor).next().expect("commit1");
+
+    let c2_cursor = relay.attempted_events().len();
+    self_update(&mut bob, &group).await;
+    let commit2 = group_events(&relay, c2_cursor).next().expect("commit2");
+
+    let _ = retain_sample(
+        &mut bob,
+        &mut alice,
+        &relay,
+        &group,
+        DeferralLineage::Uncontested,
+    )
+    .await;
+
+    // Arm an active EpochGap at `old_epoch`.
+    storage
+        .arm_epoch_backfill_intents(&armed_backfill(&group, old_epoch))
+        .unwrap();
+    assert_eq!(
+        storage
+            .active_epoch_gap_evidence_floor(group.as_slice(), old_epoch)
+            .unwrap(),
+        Some(old_epoch)
+    );
+
+    // First partial advance (`old_epoch -> old_epoch + 1`): active gap hands
+    // off to `old_epoch + 1` while preserving `evidence_floor_epoch == old_epoch`.
+    receive(&mut alice, &commit1).await;
+    alice.runtime.advance_convergence(&group).await.unwrap();
+    assert_eq!(
+        alice.runtime.group_record(&group).unwrap().epoch.0,
+        old_epoch + 1
+    );
+    alice.queue_epoch_gap_handoffs();
+    alice.finish_epoch_gap_handoff(&group).unwrap();
+    let _ = gap_ticket(&storage, &group, old_epoch + 1);
+    assert_eq!(
+        storage
+            .active_epoch_gap_evidence_floor(group.as_slice(), old_epoch + 1)
+            .unwrap(),
+        Some(old_epoch),
+        "active handoff must preserve the original evidence floor"
+    );
+
+    // Restart the client before the second partial advance (`old_epoch + 1 -> old_epoch + 2`).
+    drop(alice);
+    let mut alice = app.client("alice").await.unwrap();
+    receive(&mut alice, &commit2).await;
+    alice.runtime.advance_convergence(&group).await.unwrap();
+    assert_eq!(
+        alice.runtime.group_record(&group).unwrap().epoch.0,
+        old_epoch + 2
+    );
+    alice.queue_epoch_gap_handoffs();
+    alice.finish_epoch_gap_handoff(&group).unwrap();
+    let _ = gap_ticket(&storage, &group, old_epoch + 2);
+    assert_eq!(
+        storage
+            .active_epoch_gap_evidence_floor(group.as_slice(), old_epoch + 2)
+            .unwrap(),
+        Some(old_epoch),
+        "second partial advance after restart must keep the active gap alive"
+    );
+}

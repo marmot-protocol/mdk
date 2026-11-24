@@ -200,9 +200,14 @@ fn join_epoch_tx(
     let key = format!("epoch:{}", hex::encode(group));
     conn.execute_cached(
         "INSERT INTO account_recovery_obligations
-         (demand_key, cause, group_id, stalled_epoch, created_at_ms, updated_at_ms)
-         VALUES (?1, 1, ?2, ?3, ?4, ?4)
+         (demand_key, cause, group_id, stalled_epoch, evidence_floor_epoch, created_at_ms, updated_at_ms)
+         VALUES (?1, 1, ?2, ?3, ?3, ?4, ?4)
          ON CONFLICT(demand_key) DO UPDATE SET
+             evidence_floor_epoch = CASE
+                 WHEN state = 0 AND eligibility != 4
+                     THEN MIN(COALESCE(evidence_floor_epoch, stalled_epoch), excluded.stalled_epoch)
+                 ELSE excluded.stalled_epoch
+             END,
              stalled_epoch = MAX(stalled_epoch, excluded.stalled_epoch),
              revision = revision + 1, state = 0, eligibility = 0, incomplete_reason = NULL,
              updated_at_ms = excluded.updated_at_ms
@@ -477,7 +482,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO transport_reconciliation_items VALUES (0,x'',zeroblob(32),?1)",
+                "INSERT INTO transport_reconciliation_items(route_kind, route_id, event_id, created_at) VALUES (0,x'',zeroblob(32),?1)",
                 [(now - TRANSPORT_RECONCILIATION_RETENTION_SECS - 1) as i64],
             )
             .unwrap();

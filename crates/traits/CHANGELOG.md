@@ -16,6 +16,8 @@
 - An agent item in a subagent's thread carries NIP-22's tags (marmot-agents D-121): `validate_agent_item_tags` takes
   one `e` beside an `E`, and `validate_agent_item_edit_tags` checks the item an edit carries, which has no `e`.
   `agent_item_thread_parent`, `agent_item_reply_target` and `is_agent_own_thread_comment` (D-122) read them.
+- `MessageStorage::release_expired_deferred_message` releases a budget-expired deferred row without reopening recovery
+  inventory, coverage, or epoch-gap debt; it defaults to `delete_message`.
 
 ## 0.19.0 - 2026-11-22
 

@@ -99,6 +99,24 @@ pub struct RecoveryStagedUsage {
 
 type StagedRow = (i64, Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>, i64);
 
+fn is_expired_deferred(
+    conn: &rusqlite::Connection,
+    route_kind: i64,
+    route_id: &[u8],
+    event_id: &[u8],
+) -> StorageResult<bool> {
+    conn.query_row_cached(
+        "SELECT EXISTS(
+             SELECT 1 FROM transport_reconciliation_items
+             WHERE route_kind = ?1 AND route_id = ?2 AND event_id = ?3
+               AND expired_deferred = 1
+         )",
+        params![route_kind, route_id, event_id],
+        |row| row.get(0),
+    )
+    .storage()
+}
+
 impl SqliteAppStorage {
     /// Stage a proven slice: its unseen events and its coverage, written
     /// through the subtracting write, in one transaction.
@@ -136,7 +154,9 @@ impl SqliteAppStorage {
             let conn = self.lock()?;
             let mut staged = 0;
             for (event, created_at) in &encoded {
-                if already_seen(&conn, &event.event_id)? {
+                if already_seen(&conn, &event.event_id)?
+                    || is_expired_deferred(&conn, kind, id, &event.event_id)?
+                {
                     continue;
                 }
                 staged += conn

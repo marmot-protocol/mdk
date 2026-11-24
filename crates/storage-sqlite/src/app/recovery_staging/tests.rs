@@ -587,3 +587,85 @@ fn staged_items_are_the_routes_from_every_relay_in_range() {
         vec![(2, 10), (3, 30), (1, 50)]
     );
 }
+
+/// An ordinary recovery sweep over an uncovered range must not restage a
+/// budget-expired deferred event whose reconciliation inventory was preserved,
+/// even though its `seen_events` entry was retired so explicit redelivery still
+/// works. A replay-owed release (`release_message_for_replay`) deletes its
+/// inventory row too and therefore IS restaged.
+#[test]
+fn expired_deferred_event_is_not_restaged_by_ordinary_sweep() {
+    use crate::base::test_support::{gid, sample_group, sample_message};
+    use cgka_traits::message::MessageState;
+    use cgka_traits::storage::MessageStorage;
+    use cgka_traits::types::MessageId;
+
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    app.ensure_account_projection("alice").unwrap();
+    storage.put_group(&sample_group(gid(1), 5, 0)).unwrap();
+    let route = group(1);
+    let now = crate::unix_now_seconds();
+
+    let expired_id = MessageId::new(vec![0x41; 32]);
+    let replay_id = MessageId::new(vec![0x42; 32]);
+    for (byte, id) in [(0x41u8, &expired_id), (0x42u8, &replay_id)] {
+        let mut rec = sample_message(id.clone(), gid(1), 2);
+        rec.state = MessageState::PeelDeferred;
+        storage.put_message(&rec).unwrap();
+        mark_seen(&app, byte);
+        app.record_reconciliation_items(std::iter::once((
+            &route,
+            &TransportReconciliationItem {
+                event_id: [byte; 32],
+                created_at: now - 50,
+            },
+        )))
+        .unwrap();
+    }
+
+    let expired_rec = storage.get_message(&expired_id).unwrap();
+    let replay_rec = storage.get_message(&replay_id).unwrap();
+    storage
+        .release_expired_deferred_message(&expired_rec)
+        .unwrap();
+    storage.release_message_for_replay(&replay_rec).unwrap();
+    let consumed = storage.consume_released_transport_receipts().unwrap();
+    assert_eq!(consumed.len(), 2);
+
+    // Neither event is in `seen_events`, so explicit direct redelivery works.
+    assert!(!already_seen(&app.lock().unwrap(), expired_id.as_slice()).unwrap());
+    assert!(!already_seen(&app.lock().unwrap(), replay_id.as_slice()).unwrap());
+
+    // Ordinary recovery sweep over the range returns all three events:
+    // - the budget-expired deferred row (`expired_deferred = 1`) is skipped,
+    // - the replay-owed row (deleted from inventory) IS staged,
+    // - an unseen ordinary inventory row (`expired_deferred = 0`) IS still staged.
+    let ordinary_inv_id = [0x43u8; 32];
+    app.record_reconciliation_items(std::iter::once((
+        &route,
+        &TransportReconciliationItem {
+            event_id: ordinary_inv_id,
+            created_at: now - 50,
+        },
+    )))
+    .unwrap();
+    let mark = app.recovery_coverage_mark().unwrap();
+    let result = stage(
+        &app,
+        &route,
+        RELAY,
+        &[
+            delivery_at(0x41, now - 50),
+            delivery_at(0x42, now - 50),
+            delivery_at(0x43, now - 50),
+        ],
+        range(now - 100, now),
+        mark,
+    );
+    assert_eq!(result.staged, 2);
+    assert_eq!(
+        staged_ids(&app.staged_recovery_events(&[route], now, 10).unwrap()),
+        vec![0x42, 0x43]
+    );
+}

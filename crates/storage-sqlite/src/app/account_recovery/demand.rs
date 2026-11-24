@@ -129,6 +129,33 @@ impl SqliteAppStorage {
         })
     }
 
+    /// Return the earliest deferred-row arrival epoch that still counts as
+    /// stall evidence when handing off an active `EpochGap` obligation at
+    /// `(group_id, stalled_epoch)`.
+    ///
+    /// Returns `Ok(None)` when the obligation is absent or parked
+    /// (`NeedsDeepRepair`), so only brand-new undecryptable rows at the new tip
+    /// epoch can re-arm.
+    pub fn active_epoch_gap_evidence_floor(
+        &self,
+        group_id: &[u8],
+        stalled_epoch: u64,
+    ) -> StorageResult<Option<u64>> {
+        let floor: Option<i64> = self
+            .lock()?
+            .query_row_cached(
+                "SELECT COALESCE(evidence_floor_epoch, stalled_epoch)
+                 FROM account_recovery_obligations
+                 WHERE cause = 1 AND state = 0 AND eligibility != 4
+                   AND group_id = ?1 AND stalled_epoch = ?2",
+                params![group_id, crate::base::codec::u64_to_i64(stalled_epoch)?],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()?;
+        floor.map(i64_to_u64).transpose()
+    }
+
     pub fn pending_recovery_demands(&self) -> StorageResult<Vec<RecoveryDemand>> {
         let conn = self.lock()?;
         let rows = conn
