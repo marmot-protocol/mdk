@@ -1,7 +1,7 @@
 ---
 title: "Conversation readiness and runtime latency telemetry"
 created: 2026-09-18
-updated: 2026-11-15
+updated: 2026-11-24
 status: implementation
 tags: [marmot, runtime, telemetry, performance]
 ---
@@ -78,7 +78,7 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `worker_unit_<kind>_over_budget` | Completed-only count of the units of that kind that outlasted the engine's budget, with their durations: 250 ms for `send` and `invite_or_create`, which a host call waits on, and 500 ms for every other kind (`FOREGROUND_DEFERRED_PEEL_BUDGET_MS` and `BACKGROUND_CONVERGENCE_BUDGET_MS`) |
 | `send_publication` | Completed-only: a send's relay wait, as the session timed its publish. Success when the message reached its relays, failure otherwise. `send_execution` contains it |
 | `key_package_resolution` | A create's, invite's or invite recovery's lookup of its members' KeyPackages from the directory relays, on the account worker |
-| `member_key_package_read`, `member_key_package_relay_read` | Zero-duration counts for each member a `key_package_resolution` selected. `member_key_package_read` counts the member's deciding read of its own KeyPackage relays (its NIP-65 list, or the configured directory relays when it lists none), not the discovery relays recovery may add: a success heard every relay it asked to the end of its stored events, a failure did not. `member_key_package_relay_read` counts each distinct relay that read asked: a success finished its read, a failure did not answer in time or came back short. Selection uses what an incomplete read returned (mdk#2628, D12), so a device whose only package sat on a relay that did not answer is left out of the invitation. The failure share shows how often invitations were built from such reads; a complete read can still miss a device whose package is on no relay it asked |
+| `member_key_package_read`, `member_key_package_relay_read` | Zero-duration counts, recorded when a create's, invite's or invite recovery's `key_package_resolution` returns, before the create or invite outcome is known. Each member selection it returns adds one `member_key_package_read`: a success when that member's deciding read of its own KeyPackage relays (its NIP-65 list, or the configured directory relays when it lists none, not the discovery relays recovery may add) heard every relay it asked to the end of its stored events, a failure otherwise. The same read adds one `member_key_package_relay_read` per distinct relay it asked: a success when that relay finished its read, a failure otherwise. A share is of member selections, or of relays asked, never of invitations. Neither count says whether a device was left out: selection uses what an incomplete read returned (mdk#2628, D12), so an incomplete read may have missed a device or nothing, and a complete read still misses a device whose package is on no relay it asked |
 | `sign_in_slot_read` | The sign-in check's read of the account's KeyPackage slots from its relays |
 | `relay_limit_lookup` | A size check on the account worker's task waiting for a relay's advertised message limit. Only events over 64 KiB look it up; the relay limit cache can answer without a fetch |
 | `route_refresh` | Applying the account's group subscription routes to the relay plane: each runtime group sync, and a create's founding Welcome registering the new group's routes |
@@ -219,7 +219,8 @@ account for that wait.
 The over-budget counts name the units that held it longest; read their `duration_ms` beside the
 unit's own.
 
-The lane step spans (`send_publication` to `group_image_upload`) time the network waits the
+The lane step spans (`send_publication` to `group_image_upload`, except the zero-duration counts
+`member_key_package_read` and `member_key_package_relay_read`) time the network waits the
 worker awaits today. Most sit inside the unit that awaits them: a send's `send_publication` inside
 `worker_unit_send`, a create's `key_package_resolution` and `group_image_upload` inside
 `worker_unit_invite_or_create`, the maintenance tick's `sign_in_slot_read` inside

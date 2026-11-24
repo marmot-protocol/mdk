@@ -1369,9 +1369,9 @@ impl AppClient {
         )
     }
 
-    /// Count how completely relays answered the KeyPackage reads behind the
-    /// members a lookup selected, so invitations built from partial reads
-    /// can be counted in the field.
+    /// Count how completely relays answered the KeyPackage read behind each
+    /// member selection a lookup returned, before the create or invite that
+    /// asked for it is known to succeed.
     fn record_key_package_read_coverage(
         &self,
         reads: nostr_directory::MemberKeyPackageReadCoverage,
