@@ -1981,7 +1981,11 @@ async fn deferred_peel_redeferral_records_no_self_transition() {
     assert!(carol_peeler.attempts_for(&stuck_app.id) > attempts_before);
     let record = carol_storage.get_message(&stuck_app.id).unwrap();
     assert_eq!(record.state, MessageState::PeelDeferred);
-    assert_eq!(record.epoch, EpochId(2), "the retry restamped the row");
+    assert_eq!(
+        record.epoch,
+        EpochId(1),
+        "re-deferral preserves the arrival epoch"
+    );
 
     drop(carol);
     let stuck_hex = hex::encode(stuck_app.id.as_slice());
@@ -5248,4 +5252,61 @@ async fn generation_close_failure_keeps_recovered_content_retryable_after_reopen
         }
     ));
     assert!(carol.drain_events().is_empty());
+}
+
+/// A deferred-peel row that still cannot peel after an epoch advance keeps its
+/// arrival epoch instead of being restamped to the new tip, so account-open
+/// stall seeding at the new epoch does not mistake old unopenable rows for
+/// fresh stall evidence.
+#[tokio::test]
+async fn deferred_peel_sweep_preserves_arrival_epoch_for_stall_evidence() {
+    let (mut alice, mut carol, carol_storage, carol_peeler, group_id, commit2, _commit3) =
+        carol_behind_two_epochs().await;
+
+    let stuck_app = send_app(&mut alice, &group_id, "stuck-at-epoch-3").await;
+    assert!(matches!(
+        carol.ingest(stuck_app.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        carol_storage.get_message(&stuck_app.id).unwrap().epoch,
+        EpochId(1)
+    );
+    let attempts_before = carol_peeler.attempts_for(&stuck_app.id);
+
+    carol.ingest(commit2).await.unwrap();
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert!(carol_peeler.attempts_for(&stuck_app.id) > attempts_before);
+
+    let record = carol_storage.get_message(&stuck_app.id).unwrap();
+    assert_eq!(record.state, MessageState::PeelDeferred);
+    assert_eq!(
+        record.epoch,
+        EpochId(1),
+        "re-deferring an unopenable row across an epoch advance must preserve its arrival epoch"
+    );
+    let evidence = carol.deferred_stall_evidence(&group_id, 8).unwrap();
+    assert_eq!(evidence.epoch, EpochId(2));
+    assert!(
+        evidence.rows.is_empty(),
+        "prior-epoch deferred rows must not look like new stall evidence at epoch 2"
+    );
+    let since_arrival = carol
+        .deferred_stall_evidence_since(&group_id, EpochId(1), 8)
+        .unwrap();
+    assert_eq!(since_arrival.epoch, EpochId(2));
+    assert_eq!(since_arrival.rows.len(), 1);
+    assert_eq!(since_arrival.rows[0].message_id, stuck_app.id);
+    assert!(
+        carol
+            .deferred_stall_evidence_since(&group_id, EpochId(2), 8)
+            .unwrap()
+            .rows
+            .is_empty(),
+        "deferred_stall_evidence_since excludes rows older than min_epoch"
+    );
 }

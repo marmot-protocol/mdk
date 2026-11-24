@@ -866,6 +866,19 @@ where
         Ok(self.session.deferred_stall_evidence(group_id, limit)?)
     }
 
+    /// Undecryptable objects retained since `min_epoch` up to the group's
+    /// current epoch; see `Engine::deferred_stall_evidence_since`.
+    pub fn deferred_stall_evidence_since(
+        &mut self,
+        group_id: &GroupId,
+        min_epoch: EpochId,
+        limit: usize,
+    ) -> AccountResult<cgka_traits::DeferredStallEvidence> {
+        Ok(self
+            .session
+            .deferred_stall_evidence_since(group_id, min_epoch, limit)?)
+    }
+
     pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
         self.session.epoch_state(group_id)
     }

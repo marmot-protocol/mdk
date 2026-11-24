@@ -432,6 +432,17 @@ pub trait MessageStorage {
         self.release_message_for_replay(record)
     }
 
+    /// Release a deferred transport row whose retry or residence budget has
+    /// expired.
+    ///
+    /// Clears local seen-event deduplication so explicit redelivery remains
+    /// possible, without deleting recovery inventory, uncovering recovery
+    /// coverage, invalidating inventory, or arming an epoch gap. Backends
+    /// without host receipt bookkeeping may simply delete the row.
+    fn release_expired_deferred_message(&self, record: &MessageRecord) -> StorageResult<()> {
+        self.delete_message(&record.id)
+    }
+
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()>;
     fn list_messages(
         &self,

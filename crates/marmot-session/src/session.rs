@@ -936,6 +936,19 @@ impl AccountDeviceSession {
         Ok(self.engine.deferred_stall_evidence(group_id, limit)?)
     }
 
+    /// Undecryptable objects retained since `min_epoch` up to the group's
+    /// current epoch; see `Engine::deferred_stall_evidence_since`.
+    pub fn deferred_stall_evidence_since(
+        &mut self,
+        group_id: &GroupId,
+        min_epoch: EpochId,
+        limit: usize,
+    ) -> SessionResult<cgka_traits::DeferredStallEvidence> {
+        Ok(self
+            .engine
+            .deferred_stall_evidence_since(group_id, min_epoch, limit)?)
+    }
+
     pub fn new_protocol_profile(&self) -> ProtocolProfile {
         self.engine.new_protocol_profile()
     }

@@ -291,3 +291,126 @@ async fn restored_gap_body() {
     );
     assert!(gap_ticket(&storage, &group, old_epoch) == ticket);
 }
+
+#[test]
+fn old_deferred_rows_do_not_rearm_on_open_or_parked_handoff() {
+    run_composed_app_runtime_test(
+        "old-deferred-no-rearm",
+        old_deferred_rows_do_not_rearm_on_open_or_parked_handoff_body,
+    );
+}
+
+async fn old_deferred_rows_do_not_rearm_on_open_or_parked_handoff_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let (app, mut alice, mut bob, group) = pair(&dir, relay.clone()).await;
+    let account_storage = app.account_storage("alice").unwrap();
+    let storage = account_storage.app_storage();
+    let old_epoch = alice.runtime.group_record(&group).unwrap().epoch.0;
+
+    // Bob advances twice (commit1: old -> old+1, commit2: old+1 -> old+2) and
+    // speaks at old+2. Alice receives the old+2 messages while still at `old_epoch`.
+    let c1_cursor = relay.attempted_events().len();
+    self_update(&mut bob, &group).await;
+    let commit1 = group_events(&relay, c1_cursor).next().expect("commit1");
+    let _ = retain_sample(
+        &mut bob,
+        &mut alice,
+        &relay,
+        &group,
+        DeferralLineage::Uncontested,
+    )
+    .await;
+
+    // Arm and park an EpochGap at `old_epoch`, then advance Alice to `old_epoch + 1`.
+    storage
+        .arm_epoch_backfill_intents(&armed_backfill(&group, old_epoch))
+        .unwrap();
+    let parked_ticket = gap_ticket(&storage, &group, old_epoch);
+    crate::client::history_recovery::history_notices::park_recovery_for_test(
+        &account_storage,
+        parked_ticket.id,
+    );
+
+    receive(&mut alice, &commit1).await;
+    alice.runtime.advance_convergence(&group).await.unwrap();
+    assert_eq!(
+        alice.runtime.group_record(&group).unwrap().epoch.0,
+        old_epoch + 1
+    );
+
+    // A parked gap must retire cleanly on epoch advance instead of carrying
+    // older-epoch unopenable rows forward into a fresh EpochGap.
+    alice.queue_epoch_gap_handoffs();
+    alice.finish_epoch_gap_handoff(&group).unwrap();
+    assert!(
+        storage.pending_epoch_backfill_intents().unwrap().is_empty(),
+        "a parked gap must retire when the group advances despite older-epoch deferred rows"
+    );
+
+    // Reopening the account at `old_epoch + 1` must not arm a new EpochGap from
+    // those older-epoch deferred rows either.
+    drop(alice);
+    let alice = app.client("alice").await.unwrap();
+    assert!(
+        !alice.has_pending_epoch_backfill(),
+        "reopening at a newer epoch must not seed an epoch gap from older-epoch deferred rows"
+    );
+    assert!(
+        storage.pending_epoch_backfill_intents().unwrap().is_empty(),
+        "no durable epoch gap may be armed on reopen from older-epoch deferred rows"
+    );
+}
+
+#[test]
+fn budget_refusal_events_arm_no_epoch_gap() {
+    run_composed_app_runtime_test(
+        "budget-refusal-no-arm",
+        budget_refusal_events_arm_no_epoch_gap_body,
+    );
+}
+
+async fn budget_refusal_events_arm_no_epoch_gap_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let (app, mut alice, _bob, group) = pair(&dir, relay.clone()).await;
+    let storage = app.account_storage("alice").unwrap().app_storage();
+
+    for resource in [
+        cgka_traits::ingest::InboundResourceLimit::TransportDeferredRetryBudget,
+        cgka_traits::ingest::InboundResourceLimit::TransportDeferredResidenceBudget,
+    ] {
+        let mut effects = marmot_session::AccountDeviceEffects::default();
+        effects.events.push(
+            cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+                group_id: group.clone(),
+                message_id: MessageId::new(vec![0x77; 32]),
+                resource,
+            },
+        );
+        alice.observe_recovery_evidence(&effects);
+        assert!(
+            !alice.has_pending_epoch_backfill(),
+            "{resource:?} eviction must not arm an epoch gap"
+        );
+        assert!(
+            storage.pending_epoch_backfill_intents().unwrap().is_empty(),
+            "{resource:?} eviction must not persist an epoch gap"
+        );
+    }
+
+    // Deferred-capacity overflow is still real active-stall pressure and must arm.
+    let mut capacity_effects = marmot_session::AccountDeviceEffects::default();
+    capacity_effects.events.push(
+        cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+            group_id: group.clone(),
+            message_id: MessageId::new(vec![0x78; 32]),
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+        },
+    );
+    alice.observe_recovery_evidence(&capacity_effects);
+    assert!(
+        alice.has_pending_epoch_backfill(),
+        "TransportDeferredCapacity must still arm an epoch gap"
+    );
+}

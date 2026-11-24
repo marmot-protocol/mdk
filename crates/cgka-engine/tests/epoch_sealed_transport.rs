@@ -1084,3 +1084,107 @@ async fn deferred_stall_evidence_lists_current_epoch_rows_newer_than_the_welcome
         "the limit bounds the rows returned"
     );
 }
+
+/// Evicting an old `PeelDeferred` row on its residence or retry budget clears
+/// `seen_events` so explicit redelivery still works, without deleting recovery
+/// inventory, reopening coverage, or arming an epoch gap (even when the row
+/// has no inventory record, e.g. after 30-day inventory retention).
+#[tokio::test]
+async fn expired_deferred_row_arms_no_epoch_gap_and_keeps_inventory() {
+    let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"expired").await;
+
+    let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
+    bob.join_welcome(welcome).await.unwrap();
+    bob.drain_events();
+    bob_storage
+        .app_storage()
+        .ensure_account_projection("bob")
+        .unwrap();
+    assert!(
+        bob_storage
+            .consume_released_transport_receipts()
+            .unwrap()
+            .is_empty()
+    );
+
+    let _withheld = evolve(
+        &mut alice,
+        SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        },
+    )
+    .await;
+    let route = storage_sqlite::TransportReconciliationRoute::Group([9; 32]);
+    let with_inventory = TransportMessage {
+        id: MessageId::new(vec![0x61; 32]),
+        ..route_at(
+            chat(&mut alice, &group_id, "post-welcome with inventory").await,
+            &group_id,
+            PAST_THE_WELCOME_MARGIN + 60,
+        )
+    };
+    let without_inventory = TransportMessage {
+        id: MessageId::new(vec![0x62; 32]),
+        ..route_at(
+            chat(&mut alice, &group_id, "post-welcome without inventory").await,
+            &group_id,
+            PAST_THE_WELCOME_MARGIN + 120,
+        )
+    };
+    bob.set_deferred_peel_residence_ms(0);
+    for msg in [&with_inventory, &without_inventory] {
+        assert!(matches!(
+            bob.ingest(msg.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+    let item_ts = unix_seconds_now();
+    bob_storage
+        .app_storage()
+        .record_reconciliation_items(std::iter::once((
+            &route,
+            &storage_sqlite::TransportReconciliationItem {
+                event_id: with_inventory.id.as_slice().try_into().unwrap(),
+                created_at: item_ts,
+            },
+        )))
+        .unwrap();
+
+    for _ in 0..8 {
+        bob.retry_deferred_peels(&group_id).await.unwrap();
+        if deferred_rows(&bob_storage, &group_id) == 0 {
+            break;
+        }
+    }
+    assert_eq!(deferred_rows(&bob_storage, &group_id), 0);
+
+    let mut released = bob_storage.consume_released_transport_receipts().unwrap();
+    released.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let mut expected = vec![with_inventory.id.clone(), without_inventory.id.clone()];
+    expected.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    assert_eq!(
+        released, expected,
+        "expired rows still return their ids so hosts clear in-memory seen state"
+    );
+    assert!(
+        bob_storage
+            .app_storage()
+            .pending_epoch_backfill_intents()
+            .unwrap()
+            .is_empty(),
+        "budget-expired deferred rows must arm no epoch gap even without inventory"
+    );
+    let kept = bob_storage
+        .app_storage()
+        .transport_reconciliation_inventory(&route, 0)
+        .unwrap();
+    assert_eq!(
+        kept.items.len(),
+        1,
+        "budget-expired deferred rows must keep their recovery inventory so the runner does not bounce them back"
+    );
+    assert_eq!(
+        kept.items[0].event_id.as_slice(),
+        with_inventory.id.as_slice()
+    );
+}

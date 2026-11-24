@@ -4303,13 +4303,36 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         limit: usize,
     ) -> Result<cgka_traits::DeferredStallEvidence, EngineError> {
+        self.deferred_stall_evidence_in_range(group_id, None, limit)
+    }
+
+    /// [`Self::deferred_stall_evidence`] including rows whose arrival epoch
+    /// falls in `min_epoch..=group.epoch`, used when an active epoch-gap
+    /// obligation advances partially and must decide whether to hand off to
+    /// the new tip epoch without carrying ancient pre-stall rows forever.
+    pub fn deferred_stall_evidence_since(
+        &mut self,
+        group_id: &GroupId,
+        min_epoch: EpochId,
+        limit: usize,
+    ) -> Result<cgka_traits::DeferredStallEvidence, EngineError> {
+        self.deferred_stall_evidence_in_range(group_id, Some(min_epoch), limit)
+    }
+
+    fn deferred_stall_evidence_in_range(
+        &mut self,
+        group_id: &GroupId,
+        min_epoch: Option<EpochId>,
+        limit: usize,
+    ) -> Result<cgka_traits::DeferredStallEvidence, EngineError> {
         self.ensure_group_live(group_id)?;
         let group = self.live_group_record(group_id)?;
         let epoch = group.epoch;
+        let lower = min_epoch.unwrap_or(epoch);
         let mut rows = Vec::new();
         if limit > 0 {
             for metadata in self.storage.list_deferred_message_metadata(group_id)? {
-                if metadata.epoch != epoch {
+                if metadata.epoch < lower || metadata.epoch > epoch {
                     continue;
                 }
                 // A retired row may disappear between listing and reading.
