@@ -56,6 +56,7 @@ impl AppRuntimeHost {
         }
         if let Some(handle) = self.bridge.take() {
             handle.abort();
+            let _ = handle.await;
         }
         self.runtime = None;
     }
@@ -162,21 +163,13 @@ async fn dispatch_hosted_runtime_command(
     defaults: &DaemonDefaults,
     runtime: &marmot_app::MarmotAppRuntime,
 ) -> Option<CliOutput> {
-    let secret_store = match crate::resolve_secret_store(defaults.secret_store) {
-        Ok(secret_store) => secret_store,
-        Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
-    };
-    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
-    let account_home =
-        match crate::open_account_home(&defaults.home, secret_store, &keychain_service) {
-            Ok(account_home) => account_home,
-            Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
-        };
+    let account_home = defaults.account_home.clone();
     let app = match crate::app_for(
         defaults.home.clone(),
         defaults.relay.clone(),
         defaults.discovery_relays.clone(),
         account_home.clone(),
+        defaults.root_owner.as_deref(),
     ) {
         Ok(app) => app,
         Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
@@ -510,11 +503,7 @@ pub(crate) async fn resolve_app_runtime_account_id(
     defaults: &DaemonDefaults,
     selector: Option<String>,
 ) -> Option<String> {
-    let secret_store = crate::resolve_secret_store(defaults.secret_store).ok()?;
-    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
-    let account_home =
-        crate::open_account_home(&defaults.home, secret_store, &keychain_service).ok()?;
-    crate::resolve_account(&account_home, selector)
+    crate::resolve_account(&defaults.account_home, selector)
         .ok()
         .map(|account| account.account_id_hex)
 }
@@ -580,15 +569,14 @@ pub(crate) async fn reconcile_app_runtime(
 pub(crate) fn open_app_runtime(
     defaults: &DaemonDefaults,
 ) -> Result<marmot_app::MarmotAppRuntime, crate::WnError> {
-    let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
-    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
-    let account_home = crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
+    let account_home = defaults.account_home.clone();
     let app = crate::app_for_role(
         defaults.home.clone(),
         defaults.relay.clone(),
         defaults.discovery_relays.clone(),
         account_home,
         false,
+        defaults.root_owner.as_deref(),
     )?;
     let runtime = app.runtime();
     marmot_app::configure_product_analytics_from_environment(&runtime, "daemon");
@@ -784,7 +772,28 @@ pub(crate) fn record_runtime_activity_report(
     }
 }
 
-pub(crate) fn apply_defaults(cli: &mut Cli, defaults: &DaemonDefaults) {
+pub(crate) fn apply_defaults(
+    cli: &mut Cli,
+    defaults: &DaemonDefaults,
+) -> Result<(), crate::WnError> {
+    if cli.secret_store.is_some() && cli.secret_store != defaults.secret_store {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "forwarded secret store conflicts with the daemon secret store",
+        )
+        .into());
+    }
+    if defaults.secret_store == Some(SecretStoreKind::Keychain)
+        && cli.keychain_service.as_deref().is_some_and(|service| {
+            Some(service.trim()) != defaults.keychain_service.as_deref().map(str::trim)
+        })
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "forwarded keychain service conflicts with the daemon keychain service",
+        )
+        .into());
+    }
     cli.home = Some(defaults.home.clone());
     cli.relay = defaults.relay.clone();
     cli.daemon_discovery_relays = defaults.discovery_relays.clone();
@@ -793,6 +802,7 @@ pub(crate) fn apply_defaults(cli: &mut Cli, defaults: &DaemonDefaults) {
     cli.secret_store = defaults.secret_store;
     cli.keychain_service = defaults.keychain_service.clone();
     cli.socket = None;
+    Ok(())
 }
 
 pub(crate) fn apply_default_account_relays(cli: &mut Cli, defaults: &DaemonDefaults) {

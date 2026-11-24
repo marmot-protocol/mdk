@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Forwarded `wn` commands must use the daemon's credential store (#819).
+  Conflicting backend or keychain-service selections fail before access;
+  restart `wnd` with the intended configuration to change stores.
+- Rust `AccountSecretStore` and host `SecretStore` implementations must provide
+  owned credential acquisition, loading, release, reconciliation, and a stable
+  `cleanup_namespace` (#819). Each owner needs durable provenance and retirement
+  state. Regenerate Swift/Kotlin bindings and migrate host implementations.
+  `MarmotSecretStore` changed layout; rebuild C hosts with the matching header
+  and library. Legacy independent vault entries remain pending, not deleted.
+- Rust `AccountHome::resume_wipe_cleanup` returns a result. Startup must handle
+  mutation-lease or home-identity failure before admitting account mutations.
+  Ownership rejects a different logical root; OS-managed mobile container
+  relocation preserves identity (#819). Android file/custom-store hosts must
+  initialize the application context before credential access, too.
+
 ### Added
 
 - C and MarmotKit can durably submit tagged text, inline replies, NIP-22 thread messages with attachments, and pack
@@ -14,6 +31,20 @@
 
 ### Fixed
 
+- Account wipes resolve shared-credential ownership before the tombstone
+  rename (#819). Later vault failures no longer abort local secret scrubbing
+  or payload deletion. Failed credential deletion retains a private,
+  nonsecret record and retries under the matching exclusive root lease,
+  through its originating vault. Root-wide mutation exclusion protects the
+  ownership check from independently opened handles. Public/external setup
+  journals precede visible records, so contention cannot leave failed setup
+  looking network-ready. Failed external setup commits account removal or
+  public-role restoration before retiring credentials. Runtime deletion reaps
+  workers and drops cached storage handles before the tombstone rename. A
+  rejected wipe keeps its live NIP-46 binding. Retries preserve signing
+  credentials adopted by a new signing account. Lower-level
+  Rust owners invoke `AccountHome::resume_wipe_cleanup` explicitly while
+  holding exclusive cross-process ownership; constructors do not run cleanup.
 - A device linked soon after another no longer shows the account's accepted chats as invitations for up to an hour,
   where a decline turned into a leave on every device (mdk#3556). Each device broadcasts its small state to a newly
   listed device at once, and adds it to a chat only after that chat's invitation decision went out. During a relay
@@ -260,7 +291,6 @@ See the [release notes](docs/release/0.19.0.md) and the [0.18.0 → 0.19.0 upgra
   pending from its real inviter.
   The sibling Welcome that carries this is a new version 3, which linked
   devices must both run to read.
-
 - A relay the host-safety rule refuses no longer reads as one a send may have
   reached, or hides that a send is too large (#3305). A Welcome whose inbox
   relays it refuses, on the first attempt or a later retry, no longer counts

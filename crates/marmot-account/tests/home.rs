@@ -3081,6 +3081,1072 @@ fn account_home_file_store_keeps_per_label_secrets_for_same_account_id() {
     );
 }
 
+#[test]
+fn wipe_bad_ownership_is_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let account = home.create_account("wipe").unwrap();
+    let path = home.account_dir(&account.label);
+    std::fs::write(path.join("session.sqlite"), b"encrypted state").unwrap();
+    let ownership = path.join(".credential-ownership.json");
+    let saved = std::fs::read(&ownership).unwrap();
+    std::fs::write(&ownership, b"invalid ownership").unwrap();
+    assert!(home.remove_account(&account.label).is_err());
+    assert_eq!(home.account(&account.label).unwrap(), account);
+    assert_eq!(
+        std::fs::read(path.join("session.sqlite")).unwrap(),
+        b"encrypted state"
+    );
+    assert!(!dir.path().join(".wipe-tombstones").exists());
+    assert!(store.keys.lock().unwrap().contains_key(&account.label));
+    std::fs::write(ownership, saved).unwrap();
+    home.remove_account(&account.label).unwrap();
+    assert!(home.accounts_strict().unwrap().is_empty());
+    assert!(store.keys.lock().unwrap().is_empty());
+}
+
+#[test]
+fn wipe_holds_root_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let keys = nostr::prelude::Keys::generate();
+    let secret = keys.secret_key().to_secret_hex();
+    let imported = home.import_nostr_account_idempotent(&secret).unwrap();
+    let account = imported.account().clone();
+    let other =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let checkpoint = store.pause_once("remove");
+    let label = account.label.clone();
+    let wipe = std::thread::spawn(move || home.remove_account(&label));
+    checkpoint.wait_for_entry();
+    let (attempts, recovery, credentials_during, absent_during) = checkpoint.before_release({
+        let other = other.clone();
+        let account = account.clone();
+        let secret = secret.clone();
+        let store = store.clone();
+        move || {
+            let attempts = [
+                other.create_account("new").map(|_| ()),
+                other.create_nostr_account().map(|_| ()),
+                other.create_nostr_account_for_setup().map(|_| ()),
+                other.import_account("new", &secret).map(|_| ()),
+                other
+                    .import_account_idempotent(&account.label, &secret)
+                    .map(|_| ()),
+                other.import_nostr_account(&secret).map(|_| ()),
+                other.import_nostr_account_idempotent(&secret).map(|_| ()),
+                other
+                    .import_nostr_account_for_onboarding(&secret)
+                    .map(|_| ()),
+                other
+                    .add_public_account(&account.account_id_hex)
+                    .map(|_| ()),
+                other
+                    .add_external_signer_account(&account.account_id_hex)
+                    .map(|_| ()),
+                other
+                    .add_public_account_for_setup(&account.account_id_hex)
+                    .map(|_| ()),
+                other
+                    .add_external_signer_for_setup(&account.account_id_hex)
+                    .map(|_| ()),
+                other.revert_external_signer_upgrade(&account.label),
+                other.reset_incomplete_setup_preserving_credential(&account.label),
+                other.rollback_nostr_account_import(&imported),
+                other
+                    .set_account_signed_out(&account.label, true)
+                    .map(|_| ()),
+                other.mark_account_unlinked(&account.label).map(|_| ()),
+                other.remove_account(&account.label),
+                other.remove_nip46_session(&account.label, Nip46Removal::IncludingOrphaned),
+                other
+                    .external_database_secret(&account.label, ExternalSecretMode::Create)
+                    .map(|_| ()),
+                other.load_signing_keys(&account.label).map(|_| ()),
+            ];
+            let recovery = other.resume_wipe_cleanup();
+            let credentials_during = store.keys.lock().unwrap().len();
+            let absent_during = matches!(other.account(&account.label),
+                Err(AccountHomeError::UnknownAccount(label)) if label == account.label);
+            (attempts, recovery, credentials_during, absent_during)
+        }
+    });
+    checkpoint.release();
+    wipe.join().unwrap().unwrap();
+    assert!(
+        matches!(recovery, Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert!(absent_during);
+    assert_eq!(credentials_during, 1, "busy recovery entered the vault");
+    for attempt in attempts {
+        assert!(
+            matches!(attempt, Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+    assert!(other.accounts_strict().unwrap().is_empty());
+    assert!(store.keys.lock().unwrap().is_empty());
+    let replacement = other
+        .import_account_idempotent(&account.label, &secret)
+        .unwrap();
+    assert_eq!(
+        other
+            .load_signing_keys(&replacement.label)
+            .unwrap()
+            .public_key(),
+        keys.public_key()
+    );
+    assert_eq!(other.accounts_strict().unwrap(), [replacement]);
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(dir.path().join(".account-mutation.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn import_holds_root_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let other =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let keys = nostr::prelude::Keys::generate();
+    let secret = keys.secret_key().to_secret_hex();
+    let checkpoint = store.pause_once("write");
+    let import = std::thread::spawn(move || home.import_account("imported", &secret));
+    checkpoint.wait_for_entry();
+    let wipe = checkpoint.before_release({
+        let other = other.clone();
+        move || other.remove_account("imported")
+    });
+    checkpoint.release();
+    let account = import.join().unwrap().unwrap();
+
+    assert!(
+        matches!(wipe, Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert_eq!(other.account("imported").unwrap(), account);
+    assert_eq!(
+        other.load_signing_keys("imported").unwrap().public_key(),
+        keys.public_key()
+    );
+    other.remove_account("imported").unwrap();
+    assert!(store.keys.lock().unwrap().is_empty());
+}
+
+#[test]
+fn twin_wipes_hold_root_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    store.account_id_keys.store(true, Ordering::SeqCst);
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let first = home.create_account("first").unwrap();
+    let mut twin = first.clone();
+    twin.label = "twin".into();
+    let twin_dir = home.account_dir(&twin.label);
+    fs_private::create_dir_all_private(&twin_dir).unwrap();
+    std::fs::write(
+        twin_dir.join("account.json"),
+        serde_json::to_vec(&twin).unwrap(),
+    )
+    .unwrap();
+    for directory in [home.account_dir(&first.label), twin_dir] {
+        std::fs::write(directory.join("session.sqlite"), b"local account state").unwrap();
+    }
+    let other =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    assert_eq!(
+        home.load_signing_keys("twin")
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        first.account_id_hex
+    );
+    let checkpoint = store.pause_once("remove");
+    let wipe = std::thread::spawn(move || home.remove_account("first"));
+    checkpoint.wait_for_entry();
+    let concurrent = checkpoint.before_release({
+        let other = other.clone();
+        move || other.remove_account("twin")
+    });
+    checkpoint.release();
+    wipe.join().unwrap().unwrap();
+
+    assert!(
+        matches!(concurrent, Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert_eq!(
+        other
+            .load_signing_keys("twin")
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        first.account_id_hex
+    );
+    other.remove_account("twin").unwrap();
+    assert!(other.accounts_strict().unwrap().is_empty());
+    assert!(store.keys.lock().unwrap().is_empty());
+    other.resume_wipe_cleanup().unwrap();
+    let mut twin_intent = None;
+    for entry in std::fs::read_dir(dir.path().join(".wipe-tombstones")).unwrap() {
+        let directory = entry.unwrap().path();
+        assert!(!directory.join("session.sqlite").try_exists().unwrap());
+        let intent: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join(".wipe-cleanup.json")).unwrap())
+                .unwrap();
+        if intent["account"]["label"] == twin.label {
+            twin_intent = Some(intent);
+        }
+    }
+    // The manifestless twin has unknown raw history, separate from its
+    // successfully released managed credential and removed local payload.
+    let intent = twin_intent.expect("unknown raw history must remain recoverable");
+    assert!(
+        intent["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(serde_json::Value::is_null)
+    );
+    assert!(
+        intent["legacy"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|legacy| legacy["account"]["label"] == twin.label)
+    );
+}
+
+#[test]
+fn wipe_vault_failure_restarts() {
+    for external in [false, true] {
+        for after_delete in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(MemorySecretStore::default());
+            let home = AccountHome::open_with_secret_store(
+                dir.path(),
+                store.clone(),
+                IosOptions::default(),
+            );
+            let account = if external {
+                let user = nostr::prelude::Keys::generate();
+                let account = home
+                    .add_external_signer_account(&user.public_key().to_hex())
+                    .unwrap();
+                home.external_database_secret(&account.label, ExternalSecretMode::Create)
+                    .unwrap();
+                account
+            } else {
+                home.create_account("wipe").unwrap()
+            };
+            let path = home.account_dir(&account.label);
+            std::fs::write(path.join("session.sqlite"), b"encrypted state").unwrap();
+            std::fs::create_dir(path.join("media")).unwrap();
+            std::fs::write(path.join("media/payload"), b"cached media").unwrap();
+            #[cfg(unix)]
+            let mut handles = Vec::new();
+            for name in ["secret.json", ".external-sqlcipher-secret"] {
+                let secret = path.join(name);
+                std::fs::write(&secret, b"plaintext key material").unwrap();
+                // Open descendants can prevent directory rename on Windows.
+                #[cfg(unix)]
+                handles.push(std::fs::File::open(secret).unwrap());
+            }
+            store.fail_remove.store(!after_delete, Ordering::SeqCst);
+            store
+                .fail_remove_after_delete
+                .store(after_delete, Ordering::SeqCst);
+
+            home.remove_account(&account.label).unwrap();
+            assert!(home.accounts_strict().unwrap().is_empty());
+            assert!(!path.exists());
+            #[cfg(unix)]
+            for mut handle in handles {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut handle, &mut bytes).unwrap();
+                assert_eq!(bytes, vec![0; b"plaintext key material".len()]);
+            }
+            drop(home);
+
+            // A still-locked vault retains only nonsecret cleanup intent.
+            let reopened = AccountHome::open_with_secret_store(
+                dir.path(),
+                store.clone(),
+                IosOptions::default(),
+            );
+            reopened.resume_wipe_cleanup().unwrap();
+            assert!(reopened.accounts_strict().unwrap().is_empty());
+            let tombstones: Vec<_> = std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            if after_delete {
+                assert!(
+                    tombstones.is_empty(),
+                    "an idempotent release acknowledges an already deleted receipt"
+                );
+            } else {
+                assert_eq!(tombstones.len(), 1);
+                let files: Vec<_> = std::fs::read_dir(&tombstones[0])
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                assert_eq!(files, [".wipe-cleanup.json"]);
+                #[cfg(unix)]
+                assert_eq!(
+                    std::fs::metadata(tombstones[0].join(".wipe-cleanup.json"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+            assert_eq!(store.keys.lock().unwrap().is_empty(), after_delete);
+            drop(reopened);
+
+            store.fail_remove.store(false, Ordering::SeqCst);
+            store
+                .fail_remove_after_delete
+                .store(false, Ordering::SeqCst);
+            let recovered = AccountHome::open_with_secret_store(
+                dir.path(),
+                store.clone(),
+                IosOptions::default(),
+            );
+            recovered.resume_wipe_cleanup().unwrap();
+            assert!(recovered.accounts_strict().unwrap().is_empty());
+            assert!(store.keys.lock().unwrap().is_empty());
+            assert_eq!(
+                std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn wipe_retry_other_vault_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = Arc::new(MemorySecretStore::default());
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), origin.clone(), IosOptions::default());
+    let old = home.import_account("reused", &"01".repeat(32)).unwrap();
+    origin.fail_remove.store(true, Ordering::SeqCst);
+    home.remove_account(&old.label).unwrap();
+    drop(home);
+
+    let other = Arc::new(MemorySecretStore::default());
+    let other_home =
+        AccountHome::open_with_secret_store(dir.path(), other.clone(), IosOptions::default());
+    let replacement = other_home
+        .import_account("reused", &"02".repeat(32))
+        .unwrap();
+    assert_ne!(old.account_id_hex, replacement.account_id_hex);
+    origin.fail_remove.store(false, Ordering::SeqCst);
+
+    let recovered =
+        AccountHome::open_with_secret_store(dir.path(), origin.clone(), IosOptions::default());
+    recovered.resume_wipe_cleanup().unwrap();
+    assert_eq!(
+        other_home
+            .load_signing_keys(&replacement.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        replacement.account_id_hex
+    );
+    assert!(
+        origin.keys.lock().unwrap().is_empty(),
+        "a different vault's record must not orphan the originating credential"
+    );
+}
+
+#[test]
+fn wipe_retry_after_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    store.account_id_keys.store(true, Ordering::SeqCst);
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let secret = "01".repeat(32);
+    let old = home.import_account("original", &secret).unwrap();
+    store.fail_remove.store(true, Ordering::SeqCst);
+    home.remove_account(&old.label).unwrap();
+
+    let original = {
+        let mut tombstones = std::fs::read_dir(dir.path().join(".wipe-tombstones")).unwrap();
+        let path = tombstones.next().unwrap().unwrap().path();
+        assert!(tombstones.next().is_none());
+        path
+    };
+
+    let imported = home.import_nostr_account_idempotent(&secret).unwrap();
+    store.fail_remove.store(false, Ordering::SeqCst);
+    home.rollback_nostr_account_import(&imported).unwrap();
+    assert!(home.accounts_strict().unwrap().is_empty());
+    assert!(store.keys.lock().unwrap().contains_key(&old.account_id_hex));
+    drop(home);
+
+    let recovered =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    assert!(original.is_dir());
+    recovered.resume_wipe_cleanup().unwrap();
+    assert!(!original.exists());
+    assert!(
+        store.keys.lock().unwrap().contains_key(&old.account_id_hex),
+        "replay must honor the rollback's preserved adoption"
+    );
+}
+
+#[test]
+fn wipe_retry_other_root_owner() {
+    let first_dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    store.account_id_keys.store(true, Ordering::SeqCst);
+    let first =
+        AccountHome::open_with_secret_store(first_dir.path(), store.clone(), IosOptions::default());
+    let secret = "01".repeat(32);
+    let old = first.import_account("original", &secret).unwrap();
+    store.fail_remove.store(true, Ordering::SeqCst);
+    first.remove_account(&old.label).unwrap();
+    store.fail_remove.store(false, Ordering::SeqCst);
+
+    let other =
+        AccountHome::open_with_secret_store(other_dir.path(), store.clone(), IosOptions::default());
+    let adopted = other.import_account_idempotent("other", &secret).unwrap();
+    assert_eq!(
+        other
+            .load_signing_keys(&adopted.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        old.account_id_hex
+    );
+    first.resume_wipe_cleanup().unwrap();
+    assert_eq!(
+        other
+            .load_signing_keys(&adopted.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        old.account_id_hex
+    );
+}
+
+#[test]
+fn file_vault_keeps_other_root() {
+    let vault = tempfile::tempdir().unwrap();
+    let first_dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let first = AccountHome::open_with_secret_store(
+        first_dir.path(),
+        Arc::new(marmot_account::LocalFileSecretStore::new(
+            vault.path(),
+            IosOptions::default(),
+        )),
+        IosOptions::default(),
+    );
+    let other = AccountHome::open_with_secret_store(
+        other_dir.path(),
+        Arc::new(marmot_account::LocalFileSecretStore::new(
+            vault.path(),
+            IosOptions::default(),
+        )),
+        IosOptions::default(),
+    );
+    let secret = "01".repeat(32);
+    let original = first.import_account("shared", &secret).unwrap();
+    let adopted = other.import_account_idempotent("shared", &secret).unwrap();
+    first.remove_account(&original.label).unwrap();
+    drop(other);
+    let reopened = AccountHome::open_with_secret_store(
+        other_dir.path(),
+        Arc::new(marmot_account::LocalFileSecretStore::new(
+            vault.path(),
+            IosOptions::default(),
+        )),
+        IosOptions::default(),
+    );
+    assert_eq!(
+        reopened
+            .load_signing_keys(&adopted.label)
+            .unwrap()
+            .secret_key()
+            .to_secret_hex(),
+        secret
+    );
+
+    // Old records can coexist with a raw credential even when migration
+    // selects the managed copy already available in the shared vault.
+    let legacy_dir = first.account_dir(&original.label);
+    fs_private::create_dir_all_private(&legacy_dir).unwrap();
+    fs_private::write_private(
+        &legacy_dir.join("account.json"),
+        &serde_json::to_vec(&original).unwrap(),
+    )
+    .unwrap();
+    let raw = vault.path().join("accounts/shared/secret.json");
+    fs_private::create_dir_all_private(raw.parent().unwrap()).unwrap();
+    let raw_bytes = serde_json::to_vec(&serde_json::json!({ "secret_key_hex": secret })).unwrap();
+    fs_private::write_private(&raw, &raw_bytes).unwrap();
+    assert_eq!(
+        first
+            .load_signing_keys(&original.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        original.account_id_hex
+    );
+    first.remove_account(&original.label).unwrap();
+    first.resume_wipe_cleanup().unwrap();
+    assert_eq!(std::fs::read(raw).unwrap(), raw_bytes);
+    let mut tombstones = std::fs::read_dir(first_dir.path().join(".wipe-tombstones")).unwrap();
+    let intent = tombstones
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join(".wipe-cleanup.json");
+    assert!(tombstones.next().is_none());
+    let intent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(intent).unwrap()).unwrap();
+    assert_eq!(intent["legacy"][0]["account"]["label"], original.label);
+    assert!(intent["credentials"][0].is_null());
+    assert!(first.accounts_strict().unwrap().is_empty());
+    assert_eq!(file_receipts(vault.path()).len(), 1);
+    assert_eq!(
+        reopened
+            .load_signing_keys(&adopted.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        adopted.account_id_hex
+    );
+}
+
+#[test]
+fn wipe_retry_keeps_reimport() {
+    for account_id_keys in [false, true] {
+        for replacement_kind in ["new-identity", "same-label", "new-label"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(MemorySecretStore::default());
+            store
+                .account_id_keys
+                .store(account_id_keys, Ordering::SeqCst);
+            let home = AccountHome::open_with_secret_store(
+                dir.path(),
+                store.clone(),
+                IosOptions::default(),
+            );
+            let old_keys = nostr::prelude::Keys::generate();
+            let account = home
+                .import_account("reused", &old_keys.secret_key().to_secret_hex())
+                .unwrap();
+            // A label-keyed store permits a different identity under the same
+            // label only after deletion completed despite returning an error.
+            let deleted = !account_id_keys && replacement_kind == "new-identity";
+            store.fail_remove.store(!deleted, Ordering::SeqCst);
+            store
+                .fail_remove_after_delete
+                .store(deleted, Ordering::SeqCst);
+            home.remove_account(&account.label).unwrap();
+            let replacement = if replacement_kind == "new-identity" {
+                home.create_account("reused").unwrap()
+            } else {
+                let label = if replacement_kind == "same-label" {
+                    "reused"
+                } else {
+                    "new-label"
+                };
+                home.import_account_idempotent(label, &old_keys.secret_key().to_secret_hex())
+                    .unwrap()
+            };
+            store.fail_remove.store(false, Ordering::SeqCst);
+            store
+                .fail_remove_after_delete
+                .store(false, Ordering::SeqCst);
+            drop(home);
+
+            let reopened = AccountHome::open_with_secret_store(
+                dir.path(),
+                store.clone(),
+                IosOptions::default(),
+            );
+            reopened.resume_wipe_cleanup().unwrap();
+            assert_eq!(
+                reopened
+                    .load_signing_keys(&replacement.label)
+                    .unwrap()
+                    .public_key()
+                    .to_hex(),
+                replacement.account_id_hex
+            );
+            assert_eq!(
+                store.keys.lock().unwrap().len(),
+                1,
+                "unadopted old credentials must be deleted"
+            );
+            assert_eq!(
+                std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn wipe_bad_namespace_is_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let user = nostr::prelude::Keys::generate();
+    let client = nostr::prelude::Keys::generate();
+    let account = home
+        .add_external_signer_account(&user.public_key().to_hex())
+        .unwrap();
+    let record = nip46_record(&user, &client);
+    home.store_nip46_session(&account.label, &client, &record)
+        .unwrap();
+    let database = home
+        .external_database_secret(&account.label, ExternalSecretMode::Create)
+        .unwrap();
+    let directory = home.account_dir(&account.label);
+    std::fs::write(directory.join("session.sqlite"), b"encrypted state").unwrap();
+    store.fail_namespace.store(true, Ordering::SeqCst);
+    let blocked =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+
+    assert!(matches!(blocked.remove_account(&account.label),
+        Err(AccountHomeError::SecretStore(error)) if error == "injected namespace lookup failure"));
+    assert_eq!(home.account(&account.label).unwrap(), account);
+    assert_eq!(
+        std::fs::read(directory.join("session.sqlite")).unwrap(),
+        b"encrypted state"
+    );
+    assert!(!directory.join(".wipe-cleanup.json").exists());
+    assert!(!dir.path().join(".wipe-tombstones").exists());
+    let (restored, restored_record) = home.load_nip46_session(&account.label).unwrap().unwrap();
+    assert_eq!(restored.public_key(), client.public_key());
+    assert_eq!(restored_record, record);
+    assert_eq!(
+        *home
+            .external_database_secret(&account.label, ExternalSecretMode::Existing)
+            .unwrap(),
+        *database
+    );
+    assert_eq!(store.keys.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn wipe_retry_matches_vault() {
+    for account_id_keys in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut origin = MemorySecretStore::default();
+        origin.namespace.push_str(&"\0".repeat(32 * 1024));
+        let origin = Arc::new(origin);
+        origin
+            .account_id_keys
+            .store(account_id_keys, Ordering::SeqCst);
+        let home =
+            AccountHome::open_with_secret_store(dir.path(), origin.clone(), IosOptions::default());
+        let account = home.create_account("removed").unwrap();
+        let original_key = home.load_signing_keys(&account.label).unwrap();
+        origin.fail_remove.store(true, Ordering::SeqCst);
+        home.remove_account(&account.label).unwrap();
+        drop(home);
+        let tombstone = std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let marker = tombstone.join(".wipe-cleanup.json");
+        let intent = std::fs::read(&marker).unwrap();
+        for name in [
+            "secret.json",
+            ".external-sqlcipher-secret",
+            "session.sqlite",
+        ] {
+            std::fs::write(tombstone.join(name), b"residual payload").unwrap();
+        }
+
+        let wrong = Arc::new(MemorySecretStore::default());
+        wrong
+            .account_id_keys
+            .store(account_id_keys, Ordering::SeqCst);
+        let unrelated = nostr::prelude::Keys::generate();
+        let slot = if account_id_keys {
+            account.account_id_hex.clone()
+        } else {
+            account.label.clone()
+        };
+        wrong
+            .keys
+            .lock()
+            .unwrap()
+            .insert(slot.clone(), unrelated.secret_key().to_secret_hex());
+        let wrong_home =
+            AccountHome::open_with_secret_store(dir.path(), wrong.clone(), IosOptions::default());
+        wrong_home.resume_wipe_cleanup().unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), intent);
+        assert_eq!(
+            nostr::prelude::Keys::parse(&wrong.keys.lock().unwrap()[&slot])
+                .unwrap()
+                .public_key(),
+            unrelated.public_key()
+        );
+        assert_eq!(
+            nostr::prelude::Keys::parse(&origin.keys.lock().unwrap()[&slot])
+                .unwrap()
+                .public_key(),
+            original_key.public_key()
+        );
+        assert_eq!(
+            std::fs::read_dir(&tombstone).unwrap().count(),
+            1,
+            "wrong-vault replay must still scrub local payloads"
+        );
+        drop(wrong_home);
+
+        origin.fail_remove.store(false, Ordering::SeqCst);
+        origin.fail_namespace.store(true, Ordering::SeqCst);
+        let unavailable =
+            AccountHome::open_with_secret_store(dir.path(), origin.clone(), IosOptions::default());
+        unavailable.resume_wipe_cleanup().unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), intent);
+        assert_eq!(
+            nostr::prelude::Keys::parse(&origin.keys.lock().unwrap()[&slot])
+                .unwrap()
+                .public_key(),
+            original_key.public_key()
+        );
+        drop(unavailable);
+
+        origin.fail_namespace.store(false, Ordering::SeqCst);
+        let recovered =
+            AccountHome::open_with_secret_store(dir.path(), origin.clone(), IosOptions::default());
+        recovered.resume_wipe_cleanup().unwrap();
+        assert!(origin.keys.lock().unwrap().is_empty());
+        assert!(!tombstone.exists());
+        assert_eq!(
+            nostr::prelude::Keys::parse(&wrong.keys.lock().unwrap()[&slot])
+                .unwrap()
+                .public_key(),
+            unrelated.public_key()
+        );
+    }
+}
+
+#[test]
+fn wipe_retry_rejects_nonowners() {
+    for account_id_keys in [false, true] {
+        for external in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(MemorySecretStore::default());
+            store
+                .account_id_keys
+                .store(account_id_keys, Ordering::SeqCst);
+            let home = AccountHome::open_with_secret_store(
+                dir.path(),
+                store.clone(),
+                IosOptions::default(),
+            );
+            let old = home.create_nostr_account().unwrap();
+            store.fail_remove.store(true, Ordering::SeqCst);
+            home.remove_account(&old.label).unwrap();
+            let replacement = if external {
+                home.add_external_signer_account(&old.account_id_hex)
+                    .unwrap()
+            } else {
+                home.add_public_account(&old.account_id_hex).unwrap()
+            };
+            let database = external.then(|| {
+                home.external_database_secret(&replacement.label, ExternalSecretMode::Create)
+                    .unwrap()
+            });
+            store.fail_remove.store(false, Ordering::SeqCst);
+            drop(home);
+
+            let recovered = AccountHome::open_with_secret_store(
+                dir.path(),
+                store.clone(),
+                IosOptions::default(),
+            );
+            recovered.resume_wipe_cleanup().unwrap();
+            assert_eq!(recovered.account(&replacement.label).unwrap(), replacement);
+            assert!(!store.keys.lock().unwrap().contains_key(&old.label));
+            if let Some(database) = database {
+                assert_eq!(
+                    *recovered
+                        .external_database_secret(&replacement.label, ExternalSecretMode::Existing)
+                        .unwrap(),
+                    *database
+                );
+            }
+            assert_eq!(
+                std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn wipe_ignores_bad_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let removed = home.create_account("removed").unwrap();
+    store.fail_remove.store(true, Ordering::SeqCst);
+    home.remove_account(&removed.label).unwrap();
+    let live = home.create_account("live").unwrap();
+    let record = home.account_dir(&live.label).join("account.json");
+    std::fs::write(&record, b"invalid json").unwrap();
+    store.fail_remove.store(false, Ordering::SeqCst);
+    drop(home);
+
+    let deferred =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    deferred.resume_wipe_cleanup().unwrap();
+    assert!(!store.keys.lock().unwrap().contains_key(&removed.label));
+    assert!(!deferred.account_dir(&removed.label).exists());
+    drop(deferred);
+    std::fs::write(record, serde_json::to_vec(&live).unwrap()).unwrap();
+
+    let recovered =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    recovered.resume_wipe_cleanup().unwrap();
+    assert!(!store.keys.lock().unwrap().contains_key(&removed.label));
+    assert_eq!(
+        recovered
+            .load_signing_keys(&live.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        live.account_id_hex
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn wipe_retry_keeps_external_key() {
+    for account_id_keys in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemorySecretStore::default());
+        store
+            .account_id_keys
+            .store(account_id_keys, Ordering::SeqCst);
+        let home =
+            AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+        let user = nostr::prelude::Keys::generate();
+        let account = home
+            .add_external_signer_account(&user.public_key().to_hex())
+            .unwrap();
+        let secret = home
+            .external_database_secret(&account.label, ExternalSecretMode::Create)
+            .unwrap();
+        store.fail_remove.store(true, Ordering::SeqCst);
+        home.remove_account(&account.label).unwrap();
+        home.add_external_signer_account(&user.public_key().to_hex())
+            .unwrap();
+        assert_eq!(
+            *home
+                .external_database_secret(&account.label, ExternalSecretMode::Existing)
+                .unwrap(),
+            *secret
+        );
+        store.fail_remove.store(false, Ordering::SeqCst);
+        drop(home);
+
+        let reopened =
+            AccountHome::open_with_secret_store(dir.path(), store, IosOptions::default());
+        reopened.resume_wipe_cleanup().unwrap();
+        assert_eq!(
+            *reopened
+                .external_database_secret(&account.label, ExternalSecretMode::Existing)
+                .unwrap(),
+            *secret
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn wipe_retry_ignores_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let victim = external.path().join("victim");
+    std::fs::create_dir(&victim).unwrap();
+    let secret = victim.join("secret.json");
+    std::fs::write(&secret, b"external secret").unwrap();
+    let root = dir.path().join(".wipe-tombstones");
+    symlink(external.path(), &root).unwrap();
+    AccountHome::open(dir.path()).resume_wipe_cleanup().unwrap();
+    assert_eq!(std::fs::read(&secret).unwrap(), b"external secret");
+
+    std::fs::remove_file(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    symlink(&victim, root.join("linked")).unwrap();
+    let tombstone = root.join("removed");
+    std::fs::create_dir(&tombstone).unwrap();
+    symlink(&secret, tombstone.join("secret.json")).unwrap();
+    AccountHome::open(dir.path()).resume_wipe_cleanup().unwrap();
+    assert_eq!(std::fs::read(&secret).unwrap(), b"external secret");
+    assert!(!tombstone.exists());
+    assert!(
+        std::fs::symlink_metadata(root.join("linked"))
+            .unwrap()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn copied_manifest_keeps_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.import_account("alice", &"01".repeat(32)).unwrap();
+    let live_dir = home.account_dir(&account.label);
+    let copy_dir = home.account_dir("recovery-copy");
+    std::fs::create_dir(&copy_dir).unwrap();
+    std::fs::copy(
+        live_dir.join(".credential-ownership.json"),
+        copy_dir.join(".credential-ownership.json"),
+    )
+    .unwrap();
+    drop(home);
+
+    let reopened = AccountHome::open(dir.path());
+    reopened.resume_wipe_cleanup().unwrap();
+    assert_eq!(reopened.account(&account.label).unwrap(), account);
+    assert_eq!(
+        reopened
+            .load_signing_keys(&account.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        account.account_id_hex
+    );
+    assert!(copy_dir.join(".credential-ownership.json").is_file());
+    assert!(!copy_dir.join(".wipe-cleanup.json").exists());
+    assert!(!live_dir.join(".wipe-cleanup.json").exists());
+}
+
+#[test]
+fn wipe_unknown_keeps_ownership() {
+    for intent_kind in ["legacy", "corrupt", "unreadable", "old-intent"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemorySecretStore::default());
+        let home =
+            AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+        let account = home.create_account("legacy").unwrap();
+        let key = home
+            .load_signing_keys(&account.label)
+            .unwrap()
+            .secret_key()
+            .to_secret_hex();
+        let live = home.account_dir(&account.label);
+        let ownership = std::fs::read(live.join(".credential-ownership.json")).unwrap();
+        for name in [
+            "secret.json",
+            ".external-sqlcipher-secret",
+            "session.sqlite",
+        ] {
+            std::fs::write(live.join(name), b"old wipe residue").unwrap();
+        }
+        let root = dir.path().join(".wipe-tombstones");
+        std::fs::create_dir(&root).unwrap();
+        let tombstone = root.join("legacy.interrupted");
+        std::fs::rename(live, &tombstone).unwrap();
+        let intent = tombstone.join(".wipe-cleanup.json");
+        match intent_kind {
+            "corrupt" => std::fs::write(&intent, b"invalid intent").unwrap(),
+            "unreadable" => std::fs::create_dir(&intent).unwrap(),
+            "old-intent" => std::fs::write(
+                &intent,
+                serde_json::to_vec(&serde_json::json!({ "credentials": [null, account] })).unwrap(),
+            )
+            .unwrap(),
+            _ => {}
+        }
+        drop(home);
+        for _ in 0..2 {
+            let reopened = AccountHome::open_with_secret_store(
+                dir.path(),
+                store.clone(),
+                IosOptions::default(),
+            );
+            reopened.resume_wipe_cleanup().unwrap();
+            assert!(reopened.accounts_strict().unwrap().is_empty());
+            assert!(
+                store
+                    .keys
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|secret| secret == &key)
+            );
+            let retained: AccountSummary =
+                serde_json::from_slice(&std::fs::read(tombstone.join("account.json")).unwrap())
+                    .unwrap();
+            assert_eq!(retained, account);
+            assert_eq!(
+                std::fs::read(tombstone.join(".credential-ownership.json")).unwrap(),
+                ownership
+            );
+            for name in [
+                "secret.json",
+                ".external-sqlcipher-secret",
+                "session.sqlite",
+            ] {
+                assert!(!tombstone.join(name).exists());
+            }
+            match intent_kind {
+                "corrupt" => assert_eq!(std::fs::read(&intent).unwrap(), b"invalid intent"),
+                "unreadable" => assert!(intent.is_dir()),
+                "old-intent" => {
+                    let saved: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&intent).unwrap()).unwrap();
+                    assert_eq!(saved, serde_json::json!({ "credentials": [null, account] }));
+                }
+                _ => assert!(!intent.exists()),
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn account_home_scrubs_tombstoned_local_secret_before_failed_recursive_delete() {

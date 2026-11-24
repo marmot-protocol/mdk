@@ -6175,10 +6175,25 @@ fn daemon_socket_path_is_private() {
     assert_eq!(pid_mode, 0o600);
 }
 
+fn run_reset(home: &std::path::Path) -> Output {
+    cli_binary(env!("CARGO_BIN_EXE_wn"))
+        .env_remove("WN_SOCKET")
+        .env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
+        .arg("--home")
+        .arg(home)
+        .args(["--json", "reset", "--confirm"])
+        .output()
+        .expect("local wn reset should start")
+}
+
 #[test]
 fn daemon_refuses_reset_over_socket() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("wnd.sock");
+    let socket_dir = tempfile::tempdir().expect("custom socket directory");
+    let socket = socket_dir.path().join("private").join("wnd.sock");
+    let data = home.path().join("local-data");
+    std::fs::create_dir(&data).expect("create local data directory");
+    std::fs::write(data.join("payload"), b"local data").expect("write local data");
     let daemon = DaemonGuard::start(&socket, |wnd| {
         wnd.arg("--home")
             .arg(home.path())
@@ -6208,9 +6223,216 @@ fn daemon_refuses_reset_over_socket() {
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
     assert_eq!(value["error"]["code"], "daemon_forbidden");
     assert_eq!(value["error"]["command"], "reset");
-    assert!(home.path().exists(), "daemon home should not be deleted");
 
-    daemon.stop();
+    let lock_name = marmot_app::MARMOT_ROOT_RUNTIME_LOCK_FILE;
+    #[cfg(unix)]
+    let (lock_before, root_before) = (
+        std::fs::File::open(home.path().join(lock_name)).expect("open daemon coordination file"),
+        std::fs::File::open(home.path()).expect("open daemon home"),
+    );
+    let output = run_reset(home.path());
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("local reset error JSON");
+    assert_eq!(value["error"]["code"], "command_failed");
+    assert_eq!(
+        value["error"]["message"],
+        "marmot runtime root is already in use"
+    );
+    assert_eq!(std::fs::read(data.join("payload")).unwrap(), b"local data");
+
+    stop_owned_test_daemon(daemon);
+
+    let output = run_reset(home.path());
+    assert!(
+        output.status.success(),
+        "{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("local reset success JSON");
+    assert_eq!(value["result"]["deleted"], true);
+    let remaining: BTreeSet<_> = std::fs::read_dir(home.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        remaining,
+        BTreeSet::from(
+            [
+                lock_name,
+                marmot_account::ROOT_MUTATION_LOCK_FILE,
+                marmot_account::CREDENTIAL_STORE_LOCK_FILE,
+            ]
+            .map(std::ffi::OsString::from)
+        )
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let lock_after = home
+            .path()
+            .join(lock_name)
+            .metadata()
+            .expect("reset keeps the coordination file");
+        let root_after = home.path().metadata().expect("reset keeps the home");
+        let lock_before = lock_before.metadata().expect("original coordination inode");
+        let root_before = root_before.metadata().expect("original root inode");
+        assert_eq!(
+            (lock_after.dev(), lock_after.ino()),
+            (lock_before.dev(), lock_before.ino())
+        );
+        assert_eq!(
+            (root_after.dev(), root_after.ino()),
+            (root_before.dev(), root_before.ino())
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_rejects_empty_home() {
+    let cwd = tempfile::tempdir().unwrap();
+    let data = cwd.path().join("outside-home");
+    std::fs::write(&data, b"keep").unwrap();
+
+    let output = cli_binary(env!("CARGO_BIN_EXE_wn"))
+        .current_dir(cwd.path())
+        .env_remove("WN_SOCKET")
+        .env("WN_HOME", "")
+        .args(["--json", "reset", "--confirm"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        command_output_summary(&output)
+    );
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(error["error"]["message"], "home path must not be empty");
+    assert_eq!(std::fs::read(&data).unwrap(), b"keep");
+}
+
+#[cfg(unix)]
+#[test]
+fn whoami_parent_relative_home() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("profile");
+    let cwd = root.path().join("cwd");
+    std::fs::create_dir(&cwd).unwrap();
+    let account = create_local_account_id(&home);
+    std::os::unix::fs::symlink(&home, root.path().join("alias")).unwrap();
+
+    let run = |path| {
+        cli_binary(env!("CARGO_BIN_EXE_wn"))
+            .current_dir(&cwd)
+            .env_remove("WN_SOCKET")
+            .args(["--home", path, "--secret-store", "file", "--json", "whoami"])
+            .output()
+            .unwrap()
+    };
+    let output = run("../profile");
+    assert!(
+        output.status.success(),
+        "{}",
+        command_output_summary(&output)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["result"]["accounts"][0]["account_id"], account);
+    let rejected = run("../alias");
+    assert!(
+        !rejected.status.success(),
+        "{}",
+        command_output_summary(&rejected)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_preserves_writer_leases() {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    use marmot_account::{CREDENTIAL_STORE_LOCK_FILE, ROOT_MUTATION_LOCK_FILE};
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let vault = home.path().join("vaults").join("secondary");
+    let receipts = vault.join("receipts");
+    std::fs::create_dir_all(&receipts).unwrap();
+    let data = [home.path().join("unrelated-data"), receipts.join("receipt")];
+    for path in &data {
+        std::fs::write(path, b"local data").unwrap();
+    }
+
+    let locks = [
+        (
+            home.path().join(ROOT_MUTATION_LOCK_FILE),
+            "account mutation is already in progress",
+        ),
+        (
+            home.path().join(CREDENTIAL_STORE_LOCK_FILE),
+            "credential store is already in use",
+        ),
+        (
+            vault.join(CREDENTIAL_STORE_LOCK_FILE),
+            "credential store is already in use",
+        ),
+    ];
+    let original_files = locks.each_ref().map(|(path, _)| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+    });
+    let assert_same_inodes = || {
+        for ((path, _), original) in locks.iter().zip(&original_files) {
+            let before = original.metadata().unwrap();
+            let after = path.metadata().unwrap();
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        }
+    };
+
+    for (path, message) in &locks {
+        let lease = fs_private::try_acquire_private_exclusive_file_lease(path).unwrap();
+        let output = run_reset(home.path());
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            command_output_summary(&output)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["error"]["code"], "io_error");
+        assert_eq!(
+            value["error"]["message"],
+            format!("{message}: {}", path.display())
+        );
+        for path in &data {
+            assert_eq!(std::fs::read(path).unwrap(), b"local data");
+        }
+        assert_same_inodes();
+        drop(lease);
+    }
+
+    let output = run_reset(home.path());
+    assert!(
+        output.status.success(),
+        "{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["result"]["deleted"], true);
+    for path in &data {
+        assert!(!path.try_exists().unwrap());
+    }
+    assert!(!receipts.try_exists().unwrap());
+    assert_same_inodes();
 }
 
 #[test]
@@ -6233,13 +6455,32 @@ fn daemon_running_does_not_auto_forward_logout() {
     });
 
     let mut logout_command = wn_without_relay(home.path());
-    logout_command.env_remove("WN_SOCKET");
-    let logout = logout_command
-        .args(["logout", &account])
-        .output()
-        .expect("wn logout should start");
+    logout_command
+        .env_remove("WN_SOCKET")
+        .env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
+        .args(["logout", &account]);
+    #[cfg(not(feature = "test-policy-overrides"))]
+    {
+        let rejected = logout_command
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .output()
+            .expect("wn logout should start");
+        assert_eq!(
+            rejected.status.code(),
+            Some(1),
+            "{}",
+            command_output_summary(&rejected)
+        );
+        let value: Value = serde_json::from_slice(&rejected.stdout).expect("logout error JSON");
+        assert_eq!(value["error"]["code"], "dev_settlement_override_in_release");
+        let accounts = AccountHome::open(home.path()).accounts().expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].account_id_hex, account);
+        logout_command.env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS");
+    }
+    let logout = logout_command.output().expect("wn logout should start");
 
-    daemon.stop();
+    stop_owned_test_daemon(daemon);
 
     assert!(
         logout.status.success(),

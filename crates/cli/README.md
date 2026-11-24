@@ -159,7 +159,10 @@ wn reset --confirm
 - `export-nsec` exists for command-shape compatibility but returns `private_key_export_disabled`; this CLI never prints
   private keys.
 - `accounts create` is kept as a compatibility/repair surface; new setup flows should use `create-identity` or `login`.
-- `reset --confirm` deletes all local White Noise CLI data.
+- Stop the daemon and finish any account or credential updates before running `wn reset --confirm`. After stopping a
+  daemon on a custom socket, unset `WN_SOCKET` and omit `--socket`. Keep `--home` pointed at the home you intend to
+  reset. Reset excludes other MDK writers that hold its coordination locks; stop tools that edit the home without
+  those locks. Reset keeps lock files and the directories that contain them. It does not clear the OS keychain.
 
 ### KeyPackages
 
@@ -744,6 +747,15 @@ other devices removed it. No new storage migration or background scheduler is in
 `dev/wnd.pid`, appends startup errors to `dev/wnd.log`, and hosts one `MarmotAppRuntime`. The runtime keeps long-lived
 relay subscriptions for local signing accounts using the daemon's discovery and account-relay defaults, and updates them
 automatically after identity, group, and message mutations forwarded through it.
+
+`wnd` takes an exclusive lease on the data directory. It retries pending account-wipe cleanup before binding the
+socket and releases the lease after its workers stop. Standalone commands that open an account runtime need the same
+lease. If a daemon owns the directory, use its socket instead. Local logout does not open an account runtime.
+
+Forwarded commands and subscriptions use the credential store that `wnd` opened at startup. If you select a different
+backend, or a different service when using keychain storage, the request fails before credential access. Restart
+the daemon to change stores. Client environment values are not forwarded. They apply when starting the daemon or
+running standalone commands.
 
 ```sh
 export WN_HOME="$PWD/dev/data/daemon-demo"

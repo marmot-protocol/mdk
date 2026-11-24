@@ -251,12 +251,7 @@ pub(crate) async fn handle_timeline_messages_subscription(
 }
 
 pub(crate) fn daemon_account_ref(defaults: &DaemonDefaults, cli: &Cli) -> Result<String, String> {
-    let secret_store =
-        crate::resolve_secret_store(defaults.secret_store).map_err(|err| err.to_string())?;
-    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
-    let account_home = crate::open_account_home(&defaults.home, secret_store, &keychain_service)
-        .map_err(|err| err.to_string())?;
-    let account = crate::resolve_account(&account_home, cli.account.clone())
+    let account = crate::resolve_account(&defaults.account_home, cli.account.clone())
         .map_err(|err| err.to_string())?;
     if !account.local_signing {
         return Err(format!(

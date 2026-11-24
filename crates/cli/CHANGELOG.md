@@ -9,8 +9,21 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- `wn` and `wnd` retry pending account-wipe cleanup only while holding the exclusive data-root lease. Forwarded
+  commands reuse the daemon's account home without retrying cleanup.
+- Local logout does not open an application runtime.
+- `wn reset --confirm` refuses to delete data while a daemon (even on a custom socket), an account mutation,
+  or a credential update holds a lock. Reset keeps the lock files and their containing directories and does not
+  follow symlinks during deletion. An explicitly empty home is rejected.
+- Standalone commands accept homes relative to the caller's parent directory, such as `--home ../profile`.
+- Local commands, including logout, reject `WN_DEV_SETTLEMENT_QUIESCENCE_MS` without `test-policy-overrides`.
+
 ### Changed
 
+- Forwarded commands cannot change the daemon's credential backend or keychain service. Conflicting selections
+  fail before credential access. Restart the daemon to change stores (#819).
 - `wn messages send-event` accepts kinds 1201 (agent item) and 1202 (answer or control) in the marmot-agents shape,
   and refuses them in any other.
 - Timeline JSON gains `agent_item_first_event_missing`, true for an agent item shown from its edits because its

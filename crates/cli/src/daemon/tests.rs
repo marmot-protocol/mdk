@@ -356,6 +356,14 @@ fn daemon_socket_parent_rejects_group_writable_custom_directory() {
 #[cfg(unix)]
 async fn daemon_socket_is_owner_only_after_bind() {
     let home = tempfile::tempdir().expect("tempdir");
+    let pending = home.path().join(".wipe-tombstones").join("pending");
+    create_private_dir_all(&pending).unwrap();
+    write_private_file(
+        &pending.join(".wipe-cleanup.json"),
+        b"unreadable wipe intent",
+    )
+    .unwrap();
+    write_private_file(&pending.join("payload"), b"removed account payload").unwrap();
     let socket = home.path().join("dev").join("wnd.sock");
     let relay_url = "wss://relay.example".to_owned();
     let args = DaemonArgs {
@@ -377,6 +385,22 @@ async fn daemon_socket_is_owner_only_after_bind() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(socket.try_exists().expect("socket existence check"));
+
+    assert!(
+        !pending.join("payload").exists(),
+        "daemon recovers before exposing its socket"
+    );
+    assert!(pending.join(".wipe-cleanup.json").exists());
+    assert!(matches!(
+        marmot_app::MarmotRootRuntimeLease::try_acquire(home.path()),
+        Err(marmot_app::AppError::RuntimeBusy)
+    ));
+    let output = send_execute(&socket, daemon_test_cli(crate::Command::Whoami), None)
+        .await
+        .unwrap_or_else(|_| panic!("daemon fallback command must complete"));
+    assert_eq!(output.code, 0, "fallback shares the daemon lease");
+    let result: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(result["result"]["accounts"], serde_json::json!([]));
 
     assert_eq!(
         socket
@@ -406,12 +430,16 @@ async fn daemon_socket_is_owner_only_after_bind() {
         .expect("server task should not time out")
         .expect("server task should not panic")
         .expect("server should shut down cleanly");
+    marmot_app::MarmotRootRuntimeLease::try_acquire(home.path())
+        .expect("shutdown releases daemon root ownership");
 }
 
 #[test]
 fn apply_defaults_overwrites_forwarded_cli_relay_with_daemon_relay() {
     let defaults = DaemonDefaults {
+        root_owner: None,
         home: PathBuf::from("/tmp/wn-daemon-home"),
+        account_home: marmot_account::AccountHome::open("/tmp/wn-daemon-home"),
         socket: PathBuf::from("/tmp/wn-daemon.sock"),
         pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
         log_path: PathBuf::from("/tmp/wn-daemon.log"),
@@ -434,16 +462,18 @@ fn apply_defaults_overwrites_forwarded_cli_relay_with_daemon_relay() {
         command: crate::Command::Sync,
     };
 
-    apply_defaults(&mut cli, &defaults);
+    apply_defaults(&mut cli, &defaults).expect("matching storage scope");
 
     assert_eq!(cli.relay.as_deref(), Some("wss://daemon.example"));
     assert_eq!(cli.socket, None);
 }
 
 #[test]
-fn apply_defaults_overwrites_client_storage_scope_with_daemon_defaults() {
+fn rejects_store_conflict() {
     let defaults = DaemonDefaults {
+        root_owner: None,
         home: PathBuf::from("/tmp/wn-daemon-home"),
+        account_home: marmot_account::AccountHome::open("/tmp/wn-daemon-home"),
         socket: PathBuf::from("/tmp/wn-daemon.sock"),
         pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
         log_path: PathBuf::from("/tmp/wn-daemon.log"),
@@ -466,17 +496,22 @@ fn apply_defaults_overwrites_client_storage_scope_with_daemon_defaults() {
         command: crate::Command::Sync,
     };
 
-    apply_defaults(&mut cli, &defaults);
-
-    assert_eq!(cli.home.as_deref(), Some(defaults.home.as_path()));
-    assert_eq!(cli.secret_store, Some(crate::SecretStoreKind::File));
-    assert_eq!(cli.keychain_service.as_deref(), Some("daemon-keychain"));
+    let before = serde_json::to_value(&cli).unwrap();
+    let error = apply_defaults(&mut cli, &defaults).expect_err("conflicting store");
+    assert!(matches!(&error, crate::WnError::Io(error) if error.kind() == ErrorKind::InvalidInput));
+    assert_eq!(
+        error.to_string(),
+        "forwarded secret store conflicts with the daemon secret store"
+    );
+    assert_eq!(serde_json::to_value(&cli).unwrap(), before);
 }
 
 #[test]
 fn apply_defaults_adds_daemon_account_relays_to_account_create() {
     let defaults = DaemonDefaults {
+        root_owner: None,
         home: PathBuf::from("/tmp/wn-daemon-home"),
+        account_home: marmot_account::AccountHome::open("/tmp/wn-daemon-home"),
         socket: PathBuf::from("/tmp/wn-daemon.sock"),
         pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
         log_path: PathBuf::from("/tmp/wn-daemon.log"),
@@ -507,7 +542,7 @@ fn apply_defaults_adds_daemon_account_relays_to_account_create() {
         },
     };
 
-    apply_defaults(&mut cli, &defaults);
+    apply_defaults(&mut cli, &defaults).expect("matching storage scope");
 
     let crate::Command::Account {
         command:
@@ -767,7 +802,9 @@ async fn daemon_status_response_does_not_wait_for_busy_workers() {
     // best-effort worker snapshot instead of waiting on that mutex; otherwise a
     // long Execute still starves daemon status/stop at the next request.
     let defaults = DaemonDefaults {
+        root_owner: None,
         home: PathBuf::from("/tmp/wn-daemon-home"),
+        account_home: marmot_account::AccountHome::open("/tmp/wn-daemon-home"),
         socket: PathBuf::from("/tmp/wn-daemon.sock"),
         pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
         log_path: PathBuf::from("/tmp/wn-daemon.log"),
@@ -801,13 +838,18 @@ async fn daemon_status_response_does_not_wait_for_busy_workers() {
 
 #[tokio::test]
 async fn daemon_execute_local_command_runs_without_holding_worker_lock() {
-    // A relay-less local command takes the `run_cli_local` path, which opens its own
-    // account/session and touches no shared daemon state. It must run WITHOUT acquiring the
+    let home = tempfile::tempdir().expect("home");
+    // A relay-less local command takes the `run_cli_local` path with the daemon's
+    // account home and touches no shared worker state. It must run WITHOUT acquiring the
     // workers lock, so a concurrent lock holder (e.g. another command mid-reconcile against a
     // slow relay) cannot head-of-line block it (#633). We hold the workers lock for the entire
     // call: if the handler tried to lock it, this would deadlock and hit the timeout.
     let defaults = DaemonDefaults {
-        home: PathBuf::from("/tmp/wn-daemon-home-hol"),
+        root_owner: Some(Arc::new(
+            marmot_app::MarmotRootRuntimeLease::try_acquire(home.path()).unwrap(),
+        )),
+        home: home.path().to_path_buf(),
+        account_home: marmot_account::AccountHome::open(home.path()),
         socket: PathBuf::from("/tmp/wn-daemon-hol.sock"),
         pid_path: PathBuf::from("/tmp/wn-daemon-hol.pid"),
         log_path: PathBuf::from("/tmp/wn-daemon-hol.log"),
@@ -840,8 +882,21 @@ async fn daemon_execute_local_command_runs_without_holding_worker_lock() {
     .expect("a relay-less Execute must not block on the held workers lock");
     result.expect("handle_execute_connection should succeed off the lock");
 
+    let mut response = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        BufReader::new(client).read_line(&mut response),
+    )
+    .await
+    .expect("Whoami response must arrive while workers are locked")
+    .expect("read Whoami response");
+    let output: CliOutput = serde_json::from_str(response.trim()).expect("CLI output frame");
+    assert_eq!(output.code, 0, "Whoami shares daemon root ownership");
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_str(&output.stdout).expect("Whoami JSON");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["result"]["accounts"], serde_json::json!([]));
     drop(busy);
-    drop(client);
 }
 
 #[tokio::test]
@@ -877,7 +932,9 @@ async fn send_execute_connect_failure_recovers_cli_and_import_nsec() {
 #[tokio::test]
 async fn disabled_app_runtime_skips_relay_validation_and_preserves_nsec_sidecar() {
     let defaults = DaemonDefaults {
+        root_owner: None,
         home: PathBuf::from("/tmp/wn-daemon-home-nsec-fallback"),
+        account_home: marmot_account::AccountHome::open("/tmp/wn-daemon-home-nsec-fallback"),
         socket: PathBuf::from("/tmp/wn-daemon-nsec-fallback.sock"),
         pid_path: PathBuf::from("/tmp/wn-daemon-nsec-fallback.pid"),
         log_path: PathBuf::from("/tmp/wn-daemon-nsec-fallback.log"),
@@ -892,7 +949,7 @@ async fn disabled_app_runtime_skips_relay_validation_and_preserves_nsec_sidecar(
         nsec_stdin: true,
         relay: Some("wss://relay.example".to_owned()),
     });
-    apply_defaults(&mut cli, &defaults);
+    apply_defaults(&mut cli, &defaults).expect("matching storage scope");
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
     let mut import_nsec = Some(crate::ImportNsec::new(zeroize::Zeroizing::new(
         nsec.to_owned(),
@@ -1832,7 +1889,11 @@ fn stream_plain_output_sanitizes_hostile_remote_fields() {
 
 fn gated_daemon(home: &Path) -> (DaemonDefaults, Arc<StartGate>) {
     let defaults = DaemonDefaults {
+        root_owner: Some(Arc::new(
+            marmot_app::MarmotRootRuntimeLease::try_acquire(home).expect("own daemon root"),
+        )),
         home: home.to_path_buf(),
+        account_home: marmot_account::AccountHome::open(home),
         socket: home.join("wnd.sock"),
         pid_path: home.join("wnd.pid"),
         log_path: home.join("wnd.log"),
@@ -1843,6 +1904,226 @@ fn gated_daemon(home: &Path) -> (DaemonDefaults, Arc<StartGate>) {
         keychain_service: Some("wn-test-keychain".to_owned()),
     };
     (defaults, Arc::new(StartGate::default()))
+}
+
+#[tokio::test]
+async fn rejects_forwarded_vaults() {
+    for store in [SecretStoreKind::File, SecretStoreKind::Keychain] {
+        let home = tempfile::tempdir().unwrap();
+        let (mut defaults, _) = gated_daemon(home.path());
+        let account = defaults
+            .account_home
+            .add_external_signer_account(&nostr::prelude::Keys::generate().public_key().to_hex())
+            .unwrap();
+        if store == SecretStoreKind::Keychain {
+            defaults.secret_store = Some(store);
+            defaults.keychain_service = Some("daemon-keychain".to_owned());
+        }
+        let before = home_snapshot(home.path());
+        let mut cli = daemon_test_cli(crate::Command::Logout {
+            pubkey: account.account_id_hex.clone(),
+        });
+        let expected = match store {
+            SecretStoreKind::File => {
+                cli.secret_store = Some(SecretStoreKind::Keychain);
+                "forwarded secret store conflicts with the daemon secret store"
+            }
+            SecretStoreKind::Keychain => {
+                cli.secret_store = Some(SecretStoreKind::Keychain);
+                cli.keychain_service = Some("other-keychain".to_owned());
+                "forwarded keychain service conflicts with the daemon keychain service"
+            }
+        };
+        let requests = [
+            DaemonRequest::Execute {
+                cli: Box::new(cli.clone()),
+                import_nsec: None,
+            },
+            DaemonRequest::MessagesSubscribe {
+                cli: Box::new(cli.clone()),
+            },
+            DaemonRequest::ChatsSubscribe {
+                cli: Box::new(cli.clone()),
+            },
+            DaemonRequest::GroupStateSubscribe {
+                cli: Box::new(cli.clone()),
+            },
+            DaemonRequest::NotificationsSubscribe {
+                cli: Box::new(cli.clone()),
+            },
+        ];
+        for request in requests {
+            let streaming = daemon_request_is_subscription(&request);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let (shutdown_tx, _shutdown_rx) = mpsc::unbounded_channel();
+            let workers = SharedDaemonWorkers::default();
+            // A conflict must answer before runtime reconciliation or credential access.
+            let busy = workers.lock().await;
+            let handler = tokio::spawn(handle_daemon_connection(
+                server,
+                defaults.clone(),
+                Arc::new(Mutex::new(DaemonState {
+                    pid: 1,
+                    started_at: 0,
+                    starting: false,
+                    last_runtime_activity: None,
+                })),
+                DaemonEventHub::new(),
+                workers.clone(),
+                shutdown_tx,
+                Arc::new(tokio::sync::Semaphore::new(MAX_DAEMON_SUBSCRIPTIONS)),
+            ));
+            let mut frame = serde_json::to_vec(&request).unwrap();
+            frame.push(b'\n');
+            client.write_all(&frame).await.unwrap();
+            if streaming {
+                assert_eq!(
+                    read_subscription_frames(client).await,
+                    vec![
+                        serde_json::json!({"error": {"code": "stream_error", "message": expected}}),
+                        serde_json::json!({"stream_end": true}),
+                    ],
+                );
+            } else {
+                let mut response = String::new();
+                tokio::time::timeout(Duration::from_secs(5), client.read_to_string(&mut response))
+                    .await
+                    .expect("conflict must not wait for workers")
+                    .unwrap();
+                let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+                assert_eq!(response["code"], 1);
+                let output: serde_json::Value =
+                    serde_json::from_str(response["stdout"].as_str().unwrap()).unwrap();
+                assert_eq!(output["error"]["message"], expected);
+            }
+            handler.await.unwrap();
+            drop(busy);
+            assert!(
+                home_snapshot(home.path()) == before,
+                "rejected request changed local state"
+            );
+            assert_eq!(
+                defaults.account_home.accounts().unwrap(),
+                vec![account.clone()]
+            );
+        }
+        cli.secret_store = Some(store);
+        cli.keychain_service = Some("  daemon-keychain  ".to_owned());
+        apply_defaults(&mut cli, &defaults).expect("canonical matching service");
+        if store == SecretStoreKind::File {
+            cli.keychain_service = Some("irrelevant-service".to_owned());
+            apply_defaults(&mut cli, &defaults)
+                .expect("file stores do not select a keychain service");
+        }
+    }
+}
+
+#[tokio::test]
+async fn uses_retained_account_vault() {
+    let home = tempfile::tempdir().unwrap();
+    let vault = tempfile::tempdir().unwrap();
+    let (mut defaults, _) = gated_daemon(home.path());
+    defaults.relay = None;
+    defaults.account_home = marmot_account::AccountHome::open_with_secret_store(
+        home.path(),
+        Arc::new(marmot_account::LocalFileSecretStore::new(
+            vault.path(),
+            marmot_account::IosOptions::default(),
+        )),
+        marmot_account::IosOptions::default(),
+    );
+    let account = defaults
+        .account_home
+        .add_external_signer_account(&nostr::prelude::Keys::generate().public_key().to_hex())
+        .unwrap();
+    defaults
+        .account_home
+        .external_database_secret(&account.label, marmot_account::ExternalSecretMode::Create)
+        .unwrap();
+    {
+        let app = crate::app_for(
+            defaults.home.clone(),
+            None,
+            Vec::new(),
+            defaults.account_home.clone(),
+            defaults.root_owner.as_deref(),
+        )
+        .unwrap();
+        // Persist a real encrypted cache so a reopened default vault cannot silently
+        // create a replacement key on the consumer's first database open.
+        app.warm_directory_storage().unwrap();
+    }
+    let vault_before = home_snapshot(vault.path());
+    assert!(!vault_before.is_empty());
+
+    let listener = UnixListener::bind(&defaults.socket).unwrap();
+    let daemon = defaults.clone();
+    let handler = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (shutdown_tx, _shutdown_rx) = mpsc::unbounded_channel();
+        handle_daemon_connection(
+            stream,
+            daemon,
+            Arc::new(Mutex::new(DaemonState {
+                pid: 1,
+                started_at: 0,
+                starting: false,
+                last_runtime_activity: None,
+            })),
+            DaemonEventHub::new(),
+            SharedDaemonWorkers::default(),
+            shutdown_tx,
+            Arc::new(tokio::sync::Semaphore::new(MAX_DAEMON_SUBSCRIPTIONS)),
+        )
+        .await;
+    });
+    let mut cli = daemon_test_cli(crate::Command::Whoami);
+    cli.account = Some(account.account_id_hex.clone());
+    let output = send_execute(&defaults.socket, cli, None)
+        .await
+        .unwrap_or_else(|_| panic!("forwarded external account read"));
+    handler.await.unwrap();
+    std::fs::remove_file(&defaults.socket).unwrap();
+    assert_eq!(output.code, 0, "{}", output.stdout);
+    let output: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(output["result"]["account_id"], account.account_id_hex);
+    assert_eq!(output["result"]["local_signing"], false);
+
+    let runtime = open_app_runtime(&defaults).unwrap();
+    let names = runtime
+        .display_names_for_account_ids(std::slice::from_ref(&account.account_id_hex))
+        .unwrap();
+    assert_eq!(names.get(&account.account_id_hex), Some(&account.label));
+    runtime.shutdown().await;
+    drop(runtime);
+    assert!(
+        home_snapshot(vault.path()) == vault_before,
+        "read changed credential vault"
+    );
+    assert!(
+        home_snapshot(home.path())
+            .keys()
+            .all(|path| path.file_name().unwrap() != "secret.json")
+    );
+}
+
+fn home_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn collect(root: &Path, dir: &Path, files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    collect(root, root, &mut files);
+    files
 }
 
 async fn serve_gated_daemon(

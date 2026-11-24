@@ -29,8 +29,9 @@ account identity.
   The protocol and permission approval live in
   `marmot-app`; see [external signer accounts](../../docs/external-signer-accounts.md#nip-46-sessions).
 - Journals account setup and onboarding so an interrupted setup can resume or be cancelled cleanly.
-- Commits local wipes by moving the account out of the live catalog. Later cleanup failures do not abort secret-file
-  scrubbing or payload deletion. A private, nonsecret tombstone record retains failed credential deletion for retry
+- Moves the account out of the live catalog before cleanup. If syncing the parent directories fails, MDK defers
+  credential release, secret-file scrubbing, and payload deletion until replay. After the sync succeeds, a vault
+  failure does not stop local cleanup. A private, nonsecret tombstone retains failed credential deletion for retry
   under exclusive root ownership. Retries release the original receipt, not the current occupant of an account label.
   Ambiguous legacy vault entries remain untouched, with explicit pending cleanup metadata.
   Untracked raw intent survives replacement or deletion of a managed owner and cannot block its cleanup.
@@ -109,8 +110,10 @@ and any `LocalFileSecretStore`. Foundation validates access to each container; t
 entitlement APIs. Default options support app-private roots. C and UniFFI hosts supply the same configuration
 through the existing client options record's optional `ios_options` field.
 
-Legacy raw vault entries have no complete ownership history. They are copied when needed but never automatically
-deleted. `PendingLegacy` retains cleanup intent when such an entry exists or its absence cannot be established.
+Independent legacy vault entries have no complete ownership history. MDK copies them when needed but does not
+automatically delete them. `PendingLegacy` retains cleanup intent when an entry may still exist. Local plaintext
+files inside the wiped account (`secret.json` and `.external-sqlcipher-secret`) are separate: MDK attempts to scrub
+and unlink them during local cleanup.
 A migrated receipt retains its original legacy lookup scope. A different or unknown scope remains pending,
 even if the current lookup finds nothing.
 A successful local wipe means the account is absent, not that every vault or storage medium has erased its bytes.
