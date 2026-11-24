@@ -12,10 +12,11 @@
 //! answering go on as the wave's remaining pass ([`RemainingWelcomeSends`]),
 //! which the host runs and finishes as a wave of its own. Its finish records
 //! the late answers on the Welcome's retry record without counting a new
-//! attempt (`finish_remaining_pass`), and the pass has its own
+//! attempt (`finish_remaining_pass`), and in the same write on its delivery
+//! record, if it has one, as counts of the whole attempt. The pass has its own
 //! `welcome_publish_started`/`_finished` rows. A remaining pass that is
-//! cancelled before it finishes records nothing: the record stays as its
-//! first pass left it, so those relays are retried after their backoff, as a
+//! cancelled before it finishes records nothing: both records stay as its
+//! first pass left them, so those relays are retried after their backoff, as a
 //! relay the first pass did not hear from always was, and its started row has
 //! no finished row.
 
@@ -216,8 +217,17 @@ pub(super) struct RemainingPass {
     /// The group of the Welcome, when its wave knows it.
     group_id: Option<GroupId>,
     endpoints: Vec<TransportEndpoint>,
-    /// Each relay's stored attempt count before its first pass.
+    /// Each relay's stored attempt count before the first pass, for every
+    /// relay that pass asked.
     attempts_before: Vec<(TransportEndpoint, u32)>,
+    /// Every relay the first pass asked, and what those that answered it
+    /// said. The Welcome's delivery counts are those of the whole attempt
+    /// (mdk#1706), and when the first pass's record was not saved its
+    /// answers are recorded here.
+    first_attempted: Vec<TransportEndpoint>,
+    first_report: TransportPublishReport,
+    /// Whether an error of the first pass may have reached a relay.
+    first_exposure: bool,
     v5_welcome: Option<V5WelcomePass>,
     /// The Welcome's acknowledgement policy.
     required_acks: usize,
@@ -275,9 +285,14 @@ impl<'a> RemainingWelcomeSends<'a> {
             .fanout
             .targets
             .iter()
-            .filter(|target| endpoints.contains(&target.endpoint))
+            .filter(|target| attempt.retry_endpoints.contains(&target.endpoint))
             .map(|target| (target.endpoint.clone(), target.attempt_count))
             .collect();
+        let first_exposure = answers.iter().any(|(asked, result)| {
+            result
+                .as_ref()
+                .is_err_and(|error| !publish_error_reached_no_relay(error, asked))
+        });
         self.passes.push((
             index,
             RemainingPass {
@@ -285,6 +300,9 @@ impl<'a> RemainingWelcomeSends<'a> {
                 group_id,
                 endpoints,
                 attempts_before,
+                first_attempted: attempt.retry_endpoints.clone(),
+                first_report: joined_report(&attempt.message_id, attempt.required_acks, answers),
+                first_exposure,
                 v5_welcome,
                 required_acks: attempt.required_acks,
                 answers: Vec::new(),
@@ -350,28 +368,37 @@ impl<'a> RemainingWelcomeSends<'a> {
     }
 }
 
+/// Every receipt and named failure of `answers`, as one report.
+fn joined_report(
+    welcome_id: &cgka_traits::MessageId,
+    required_acks: usize,
+    answers: &[RelayAnswer],
+) -> TransportPublishReport {
+    let mut report = TransportPublishReport {
+        message_id: welcome_id.clone(),
+        accepted: Vec::new(),
+        failed: Vec::new(),
+        required_acks,
+    };
+    for (_, result) in answers {
+        match result {
+            Ok(answer) => {
+                report.accepted.extend(answer.accepted.iter().cloned());
+                report.failed.extend(answer.failed.iter().cloned());
+            }
+            Err(error) => report
+                .failed
+                .extend(error.publish_endpoint_failures().iter().cloned()),
+        }
+    }
+    report
+}
+
 impl RemainingPass {
     /// Every receipt and named failure of the pass's answers, as its finished
     /// row reads them.
     fn report(&self) -> TransportPublishReport {
-        let mut report = TransportPublishReport {
-            message_id: self.welcome_id.clone(),
-            accepted: Vec::new(),
-            failed: Vec::new(),
-            required_acks: self.required_acks,
-        };
-        for (_, result) in &self.answers {
-            match result {
-                Ok(answer) => {
-                    report.accepted.extend(answer.accepted.iter().cloned());
-                    report.failed.extend(answer.failed.iter().cloned());
-                }
-                Err(error) => report
-                    .failed
-                    .extend(error.publish_endpoint_failures().iter().cloned()),
-            }
-        }
-        report
+        joined_report(&self.welcome_id, self.required_acks, &self.answers)
     }
 
     /// Record this pass's finished row from its answers, with no stored
@@ -395,10 +422,12 @@ where
     K: KeyPackagePublisher,
 {
     /// Record what the relays of a remaining pass answered on the Welcome's
-    /// retry record. Its first pass counted and dated their attempt and left
-    /// them failed, so each answer only says how that attempt ended: an
-    /// acceptance, a refusal, or a possible exposure. When the first pass's
-    /// record could not be saved, the attempt is counted and dated here. When
+    /// retry record, and on its delivery record in the same write. Its first
+    /// pass counted and dated their attempt and left them failed, so each
+    /// answer only says how that attempt ended: an acceptance, a refusal, or
+    /// a possible exposure. When the first pass's record could not be saved,
+    /// this pass records that whole attempt: every relay the first pass
+    /// asked is counted and dated, with what it or this pass answered. When
     /// the record cannot be read or saved, the finished row still records the
     /// relays' answers, with no stored total. The first pass met the
     /// Welcome's policy, so this one never reports it undelivered.
@@ -432,34 +461,55 @@ where
                 fanout.possible_exposure = true;
             }
         }
+        let attempts_before = |endpoint: &TransportEndpoint| {
+            pass.attempts_before
+                .iter()
+                .find(|(asked, _)| asked == endpoint)
+                .map_or(0, |(_, count)| *count)
+        };
+        // The first pass's record was not saved when a relay still answering
+        // has no attempt counted since.
+        let first_pass_unsaved = fanout.targets.iter().any(|target| {
+            target.state != TransportFanoutAttemptState::Accepted
+                && pass.endpoints.contains(&target.endpoint)
+                && target.attempt_count <= attempts_before(&target.endpoint)
+        });
+        // The whole attempt's answers: the first pass's with these late ones.
+        let mut whole_attempt = report.clone();
+        whole_attempt
+            .accepted
+            .extend(pass.first_report.accepted.iter().cloned());
+        whole_attempt
+            .failed
+            .extend(pass.first_report.failed.iter().cloned());
+        let recorded = if first_pass_unsaved {
+            fanout.possible_exposure |= pass.first_exposure;
+            &pass.first_attempted
+        } else {
+            &pass.endpoints
+        };
         let now = self.wall_clock.now();
         for target in &mut fanout.targets {
             if target.state == TransportFanoutAttemptState::Accepted
-                || !pass.endpoints.contains(&target.endpoint)
+                || !recorded.contains(&target.endpoint)
             {
                 continue;
             }
-            // The first pass's record was not saved: its attempt is not
-            // counted yet.
-            let before = pass
-                .attempts_before
-                .iter()
-                .find(|(endpoint, _)| *endpoint == target.endpoint)
-                .map_or(0, |(_, count)| *count);
+            let before = attempts_before(&target.endpoint);
             if target.attempt_count <= before {
                 target.attempt_count = before.saturating_add(1);
                 target.last_attempt_at = Some(now);
                 target.state = TransportFanoutAttemptState::AttemptedFailed;
                 target.failure_code = Some("publish_failed".into());
             }
-            if report
+            if whole_attempt
                 .accepted
                 .iter()
                 .any(|receipt| receipt.endpoint == target.endpoint)
             {
                 target.state = TransportFanoutAttemptState::Accepted;
                 target.failure_code = None;
-            } else if let Some(failure) = report
+            } else if let Some(failure) = whole_attempt
                 .failed
                 .iter()
                 .find(|failure| failure.endpoint == target.endpoint)
@@ -468,7 +518,20 @@ where
                 target.failure_code = Some("transport_rejected".into());
             }
         }
-        self.put_pass_fanout(&fanout, &pass.v5_welcome, Some(&report), &pass.endpoints)?;
+        // The delivery counts are the whole attempt's. Its attempt is counted
+        // already, unless the first pass's save, which counts it, failed. The
+        // finished row covers only this pass's relays.
+        self.put_pass_fanout_counting(
+            &fanout,
+            &pass.v5_welcome,
+            Some(&report),
+            &pass.endpoints,
+            welcome_outcomes::PassCounts {
+                attempted: &pass.first_attempted,
+                report: Some(&whole_attempt),
+                counts_attempt: first_pass_unsaved,
+            },
+        )?;
         let accepted_total = accepted_fanout_targets(&fanout);
         self.settle_met_welcome(&fanout.exact_message, accepted_total, fanout.required_acks);
         self.record_v5_welcome_publish_finished(

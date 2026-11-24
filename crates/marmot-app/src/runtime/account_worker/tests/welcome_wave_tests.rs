@@ -1176,3 +1176,194 @@ async fn unlinking_ends_a_held_wave() {
         .unwrap();
     runtime.shutdown_and_close().await.unwrap();
 }
+
+/// mdk#1706: a host reads each invite's delivery from the public runtime,
+/// and is told when it changes. A founding Welcome no relay takes reads as
+/// still being sent, and its worker announces that; after a restart whose
+/// retry a relay stores, the durable record reads as accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_deliveries_answer_from_durable_records_and_announce_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, bob) = alice_and_bob(&dir).await;
+    let Alice { relay, runtime, .. } = alice;
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    let mut events = runtime.subscribe();
+    let group = runtime
+        .create_group(
+            "alice",
+            "invite delivery",
+            std::slice::from_ref(&bob.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let invites = runtime
+        .invite_deliveries("alice", Some(&group))
+        .await
+        .unwrap();
+    assert_eq!(invites.len(), 1, "{invites:?}");
+    let invite = &invites[0];
+    assert_eq!(invite.recipient_hex, bob.account_id_hex);
+    assert_eq!(invite.invite_id_hex, None, "the create added bob");
+    assert!(
+        matches!(
+            invite.state,
+            crate::WelcomeDeliveryState::Sending {
+                last_problem: Some(_)
+            }
+        ),
+        "{invite:?}"
+    );
+    assert_eq!((invite.accepted_device_count, invite.device_count), (0, 1));
+    let mut announced = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let MarmotAppEvent::InviteDeliveryChanged { delivery, .. } = event {
+            announced.push(delivery);
+        }
+    }
+    assert_eq!(announced.last(), Some(invite), "{announced:?}");
+    close(&runtime).await;
+
+    relay.allow_all_publish_kinds();
+    let runtime = restart(&dir, &relay).await;
+    let invites = runtime
+        .invite_deliveries("alice", Some(&group))
+        .await
+        .unwrap();
+    assert_eq!(invites[0].state, crate::WelcomeDeliveryState::RelayAccepted);
+    assert_eq!(invites[0].accepted_device_count, 1);
+    assert_eq!(
+        runtime.invite_deliveries("alice", None).await.unwrap(),
+        invites
+    );
+    close(&runtime).await;
+}
+
+/// A raw connection to alice's account database, for putting it in a state
+/// no runtime call makes. The runtime must not be running.
+fn alices_database(app: &MarmotApp) -> rusqlite::Connection {
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+        .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+}
+
+/// mdk#1706: an invite whose Welcome existed before the device kept invite
+/// delivery records (an upgrade) is never listed by `invite_deliveries` and
+/// announces nothing, yet is delivered as before and stays a pending
+/// delivery while owed. An invite sent to the same account after the
+/// upgrade is listed and announced as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invite_from_before_the_upgrade_is_delivered_but_not_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, bob) = alice_and_bob(&dir).await;
+    let Alice {
+        app,
+        relay,
+        runtime,
+        ..
+    } = alice;
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    let group = runtime
+        .create_group(
+            "alice",
+            "from before",
+            std::slice::from_ref(&bob.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
+    close(&runtime).await;
+    // As a database from before the ledger: the owed Welcome has no record.
+    alices_database(&app)
+        .execute_batch("DELETE FROM cgka_welcome_delivery_ledger;")
+        .unwrap();
+
+    let runtime = restart(&dir, &relay).await;
+    let mut events = runtime.subscribe();
+    assert!(
+        runtime
+            .invite_deliveries("alice", Some(&group))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let pending = pending_of(&runtime, &group).await;
+    assert_eq!(pending.len(), 1, "still a pending delivery while owed");
+
+    relay.allow_all_publish_kinds();
+    runtime
+        .redeliver_welcome("alice", &pending[0].message_id_hex)
+        .await
+        .unwrap();
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(pending_of(&runtime, &group).await.is_empty(), "delivered");
+    assert!(
+        runtime
+            .invite_deliveries("alice", Some(&group))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, MarmotAppEvent::InviteDeliveryChanged { .. }),
+            "{event:?}"
+        );
+    }
+
+    // Bob is invited again after the upgrade: that invite is listed.
+    runtime
+        .remove_members("alice", &group, std::slice::from_ref(&bob.account_id_hex))
+        .await
+        .unwrap();
+    runtime.publish_key_package("bob").await.unwrap();
+    runtime
+        .invite_members("alice", &group, std::slice::from_ref(&bob.account_id_hex))
+        .await
+        .unwrap();
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
+    let invites = runtime
+        .invite_deliveries("alice", Some(&group))
+        .await
+        .unwrap();
+    assert_eq!(invites.len(), 1, "{invites:?}");
+    assert_eq!(invites[0].recipient_hex, bob.account_id_hex);
+    assert!(invites[0].invite_id_hex.is_some(), "the re-invite's commit");
+    assert_eq!(invites[0].state, crate::WelcomeDeliveryState::RelayAccepted);
+    let mut announced = false;
+    while let Ok(event) = events.try_recv() {
+        announced |= matches!(event, MarmotAppEvent::InviteDeliveryChanged { .. });
+    }
+    assert!(announced, "the re-invite is announced");
+    close(&runtime).await;
+}

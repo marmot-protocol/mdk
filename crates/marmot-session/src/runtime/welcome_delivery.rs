@@ -463,6 +463,7 @@ where
             None
         };
         let withdrawal = self.session.withdraw_sent_welcome(message_id)?;
+        self.note_welcome_delivery_changed(message_id);
         if withdrawal == WelcomeWithdrawal::AlreadyDelivered {
             return Ok(withdrawal);
         }
@@ -530,6 +531,7 @@ where
                 "acknowledged Welcome remains conservatively retryable"
             );
         }
+        self.note_welcome_delivery_changed(message_id);
     }
 
     /// Build the structured re-delivery record for a welcome that just failed
@@ -610,7 +612,10 @@ where
     /// stages with a commit: the caller
     /// publishes them only if the commit was published, and a commit left
     /// for retry confirms later.
+    /// Each also gets its delivery record ([`Self::record_new_welcomes`]).
     pub(super) fn watch_welcomes(&mut self, ids: impl IntoIterator<Item = cgka_traits::MessageId>) {
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        self.record_new_welcomes(&ids);
         for id in ids {
             if !self.watched_welcomes.contains(&id) {
                 self.watched_welcomes.push(id);
@@ -702,7 +707,12 @@ where
                     watching.push(id);
                 }
                 Ok((OutboundWelcomeStatus::Settled(settlement), _)) => {
-                    if !self.record_v5_welcome_settled(&id, settlement) {
+                    // Its watch ends only once a host is told and the
+                    // settlement recorded; the notice goes first, so a retry
+                    // never records the settlement twice.
+                    if !self.note_welcome_delivery_changed(&id)
+                        || !self.record_v5_welcome_settled(&id, settlement)
+                    {
                         watching.push(id);
                     }
                 }

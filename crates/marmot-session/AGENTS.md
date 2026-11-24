@@ -129,6 +129,19 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     watch and retry fanout, including across reopen and missed events. Only terminal origin loss retires that debt;
     native re-adoption can make it owed again under its original deadline. `tests/runtime/hydrated_welcome.rs` owns
     encrypted recovery continuation, unrelated-group cancellation, parked retry retention and terminal pruning.
+  - `runtime/welcome_outcomes.rs` — the sender's view of each outbound Welcome's delivery (mdk#1706). Never store a
+    Welcome's state: `welcome_delivery_outcomes` derives it on every read from the engine's stored row
+    (`stored_outbound_welcome_status`, which needs no live group). The ledger, `cgka_welcome_delivery_ledger`, keeps only
+    what nothing else holds: the Welcome's invite (group, recipient, origin commit) and its attempt counts, which
+    outlive the 24-hour retry record. A relay pass writes its counts in the same transaction as the retry record, in
+    `put_pass_fanout`, the one place every pass saves it; a route failure, which saves no retry record, writes them
+    alone. A record is made only when this runtime stages or creates an invite's Welcomes (`watch_welcomes`), all of
+    an invite's in one transaction; every other step only updates an existing record, so a Welcome from before the
+    upgrade never gets one, is never listed, and is delivered as before. There is no reconcile, recovery or adoption
+    pass. The newest invite per group and recipient is the one first recorded last, chosen before retention
+    (`INVITE_DELIVERY_RETENTION_SECS`). Each seam that changes
+    a Welcome's delivery queues its `(group, recipient)` for `take_welcome_delivery_changes`, so the app re-reads only
+    those answers after a turn; an unqueued change only delays the host's notice.
   - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b), and join a
     chat from a sibling Welcome the app admitted (3.5b); like a confirmed rejoin, that join's events wait for the
     caller's drain. It also lists the sibling Welcomes this device owes and records a carrier's outcome on one

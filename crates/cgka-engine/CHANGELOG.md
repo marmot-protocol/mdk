@@ -6,6 +6,8 @@
 
 - `Engine::deferred_stall_evidence_since` returns deferred stall evidence for rows whose arrival epoch falls in
   `min_epoch..=group.epoch`, for active epoch-gap handoffs across partial advances.
+- `Engine::stored_outbound_welcome_status`, an outbound Welcome's status read from its stored rows without the
+  live-group gate, for the sender's invite delivery view (mdk#1706).
 
 ### Changed
 

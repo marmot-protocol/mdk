@@ -24,6 +24,7 @@ mod roster_tag_keys;
 mod sibling_adds;
 pub(crate) mod snapshots;
 mod transport_routes;
+mod welcome_delivery_ledger;
 mod welcomes;
 
 /// A database file that a test opens twice, so one connection can hold the

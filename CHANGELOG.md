@@ -6,6 +6,11 @@
 
 - C and MarmotKit can durably submit tagged text, inline replies, NIP-22 thread messages with attachments, and pack
   stickers. Retrying the same accepted request with its original client token after restart returns the original ID.
+- Hosts can read whether each invite reached the invited account's inbox relays: `invite_deliveries` returns one
+  durable answer per group and invited account (`Waiting`, `Sending` with the latest problem, `RelayAccepted`,
+  `Undeliverable` or `Cancelled`, with device and relay counts), and `InviteDeliveryChanged` reports each change, in
+  MarmotKit and C (mdk#1706). `RelayAccepted` means a relay stored the Welcome, not that the recipient received it.
+  Only invites sent after the upgrade are listed; an older Welcome stays in `pending_welcome_deliveries`.
 
 ### Changed
 

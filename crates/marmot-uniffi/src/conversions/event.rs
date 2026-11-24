@@ -83,6 +83,17 @@ pub enum MarmotEventFfi {
         /// this notice remains once per process/Welcome.
         size_class: Option<crate::EventSizeClassFfi>,
     },
+    /// The delivery state of an invite of this account changed (mdk#1706).
+    /// `delivery` is the invited account's answer for its group now, as
+    /// `invite_deliveries` reads it; `RelayAccepted` means a relay stored the
+    /// Welcome, not that the recipient received it or joined. The query is
+    /// the source of truth: a missed, late or repeated event is harmless,
+    /// since a host can always read `invite_deliveries` again.
+    InviteDeliveryChanged {
+        account_id_hex: String,
+        account_label: String,
+        delivery: crate::conversions::InviteDeliveryFfi,
+    },
     /// This device armed `arms` epoch-gap history backfills for the group with
     /// no sign in between that it caught up: it is still at `stalled_epoch`.
     /// Surface it as "this group cannot catch up; re-syncing is recommended";
@@ -536,6 +547,15 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 message_id_hex,
                 recipient_hex,
                 size_class: size_class.map(Into::into),
+            },
+            MarmotAppEvent::InviteDeliveryChanged {
+                account_id_hex,
+                account_label,
+                delivery,
+            } => Self::InviteDeliveryChanged {
+                account_id_hex,
+                account_label,
+                delivery: delivery.into(),
             },
             MarmotAppEvent::EpochStallEscalated {
                 account_id_hex,

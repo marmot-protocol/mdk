@@ -453,6 +453,20 @@ async fn a_too_large_welcome_is_named_and_its_sibling_invitee_is_withdrawn() {
         refused,
         marmot_session::PreparedSessionSend::Refused(_)
     ));
+    // Their deliveries read so at once.
+    let states = runtime
+        .welcome_delivery_outcomes(None, None)
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .map(|outcome| outcome.state)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        states,
+        [cgka_traits::maintenance::WelcomeDeliveryState::Cancelled {
+            reason: cgka_traits::maintenance::WelcomeCancelReason::Withdrawn
+        }; 2]
+    );
 
     let member_ref = |session: &AccountDeviceSession| {
         marmot_forensics::v5::MemberRef::from_member_identity(session.self_id().as_slice())

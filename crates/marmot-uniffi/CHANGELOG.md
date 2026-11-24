@@ -23,6 +23,11 @@
 - `TimelineMessageRecordFfi::agent_item` (`AgentItemFfi`, `AgentItemStateFfi`): the latest version of a kind-1201
   agent item, with its type, fields JSON, `settles` and whether it alerts. A kind-1201 row without one is an
   unreadable item, such as the old shape.
+- `Marmot::invite_deliveries(account_ref, group_id_hex)` and the `InviteDeliveryChanged` event (mdk#1706), with
+  `InviteDeliveryFfi`, `InviteDeviceDeliveryFfi`, `InviteRelayCountsFfi`, `InviteDeliveryStateFfi`,
+  `InviteDeliveryProblemFfi` and `InviteCancelReasonFfi`. `Undeliverable`, `TooLarge` and `KeyPackageRetired` are
+  not produced for ordinary invites yet. Only invites sent after the upgrade are listed; an older Welcome stays in
+  `pending_welcome_deliveries` and `WelcomeDeliveryPending`, which are unchanged.
 - `send_custom_event_with_client_token`: durable token admission of an app-defined event, such as an answer or a
   control for an agent (kind 1202), so a retry after a restart does not send it twice.
 - `submit_tagged_text`, `submit_tagged_reply`, `submit_thread_message`, and `submit_tagged_sticker` return durable

@@ -4541,6 +4541,28 @@ impl<S: StorageProvider> Engine<S> {
         id: &MessageId,
         now: Timestamp,
     ) -> Result<OutboundWelcomeStatus, EngineError> {
+        self.outbound_welcome_status_in(id, now, true)
+    }
+
+    /// [`Self::outbound_welcome_status`] read from the stored rows alone, for a
+    /// group that is not live too: a Welcome of an unhydrated or quarantined
+    /// group reads as its rows stand, staged (`Waiting`) or owed, instead of
+    /// `Waiting`. For a host's view of a Welcome's delivery (mdk#1706), never
+    /// for deciding whether to publish it.
+    pub fn stored_outbound_welcome_status(
+        &self,
+        id: &MessageId,
+        now: Timestamp,
+    ) -> Result<OutboundWelcomeStatus, EngineError> {
+        self.outbound_welcome_status_in(id, now, false)
+    }
+
+    fn outbound_welcome_status_in(
+        &self,
+        id: &MessageId,
+        now: Timestamp,
+        live_group_only: bool,
+    ) -> Result<OutboundWelcomeStatus, EngineError> {
         let record = match self.storage.get_message(id) {
             Ok(record) => record,
             Err(StorageError::NotFound) => {
@@ -4573,7 +4595,7 @@ impl<S: StorageProvider> Engine<S> {
             _ => return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Untracked)),
         }
         // A quarantined group may recover, and an unhydrated one hydrates.
-        if self.ensure_group_live(&record.group_id).is_err() {
+        if live_group_only && self.ensure_group_live(&record.group_id).is_err() {
             return Ok(OutboundWelcomeStatus::Waiting);
         }
         // A `Sent` row that cannot be read may still be staged: wait.

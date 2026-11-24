@@ -427,6 +427,8 @@ mod migration_0222_small_state_broadcast_devices;
 mod migration_0223_local_deletion_invitation;
 #[path = "migrations/0224_epoch_gap_evidence_floor.rs"]
 mod migration_0224_epoch_gap_evidence_floor;
+#[path = "migrations/0225_welcome_delivery_ledger.rs"]
+mod migration_0225_welcome_delivery_ledger;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1625,6 +1627,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0224_epoch_gap_evidence_floor",
         suspend_foreign_keys: &[],
         apply: migration_0224_epoch_gap_evidence_floor::apply,
+    },
+    Migration {
+        version: 225,
+        name: "0225_welcome_delivery_ledger",
+        suspend_foreign_keys: &[],
+        apply: migration_0225_welcome_delivery_ledger::apply,
     },
 ];
 

@@ -89,8 +89,10 @@ mod sign_in_rejection;
 mod slot_announcement;
 mod welcome_audit;
 mod welcome_delivery;
+mod welcome_outcomes;
 mod welcome_relays;
 use welcome_audit::{InviteRefusal, V5WelcomePass};
+pub use welcome_outcomes::{INVITE_DELIVERY_RETENTION_SECS, WelcomeDeliveryOutcome};
 use welcome_relays::{
     RelayPublish, RemainingPass, RemainingWelcomeSends, join_relay_answers, relay_sends, until_met,
 };
@@ -774,6 +776,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// Welcomes whose withdrawal `withdraw_welcome` recorded, so the
     /// watcher does not record it again.
     v5_withdrawn_welcomes: std::sync::Mutex<HashSet<cgka_traits::MessageId>>,
+    /// The `(group, recipient)` pairs whose Welcome delivery state changed
+    /// and that no host has taken yet (`take_welcome_delivery_changes`).
+    welcome_delivery_changes: std::sync::Mutex<Vec<(GroupId, MemberId)>>,
     /// Whether the store has been read for `watched_welcomes`: the startup
     /// pass reads it, or else the first maintenance pass.
     welcome_store_read: bool,
@@ -852,6 +857,7 @@ where
             watched_welcomes: Vec::new(),
             v5_prepared_welcomes: HashSet::new(),
             v5_withdrawn_welcomes: std::sync::Mutex::new(HashSet::new()),
+            welcome_delivery_changes: std::sync::Mutex::new(Vec::new()),
             welcome_store_read: false,
             unread_welcome_groups: Vec::new(),
             finish_stage_failure: None,
@@ -6262,9 +6268,15 @@ where
                 accepted_before,
                 audit_v5::RouteSource::RetainedTarget,
             );
-            // The pass's per-endpoint results, joined for its finished row:
-            // each report, and the endpoint failures an adapter error names.
-            // One that names none leaves the row's results incomplete.
+            // The pass's per-endpoint results, joined for its finished row
+            // and a Welcome's delivery record: each report, and the endpoint
+            // failures an adapter error names. One that names none leaves the
+            // row's results incomplete.
+            let collects_pass_report = v5_welcome.is_some()
+                || matches!(
+                    fanout.exact_message.envelope,
+                    TransportEnvelope::Welcome { .. }
+                );
             let mut pass_report = TransportPublishReport {
                 message_id: message_id.clone(),
                 accepted: Vec::new(),
@@ -6343,14 +6355,14 @@ where
                                 reason: "fanout endpoint did not acknowledge".into(),
                             });
                         }
-                        if v5_welcome.is_some() {
+                        if collects_pass_report {
                             pass_report.accepted.extend(report.accepted.iter().cloned());
                             pass_report.failed.extend(report.failed.iter().cloned());
                         }
                         output.reports.push(report);
                     }
                     Err(error) => {
-                        if v5_welcome.is_some() {
+                        if collects_pass_report {
                             pass_report
                                 .failed
                                 .extend(error.publish_endpoint_failures().iter().cloned());
@@ -7402,6 +7414,9 @@ where
                         welcome_facts.clone(),
                         audit_v5::NotStartedReason::RouteResolutionFailed,
                     );
+                    if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+                        self.record_welcome_route_failure(&message.id);
+                    }
                     self.record_audit_event(
                         welcome_facts.as_ref().map(|facts| &facts.group_id),
                         Some(publish_context),
@@ -7581,7 +7596,8 @@ where
         )))
     }
 
-    /// Save a publish pass's fanout bookkeeping. When that fails after the
+    /// Save a publish pass's fanout bookkeeping, and a Welcome's delivery
+    /// counts in the same transaction (mdk#1706). When that fails after the
     /// relays answered, the pass's finished row still records their answers,
     /// with no stored total, before the error returns.
     fn put_pass_fanout(
@@ -7591,15 +7607,65 @@ where
         report: Option<&TransportPublishReport>,
         attempted: &[TransportEndpoint],
     ) -> AccountResult<()> {
+        self.put_pass_fanout_counting(
+            fanout,
+            v5_welcome,
+            report,
+            attempted,
+            welcome_outcomes::PassCounts {
+                attempted,
+                report,
+                counts_attempt: true,
+            },
+        )
+    }
+
+    /// [`Self::put_pass_fanout`], counting the pass on the delivery record
+    /// as `counts` says.
+    fn put_pass_fanout_counting(
+        &self,
+        fanout: &DurableTransportFanout,
+        v5_welcome: &Option<V5WelcomePass>,
+        report: Option<&TransportPublishReport>,
+        attempted: &[TransportEndpoint],
+        counts: welcome_outcomes::PassCounts<'_>,
+    ) -> AccountResult<()> {
         // Test-only fault injection (`arm_finish_stage_failure`): the write
         // fails with transient contention.
-        let written = if self.finish_stage_failure.as_ref() == Some(&fanout.exact_message.id) {
-            Err(SessionError::from(StorageError::Busy(
-                "injected finish-stage failure".into(),
-            )))
-        } else {
-            self.session.put_transport_fanout(fanout)
-        };
+        // The counts and the retry record are one write, all or nothing: a
+        // delivery record that cannot be read fails the save like any storage
+        // error in it, never leaving the retry record saved without its
+        // counts. As for any failed save, the pass is retried and a relay
+        // that already stored the Welcome answers duplicate.
+        let written: AccountResult<()> =
+            if self.finish_stage_failure.as_ref() == Some(&fanout.exact_message.id) {
+                Err(
+                    SessionError::from(StorageError::Busy("injected finish-stage failure".into()))
+                        .into(),
+                )
+            } else {
+                let now = self.wall_clock.now();
+                self.welcome_delivery_group(fanout)
+                    .and_then(|group| {
+                        let delivery = group.map(|group| {
+                            (
+                                group,
+                                &fanout.exact_message.id,
+                                |record: &mut cgka_traits::maintenance::WelcomeDeliveryRecord| {
+                                    welcome_outcomes::record_pass(record, fanout, &counts, now)
+                                },
+                            )
+                        });
+                        Ok(self
+                            .session
+                            .put_transport_fanout_with_welcome_delivery(fanout, delivery)?)
+                    })
+                    .map(|saved| {
+                        if let Some(saved) = &saved {
+                            self.queue_welcome_delivery_change(saved);
+                        }
+                    })
+            };
         if written.is_err() {
             self.record_v5_welcome_publish_finished(
                 v5_welcome,
@@ -7609,7 +7675,7 @@ where
                 fanout.required_acks,
             );
         }
-        Ok(written?)
+        written
     }
 
     async fn finish_prepared_legacy_publish(

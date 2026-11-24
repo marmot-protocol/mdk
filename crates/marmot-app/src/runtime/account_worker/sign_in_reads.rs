@@ -237,6 +237,9 @@ impl AccountWorkerCommand {
             Self::RetryPushRegistration { .. }
             | Self::RetryRuntimeGroupSubscriptions { .. }
             | Self::StartupCatchUpResult { .. } => false,
+            // A read of one group's invites names that group; an account-wide
+            // one names none.
+            Self::InviteDeliveries { group_id, .. } => group_id.is_none(),
             // Commands that name an existing group.
             Self::Members { .. }
             | Self::MemberIdsPage { .. }

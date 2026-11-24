@@ -1197,6 +1197,29 @@ impl Marmot {
             .collect())
     }
 
+    /// Whether each of this account's invites reached the invited account's
+    /// inbox relays (mdk#1706): one answer per group and invited account, for
+    /// `group_id_hex` or, when `None`, every group. `RelayAccepted` means a
+    /// relay stored the Welcome, not that the recipient received it or joined.
+    /// Read from durable records, so it answers after a restart and for a group
+    /// not loaded yet; `InviteDeliveryChanged` reports changes. Only invites
+    /// sent after this device upgraded are listed; an older Welcome stays in
+    /// `pending_welcome_deliveries`. Local read; no network I/O.
+    pub async fn invite_deliveries(
+        &self,
+        account_ref: String,
+        group_id_hex: Option<String>,
+    ) -> Result<Vec<crate::conversions::InviteDeliveryFfi>, MarmotKitError> {
+        let group_id = group_id_hex.as_deref().map(group_id_from_hex).transpose()?;
+        Ok(self
+            .runtime
+            .invite_deliveries(&account_ref, group_id.as_ref())
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     /// Re-read on GroupStateUpdated; display uncertainty separately from whether
     /// the user accepted the original invitation. `history_notice_ids` are this
     /// group's "history may be incomplete" occurrences.

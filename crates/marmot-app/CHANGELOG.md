@@ -26,6 +26,9 @@
 ### Added
 
 - `submit_thread_message` and `submit_tagged_sticker` accept a client token and return before relay publication.
+- `MarmotAppRuntime::invite_deliveries` and `MarmotAppEvent::InviteDeliveryChanged` (mdk#1706): one `InviteDelivery`
+  per group and invited account, rolled up from the session's per-Welcome delivery records. `RelayAccepted` means a
+  relay stored the Welcome, not that the recipient received it or joined.
 - A later version of an agent item is a kind-1009 edit carrying the whole item with a higher `v`, sent crash-safely
   with `submit_tagged_edit_for_local_send` on the item's token. The row keeps the highest version, ignores an older
   one that arrives late, applies an edit that arrived before its item, and is not marked edited.
