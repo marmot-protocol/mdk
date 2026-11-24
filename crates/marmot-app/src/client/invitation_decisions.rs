@@ -20,6 +20,20 @@ pub(super) enum AccountLeaveReason<'a> {
     ReceivedDecline(&'a InvitationDecision),
 }
 
+/// Whether a row's or frontier's recorded `via_welcome_message_id_hex` belongs
+/// to `admission`. A mismatch means the projection predates a replacement
+/// admission (or predates migration 0223), so its inviter cannot be trusted to
+/// evaluate local blocks for `admission`.
+pub(super) fn standing_matches_admission(
+    via_welcome_hex: Option<&str>,
+    admission: &cgka_traits::group::InvitationAdmission,
+) -> bool {
+    match &admission.via_welcome {
+        None => admission.created_locally && via_welcome_hex.is_none(),
+        Some(welcome) => via_welcome_hex == Some(hex::encode(welcome.as_slice()).as_str()),
+    }
+}
+
 impl AppClient {
     /// Read current local membership and distinct active administrator accounts
     /// before a new choice or departure publication. Native send still validates.
@@ -220,6 +234,84 @@ impl AppClient {
         Ok(Some(decision))
     }
 
+    /// Clear `pending_confirmation` on the in-memory row so the enclosing
+    /// projection batch persists it settled.
+    fn clear_pending_confirmation_in_batch(&mut self, group_id: &GroupId, chat: &str) {
+        if let Some(group) = self
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == chat)
+        {
+            group.pending_confirmation = false;
+            self.mark_group_projection_dirty(group_id);
+        }
+    }
+
+    /// Re-arm `admission`'s retained decision and settle an acceptable accept
+    /// in the enclosing projection batch.
+    fn owe_and_settle_admission(
+        &mut self,
+        group_id: &GroupId,
+        chat: &str,
+        admission: &cgka_traits::group::InvitationAdmission,
+    ) -> Result<(), AppError> {
+        let account = self.app.account_storage(&self.state.label)?;
+        account
+            .app_storage()
+            .owe_installed_invitation_decision(chat, &admission.generation)?;
+        // A decision this admission makes actionable applies on the worker's
+        // next turn (mdk#3566).
+        self.invitation_decisions_changed = true;
+        if self.accepted_invitation_projection(group_id)?.is_some() {
+            self.clear_pending_confirmation_in_batch(group_id, chat);
+        }
+        Ok(())
+    }
+
+    /// A sibling's decision that arrived while this chat was deleted locally
+    /// was set aside with no work, because there was no row to apply it to,
+    /// and only an exact admission re-arms it. A message that recreates the
+    /// row is not an admission, so re-arm the current admission's decision
+    /// here, settle an acceptable retained accept in the same batch (as
+    /// [`Self::note_invitation_admission`] does), and let the ordinary
+    /// decision pass finish any decline or gap bookkeeping (mdk#3555).
+    pub(super) fn owe_decision_set_aside_while_deleted(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        if !self.app.device_groups_enabled() || self.is_device_group(group_id)? {
+            return Ok(());
+        }
+        let account = self.app.account_storage(&self.state.label)?;
+        let Some(admission) = account.invitation_admission(group_id)? else {
+            return Ok(());
+        };
+        let chat = hex::encode(group_id.as_slice());
+        let standing_matches = self.state_group_record(group_id).is_some_and(|group| {
+            standing_matches_admission(group.via_welcome_message_id_hex.as_deref(), &admission)
+        });
+        if !standing_matches {
+            // Without this admission's own Welcome/inviter on the recreated
+            // row (a pre-0223 frontier, or a replacement Welcome whose join
+            // checkpoint failed before deletion), we cannot verify the inviter
+            // against local blocks for an accept. Still re-arm a retained
+            // decline so Leave runs as the sibling decided.
+            if account
+                .app_storage()
+                .invitation_decision(&chat, &admission.generation)?
+                .is_some_and(|decision| decision.declined)
+            {
+                account
+                    .app_storage()
+                    .owe_installed_invitation_decision(&chat, &admission.generation)?;
+                self.invitation_decisions_changed = true;
+            }
+            return Ok(());
+        }
+        self.owe_and_settle_admission(group_id, &chat, &admission)
+    }
+
     /// Called from the real admitted lifecycle event, including durable replay.
     pub(super) fn note_invitation_admission(
         &mut self,
@@ -231,37 +323,25 @@ impl AppClient {
             return Ok(());
         }
         let account = self.app.account_storage(&self.state.label)?;
-        let accepted = match account.invitation_admission(group_id)? {
+        let chat = hex::encode(group_id.as_slice());
+        match account.invitation_admission(group_id)? {
             // An unidentified copy stays local-only. Only the sibling that
             // added it can say it is confirmed there (mdk#3546).
-            None => forwarded.confirmed && self.acceptable_pending_invitation(group_id)?.is_some(),
+            None => {
+                if forwarded.confirmed && self.acceptable_pending_invitation(group_id)?.is_some() {
+                    self.clear_pending_confirmation_in_batch(group_id, &chat);
+                }
+            }
             Some(admission) => {
                 if admission.via_welcome.as_ref() != via_welcome {
                     return Ok(());
                 }
-                let storage = account.app_storage();
-                let chat = hex::encode(group_id.as_slice());
                 if admission.created_locally {
-                    storage.ensure_founding_invitation_decision(&chat, admission.generation)?;
+                    account
+                        .app_storage()
+                        .ensure_founding_invitation_decision(&chat, admission.generation)?;
                 }
-                storage.owe_installed_invitation_decision(&chat, &admission.generation)?;
-                // A decision this admission makes actionable applies on the
-                // worker's next turn (mdk#3566).
-                self.invitation_decisions_changed = true;
-                self.accepted_invitation_projection(group_id)?.is_some()
-            }
-        };
-        // The enclosing projection batch persists any presentation change.
-        if accepted {
-            let chat = hex::encode(group_id.as_slice());
-            if let Some(group) = self
-                .state
-                .groups
-                .iter_mut()
-                .find(|group| group.group_id_hex == chat)
-            {
-                group.pending_confirmation = false;
-                self.mark_group_projection_dirty(group_id);
+                self.owe_and_settle_admission(group_id, &chat, &admission)?;
             }
         }
         Ok(())
@@ -276,8 +356,9 @@ impl AppClient {
     /// sibling installs its copy settled and no send takes in device-group
     /// traffic mid-scan. Only a copy founded here, or whose presented
     /// invitation is that admission's own Welcome, counts as accepted: a row
-    /// rebuilt after a local deletion is unconfirmed by default and carries no
-    /// Welcome.
+    /// rebuilt after a local deletion carries the standing and Welcome the
+    /// deleted row had, or none if its deletion predates that record
+    /// (mdk#3555).
     pub(super) fn record_unrecorded_acceptance(
         &mut self,
         group_id: &GroupId,
@@ -300,13 +381,7 @@ impl AppClient {
         {
             return Ok(false);
         }
-        let accepted_here = match &admission.via_welcome {
-            None => admission.created_locally,
-            Some(welcome) => {
-                group.via_welcome_message_id_hex == Some(hex::encode(welcome.as_slice()))
-            }
-        };
-        if !accepted_here {
+        if !standing_matches_admission(group.via_welcome_message_id_hex.as_deref(), &admission) {
             return Ok(false);
         }
         storage.ensure_founding_invitation_decision(&chat, admission.generation)?;
@@ -396,7 +471,13 @@ impl AppClient {
         if decision.declined {
             return Ok(None);
         }
-        self.acceptable_pending_invitation(group_id)
+        let Some(group) = self.acceptable_pending_invitation(group_id)? else {
+            return Ok(None);
+        };
+        if !standing_matches_admission(group.via_welcome_message_id_hex.as_deref(), &admission) {
+            return Ok(None);
+        }
+        Ok(Some(group))
     }
 
     /// A pending invitation on an active local copy that an acceptance may

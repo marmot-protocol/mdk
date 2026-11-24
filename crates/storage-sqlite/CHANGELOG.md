@@ -10,6 +10,9 @@
 - Migration 0221 adds `agent_item_expired_targets`: the retention sweep records each agent item whose row it removed,
   so an edit of it that arrives later does not show it again. A sweep from before the migration is not recorded, so
   on a nightly build's database a late edit of an item removed then can still show it.
+- Account migration 0223 adds the invitation standing (`pending_confirmation`, `welcomer_account_id_hex`,
+  `via_welcome_message_id_hex`) to `local_group_deletion_frontiers`. Older binaries refuse schema 223; downgrade is
+  unsupported.
 
 ### Added
 
@@ -29,6 +32,9 @@
   an open timeline drops them.
 - An agent's own words in a thread under one of its agent items (a kind 1111 with `E`, `K` 1201 and `P` its sender)
   never count as unread, in the projection, its rebuild and the retention sweep.
+- `delete_local_group_data` keeps the deleted row's invitation standing on the group's deletion frontier, and
+  `SqliteAppStorage::local_group_deletion_invitation` returns it as `LocalGroupDeletionInvitation` (mdk#3555). A
+  frontier written before schema 223, or by a delete that found no row, returns `None`.
 
 ### Fixed
 
