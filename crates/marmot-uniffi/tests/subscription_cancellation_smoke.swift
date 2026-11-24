@@ -263,16 +263,6 @@ private struct SubscriptionCancellationSmoke {
     let chatCountAfter = try kit.chatList(accountRef: account.label, includeArchived: true).count
     precondition(chatCountAfter == chatCount, "pre-cancelled createGroup created a chat")
 
-    // A public receive cancelled while it waits ends promptly (the watchdog
-    // bounds "promptly"), whether the cancel lands before or after its poll.
-    let waitingEvent = Task.detached { try await events.nextCancellable() }
-    try await Task.sleep(nanoseconds: 100_000_000)
-    waitingEvent.cancel()
-    do {
-      _ = try await waitingEvent.value
-      preconditionFailure("cancelled events receive returned normally")
-    } catch is CancellationError {
-    }
 
     try await cancelNativePending(
       "PresentedChatListSubscription",
@@ -302,6 +292,12 @@ private struct SubscriptionCancellationSmoke {
       makeHandle: {
         uniffi_marmot_uniffi_fn_method_blocklistsubscription_next(blocks.uniffiClonePointer())
       }, lift: { try FfiConverterOptionTypeBlockListSnapshotFfi.lift($0) }, callback: .cancelled)
+    // A receive generated without `throws`, through the helper its adapter uses.
+    try await cancelNativePending(
+      "EventsSubscription",
+      makeHandle: {
+        uniffi_marmot_uniffi_fn_method_eventssubscription_next(events.uniffiClonePointer())
+      }, lift: { try FfiConverterOptionTypeMarmotEventFfi.lift($0) })
 
     _ = try kit.setChatManuallyUnread(
       accountRef: account.label, groupIdHex: group, manuallyUnread: true)

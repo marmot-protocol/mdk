@@ -103,7 +103,9 @@ impl Marmot {
     /// after this returns. The returned `SignOutOutcomeFfi` surfaces per-relay
     /// KeyPackage cleanup failures. These are the final best-effort results for
     /// this call; the runtime does not persist a remote-deletion retry queue
-    /// (mdk#477).
+    /// (mdk#477). It keeps running when the call is cancelled, so a withdrawn
+    /// KeyPackage slot is always followed by local deactivation.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn sign_out(
         &self,
         account_ref: String,

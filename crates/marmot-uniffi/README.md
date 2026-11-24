@@ -488,12 +488,12 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
 - **Async methods** run their work as a task on that runtime. The Swift task or Kotlin coroutine
   awaiting the call only waits for the task to finish, so awaiting from the main actor or
   `Dispatchers.Main` does not run MDK work on the UI thread. Cancelling a Kotlin coroutine frees
-  the call, which aborts the task at its next suspension point; `shutdownAndClose()` and
+  the call, which aborts the task at its next suspension point; `shutdownAndClose()`, `signOut()` and
   `signOutAndWipe()` keep running regardless. Cancelling a Swift `Task` awaiting a throwing call does the
   same and throws `CancellationError`. Swift still waits for the result of the calls whose work must
-  finish (`shutdownAndClose()`, `signOutAndWipe()`, `releaseAttachmentHandoff()`, `startDirectConversation*`,
-  and Nip46 `approvePermissions()` and `logout()`), even from a cancelled task, and of non-throwing
-  methods: several subscription receives (which have throwing
+  finish (`shutdownAndClose()`, `signOut()`, `signOutAndWipe()`, `releaseAttachmentHandoff()`,
+  `startDirectConversation*`, and Nip46 `approvePermissions()` and `logout()`), even from a cancelled
+  task, and of non-throwing methods: several subscription receives (which have throwing
   [adapters](API-REFERENCE.md#swift-cancellation-adapters)), `relayHealth()`, `shutdown()` and
   `ConversationWindowSubscription.cancel()`.
 - **Subscription receives** (`next()`, `nextUpdate()`) are the exception: they wait on the calling

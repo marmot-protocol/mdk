@@ -10,6 +10,7 @@
 pub(crate) const SWIFT_AWAITS_COMPLETION: &[&str] = &[
     "uniffi_marmot_uniffi_fn_method_marmot_release_attachment_handoff",
     "uniffi_marmot_uniffi_fn_method_marmot_shutdown_and_close",
+    "uniffi_marmot_uniffi_fn_method_marmot_sign_out",
     "uniffi_marmot_uniffi_fn_method_marmot_sign_out_and_wipe",
     "uniffi_marmot_uniffi_fn_method_marmot_start_direct_conversation",
     "uniffi_marmot_uniffi_fn_method_marmot_start_direct_conversation_with_options",
