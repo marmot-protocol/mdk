@@ -89,7 +89,11 @@ mod sign_in_rejection;
 mod slot_announcement;
 mod welcome_audit;
 mod welcome_delivery;
+mod welcome_relays;
 use welcome_audit::{InviteRefusal, V5WelcomePass};
+use welcome_relays::{
+    RelayPublish, RemainingPass, RemainingWelcomeSends, join_relay_answers, relay_sends, until_met,
+};
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
@@ -249,6 +253,8 @@ enum LegacyPublishCompletion {
         Box<PreparedLegacyPublishAttempt>,
         Result<TransportPublishReport, TransportAdapterError>,
     ),
+    /// What the relays a settled pass left answering said since.
+    Remaining(Box<RemainingPass>),
 }
 
 struct PreparedLegacyPublishAttempt {
@@ -307,12 +313,22 @@ struct CompletedWelcomePublish {
 #[doc(hidden)]
 #[must_use = "a prepared Welcome publish task must be run and reconciled"]
 pub struct PreparedWelcomePublishTask {
-    adapter: Arc<dyn TransportAdapter>,
-    wall_clock: Arc<dyn WallClock>,
-    prepared: PreparedWelcomePublish,
     message_ids: Vec<cgka_traits::MessageId>,
-    holds: DetachedWelcomeHolds,
-    selection: Arc<futures::lock::Mutex<()>>,
+    run: WelcomeTaskRun,
+}
+
+enum WelcomeTaskRun {
+    /// A wave's passes, each started once its hold allows.
+    Wave {
+        adapter: Arc<dyn TransportAdapter>,
+        wall_clock: Arc<dyn WallClock>,
+        prepared: PreparedWelcomePublish,
+        holds: DetachedWelcomeHolds,
+        selection: Arc<futures::lock::Mutex<()>>,
+    },
+    /// The relays a wave's passes left answering
+    /// ([`CompletedWelcomePublishTask::take_remaining`]).
+    Remaining(RemainingWelcomeSends<'static>),
 }
 
 /// Opaque relay results from [`PreparedWelcomePublishTask::run`].
@@ -320,9 +336,26 @@ pub struct PreparedWelcomePublishTask {
 pub struct CompletedWelcomePublishTask {
     completed: CompletedWelcomePublish,
     message_ids: Vec<cgka_traits::MessageId>,
+    remaining: Option<RemainingWelcomeSends<'static>>,
 }
 
 impl CompletedWelcomePublishTask {
+    /// The relays this task's passes were still waiting on when each pass
+    /// had met its Welcome's policy, as a task of their own that keeps
+    /// asking them. Their Welcomes' reservations go with it, so this task's
+    /// finish settles each pass at once, and the returned task's finish, or
+    /// its abandonment, releases them. Left untaken, they stop when this task
+    /// is finished, and maintenance retries them after their backoff.
+    pub fn take_remaining(&mut self) -> Option<PreparedWelcomePublishTask> {
+        let remaining = self.remaining.take()?;
+        let message_ids = remaining.message_ids();
+        self.message_ids.retain(|id| !message_ids.contains(id));
+        Some(PreparedWelcomePublishTask {
+            message_ids,
+            run: WelcomeTaskRun::Remaining(remaining),
+        })
+    }
+
     /// Drop the results of every Welcome whose group `gone` names, so that
     /// finishing this task changes nothing of a group the host left or
     /// deleted while the task ran. Their records stay as preparation left
@@ -366,15 +399,19 @@ impl CompletedWelcomePublishTask {
 /// The finished row of a pass that reached relays and whose results are
 /// dropped unreconciled.
 fn record_dropped_completion(audit: &SharedRecorder, completion: &LegacyPublishCompletion) {
-    if let LegacyPublishCompletion::Network(attempt, result) = completion
-        && let Some(pass) = &attempt.v5_welcome
-    {
-        pass.record_dropped(
-            audit,
-            result,
-            &attempt.retry_endpoints,
-            attempt.required_acks,
-        );
+    match completion {
+        LegacyPublishCompletion::Network(attempt, result) => {
+            if let Some(pass) = &attempt.v5_welcome {
+                pass.record_dropped(
+                    audit,
+                    result,
+                    &attempt.retry_endpoints,
+                    attempt.required_acks,
+                );
+            }
+        }
+        LegacyPublishCompletion::Remaining(pass) => pass.record_dropped(audit),
+        LegacyPublishCompletion::Complete(_) => {}
     }
 }
 
@@ -386,18 +423,41 @@ impl PreparedWelcomePublishTask {
 
     /// Run only the bounded relay publication phase. This owns no engine or
     /// SQLite state and is therefore safe to poll beside the account worker.
+    /// A wave returns once each of its passes is done; the relays a pass was
+    /// still waiting on are left in the result
+    /// ([`CompletedWelcomePublishTask::take_remaining`]), still asking.
     pub async fn run(self) -> CompletedWelcomePublishTask {
-        CompletedWelcomePublishTask {
-            completed: self
-                .prepared
-                .publish(
-                    self.adapter.as_ref(),
-                    self.wall_clock.as_ref(),
-                    Some(&self.holds),
-                    Some(&self.selection),
-                )
-                .await,
-            message_ids: self.message_ids,
+        match self.run {
+            WelcomeTaskRun::Wave {
+                adapter,
+                wall_clock,
+                prepared,
+                holds,
+                selection,
+            } => {
+                // Each relay request owns the adapter, so a relay still
+                // answering can outlive this wave.
+                let send = move |request| -> RelayPublish<'static> {
+                    let adapter = adapter.clone();
+                    async move { adapter.publish(request).await }.boxed()
+                };
+                let (completed, mut remaining) = prepared
+                    .publish(&send, wall_clock.as_ref(), Some(&holds), Some(&selection))
+                    .await;
+                if let Some(remaining) = remaining.as_mut() {
+                    remaining.start();
+                }
+                CompletedWelcomePublishTask {
+                    completed,
+                    message_ids: self.message_ids,
+                    remaining,
+                }
+            }
+            WelcomeTaskRun::Remaining(remaining) => CompletedWelcomePublishTask {
+                completed: remaining.run().await,
+                message_ids: self.message_ids,
+                remaining: None,
+            },
         }
     }
 }
@@ -412,13 +472,22 @@ impl PreparedWelcomePublish {
 
     /// Check the owner's current hold before starting each queued attempt.
     /// Already-started relay I/O still completes under its original contract.
-    async fn publish(
+    ///
+    /// Each attempt asks its relays through `send`, one request per relay when
+    /// it has more than its goal (`relay_sends`), and is done once their
+    /// answers meet its goal or all have answered. A relay that answers while
+    /// the wave still runs joins its pass. The relays still answering once
+    /// every pass is done are returned, still asking.
+    async fn publish<'a, S>(
         mut self,
-        adapter: &dyn TransportAdapter,
+        send: &S,
         wall_clock: &dyn WallClock,
         holds: Option<&DetachedWelcomeHolds>,
         selection: Option<&Arc<futures::lock::Mutex<()>>>,
-    ) -> CompletedWelcomePublish {
+    ) -> (CompletedWelcomePublish, Option<RemainingWelcomeSends<'a>>)
+    where
+        S: Fn(TransportPublishRequest) -> RelayPublish<'a> + Sync,
+    {
         let audit = &self.audit;
         let publish = |index, mut attempt: Box<PreparedLegacyPublishAttempt>| async move {
             let mut selection = match selection {
@@ -450,7 +519,11 @@ impl PreparedWelcomePublish {
                 if let Some(pass) = attempt.v5_welcome.as_mut() {
                     pass.start(audit);
                 }
-                let mut future = adapter.publish(attempt.request.clone());
+                let mut future = until_met(
+                    relay_sends(send, &attempt.request),
+                    attempt.request.required_acks,
+                )
+                .boxed();
                 let result = future.poll_unpin(cx).map(Ok);
                 publishing = Some(future);
                 drop(selection.take());
@@ -466,31 +539,77 @@ impl PreparedWelcomePublish {
             };
             in_flight.push(publish(index, attempt));
         }
-        while let Some((index, attempt, result)) = in_flight.next().await {
-            self.completions[index] = Some(match result {
-                Ok(result) => LegacyPublishCompletion::Network(attempt, result),
-                Err(WelcomeHold::AwaitsCommit) => {
-                    LegacyPublishCompletion::Complete(PublishStatus {
-                        awaits_commit: true,
-                        ..PublishStatus::default()
-                    })
+        // Each done pass, by index, with its answers so far, and the answers
+        // still to come from the relays a done pass was waiting on.
+        let mut done: Vec<(usize, Box<PreparedLegacyPublishAttempt>, Vec<_>)> = Vec::new();
+        let mut late = FuturesUnordered::new();
+        while !in_flight.is_empty() {
+            let next = futures::future::poll_fn(|cx| {
+                if let std::task::Poll::Ready(Some(answer)) = late.poll_next_unpin(cx) {
+                    return std::task::Poll::Ready(Err(answer));
                 }
-                Err(_) => LegacyPublishCompletion::Complete(PublishStatus {
-                    withdrawn: true,
-                    ..PublishStatus::default()
-                }),
-            });
+                in_flight.poll_next_unpin(cx).map(Ok)
+            })
+            .await;
+            let (index, attempt, result) = match next {
+                Ok(Some(started)) => started,
+                Ok(None) => break,
+                Err((index, answer)) => {
+                    if let Some((_, _, answers)) = done.iter_mut().find(|done| done.0 == index) {
+                        answers.push(answer);
+                    }
+                    continue;
+                }
+            };
+            match result {
+                Ok((answers, sends)) => {
+                    for send in sends {
+                        late.push(async move { (index, send.await) }.boxed());
+                    }
+                    done.push((index, attempt, answers));
+                }
+                Err(WelcomeHold::AwaitsCommit) => {
+                    self.completions[index] =
+                        Some(LegacyPublishCompletion::Complete(PublishStatus {
+                            awaits_commit: true,
+                            ..PublishStatus::default()
+                        }));
+                }
+                Err(_) => {
+                    self.completions[index] =
+                        Some(LegacyPublishCompletion::Complete(PublishStatus {
+                            withdrawn: true,
+                            ..PublishStatus::default()
+                        }));
+                }
+            }
             if let Some((next_index, next_attempt)) = self.pending.pop_front() {
                 in_flight.push(publish(next_index, next_attempt));
             }
         }
 
-        CompletedWelcomePublish {
-            group_id: self.group_id,
-            metadata: self.metadata,
-            completions: self.completions,
-            audit: self.audit.clone(),
+        let mut remaining =
+            RemainingWelcomeSends::new(late, self.group_id.clone(), self.audit.clone());
+        for (index, attempt, answers) in done {
+            remaining.push(
+                index,
+                &attempt,
+                self.metadata[index].group_id.clone(),
+                &answers,
+            );
+            let result = join_relay_answers(&attempt.request, answers);
+            self.completions[index] = Some(LegacyPublishCompletion::Network(attempt, result));
         }
+
+        (
+            CompletedWelcomePublish {
+                group_id: self.group_id,
+                metadata: self.metadata,
+                completions: self.completions,
+                audit: self.audit.clone(),
+            },
+            (!remaining.is_empty()).then_some(remaining),
+        )
     }
 }
 

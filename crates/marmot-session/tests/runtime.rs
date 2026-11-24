@@ -4887,11 +4887,12 @@ async fn adapter_publish_failure_records_per_relay_causes() {
         })
         .await
         .unwrap();
-    assert_eq!(adapter.publishes().len(), 1);
-    assert!(matches!(
-        adapter.publishes()[0].message.envelope,
-        TransportEnvelope::Welcome { .. }
-    ));
+    // The Welcome asks each relay on its own.
+    assert_eq!(adapter.publishes().len(), 2);
+    assert!(adapter.publishes().iter().all(|request| {
+        matches!(request.message.envelope, TransportEnvelope::Welcome { .. })
+            && request.target.endpoints().len() == 1
+    }));
 
     let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
     assert_eq!(fanout.targets.len(), 2);

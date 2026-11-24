@@ -61,6 +61,15 @@
   undone. A device now takes a small-state update or broadcast request only from a leaf whose device tag reads, at
   the message's epoch, as a device its roster lists, and sends its own only once its leaf is tagged: a newly linked
   device's first broadcast waits for its tag commit instead of going out untagged.
+- When the app's account worker publishes a Welcome (an invite's, a new chat's, or a retry of either), the first pass
+  now reaches every inbox relay of its recipient, not only the first relay that acknowledged it. Each relay is asked
+  on its own. The Welcome is still marked delivered at the first acknowledgement, and the host and the account worker
+  do not wait for the other relays. Their answers are recorded once all of them have answered. If the worker stops
+  waiting first (at the shutdown bound, a reconnect, sign-out or unlink), nothing more is recorded: those relays stay
+  owed and are retried after their backoff, and one that already stored the Welcome answers duplicate. A Welcome whose
+  only acknowledgement came from a relay that accepts gift wraps but cannot serve them back no longer depends on a
+  retry 30 seconds later, which a closed app never ran. `redeliver_welcome` and runtimes that publish Welcomes inline
+  still stop at the first acknowledgement.
 - A newly linked device no longer waits up to an hour for its siblings' small state, showing a chat the account already
   accepted as an invitation, with an "invited you" notification, when every sibling broadcast within the last hour
   (mdk#3556). A device whose trusted roster lists a device its last broadcast was not made for broadcasts at once, and

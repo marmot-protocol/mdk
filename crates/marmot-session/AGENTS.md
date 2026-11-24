@@ -88,6 +88,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     before its finished row; never mark it elsewhere. Start a pass
     (`V5WelcomePass::start`) only where the transport is called, after the last hold check, so a stopped attempt
     records nothing. Every row of a Welcome carries `welcome_audit_operation_id`.
+  - `runtime/welcome_relays.rs` — a Welcome pass's per-relay requests, the result they join into, and the
+    remaining pass of the relays still answering when the pass was done (see `runtime/welcome_delivery.rs`).
   - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
     one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this
@@ -111,7 +113,14 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     selection to finish and checks its current hold; already-started I/O continues. The host finishes it in input
     order (`finish_welcome_publish_task`), after dropping the
     results of a group it no longer shows (`CompletedWelcomePublishTask::drop_gone_groups`), or abandons it
-    (`abandon_welcome_publish_task`), which releases only the reservation. Prepare has already stored each
+    (`abandon_welcome_publish_task`), which releases only the reservation. A pass with more inbox relays than its
+    goal asks each relay with its own request (`runtime/welcome_relays.rs`), since the transport may answer one
+    request at its goal and drop the other relays' answers. The pass is done once its answers meet its goal or every
+    relay answered; a detached wave returns then, and the relays still answering go on as a task of their own
+    (`CompletedWelcomePublishTask::take_remaining`), which takes their reservations. Its finish records their answers
+    on the Welcome's fanout without counting another attempt (it counts and dates one only if the first pass's record
+    was never saved), under its own started/finished pair. Left untaken, cancelled or abandoned, it records nothing
+    (its pass has a started row and no finished row) and those relays are retried after their backoff, as before. Prepare has already stored each
     Welcome's exact signed bytes and endpoint snapshot as a transport fanout, with no relay attempt on any endpoint,
     and the Welcome stays owed, so the next maintenance pass retries that fanout. Every other publish path treats a reserved id as held by its wave. A pending
     create's first Welcome and `redeliver_welcome` still publish inline; a redelivery of a Welcome a wave holds

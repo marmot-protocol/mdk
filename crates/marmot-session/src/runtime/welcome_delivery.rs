@@ -136,12 +136,14 @@ where
             .unwrap_or_else(|error| error.into_inner())
             .extend(message_ids.iter().cloned().map(|id| (id, None)));
         PreparedWelcomePublishTask {
-            adapter,
-            wall_clock: self.wall_clock.clone(),
-            prepared,
             message_ids,
-            holds: self.session.detached_welcome_holds.clone(),
-            selection: self.session.welcome_selection.clone(),
+            run: WelcomeTaskRun::Wave {
+                adapter,
+                wall_clock: self.wall_clock.clone(),
+                prepared,
+                holds: self.session.detached_welcome_holds.clone(),
+                selection: self.session.welcome_selection.clone(),
+            },
         }
     }
 
@@ -152,9 +154,11 @@ where
         &mut self,
         task: CompletedWelcomePublishTask,
     ) -> AccountResult<AccountDeviceEffects> {
+        // Relays left answering that the host did not take stop here.
         let CompletedWelcomePublishTask {
             completed,
             message_ids,
+            remaining: _,
         } = task;
         let mut output = AccountDeviceEffects::default();
         let result = self.finish_welcome_publish(completed, &mut output).await;
@@ -198,9 +202,18 @@ where
             self.prepared_welcome_tasks.push(task);
             return Ok(());
         }
-        let completed = prepared
-            .publish(&self.adapter, self.wall_clock.as_ref(), None, None)
+        let adapter = &self.adapter;
+        let (completed, remaining) = prepared
+            .publish(
+                &|request| adapter.publish(request),
+                self.wall_clock.as_ref(),
+                None,
+                None,
+            )
             .await;
+        // Inline, nothing waits for the relays a pass left answering: they
+        // stop here, and maintenance retries them after their backoff.
+        drop(remaining);
         self.finish_welcome_publish(completed, output).await
     }
 
@@ -279,6 +292,7 @@ where
                     self.finish_prepared_legacy_publish(*attempt, result, &mut effects)
                         .await
                 }
+                LegacyPublishCompletion::Remaining(pass) => self.finish_remaining_pass(*pass),
             };
             let status = match status {
                 Ok(status) => Some(status),
