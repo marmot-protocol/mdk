@@ -70,29 +70,31 @@ pub(super) async fn drain(runtime: &crate::MarmotAppRuntime) -> oneshot::Receive
     drained
 }
 
-/// A hold the worker of one account, by id, enters after it settles a wave
-/// and before it answers the waits on it: the notifiers it enters and waits
-/// on.
-type SettleHold = (String, Arc<Notify>, Arc<Notify>);
-static HOLD_AFTER_SETTLE: std::sync::Mutex<Option<SettleHold>> = std::sync::Mutex::new(None);
+/// A hold the worker of one account enters after it settles a wave and
+/// before it answers the waits on it: the notifiers it enters and waits on.
+/// Kept by account id, so tests that share a process do not take each
+/// other's hold.
+type SettleHold = (Arc<Notify>, Arc<Notify>);
+static HOLD_AFTER_SETTLE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, SettleHold>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Hold the worker of the account `account_id_hex` after it next settles a
 /// wave.
 fn hold_after_settle(account_id_hex: &str) -> (Arc<Notify>, Arc<Notify>) {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
-    *HOLD_AFTER_SETTLE.lock().unwrap() =
-        Some((account_id_hex.to_owned(), entered.clone(), release.clone()));
+    HOLD_AFTER_SETTLE.lock().unwrap().insert(
+        account_id_hex.to_owned(),
+        (entered.clone(), release.clone()),
+    );
     (entered, release)
 }
 
 /// The worker's side of [`hold_after_settle`].
 pub(in crate::runtime::account_worker) async fn held_after_settle(account_id_hex: &str) {
-    let held = HOLD_AFTER_SETTLE
-        .lock()
-        .unwrap()
-        .take_if(|(held, ..)| held == account_id_hex);
-    if let Some((_, entered, release)) = held {
+    let held = HOLD_AFTER_SETTLE.lock().unwrap().remove(account_id_hex);
+    if let Some((entered, release)) = held {
         entered.notify_one();
         release.notified().await;
     }

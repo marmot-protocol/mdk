@@ -76,8 +76,10 @@ where
 }
 
 /// The most relays a pass asks one by one. A longer route goes out as one
-/// request, so the transport judges it whole, as it did before passes asked
-/// relay by relay: a transport that limits a route's relays refuses it.
+/// request over all of them, as every route did before passes asked relay by
+/// relay, so a transport that limits a route's relays still judges it whole.
+/// The count is of the route as given, before the transport drops any relay
+/// it will not use; such a pass stops at its goal, as it did before.
 const MAX_RELAYS_ASKED_ONE_BY_ONE: usize = 16;
 
 /// The relays a pass asks one by one: each distinct relay of `endpoints`,

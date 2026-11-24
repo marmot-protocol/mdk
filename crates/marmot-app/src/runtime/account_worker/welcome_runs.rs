@@ -37,7 +37,7 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinError};
-use tokio::time::{Instant as TokioInstant, timeout_at};
+use tokio::time::{Instant as TokioInstant, sleep_until};
 
 use super::RuntimeSharedServices;
 use super::read_queue::ReadReply;
@@ -232,7 +232,15 @@ impl WelcomeRuns {
         deadline: TokioInstant,
     ) {
         self.adopt(client);
-        while let Ok(Some(ended)) = timeout_at(deadline, self.running.next()).await {
+        loop {
+            // The deadline is looked at first: a wave that ended after it is
+            // left to `cancel_and_join`, even when a settle ran past it.
+            let ended = tokio::select! {
+                biased;
+                () = sleep_until(deadline) => break,
+                ended = self.running.next() => ended,
+            };
+            let Some(ended) = ended else { break };
             self.settle(client, ended).await;
             self.adopt(client);
             self.answer_waiting(client, shared);
