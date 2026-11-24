@@ -59,7 +59,9 @@ impl Marmot {
             .collect())
     }
 
-    /// Remove a local-signing account from this device.
+    /// Remove a local-signing account from this device. It keeps running when
+    /// the call is cancelled, so the account is either removed or left intact.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn remove_account(&self, account_ref: String) -> Result<(), MarmotKitError> {
         self.runtime.accounts().remove_account(&account_ref).await?;
         Ok(())
@@ -214,7 +216,11 @@ impl Marmot {
     ///
     /// `inbox_relays` (default empty) sets the kind-10050 inbox list
     /// separately; empty declares `default_relays` in both lists.
+    ///
+    /// It keeps running when the call is cancelled, so an interrupted setup
+    /// still completes or rolls back.
     #[uniffi::method(default(inbox_relays = []))]
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn login(
         &self,
         identity: String,
@@ -272,7 +278,11 @@ impl Marmot {
     ///
     /// `inbox_relays` (default empty) sets the kind-10050 inbox list
     /// separately; empty declares `default_relays` in both lists.
+    ///
+    /// It keeps running when the call is cancelled, so an interrupted setup
+    /// still completes or rolls back.
     #[uniffi::method(default(inbox_relays = []))]
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn login_recovering_incomplete_setup(
         &self,
         nsec: String,
@@ -321,7 +331,11 @@ impl Marmot {
     ///
     /// `inbox_relays` (default empty) sets the kind-10050 inbox list
     /// separately; empty declares `default_relays` in both lists.
+    ///
+    /// It keeps running when the call is cancelled, so an interrupted setup
+    /// still completes or rolls back.
     #[uniffi::method(default(inbox_relays = []))]
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn login_external_signer(
         &self,
         public_key: String,

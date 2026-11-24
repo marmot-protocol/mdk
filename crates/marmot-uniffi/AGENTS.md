@@ -64,7 +64,9 @@ Expose `marmot-app` behavior through bindings, following [MDK's host boundary](.
   with `async_runtime = "tokio"`: UniFFI's `async_compat` fallback runs every MDK task on one thread and part of each
   call on the host's thread. Mark subscription receives (`next`, `next_update`) `#[marmot_uniffi_macros::receive]`
   so a cancelled wait never consumes an update, and work that must outlive a cancelled call
-  `#[marmot_uniffi_macros::survives_cancellation]`. Constructors enter `tokio_runtime::handle()` so
+  `#[marmot_uniffi_macros::survives_cancellation]`. Kotlin and Swift cancel every other async export at any
+  `.await`, so an export whose steps a cancel could tear (a durable or external effect, then an awaited step that
+  must follow) takes that marker, and `src/swift_awaits_completion.rs` lists it. Constructors enter `tokio_runtime::handle()` so
   construction-time spawns land on the same runtime. Keep the worker count small (`tokio_runtime::worker_threads`) and workers abortable `tokio::spawn`
   tasks; see README.md#threading-model.
 - Android consumers must call `MarmotAndroid.initialize(context)` before constructing `Marmot` (Keystore JNI via

@@ -16,9 +16,10 @@
 
 - Cancelling a Swift task now cancels the throwing MarmotKit call it awaits, commands and subscription receives
   alike, and releases the native references that call holds without `shutdownAndClose()` (mdk#3670). Calls whose
-  work must finish, such as `shutdownAndClose()`, `signOut()` and `signOutAndWipe()`, still run to completion, and
-  the receives generated without `throws` gain throwing `nextCancellable()` adapters. `signOut()` also keeps running
-  when a Kotlin caller cancels it, so a withdrawn KeyPackage slot is always followed by local deactivation.
+  work must finish, such as `shutdownAndClose()`, `removeAccount()`, `signOut()`, `signOutAndWipe()` and the `login*`
+  calls, still run to completion, and the receives generated without `throws` gain throwing `nextCancellable()`
+  adapters. An audit of every async export found six whose steps could be torn by a cancel; they now keep running
+  when a Kotlin or Swift caller cancels them: sign-out, account removal, the three logins and the audit-log switch.
 - A device linked soon after another no longer shows the account's accepted chats as invitations for up to an hour,
   where a decline turned into a leave on every device (mdk#3556). Each device broadcasts its small state to a newly
   listed device at once, and adds it to a chat only after that chat's invitation decision went out. During a relay

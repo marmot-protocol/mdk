@@ -170,6 +170,35 @@ private func generatedReceive<Value>(
   )
 }
 
+// Cancels a quiet receive from outside its task once the generated helper has
+// issued its native poll, so the helper's cancellation handler must end the
+// wait; a check made only on entry would leave it waiting forever.
+private func cancelWhileWaiting(_ makeHandle: @escaping @Sendable () -> UInt64) async throws {
+  let (polled, signal) = AsyncStream<Void>.makeStream()
+  let waiting = Task.detached {
+    try await uniffiRustCallAsync(
+      rustFutureFunc: makeHandle,
+      pollFunc: { handle, callback, data in
+        ffi_marmot_uniffi_rust_future_poll_rust_buffer(handle, callback, data)
+        signal.yield()
+      },
+      completeFunc: ffi_marmot_uniffi_rust_future_complete_rust_buffer,
+      freeFunc: ffi_marmot_uniffi_rust_future_free_rust_buffer,
+      cancelFunc: ffi_marmot_uniffi_rust_future_cancel_rust_buffer,
+      liftFunc: { (_: RustBuffer) -> Void in preconditionFailure("quiet receive returned a value") },
+      errorHandler: FfiConverterTypeMarmotKitError_lift
+    )
+  }
+  var polls = polled.makeAsyncIterator()
+  _ = await polls.next()
+  waiting.cancel()
+  do {
+    try await waiting.value
+    preconditionFailure("receive cancelled while waiting returned normally")
+  } catch is CancellationError {
+  }
+}
+
 private func receiveMatching<Value>(
   _ next: () async throws -> Value?,
   matching predicate: (Value) -> Bool
@@ -292,6 +321,9 @@ private struct SubscriptionCancellationSmoke {
       makeHandle: {
         uniffi_marmot_uniffi_fn_method_blocklistsubscription_next(blocks.uniffiClonePointer())
       }, lift: { try FfiConverterOptionTypeBlockListSnapshotFfi.lift($0) }, callback: .cancelled)
+    try await cancelWhileWaiting {
+      uniffi_marmot_uniffi_fn_method_blocklistsubscription_next(blocks.uniffiClonePointer())
+    }
     // A receive generated without `throws`, through the helper its adapter uses.
     try await cancelNativePending(
       "EventsSubscription",
