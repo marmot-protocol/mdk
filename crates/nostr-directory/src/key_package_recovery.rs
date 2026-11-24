@@ -13,8 +13,8 @@ use super::Directory;
 use super::resources::DirectoryResources;
 use crate::published_records::{
     KeyPackageJournalFence, KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget,
-    key_package_queries, key_package_read_page_full, newest_publication_first,
-    select_fenced_key_packages, without_revoked_slot_winners,
+    key_package_queries, key_package_read_page_full, newest_publication_first, package_is_deleted,
+    select_fenced_key_packages, verified_deletions, without_revoked_slot_winners,
 };
 use crate::{DirectoryFreshness, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome, DirectoryRelayEventRecord};
@@ -38,7 +38,8 @@ pub(super) struct RecoveredKeyPackageRecords {
 impl RecoveredKeyPackageRecords {
     /// The final selection, which revalidates each package on the wall clock.
     /// A non-empty selection may still leave out a device (D12). After a
-    /// complete read, an empty one or a refusal is the verdict.
+    /// complete read, an empty one or a refusal is the verdict, unless
+    /// `fence` knows a publication the records lack.
     pub(super) fn select(
         &self,
         account: &str,
@@ -140,15 +141,16 @@ impl<R: DirectoryResources> Directory<R> {
         if select_fenced_key_packages(account, &observed, freshness, requirements, fence)
             .is_ok_and(|selection| !selection.value.is_empty())
         {
+            // Losing this package decides nothing if a supplementary read was
+            // skipped or an earlier read's package went unserved.
+            let complete = primary_complete
+                && supplementary.is_empty()
+                && !unserved_hint(account, &hints, &served, &observed, fence, freshness);
             return Ok(RecoveredKeyPackageRecords {
                 freshness,
                 records: observed,
                 cache_evidence: None,
-                // Losing this package decides nothing if a supplementary
-                // read was skipped or an earlier read's package went unserved.
-                complete: primary_complete
-                    && supplementary.is_empty()
-                    && !unserved_hint(account, &hints, &served, freshness),
+                complete,
             });
         }
         let mut package_coverage = primary_complete;
@@ -175,8 +177,13 @@ impl<R: DirectoryResources> Directory<R> {
             observed.extend(outcome.records);
             package_coverage &= outcome.complete;
         }
+        // Evaluated at each verdict: a deletion request a later read returns
+        // accounts for an earlier read's package too.
         let verdict_coverage =
-            package_coverage && !unserved_hint(account, &hints, &served, freshness);
+            |deletions: &[DirectoryRelayEventRecord], fence: Option<&KeyPackageJournalFence>| {
+                package_coverage
+                    && !unserved_hint(account, &hints, &served, deletions, fence, freshness)
+            };
         let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));
         // Deletion requests read with the KeyPackages count from the start; a
         // later scoped read that misses one never revives what it covers.
@@ -208,15 +215,16 @@ impl<R: DirectoryResources> Directory<R> {
                     );
                     // A compatibility refusal describes the recipient's
                     // available packages and requires complete coverage.
+                    let journal = refreshed.as_ref().or(fence);
                     let selection = match select_fenced_key_packages(
                         account,
                         &records,
                         freshness,
                         requirements,
-                        refreshed.as_ref().or(fence),
+                        journal,
                     ) {
                         Err(DirectoryError::KeyPackageRequirements(error))
-                            if !verdict_coverage
+                            if !verdict_coverage(&deletions, journal)
                                 && key_package_requirements_are_incompatible(&error) =>
                         {
                             return Err(recovery_incomplete(account));
@@ -238,7 +246,8 @@ impl<R: DirectoryResources> Directory<R> {
                         selected.push(cached.clone());
                     }
                     if selected.is_empty() {
-                        if !package_coverage {
+                        // Absence is a verdict too, with the same coverage.
+                        if !verdict_coverage(&deletions, journal) {
                             return Err(recovery_incomplete(account));
                         }
                         return Ok(RecoveredKeyPackageRecords {
@@ -256,13 +265,9 @@ impl<R: DirectoryResources> Directory<R> {
                 .find(|target| !proven.contains(&target.event_id))
                 .cloned()
             else {
+                let complete = verdict_coverage(&deletions, refreshed.as_ref().or(fence));
                 return Ok(proven_records(
-                    account,
-                    observed,
-                    &deletions,
-                    freshness,
-                    &proven,
-                    verdict_coverage,
+                    account, observed, &deletions, freshness, &proven, complete,
                 ));
             };
             if !package_coverage || routes.is_empty() || revocations == RECOVERY_CANDIDATE_LIMIT {
@@ -386,30 +391,43 @@ fn proven_records(
     }
 }
 
-/// Whether some package in `hints` that selection could admit has no
+/// Whether some package in `hints` that is still a candidate has no
 /// completed read serving it or a publication that replaces it in its slot.
-/// Confirmation uses selection's freshness boundary and slot order.
+/// Confirmation uses selection's freshness boundary and slot order. A hint
+/// that a verified deletion request among `observed` covers, or that the
+/// journal bars, is no candidate and needs no confirmation.
 fn unserved_hint(
     account: &str,
     hints: &[DirectoryRelayEventRecord],
     served: &[DirectoryRelayEventRecord],
+    observed: &[DirectoryRelayEventRecord],
+    fence: Option<&KeyPackageJournalFence>,
     freshness: DirectoryFreshness,
 ) -> bool {
+    if hints.is_empty() {
+        return false;
+    }
     let package = |record: &&DirectoryRelayEventRecord| {
         record.event.kind == KIND_MARMOT_KEY_PACKAGE
             && record.event.pubkey == account
             && freshness.accepts(record)
     };
+    let deletions = verified_deletions(account, observed);
     hints.iter().filter(package).any(|hint| {
         let slot = hint.event.tag_value("d").unwrap_or_default();
+        let (id, created_at) = (hint.event.id.as_str(), hint.event.created_at);
+        if package_is_deleted(account, id, slot, created_at, &deletions)
+            || fence.is_some_and(|fence| !fence.allows(id, slot, created_at))
+        {
+            return false;
+        }
         !served.iter().filter(package).any(|record| {
             // A package without a slot is replaced by nothing else.
             if slot.is_empty() {
-                return record.event.id == hint.event.id;
+                return record.event.id == id;
             }
             record.event.tag_value("d") == Some(slot)
-                && newest_publication_first(&record.event, hint.event.created_at, &hint.event.id)
-                    != Ordering::Greater
+                && newest_publication_first(&record.event, created_at, id) != Ordering::Greater
         })
     })
 }

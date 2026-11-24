@@ -357,7 +357,10 @@ pub(crate) fn without_revoked_slot_winners(
 }
 
 /// The account's signed kind 5 requests among `records`.
-fn verified_deletions(account: &str, records: &[RelayEventRecord]) -> Vec<NostrTransportEvent> {
+pub(crate) fn verified_deletions(
+    account: &str,
+    records: &[RelayEventRecord],
+) -> Vec<NostrTransportEvent> {
     records
         .iter()
         .filter(|record| {
@@ -596,7 +599,9 @@ impl KeyPackageJournalFence {
         }
     }
 
-    fn allows(&self, event_id: &str, slot: &str, created_at: u64) -> bool {
+    /// Whether the journal knows neither a replacement nor a deletion of this
+    /// publication.
+    pub(crate) fn allows(&self, event_id: &str, slot: &str, created_at: u64) -> bool {
         self.barriers.iter().all(|barrier| {
             (barrier.deleted_event_id.is_none() && barrier.key_package_id != slot)
                 || barrier_allows(event_id, created_at, barrier)

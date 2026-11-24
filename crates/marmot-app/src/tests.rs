@@ -739,7 +739,8 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     pub(crate) events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     pub(crate) reject_multi_author: std::sync::atomic::AtomicBool,
-    key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Events a relay returns only to single-author reads.
+    events_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Events a relay returns only to multi-author reads.
     events_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Every multi-author read stops before its end of stored events, as a
@@ -921,7 +922,7 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         {
             return Ok(Vec::new());
         }
-        let single_author_only = self.key_packages_only_in_single_author.lock().unwrap();
+        let single_author_only = self.events_only_in_single_author.lock().unwrap();
         let multi_author_only = self.events_only_in_multi_author.lock().unwrap();
         let matches_query = |event: &NostrTransportEvent| {
             if event.kind == 5 && event.to_verified_nostr_event().is_err() {
@@ -932,8 +933,7 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
             {
                 return false;
             }
-            if event.kind == KIND_MARMOT_KEY_PACKAGE
-                && single_author_only.contains(&event.id)
+            if single_author_only.contains(&event.id)
                 && request.queries.iter().any(|query| query.authors.len() > 1)
             {
                 return false;

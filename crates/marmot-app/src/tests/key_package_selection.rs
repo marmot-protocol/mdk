@@ -881,7 +881,7 @@ async fn every_device_is_resolved_from_a_single_author_read() {
             expected.extend([newer.id.clone(), older.id.clone()]);
             if truncate_batch {
                 fetcher
-                    .key_packages_only_in_single_author
+                    .events_only_in_single_author
                     .lock()
                     .unwrap()
                     .insert(older.id.clone());
@@ -1080,7 +1080,7 @@ async fn per_author_refetch_preserves_slot_replacements_seen_in_batch() {
         replacement.content = "not base64".into();
         let fallback = candidate(account, package, "amethyst", Some("amethyst"), now - 10);
         fetcher
-            .key_packages_only_in_single_author
+            .events_only_in_single_author
             .lock()
             .unwrap()
             .insert(old.id.clone());
@@ -2045,7 +2045,8 @@ async fn a_tied_relay_list_too_long_to_add_still_reads_the_remembered_outbox() {
 /// or package. When the single-author retry and the later reads then finish
 /// without it, no completed read served it, so it supports no incompatibility
 /// verdict. A replacement dated past the allowed clock skew confirms nothing
-/// either. A retry that serves both again lets the verdict stand.
+/// either. A retry that serves both again lets the verdict stand, and so does
+/// a deletion request for the package, from a completed read or the journal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn what_only_an_unfinished_batch_returned_decides_nothing() {
     let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
@@ -2129,7 +2130,7 @@ async fn what_only_an_unfinished_batch_returned_decides_nothing() {
         *fetcher.events_only_in_multi_author.lock().unwrap() = [unserved].into();
         if let Some(replacement) = replacement {
             fetcher
-                .key_packages_only_in_single_author
+                .events_only_in_single_author
                 .lock()
                 .unwrap()
                 .insert(replacement.id.clone());
@@ -2147,6 +2148,106 @@ async fn what_only_an_unfinished_batch_returned_decides_nothing() {
             unfinished.err()
         );
     }
+    // A legacy package only the unfinished batch returned decides no
+    // absence either.
+    let legacy = signed(
+        &app,
+        bob,
+        candidate(
+            bob,
+            fresh_key_package_for_account(&app, bob, true).await,
+            "legacy",
+            None,
+            unix_now_seconds(),
+        ),
+    );
+    for events in fetcher.events_by_endpoint.lock().unwrap().values_mut() {
+        events.retain(|event| {
+            event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != bob.account_id_hex
+        });
+        events.push(legacy.clone());
+    }
+    *fetcher.events_only_in_multi_author.lock().unwrap() = [legacy.id.clone()].into();
+    let obsolete = resolve().await;
+    assert!(
+        matches!(
+            &obsolete,
+            Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
+        ),
+        "{:?}",
+        obsolete.err()
+    );
+
+    // A deletion request the completed retry returns accounts for that
+    // package, so the recipient has none.
+    let deletion = signed_deletion(
+        &app,
+        bob,
+        vec![
+            vec!["e".into(), legacy.id],
+            vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+        ],
+        unix_now_seconds(),
+    );
+    fetcher
+        .events_only_in_single_author
+        .lock()
+        .unwrap()
+        .insert(deletion.id.clone());
+    for events in fetcher.events_by_endpoint.lock().unwrap().values_mut() {
+        events.push(deletion.clone());
+    }
+    let deleted = resolve().await;
+    assert!(
+        matches!(deleted, Err(DirectoryError::MissingKeyPackage { .. })),
+        "{:?}",
+        deleted.err()
+    );
+
+    // So does a deletion the journal already holds and no read returns.
+    let journaled = signed(
+        &app,
+        bob,
+        candidate(
+            bob,
+            fresh_key_package_for_account(&app, bob, true).await,
+            "journaled",
+            None,
+            unix_now_seconds(),
+        ),
+    );
+    for events in fetcher.events_by_endpoint.lock().unwrap().values_mut() {
+        events.push(journaled.clone());
+    }
+    *fetcher.events_only_in_multi_author.lock().unwrap() = [journaled.id.clone()].into();
+    let unconfirmed = resolve().await;
+    assert!(
+        matches!(
+            &unconfirmed,
+            Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
+        ),
+        "{:?}",
+        unconfirmed.err()
+    );
+    let now = unix_now_seconds();
+    app.shared_storage()
+        .unwrap()
+        .put_public_key_package_barrier(&storage_sqlite::PublicKeyPackageBarrierRecord {
+            account_id_hex: bob.account_id_hex.clone(),
+            key_package_id: "journaled".into(),
+            event_id_hex: "ab".repeat(32),
+            deleted_event_id: Some(journaled.id),
+            event_created_at: now,
+            observed_at: now,
+            kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
+        })
+        .unwrap();
+    let barred = resolve().await;
+    assert!(
+        matches!(barred, Err(DirectoryError::MissingKeyPackage { .. })),
+        "{:?}",
+        barred.err()
+    );
     app.close_storage().unwrap();
 }
 
