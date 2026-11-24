@@ -46,10 +46,9 @@ where
     S: Fn(TransportPublishRequest) -> RelayPublish<'a>,
 {
     let endpoints = request.target.endpoints();
-    let requests = if endpoints.len() <= request.required_acks.max(1) {
-        vec![(endpoints.to_vec(), request.clone())]
-    } else {
-        endpoints
+    let requests = match asked_one_by_one(endpoints, request.required_acks) {
+        None => vec![(endpoints.to_vec(), request.clone())],
+        Some(distinct) => distinct
             .iter()
             .map(|endpoint| {
                 (
@@ -65,7 +64,7 @@ where
                     },
                 )
             })
-            .collect()
+            .collect(),
     };
     requests
         .into_iter()
@@ -74,6 +73,23 @@ where
             async move { (asked, publish.await) }.boxed()
         })
         .collect()
+}
+
+/// The relays a pass asks one by one: each distinct relay of `endpoints`,
+/// when there are more of them than the goal. `None` when one request over
+/// all of them does, since every relay must answer anyway. A relay named
+/// twice is one relay: asked twice, it would meet a goal of two on its own.
+fn asked_one_by_one(
+    endpoints: &[TransportEndpoint],
+    required_acks: usize,
+) -> Option<Vec<TransportEndpoint>> {
+    let mut distinct = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        if !distinct.contains(endpoint) {
+            distinct.push(endpoint.clone());
+        }
+    }
+    (distinct.len() > required_acks.max(1)).then_some(distinct)
 }
 
 /// Run `sends` until their answers meet `required_acks`, or all have
@@ -456,5 +472,30 @@ where
             possible_ambiguous_exposure: fanout.possible_exposure,
             ..met
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relays(names: &[&str]) -> Vec<TransportEndpoint> {
+        names
+            .iter()
+            .map(|name| TransportEndpoint(format!("wss://{name}.example")))
+            .collect()
+    }
+
+    /// A relay an inbox list names twice is asked once: two requests to it
+    /// would meet a goal of two with one relay's acknowledgement.
+    #[test]
+    fn a_relay_named_twice_is_one_relay() {
+        assert_eq!(asked_one_by_one(&relays(&["a", "a"]), 2), None);
+        assert_eq!(asked_one_by_one(&relays(&["a", "a"]), 1), None);
+        assert_eq!(
+            asked_one_by_one(&relays(&["a", "b", "a"]), 1),
+            Some(relays(&["a", "b"]))
+        );
+        assert_eq!(asked_one_by_one(&relays(&["a", "b", "a"]), 2), None);
     }
 }

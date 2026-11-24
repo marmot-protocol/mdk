@@ -32,9 +32,9 @@
 //! parked when the worker returns gets the error a queued command gets
 //! ([`WelcomeRuns::end`]).
 
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinError};
 use tokio::time::{Instant as TokioInstant, timeout_at};
@@ -241,22 +241,19 @@ impl WelcomeRuns {
 
     /// When the worker stops with its client, before its audit recording
     /// closes (a stop or an unlink): settle each wave whose task already
-    /// returned, as the worker would have, then cancel the rest and wait for
+    /// returned, as the worker would have, and cancel the rest, waiting for
     /// each ([`Self::cancel_and_join`]).
     pub(super) async fn stop(&mut self, client: &mut AppClient) {
-        self.adopt(client);
-        while let Some(Some(ended)) = self.running.next().now_or_never() {
-            self.settle(client, ended).await;
-            self.adopt(client);
-        }
         self.cancel_and_join(Some(client)).await;
     }
 
     /// Cancel every wave and wait for its task to end, and for the task of
     /// each remaining wave a returned wave started. A cancelled wave records
-    /// nothing: its Welcomes and relays stay owed. A remaining wave that ran
-    /// to completion before its cancel took effect is settled on `client`,
-    /// when there is one; its first wave settled before it started.
+    /// nothing: its Welcomes and relays stay owed. A wave whose task returned
+    /// before its cancel took effect holds real answers, and is settled on
+    /// `client`, when there is one; the remaining wave it starts is cancelled
+    /// in turn. Each task is waited for, never polled once: a task that has
+    /// finished can still read as not ready.
     pub(super) async fn cancel_and_join(&mut self, mut client: Option<&mut AppClient>) {
         if let Some(client) = client.as_deref_mut() {
             self.adopt(client);
@@ -266,11 +263,14 @@ impl WelcomeRuns {
         }
         let mut remaining = Vec::new();
         while let Some(ended) = self.running.next().await {
-            if ended.tail.is_remaining()
-                && ended.run.is_ok()
+            if ended.run.is_ok()
                 && let Some(client) = client.as_deref_mut()
             {
                 self.settle(client, ended).await;
+                self.adopt(client);
+                for (_, abort, _) in &self.in_flight {
+                    abort.abort();
+                }
                 continue;
             }
             if let Ok(results) = ended.run {

@@ -384,16 +384,6 @@ impl CompletedWelcomePublishTask {
         completed.completions = completions;
         before - completed.metadata.len()
     }
-
-    /// Record the finished audit row of each pass of this task that reached
-    /// relays, from the answers it got, with no stored outcome: for a task
-    /// dropped unsettled as its worker stops. Its records stay as preparation
-    /// left them, and its Welcomes stay owed.
-    pub fn record_unsettled_passes(&self) {
-        for completion in self.completed.completions.iter().flatten() {
-            record_dropped_completion(&self.completed.audit, completion);
-        }
-    }
 }
 
 /// The finished row of a pass that reached relays and whose results are
