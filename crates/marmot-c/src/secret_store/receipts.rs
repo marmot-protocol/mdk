@@ -60,8 +60,8 @@ c_enum! {
     MarmotSecretStoreStatus {
         /// The operation succeeded.
         Ok,
-        /// No credential or discoverable source exists. Releasing an
-        /// already retired receipt succeeds.
+        /// No credential or discoverable source exists. Absence does not
+        /// exempt `release_secret` from durably retiring the owner.
         NotFound,
         /// The store exists but cannot be reached right now (locked vault,
         /// keystore unavailable). The runtime treats this as recoverable.
@@ -112,7 +112,8 @@ c_enum! {
     MarmotSecretReleaseMode from SecretReleaseMode { DeleteIfUnowned, Preserve }
 }
 c_enum! {
-    /// PendingLegacy confirms managed retirement/deletion; only raw legacy cleanup is unresolved.
+    /// PendingLegacy confirms managed retirement and any required deletion are complete.
+    /// Only raw legacy cleanup remains.
     MarmotSecretReleaseOutcome from SecretReleaseOutcome { Released, PendingLegacy }
 }
 
@@ -130,8 +131,9 @@ pub struct MarmotSecretCredential {
 }
 
 /// Acquire an immutable owner receipt. NULL `proposed_hex` means no proposal.
-/// Write an allocated secret and MarmotSecretOrigin tag on success. Every
-/// non-NULL secret output is returned through free_secret on every status.
+/// On success, write an allocated, NUL-terminated secret-key hex string to
+/// `out_secret_key_hex` and a MarmotSecretOrigin tag to `out_origin`.
+/// MDK calls `free_secret` exactly once for each non-NULL output, regardless of status.
 /// Same-owner retries preserve material and origin. Retired owners cannot
 /// acquire again. Signing secrets must derive the requested account ID.
 /// Signing discovery is shared by account ID; auxiliary discovery is scoped
@@ -162,11 +164,13 @@ pub type MarmotSecretStoreLoadFn = Option<
     ) -> u32,
 >;
 
-/// Retire only this receipt. Preserve retains a source until a new owner
-/// durably adopts it; repeating an old release cannot resurrect that source.
-/// Write a MarmotSecretReleaseOutcome tag on success.
-/// PendingLegacy requires completed managed retirement and deletion. Return a
-/// failure status for uncertain or failed managed deletion, not PendingLegacy.
+/// Durably retire this owner even if acquisition never ran and no copy exists.
+/// Preserve retains a source until a new owner durably adopts it.
+/// Repeating an old release cannot resurrect that source or delete another owner's copy.
+/// Write a MarmotSecretReleaseOutcome tag on success: Released if no cleanup
+/// remains, or PendingLegacy if only raw legacy cleanup remains after managed
+/// retirement and any required deletion are complete. Return a failure status
+/// if managed retirement or deletion fails or is uncertain.
 pub type MarmotSecretStoreReleaseFn = Option<
     unsafe extern "C" fn(
         user_data: *mut c_void,

@@ -1995,7 +1995,7 @@ async fn nip46_bind_failure_stays_gated() {
         tokio::time::timeout(Duration::from_secs(10), store.entered.notified())
             .await
             .unwrap();
-        if matches!(fault, Fault::Release) {
+        let cached = if matches!(fault, Fault::Release) {
             app.register_external_signer(
                 &id,
                 TestExternalAccountSigner {
@@ -2004,7 +2004,14 @@ async fn nip46_bind_failure_stays_gated() {
             )
             .await
             .unwrap();
-        }
+            Some(
+                app.account_signer_for_summary(&home.account(&id).unwrap())
+                    .unwrap()
+                    .as_nostr_signer(),
+            )
+        } else {
+            None
+        };
         let binding_readiness = runtime.account_setup_readiness(&id).unwrap();
         let binding_contention = fs_private::try_acquire_private_exclusive_file_lease(
             &dir.path().join(".account-mutation.lock"),
@@ -2051,12 +2058,12 @@ async fn nip46_bind_failure_stays_gated() {
         );
 
         if matches!(fault, Fault::Release) {
-            assert!(
-                matches!(result, Err(AppError::Nip46(Nip46Error::Disconnected))),
-                "{result:?}"
-            );
             match origin {
                 Origin::Created => {
+                    assert!(
+                        matches!(result, Err(AppError::Nip46(Nip46Error::Disconnected))),
+                        "{result:?}"
+                    );
                     assert!(matches!(
                         home.account(&id),
                         Err(AccountHomeError::UnknownAccount(_))
@@ -2072,11 +2079,29 @@ async fn nip46_bind_failure_stays_gated() {
                     assert!(tombstone.join(".wipe-cleanup.json").is_file());
                 }
                 Origin::Promoted => {
+                    let Err(AppError::AccountSetupRollback {
+                        setup, rollback, ..
+                    }) = result
+                    else {
+                        panic!("expected typed retirement failure: {result:?}");
+                    };
+                    assert!(matches!(*setup, AppError::Nip46(Nip46Error::Disconnected)));
+                    assert!(matches!(
+                        rollback.as_ref(),
+                        AppError::AccountHome(AccountHomeError::Io(error))
+                            if error.to_string() == "injected session retirement failure"
+                    ));
                     let retained = home.account(&id).unwrap();
                     assert!(!retained.external_signing);
                     assert!(!retained.local_signing);
                     assert_eq!(std::fs::read(&payload).unwrap(), b"existing public payload");
-                    assert!(app.has_external_signer(&id));
+                    let mut unsigned = EventBuilder::new(Kind::Metadata, "{}")
+                        .finalize_unsigned(peer.user.public_key());
+                    unsigned.ensure_id();
+                    let expected = unsigned.id.unwrap();
+                    let signed = cached.unwrap().sign_event(unsigned).await.unwrap();
+                    assert_eq!(signed.id, expected);
+                    signed.verify().unwrap();
                     assert!(
                         home.account_dir(&id)
                             .join(".nip46-session-removing.json")
@@ -2086,9 +2111,17 @@ async fn nip46_bind_failure_stays_gated() {
             }
         } else {
             let retained = home.account(&id).unwrap();
-            assert!(matches!(result, Err(AppError::RelayDirectory(error))
-                    if error.contains("rollback error:")
-                        && error.contains(&Nip46Error::Disconnected.to_string())));
+            let Err(AppError::AccountSetupRollback {
+                setup, rollback, ..
+            }) = result
+            else {
+                panic!("expected typed precommit rollback failure: {result:?}");
+            };
+            assert!(matches!(*setup, AppError::Nip46(Nip46Error::Disconnected)));
+            assert!(matches!(
+                *rollback,
+                AppError::AccountHome(AccountHomeError::Io(_))
+            ));
             assert!(retained.external_signing);
             assert_eq!(
                 runtime.account_setup_readiness(&id).unwrap(),
@@ -2100,6 +2133,14 @@ async fn nip46_bind_failure_stays_gated() {
                 state.phase,
                 marmot_account::AccountSetupPhase::LocalStateCreated
             );
+            if matches!(fault, Fault::CleanupJournal) {
+                let replacement = peer.session(&app);
+                let replacement_key = replacement.client_public_key().unwrap();
+                replacement.connect_async().await.unwrap();
+                runtime.nip46_register(&id, replacement).await.unwrap();
+                let (keys, _) = home.load_nip46_session(&id).unwrap().unwrap();
+                assert_eq!(keys.public_key(), replacement_key);
+            }
         }
         runtime.shutdown_and_close().await.unwrap();
         drop(session);

@@ -289,7 +289,7 @@ callbacks do not match this layout.
 
 The credential record and its strings are borrowed only for the callback. Copy identifiers needed for persistence;
 do not retain their pointers. Return namespace and secret buffers as allocated, NUL-terminated strings. MDK passes
-each non-NULL buffer back to the host's `free_secret` callback, even on a failure status.
+each non-NULL buffer back to the host's `free_secret` callback exactly once, even on a failure status.
 The header defines the integer tags for claim mode, origin, release mode, and release outcome.
 
 <a id="experimental-device-group-test-builds"></a>

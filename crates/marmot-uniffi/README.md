@@ -252,9 +252,14 @@ home ID, owner ID, and `SecretCredentialKind`. Store an immutable copy per owner
 shared by account ID across homes; auxiliary discovery is home-scoped. Ordinary claims use managed sources only;
 `SecretClaimMode::MigrateLegacy` explicitly permits independent legacy lookup and retains its pending cleanup pointer.
 
-`SecretReleaseMode::Preserve` keeps a discoverable hold until a new owner has its own copy. Retire owners before deletion,
-keep retirement metadata, and never let old releases resurrect consumed holds or delete other owners' copies.
-Return `SecretReleaseOutcome::PendingLegacy` for retained ambiguous legacy material; it does not claim physical erasure.
+`SecretReleaseMode::Preserve` keeps a discoverable hold until a new owner has its own copy. Durably retire the owner
+even if acquisition never ran and no copy exists. Retire before deleting the copy and keep retirement metadata.
+Old releases must not restore consumed holds or delete other owners' copies.
+
+Return `SecretReleaseOutcome::Released` when no cleanup remains.
+Return `SecretReleaseOutcome::PendingLegacy` only if raw legacy cleanup remains after managed retirement and any
+required deletion are complete. Retain ambiguous legacy material. Return an error if managed retirement or deletion
+fails or is uncertain.
 Replay cleanup at `reconcileCleanup()`, including when no account wipe remains. Keep the read-only signing presence probes.
 Callbacks may run synchronously during construction, so do not wait for the UI thread or re-enter mutations on the same root.
 The host owns callback-side secret protection and temporary-copy clearing. The [native host fixtures](NATIVE-HOST-TESTS.md)
@@ -408,10 +413,15 @@ custom relay policy.
 On iOS, set `iosOptions.appGroupIdentifiers` when the account root is in a shared App Group container.
 Pass the entitled identifiers on each open, including when you supply a `secretStore` callback.
 With the native Keychain store, `iosOptions.keychainAccessGroup` selects the access group for managed receipts.
-An explicit group must be authorized by iOS and must not conflict with the captured Keychain provider's group.
-Omitting it uses the captured provider's default. The option does not change how the provider looks up legacy entries.
-Hosts with extensions or changing entitlements should always set the group explicitly; if the OS default changes,
-select the previous group to reopen existing credentials.
+An explicit group must be authorized by iOS and can differ from the captured Keychain provider's group.
+If you omit it, MDK uses the captured provider's group if set, or the OS default otherwise.
+The option does not change how the provider looks up legacy entries.
+If the default changes, set the previous managed group explicitly to reopen its receipts. The app must still be
+entitled to use the group and have access to the same container MDK uses to lock it. For a managed App Group, that is
+the group's own container. For a Keychain Sharing-only group, MDK uses the container chosen on the group's first open.
+If that was the first app's private container, another bundle cannot reopen the receipts even with the Keychain entitlement.
+To share a Keychain Sharing-only group across bundles, pass the same shared App Group first in `iosOptions.appGroupIdentifiers`
+when opening the group for the first time. Each bundle must be entitled to use that container.
 
 C hosts use `marmot_client_new_with_configuration` and a `MarmotClientOptions`
 struct; zero initialization selects the same defaults. Use the matching header

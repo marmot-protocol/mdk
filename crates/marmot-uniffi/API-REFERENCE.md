@@ -4880,7 +4880,7 @@ fn cleanup_namespace(&self) -> Result<String, MarmotKitError>
 
 Identify the physical vault and credential namespace for restart-safe wipe cleanup. Keep this nonsecret identity stable across restarts and vault locks, distinct for different stores or services, and fixed for this store object's lifetime. Return an error rather than guessing an unavailable identity; see [host secret-store identity](README.md#host-secret-store-identity).
 
-[Source](src/secret_store/receipts.rs#L93)
+[Source](src/secret_store/receipts.rs#L94)
 
 ### `SecretStore::has_secret_for_label`
 
@@ -4892,7 +4892,7 @@ fn has_secret_for_label(&self, label: String) -> Result<bool, MarmotKitError>
 
 Whether a credential is stored under `label`.
 
-[Source](src/secret_store/receipts.rs#L96)
+[Source](src/secret_store/receipts.rs#L97)
 
 ### `SecretStore::has_secret_for_account_id`
 
@@ -4904,7 +4904,7 @@ fn has_secret_for_account_id(&self, account_id_hex: String) -> Result<bool, Marm
 
 Whether a credential is stored under `account_id_hex`. Stores that key one credential per label report `false`.
 
-[Source](src/secret_store/receipts.rs#L99)
+[Source](src/secret_store/receipts.rs#L100)
 
 ### `SecretStore::acquire_secret`
 
@@ -4916,7 +4916,7 @@ fn acquire_secret( &self, record: SecretCredential, mode: SecretClaimMode, propo
 
 Persist this owner's immutable credential copy before returning its secret and original acquisition origin. Same-owner retries retain both values. Managed signing discovery is shared by account ID; auxiliary discovery is home-scoped. Only `MigrateLegacy` permits raw legacy lookup. See [host ownership](README.md#host-secret-store-identity).
 
-[Source](src/secret_store/receipts.rs#L113)
+[Source](src/secret_store/receipts.rs#L114)
 
 ### `SecretStore::load_secret`
 
@@ -4928,7 +4928,7 @@ fn load_secret(&self, record: SecretCredential) -> Result<String, MarmotKitError
 
 Return this active owner's secret-key hex, or `MarmotKitError::SecretNotFound` for a missing or retired receipt. Do not substitute another owner's copy on load; adoption requires `acquire_secret`.
 
-[Source](src/secret_store/receipts.rs#L121)
+[Source](src/secret_store/receipts.rs#L122)
 
 ### `SecretStore::release_secret`
 
@@ -4940,7 +4940,7 @@ fn release_secret( &self, record: SecretCredential, mode: SecretReleaseMode, ) -
 
 Retire only this receipt before deleting its material. `Preserve` keeps a discoverable hold until another owner durably adopts a copy. Retain retirement metadata so an old operation cannot recreate a retired owner or consume another owner's key. Return `PendingLegacy` only after managed retirement and deletion complete, with raw legacy material retained or its absence unproven. Return an error for failed or uncertain managed deletion.
 
-[Source](src/secret_store/receipts.rs#L130)
+[Source](src/secret_store/receipts.rs#L133)
 
 ### `SecretStore::reconcile_cleanup`
 
@@ -4952,7 +4952,7 @@ fn reconcile_cleanup(&self) -> Result<(), MarmotKitError>
 
 Retry durable retired-receipt cleanup, including when no account wipe remains. Attempt independent retirements despite individual failures. Keep preserved holds and ambiguous legacy credentials. Cleanup cannot infer ownership from the live account catalog.
 
-[Source](src/secret_store/receipts.rs#L138)
+[Source](src/secret_store/receipts.rs#L141)
 
 </details>
 

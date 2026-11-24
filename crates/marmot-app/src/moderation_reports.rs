@@ -691,15 +691,7 @@ impl MarmotApp {
         &self,
         label: &str,
     ) -> (ModerationReportFence, Result<u64, AppError>) {
-        let slot = self.moderation_reports.slot(label);
-        // Raise the fence before bumping: work that subscribes after the bump
-        // sees the fence under the lock instead.
-        slot.fences
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let fence = ModerationReportFence(slot.clone());
-        slot.generation
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
-        let _work = slot.work.lock().await;
+        let fence = self.pause_moderation_reports(label).await;
         // An account that cannot sign, or whose database was never created,
         // has no reports. Do not create and migrate a database to learn that.
         #[cfg(test)]
@@ -727,10 +719,23 @@ impl MarmotApp {
                 target: "marmot_app::moderation_reports",
                 method = "fence_moderation_reports",
                 error_kind = error.privacy_safe_kind(),
-                "failed to purge queued moderation reports"
+                "could not purge queued moderation reports"
             );
         }
         (fence, purged)
+    }
+
+    pub(crate) async fn pause_moderation_reports(&self, label: &str) -> ModerationReportFence {
+        let slot = self.moderation_reports.slot(label);
+        // Raise the fence before bumping: work that subscribes after the bump
+        // sees the fence under the lock instead.
+        slot.fences
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let fence = ModerationReportFence(slot.clone());
+        slot.generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        let _work = slot.work.lock().await;
+        fence
     }
 
     async fn publish_moderation_wrap(

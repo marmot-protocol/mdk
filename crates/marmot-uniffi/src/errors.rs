@@ -860,6 +860,28 @@ impl From<&AppError> for MarmotKitError {
             AppError::Nip46(error) => Self::Nip46 {
                 reason: error.clone().into(),
             },
+            AppError::AccountSetupRollback {
+                rollback,
+                additional,
+                ..
+            } => {
+                let mut error = Self::from(rollback.as_ref());
+                if let Self::Io { details }
+                | Self::KeystoreUnavailable { details }
+                | Self::Runtime { details }
+                | Self::StorageBusy { details }
+                | Self::StorageFull { details } = &mut error
+                {
+                    use std::fmt::Write as _;
+
+                    details.clear();
+                    write!(details, "{value}").expect("writing to a String cannot fail");
+                    for failure in additional {
+                        write!(details, "; {failure}").expect("writing to a String cannot fail");
+                    }
+                }
+                error
+            }
             AppError::ExternalSignerRejected => Self::ExternalSignerRejected,
             AppError::InvalidSticker(details) => Self::InvalidSticker {
                 details: details.clone(),
@@ -1035,6 +1057,32 @@ mod tests {
     use cgka_traits::storage::StorageError;
     use marmot_account::AccountHomeError;
     use marmot_app::{AccountError, AppError};
+
+    #[test]
+    fn failed_account_rollback_keeps_binding_cause() {
+        let setup = || Box::new(AppError::Nip46(marmot_app::Nip46Error::Disconnected));
+        let error = MarmotKitError::from(AppError::AccountSetupRollback {
+            setup: setup(),
+            rollback: Box::new(AppError::Io(std::io::Error::other("retirement failed"))),
+            additional: vec![AppError::RuntimeBusy],
+        });
+        let MarmotKitError::Io { details } = error else {
+            panic!("rollback lost its typed IO cause: {error:?}");
+        };
+        assert!(details.contains("remote signer disconnected"));
+        assert!(details.contains("retirement failed"));
+        assert!(details.contains(&AppError::RuntimeBusy.to_string()));
+
+        let reason = marmot_app::Nip46Error::Storage;
+        let error = MarmotKitError::from(AppError::AccountSetupRollback {
+            setup: setup(),
+            rollback: Box::new(AppError::Nip46(reason.clone())),
+            additional: Vec::new(),
+        });
+        assert!(
+            matches!(error, MarmotKitError::Nip46 { reason: actual } if actual == reason.into())
+        );
+    }
 
     #[test]
     fn block_and_follow_refusals_keep_distinct_host_choices() {

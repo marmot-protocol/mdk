@@ -5964,7 +5964,7 @@ impl MarmotApp {
 
     /// Remove compatibility artifacts that live outside the account directory.
     /// Account-home deletion cannot otherwise make setup rollback complete.
-    fn remove_account_key_package_artifacts(&self, label: &str) -> Result<(), AppError> {
+    fn remove_account_key_package_artifacts(&self, label: &str) -> std::io::Result<()> {
         for path in [
             self.key_package_record_path(label),
             self.key_package_cutover_replacement_pending_path(label),
@@ -5973,7 +5973,7 @@ impl MarmotApp {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
         Ok(())

@@ -3711,6 +3711,11 @@ async fn cancelled_startup_is_reaped() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn setup_rollback_reaps_worker() {
+    assert_rollback_reaps(None).await;
+    assert_rollback_reaps(Some(AccountSetupPhase::KeyPackagePublicationStarted)).await;
+}
+
+async fn assert_rollback_reaps(published: Option<AccountSetupPhase>) {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relays(dir.path(), vec![]);
     let keys = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
@@ -3758,6 +3763,13 @@ async fn setup_rollback_reaps_worker() {
     let reached_reaper = early.is_none();
     let live_while_open = app.account_home().account(&account.label).is_ok();
     let worker_held = !old_commands.is_closed();
+    let artifact = app.key_package_record_path(&account.label);
+    if let Some(phase) = published {
+        fs_private::write_private(&artifact, b"retain published setup").unwrap();
+        app.account_home()
+            .set_account_setup_phase(&account.label, phase)
+            .unwrap();
+    }
     proceed.send(()).unwrap();
     let result = match early {
         Some(result) => result,
@@ -3784,7 +3796,20 @@ async fn setup_rollback_reaps_worker() {
         "the old worker must stop before removal completes"
     );
     assert!(matches!(result, Err(AppError::MissingDefaultRelays)));
-    assert!(removed, "successful compensation removes the failed import");
+    if let Some(phase) = published {
+        assert!(!removed, "preserve an import after publication intent");
+        assert_eq!(
+            app.account_home()
+                .account_setup_state(&account.label)
+                .unwrap()
+                .unwrap()
+                .phase,
+            phase
+        );
+        assert_eq!(std::fs::read(artifact).unwrap(), b"retain published setup");
+    } else {
+        assert!(removed, "successful compensation removes the failed import");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

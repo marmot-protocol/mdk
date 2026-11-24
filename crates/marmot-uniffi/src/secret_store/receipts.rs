@@ -49,8 +49,9 @@ pub enum SecretReleaseMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum SecretReleaseOutcome {
+    /// The owner is retired and no cleanup remains for this release.
     Released,
-    /// Managed retirement and deletion completed; only raw legacy cleanup remains unresolved.
+    /// Managed retirement and any required deletion are complete. Only raw legacy cleanup remains.
     PendingLegacy,
 }
 
@@ -120,13 +121,15 @@ pub trait SecretStore: Send + Sync {
     /// Return this owner's secret hex, or SecretNotFound when no active copy exists.
     fn load_secret(&self, record: SecretCredential) -> Result<String, MarmotKitError>;
 
-    /// Retire before deleting this owner's copy; never delete another owner's key.
+    /// Durably retire this owner even if acquisition never ran and no copy exists.
+    /// Retire before deleting the copy and never delete another owner's key.
     /// Preserve retains discoverable material until a new owner owns a copy.
-    /// Old release retries cannot resurrect consumed holds. Retain ambiguous
-    /// independent legacy material and return PendingLegacy instead of claiming
-    /// physical erasure. Retirement metadata must outlive the account record.
-    /// PendingLegacy confirms managed retirement and deletion completed. An
-    /// uncertain or failed managed deletion returns an error, not PendingLegacy.
+    /// Old release retries cannot resurrect consumed holds. Retirement metadata
+    /// must outlive the account record.
+    /// Return Released if no cleanup remains. Return PendingLegacy only if raw
+    /// legacy cleanup remains after managed retirement and any required deletion
+    /// are complete. Retain ambiguous legacy material. Return an error if
+    /// managed retirement or deletion fails or is uncertain.
     fn release_secret(
         &self,
         record: SecretCredential,

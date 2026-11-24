@@ -304,6 +304,13 @@ pub enum AppError {
     ExternalSignerRejected,
     #[error(transparent)]
     Nip46(#[from] crate::Nip46Error),
+    #[error("account setup failed: {setup}; rollback failed: {rollback}")]
+    AccountSetupRollback {
+        setup: Box<Self>,
+        #[source]
+        rollback: Box<Self>,
+        additional: Vec<Self>,
+    },
     #[error("invalid Marmot KeyPackage event: {0}")]
     InvalidKeyPackageEvent(String),
     #[error("no directory entry for account")]
@@ -766,6 +773,7 @@ impl AppError {
             Self::ExternalSignerMismatch => "external_signer_mismatch",
             Self::ExternalSignerRejected => "external_signer_rejected",
             Self::Nip46(_) => "nip46",
+            Self::AccountSetupRollback { rollback, .. } => rollback.privacy_safe_kind(),
             Self::InvalidKeyPackageEvent(_) => "invalid_key_package_event",
             Self::MissingDirectoryEntry(_) => "missing_directory_entry",
             Self::InvalidDirectorySearch(_) => "invalid_directory_search",
@@ -861,6 +869,7 @@ impl AppError {
                 SyncErrorClass::RelayDirectory
             }
             Self::AccountCatchUp(error) => error.classification().error_class,
+            Self::AccountSetupRollback { rollback, .. } => rollback.sync_error_class(),
             Self::FullHistoryRepairIncomplete { reason, .. } => match reason {
                 FullHistoryRepairIncompleteReason::Cancelled => SyncErrorClass::Cancelled,
                 FullHistoryRepairIncompleteReason::Deadline

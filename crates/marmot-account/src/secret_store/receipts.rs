@@ -1150,9 +1150,17 @@ mod tests {
     use crate::io::overwrite_file_with_zeros;
     use std::fs;
 
+    fn receipt_name(credential: SecretCredential<'_>) -> String {
+        format!(
+            "{}-{}",
+            owned_vault::slot_name(credential, Addressing::Label),
+            credential.owner_id
+        )
+    }
+
     #[test]
     #[cfg(unix)]
-    fn namespace_keeps_raw_paths() {
+    fn namespace_distinguishes_vaults_and_pins_aliases() {
         use std::ffi::OsString;
         use std::os::unix::{ffi::OsStringExt, fs::symlink};
 
@@ -1164,9 +1172,18 @@ mod tests {
         assert_eq!(first.to_string_lossy(), second.to_string_lossy());
         let alias = dir.path().join("vault-alias");
         symlink(&first, &alias).unwrap();
-        let namespace = LocalFileSecretStore::new(&first, IosOptions::default())
-            .cleanup_namespace()
-            .unwrap();
+        let store = LocalFileSecretStore::new(&first, IosOptions::default());
+        let guard = fs_private::try_acquire_private_exclusive_file_lease(
+            &first.join(CREDENTIAL_STORE_LOCK_FILE),
+        )
+        .unwrap();
+        assert!(
+            matches!(store.cleanup_namespace(), Err(AccountHomeError::Io(error))
+            if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert!(!first.join(VAULT_ID_FILE).exists());
+        drop(guard);
+        let namespace = store.cleanup_namespace().unwrap();
         let pinned = LocalFileSecretStore::new(&alias, IosOptions::default());
         assert_eq!(pinned.cleanup_namespace().unwrap(), namespace);
         assert_eq!(
@@ -1196,7 +1213,7 @@ mod tests {
     #[test]
     fn file_vault_rejects_retarget() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("vault");
+        let root = directory.path().join("new-parent/vault");
         let moved = directory.path().join("original-vault");
         let store = LocalFileSecretStore::new(&root, IosOptions::default());
         let keys = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
@@ -1213,6 +1230,10 @@ mod tests {
         store
             .acquire_secret(credential, SecretClaimMode::CreateOnly, Some(&keys))
             .unwrap();
+        let namespace = store.cleanup_namespace().unwrap();
+        let held_directory = store.storage_directory().unwrap();
+        let name = receipt_name(credential);
+        let original = store.read(RecordKind::Receipt, &name).unwrap().unwrap();
         let clone = store.clone();
         fs::rename(&root, &moved).unwrap();
         fs::create_dir(&root).unwrap();
@@ -1231,10 +1252,136 @@ mod tests {
         );
         assert!(fs::read_dir(&root).unwrap().next().is_none());
 
-        fs::remove_dir(&root).unwrap();
+        let replacement = LocalFileSecretStore::new(&root, IosOptions::default());
+        let other_keys = nostr::prelude::Keys::parse(&"02".repeat(32)).unwrap();
+        let other_account_id = other_keys.public_key().to_hex();
+        replacement
+            .acquire_secret(
+                SecretCredential {
+                    account_id_hex: &other_account_id,
+                    ..credential
+                },
+                SecretClaimMode::CreateOnly,
+                Some(&other_keys),
+            )
+            .unwrap();
+        assert_ne!(replacement.cleanup_namespace().unwrap(), namespace);
+        let other = replacement
+            .read(RecordKind::Receipt, &name)
+            .unwrap()
+            .unwrap();
+        assert_ne!(other.as_str(), original.as_str());
+
+        // Move the pathname after obtaining the directory, but before opening the record.
+        let pinned =
+            read_secret_text_with(|| held_directory.open_record(RecordKind::Receipt, &name))
+                .unwrap();
+        assert_eq!(pinned.as_str(), original.as_str());
+
+        let reopened = LocalFileSecretStore::new(&moved, IosOptions::default());
+        assert_eq!(reopened.cleanup_namespace().unwrap(), namespace);
+        assert_eq!(
+            reopened.load_secret(credential).unwrap().secret_key(),
+            keys.secret_key()
+        );
+        drop((reopened, replacement));
+        fs::remove_dir_all(&root).unwrap();
         fs::rename(&moved, &root).unwrap();
         assert_eq!(
             store.load_secret(credential).unwrap().secret_key(),
+            keys.secret_key()
+        );
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn marker_publication_never_retargets_or_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        let moved = dir.path().join("moved");
+        let pending = LocalFileSecretStore::new(&root, IosOptions::default());
+        let held = pending.storage_directory().unwrap();
+        fs::rename(&root, &moved).unwrap();
+        let replacement = LocalFileSecretStore::new(&root, IosOptions::default());
+        let (replacement_lease, namespace) = replacement.store_guard().unwrap();
+        let marker_path = root.join(VAULT_ID_FILE);
+        let replacement_id = fs::read(&marker_path).unwrap();
+
+        // The original and replacement lock files remain distinct after the move.
+        let _original_lease = acquire_vault_lease(&held.handle).unwrap();
+        let original_id = [b'a'; VAULT_ID_LEN];
+        publish_vault_marker(&held.handle, &original_id).unwrap();
+        assert_eq!(fs::read(moved.join(VAULT_ID_FILE)).unwrap(), original_id);
+        assert_eq!(fs::read(&marker_path).unwrap(), replacement_id);
+        let error = publish_vault_marker(&held.handle, &[b'b'; VAULT_ID_LEN]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(held.read_marker().unwrap(), Some(original_id));
+        assert_eq!(replacement.cleanup_namespace().unwrap(), namespace);
+        drop(replacement_lease);
+    }
+
+    #[test]
+    fn vault_refuses_unverifiable_identity_over_managed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSecretStore::new(dir.path(), IosOptions::default());
+        let keys = nostr::prelude::Keys::generate();
+        let account_id = keys.public_key().to_hex();
+        let credential = SecretCredential {
+            label: "needs-identity",
+            account_id_hex: &account_id,
+            home_id: &"11".repeat(32),
+            owner_id: &"22".repeat(32),
+            kind: SecretCredentialKind::Signing,
+        };
+        store
+            .acquire_secret(credential, SecretClaimMode::CreateOnly, Some(&keys))
+            .unwrap();
+        let path = store
+            .owned_path(RecordKind::Receipt, &receipt_name(credential))
+            .unwrap();
+        let receipt = Zeroizing::new(fs::read(&path).unwrap());
+        let marker = dir.path().join(VAULT_ID_FILE);
+        let saved_identity = fs::read(&marker).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_file(&marker).unwrap();
+
+        assert!(
+            matches!(store.cleanup_namespace(), Err(AccountHomeError::SecretStore(error))
+            if error == "cached file vault identity marker changed; reopen its original target")
+        );
+        let reopened = LocalFileSecretStore::new(dir.path(), IosOptions::default());
+        for result in [
+            reopened.cleanup_namespace().map(|_| ()),
+            reopened.load_secret(credential).map(|_| ()),
+            reopened
+                .release_secret(credential, SecretReleaseMode::DeleteIfUnowned)
+                .map(|_| ()),
+            reopened.reconcile_cleanup(),
+        ] {
+            assert!(matches!(result, Err(AccountHomeError::SecretStore(error))
+                if error == "file vault identity marker is missing over managed credential storage"));
+        }
+        assert!(!marker.exists());
+
+        let malformed = [b'g'; VAULT_ID_LEN];
+        fs_private::write_private(&marker, &malformed).unwrap();
+        assert!(
+            matches!(reopened.cleanup_namespace(), Err(AccountHomeError::SecretStore(error))
+            if error == "invalid file vault identity marker")
+        );
+        assert_eq!(fs::read(&marker).unwrap(), malformed);
+        assert_eq!(fs::read(&path).unwrap().as_slice(), receipt.as_slice());
+
+        fs_private::write_private(&marker, &saved_identity).unwrap();
+        assert_eq!(
+            reopened.load_secret(credential).unwrap().secret_key(),
             keys.secret_key()
         );
     }
@@ -1314,10 +1461,7 @@ mod tests {
         store
             .acquire_secret(credential, SecretClaimMode::CreateOnly, Some(&keys))
             .unwrap();
-        let name = format!(
-            "{}-{owner_id}",
-            owned_vault::slot_name(credential, Addressing::Label)
-        );
+        let name = receipt_name(credential);
         let path = store.owned_path(RecordKind::Receipt, &name).unwrap();
         assert!(
             fs::read_to_string(&path)
@@ -1347,9 +1491,9 @@ mod tests {
         }
         drop(writer);
         #[cfg(unix)]
-        let mut held = fs::File::open(&path).unwrap();
+        let held = hold_secret(&path);
         #[cfg(unix)]
-        let mut held_temporary = fs::File::open(&temporary).unwrap();
+        let held_temporary = hold_secret(&temporary);
         assert_eq!(
             store
                 .release_secret(credential, SecretReleaseMode::DeleteIfUnowned)
@@ -1360,12 +1504,8 @@ mod tests {
         assert!(!temporary.exists());
         #[cfg(unix)]
         {
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut held, &mut bytes).unwrap();
-            assert!(bytes.iter().all(|byte| *byte == 0));
-            bytes.clear();
-            std::io::Read::read_to_end(&mut held_temporary, &mut bytes).unwrap();
-            assert!(bytes.iter().all(|byte| *byte == 0));
+            assert_scrubbed(held);
+            assert_scrubbed(held_temporary);
         }
         assert_eq!(
             store
@@ -1373,5 +1513,106 @@ mod tests {
                 .unwrap(),
             SecretReleaseOutcome::Released
         );
+    }
+
+    #[cfg(unix)]
+    fn hold_secret(path: &Path) -> (File, u64) {
+        let file = File::open(path).unwrap();
+        let len = file.metadata().unwrap().len();
+        assert!(len > 0);
+        (file, len)
+    }
+
+    #[cfg(unix)]
+    fn assert_scrubbed((mut file, len): (File, u64)) {
+        let mut bytes = Zeroizing::new(Vec::new());
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes.len() as u64, len);
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_scrubs_only_terminal_owners_and_retries_failed_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSecretStore::new(dir.path(), IosOptions::default());
+        let keys = nostr::prelude::Keys::generate();
+        let account_id = keys.public_key().to_hex();
+        let home_id = "11".repeat(32);
+        let owners = ["22", "33", "44", "55"].map(|id| id.repeat(32));
+        let credentials = owners.each_ref().map(|owner_id| SecretCredential {
+            label: "sweep",
+            account_id_hex: &account_id,
+            home_id: &home_id,
+            owner_id,
+            kind: SecretCredentialKind::Signing,
+        });
+        let copies = std::array::from_fn::<_, 4, _>(|index| {
+            let credential = credentials[index];
+            let (mode, proposed) = if index == 0 {
+                (SecretClaimMode::CreateOnly, Some(&keys))
+            } else {
+                (SecretClaimMode::AdoptOnly, None)
+            };
+            store.acquire_secret(credential, mode, proposed).unwrap();
+            let name = receipt_name(credential);
+            let path = store.owned_path(RecordKind::Receipt, &name).unwrap();
+            let temp = path.with_file_name(format!(".{name}.tmp.1.1"));
+            let contents = Zeroizing::new(fs::read(&path).unwrap());
+            (path, temp, contents)
+        });
+        for credential in &credentials[..2] {
+            assert_eq!(
+                store
+                    .release_secret(*credential, SecretReleaseMode::DeleteIfUnowned)
+                    .unwrap(),
+                SecretReleaseOutcome::Released
+            );
+        }
+        assert_eq!(
+            store
+                .release_secret(credentials[2], SecretReleaseMode::Preserve)
+                .unwrap(),
+            SecretReleaseOutcome::Released
+        );
+
+        // Restore the receipt bytes a crash after terminal publication could leave behind.
+        for (path, temp, contents) in &copies[..2] {
+            fs_private::write_private(path, contents).unwrap();
+            fs_private::write_private(temp, contents).unwrap();
+        }
+        for (_, temp, contents) in &copies[2..] {
+            fs_private::write_private(temp, contents).unwrap();
+        }
+        let blocked = copies[0].1.with_extension("2");
+        fs::create_dir(&blocked).unwrap();
+        let held = [
+            hold_secret(&copies[0].0),
+            hold_secret(&copies[0].1),
+            hold_secret(&copies[1].0),
+            hold_secret(&copies[1].1),
+        ];
+        drop(store);
+        let reopened = LocalFileSecretStore::new(dir.path(), IosOptions::default());
+        assert!(
+            matches!(reopened.reconcile_cleanup(), Err(AccountHomeError::Io(error))
+            if error.kind() == io::ErrorKind::IsADirectory || error.raw_os_error() == Some(libc::EPERM))
+        );
+        for (path, temp, _) in &copies[..2] {
+            assert!(!path.exists());
+            assert!(!temp.exists());
+        }
+        for (path, temp, contents) in &copies[2..] {
+            assert_eq!(fs::read(path).unwrap().as_slice(), contents.as_slice());
+            assert_eq!(fs::read(temp).unwrap().as_slice(), contents.as_slice());
+        }
+        held.into_iter().for_each(assert_scrubbed);
+
+        fs::remove_dir(&blocked).unwrap();
+        fs_private::write_private(&blocked, &copies[0].2).unwrap();
+        let held_retry = hold_secret(&blocked);
+        reopened.reconcile_cleanup().unwrap();
+        assert!(!blocked.exists());
+        assert_scrubbed(held_retry);
     }
 }
