@@ -2330,6 +2330,88 @@ async fn a_deletion_journaled_during_the_supplementary_read_bars_the_package() {
     app.close_storage().unwrap();
 }
 
+/// Recovery finds one device's package in two slots, proves the preferred
+/// slot undeleted and sets the other aside. Another lookup journals the
+/// preferred slot's deletion while that proof is in flight. The slot set
+/// aside was never checked, so the lookup is incomplete rather than empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deletion_journaled_during_the_proof_leaves_an_unproven_alternate() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let package = fresh_key_package_for_account(&app, &bob, false).await;
+    let now = unix_now_seconds();
+    let preferred = candidate(&bob, package.clone(), "preferred", None, now);
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        for relay in ["wss://shared.example", "wss://directory.example"] {
+            by_endpoint
+                .get_mut(relay)
+                .unwrap()
+                .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        }
+        by_endpoint
+            .get_mut("wss://directory.example")
+            .unwrap()
+            .extend([
+                preferred.clone(),
+                candidate(&bob, package, "alternate", None, now - 1),
+            ]);
+    }
+    let (mut entered, mut release) = fetcher.hold_fetches();
+    let lookup = {
+        let app = app.clone();
+        let bob = bob.account_id_hex.clone();
+        tokio::spawn(async move {
+            app.directory()
+                .resolve_compatible_member_key_packages(
+                    vec![bob],
+                    &requirements,
+                    nostr_directory::MemberResolutionPurpose::Commit,
+                    nostr_directory::MemberResolutionPolicy::Atomic,
+                )
+                .await
+                .map(|_| ())
+        })
+    };
+    // The batch and single-author reads of the outbox find nothing and
+    // recovery's read of the directory relay finds both slots, so the
+    // deletion proof is the fourth read that asks for deletion requests.
+    for read in 0..3 {
+        entered.notified().await;
+        let next = if read < 2 {
+            fetcher.hold_fetches()
+        } else {
+            fetcher.hold_fetches_for_kind(5)
+        };
+        release.notify_one();
+        (entered, release) = next;
+    }
+    entered.notified().await;
+    app.shared_storage()
+        .unwrap()
+        .put_public_key_package_barrier(&storage_sqlite::PublicKeyPackageBarrierRecord {
+            account_id_hex: bob.account_id_hex.clone(),
+            key_package_id: "preferred".into(),
+            event_id_hex: "ab".repeat(32),
+            deleted_event_id: Some(preferred.id.clone()),
+            event_created_at: now,
+            observed_at: now,
+            kind: storage_sqlite::PublicKeyPackageBarrierKind::Deletion,
+        })
+        .unwrap();
+    release.notify_one();
+    let result = lookup.await.unwrap();
+    assert!(
+        matches!(
+            &result,
+            Err(DirectoryError::DirectoryLookupIncomplete(account))
+                if account == &bob.account_id_hex
+        ),
+        "{result:?}"
+    );
+    app.close_storage().unwrap();
+}
+
 /// Recovery returns a package from its first read without reading the
 /// supplementary relays. If final selection then loses that package, as
 /// wall-clock revalidation can, the incompatibility left behind is a verdict

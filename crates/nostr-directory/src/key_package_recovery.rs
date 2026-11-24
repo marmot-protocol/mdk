@@ -356,8 +356,9 @@ impl<R: DirectoryResources> Directory<R> {
 /// revalidates MLS lifetime on the real wall clock. It may reject a proven
 /// identity after a slow deletion read, but must never select a different
 /// fresh slot whose deletion was not read. Rejected-future metadata stays for
-/// the diagnostic cache fallback, whose exact target was checked. `complete`
-/// says whether losing the proven candidates is a verdict.
+/// the diagnostic cache fallback, whose exact target was checked. Losing the
+/// proven candidates is a verdict only with `complete` coverage and no other
+/// fresh package left unproven here.
 fn proven_records(
     account: &str,
     observed: Vec<DirectoryRelayEventRecord>,
@@ -368,12 +369,20 @@ fn proven_records(
 ) -> RecoveredKeyPackageRecords {
     let (mut records, evidence) =
         without_revoked_slot_winners(account, observed, deletions, freshness);
-    records.retain(|record| !freshness.accepts(record) || proven.contains(&record.event.id));
+    let unproven = |record: &DirectoryRelayEventRecord| {
+        freshness.accepts(record) && !proven.contains(&record.event.id)
+    };
+    let alternate = records.iter().any(|record| {
+        record.event.kind == KIND_MARMOT_KEY_PACKAGE
+            && record.event.pubkey == account
+            && unproven(record)
+    });
+    records.retain(|record| !unproven(record));
     RecoveredKeyPackageRecords {
         freshness,
         records,
         cache_evidence: Some(evidence),
-        complete,
+        complete: complete && !alternate,
     }
 }
 
