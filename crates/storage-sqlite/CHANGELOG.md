@@ -22,8 +22,9 @@
   from its edits: the earliest readable edit stands in for the first event, at its place, and the highest version
   shows. `TimelineMessageRecord::agent_item_first_event_missing` says so. The first event, if it arrives, takes the
   row back to its own place. If the id turns out to name an event that is no item, such as another edit, the row
-  goes, and the replies quoting it are updated in the same change. A nightly build from before this change stored
-  such edits without a row: the item shows once another event of it arrives or the chat's timeline is rebuilt.
+  goes, and the replies quoting it lose the quote in the same change, as `ReplyPreviewChanged`. A nightly build from
+  before this change stored such edits without a row: the item shows once another event of it arrives or the chat's
+  timeline is rebuilt.
 - A history import reports the rows it removed, such as an item whose only edit it deleted, as `Remove` changes, so
   an open timeline drops them.
 - An agent's own words in a thread under one of its agent items (a kind 1111 with `E`, `K` 1201 and `P` its sender)

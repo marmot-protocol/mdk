@@ -3830,23 +3830,25 @@ fn timeline_trigger_for_event_row(
     row: &TimelineMessageRecord,
 ) -> TimelineUpdateTrigger {
     let event_targets = tag_values(tags, EVENT_REF_TAG).collect::<Vec<_>>();
+    // A reply to this event itself, of whatever kind (such as one with the id
+    // of an agent item shown from its edits), or to a message it changes.
     if row.message_id_hex != event_message_id_hex
         && row
             .reply_to_message_id_hex
             .as_deref()
             .is_some_and(|reply_target| {
                 reply_target == event_message_id_hex
-                    || event_targets.iter().any(|target| target == &reply_target)
+                    || (event_targets.iter().any(|target| target == &reply_target)
+                        && (cgka_traits::is_chat_message(kind, tags)
+                            || matches!(
+                                kind,
+                                MARMOT_APP_EVENT_KIND_AGENT_ITEM
+                                    | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+                                    | MARMOT_APP_EVENT_KIND_DELETE
+                                    | MARMOT_APP_EVENT_KIND_REMOVE
+                                    | MARMOT_APP_EVENT_KIND_EDIT
+                            )))
             })
-        && (cgka_traits::is_chat_message(kind, tags)
-            || matches!(
-                kind,
-                MARMOT_APP_EVENT_KIND_AGENT_ITEM
-                    | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
-                    | MARMOT_APP_EVENT_KIND_DELETE
-                    | MARMOT_APP_EVENT_KIND_REMOVE
-                    | MARMOT_APP_EVENT_KIND_EDIT
-            ))
     {
         return TimelineUpdateTrigger::ReplyPreviewChanged;
     }

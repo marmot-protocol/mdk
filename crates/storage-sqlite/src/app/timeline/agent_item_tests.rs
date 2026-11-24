@@ -755,23 +755,7 @@ fn a_row_shown_from_an_edit_of_an_edit_goes_when_that_edit_arrives() {
     store
         .record_app_event(&item_edit("edit-3", &earlier, 30, 3, "done"))
         .unwrap();
-    let reply = hex('f');
-    let quote = vec![tag(&["e", &earlier])];
-    store
-        .record_app_event(&event(
-            &reply,
-            "alice",
-            40,
-            MARMOT_APP_EVENT_KIND_CHAT,
-            quote,
-            "ok",
-        ))
-        .unwrap();
-    assert!(row(&store, &reply).reply_preview.is_some());
-    assert_eq!(
-        rows(&store),
-        [ITEM.to_owned(), earlier.clone(), reply.clone()]
-    );
+    assert_eq!(rows(&store), [ITEM.to_owned(), earlier.clone()]);
 
     let update = store
         .record_app_event(&item_edit(&earlier, ITEM, 20, 2, "running"))
@@ -780,13 +764,62 @@ fn a_row_shown_from_an_edit_of_an_edit_goes_when_that_edit_arrives() {
         change,
         TimelineMessageChange::Remove { message_id_hex, .. } if *message_id_hex == earlier
     )));
-    // The reply's quote of the row that went is no longer shown, live too.
-    let live = update.messages.iter().find(|m| m.message_id_hex == reply);
-    assert!(live.expect("the reply is updated").reply_preview.is_none());
     for _ in 0..2 {
-        assert_eq!(rows(&store), [ITEM.to_owned(), reply.clone()]);
-        assert!(row(&store, &reply).reply_preview.is_none());
+        assert_eq!(rows(&store), [ITEM]);
         assert_eq!(row(&store, ITEM).plaintext, "v2 running");
         store.rebuild_message_timeline_for_group(GROUP).unwrap();
+    }
+}
+
+#[test]
+fn a_reply_quoting_a_row_shown_from_an_edit_loses_its_quote_when_that_row_goes() {
+    let earlier = hex('e');
+    let reply = hex('f');
+    let reaction = event(
+        &earlier,
+        "bob",
+        20,
+        MARMOT_APP_EVENT_KIND_REACTION,
+        vec![tag(&["e", ITEM])],
+        "+",
+    );
+    for not_an_item in [item_edit(&earlier, ITEM, 20, 2, "running"), reaction] {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        store
+            .record_app_event(&item(ITEM, 10, 1, "running", 1))
+            .unwrap();
+        store
+            .record_app_event(&item_edit("edit-3", &earlier, 30, 3, "done"))
+            .unwrap();
+        let quote = vec![tag(&["e", &earlier])];
+        store
+            .record_app_event(&event(
+                &reply,
+                "alice",
+                40,
+                MARMOT_APP_EVENT_KIND_CHAT,
+                quote,
+                "ok",
+            ))
+            .unwrap();
+        assert!(row(&store, &reply).reply_preview.is_some());
+
+        let update = store.record_app_event(&not_an_item).unwrap();
+        assert!(
+            update.changes.iter().any(|change| matches!(
+                change,
+                TimelineMessageChange::Upsert {
+                    trigger: TimelineUpdateTrigger::ReplyPreviewChanged,
+                    message,
+                } if message.message_id_hex == reply && message.reply_preview.is_none()
+            )),
+            "kind {}",
+            not_an_item.kind
+        );
+        for _ in 0..2 {
+            assert_eq!(rows(&store), [ITEM.to_owned(), reply.clone()]);
+            assert!(row(&store, &reply).reply_preview.is_none());
+            store.rebuild_message_timeline_for_group(GROUP).unwrap();
+        }
     }
 }
