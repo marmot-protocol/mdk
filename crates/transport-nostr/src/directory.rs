@@ -798,8 +798,10 @@ impl NostrSdkDirectoryRelayFetcher {
     /// a relay missing from the pool. A relay's every EVENT frame would count
     /// toward an item cap, matching or not, so none is set: one relay that
     /// ignores the filter cannot crowd out the events asked for. The relays
-    /// share one byte budget, however their replies divide it, and the
-    /// deadline bounds them.
+    /// share one byte budget for the events they keep, however their replies
+    /// divide it, and the deadline bounds them. Frames not yet read are
+    /// bounded per relay, as for every finite request: each relay's queue
+    /// holds at most that budget plus one frame, and drains as it is read.
     async fn fetch_each(
         &self,
         relay_urls: &[RelayUrl],
@@ -945,10 +947,21 @@ impl NostrSdkDirectoryRelayFetcher {
                 let relay_urls = &relay_urls;
                 async move {
                     let filter = directory_query_filter(&query, false)?;
-                    // The newest `limit` distinct events any relay sent.
-                    let events = self
+                    let replies = self
                         .fetch_each(relay_urls, std::slice::from_ref(&filter))
-                        .await
+                        .await;
+                    // A plain lookup cannot say it is partial, and a record a
+                    // cut relay never sent would read as absent: the lookup
+                    // fails instead, which callers treat as unresolved.
+                    if replies
+                        .iter()
+                        .flatten()
+                        .any(|reply| reply.end == FiniteEnd::ByteLimit)
+                    {
+                        return Err("directory read exceeded its byte budget".to_owned());
+                    }
+                    // The newest `limit` distinct events any relay sent.
+                    let events = replies
                         .into_iter()
                         .flatten()
                         .flat_map(|reply| reply.events)
@@ -2290,6 +2303,43 @@ mod tests {
             }
         });
         (endpoint, filter_counts, server)
+    }
+
+    /// A lookup whose relays send more than its byte budget fails rather than
+    /// return what fit: a record past the cut would read as absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_directory_read_past_its_byte_budget_fails() {
+        use nostr_sdk::prelude::{EventBuilder, Keys};
+
+        let keys = Keys::generate();
+        let filler = "x".repeat(1024 * 1024);
+        let stored = (0..17)
+            .map(|n| {
+                let event = EventBuilder::new(Kind::Metadata, format!("{n}{filler}"))
+                    .custom_created_at(Timestamp::from_secs(1_700_000_000 + n))
+                    .finalize(&keys)
+                    .unwrap();
+                serde_json::to_value(event).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (endpoint, _, server) = spawn_filter_limited_relay(3, stored).await;
+        let request = DirectoryFetchRequest::new(
+            vec![endpoint],
+            vec![DirectoryEventQuery::new(
+                0,
+                vec![keys.public_key().to_hex()],
+                1,
+            )],
+        )
+        .unwrap();
+        let result = timeout(
+            Duration::from_secs(10),
+            NostrSdkDirectoryRelayFetcher::standalone().fetch_directory_events(request),
+        )
+        .await
+        .expect("the relay answers");
+        server.abort();
+        assert!(result.is_err());
     }
 
     /// A relay that ignores the filter and sends other events first still
