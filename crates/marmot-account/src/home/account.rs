@@ -77,9 +77,26 @@ struct WipeCleanup {
 struct CredentialManifest {
     account: AccountSummary,
     legacy: bool,
+    #[serde(default)]
+    generated_named_creation: bool,
     // Clearing an owner must not reopen admission of retained raw keys.
     nip46_admission: Nip46Admission,
+    #[serde(default)]
+    nip46_retirement_pending: bool,
+    #[serde(default)]
+    nip46_legacy_cleanup_pending: bool,
     credentials: [Option<OwnedCredential>; 3],
+}
+
+impl CredentialManifest {
+    fn validate_identity(&self, account: &AccountSummary) -> AccountHomeResult<()> {
+        if self.account.label != account.label
+            || self.account.account_id_hex != account.account_id_hex
+        {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -113,6 +130,8 @@ struct CleanupCredential {
 struct LegacyCredential {
     account: AccountSummary,
     kind: SecretCredentialKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_tombstone_home: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -148,6 +167,7 @@ static TOMBSTONE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct AccountHome {
     root: PathBuf,
     secret_store: Arc<dyn AccountSecretStore>,
+    local_file_store: bool,
     ios_options: IosOptions,
     /// Serializes mutating operations whose check-then-act sequences would
     /// otherwise race against concurrent callers, including session credential
@@ -220,7 +240,8 @@ pub enum Nip46SessionWrite {
 pub enum Nip46Removal {
     /// Generic external-account cleanup must not query an unrelated host vault.
     Recorded,
-    /// Explicit NIP-46 removal also revokes a key whose metadata was lost.
+    /// Retire an exact managed owner even if its session metadata was lost.
+    /// Keep unresolved raw legacy cleanup separately without acquiring a key.
     IncludingOrphaned,
 }
 
@@ -308,6 +329,84 @@ pub struct AccountSetupState {
     #[serde(default)]
     pub kind: AccountSetupKind,
     pub phase: AccountSetupPhase,
+}
+
+/// Result of checking and rolling back an unpublished account setup.
+#[derive(Debug)]
+pub enum AccountSetupRollback {
+    /// The expected account or its unpublished journal no longer matches.
+    Skipped,
+    /// The account has left the live catalog.
+    Removed,
+    /// The prior public account is live. Retirement may need another attempt.
+    RestoredPublic { retirement: AccountHomeResult<()> },
+}
+
+#[derive(Deserialize, Serialize)]
+struct AccountSetupJournal {
+    #[serde(flatten)]
+    state: AccountSetupState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission_role: Option<SetupAdmissionRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    promotion: Option<PublicPromotion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created: Option<bool>,
+}
+
+impl AccountSetupJournal {
+    fn promotion_for(
+        &self,
+        account: &AccountSummary,
+    ) -> AccountHomeResult<Option<&PublicPromotion>> {
+        if self.state.account_id_hex != account.account_id_hex {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        if let Some(promotion) = &self.promotion {
+            promotion.validate_account(account)?;
+        }
+        Ok(self.promotion.as_ref())
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct PublicPromotion {
+    account: AccountSummary,
+    prior_journal: bool,
+    #[serde(default)]
+    prior_created: Option<bool>,
+}
+
+impl PublicPromotion {
+    fn validate_account(&self, account: &AccountSummary) -> AccountHomeResult<()> {
+        if self.account.label != account.label
+            || self.account.account_id_hex != account.account_id_hex
+            || self.account.can_sign()
+        {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SetupAdmissionRole {
+    Local,
+    External,
+    Public,
+}
+
+impl SetupAdmissionRole {
+    fn of(account: &AccountSummary) -> Self {
+        if account.local_signing {
+            Self::Local
+        } else if account.external_signing {
+            Self::External
+        } else {
+            Self::Public
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -402,7 +501,10 @@ impl AccountHome {
     pub fn open(root: impl AsRef<Path>) -> Self {
         let root = root.as_ref();
         let secret_store = Arc::new(LocalFileSecretStore::new(root, IosOptions::default()));
-        Self::open_with_secret_store(root, secret_store, IosOptions::default())
+        Self {
+            local_file_store: true,
+            ..Self::open_with_secret_store(root, secret_store, IosOptions::default())
+        }
     }
 
     pub fn open_with_keychain(
@@ -426,6 +528,7 @@ impl AccountHome {
         Self {
             root: root.as_ref().to_path_buf(),
             secret_store,
+            local_file_store: false,
             ios_options,
             mutation_lock: Arc::new(Mutex::new(())),
             home_id: Arc::new(OnceLock::new()),
@@ -442,8 +545,44 @@ impl AccountHome {
     }
 
     pub fn create_account(&self, label: &str) -> AccountHomeResult<AccountSummary> {
+        let _guard = self.mutation_guard()?;
+        validate_account_label(label)?;
+        if self.account_record_path(label).try_exists()?
+            || self.raw_account_setup_state(label)?.is_some()
+        {
+            return Err(AccountHomeError::AccountExists(label.to_owned()));
+        }
+        if let Some(mut manifest) = self.credential_manifest(label)? {
+            let index = credential_index(SecretCredentialKind::Signing);
+            let Some(claim) = manifest.credentials[index].as_ref() else {
+                return Err(AccountHomeError::AccountExists(label.to_owned()));
+            };
+            if !manifest.generated_named_creation
+                || manifest.account.label != label
+                || !manifest.account.local_signing
+                || manifest.account.external_signing
+                || manifest.legacy
+                || claim.kind != SecretCredentialKind::Signing
+                || claim.claim_mode != SecretClaimMode::CreateOnly
+                || claim.account != manifest.account
+                || manifest
+                    .credentials
+                    .iter()
+                    .enumerate()
+                    .any(|(slot, claim)| slot != index && claim.is_some())
+            {
+                return Err(AccountHomeError::AccountExists(label.to_owned()));
+            }
+            self.check_credential(&manifest.account, claim)?;
+            self.secret_store
+                .release_secret(claim.request(), SecretReleaseMode::DeleteIfUnowned)?;
+            // Leave the on-disk owner intact until the directory moves, so a
+            // crash or rename failure retries release against the same owner.
+            manifest.credentials[index] = None;
+            self.abort_prepared_account(label, &self.account_dir(label), &manifest)?;
+        }
         let keys = nostr::prelude::Keys::generate();
-        self.write_signing_account_for_label(label, &keys)
+        self.write_signing_account_for_label_locked(label, &keys, true)
     }
 
     pub fn create_nostr_account(&self) -> AccountHomeResult<AccountSummary> {
@@ -475,13 +614,18 @@ impl AccountHome {
         {
             return Err(AccountHomeError::AccountExists(account.label));
         }
-        let state = AccountSetupState {
-            account_id_hex: account.account_id_hex.clone(),
-            reused_account_id_credential: false,
-            kind: AccountSetupKind::GeneratedIdentity,
-            phase: AccountSetupPhase::LocalStateCreated,
+        let journal = AccountSetupJournal {
+            state: AccountSetupState {
+                account_id_hex: account.account_id_hex.clone(),
+                reused_account_id_credential: false,
+                kind: AccountSetupKind::GeneratedIdentity,
+                phase: AccountSetupPhase::LocalStateCreated,
+            },
+            admission_role: Some(SetupAdmissionRole::Local),
+            promotion: None,
+            created: Some(true),
         };
-        self.write_account_setup_state(&account.label, &state)?;
+        self.write_account_setup_journal(&account.label, &journal)?;
         self.acquire_credential(
             &account,
             SecretCredentialKind::Signing,
@@ -705,8 +849,13 @@ impl AccountHome {
             unlinked: false,
         };
         let _ = self.pending_signing_admission(&account.label, &account.account_id_hex)?;
-        if let Some(mut setup) = self.raw_account_setup_state(&account.label)? {
-            if setup.account_id_hex != account.account_id_hex || setup.kind != kind {
+        if let Some(mut journal) = self.raw_account_setup_journal(&account.label)? {
+            if journal.state.account_id_hex != account.account_id_hex
+                || journal.state.kind != kind
+                || journal
+                    .admission_role
+                    .is_some_and(|role| role != SetupAdmissionRole::Local)
+            {
                 return Err(AccountHomeError::AccountExists(account.label));
             }
             let acquired = self.acquire_credential(
@@ -720,13 +869,15 @@ impl AccountHome {
                     .secret_store
                     .has_secret_for_account_id(&account.account_id_hex)?
             {
-                setup.reused_account_id_credential = true;
+                journal.state.reused_account_id_credential = true;
             }
-            self.write_account_setup_state(&account.label, &setup)?;
+            journal.admission_role = Some(SetupAdmissionRole::Local);
+            journal.created = Some(true);
+            self.write_account_setup_journal(&account.label, &journal)?;
             self.write_account_record(&account)?;
             return Ok(NostrAccountImport {
                 account,
-                reused_account_id_credential: setup.reused_account_id_credential,
+                reused_account_id_credential: journal.state.reused_account_id_credential,
             });
         }
         if self.secret_store.has_secret_for_label(&account.label)? {
@@ -740,13 +891,18 @@ impl AccountHome {
         let reused = self
             .secret_store
             .has_secret_for_account_id(&account.account_id_hex)?;
-        let mut setup = AccountSetupState {
-            account_id_hex: account.account_id_hex.clone(),
-            reused_account_id_credential: reused,
-            kind,
-            phase: AccountSetupPhase::LocalStateCreated,
+        let mut journal = AccountSetupJournal {
+            state: AccountSetupState {
+                account_id_hex: account.account_id_hex.clone(),
+                reused_account_id_credential: reused,
+                kind,
+                phase: AccountSetupPhase::LocalStateCreated,
+            },
+            admission_role: Some(SetupAdmissionRole::Local),
+            promotion: None,
+            created: Some(true),
         };
-        self.write_account_setup_state(&account.label, &setup)?;
+        self.write_account_setup_journal(&account.label, &journal)?;
         let mode = if reused {
             SecretClaimMode::MigrateLegacy
         } else {
@@ -759,13 +915,13 @@ impl AccountHome {
                 .secret_store
                 .has_secret_for_account_id(&account.account_id_hex)?
         {
-            setup.reused_account_id_credential = true;
-            self.write_account_setup_state(&account.label, &setup)?;
+            journal.state.reused_account_id_credential = true;
+            self.write_account_setup_journal(&account.label, &journal)?;
         }
         self.write_account_record(&account)?;
         Ok(NostrAccountImport {
             account,
-            reused_account_id_credential: setup.reused_account_id_credential,
+            reused_account_id_credential: journal.state.reused_account_id_credential,
         })
     }
 
@@ -791,14 +947,42 @@ impl AccountHome {
         phase: AccountSetupPhase,
     ) -> AccountHomeResult<AccountSetupState> {
         let _guard = self.mutation_guard()?;
+        validate_account_label(&account.label)?;
+        let prior = self.raw_account_setup_journal(&account.label)?;
+        let has_record = self.account_record_path(&account.label).try_exists()?;
+        let role = SetupAdmissionRole::of(account);
+        if let Some(prior) = &prior {
+            prior.promotion_for(account)?;
+            if !has_record
+                && (prior.state.kind != kind
+                    || prior.admission_role.is_some_and(|stored| stored != role))
+            {
+                return Err(AccountHomeError::AccountExists(account.label.clone()));
+            }
+        }
+        if !has_record && let Some(manifest) = self.credential_manifest(&account.label)? {
+            manifest.validate_identity(account)?;
+            if SetupAdmissionRole::of(&manifest.account) != role {
+                return Err(AccountHomeError::AccountExists(account.label.clone()));
+            }
+        }
         let state = AccountSetupState {
             account_id_hex: account.account_id_hex.clone(),
             reused_account_id_credential,
             kind,
             phase,
         };
-        self.write_account_setup_state(&account.label, &state)?;
-        Ok(state)
+        let journal = AccountSetupJournal {
+            state,
+            admission_role: Some(role),
+            created: prior
+                .as_ref()
+                .and_then(|journal| journal.created)
+                .or(Some(!has_record)),
+            promotion: prior.and_then(|journal| journal.promotion),
+        };
+        self.write_account_setup_journal(&account.label, &journal)?;
+        Ok(journal.state)
     }
 
     pub fn account_setup_state(
@@ -810,6 +994,15 @@ impl AccountHome {
     }
 
     fn raw_account_setup_state(&self, label: &str) -> AccountHomeResult<Option<AccountSetupState>> {
+        Ok(self
+            .raw_account_setup_journal(label)?
+            .map(|journal| journal.state))
+    }
+
+    fn raw_account_setup_journal(
+        &self,
+        label: &str,
+    ) -> AccountHomeResult<Option<AccountSetupJournal>> {
         match read_json(self.account_setup_state_path(label)) {
             Ok(state) => Ok(Some(state)),
             Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -826,31 +1019,35 @@ impl AccountHome {
     ) -> AccountHomeResult<()> {
         let _guard = self.mutation_guard()?;
         let account = self.account(account_ref)?;
-        let Some(mut state) = self.account_setup_state(&account.label)? else {
+        let Some(mut journal) = self.raw_account_setup_journal(&account.label)? else {
             return Err(AccountHomeError::AccountSetupStateMissing);
         };
-        if state.account_id_hex != account.account_id_hex {
+        if journal.state.account_id_hex != account.account_id_hex {
             return Err(AccountHomeError::AccountIdMismatch);
         }
-        state.phase = phase;
-        write_private_json(self.account_setup_state_path(&account.label), &state)
+        journal.state.phase = phase;
+        self.write_account_setup_journal(&account.label, &journal)
     }
 
-    fn write_account_setup_state(
+    fn write_account_setup_journal(
         &self,
         label: &str,
-        state: &AccountSetupState,
+        journal: &AccountSetupJournal,
     ) -> AccountHomeResult<()> {
         validate_account_label(label)?;
-        write_private_json(self.account_setup_state_path(label), state)
+        write_private_json(&self.root, self.account_setup_state_path(label), journal)
     }
 
     pub fn complete_account_setup(&self, account_ref: &str) -> AccountHomeResult<()> {
         let _guard = self.mutation_guard()?;
         let account = self.account(account_ref)?;
+        self.remove_account_setup_journal(&account.label)
+    }
+
+    fn remove_account_setup_journal(&self, label: &str) -> AccountHomeResult<()> {
         for path in [
-            self.account_setup_state_path(&account.label),
-            self.account_setup_context_path(&account.label),
+            self.account_setup_state_path(label),
+            self.account_setup_context_path(label),
         ] {
             match fs::remove_file(path) {
                 Ok(()) => {}
@@ -858,7 +1055,7 @@ impl AccountHome {
                 Err(err) => return Err(err.into()),
             }
         }
-        Ok(())
+        Ok(crate::io::sync_directory(&self.account_dir(label))?)
     }
 
     /// Store app-owned, opaque setup context alongside the account journal.
@@ -874,7 +1071,11 @@ impl AccountHome {
         if self.raw_account_setup_state(&account.label)?.is_none() {
             return Err(AccountHomeError::AccountSetupStateMissing);
         }
-        write_private_bytes(self.account_setup_context_path(&account.label), bytes)
+        write_private_bytes(
+            &self.root,
+            self.account_setup_context_path(&account.label),
+            bytes,
+        )
     }
 
     pub fn account_setup_context(&self, account_ref: &str) -> AccountHomeResult<Option<Vec<u8>>> {
@@ -894,6 +1095,7 @@ impl AccountHome {
         let _guard = self.mutation_guard()?;
         let account = self.account(account_ref)?;
         write_private_bytes(
+            &self.root,
             self.account_dir(&account.label).join("onboarding.json"),
             bytes,
         )
@@ -942,7 +1144,11 @@ impl AccountHome {
             return Ok(());
         }
         *floor = created_at;
-        write_private_json(self.replaceable_record_floors_path(&account.label), &floors)
+        write_private_json(
+            &self.root,
+            self.replaceable_record_floors_path(&account.label),
+            &floors,
+        )
     }
 
     /// Retain the last cancelled checkpoint while removing its active gate.
@@ -955,15 +1161,11 @@ impl AccountHome {
             return Err(AccountHomeError::AccountExists(account.label));
         }
         let directory = self.account_dir(&account.label);
-        match fs::rename(
-            directory.join("onboarding.json"),
-            directory.join("onboarding-cancelled.json"),
+        match crate::io::replace_file_for_commit(
+            &directory.join("onboarding.json"),
+            &directory.join("onboarding-cancelled.json"),
         ) {
-            Ok(()) => {
-                #[cfg(unix)]
-                fs::File::open(directory)?.sync_all()?;
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -979,6 +1181,7 @@ impl AccountHome {
         let _guard = self.mutation_guard()?;
         let account = self.account(account_ref)?;
         write_private_bytes(
+            &self.root,
             self.account_dir(&account.label)
                 .join("onboarding-recovery.json"),
             bytes,
@@ -1014,13 +1217,9 @@ impl AccountHome {
             return Err(AccountHomeError::AccountExists(account.label));
         }
         let directory = self.account_dir(&account.label);
-        write_private_bytes(directory.join("onboarding.json"), tombstone)?;
-        fs::rename(
-            directory.join("onboarding.json"),
-            directory.join("onboarding-cancelled.json"),
-        )?;
-        #[cfg(unix)]
-        fs::File::open(directory)?.sync_all()?;
+        let active = directory.join("onboarding.json");
+        write_private_bytes(&self.root, &active, tombstone)?;
+        crate::io::replace_file_for_commit(&active, &directory.join("onboarding-cancelled.json"))?;
         Ok(())
     }
 
@@ -1090,32 +1289,131 @@ impl AccountHome {
 
     pub fn revert_external_signer_upgrade(&self, account_ref: &str) -> AccountHomeResult<()> {
         let _guard = self.mutation_guard()?;
-        let mut account = self.account(account_ref)?;
-        if !account.external_signing || account.local_signing {
+        let account = self.account(account_ref)?;
+        if account.local_signing {
             return Ok(());
         }
-        let mut manifest = self.manifest_or_legacy(&account)?;
+        if !account.external_signing {
+            return self.resume_public_nip46_retirement(&account);
+        }
+        let mut public = account.clone();
+        public.external_signing = false;
+        if let Some(promotion) = self
+            .raw_account_setup_journal(&account.label)?
+            .and_then(|journal| journal.promotion)
+        {
+            promotion.validate_account(&account)?;
+            public = promotion.account;
+        }
+        self.restore_public_role(&account, &public)?
+    }
+
+    /// Whether the external-signing account has a journaled prior public role.
+    /// Rollback checks the record again under the mutation guard.
+    pub fn external_signer_setup_promoted(&self, account_ref: &str) -> AccountHomeResult<bool> {
+        let account = self.account(account_ref)?;
+        if !account.external_signing || account.local_signing {
+            return Ok(false);
+        }
+        let Some(journal) = self.raw_account_setup_journal(&account.label)? else {
+            return Ok(false);
+        };
+        Ok(journal.promotion_for(&account)?.is_some())
+    }
+
+    /// Roll back a setup the caller owns after it has quiesced the account runtime.
+    /// This checks the expected account and unpublished phase under the same guard
+    /// as phase writes. A promoted account keeps its public payload.
+    /// `before_wipe` runs under the guard only before destructive removal. It
+    /// must not call back into `AccountHome`.
+    pub fn rollback_unpublished_account_setup(
+        &self,
+        expected: &AccountSummary,
+        import: Option<&NostrAccountImport>,
+        before_wipe: Option<&dyn Fn() -> std::io::Result<()>>,
+    ) -> AccountHomeResult<AccountSetupRollback> {
+        let _guard = self.mutation_guard()?;
+        validate_account_label(&expected.label)?;
+        let account: AccountSummary =
+            match read_private_json(self.account_record_path(&expected.label)) {
+                Ok(account) => account,
+                Err(AccountHomeError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(AccountSetupRollback::Skipped);
+                }
+                Err(error) => return Err(error),
+            };
+        if &account != expected {
+            return Ok(AccountSetupRollback::Skipped);
+        }
+        let Some(journal) = self.raw_account_setup_journal(&account.label)? else {
+            return Ok(AccountSetupRollback::Skipped);
+        };
+        let promotion = journal.promotion_for(&account)?;
+        if journal.state.phase != AccountSetupPhase::LocalStateCreated
+            || journal
+                .admission_role
+                .is_some_and(|role| role != SetupAdmissionRole::of(&account))
+        {
+            return Ok(AccountSetupRollback::Skipped);
+        }
+        if let Some(promotion) = promotion {
+            if !account.external_signing || account.local_signing {
+                return Ok(AccountSetupRollback::Skipped);
+            }
+            let retirement = self.restore_public_role(&account, &promotion.account)?;
+            return Ok(AccountSetupRollback::RestoredPublic { retirement });
+        }
+        if import.is_some_and(|import| &import.account != expected) {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        if journal.created != Some(true) && !(account.local_signing && import.is_some()) {
+            return Ok(AccountSetupRollback::Skipped);
+        }
+        let removal = if account.local_signing
+            && (journal.state.reused_account_id_credential
+                || import.is_some_and(|import| import.reused_account_id_credential))
+        {
+            SigningKeyRemoval::Preserve
+        } else {
+            SigningKeyRemoval::Delete
+        };
+        if let Some(before_wipe) = before_wipe {
+            before_wipe()?;
+        }
+        self.remove_account_locked(&account.label, Some(&account), removal)?;
+        Ok(AccountSetupRollback::Removed)
+    }
+
+    fn restore_public_role(
+        &self,
+        external: &AccountSummary,
+        public: &AccountSummary,
+    ) -> AccountHomeResult<AccountHomeResult<()>> {
+        let mut manifest = self.manifest_or_legacy(external)?;
         if self.root.join(HOME_IDENTITY_FILE).try_exists()? {
             self.home_identity(false)?;
         }
         for credential in manifest.credentials.iter().flatten() {
-            self.check_credential(&account, credential)?;
+            self.check_credential(external, credential)?;
         }
+        manifest.nip46_retirement_pending = true;
         if manifest.legacy && manifest.nip46_admission == Nip46Admission::LegacyAllowed {
-            // A raw orphan may have no session file or managed owner. Record the
-            // old role before committing so a crash cannot hide its cleanup scope.
             manifest.account.external_signing = true;
-            self.write_credential_manifest(&account.label, &manifest)?;
         }
-        account.external_signing = false;
-        self.write_account_record(&account)?;
-        if self
-            .remove_nip46_session_inner(&account, Nip46Removal::IncludingOrphaned)
-            .is_err()
-        {
-            tracing::warn!(target: TRACE_TARGET, method = "revert_external_signer_upgrade", "public role restored; NIP-46 credential retirement remains pending");
+        self.write_credential_manifest(&external.label, &manifest)?;
+        if let Err(error) = self.write_account_record(public) {
+            return if self
+                .account(&public.label)
+                .is_ok_and(|live| live == *public)
+            {
+                Ok(Err(error))
+            } else {
+                Err(error)
+            };
         }
-        Ok(())
+        Ok(self.remove_nip46_session_inner(public, Nip46Removal::IncludingOrphaned))
     }
 
     pub fn account_id_for_secret(secret_key: &str) -> AccountHomeResult<String> {
@@ -1291,7 +1589,7 @@ impl AccountHome {
         {
             self.retire_claim(&account, SecretCredentialKind::Nip46Session, &mut manifest)?;
         }
-        write_private_json(directory.join(NIP46_SESSION_FILE), record)?;
+        write_private_json(&self.root, directory.join(NIP46_SESSION_FILE), record)?;
         let acquired = self.acquire_credential(
             &account,
             SecretCredentialKind::Nip46Session,
@@ -1372,8 +1670,9 @@ impl AccountHome {
     }
 
     /// Remove the session locally, without requiring the remote signer to respond.
-    /// A failed secret-store deletion leaves a removal record for an explicit retry.
-    /// Retained raw legacy material remains pending independently of local completion.
+    /// A failed managed retirement leaves a removal record for an explicit retry.
+    /// Success confirms local removal. Independent raw legacy cleanup may still
+    /// be pending and never reopens legacy admission.
     pub fn remove_nip46_session(
         &self,
         account_ref: &str,
@@ -1417,30 +1716,60 @@ impl AccountHome {
         let recorded = path.try_exists()? || removing.try_exists()?;
         let index = credential_index(SecretCredentialKind::Nip46Session);
         let mut manifest = self.manifest_or_legacy(account)?;
-        if manifest.nip46_admission != Nip46Admission::ManagedOnly {
+        let raw_pending =
+            manifest.legacy && (recorded || removal == Nip46Removal::IncludingOrphaned);
+        if manifest.nip46_admission != Nip46Admission::ManagedOnly
+            || (raw_pending && !manifest.nip46_legacy_cleanup_pending)
+        {
             manifest.nip46_admission = Nip46Admission::ManagedOnly;
+            manifest.nip46_legacy_cleanup_pending |= raw_pending;
             self.write_credential_manifest(&account.label, &manifest)?;
         }
-        if !recorded && (removal == Nip46Removal::Recorded || manifest.credentials[index].is_none())
+        if recorded
+            || (removal == Nip46Removal::IncludingOrphaned && manifest.credentials[index].is_some())
         {
-            return Ok(());
-        }
-        match crate::io::rename_for_commit(&path, &removing) {
-            Ok(()) => crate::io::sync_directory(&directory)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if !removing.try_exists()? {
-                    write_private_json(&removing, &())?;
+            match crate::io::rename_for_commit(&path, &removing) {
+                Ok(()) => crate::io::sync_directory(&directory)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if !removing.try_exists()? {
+                        write_private_json(&self.root, &removing, &())?;
+                    }
                 }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
+            self.retire_claim(account, SecretCredentialKind::Nip46Session, &mut manifest)?;
+            match fs::remove_file(removing) {
+                Ok(()) => crate::io::sync_directory(&directory)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        self.retire_claim(account, SecretCredentialKind::Nip46Session, &mut manifest)?;
-        match fs::remove_file(removing) {
-            Ok(()) => crate::io::sync_directory(&directory)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        if manifest.nip46_retirement_pending && !account.external_signing {
+            self.restore_public_setup_journal(account)?;
+            manifest.nip46_retirement_pending = false;
+            self.write_credential_manifest(&account.label, &manifest)?;
+        }
+        if manifest.nip46_legacy_cleanup_pending && removal == Nip46Removal::IncludingOrphaned {
+            tracing::warn!(target: TRACE_TARGET, method = "remove_nip46_session", "independent raw NIP-46 credential cleanup remains pending");
         }
         Ok(())
+    }
+
+    fn restore_public_setup_journal(&self, account: &AccountSummary) -> AccountHomeResult<()> {
+        let Some(mut journal) = self.raw_account_setup_journal(&account.label)? else {
+            return Ok(());
+        };
+        let Some(promotion) = journal.promotion.take() else {
+            return Ok(());
+        };
+        promotion.validate_account(account)?;
+        if promotion.prior_journal {
+            journal.admission_role = Some(SetupAdmissionRole::Public);
+            journal.created = promotion.prior_created;
+            self.write_account_setup_journal(&account.label, &journal)
+        } else {
+            self.remove_account_setup_journal(&account.label)
+        }
     }
 
     /// List the complete account catalog or report a read error. Unlike `accounts`,
@@ -1605,8 +1934,7 @@ impl AccountHome {
             return Ok(None);
         }
         let tombstone_root = self.root.join(WIPE_TOMBSTONE_DIR);
-        fs_private::create_dir_all_private(&tombstone_root)?;
-        crate::io::sync_directory(&self.root)?;
+        crate::io::create_durable_private_dir(&self.root, &tombstone_root)?;
         for _ in 0..32 {
             let attempt = TOMBSTONE_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tombstone =
@@ -1673,6 +2001,7 @@ impl AccountHome {
             .account_dir(&account.label)
             .join(ACCOUNT_KEY_SECURITY_FILE);
         write_private_json(
+            &self.root,
             &path,
             &StoredKeySecurity {
                 key_security_byte: 0x00,
@@ -1738,6 +2067,15 @@ impl AccountHome {
         keys: &nostr::prelude::Keys,
     ) -> AccountHomeResult<AccountSummary> {
         let _guard = self.mutation_guard()?;
+        self.write_signing_account_for_label_locked(label, keys, false)
+    }
+
+    fn write_signing_account_for_label_locked(
+        &self,
+        label: &str,
+        keys: &nostr::prelude::Keys,
+        generated_named_creation: bool,
+    ) -> AccountHomeResult<AccountSummary> {
         validate_account_label(label)?;
         if self.account_record_path(label).try_exists()? {
             return Err(AccountHomeError::AccountExists(label.to_owned()));
@@ -1771,7 +2109,17 @@ impl AccountHome {
             signed_out: false,
             unlinked: false,
         };
-        self.write_new_signing_account(&account, keys)
+        let mut manifest = self.manifest_or_legacy(&account)?;
+        manifest.generated_named_creation = generated_named_creation;
+        self.acquire_prepared_credential(
+            &account,
+            SecretCredentialKind::Signing,
+            SecretClaimMode::CreateOnly,
+            Some(keys),
+            manifest,
+        )?;
+        self.write_account_record(&account)?;
+        Ok(account)
     }
 
     fn pending_signing_admission(
@@ -1779,6 +2127,21 @@ impl AccountHome {
         label: &str,
         account_id_hex: &str,
     ) -> AccountHomeResult<Option<CredentialManifest>> {
+        if self
+            .raw_account_setup_journal(label)?
+            .is_some_and(|journal| {
+                journal.state.account_id_hex != account_id_hex
+                    || matches!(
+                        journal.state.kind,
+                        AccountSetupKind::PublicIdentity | AccountSetupKind::ExternalSigner
+                    )
+                    || journal
+                        .admission_role
+                        .is_some_and(|role| role != SetupAdmissionRole::Local)
+            })
+        {
+            return Err(AccountHomeError::AccountExists(label.to_owned()));
+        }
         let manifest = self.credential_manifest(label)?;
         if manifest.as_ref().is_some_and(|manifest| {
             manifest.account.account_id_hex != account_id_hex
@@ -1814,21 +2177,6 @@ impl AccountHome {
         Ok(account)
     }
 
-    fn write_new_signing_account(
-        &self,
-        account: &AccountSummary,
-        keys: &nostr::prelude::Keys,
-    ) -> AccountHomeResult<AccountSummary> {
-        self.acquire_credential(
-            account,
-            SecretCredentialKind::Signing,
-            SecretClaimMode::CreateOnly,
-            Some(keys),
-        )?;
-        self.write_account_record(account)?;
-        Ok(account.clone())
-    }
-
     fn write_account_record(&self, account: &AccountSummary) -> AccountHomeResult<()> {
         validate_account_label(&account.label)?;
         let path = self.account_record_path(&account.label);
@@ -1843,12 +2191,15 @@ impl AccountHome {
                 &CredentialManifest {
                     account: account.clone(),
                     legacy: false,
+                    generated_named_creation: false,
                     nip46_admission: Nip46Admission::ManagedOnly,
+                    nip46_retirement_pending: false,
+                    nip46_legacy_cleanup_pending: false,
                     credentials: Default::default(),
                 },
             )?;
         }
-        write_private_json(path, account)
+        write_private_json(&self.root, path, account)
     }
 
     fn accounts_dir(&self) -> PathBuf {

@@ -25,9 +25,9 @@ mod secret_store;
 
 pub use error::{AccountHomeError, AccountHomeResult};
 pub use home::{
-    AccountHome, AccountSetupKind, AccountSetupPhase, AccountSetupState, AccountSummary,
-    EXTERNAL_SQLCIPHER_SECRET_FILE, ExternalSecretMode, Nip46Removal, Nip46SessionRecord,
-    Nip46SessionWrite, NostrAccountImport, ROOT_MUTATION_LOCK_FILE,
+    AccountHome, AccountSetupKind, AccountSetupPhase, AccountSetupRollback, AccountSetupState,
+    AccountSummary, EXTERNAL_SQLCIPHER_SECRET_FILE, ExternalSecretMode, Nip46Removal,
+    Nip46SessionRecord, Nip46SessionWrite, NostrAccountImport, ROOT_MUTATION_LOCK_FILE,
 };
 pub use location::IosOptions;
 pub use ownership::{

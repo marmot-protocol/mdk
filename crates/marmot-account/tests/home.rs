@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use marmot_account::{
     AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore, AccountSetupKind,
-    AccountSetupPhase, AccountSetupState, AccountSummary, AcquiredSecret, ExternalSecretMode,
-    IosOptions, KeychainSecretStore, LocalFileSecretStore, Nip46Removal, Nip46SessionRecord,
-    Nip46SessionWrite, SecretClaimMode, SecretCredential, SecretCredentialKind, SecretOrigin,
-    SecretReleaseMode, SecretReleaseOutcome,
+    AccountSetupPhase, AccountSetupRollback, AccountSetupState, AccountSummary, AcquiredSecret,
+    ExternalSecretMode, IosOptions, KeychainSecretStore, LocalFileSecretStore, Nip46Removal,
+    Nip46SessionRecord, Nip46SessionWrite, SecretClaimMode, SecretCredential, SecretCredentialKind,
+    SecretOrigin, SecretReleaseMode, SecretReleaseOutcome,
 };
 use nostr::nips::nip19::FromBech32;
 use nostr::nips::nip49::{EncryptedSecretKey, KeySecurity};
@@ -410,6 +410,17 @@ fn runtime_import_recovers_journal_before_secret_or_account_record() {
     .unwrap();
 
     let home = AccountHome::open(dir.path());
+    for admit in [
+        AccountHome::add_public_account_for_setup,
+        AccountHome::add_external_signer_for_setup,
+    ] {
+        let attempt = admit(&home, &account_id);
+        assert!(
+            matches!(attempt, Err(AccountHomeError::AccountExists(label)) if label == account_id)
+        );
+        assert!(!account_dir.join("account.json").exists());
+        assert!(!account_dir.join(".credential-ownership.json").exists());
+    }
     let imported = home
         .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
         .unwrap();
@@ -490,6 +501,82 @@ fn generated_setup_admission() {
         assert_eq!(
             other
                 .load_signing_keys(&account.label)
+                .unwrap()
+                .public_key()
+                .to_hex(),
+            account.account_id_hex
+        );
+    }
+}
+
+#[test]
+fn named_create_retires_ambiguous_owner_on_same_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let other = home.create_account("other").unwrap();
+    let imported_keys = nostr::prelude::Keys::generate();
+    let imported_secret = imported_keys.secret_key().to_secret_hex();
+    store.fail_write_after_commit.store(true, Ordering::SeqCst);
+    assert!(
+        matches!(home.import_account("pending-import", &imported_secret),
+        Err(AccountHomeError::SecretStore(error)) if error == "injected write failure")
+    );
+    assert!(
+        matches!(home.create_account("retry"), Err(AccountHomeError::SecretStore(error)) if error == "injected write failure")
+    );
+    assert!(matches!(
+        home.account("retry"),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    let (abandoned_owner, abandoned_id) = {
+        let state = store.ownership.lock().unwrap();
+        let (owner_id, owner) = state
+            .owners
+            .iter()
+            .find(|(_, owner)| owner.credential.label == "retry")
+            .unwrap();
+        (owner_id.clone(), owner.credential.account_id_hex.clone())
+    };
+    store.fail_write_after_commit.store(false, Ordering::SeqCst);
+    assert!(matches!(home.create_account("pending-import"),
+        Err(AccountHomeError::AccountExists(label)) if label == "pending-import"));
+    let imported = home
+        .import_account("pending-import", &imported_secret)
+        .unwrap();
+    assert_eq!(imported.account_id_hex, imported_keys.public_key().to_hex());
+    store.fail_remove.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        home.create_account("retry"),
+        Err(AccountHomeError::SecretStore(_))
+    ));
+    assert!(matches!(
+        home.account("retry"),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    assert!(
+        store
+            .ownership
+            .lock()
+            .unwrap()
+            .owners
+            .contains_key(&abandoned_owner)
+    );
+    store.fail_remove.store(false, Ordering::SeqCst);
+    let created = home.create_account("retry").unwrap();
+    assert_ne!(created.account_id_hex, abandoned_id);
+    assert!(
+        store
+            .ownership
+            .lock()
+            .unwrap()
+            .retired
+            .contains_key(&abandoned_owner)
+    );
+    for account in [created, other, imported] {
+        assert_eq!(
+            home.load_signing_keys(&account.label)
                 .unwrap()
                 .public_key()
                 .to_hex(),
@@ -1151,6 +1238,13 @@ fn nonlocal_setup_admission() {
             home.set_account_setup_phase(&public_key, AccountSetupPhase::LocalReady)
                 .unwrap();
             assert_eq!(admit(&home, &public_key).unwrap(), account);
+            assert!(matches!(
+                reopened
+                    .rollback_unpublished_account_setup(&account, None, None)
+                    .unwrap(),
+                AccountSetupRollback::Skipped
+            ));
+            assert_eq!(reopened.account(&public_key).unwrap(), account);
             assert_eq!(
                 home.account_setup_state(&public_key)
                     .unwrap()
@@ -1158,9 +1252,29 @@ fn nonlocal_setup_admission() {
                     .phase,
                 AccountSetupPhase::LocalReady
             );
+            let existing_id = nostr::prelude::Keys::generate().public_key().to_hex();
+            let existing = home.add_external_signer_account(&existing_id).unwrap();
+            assert_eq!(admit(&home, &existing_id).unwrap(), existing);
+            assert!(matches!(
+                reopened
+                    .rollback_unpublished_account_setup(&existing, None, None)
+                    .unwrap(),
+                AccountSetupRollback::Skipped
+            ));
+            assert_eq!(reopened.account(&existing_id).unwrap(), existing);
         } else {
             assert!(matches!(admit(&home, &public_key),
                 Err(AccountHomeError::AccountExists(label)) if label == public_key));
+            assert!(matches!(
+                reopened
+                    .rollback_unpublished_account_setup(&account, None, None)
+                    .unwrap(),
+                AccountSetupRollback::Removed
+            ));
+            assert!(matches!(
+                reopened.account(&public_key),
+                Err(AccountHomeError::UnknownAccount(_))
+            ));
         }
     }
 }
@@ -1230,11 +1344,21 @@ fn setup_journal_write_is_atomic() {
             AccountHome::add_public_account_for_setup
         };
 
-        assert!(matches!(
-            admit(&home, &public_key),
-            Err(AccountHomeError::Io(error))
-                if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::EMLINK))
-        ));
+        let Err(AccountHomeError::Io(error)) = admit(&home, &public_key) else {
+            panic!("symlinked account directory must be rejected by the writer");
+        };
+        let refusal = [
+            libc::ELOOP,
+            libc::EMLINK,
+            #[cfg(target_os = "netbsd")]
+            libc::EFTYPE,
+        ];
+        assert!(
+            error
+                .raw_os_error()
+                .is_some_and(|code| refusal.contains(&code)),
+            "{error}"
+        );
         assert!(!saved.join(".account-setup.json").exists());
         assert_eq!(
             home.accounts().unwrap(),
@@ -1294,19 +1418,31 @@ fn setup_journal_error_is_hidden() {
 
 #[test]
 fn setup_admission_keeps_journal() {
-    for (external, recorded) in [(false, false), (true, false), (true, true)] {
+    for (external, recorded, created) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let public_key = nostr::prelude::Keys::generate().public_key().to_hex();
-        let previous = home.add_public_account(&public_key).unwrap();
-        let state = home
-            .begin_account_setup_with(
-                &previous,
-                true,
-                AccountSetupKind::InteractiveIdentity,
-                AccountSetupPhase::BootstrapPublicationStarted,
-            )
-            .unwrap();
+        let (previous, state) = if created {
+            let account = home.add_public_account_for_setup(&public_key).unwrap();
+            let state = home.account_setup_state(&public_key).unwrap().unwrap();
+            (account, state)
+        } else {
+            let account = home.add_public_account(&public_key).unwrap();
+            let state = home
+                .begin_account_setup_with(
+                    &account,
+                    true,
+                    AccountSetupKind::InteractiveIdentity,
+                    AccountSetupPhase::BootstrapPublicationStarted,
+                )
+                .unwrap();
+            (account, state)
+        };
         let account_dir = home.account_dir(&public_key);
         let journal = account_dir.join(".account-setup.json");
         let bytes = std::fs::read(&journal).unwrap();
@@ -1314,18 +1450,50 @@ fn setup_admission_keeps_journal() {
             std::fs::remove_file(account_dir.join("account.json")).unwrap();
         }
 
-        let promoted = if external {
+        let admission = if external {
             home.add_external_signer_for_setup(&public_key)
         } else {
             home.add_public_account_for_setup(&public_key)
+        };
+        if external && !recorded {
+            assert!(
+                matches!(admission, Err(AccountHomeError::AccountExists(label)) if label == public_key)
+            );
+            assert_eq!(std::fs::read(&journal).unwrap(), bytes);
+            assert!(!account_dir.join("account.json").exists());
+            continue;
         }
-        .unwrap();
+        let promoted = admission.unwrap();
 
         assert_eq!(promoted.external_signing, external);
         assert_eq!(promoted.account_id_hex, previous.account_id_hex);
-        assert_eq!(std::fs::read(&journal).unwrap(), bytes);
+        if !external {
+            assert_eq!(std::fs::read(&journal).unwrap(), bytes);
+        }
         assert_eq!(home.account_setup_state(&public_key).unwrap(), Some(state));
         assert_eq!(home.accounts().unwrap(), [promoted]);
+        if external {
+            drop(home);
+            let reopened = AccountHome::open(dir.path());
+            reopened.set_account_signed_out(&public_key, true).unwrap();
+            reopened
+                .revert_external_signer_upgrade(&public_key)
+                .unwrap();
+            assert_eq!(reopened.account(&public_key).unwrap(), previous);
+            assert_eq!(std::fs::read(&journal).unwrap(), bytes);
+            if created {
+                assert!(matches!(
+                    reopened
+                        .rollback_unpublished_account_setup(&previous, None, None)
+                        .unwrap(),
+                    AccountSetupRollback::Removed
+                ));
+                assert!(matches!(
+                    reopened.account(&public_key),
+                    Err(AccountHomeError::UnknownAccount(_))
+                ));
+            }
+        }
     }
 }
 
@@ -1351,6 +1519,44 @@ fn setup_mismatch_keeps_record() {
     ));
     assert_eq!(home.account(&public_key).unwrap(), previous);
     assert_eq!(std::fs::read(journal).unwrap(), bytes);
+}
+
+#[test]
+fn nonlocal_admission_preserves_pending_signing_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let key = nostr::prelude::Keys::generate();
+    let id = key.public_key().to_hex();
+    let account = home
+        .import_nostr_account(&key.secret_key().to_secret_hex())
+        .unwrap();
+    let path = home.account_dir(&id);
+    std::fs::remove_file(path.join("account.json")).unwrap();
+    let manifest = path.join(".credential-ownership.json");
+    let original = std::fs::read(&manifest).unwrap();
+    for admit in [
+        AccountHome::add_public_account_for_setup,
+        AccountHome::add_external_signer_for_setup,
+    ] {
+        assert!(
+            matches!(admit(&home, &id), Err(AccountHomeError::AccountExists(label)) if label == id)
+        );
+        assert!(!path.join("account.json").exists());
+        assert!(!path.join(".account-setup.json").exists());
+        assert_eq!(std::fs::read(&manifest).unwrap(), original);
+    }
+    assert_eq!(
+        home.import_nostr_account(&key.secret_key().to_secret_hex())
+            .unwrap(),
+        account
+    );
+    let mut corrupt: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    corrupt["account"]["account_id_hex"] = serde_json::Value::String("01".repeat(32));
+    fs_private::write_private(&manifest, &serde_json::to_vec(&corrupt).unwrap()).unwrap();
+    assert!(matches!(
+        home.load_signing_keys(&id),
+        Err(AccountHomeError::AccountIdMismatch)
+    ));
 }
 
 #[test]
@@ -2245,6 +2451,12 @@ fn nip46_legacy_removal_repair() {
         assert!(home.load_nip46_session(&label).unwrap().is_none());
         home.remove_nip46_session(&label, Nip46Removal::IncludingOrphaned)
             .unwrap();
+        let ownership = home.account_dir(&label).join(".credential-ownership.json");
+        let pending = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&ownership).unwrap()).unwrap()
+        };
+        assert_eq!(pending()["nip46_legacy_cleanup_pending"], true);
+        assert!(pending()["credentials"][2].is_null());
         drop(home);
 
         for byte in ["03", "04"] {
@@ -2265,6 +2477,7 @@ fn nip46_legacy_removal_repair() {
                 .unwrap();
             assert!(reopened.load_nip46_session(&label).unwrap().is_none());
         }
+        assert_eq!(pending()["nip46_legacy_cleanup_pending"], true);
         assert_eq!(std::fs::read(raw).unwrap(), raw_bytes);
     }
 }
@@ -2400,12 +2613,23 @@ fn nip46_interrupted_repair() {
             let outcome = reopened
                 .store_nip46_session(&label, &fresh, &record)
                 .unwrap();
-            if matches!(recovery, Recovery::RemoveThenPair) {
+            if matches!(interruption, Interruption::AfterWrite)
+                && !matches!(recovery, Recovery::RemoveThenPair)
+            {
+                assert!(
+                    matches!(&outcome, Nip46SessionWrite::Existing(prior) if prior == &record),
+                    "{outcome:?}"
+                );
+            } else {
                 assert!(matches!(outcome, Nip46SessionWrite::Created), "{outcome:?}");
             }
             drop(reopened);
             let loaded =
                 AccountHome::open_with_secret_store(dir.path(), store, IosOptions::default());
+            let _lease = fs_private::try_acquire_private_exclusive_file_lease(
+                &dir.path().join(marmot_account::ROOT_MUTATION_LOCK_FILE),
+            )
+            .unwrap();
             let (keys, restored) = loaded.load_nip46_session(&label).unwrap().unwrap();
             assert_eq!(keys.secret_key(), fresh.secret_key());
             assert_eq!(restored, record);
@@ -2484,7 +2708,10 @@ fn nip46_orphan_wipe_intent() {
         );
         home.resume_wipe_cleanup().unwrap();
         assert_eq!(std::fs::read(&raw).unwrap(), raw_bytes);
-        assert!(tombstone.join(".wipe-cleanup.json").exists());
+        let replayed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tombstone.join(".wipe-cleanup.json")).unwrap())
+                .unwrap();
+        assert_eq!(replayed["legacy"][2], intent["legacy"][2]);
     }
 }
 
@@ -2502,7 +2729,11 @@ fn nip46_retirement_retry() {
         let path = home.account_dir(&label);
         let payload = path.join("session.sqlite");
         std::fs::write(&payload, b"original public payload").unwrap();
-        let external = home.add_external_signer_account(&label).unwrap();
+        let external = if reverted {
+            home.add_external_signer_for_setup(&label).unwrap()
+        } else {
+            home.add_external_signer_account(&label).unwrap()
+        };
         let raw = write_raw_nip46(&home, &label, &user);
         let raw_bytes = std::fs::read(&raw).unwrap();
         assert!(matches!(
@@ -2511,13 +2742,23 @@ fn nip46_retirement_retry() {
         ));
         let old_receipt = file_receipts(dir.path()).pop().unwrap();
         let old_receipt_bytes = std::fs::read(&old_receipt).unwrap();
+        drop(home);
+        let home = AccountHome::open(dir.path());
+        assert_eq!(
+            home.external_signer_setup_promoted(&label).unwrap(),
+            reverted
+        );
         let locked = fs_private::try_acquire_private_exclusive_file_lease(
             &dir.path().join(".credential-store.lock"),
         )
         .unwrap();
 
         if reverted {
-            home.revert_external_signer_upgrade(&label).unwrap();
+            assert!(matches!(
+                home.rollback_unpublished_account_setup(&external, None, None).unwrap(),
+                AccountSetupRollback::RestoredPublic { retirement: Err(AccountHomeError::Io(error)) }
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
             assert_eq!(home.account(&label).unwrap(), public);
             assert!(home.load_nip46_session(&label).unwrap().is_none());
         } else {
@@ -2534,8 +2775,9 @@ fn nip46_retirement_retry() {
                 reopened.add_external_signer_for_setup(&label),
                 Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
             ));
-            assert_eq!(reopened.accounts_strict().unwrap(), [public]);
-            assert!(reopened.account_setup_state(&label).unwrap().is_none());
+            reopened.resume_wipe_cleanup().unwrap();
+            assert_eq!(reopened.accounts_strict().unwrap(), [public.clone()]);
+            assert!(reopened.account_setup_state(&label).unwrap().is_some());
         } else {
             assert!(matches!(
                 reopened.store_nip46_session(&label, &fresh, &pairing),
@@ -2554,6 +2796,12 @@ fn nip46_retirement_retry() {
         drop(locked);
 
         if reverted {
+            reopened.resume_wipe_cleanup().unwrap();
+            assert_eq!(reopened.account(&label).unwrap(), public);
+            assert!(reopened.account_setup_state(&label).unwrap().is_none());
+            assert!(!old_receipt.exists());
+            assert!(!removing.exists());
+            assert_eq!(std::fs::read(&payload).unwrap(), b"original public payload");
             assert_eq!(
                 reopened.add_external_signer_for_setup(&label).unwrap(),
                 external
@@ -2678,9 +2926,7 @@ fn nip46_storage_failure_retry() {
 #[test]
 fn external_db_key_migration() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(MemorySecretStore::default());
-    let home =
-        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let home = AccountHome::open(dir.path());
     let user = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
     let account = home
         .add_external_signer_account(&user.public_key().to_hex())
@@ -2688,7 +2934,27 @@ fn external_db_key_migration() {
     let legacy = home
         .account_dir(&account.label)
         .join(marmot_account::EXTERNAL_SQLCIPHER_SECRET_FILE);
-    std::fs::write(&legacy, "02".repeat(32)).unwrap();
+    let raw = dir
+        .path()
+        .join("accounts/.external-sqlcipher")
+        .join(&account.label)
+        .join("secret.json");
+    fs_private::create_dir_all_private(raw.parent().unwrap()).unwrap();
+    let raw_bytes =
+        serde_json::to_vec(&serde_json::json!({"secret_key_hex": "02".repeat(32)})).unwrap();
+    fs_private::write_private(&raw, &raw_bytes).unwrap();
+    let conflicting = "03".repeat(32);
+    fs_private::write_private(&legacy, conflicting.as_bytes()).unwrap();
+    assert!(matches!(
+        home.external_database_secret(&account.label, ExternalSecretMode::Existing),
+        Err(AccountHomeError::AccountIdMismatch)
+    ));
+    assert_eq!(std::fs::read(&raw).unwrap(), raw_bytes);
+    assert_eq!(std::fs::read_to_string(&legacy).unwrap(), conflicting);
+    assert!(file_receipts(dir.path()).is_empty());
+    assert_eq!(home.account(&account.label).unwrap(), account);
+
+    fs_private::write_private(&legacy, "02".repeat(32).as_bytes()).unwrap();
     assert_eq!(
         *home
             .external_database_secret(&account.label, ExternalSecretMode::Existing)
@@ -2696,30 +2962,76 @@ fn external_db_key_migration() {
         [2; 32]
     );
     assert!(!legacy.exists());
-    let reopened = AccountHome::open_with_secret_store(dir.path(), store, IosOptions::default());
+    assert_eq!(std::fs::read(&raw).unwrap(), raw_bytes);
+    drop(home);
+    let reopened = AccountHome::open(dir.path());
     assert_eq!(
         *reopened
             .external_database_secret(&account.label, ExternalSecretMode::Existing)
             .unwrap(),
         [2; 32]
     );
+    let receipt = file_receipts(dir.path()).pop().unwrap();
+    let before = std::fs::read(&receipt).unwrap();
+    let other_raw =
+        serde_json::to_vec(&serde_json::json!({"secret_key_hex": "04".repeat(32)})).unwrap();
+    fs_private::write_private(&raw, &other_raw).unwrap();
+    fs_private::write_private(&legacy, "02".repeat(32).as_bytes()).unwrap();
+    // Older plaintext migration could commit its receipt before storing the origin.
+    let manifest_path = reopened
+        .account_dir(&account.label)
+        .join(".credential-ownership.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["credentials"][1]["claim_mode"] = serde_json::json!("create_or_adopt");
+    manifest["credentials"][1]["origin"] = serde_json::Value::Null;
+    let pending = serde_json::to_vec(&manifest).unwrap();
+    fs_private::write_private(&manifest_path, &pending).unwrap();
+    assert!(matches!(
+        reopened.external_database_secret(&account.label, ExternalSecretMode::Existing),
+        Err(AccountHomeError::AccountIdMismatch)
+    ));
+    assert_eq!(std::fs::read(&receipt).unwrap(), before);
+    assert_eq!(std::fs::read(&raw).unwrap(), other_raw);
+    assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "02".repeat(32));
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), pending);
 }
 
 #[test]
 fn external_db_key_missing() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(MemorySecretStore::default());
-    let home =
-        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let home = AccountHome::open(dir.path());
     let user = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
     let account = home
         .add_external_signer_account(&user.public_key().to_hex())
         .unwrap();
+    let raw = dir
+        .path()
+        .join("accounts/.external-sqlcipher")
+        .join(&account.label)
+        .join("secret.json");
+    fs_private::create_dir_all_private(raw.parent().unwrap()).unwrap();
+    let raw_bytes =
+        serde_json::to_vec(&serde_json::json!({"secret_key_hex": "02".repeat(32)})).unwrap();
+    fs_private::write_private(&raw, &raw_bytes).unwrap();
     assert!(matches!(
         home.external_database_secret(&account.label, ExternalSecretMode::Existing),
         Err(AccountHomeError::SecretNotFound(_))
     ));
-    assert!(store.keys.lock().unwrap().is_empty());
+    assert!(file_receipts(dir.path()).is_empty());
+    let generated = home
+        .external_database_secret(&account.label, ExternalSecretMode::Create)
+        .unwrap();
+    assert_ne!(*generated, [2; 32]);
+    assert_eq!(std::fs::read(raw).unwrap(), raw_bytes);
+    drop(home);
+    let reopened = AccountHome::open(dir.path());
+    assert_eq!(
+        *reopened
+            .external_database_secret(&account.label, ExternalSecretMode::Existing)
+            .unwrap(),
+        *generated
+    );
 }
 
 #[test]
@@ -3531,6 +3843,14 @@ fn wipe_retry_other_root_owner() {
     store.fail_remove.store(true, Ordering::SeqCst);
     first.remove_account(&old.label).unwrap();
     store.fail_remove.store(false, Ordering::SeqCst);
+    let tombstones = first_dir.path().join(".wipe-tombstones");
+    let pending = std::fs::read_dir(&tombstones)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(pending.join(".wipe-cleanup.json").is_file());
 
     let other =
         AccountHome::open_with_secret_store(other_dir.path(), store.clone(), IosOptions::default());
@@ -3544,6 +3864,7 @@ fn wipe_retry_other_root_owner() {
         old.account_id_hex
     );
     first.resume_wipe_cleanup().unwrap();
+    assert!(!pending.exists());
     assert_eq!(
         other
             .load_signing_keys(&adopted.label)
@@ -4161,6 +4482,70 @@ fn wipe_unknown_keeps_ownership() {
 
 #[cfg(unix)]
 #[test]
+fn wiping_legacy_local_signing_clears_scrubbed_source() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let key = nostr::prelude::Keys::generate();
+    let label = "legacy";
+    let path = home.account_dir(label);
+    fs_private::create_dir_all_private(&path).unwrap();
+    let record = serde_json::json!({"label": label, "account_id_hex": key.public_key().to_hex(), "local_signing": true});
+    fs_private::write_private(
+        &path.join("account.json"),
+        &serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let raw = path.join("secret.json");
+    std::fs::create_dir(&raw).unwrap();
+    let obstructed = raw.join("legacy-key");
+    let raw_bytes = serde_json::to_vec(
+        &serde_json::json!({"secret_key_hex": key.secret_key().to_secret_hex()}),
+    )
+    .unwrap();
+    fs_private::write_private(&obstructed, &raw_bytes).unwrap();
+    let mut open_raw = std::fs::File::open(&obstructed).unwrap();
+
+    home.remove_account(label).unwrap();
+    let tombstones = dir.path().join(".wipe-tombstones");
+    let tombstone = std::fs::read_dir(&tombstones)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let intent_path = tombstone.join(".wipe-cleanup.json");
+    let intent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&intent_path).unwrap()).unwrap();
+    assert_eq!(intent["legacy"][0]["account"]["label"], label);
+    drop(home);
+    let reopened = AccountHome::open(dir.path());
+    reopened.resume_wipe_cleanup().unwrap();
+    assert_eq!(
+        std::fs::read(tombstone.join("secret.json/legacy-key")).unwrap(),
+        raw_bytes
+    );
+    let replayed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&intent_path).unwrap()).unwrap();
+    assert_eq!(replayed["legacy"][0], intent["legacy"][0]);
+    let secret_path = tombstone.join("secret.json");
+    let staged = tombstone.join("legacy-key");
+    std::fs::rename(secret_path.join("legacy-key"), &staged).unwrap();
+    std::fs::remove_dir(&secret_path).unwrap();
+    std::fs::rename(staged, &secret_path).unwrap();
+
+    reopened.resume_wipe_cleanup().unwrap();
+    assert!(reopened.accounts().unwrap().is_empty());
+    assert!(!raw.exists());
+    assert!(std::fs::read_dir(&tombstones).unwrap().next().is_none());
+    let mut contents = Vec::new();
+    open_raw.read_to_end(&mut contents).unwrap();
+    assert_eq!(contents, vec![0; raw_bytes.len()]);
+}
+
+#[cfg(unix)]
+#[test]
 fn account_home_scrubs_tombstoned_local_secret_before_failed_recursive_delete() {
     use std::io::Read;
 
@@ -4296,6 +4681,28 @@ fn without_dac_override<T: Send>(operation: impl FnOnce() -> T + Send) -> T {
 }
 
 #[cfg(target_os = "linux")]
+struct RestorePermissions<'a> {
+    path: &'a std::path::Path,
+    original: std::fs::Permissions,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> RestorePermissions<'a> {
+    fn restrict(path: &'a std::path::Path, mode: u32) -> Self {
+        let original = std::fs::metadata(path).unwrap().permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        Self { path, original }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RestorePermissions<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(self.path, self.original.clone());
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn receipt_retry_requires_sync() {
     let dir = tempfile::tempdir().unwrap();
@@ -4317,13 +4724,13 @@ fn receipt_retry_requires_sync() {
     let receipt = file_receipts(dir.path()).pop().unwrap();
     let before = std::fs::read(&receipt).unwrap();
     let parent = receipt.parent().unwrap();
-    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o100)).unwrap();
+    let permissions = RestorePermissions::restrict(parent, 0o100);
     let retry = without_dac_override(|| {
         let loaded = store.load_secret(credential).unwrap();
         assert_eq!(loaded.secret_key(), keys.secret_key());
         store.acquire_secret(credential, SecretClaimMode::CreateOnly, None)
     });
-    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(permissions);
     assert!(
         matches!(retry, Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
     );
@@ -4346,10 +4753,10 @@ fn wipe_waits_for_rename_sync() {
     fs_private::create_dir_all_private(&accounts).unwrap();
     fs_private::create_dir_all_private(&tombstone).unwrap();
     fs_private::write_private(&secret, b"tombstoned secret").unwrap();
-    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o100)).unwrap();
+    let permissions = RestorePermissions::restrict(&accounts, 0o100);
 
     without_dac_override(|| home.resume_wipe_cleanup()).unwrap();
-    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(permissions);
     assert_eq!(std::fs::read(&secret).unwrap(), b"tombstoned secret");
 
     home.resume_wipe_cleanup().unwrap();

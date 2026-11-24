@@ -23,6 +23,14 @@ pub(crate) trait VaultStorage: Send + Sync {
         Ok(())
     }
     fn remove(&self, kind: RecordKind, name: &str) -> AccountHomeResult<()>;
+    // `names` is sorted and each retirement has passed its durability barrier.
+    fn remove_retired_receipts(&self, names: &[String]) -> AccountHomeResult<()> {
+        let mut result = Ok(());
+        for name in names {
+            result = result.and(self.remove(RecordKind::Receipt, name));
+        }
+        result
+    }
     fn names(&self, kind: RecordKind) -> AccountHomeResult<Vec<String>>;
 }
 
@@ -242,6 +250,20 @@ pub(crate) fn acquire(
             "retired credential owner cannot acquire again",
         ));
     }
+    // A plaintext database proposal must agree with the old raw slot even
+    // when an exact or adoptable managed receipt is also present.
+    let (raw_database, legacy_lookup) = if credential.kind == SecretCredentialKind::ExternalDatabase
+        && mode == SecretClaimMode::MigrateLegacy
+        && proposed.is_some()
+    {
+        let raw = legacy_lookup()?;
+        if let Some((keys, _)) = &raw {
+            validate_material(credential, keys, proposed)?;
+        }
+        (raw, None)
+    } else {
+        (None, Some(legacy_lookup))
+    };
     if let Some(receipt) = read_receipt(storage, &name)? {
         let keys = receipt_keys(credential, &receipt, proposed)?;
         storage.sync(RecordKind::Receipt)?;
@@ -293,9 +315,18 @@ pub(crate) fn acquire(
     let (keys, origin, legacy, adopted_from) = if let Some((keys, legacy, source)) = selected {
         (keys, SecretOrigin::Existing, legacy, source)
     } else if mode == SecretClaimMode::MigrateLegacy {
-        match legacy_lookup()? {
+        let legacy = match legacy_lookup {
+            Some(lookup) => {
+                let raw = lookup()?;
+                if let Some((keys, _)) = &raw {
+                    validate_material(credential, keys, proposed)?;
+                }
+                raw
+            }
+            None => raw_database,
+        };
+        match legacy {
             Some((keys, origin_scope)) => {
-                validate_material(credential, &keys, proposed)?;
                 let legacy = LegacySecret {
                     label: credential.label.to_owned(),
                     account_id_hex: credential.account_id_hex.to_owned(),
@@ -470,24 +501,29 @@ pub(crate) fn has_managed(
 }
 
 pub(crate) fn reconcile(storage: &impl VaultStorage) -> AccountHomeResult<()> {
+    let mut names = storage.names(RecordKind::Retirement)?;
     let mut failure = None;
-    for name in storage.names(RecordKind::Retirement)? {
+    names.retain(|name| {
         let result = (|| {
-            if read_retirement(storage, &name)?
-                .is_some_and(|record| !record.state.has_preserve_hold())
-            {
+            let retired = read_retirement(storage, name)?
+                .is_some_and(|record| !record.state.has_preserve_hold());
+            if retired {
                 storage.sync(RecordKind::Retirement)?;
-                storage.remove(RecordKind::Receipt, &name)?;
             }
-            Ok(())
+            Ok(retired)
         })();
-        if let Err(error) = result
-            && failure.is_none()
-        {
-            failure = Some(error);
+        match result {
+            Ok(retired) => retired,
+            Err(error) => {
+                failure.get_or_insert(error);
+                false
+            }
         }
-    }
-    failure.map_or(Ok(()), Err)
+    });
+    names.sort_unstable();
+    failure
+        .map_or(Ok(()), Err)
+        .and(storage.remove_retired_receipts(&names))
 }
 
 #[cfg(test)]
@@ -775,7 +811,7 @@ mod tests {
         let original = directory.path().join("legacy-a");
         let other = directory.path().join("legacy-b");
         let secret = keys.secret_key().to_secret_hex();
-        crate::io::write_secret_bytes(&original, secret.as_bytes()).unwrap();
+        crate::io::write_secret_bytes(directory.path(), &original, secret.as_bytes()).unwrap();
         let home = "11".repeat(32);
         let first_id = "22".repeat(32);
         let second_id = "33".repeat(32);

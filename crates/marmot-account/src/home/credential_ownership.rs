@@ -97,7 +97,7 @@ impl AccountHome {
             id: random_owner_id()?,
             path_hash: hex::encode(crate::location::root_hash(&root, &self.ios_options)?),
         };
-        write_private_json(&path, &identity)?;
+        write_private_json(&self.root, &path, &identity)?;
         let _ = self.home_id.set((root, identity.id));
         Ok(())
     }
@@ -146,20 +146,19 @@ impl AccountHome {
                 CredentialManifest {
                     account: account.clone(),
                     legacy,
+                    generated_named_creation: false,
                     nip46_admission: if legacy {
                         Nip46Admission::LegacyAllowed
                     } else {
                         Nip46Admission::ManagedOnly
                     },
+                    nip46_retirement_pending: false,
+                    nip46_legacy_cleanup_pending: false,
                     credentials: Default::default(),
                 }
             }
         };
-        if manifest.account.account_id_hex != account.account_id_hex
-            || manifest.account.label != account.label
-        {
-            return Err(AccountHomeError::AccountIdMismatch);
-        }
+        manifest.validate_identity(account)?;
         Ok(manifest)
     }
 
@@ -169,6 +168,7 @@ impl AccountHome {
         manifest: &CredentialManifest,
     ) -> AccountHomeResult<()> {
         write_private_json(
+            &self.root,
             self.account_dir(label).join(CREDENTIAL_OWNERS_FILE),
             manifest,
         )
@@ -199,7 +199,18 @@ impl AccountHome {
         mode: SecretClaimMode,
         proposed: Option<&nostr::prelude::Keys>,
     ) -> AccountHomeResult<AcquiredSecret> {
-        let mut manifest = self.manifest_or_legacy(account)?;
+        let manifest = self.manifest_or_legacy(account)?;
+        self.acquire_prepared_credential(account, kind, mode, proposed, manifest)
+    }
+
+    pub(super) fn acquire_prepared_credential(
+        &self,
+        account: &AccountSummary,
+        kind: SecretCredentialKind,
+        mode: SecretClaimMode,
+        proposed: Option<&nostr::prelude::Keys>,
+        mut manifest: CredentialManifest,
+    ) -> AccountHomeResult<AcquiredSecret> {
         let namespace = self.wipe_namespace()?;
         if manifest
             .credentials
@@ -212,11 +223,15 @@ impl AccountHome {
             ));
         }
         let index = credential_index(kind);
+        let plaintext_migration = kind == SecretCredentialKind::ExternalDatabase
+            && mode == SecretClaimMode::MigrateLegacy
+            && proposed.is_some();
         if let Some(credential) = &mut manifest.credentials[index]
             && kind != SecretCredentialKind::Nip46Session
             && credential.origin.is_none()
             && proposed.is_some()
             && credential.claim_mode != mode
+            && !plaintext_migration
             && mode != SecretClaimMode::AdoptOnly
         {
             credential.claim_mode = mode;
@@ -254,11 +269,16 @@ impl AccountHome {
             .as_ref()
             .expect("credential prepared");
         self.check_credential(account, credential)?;
-        let acquired = self.secret_store.acquire_secret(
-            credential.request(),
-            credential.claim_mode,
-            proposed,
-        )?;
+        // The plaintext file remains the migration intent until a successful
+        // comparison and acquisition. Older owners may predate that mode.
+        let request_mode = if plaintext_migration {
+            mode
+        } else {
+            credential.claim_mode
+        };
+        let acquired =
+            self.secret_store
+                .acquire_secret(credential.request(), request_mode, proposed)?;
         if (kind == SecretCredentialKind::Signing
             && acquired.keys.public_key().to_hex() != account.account_id_hex)
             || proposed.is_some_and(|keys| keys.secret_key() != acquired.keys.secret_key())
@@ -304,6 +324,7 @@ impl AccountHome {
             }
             Err(error) => return Err(error),
         };
+        manifest.validate_identity(account)?;
         if let Some(credential) = &manifest.credentials[credential_index(kind)] {
             if readonly {
                 self.home_identity(true)?;
@@ -385,8 +406,14 @@ impl AccountHome {
         let index = credential_index(kind);
         if let Some(credential) = &manifest.credentials[index] {
             self.check_credential(account, credential)?;
-            self.secret_store
+            let outcome = self
+                .secret_store
                 .release_secret(credential.request(), SecretReleaseMode::DeleteIfUnowned)?;
+            if kind == SecretCredentialKind::Nip46Session
+                && outcome == SecretReleaseOutcome::PendingLegacy
+            {
+                manifest.nip46_legacy_cleanup_pending = true;
+            }
             manifest.credentials[index] = None;
             self.write_credential_manifest(&account.label, manifest)?;
         }
@@ -399,11 +426,7 @@ impl AccountHome {
         manifest: &CredentialManifest,
         signing: SigningKeyRemoval,
     ) -> AccountHomeResult<WipeCleanup> {
-        if manifest.account.account_id_hex != account.account_id_hex
-            || manifest.account.label != account.label
-        {
-            return Err(AccountHomeError::AccountIdMismatch);
-        }
+        manifest.validate_identity(account)?;
         let mut cleanup = WipeCleanup {
             account: Some(account.clone()),
             ..WipeCleanup::default()
@@ -428,23 +451,42 @@ impl AccountHome {
                     mode,
                 });
             }
-            if !manifest.legacy {
-                continue;
-            }
             let target = match kind {
-                SecretCredentialKind::Signing if account.local_signing => Some(account.clone()),
-                SecretCredentialKind::ExternalDatabase if account.external_signing => {
+                SecretCredentialKind::Signing if manifest.legacy && account.local_signing => {
+                    Some(account.clone())
+                }
+                SecretCredentialKind::ExternalDatabase
+                    if manifest.legacy
+                        && (account.external_signing || manifest.account.external_signing) =>
+                {
                     Some(external_database_credential(account))
                 }
-                SecretCredentialKind::Nip46Session if !account.local_signing => (account
-                    .external_signing
-                    || manifest.account.external_signing
-                    || manifest.nip46_admission == Nip46Admission::ManagedOnly)
-                    .then(|| synthetic_credential(account, NIP46_CREDENTIAL_PREFIX)),
+                SecretCredentialKind::Nip46Session
+                    if !account.local_signing
+                        && (manifest.nip46_legacy_cleanup_pending
+                            || (manifest.legacy
+                                && (account.external_signing
+                                    || manifest.account.external_signing
+                                    || manifest.nip46_admission
+                                        == Nip46Admission::ManagedOnly))) =>
+                {
+                    Some(synthetic_credential(account, NIP46_CREDENTIAL_PREFIX))
+                }
                 _ => None,
             };
             if let Some(account) = target {
-                cleanup.legacy[index] = Some(LegacyCredential { account, kind });
+                let local_tombstone_home =
+                    if kind == SecretCredentialKind::Signing && self.local_file_store {
+                        self.initialize_home_identity()?;
+                        Some(self.home_identity(false)?.to_owned())
+                    } else {
+                        None
+                    };
+                cleanup.legacy[index] = Some(LegacyCredential {
+                    account,
+                    kind,
+                    local_tombstone_home,
+                });
             }
         }
         Ok(cleanup)
@@ -468,7 +510,7 @@ impl AccountHome {
         };
         let account = &manifest.account;
         let cleanup = self.build_wipe_cleanup(account, manifest, signing)?;
-        write_private_json(directory.join(WIPE_CLEANUP_FILE), &cleanup)?;
+        write_private_json(&self.root, directory.join(WIPE_CLEANUP_FILE), &cleanup)?;
         if let Some(tombstone) = self.move_account_dir_to_tombstone(label, directory)? {
             self.finish_wipe_cleanup(&tombstone, Some(cleanup));
         }
@@ -546,12 +588,12 @@ impl AccountHome {
                 Err(AccountHomeError::Io(error))
                     if error.kind() == std::io::ErrorKind::NotFound =>
                 {
-                    crate::io::create_durable_private_dir(&self.root)?;
+                    crate::io::create_durable_private_dir(&self.root, &self.root)?;
                     self.canonical_root()?
                 }
                 Err(error) => return Err(error),
             };
-            crate::io::create_durable_private_dir(&root)?;
+            crate::io::create_durable_private_dir(&root, &root)?;
             let root_lease = fs_private::try_acquire_private_exclusive_file_lease(
                 &root.join(ROOT_MUTATION_LOCK_FILE),
             )?;
@@ -584,15 +626,13 @@ impl AccountHome {
         };
         let account_id_hex = Self::account_id_for_public_key(public_key)?;
         let _guard = self.mutation_guard()?;
-        let (account, write_record) = if self.account_record_path(&account_id_hex).try_exists()? {
+        let has_record = self.account_record_path(&account_id_hex).try_exists()?;
+        let (account, promoted) = if has_record {
             let mut account = self.account(&account_id_hex)?;
             if !external_signing || account.local_signing {
                 return Err(AccountHomeError::AccountExists(account_id_hex));
             }
             let promoted = !account.external_signing;
-            if promoted {
-                self.remove_nip46_session_inner(&account, Nip46Removal::IncludingOrphaned)?;
-            }
             account.external_signing = true;
             (account, promoted)
         } else {
@@ -605,36 +645,97 @@ impl AccountHome {
                     signed_out: false,
                     unlinked: false,
                 },
-                true,
+                false,
             )
         };
-        if let Some(kind) = setup_kind {
-            if let Some(state) = self.raw_account_setup_state(&account.label)? {
-                if state.account_id_hex != account.account_id_hex {
-                    return Err(AccountHomeError::AccountIdMismatch);
+        let manifest = self.credential_manifest(&account.label)?;
+        if let Some(manifest) = &manifest {
+            manifest.validate_identity(&account)?;
+            if manifest.account.local_signing
+                || (!has_record && manifest.account.external_signing != external_signing)
+            {
+                return Err(AccountHomeError::AccountExists(account.label));
+            }
+        }
+        let mut journal = self.raw_account_setup_journal(&account.label)?;
+        if let Some(journal) = &journal {
+            let state = &journal.state;
+            let promotion = journal.promotion_for(&account)?;
+            let role_matches = match journal.admission_role {
+                Some(role) => {
+                    role == SetupAdmissionRole::of(&account)
+                        || (promoted && role == SetupAdmissionRole::Public)
                 }
+                None => {
+                    state.kind != AccountSetupKind::InteractiveIdentity
+                        || has_record
+                        || manifest.is_some()
+                }
+            };
+            let public_transition = external_signing
+                && setup_kind.is_some()
+                && (promoted || promotion.is_some())
+                && state.kind == AccountSetupKind::PublicIdentity;
+            if !role_matches
+                || (Some(state.kind) != setup_kind
+                    && !(setup_kind.is_some()
+                        && state.kind == AccountSetupKind::InteractiveIdentity)
+                    && !public_transition)
+            {
+                return Err(AccountHomeError::AccountExists(account.label));
+            }
+        }
+        let prior_public = if promoted {
+            let mut public = account.clone();
+            public.external_signing = false;
+            if manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.nip46_retirement_pending)
+            {
+                self.resume_public_nip46_retirement(&public)?;
+                journal = self.raw_account_setup_journal(&account.label)?;
             } else {
-                let state = AccountSetupState {
+                self.remove_nip46_session_inner(&public, Nip46Removal::IncludingOrphaned)?;
+            }
+            Some(public)
+        } else {
+            None
+        };
+        if let Some(kind) = setup_kind
+            && (journal.is_none() || promoted)
+        {
+            let prior_journal = journal.is_some();
+            let mut journal = journal.unwrap_or_else(|| AccountSetupJournal {
+                state: AccountSetupState {
                     account_id_hex: account.account_id_hex.clone(),
                     reused_account_id_credential: false,
                     kind,
                     phase: AccountSetupPhase::LocalStateCreated,
-                };
-                self.write_account_setup_state(&account.label, &state)?;
+                },
+                admission_role: None,
+                promotion: None,
+                created: Some(!has_record),
+            });
+            journal.admission_role = Some(SetupAdmissionRole::of(&account));
+            if let Some(public) = prior_public {
+                let prior_created = journal.created;
+                journal.created = Some(false);
+                journal.promotion.get_or_insert(PublicPromotion {
+                    account: public,
+                    prior_journal,
+                    prior_created,
+                });
             }
+            self.write_account_setup_journal(&account.label, &journal)?;
         }
-        if write_record {
+        if !has_record || promoted {
             self.write_account_record(&account)?;
         }
         Ok(account)
     }
 
-    /// Undo the `external_signing` promotion that [`Self::add_external_signer_account`]
-    /// applies to a pre-existing public/tracked account, so a failed external-signer
-    /// setup restores that account to its prior tracked state instead of leaving it
-    /// half-configured. Credential retirement follows the public-role commit;
-    /// failures remain pending for retry before another promotion. Local accounts
-    /// are unchanged. Callers must establish that this setup promoted the account.
+    /// Journal a wipe and move the account out of the live catalog. The caller
+    /// must hold the account mutation guard through the move.
     pub(super) fn remove_account_locked(
         &self,
         account_ref: &str,
@@ -648,14 +749,37 @@ impl AccountHome {
         let manifest = self.manifest_or_legacy(&account)?;
         let cleanup = self.build_wipe_cleanup(&account, &manifest, removal)?;
         let live_dir = self.account_dir(&account.label);
-        write_private_json(live_dir.join(WIPE_CLEANUP_FILE), &cleanup)?;
+        write_private_json(&self.root, live_dir.join(WIPE_CLEANUP_FILE), &cleanup)?;
         if let Some(tombstone) = self.move_account_dir_to_tombstone(&account.label, &live_dir)? {
             self.finish_wipe_cleanup(&tombstone, Some(cleanup));
         }
         Ok(())
     }
 
-    /// Retry best-effort cleanup of committed account wipes.
+    pub(super) fn resume_public_nip46_retirement(
+        &self,
+        account: &AccountSummary,
+    ) -> AccountHomeResult<()> {
+        validate_account_label(&account.label)?;
+        let directory = self.account_dir(&account.label);
+        let manifest = self.credential_manifest(&account.label)?;
+        if manifest.as_ref().is_some_and(|manifest| {
+            manifest.nip46_retirement_pending
+                || manifest.credentials[credential_index(SecretCredentialKind::Nip46Session)]
+                    .is_some()
+                || (manifest.legacy
+                    && manifest.account.external_signing
+                    && manifest.nip46_admission == Nip46Admission::LegacyAllowed)
+        }) || directory.join(NIP46_REMOVING_FILE).try_exists()?
+            || directory.join(NIP46_SESSION_FILE).try_exists()?
+        {
+            crate::io::sync_directory(&directory)?;
+            self.remove_nip46_session_inner(account, Nip46Removal::IncludingOrphaned)?;
+        }
+        Ok(())
+    }
+
+    /// Retry best-effort cleanup of committed wipes and public-role restorations.
     ///
     /// Failure to acquire the mutation lease or authorize this home is returned
     /// before accessing the vault. Individual cleanup failures remain pending.
@@ -671,6 +795,18 @@ impl AccountHome {
         }
         if self.cleanup_abandoned_admissions().is_err() {
             tracing::warn!(target: TRACE_TARGET, method = "resume_wipe_cleanup", "incomplete account admission cleanup remains pending");
+        }
+        match self.accounts() {
+            Ok(accounts) => {
+                for account in accounts.iter().filter(|account| !account.can_sign()) {
+                    if self.resume_public_nip46_retirement(account).is_err() {
+                        tracing::warn!(target: TRACE_TARGET, method = "resume_wipe_cleanup", "public account NIP-46 retirement remains pending");
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::warn!(target: TRACE_TARGET, method = "resume_wipe_cleanup", "public accounts could not be listed for NIP-46 retirement replay")
+            }
         }
         let root = self.root.join(WIPE_TOMBSTONE_DIR);
         match fs::symlink_metadata(&root) {
@@ -720,8 +856,33 @@ impl AccountHome {
             tracing::warn!(target: TRACE_TARGET, method = "finish_wipe_cleanup", "wipe rename durability is uncertain; cleanup remains pending");
             return;
         }
+        let scrubbed = |name| {
+            let path = tombstone.join(name);
+            scrub_and_remove_local_secret_file(&path).is_ok()
+                && fs::symlink_metadata(&path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
+        let signing_scrubbed = scrubbed(ACCOUNT_SECRET_FILE);
+        let database_scrubbed = scrubbed(EXTERNAL_SQLCIPHER_SECRET_FILE);
         let mut progress_saved = true;
         if let Some(cleanup) = &mut cleanup {
+            let signing = credential_index(SecretCredentialKind::Signing);
+            if signing_scrubbed
+                && cleanup.legacy[signing].as_ref().is_some_and(|legacy| {
+                    legacy.kind == SecretCredentialKind::Signing
+                        && cleanup.account.as_ref() == Some(&legacy.account)
+                        && legacy.local_tombstone_home.as_deref().is_some_and(|home| {
+                            self.home_identity(false)
+                                .is_ok_and(|current| current == home)
+                        })
+                })
+                && crate::io::sync_directory(tombstone).is_ok()
+            {
+                cleanup.legacy[signing] = None;
+                progress_saved =
+                    write_private_json(&self.root, tombstone.join(WIPE_CLEANUP_FILE), cleanup)
+                        .is_ok();
+            }
             for index in 0..cleanup.credentials.len() {
                 let Some(CleanupCredential { credential, mode }) = &cleanup.credentials[index]
                 else {
@@ -740,22 +901,20 @@ impl AccountHome {
                     .is_ok_and(|outcome| outcome == SecretReleaseOutcome::Released)
                 {
                     cleanup.credentials[index] = None;
-                    progress_saved =
-                        write_private_json(tombstone.join(WIPE_CLEANUP_FILE), cleanup).is_ok();
+                    progress_saved &=
+                        write_private_json(&self.root, tombstone.join(WIPE_CLEANUP_FILE), cleanup)
+                            .is_ok();
                 }
             }
         }
         let unknown = cleanup.is_none();
-        let mut pending = !progress_saved
+        let mut pending = !signing_scrubbed
+            || !database_scrubbed
+            || !progress_saved
             || cleanup.as_ref().is_none_or(|cleanup| {
                 cleanup.credentials.iter().any(Option::is_some)
                     || cleanup.legacy.iter().any(Option::is_some)
             });
-        for name in [ACCOUNT_SECRET_FILE, EXTERNAL_SQLCIPHER_SECRET_FILE] {
-            if scrub_and_remove_local_secret_file(&tombstone.join(name)).is_err() {
-                pending = true;
-            }
-        }
         match fs::read_dir(tombstone) {
             Ok(entries) => {
                 for entry in entries {
@@ -763,6 +922,8 @@ impl AccountHome {
                         let entry = entry?;
                         let name = entry.file_name();
                         if name == WIPE_CLEANUP_FILE
+                            || name == ACCOUNT_SECRET_FILE
+                            || name == EXTERNAL_SQLCIPHER_SECRET_FILE
                             || (unknown
                                 && (name == ACCOUNT_RECORD_FILE || name == CREDENTIAL_OWNERS_FILE))
                         {
@@ -822,7 +983,7 @@ impl AccountHome {
             self.acquire_credential(
                 &account,
                 SecretCredentialKind::ExternalDatabase,
-                SecretClaimMode::CreateOrAdopt,
+                SecretClaimMode::MigrateLegacy,
                 Some(keys),
             )?
             .keys

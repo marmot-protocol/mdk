@@ -72,7 +72,7 @@ a signing account only after acquisition succeeds. Owner IDs are random and neve
   `SecretNotFound` guarantees no source and no committed or pending receipt for that owner. Uncertain lookup or
   write failures must return another error, so recovery retains the same owner.
 - `load_secret` reads that owner's active receipt. It does not substitute a label's newest credential.
-  Existing receipt reads do not take a writer lease; migration and permission upgrades still require admission.
+  File-vault reads use the pinned directory without a writer lease; native vaults take the provider lease.
 - `release_secret` retires that receipt before deleting its material. `Preserve` leaves a durable store-side hold
   even after rollback removes the account record. Adoption persists a new copy before consuming that hold.
 - `reconcile_cleanup` retries retired copies without consulting the live account catalog. Retirement metadata
@@ -80,14 +80,16 @@ a signing account only after acquisition succeeds. Owner IDs are random and neve
 
 Native backends store one protected copy per owner. Android uses AES-GCM encrypted files and per-receipt
 Android Keystore keys on API 23 or later. SharedPreferences is read only for legacy migration.
-On Android, writes and removals take the vault lease. A write syncs its unpublished file, renames it atomically
-to the final path, and returns success only after syncing the directory. Reads and listings see only final files
-and do not take the lease. An invalid final receipt remains an error. A retry by the same owner reuses its Keystore
-key, and exact-owner removal deletes the unpublished file, final receipt, and key.
+On Android, the service lease lives outside the receipt directory. Reads and writes use the directory opened under
+that lease. A write syncs its unpublished file, renames it atomically, and syncs the directory before returning.
+An invalid final receipt remains an error. A retry reuses its owner's Keystore key. Exact-owner removal deletes the
+unpublished file, final receipt, and key.
 Windows managed copies use local-machine persistence and bind to the user SID and MachineGuid, not the computer
-name; they do not roam. macOS binds to the selected keychain domain and path, not the replaceable file inode.
+name; they do not roam. Durable private record replacement on Windows requires NTFS with POSIX rename support.
+macOS checks a persistent marker in the captured keychain as well as its selected domain and path.
 The development file store keeps plaintext receipts under `.owned-secrets-v1` with private permissions.
-It pins the directory on first use and rejects operations if the canonical path later names another directory.
+It checks a nonsecret ID in the pinned directory. Moving the vault with that ID keeps its identity; creating another
+vault at the old path does not. Keep the ID with the vault when restoring a backup.
 
 On Linux and BSD, select the intended Secret Service collection as the default before first use or legacy migration.
 MDK binds managed receipts to a nonsecret identity item in that collection. This identity survives keyring updates
@@ -101,9 +103,9 @@ not prompt for an unlock. Legacy lookup still searches all collections, so a man
 a raw legacy item is absent.
 
 Managed namespaces identify protected storage separately from raw legacy lookup options. On iOS, the OS resolves
-the default managed access group. Sharing across applications requires `IosOptions.keychain_access_group` set to
-an authorized common group, or a shared host store. Group selection does not narrow the captured provider's
-historical raw-credential lookup; a broad raw lookup has unknown provenance and remains pending after migration.
+the default managed access group unless `IosOptions.keychain_access_group` selects an authorized group. Apps sharing
+a native group also need access to the same lock container, selected when the vault is opened first. Changing the
+managed group does not narrow the captured provider's historical raw lookup. That scope can still be unknown.
 
 For iOS app-group roots, pass authorized group identifiers in `IosOptions.app_group_identifiers` to both the home
 and any `LocalFileSecretStore`. Foundation validates access to each container; the SDK does not inspect private
