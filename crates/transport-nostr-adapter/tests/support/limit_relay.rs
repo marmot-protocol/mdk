@@ -71,6 +71,14 @@ pub enum NegFault {
     None,
     /// Answer every NEG-OPEN with NEG-ERR (session not created).
     ErrOnOpen,
+    /// As [`NegFault::ErrOnOpen`], with this reason.
+    ErrOnOpenWith(&'static str),
+    /// Answer every NEG-OPEN with strfry's `unknown cmd` NOTICE, as a relay
+    /// without NIP-77 does (session not created).
+    UnknownCmdOnOpen,
+    /// Send one mismatched fingerprint, then answer the next NEG-MSG with
+    /// NEG-ERR: a refusal after reconciliation began.
+    ErrAfterReply,
     /// Swallow every NEG-OPEN: the session is open on the relay, but nothing
     /// answers it (exercises the client's first-reply timeout).
     SilentOpen,
@@ -950,7 +958,20 @@ fn inspect_client_frame(
                             .then(|| serde_json::json!(["NEG-CLOSE", id]).to_string()),
                     }
                 }
-                None if fault == NegFault::ErrOnOpen => {
+                None if fault == NegFault::UnknownCmdOnOpen => {
+                    shared.refresh(connection);
+                    Verdict::Refuse {
+                        reply: serde_json::json!(["NOTICE", "ERROR: bad msg: unknown cmd"])
+                            .to_string(),
+                        upstream: replaced
+                            .then(|| serde_json::json!(["NEG-CLOSE", id]).to_string()),
+                    }
+                }
+                None if matches!(fault, NegFault::ErrOnOpen | NegFault::ErrOnOpenWith(_)) => {
+                    let reason = match fault {
+                        NegFault::ErrOnOpenWith(reason) => reason,
+                        _ => "blocked: injected refusal",
+                    };
                     *shared
                         .stats
                         .neg_rejections
@@ -958,8 +979,7 @@ fn inspect_client_frame(
                         .or_default() += 1;
                     shared.refresh(connection);
                     Verdict::Refuse {
-                        reply: serde_json::json!(["NEG-ERR", id, "blocked: injected refusal"])
-                            .to_string(),
+                        reply: serde_json::json!(["NEG-ERR", id, reason]).to_string(),
                         upstream: replaced
                             .then(|| serde_json::json!(["NEG-CLOSE", id]).to_string()),
                     }
@@ -969,9 +989,9 @@ fn inspect_client_frame(
                     shared.refresh(connection);
                     match fault {
                         NegFault::SilentOpen => Verdict::Swallow,
-                        NegFault::StallAfterReply | NegFault::FingerprintLoop => {
-                            Verdict::Fingerprint(id)
-                        }
+                        NegFault::StallAfterReply
+                        | NegFault::FingerprintLoop
+                        | NegFault::ErrAfterReply => Verdict::Fingerprint(id),
                         _ => Verdict::Forward,
                     }
                 }
@@ -983,6 +1003,18 @@ fn inspect_client_frame(
         {
             shared.stats.neg_fingerprint_rounds += 1;
             Verdict::Swallow
+        }
+        "NEG-MSG"
+            if shared.neg_fault == Some(NegFault::ErrAfterReply)
+                && shared.states[connection].neg.remove(&id) =>
+        {
+            shared.stats.neg_fingerprint_rounds += 1;
+            shared.refresh(connection);
+            Verdict::Refuse {
+                reply: serde_json::json!(["NEG-ERR", id, "blocked: injected refusal"]).to_string(),
+                // The fingerprint never reached the upstream relay.
+                upstream: None,
+            }
         }
         "NEG-MSG"
             if shared.neg_fault == Some(NegFault::FingerprintLoop)

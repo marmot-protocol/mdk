@@ -271,8 +271,12 @@ async fn sweep_pages_a_strfry_relay_and_resolves_a_saturated_second() {
     assert_eq!(fixture.limit.stats().max_req_limit_seen, 500);
 }
 
-/// Missing metadata leaves the relay's NIP-77 support unknown. A refusal to
-/// negotiate cannot refuse the underlying history REQ or advance its cursor.
+/// Missing metadata leaves the relay's NIP-77 support unknown. A relay that
+/// refuses the NEG-OPEN, or says it does not know the command, then cannot
+/// prove the second, as one whose document omits NIP-77 cannot (mdk#3264);
+/// that refuses neither the underlying history REQ nor advances its cursor.
+/// Silence, a refusal after a reply, or withheld ids it listed leave the
+/// second inconclusive: a later attempt may prove it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_without_relay_metadata_advances_only_after_reconciliation() {
     let fixture = Fixture::new().await;
@@ -298,10 +302,37 @@ async fn a_second_without_relay_metadata_advances_only_after_reconciliation() {
     assert_eq!(published.end, SweepEnd::SaturatedSecond { second: T0 });
     assert_eq!(fixture.limit.stats().neg_opens, 0);
 
-    fixture.limit.set_neg_fault(NegFault::ErrOnOpen);
-    let refused = run_sweep(request(range), &relay, &mut sink, &store, &cancel).await;
-    assert_eq!(refused.end, SweepEnd::InconclusiveSecond { second: T0 });
-    assert!(sink.slices.is_empty());
+    // A refused NEG-OPEN, or a NOTICE the SDK reads as "negentropy not
+    // supported" (here strfry's `unknown cmd`), answers that the relay cannot
+    // prove the second.
+    for fault in [NegFault::ErrOnOpen, NegFault::UnknownCmdOnOpen] {
+        fixture.limit.set_neg_fault(fault);
+        let refused = run_sweep(request(range), &relay, &mut sink, &store, &cancel).await;
+        assert_eq!(
+            refused.end,
+            SweepEnd::SaturatedSecond { second: T0 },
+            "{fault:?}"
+        );
+        assert!(sink.slices.is_empty());
+    }
+    // A relay that may serve it after AUTH, that failed generically, that
+    // never answered, or that refused only after reconciling began may still
+    // prove it.
+    for fault in [
+        NegFault::ErrOnOpenWith("auth-required: injected"),
+        NegFault::ErrOnOpenWith("error: injected"),
+        NegFault::SilentOpen,
+        NegFault::ErrAfterReply,
+    ] {
+        fixture.limit.set_neg_fault(fault);
+        let retried = run_sweep(request(range), &relay, &mut sink, &store, &cancel).await;
+        assert_eq!(
+            retried.end,
+            SweepEnd::InconclusiveSecond { second: T0 },
+            "{fault:?}"
+        );
+        assert!(sink.slices.is_empty());
+    }
 
     fixture.limit.set_neg_fault(NegFault::None);
     fixture.limit.withhold_id_fetch_events(1);

@@ -2169,11 +2169,11 @@ async fn recovery_runner_retries_at_once_when_an_uncover_takes_back_its_proof() 
 }
 
 /// A unit records the second its sweep stopped on only when its relay
-/// cannot prove it under caps the relay published: asking again stops there
-/// too. A sweep on caps never read cannot tell an unprovable second from a
-/// document that failed to load, a failed read sweeps on the caps recorded
-/// last, an answer cut short at the quantum's deadline may still return
-/// history, and a quantum that gets past the second clears it.
+/// cannot prove it: asking again stops there too. With no document that
+/// means the relay's own NIP-77 answer said so (mdk#3264). A
+/// failed read sweeps on the caps recorded last, an answer cut short at the
+/// quantum's deadline may still return history, and a quantum that gets past
+/// the second clears it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_saturates_a_unit_only_on_an_unprovable_second() {
     let account = account();
@@ -2200,7 +2200,7 @@ async fn recovery_runner_saturates_a_unit_only_on_an_unprovable_second() {
 
     host.caps_unknown.store(true, Ordering::SeqCst);
     assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
-    assert_eq!(saturated(), None, "caps never read");
+    assert_eq!(saturated(), Some(floor), "no document, and no NIP-77 proof");
 
     host.caps_unknown.store(false, Ordering::SeqCst);
     due();

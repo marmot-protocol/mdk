@@ -968,9 +968,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`live_fences`) over each unit's durable capture ranges, holding through an account breaker pause and while no
   required relay serves the group and a unit still pursuing its debt owes it: through unreachable spells, cooldowns
   and deadline-cut answers, until the unit saturates (an answered quantum stopped on the first second it owes because
-  its relay cannot prove it under the caps the relay published; migration 0151 records that second, and a change in
-  the relay's recorded caps clears it; a deadline cut, an inconclusive NIP-77 answer (a listed id the relay then
-  withheld, a malformed exchange, or a cut one-id fetch), or unknown caps never saturate) or breaks (a live frame
+  its relay cannot prove it under the caps the relay published, or, with no document, because the relay refused
+  the NEG-OPEN for that second before any NIP-77 reply, sent a NOTICE the SDK reads as "negentropy not supported"
+  (`bad msg` with `unknown cmd`, `negentropy` or `NEG-`), or listed too many ids for it: such a relay can never
+  prove the second, so holding buys nothing (mdk#3264); migration 0151 records that second, and a change in the relay's recorded caps
+  clears it; a deadline cut or an inconclusive NIP-77 answer (a listed id the relay then withheld, a malformed
+  exchange, or a cut one-id fetch) never saturates) or breaks (a live frame
   opened ahead of its sender's owed messages can put them past the ratchet's out-of-order window for good). A
   saturated unit leaves the frontier even after advancing, while that second is still the first it owes. A quantum
   whose proven slices an un-cover took back mid-fetch settles as unanswered: due again at once, holding its fence.

@@ -22,7 +22,8 @@ struct ReplayFilter {
 }
 
 /// Keep real relay storage, signatures, newest-first replay and live fanout;
-/// impose only the two production constraints relevant to these regressions.
+/// impose only the two production constraints relevant to these regressions:
+/// a 500-event clamp and refused NIP-77.
 struct OfflineReplayRelay {
     _upstream: LocalRelay,
     url: String,
@@ -31,7 +32,10 @@ struct OfflineReplayRelay {
 }
 
 impl OfflineReplayRelay {
-    async fn start() -> Self {
+    /// With `information`, the relay serves a NIP-11 document advertising its
+    /// clamp. Without one, as some relays and White Noise Android's recovery
+    /// qualification fixture do, MDK reads its caps as unknown.
+    async fn start(information: bool) -> Self {
         let upstream = LocalRelay::new(
             RelayBuilder::default()
                 .database(MemoryDatabase::with_opts(MemoryDatabaseOptions {
@@ -80,14 +84,20 @@ impl OfflineReplayRelay {
                     })
                     .await;
                     let Ok(Some(received)) = received else { return };
-                    let information = String::from_utf8_lossy(&header[..received])
+                    let asks_information = String::from_utf8_lossy(&header[..received])
                         .lines()
                         .any(|line| line.split_once(':').is_some_and(|(name, value)| {
                             name.eq_ignore_ascii_case("accept")
                                 && value.contains("application/nostr+json")
                         }));
-                    if information {
+                    if asks_information {
                         use tokio::io::AsyncWriteExt;
+                        if !information {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                                .await;
+                            return;
+                        }
                         let body = r#"{"supported_nips":[],"limitation":{"max_limit":500}}"#;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -193,7 +203,7 @@ fn replay_app(root: &Path, url: &str, policy: marmot_app::CursorPersistence) -> 
 
 async fn offline_plaintext_replay(senders: usize, per_sender: usize, offline: Duration) {
     storage_sqlite::relax_storage_for_test_process();
-    let relay = OfflineReplayRelay::start().await;
+    let relay = OfflineReplayRelay::start(true).await;
     let roots: Vec<_> = (0..=senders)
         .map(|_| tempfile::tempdir().unwrap())
         .collect();
@@ -508,4 +518,100 @@ async fn offline_replay_crosses_queue() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn offline_150s_six_sender_replay() {
     offline_plaintext_replay(6, 100, Duration::from_secs(150)).await;
+}
+
+/// Waits up to 60 s, White Noise Android's qualification budget, for
+/// `account` to receive `plaintext`.
+async fn receives(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    account: &str,
+    plaintext: &str,
+) {
+    wait_for_event_within(events, Duration::from_secs(60), |event| {
+        matches!(event, MarmotAppEvent::MessageReceived(update)
+            if update.account_id_hex == account && update.message.plaintext == plaintext)
+    })
+    .await;
+}
+
+/// mdk#3264: on a relay that publishes no NIP-11 document and refuses NIP-77,
+/// the history a live REQ re-reads cannot be proven complete. Creating and
+/// locally deleting another group can re-send the healthy group's REQ, and a
+/// restart always does; either re-reads its stored messages. That second
+/// stays owed, but the healthy group's newer live messages must still
+/// arrive: before the fix they waited behind it until recovery broke, about
+/// 15 minutes later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_messages_pass_history_a_relay_without_metadata_cannot_prove() {
+    storage_sqlite::relax_storage_for_test_process();
+    let relay = OfflineReplayRelay::start(false).await;
+    let config = || MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let sender_dir = tempfile::tempdir().unwrap();
+    let receiver_dir = tempfile::tempdir().unwrap();
+    let sender = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+        sender_dir.path(),
+        relay.url.clone(),
+        config(),
+    ));
+    let receiver_app =
+        || MarmotApp::with_relay_and_config(receiver_dir.path(), relay.url.clone(), config());
+    let receiver = MarmotAppRuntime::new(receiver_app());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&relay.url)],
+        bootstrap_relays: vec![endpoint(&relay.url)],
+        discovery_relays: vec![endpoint(&relay.url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&sender, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&receiver, setup).await;
+    let alice_id = alice.account.account_id_hex;
+    let bob_id = bob.account.account_id_hex;
+    let mut received = receiver.subscribe();
+    let group = sender
+        .create_group(&alice_id, "healthy", std::slice::from_ref(&bob_id), None)
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    accept_group_invite_retrying_busy(&receiver, &bob_id, &group)
+        .await
+        .unwrap();
+    sender
+        .send_message(&alice_id, &group, b"first".to_vec())
+        .await
+        .unwrap();
+    receives(&mut received, &bob_id, "first").await;
+
+    let deleted = receiver
+        .create_group(&bob_id, "deleted", &[], None)
+        .await
+        .unwrap()
+        .operation
+        .expect("a group with no other members");
+    assert!(
+        receiver
+            .delete_group_local(&bob_id, &deleted)
+            .await
+            .unwrap()
+    );
+    sender
+        .send_message(&alice_id, &group, b"after the deletion".to_vec())
+        .await
+        .unwrap();
+    receives(&mut received, &bob_id, "after the deletion").await;
+
+    receiver.shutdown_and_close().await.unwrap();
+    drop(receiver);
+    let receiver = MarmotAppRuntime::new(receiver_app());
+    let mut received = receiver.subscribe();
+    receiver.reconcile_accounts().await.unwrap();
+    sender
+        .send_message(&alice_id, &group, b"after the restart".to_vec())
+        .await
+        .unwrap();
+    receives(&mut received, &bob_id, "after the restart").await;
+    sender.shutdown().await;
+    receiver.shutdown().await;
 }

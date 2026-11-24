@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-11-18
+updated: 2026-11-23
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -1044,14 +1044,21 @@ cut short at their deadline, so nothing newer goes ahead of history its relay ma
 Two units hold nothing. A saturated one, whose last answered quantum stopped on the first
 second it owes because its relay cannot prove it under the caps the relay published (no cap and
 no NIP-77 proof; migration 0151 records that second), would stop on the same second if asked
-again while those caps stand. It pursues again once it owes an earlier second first or the
-relay's recorded caps change. An answer its deadline cut saturates nothing, and nor does a relay
-whose caps were never read: a document that failed to load is not a relay that cannot prove the
-second. Nor does an inconclusive NIP-77 answer: ids the relay listed and then did not all
+again while those caps stand. A relay whose document was never read saturates the same way once
+the relay itself answers that it cannot prove that second (mdk#3264): a NEG-ERR to the NEG-OPEN
+before any NIP-77 reply, a NOTICE the SDK reads as "negentropy not supported" (`bad msg` with
+`unknown cmd`, `negentropy` or `NEG-`), or more ids for the second than one exchange lists. A
+relay with no document that cannot take NIP-77 messages can never prove that second, so holding
+newer frames behind it buys nothing. The second stays owed, and newer live frames no longer wait about 15 minutes for the unit to break. A
+`rate-limited:` refusal is waited out, and an `auth-required:` or `error:` one, silence, or a
+failure after the relay began reconciling is inconclusive: a relay that ignores the NEG-OPEN still
+holds them until the unit breaks. It pursues again once
+it owes an earlier second first or the relay's recorded caps change, a document read included.
+An answer its deadline cut saturates nothing. Nor does an inconclusive NIP-77 answer: ids the relay listed and then did not all
 return (the event may have gone in between), an exchange that broke off on a malformed
 message, which is not a relay without NIP-77, or a one-id fetch cut short (the reply budget
-counts duplicate frames). Only the relay's own capability or the size of the set it holds for
-the second proves it cannot prove it. The sweep ends on an inconclusive second and asks
+counts duplicate frames). Only the relay's own capability (its document, or with none its
+answer to the NEG-OPEN) or the size of the set it holds for the second proves it cannot prove it. The sweep ends on an inconclusive second and asks
 again on the backoff. A broken unit's debt is parked. The group's frames go once each
 holding unit saturates or breaks, or a relay serves the group again. An admission turn ingests at most 16 staged
 events in one worker command, stopping at the first event the engine keeps no trace of, so

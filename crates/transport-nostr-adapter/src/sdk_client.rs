@@ -6555,12 +6555,44 @@ async fn sync_watching_neg_cap(
         .map_err(|error| error.failure)
 }
 
-/// A failed NIP-77 sync: its reconciliation class, and whether the SDK
-/// reported a protocol error. A malformed exchange is not the relay saying it
-/// lacks NIP-77, and a later attempt may complete it.
+/// A failed NIP-77 sync: its reconciliation class, whether the SDK reported a
+/// protocol error, and whether the relay may have begun reconciling. A
+/// malformed exchange is not the relay saying it lacks NIP-77, and a later
+/// attempt may complete it.
 struct NegSyncError {
     failure: NostrReconciliationFailure,
     malformed: bool,
+    /// The relay sent a NEG-MSG, or notifications were missed, so its NEG-ERR
+    /// may not refuse the NEG-OPEN. Another NEG session on the same relay may
+    /// set it too, which only keeps a refusal from counting as one.
+    answered: bool,
+}
+
+/// What a NIP-77 sync's relay notifications showed.
+#[derive(Default)]
+struct NegWatch {
+    cap_notice: bool,
+    answered: bool,
+}
+
+impl NegWatch {
+    fn observe(&mut self, update: NotificationUpdate<RelayNotification>) {
+        let NotificationUpdate::Notification(notification) = update else {
+            // A reply may have gone unseen.
+            self.answered = true;
+            return;
+        };
+        self.cap_notice |= is_neg_cap_notice(&notification);
+        self.answered |= matches!(
+            &notification,
+            RelayNotification::Message { message }
+                if matches!(message.as_ref(), RelayMessage::NegMsg { .. })
+        );
+    }
+
+    fn settled(&self) -> bool {
+        self.cap_notice && self.answered
+    }
 }
 
 impl From<NostrReconciliationFailure> for NegSyncError {
@@ -6568,6 +6600,7 @@ impl From<NostrReconciliationFailure> for NegSyncError {
         Self {
             failure,
             malformed: false,
+            answered: false,
         }
     }
 }
@@ -6593,30 +6626,29 @@ async fn sync_watching_neg_cap_detailed(
     // The SDK exposes no completion handle for that task; unlike success, this
     // does not guarantee NEG-CLOSE reaches the socket queue before credit reuse.
     // Subscribe before the NEG-OPEN goes out, so the answer cannot be missed.
-    let mut notifications = relay.notifications();
+    let mut notifications = relay.notifications_with_gaps();
     let sync = relay.sync(filter).items(items).opts(options).into_future();
     tokio::pin!(sync);
-    let mut cap_notice = false;
+    let mut watch = NegWatch::default();
     let result = loop {
         tokio::select! {
             result = &mut sync => break result,
-            Some(notification) = notifications.next(), if !cap_notice => {
-                cap_notice = is_neg_cap_notice(&notification);
-            }
+            Some(update) = notifications.next(), if !watch.settled() => watch.observe(update),
         }
     };
-    // The timeout and a NOTICE already queued can be ready in the same wake.
+    // The failure and a message already queued can be ready in the same wake.
     if result.is_err() {
-        while !cap_notice {
+        while !watch.settled() {
             match futures::FutureExt::now_or_never(notifications.next()) {
-                Some(Some(notification)) => cap_notice = is_neg_cap_notice(&notification),
+                Some(Some(update)) => watch.observe(update),
                 _ => break,
             }
         }
     }
     result.map_err(|error| NegSyncError {
-        failure: sync_failure(&error, cap_notice),
+        failure: sync_failure(&error, watch.cap_notice),
         malformed: matches!(error.kind(), SdkErrorKind::Protocol),
+        answered: watch.answered,
     })
 }
 
@@ -6657,7 +6689,7 @@ pub(crate) async fn neg_sync_dry_run(
 ) -> Result<NegCompared, crate::sweep::NegFailure> {
     use crate::sweep::{ClosedReason, NegFailure, UnreachableKind};
     let local = items.len();
-    let failure = match sync_watching_neg_cap_detailed(
+    let (failure, answered) = match sync_watching_neg_cap_detailed(
         relay, filter, items, options, credits, deadline,
     )
     .await
@@ -6674,9 +6706,15 @@ pub(crate) async fn neg_sync_dry_run(
         Err(NegSyncError {
             malformed: true, ..
         }) => return Err(NegFailure::Inconclusive),
-        Err(NegSyncError { failure, .. }) => failure,
+        Err(NegSyncError {
+            failure, answered, ..
+        }) => (failure, answered),
     };
     Err(match failure {
+        // NEG-ERR before any NEG-MSG: the relay refused the NEG-OPEN.
+        NostrReconciliationFailure::NegErr(category) if !answered => {
+            NegFailure::Declined(ClosedReason(category))
+        }
         NostrReconciliationFailure::NegErr(category) => NegFailure::Closed(ClosedReason(category)),
         // The cap NOTICE is a transient refusal, waited out like a rate limit.
         NostrReconciliationFailure::NegCapNotice => NegFailure::Closed(ClosedReason(Some(
@@ -6692,7 +6730,10 @@ pub(crate) async fn neg_sync_dry_run(
         NostrReconciliationFailure::LocalError => NegFailure::Local,
         // Only the relay's own word that it lacks NIP-77 leaves the second
         // unproven; with a protocol error kept apart above, that is what
-        // remains of this class.
+        // remains of this class: the SDK's "negentropy not supported" NOTICE
+        // (`bad msg` with `unknown cmd`, `negentropy` or `NEG-`). With no
+        // document it releases a held group as well (mdk#3264): such a relay
+        // can never prove the second.
         NostrReconciliationFailure::NegentropyUnsupported => NegFailure::Unproven,
         // No NIP-77 sync ends in these. Any that did proved nothing this
         // time, and a later attempt may complete it.
