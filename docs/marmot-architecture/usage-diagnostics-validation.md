@@ -47,10 +47,12 @@ site, and absence of a row does not establish that an operation never occurred.
   Welcomes. Neither measurement proves recipient receipt or decryption.
 - Welcome `process/attempt` is one inbox delivery this device ingested.
   `duplicate` is a copy it already had or its own echo. `absent` is a Welcome
-  naming another KeyPackage of this account, a sibling device's delivery: it
-  reached the account but not this device, which cannot join from it. Rows
-  count deliveries, not invitations: `absent` without a matching `success`
-  points at devices that saw only their siblings' Welcomes.
+  naming another KeyPackage of this account: a sibling device's delivery,
+  which this device cannot join from, whether or not it also received or
+  already joined from its own. It reuses an existing outcome value because a
+  new one would change the registry revision and ask every consenting user to
+  accept again. Rows count deliveries and carry no invitation, so they cannot
+  pair an `absent` with the `success` of the same invitation.
 - Generated account setup records the full local-ready phase once and network-ready
   attempts separately; the local handoff remains an OTLP-only submeasurement.
   Local notification settings and native push settings have separate operations.

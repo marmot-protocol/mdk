@@ -10,7 +10,7 @@
 //! requests.
 
 use crate::error::{DirectoryError, MissingKeyPackageReason};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cgka_engine::key_package::key_package_metadata;
@@ -145,6 +145,34 @@ mod tests {
             Some(MemberResolutionStatus::ObsoleteKeyPackage)
         );
     }
+
+    /// One relay listed under two spellings is one relay asked: the
+    /// transport reads twins once, so a read every relay answered must not
+    /// count a relay as unanswered.
+    #[test]
+    fn a_relay_listed_twice_is_asked_once() {
+        let endpoint = |url: &str| TransportEndpoint(url.to_owned());
+        let outcome = DirectoryFetchOutcome {
+            records: Vec::new(),
+            complete: true,
+            complete_endpoints: vec![endpoint("wss://relay.example")],
+        };
+        assert_eq!(
+            MemberKeyPackageReadCoverage::of_read(
+                &[
+                    endpoint("wss://relay.example"),
+                    endpoint("wss://relay.example/")
+                ],
+                &outcome,
+            ),
+            MemberKeyPackageReadCoverage {
+                complete_reads: 1,
+                incomplete_reads: 0,
+                relays_asked: 1,
+                relays_answered: 1,
+            }
+        );
+    }
 }
 
 #[derive(Default)]
@@ -266,11 +294,12 @@ pub struct MemberKeyPackageResolutionStats {
 }
 
 /// How completely relays answered the KeyPackage reads that selected
-/// accounts. Each selected account counts its deciding read: its
-/// single-author batch, or its single-author fallback read. Selection uses
-/// what an incomplete read returned (D12), so a device whose only package
-/// sat on a relay that did not answer is left out; these counts bound how
-/// often a selection could have missed one.
+/// accounts. Each selected account counts its deciding read of its own
+/// relays: its single-author batch, or its single-author fallback read, not
+/// the discovery relays recovery may add. Selection uses what an incomplete
+/// read returned (D12), so a device whose only package sat on a relay that
+/// did not answer is left out; these counts show how often a selection was
+/// made from such a read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemberKeyPackageReadCoverage {
     /// Selected accounts whose read heard every relay it asked to the end of
@@ -285,12 +314,23 @@ pub struct MemberKeyPackageReadCoverage {
 }
 
 impl MemberKeyPackageReadCoverage {
-    fn of_read(asked: usize, outcome: &DirectoryFetchOutcome) -> Self {
+    fn of_read(asked: &[TransportEndpoint], outcome: &DirectoryFetchOutcome) -> Self {
+        // Relays, not spellings: the transport reads a relay listed twice
+        // once, and names the endpoints it completed in its own spelling.
+        let relays = |endpoints: &[TransportEndpoint]| {
+            endpoints
+                .iter()
+                .map(|endpoint| transport_nostr::canonical_relay(endpoint.as_str()))
+                .collect::<BTreeSet<_>>()
+        };
+        let asked = relays(asked);
         Self {
             complete_reads: usize::from(outcome.complete),
             incomplete_reads: usize::from(!outcome.complete),
-            relays_asked: asked,
-            relays_answered: outcome.complete_endpoints.len().min(asked),
+            relays_asked: asked.len(),
+            relays_answered: relays(&outcome.complete_endpoints)
+                .intersection(&asked)
+                .count(),
         }
     }
 
@@ -1261,13 +1301,13 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .map(move |(indices, endpoints, queries)| {
                 let directory = directory.clone();
                 started_before(batch_cut_off, async move {
-                    let asked = endpoints.len();
+                    let asked = endpoints.clone();
                     let result = directory
                         .relay_plane
                         .fetch_directory_events_with_completion(endpoints, queries)
                         .await
                         .map(|outcome| {
-                            let coverage = MemberKeyPackageReadCoverage::of_read(asked, &outcome);
+                            let coverage = MemberKeyPackageReadCoverage::of_read(&asked, &outcome);
                             (outcome.records, coverage)
                         })
                         .map_err(DirectoryError::RelayDirectory);
@@ -1394,7 +1434,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 .await
                                 .map_err(DirectoryError::RelayDirectory)?;
                             let coverage =
-                                MemberKeyPackageReadCoverage::of_read(endpoints.len(), &fetched);
+                                MemberKeyPackageReadCoverage::of_read(&endpoints, &fetched);
                             let mut records = fetched.records;
                             // This supplementary lookup must not discard a
                             // valid package observed in this call's batch.
