@@ -677,7 +677,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 continue;
             };
             // An incompatibility verdict needs current outbox discovery as
-            // well as complete KeyPackage reads.
+            // well as complete KeyPackage reads. Absence stands without a
+            // confirmed list, as for an account that publishes none.
             let result = match result {
                 Err(DirectoryError::KeyPackageRequirements(error))
                     if !relay_lists_completed.contains(&index)
@@ -808,12 +809,13 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     /// A member's listed KeyPackage routes, or `defaults` when the list names
     /// none, plus any tied relays, admitted together. Tied relays only add
     /// reads: when they push the routes past the admission limit, the primary
-    /// routes are read alone.
+    /// routes are read alone, and the second value is the tied relays left
+    /// out.
     fn member_key_package_routes(
         &self,
         target: &MemberTarget,
         defaults: &[TransportEndpoint],
-    ) -> Result<Vec<TransportEndpoint>, String> {
+    ) -> Result<(Vec<TransportEndpoint>, Vec<TransportEndpoint>), String> {
         let context = "member KeyPackage batch fetch";
         let safe = |relays: &[String]| {
             self.relay_plane.retain_safe_discovered_endpoints(
@@ -831,7 +833,23 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 "member KeyPackage route admission",
             )
         };
-        admit(safe(&target.tied_relays)).or_else(|_| admit(Vec::new()))
+        // A tied list can repeat the listed relays, spelled the same or with
+        // an optional root slash. Only the relays it adds count toward the
+        // limit.
+        let mut named = primary
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
+            .collect::<BTreeSet<_>>();
+        let tied = safe(&target.tied_relays)
+            .into_iter()
+            .filter(|endpoint| {
+                RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| named.insert(relay))
+            })
+            .collect::<Vec<_>>();
+        match admit(tied.clone()) {
+            Ok(routes) => Ok((routes, Vec::new())),
+            Err(_) => admit(Vec::new()).map(|routes| (routes, tied)),
+        }
     }
 
     /// Journals what a read returned for an account, then fences selection
@@ -1279,9 +1297,26 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     ) -> Result<(), DirectoryError> {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
+        // Members with a tied outbox that neither their routes nor recovery's
+        // supplementary routes read. For them absence is unproven.
+        let mut tie_unread = HashSet::new();
         for index in unresolved.iter().copied() {
             let mut endpoints = match self.member_key_package_routes(&targets[index], &defaults) {
-                Ok(endpoints) => endpoints,
+                Ok((endpoints, skipped)) => {
+                    let (searched, supplementary) =
+                        self.key_package_recovery_routes(&endpoints, &defaults);
+                    let read = searched
+                        .iter()
+                        .chain(&supplementary)
+                        .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
+                        .collect::<BTreeSet<_>>();
+                    if skipped.iter().any(|endpoint| {
+                        RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| !read.contains(&relay))
+                    }) {
+                        tie_unread.insert(index);
+                    }
+                    endpoints
+                }
                 Err(_) => {
                     outcomes[index] = Some(Err(DirectoryError::DirectoryLookupIncomplete(
                         targets[index].account_id_hex.clone(),
@@ -1469,9 +1504,23 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let mut fallback_results =
             stream::iter(work).buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY);
         while let Some((index, result)) = fallback_results.next().await {
-            outcomes[index] = Some(result.and_then(|selected| {
+            let result = result.and_then(|selected| {
                 self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)
-            }));
+            });
+            // Decided as each member's result is stored, so a deadline that
+            // cancels the remaining members cannot lose it.
+            let absent = match &result {
+                Err(DirectoryError::MissingKeyPackage { .. }) => true,
+                Ok(packages) => packages.is_empty(),
+                Err(_) => false,
+            };
+            outcomes[index] = Some(if absent && tie_unread.contains(&index) {
+                Err(DirectoryError::DirectoryLookupIncomplete(
+                    targets[index].account_id_hex.clone(),
+                ))
+            } else {
+                result
+            });
         }
         Ok(())
     }

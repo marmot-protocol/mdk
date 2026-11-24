@@ -33,6 +33,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   this device's KeyPackage journal keeps a publication of theirs that the lookup did not account for. The shared API
   guidance for `marmot_start_direct_chat_with_options` states what accounts for one and how long the journal keeps
   it.
+- A member with no KeyPackage is `MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPLETE`, not missing, while a relay list tied with
+  theirs named a usable outbox that no KeyPackage read covered.
 - Group creation, invites and direct-chat starts always discover the members' current relay routes after
   `marmot_prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm
   no longer skips discovery.

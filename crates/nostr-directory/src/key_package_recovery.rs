@@ -117,28 +117,7 @@ impl<R: DirectoryResources> Directory<R> {
         if key_package_read_page_full(account, &observed) {
             return Err(recovery_incomplete(account));
         }
-        // Primary routes already crossed the maintained 16-endpoint admission
-        // gate. Recovery only adds eight distinct safe configured routes.
-        let searched = self.relay_plane.retain_safe_discovered_endpoints(
-            searched.to_vec(),
-            "KeyPackage recovery searched routes",
-        );
-        // RelayUrl equality ignores an optional root slash, while its display
-        // spelling (and TransportEndpoint equality) preserves it. Count relay
-        // identities, not spellings, against the supplementary route budget.
-        let mut seen = searched
-            .iter()
-            .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
-            .collect::<BTreeSet<_>>();
-        let supplementary = self
-            .relay_plane
-            .retain_safe_discovered_endpoints(discovery.to_vec(), "KeyPackage discovery recovery")
-            .into_iter()
-            .filter(|endpoint| {
-                RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| seen.insert(relay))
-            })
-            .take(RECOVERY_ENDPOINT_LIMIT)
-            .collect::<Vec<_>>();
+        let (searched, supplementary) = self.key_package_recovery_routes(searched, discovery);
         let freshness = self.directory_freshness();
         // What the read found is used even when the read was incomplete:
         // every device is sought, not guaranteed (mdk#2628, D12).
@@ -337,6 +316,38 @@ impl<R: DirectoryResources> Directory<R> {
             }
             proven.insert(target.event_id);
         }
+    }
+
+    /// The safe routes among `searched`, and the supplementary routes
+    /// recovery reads from `discovery` when those find no usable package.
+    pub(super) fn key_package_recovery_routes(
+        &self,
+        searched: &[TransportEndpoint],
+        discovery: &[TransportEndpoint],
+    ) -> (Vec<TransportEndpoint>, Vec<TransportEndpoint>) {
+        // Primary routes already crossed the maintained 16-endpoint admission
+        // gate. Recovery only adds eight distinct safe configured routes.
+        let searched = self.relay_plane.retain_safe_discovered_endpoints(
+            searched.to_vec(),
+            "KeyPackage recovery searched routes",
+        );
+        // RelayUrl equality ignores an optional root slash, while its display
+        // spelling (and TransportEndpoint equality) preserves it. Count relay
+        // identities, not spellings, against the supplementary route budget.
+        let mut seen = searched
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
+            .collect::<BTreeSet<_>>();
+        let supplementary = self
+            .relay_plane
+            .retain_safe_discovered_endpoints(discovery.to_vec(), "KeyPackage discovery recovery")
+            .into_iter()
+            .filter(|endpoint| {
+                RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| seen.insert(relay))
+            })
+            .take(RECOVERY_ENDPOINT_LIMIT)
+            .collect();
+        (searched, supplementary)
     }
 
     /// Journals `records`, then rereads the account's fence when the caller

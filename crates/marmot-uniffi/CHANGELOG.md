@@ -32,6 +32,8 @@
   this device's KeyPackage journal keeps a publication of theirs that the lookup did not account for. The API
   reference for `start_direct_conversation_with_options` states what accounts for one and how long the journal keeps
   it.
+- A member with no KeyPackage is `MemberResolutionStatusFfi::Incomplete`, not missing, while a relay list tied with
+  theirs named a usable outbox that no KeyPackage read covered.
 - Group creation, invites and direct-chat starts always discover the members' current relay routes after
   `prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm no longer
   skips discovery.

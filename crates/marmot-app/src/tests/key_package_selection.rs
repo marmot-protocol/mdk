@@ -2456,7 +2456,9 @@ async fn a_tied_outbox_does_not_displace_the_directory_relays() {
 
 /// A tied relay list can name enough relays to push the recipient's routes
 /// past the admission limit. The tie only adds reads, so the remembered outbox
-/// is still read and its compatible package is used.
+/// is still read and its compatible package is used. While that outbox and
+/// the directory relays hold none, the outboxes left unread keep the lookup
+/// from reporting the recipient as having no KeyPackage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tied_relay_list_too_long_to_add_still_reads_the_remembered_outbox() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
@@ -2492,9 +2494,134 @@ async fn a_tied_relay_list_too_long_to_add_still_reads_the_remembered_outbox() {
             .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
             .unwrap()
             .clone();
-        let old_outbox = by_endpoint.get_mut("wss://shared.example").unwrap();
-        old_outbox.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
-        old_outbox.push(compatible.clone());
+        for relay in ["wss://shared.example", "wss://directory.example"] {
+            by_endpoint
+                .get_mut(relay)
+                .unwrap()
+                .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        }
+        by_endpoint.insert(tied[0].clone(), vec![compatible.clone()]);
+        compatible
+    };
+    let skipped = resolve().await;
+    assert!(
+        matches!(
+            &skipped,
+            Err(DirectoryError::DirectoryLookupIncomplete(account)) if account == &bob.account_id_hex
+        ),
+        "{:?}",
+        skipped.err()
+    );
+    fetcher
+        .events_by_endpoint
+        .lock()
+        .unwrap()
+        .get_mut("wss://shared.example")
+        .unwrap()
+        .push(compatible.clone());
+    let compatible = compatible.id;
+    let resolved = resolve().await.unwrap();
+    assert_eq!(
+        resolved
+            .key_packages
+            .iter()
+            .map(|package| hex::encode(package.source.as_ref().unwrap().event_id.as_slice()))
+            .collect::<Vec<_>>(),
+        vec![compatible]
+    );
+    app.close_storage().unwrap();
+}
+
+/// A tied relay list can push the routes past the admission limit and still
+/// leave nothing unread: its only outbox is a directory relay, which recovery
+/// reads when the listed outboxes hold nothing. Every outbox either list names
+/// was then read, so the recipient has no KeyPackage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tied_outbox_recovery_reads_leaves_absence_decided() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let directory = app.directory();
+    let resolve = || {
+        directory.resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+    };
+    for events in fetcher.events_by_endpoint.lock().unwrap().values_mut() {
+        events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    }
+    // The first lookup remembers a list naming as many outboxes as one read
+    // admits.
+    let listed = (0..16)
+        .map(|relay| format!("wss://listed-{relay}.example"))
+        .collect::<Vec<_>>();
+    advertise_updated_direct_outbox(
+        &fetcher,
+        &bob,
+        &listed.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let first = resolve().await;
+    assert!(
+        matches!(first, Err(DirectoryError::MissingKeyPackage { .. })),
+        "{:?}",
+        first.err()
+    );
+    tie_directory_relay_list(&fetcher, &bob, &["wss://directory.example"]);
+    let tied = resolve().await;
+    assert!(
+        matches!(tied, Err(DirectoryError::MissingKeyPackage { .. })),
+        "{:?}",
+        tied.err()
+    );
+    app.close_storage().unwrap();
+}
+
+/// A tied relay list that repeats a listed relay with a trailing slash adds
+/// no route for it. Fifteen more relays beside it still fit one read, so the
+/// package on one of them is found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tied_list_repeating_a_listed_relay_does_not_use_up_the_route_limit() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let directory = app.directory();
+    let resolve = || {
+        directory.resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+    };
+    // The first lookup remembers the list naming the old outbox.
+    let first = resolve().await;
+    assert!(
+        matches!(first, Err(DirectoryError::KeyPackageRequirements(_))),
+        "{:?}",
+        first.err()
+    );
+    let added = (0..15)
+        .map(|relay| format!("wss://tied-{relay}.example"))
+        .collect::<Vec<_>>();
+    let tied = std::iter::once("wss://shared.example/")
+        .chain(added.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    tie_directory_relay_list(&fetcher, &bob, &tied);
+    let compatible = {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let compatible = by_endpoint[UPDATED_DIRECT_OUTBOX]
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap()
+            .clone();
+        for relay in ["wss://shared.example", "wss://directory.example"] {
+            by_endpoint
+                .get_mut(relay)
+                .unwrap()
+                .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        }
+        by_endpoint.insert(added[0].clone(), vec![compatible.clone()]);
         compatible.id
     };
     let resolved = resolve().await.unwrap();

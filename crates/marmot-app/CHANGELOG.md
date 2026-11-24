@@ -54,6 +54,8 @@
 - A member lookup that finds no usable KeyPackage reports `DirectoryLookupIncomplete`, not a missing or incompatible
   KeyPackage, while this device's KeyPackage journal keeps a publication of that member that the lookup did not account
   for. The README's direct-chat section states what accounts for one and how long the journal keeps it.
+- A member lookup that finds no KeyPackage reports `DirectoryLookupIncomplete`, not a missing KeyPackage, while a relay
+  list tied with the member's named a usable outbox that no KeyPackage read covered.
 
 ### Fixed
 
