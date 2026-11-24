@@ -555,10 +555,14 @@ impl AppClient {
     /// whose leaf a chat still holds are then kept another 30 days
     /// ([`Self::keep_removed_device_keys`]).
     async fn clean_up_removed_devices(&mut self) -> Result<(), AppError> {
+        // One clock reading for the whole pass: the keys that found a held
+        // leaf are the ones renewed, even when the removals awaited between
+        // the lookup and the renewal cross the 30-day cutoff.
+        let now = unix_now_seconds();
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Ok(());
         };
-        let gone = self.gone_devices(&group_id, &roster)?;
+        let gone = self.gone_devices(&group_id, &roster, now)?;
         if gone.slots.is_empty() {
             return Ok(());
         }
@@ -597,7 +601,7 @@ impl AppClient {
                 }
             }
         }
-        if let Err(error) = self.keep_removed_device_keys(&group_id, &held) {
+        if let Err(error) = self.keep_removed_device_keys(&group_id, &held, now) {
             first_error.get_or_insert(error);
         }
         first_error.map_or(Ok(()), Err)
@@ -618,9 +622,10 @@ impl AppClient {
         &self,
         group_id: &GroupId,
         held: &BTreeSet<DeviceSlotId>,
+        now: u64,
     ) -> Result<(), AppError> {
         let removed = self
-            .remembered_tag_keys(group_id)?
+            .remembered_tag_keys_at(group_id, now)?
             .into_iter()
             .filter(|key| key.held_as_removed && held.contains(&key.slot))
             .map(|key| key.slot)
@@ -628,7 +633,6 @@ impl AppClient {
         if removed.is_empty() {
             return Ok(());
         }
-        let now = unix_now_seconds();
         let storage = self.app.account_storage(&self.state.label)?;
         for slot in removed {
             storage.renew_roster_tag_keys(
@@ -652,7 +656,7 @@ impl AppClient {
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Ok(0);
         };
-        let gone = self.gone_devices(&group_id, &roster)?;
+        let gone = self.gone_devices(&group_id, &roster, unix_now_seconds())?;
         if gone.slots.is_empty() {
             return Ok(0);
         }
@@ -678,6 +682,7 @@ impl AppClient {
         &self,
         group_id: &GroupId,
         roster: &DeviceRosterV1,
+        now: u64,
     ) -> Result<GoneDevices, AppError> {
         let mut gone = GoneDevices::default();
         let own_slot = self.own_slot().ok();
@@ -710,7 +715,7 @@ impl AppClient {
                 .account_storage(&self.state.label)?
                 .app_storage()
                 .device_removals()?;
-            for key in self.remembered_tag_keys(group_id)? {
+            for key in self.remembered_tag_keys_at(group_id, now)? {
                 let explicitly_removed = removals.iter().any(|removal| {
                     removal.group_id_hex == hex::encode(group_id.as_slice())
                         && removal.slot_hex == hex::encode(key.slot)
@@ -741,7 +746,9 @@ impl AppClient {
         group_id: &GroupId,
         roster: &DeviceRosterV1,
     ) -> Result<BTreeSet<DeviceSlotId>, AppError> {
-        Ok(self.gone_devices(group_id, roster)?.slots)
+        Ok(self
+            .gone_devices(group_id, roster, unix_now_seconds())?
+            .slots)
     }
 
     /// The tag signature keys rosters of `group_id` this device applied
@@ -751,7 +758,17 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<RosterTagKey>, AppError> {
-        let since = unix_now_seconds().saturating_sub(ROSTER_TAG_KEY_RETENTION_SECS);
+        self.remembered_tag_keys_at(group_id, unix_now_seconds())
+    }
+
+    /// [`Self::remembered_tag_keys`] as of `now`, for a pass that reads them
+    /// more than once.
+    fn remembered_tag_keys_at(
+        &self,
+        group_id: &GroupId,
+        now: u64,
+    ) -> Result<Vec<RosterTagKey>, AppError> {
+        let since = now.saturating_sub(ROSTER_TAG_KEY_RETENTION_SECS);
         Ok(self
             .app
             .account_storage(&self.state.label)?
