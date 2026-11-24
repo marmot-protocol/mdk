@@ -1525,6 +1525,9 @@ jobs:
           sudo install -m 0755 /tmp/tamarin-prover /usr/local/bin/tamarin-prover
           tamarin-prover --version
 
+      - name: Check Tamarin prover runner tests
+        run: python3 -B -m unittest discover -s formal/tamarin -p 'test_*.py'
+
       - name: Run Tamarin proofs
         run: make -C formal/tamarin prove
 
