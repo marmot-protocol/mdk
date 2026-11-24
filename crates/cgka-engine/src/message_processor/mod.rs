@@ -3128,21 +3128,12 @@ impl<S: StorageProvider> Engine<S> {
             }
             finish_one_background_row = false;
             let record = self.storage.get_message(&metadata.id)?;
-            let lifecycle = record
+            let over_retry_budget = record
                 .deferred_peel
                 .as_ref()
-                .expect("deferred lifecycle normalized before sweep");
-            if lifecycle.live_context_attempts >= retry_budget {
-                execution.consume_row();
-                attempted += 1;
-                self.release_deferred_peel_row(
-                    &record,
-                    InboundResourceLimit::TransportDeferredRetryBudget,
-                    crate::message_disposition::MessageDisposition::RetryBudgetRefused,
-                )?;
-                terminal += 1;
-                continue;
-            }
+                .expect("deferred lifecycle normalized before sweep")
+                .live_context_attempts
+                >= retry_budget;
             execution.consume_row();
             attempted += 1;
             let remaining = execution.remaining(self.monotonic.elapsed());
@@ -3173,6 +3164,18 @@ impl<S: StorageProvider> Engine<S> {
             };
             if result {
                 progressed += 1;
+                continue;
+            }
+            // Give a newly arrived peel context one bounded attempt before
+            // deleting a row at the retry cutoff so a commit that unlocks the
+            // row on the cutoff sweep is never silently discarded.
+            if over_retry_budget {
+                self.release_deferred_peel_row(
+                    &record,
+                    InboundResourceLimit::TransportDeferredRetryBudget,
+                    crate::message_disposition::MessageDisposition::RetryBudgetRefused,
+                )?;
+                terminal += 1;
                 continue;
             }
 

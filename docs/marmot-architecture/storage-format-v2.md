@@ -71,8 +71,9 @@ retires its receipts without arming a backfill unless no recovery inventory row
 placed it. Today, budget-expired deferred-peel evictions (retry-budget and
 residence-budget) simply delete the row from `cgka_messages` without journaling
 a replay release, retiring `seen_events`, deleting reconciliation inventory, or
-uncovering coverage, so neither NIP-77 nor ordinary recovery sweeps re-admit
-rows that already exhausted their local deferred budget. An id released again
+uncovering coverage. Leaving coverage and inventory intact closes the immediate
+bounce-back loop, and keeping the `seen_events` entry suppresses ordinary-sweep
+re-staging while the event remains within the bounded 16,384-entry seen ring. An id released again
 before consumption counts if either release did, at that release's epoch. The caller
 then clears its in-memory seen ring/index synchronously, before any await or
 fallible operation. Process death before

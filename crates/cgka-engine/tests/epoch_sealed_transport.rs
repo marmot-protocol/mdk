@@ -1145,6 +1145,19 @@ async fn expired_deferred_row_arms_no_epoch_gap_and_keeps_inventory() {
             },
         )))
         .unwrap();
+    let seen_ids = [
+        hex::encode(with_inventory.id.as_slice()),
+        hex::encode(without_inventory.id.as_slice()),
+    ];
+    let mut projection = bob_storage
+        .app_storage()
+        .load_account_projection_state("bob", 100)
+        .unwrap();
+    projection.seen_events.extend(seen_ids.iter().cloned());
+    bob_storage
+        .app_storage()
+        .save_account_projection_state(&projection, 100, item_ts)
+        .unwrap();
 
     for _ in 0..8 {
         bob.retry_deferred_peels(&group_id).await.unwrap();
@@ -1161,6 +1174,17 @@ async fn expired_deferred_row_arms_no_epoch_gap_and_keeps_inventory() {
             .is_empty(),
         "budget-expired rows must not journal a replay release or retire seen_events"
     );
+    let seen_after = bob_storage
+        .app_storage()
+        .load_account_projection_state("bob", 100)
+        .unwrap()
+        .seen_events;
+    for id_hex in &seen_ids {
+        assert!(
+            seen_after.contains(id_hex),
+            "seen_events receipt must survive budget expiry"
+        );
+    }
     assert!(
         bob_storage
             .app_storage()
