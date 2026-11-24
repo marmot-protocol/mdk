@@ -606,6 +606,33 @@ impl KeyPackageJournalFence {
             .filter(|replacement| replacement.key_package_id == slot)
             .all(|replacement| replacement_allows(event_id, created_at, replacement))
     }
+
+    /// Whether the journal knows a publication that replaces this one in its
+    /// slot and knows no deletion of that replacement. Records that lack the
+    /// replacement then say nothing about what the account publishes there.
+    fn replaced_by_a_live_publication(&self, event_id: &str, slot: &str, created_at: u64) -> bool {
+        let replacements = self
+            .replacements
+            .iter()
+            .filter(|replacement| {
+                replacement.key_package_id == slot
+                    && !replacement_allows(event_id, created_at, replacement)
+            })
+            .map(|replacement| (&replacement.event_id_hex, replacement.event_created_at));
+        // A replacement pruned from the journal's table stays as a barrier.
+        let pruned = self
+            .barriers
+            .iter()
+            .filter(|barrier| {
+                barrier.kind == PublicKeyPackageBarrierKind::Replacement
+                    && barrier.key_package_id == slot
+                    && !barrier_allows(event_id, created_at, barrier)
+            })
+            .map(|barrier| (&barrier.event_id_hex, barrier.event_created_at));
+        replacements
+            .chain(pruned)
+            .any(|(replacement, published_at)| self.allows(replacement, slot, published_at))
+    }
 }
 
 /// Select the account's KeyPackages to add (`foundation/key-packages.md`,
@@ -652,10 +679,18 @@ pub(crate) fn select_fenced_key_packages(
         newest_error,
         rejected_future,
         legacy_slots,
+        unread_replacement,
     } = slot_candidates(account_id_hex, records, freshness, requirements, fence);
     if candidates.is_empty()
         && let Some(error) = newest_error
     {
+        // A rejection describes the account's packages only when the records
+        // hold every slot's current publication.
+        if unread_replacement {
+            return Err(DirectoryError::DirectoryLookupIncomplete(
+                account_id_hex.to_owned(),
+            ));
+        }
         return Err(error);
     }
     candidates.sort_by(|a, b| {
@@ -696,6 +731,8 @@ struct SlotCandidates {
     newest_error: Option<DirectoryError>,
     rejected_future: bool,
     legacy_slots: bool,
+    /// The journal knows a live replacement of some slot's newest record.
+    unread_replacement: bool,
 }
 
 fn slot_candidates(
@@ -717,6 +754,7 @@ fn slot_candidates(
     let mut newest_error = None;
     let mut slots = BTreeSet::new();
     let mut legacy_slots = false;
+    let mut unread_replacement = false;
     let mut candidates = Vec::new();
     for record in records {
         if !freshness.accepts(record) {
@@ -733,9 +771,17 @@ fn slot_candidates(
             slot,
             record.event.created_at,
             &deletions,
-        ) || fence
-            .is_some_and(|fence| !fence.allows(&record.event.id, slot, record.event.created_at))
+        ) {
+            continue;
+        }
+        if let Some(fence) = fence
+            && !fence.allows(&record.event.id, slot, record.event.created_at)
         {
+            unread_replacement |= fence.replaced_by_a_live_publication(
+                &record.event.id,
+                slot,
+                record.event.created_at,
+            );
             continue;
         }
         let (fetched, metadata) = match key_package_and_metadata_from_borrowed_record(record) {
@@ -778,6 +824,7 @@ fn slot_candidates(
         newest_error,
         rejected_future,
         legacy_slots,
+        unread_replacement,
     }
 }
 
@@ -1350,4 +1397,58 @@ pub(crate) fn watermark_allows(
         return created_at > barrier.observed_at.saturating_add(future_skew_secs);
     }
     barrier_allows(event_id, created_at, barrier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A slot's older publication is hidden by a replacement the journal
+    /// knows, from its table or pruned to a barrier, until the journal also
+    /// knows that replacement deleted.
+    #[test]
+    fn a_fence_reports_a_replacement_until_it_is_deleted() {
+        let account = "aa".repeat(32);
+        let (older, newer) = ("11".repeat(32), "22".repeat(32));
+        let barrier = |kind, deleted_event_id| PublicKeyPackageBarrierRecord {
+            account_id_hex: account.clone(),
+            key_package_id: "slot".into(),
+            event_id_hex: newer.clone(),
+            deleted_event_id,
+            event_created_at: 20,
+            observed_at: 30,
+            kind,
+        };
+        let fence = |replaced: bool, barriers| KeyPackageJournalFence {
+            replacements: replaced
+                .then(|| PublicKeyPackageReplacementRecord {
+                    account_id_hex: account.clone(),
+                    key_package_id: "slot".into(),
+                    event_id_hex: newer.clone(),
+                    event_created_at: 20,
+                    observed_at: 30,
+                })
+                .into_iter()
+                .collect(),
+            barriers,
+        };
+        let pruned = barrier(PublicKeyPackageBarrierKind::Replacement, None);
+        let deletion = PublicKeyPackageBarrierRecord {
+            event_id_hex: "33".repeat(32),
+            ..barrier(PublicKeyPackageBarrierKind::Deletion, Some(newer.clone()))
+        };
+        for (fence, hidden) in [
+            (fence(true, vec![]), true),
+            (fence(false, vec![pruned]), true),
+            (fence(true, vec![deletion]), false),
+            (fence(false, vec![]), false),
+        ] {
+            assert_eq!(
+                fence.replaced_by_a_live_publication(&older, "slot", 10),
+                hidden
+            );
+            assert!(!fence.replaced_by_a_live_publication(&newer, "slot", 20));
+            assert!(!fence.replaced_by_a_live_publication(&older, "other", 10));
+        }
+    }
 }

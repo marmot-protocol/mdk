@@ -1581,6 +1581,94 @@ async fn a_moved_outbox_cannot_revive_a_package_prewarm_saw_replaced() {
     app.close_storage().unwrap();
 }
 
+/// Prewarm sees a compatible package replace a slot. The recipient's outbox
+/// then moves, and the new one serves an older copy of that slot beside an
+/// incompatible slot. The journal bars the older copy, but the replacement it
+/// knows went unread, so the other slot's refusal is no verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacement_only_the_journal_knows_decides_no_incompatibility() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let replacement = candidate(
+        &bob,
+        fresh_key_package_for_account(&app, &bob, false).await,
+        "x",
+        None,
+        unix_now_seconds(),
+    );
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        for endpoint in ["wss://directory.example", "wss://shared.example"] {
+            by_endpoint
+                .get_mut(endpoint)
+                .unwrap()
+                .push(replacement.clone());
+        }
+        for relays in by_endpoint.values_mut() {
+            for event in relays
+                .iter_mut()
+                .filter(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            {
+                *event = signed(&app, &bob, event.clone());
+            }
+        }
+    }
+    app.directory()
+        .prewarm_group_member_key_packages(&[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let older = fresh_key_package_for_account(&app, &bob, false).await;
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let records = by_endpoint.get_mut("wss://directory.example").unwrap();
+        let limited = records
+            .iter()
+            .find(|event| {
+                event.kind == KIND_MARMOT_KEY_PACKAGE && event.tag_value("d") == Some("limited")
+            })
+            .unwrap()
+            .clone();
+        let stale = candidate(&bob, older, "x", None, replacement.created_at - 1);
+        let outbox = records
+            .iter_mut()
+            .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
+            .unwrap();
+        *outbox = NostrTransportEvent::new_unsigned_at(
+            bob.account_id_hex.clone(),
+            KIND_NIP65_RELAY_LIST,
+            vec![vec![
+                "r".into(),
+                UPDATED_DIRECT_OUTBOX.into(),
+                "write".into(),
+            ]],
+            String::new(),
+            outbox.created_at + 1,
+        );
+        records.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        let updated = by_endpoint.get_mut(UPDATED_DIRECT_OUTBOX).unwrap();
+        updated.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        updated.push(stale);
+        updated.push(limited);
+    }
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let error = runtime
+        .start_direct_conversation_with_options(
+            "alice",
+            &bob.account_id_hex,
+            crate::DirectConversationOptions {
+                disappearing_message_secs: 300,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::DirectoryLookupIncomplete { .. }),
+        "{error}"
+    );
+    assert!(app.groups("alice").unwrap().is_empty());
+    runtime.shutdown().await;
+    app.close_storage().unwrap();
+}
+
 /// Points the directory's relay list for `bob` at `relays`, keeping its
 /// timestamp, and drops the old outbox's own copy of the list.
 fn tie_directory_relay_list(
