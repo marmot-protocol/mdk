@@ -257,6 +257,20 @@ class RecordingControlServer:
             }
 
 
+PROBE_TOOL_NAMES = ("probe_alpha", "web_search", "probe_beta")
+PROBE_PROGRESS_MARKERS = (
+    "probe_alpha",
+    "probe_beta",
+    "web_search",
+    "Searching the web",
+)
+
+
+def _contains_tool_progress(text: Any) -> bool:
+    raw = str(text or "")
+    return any(marker in raw for marker in PROBE_PROGRESS_MARKERS)
+
+
 class DeterministicAIAgent:
     instances: list["DeterministicAIAgent"] = []
 
@@ -264,9 +278,8 @@ class DeterministicAIAgent:
         self.tool_progress_callback = None
         self.is_interrupted = False
         self.fail_turn = bool(kwargs.pop("_fail_turn", False))
-        self.tool_names = list(
-            kwargs.pop("_tool_names", ("probe_alpha", "web_search", "probe_beta"))
-        )
+        self.tool_names = list(kwargs.pop("_tool_names", PROBE_TOOL_NAMES))
+        self.progress_callback_invocations = 0
         self.last_result: dict[str, Any] | None = None
         self.created = True
         DeterministicAIAgent.instances.append(self)
@@ -276,6 +289,7 @@ class DeterministicAIAgent:
         if callback is not None:
             for name in self.tool_names:
                 callback("tool.started", name, preview=f"{name}-preview", args={"q": name})
+                self.progress_callback_invocations += 1
         if self.fail_turn:
             self.last_result = {
                 "final_response": "",
@@ -811,8 +825,12 @@ async def _exercise_reconstructed_adapter(
             raise AssertionError("reconstructed adapter issued automatic wire deletes")
         if fake.operation_sends != 0:
             raise AssertionError("reconstructed adapter emitted retired operation events")
-        if fake.final_sends != 1 or fake.probe_final_acks != 1:
+        if fake.probe_final_acks != 1:
             raise AssertionError("reconstructed adapter did not deliver the verbatim final reply")
+        if any(_contains_tool_progress(text) for text in fake.final_texts):
+            raise AssertionError("reconstructed adapter leaked tool progress into durable sends")
+        if sum(inst.progress_callback_invocations for inst in DeterministicAIAgent.instances) < len(PROBE_TOOL_NAMES):
+            raise AssertionError("reconstructed adapter turn did not exercise host progress callback")
     finally:
         if original_load_gateway_config is not None:
             gateway_run._load_gateway_config = original_load_gateway_config
@@ -987,9 +1005,13 @@ async def _run_gateway_turn_body(
         inst.last_result for inst in DeterministicAIAgent.instances if inst.last_result is not None
     ]
     agent_failed = any(bool(result.get("failed")) for result in agent_results)
+    progress_callback_invocations = sum(
+        inst.progress_callback_invocations for inst in DeterministicAIAgent.instances
+    )
     return {
         "resolved_cleanup": resolved_cleanup,
         "operation_sends": fake.operation_sends,
+        "progress_callback_invocations": progress_callback_invocations,
         "final_sends": fake.final_sends,
         "final_texts": list(fake.final_texts),
         "probe_final_acks": fake.probe_final_acks,
@@ -1025,12 +1047,14 @@ def _assert_progress_suppressed_and_final_delivered(
 ) -> None:
     if result["resolved_cleanup"] is not expected_cleanup:
         raise AssertionError(f"{label}: installed cleanup resolved unexpectedly")
+    if result["progress_callback_invocations"] < len(PROBE_TOOL_NAMES):
+        raise AssertionError(f"{label}: host progress callback was not exercised")
     if result["operation_sends"] != 0:
         raise AssertionError(f"{label}: retired operation events were sent")
-    if result["final_sends"] != 1 or result["probe_final_acks"] != 1:
-        raise AssertionError(f"{label}: expected only the verbatim probe final reply")
-    if result["final_texts"] != [PROBE_FINAL_TEXT]:
-        raise AssertionError(f"{label}: durable sends did not match the verbatim final reply")
+    if result["probe_final_acks"] != 1:
+        raise AssertionError(f"{label}: expected verbatim probe final reply")
+    if any(_contains_tool_progress(text) for text in result["final_texts"]):
+        raise AssertionError(f"{label}: tool progress leaked into durable sends")
     if not result["delivery_boundary_observed"]:
         raise AssertionError(f"{label}: host delivery-finally boundary was not observed")
     if not result["scheduled_work_drained"]:
@@ -1045,8 +1069,12 @@ def _assert_failure_suppressed(
 ) -> None:
     if result["resolved_cleanup"] is not False:
         raise AssertionError(f"{label}: installed cleanup did not resolve false")
+    if result["progress_callback_invocations"] < len(PROBE_TOOL_NAMES):
+        raise AssertionError(f"{label}: host progress callback was not exercised")
     if result["operation_sends"] != 0:
         raise AssertionError(f"{label}: retired operation events were sent")
+    if any(_contains_tool_progress(text) for text in result["final_texts"]):
+        raise AssertionError(f"{label}: tool progress leaked into durable sends")
     if not result["delivery_boundary_observed"]:
         raise AssertionError(f"{label}: host delivery-finally boundary was not observed")
     if not result["scheduled_work_drained"]:

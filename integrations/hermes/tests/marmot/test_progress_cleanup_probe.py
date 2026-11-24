@@ -157,9 +157,10 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
     def test_progress_suppressed_assertion_requires_zero_operations_and_verbatim_final(self):
         result = {
             "resolved_cleanup": False,
+            "progress_callback_invocations": len(probe.PROBE_TOOL_NAMES),
             "operation_sends": 0,
-            "final_sends": 1,
-            "final_texts": [probe.PROBE_FINAL_TEXT],
+            "final_sends": 2,
+            "final_texts": ["No home channel notice", probe.PROBE_FINAL_TEXT],
             "probe_final_acks": 0,
             "delivery_boundary_observed": True,
             "scheduled_work_drained": True,
@@ -170,6 +171,12 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
             probe._assert_progress_suppressed_and_final_delivered(result, label="accumulate")
         result["probe_final_acks"] = 1
         probe._assert_progress_suppressed_and_final_delivered(result, label="accumulate")
+        leaked = dict(result, final_texts=["🔍 Searching the web for cats", probe.PROBE_FINAL_TEXT])
+        with self.assertRaisesRegex(AssertionError, "tool progress leaked"):
+            probe._assert_progress_suppressed_and_final_delivered(leaked, label="accumulate")
+        unexercised = dict(result, progress_callback_invocations=0)
+        with self.assertRaisesRegex(AssertionError, "progress callback was not exercised"):
+            probe._assert_progress_suppressed_and_final_delivered(unexercised, label="accumulate")
         result["operation_sends"] = 1
         with self.assertRaisesRegex(AssertionError, "retired operation events"):
             probe._assert_progress_suppressed_and_final_delivered(result, label="accumulate")
