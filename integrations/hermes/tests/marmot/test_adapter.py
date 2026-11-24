@@ -189,6 +189,16 @@ def install_fake_hermes_modules(*, media_kinds: bool = False):
         async def remove_reaction(self, chat_id, message_id=None):
             raise NotImplementedError
 
+        async def edit_message(
+            self,
+            chat_id,
+            message_id,
+            content,
+            *,
+            finalize=False,
+        ):
+            return SendResult(success=False, error="Not supported")
+
         def resume_typing_for_chat(self, chat_id):
             pass
 
@@ -1468,9 +1478,6 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(parse(" \n ")[0], "invalid")
         self.assertEqual(parse("x" * 81)[0], "invalid")
 
-    def test_plain_two_word_message_is_not_legacy_tool_progress(self):
-        self.assertEqual(self.adapter._tool_events_from_progress_text("hello world"), [])
-
 
 class MediaLimitConfigurationTests(unittest.TestCase):
     def test_defaults_support_large_application_artifacts(self):
@@ -1643,110 +1650,79 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.continuation_message_ids, ("aa", "bb"))
         self.assertEqual(fake_client.calls, [("11" * 32, "22" * 32, "pong", "33" * 32)])
 
-    async def test_tool_progress_send_maps_to_agent_operation_event(self):
-        class FakeClient:
-            def __init__(self):
-                self.tool_events = []
-                self.final_sends = []
-
-            async def send_agent_operation_event(self, account_id_hex, group_id_hex, **kwargs):
-                self.tool_events.append((account_id_hex, group_id_hex, kwargs))
-                return {
-                    "type": "app_event_sent",
-                    "message_ids_hex": ["44" * 32],
-                }
-
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
-                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
-                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(extra={"account_id_hex": "11" * 32}),
-            client=fake_client,
-        )
-
-        result = await adapter.send(
-            chat_id="22" * 32,
-            content='* search: "glp-1"',
-            reply_to="33" * 32,
-        )
-
-        self.assertTrue(result.success)
-        self.assertTrue(result.message_id.startswith("marmot-tool-progress:"))
-        self.assertEqual(fake_client.final_sends, [])
-        self.assertEqual(len(fake_client.tool_events), 1)
-        account_id, group_id, kwargs = fake_client.tool_events[0]
-        self.assertEqual(account_id, "11" * 32)
-        self.assertEqual(group_id, "22" * 32)
-        self.assertEqual(kwargs["event_type"], "tool_call")
-        self.assertEqual(kwargs["status"], "started")
-        self.assertEqual(kwargs["name"], "search")
-        self.assertEqual(kwargs["preview"], "glp-1")
-        self.assertEqual(kwargs["reply_to_message_id_hex"], "33" * 32)
-
-    async def test_tool_progress_retry_resends_failed_event(self):
-        class FakeClient:
-            def __init__(self):
-                self.tool_events = []
-                self.final_sends = []
-                self.fail_next = True
-
-            async def send_agent_operation_event(self, account_id_hex, group_id_hex, **kwargs):
-                self.tool_events.append((account_id_hex, group_id_hex, kwargs))
-                if self.fail_next:
-                    self.fail_next = False
-                    raise RuntimeError("temporary send failure")
-                return {
-                    "type": "app_event_sent",
-                    "message_ids_hex": ["44" * 32],
-                }
-
-            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
-                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
-                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
-
-        fake_client = FakeClient()
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(extra={"account_id_hex": "11" * 32}),
-            client=fake_client,
-        )
-
-        first = await adapter.send(
-            chat_id="22" * 32,
-            content='* search: "glp-1"',
-            reply_to="33" * 32,
-        )
-        self.assertFalse(first.success)
-        self.assertTrue(first.message_id.startswith("marmot-tool-progress:"))
-
-        retry = await adapter.edit_message(
-            chat_id="22" * 32,
-            message_id=first.message_id,
-            content='* search: "glp-1"',
-        )
-
-        self.assertTrue(retry.success)
-        self.assertEqual(fake_client.final_sends, [])
-        self.assertEqual(len(fake_client.tool_events), 2)
-        self.assertEqual(fake_client.tool_events[0][0:2], fake_client.tool_events[1][0:2])
-        self.assertEqual(fake_client.tool_events[0][2], fake_client.tool_events[1][2])
-        self.assertEqual(fake_client.tool_events[1][2]["reply_to_message_id_hex"], "33" * 32)
-
     async def test_edit_of_a_durable_message_is_refused_without_sending(self):
-        # Marmot has no edit-in-place or live preview: Hermes must fall back to
-        # a fresh durable send rather than mutate an already-sent message.
+        # Marmot has no edit-in-place or live preview: inherit Hermes's base
+        # edit_message so Hermes skips edit-based tool-progress bubbles before
+        # calling send(), and falls back to a fresh durable send if edit is
+        # ever called directly.
         fake_client = _DeliveryRoutingFakeClient()
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(extra={"account_id_hex": "11" * 32}),
             client=fake_client,
         )
+        base_adapter_cls = sys.modules["gateway.platforms.base"].BasePlatformAdapter
+
+        self.assertIs(type(adapter).edit_message, base_adapter_cls.edit_message)
 
         result = await adapter.edit_message("22" * 32, "77" * 32, "hello", finalize=True)
 
         self.assertFalse(result.success)
         self.assertEqual(fake_client.final_sends, [])
         self.assertEqual(fake_client.activities, [])
+        self.assertEqual(fake_client.tool_events, [])
+
+    async def test_format_tool_event_eats_structured_tool_chrome(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=_DeliveryRoutingFakeClient(),
+        )
+        event = types.SimpleNamespace(
+            tool_name="web_search",
+            preview="cats",
+            args={"query": "cats"},
+            index=1,
+        )
+        self.assertIsNone(adapter.format_tool_event(event))
+
+    async def test_final_reply_resembling_tool_progress_is_sent_verbatim(self):
+        # Issue #3423: send() must never intercept outbound reply text as
+        # legacy tool progress; every non-commentary reply goes straight to
+        # send_final verbatim.
+        replies = {
+            "blockquoted yaml": (
+                "Here is the reaction config:\n\n"
+                ">     reactions:\n"
+                '>         accepted: "👀"\n'
+                '>         done: "✅"\n'
+                '>         waiting: "⏸️"\n'
+                '>         failed: "❌"\n\n'
+                "Restart the gateway to apply it."
+            ),
+            "blockquote only": '>         accepted: "👀"',
+            "prose ellipsis": "Hmm, checking...\nThe build passed on the second run.",
+            "prose ellipsis only": "Hmm, checking...",
+            "two-word prose ellipsis": "Still checking...",
+            "emoji verb prose": "💻 Running the tests now.",
+            "friendly tool line text": "🔍 Searching the web for cats",
+            "legacy tool line text": '* search: "glp-1"',
+            "raw tool line text": "⚙️ custom_tool...",
+        }
+        for label, reply in replies.items():
+            with self.subTest(label):
+                fake_client = _DeliveryRoutingFakeClient()
+                adapter = self.adapter_module.MarmotPlatformAdapter(
+                    self.config_cls(extra={"account_id_hex": "11" * 32}),
+                    client=fake_client,
+                )
+
+                result = await adapter.send(chat_id="22" * 32, content=reply, reply_to="33" * 32)
+
+                self.assertTrue(result.success)
+                self.assertEqual(fake_client.tool_events, [])
+                self.assertEqual(
+                    fake_client.final_sends,
+                    [("11" * 32, "22" * 32, reply, "33" * 32)],
+                )
 
     async def test_token_stream_preview_send_is_refused_and_a_final_send_goes_out(self):
         # Hermes token streaming sends a partial reply it expects to edit
@@ -1773,19 +1749,6 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(final.success)
         self.assertEqual(len(fake_client.final_sends), 1)
-
-    async def test_disconnect_clears_tool_progress_dedupe_cache(self):
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(extra={"account_id_hex": "11" * 32}),
-            client=object(),
-        )
-        adapter._tool_progress_events["marmot-tool-progress:test"] = {"event"}
-        adapter._tool_progress_replies["marmot-tool-progress:test"] = "33" * 32
-
-        await adapter.disconnect()
-
-        self.assertEqual(adapter._tool_progress_events, {})
-        self.assertEqual(adapter._tool_progress_replies, {})
 
     async def test_connect_accepts_gateway_is_reconnect_keyword(self):
         # hermes-agent's gateway connects adapters via connect(is_reconnect=...)
@@ -2926,7 +2889,7 @@ class DeliveryMetadataRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.retryable)
         self.assertEqual(fake_client.final_sends, [])
 
-    async def test_commentary_before_tool_sends_one_activity_zero_finals(self):
+    async def test_commentary_with_progress_shaped_text_routes_to_activity_zero_finals(self):
         fake_client = _DeliveryRoutingFakeClient()
         adapter = self._adapter(fake_client)
 
@@ -2936,18 +2899,20 @@ class DeliveryMetadataRoutingTests(unittest.IsolatedAsyncioTestCase):
             reply_to="33" * 32,
             metadata=self.NON_FINAL_COMMENTARY,
         )
-        tool = await adapter.send(
+        progress_shaped_commentary = await adapter.send(
             chat_id="22" * 32,
             content='* search: "titanium prices"',
             reply_to="33" * 32,
+            metadata=self.NON_FINAL_COMMENTARY,
         )
 
         self.assertTrue(commentary.success)
-        self.assertTrue(tool.success)
-        self.assertEqual(len(fake_client.activities), 1)
+        self.assertTrue(progress_shaped_commentary.success)
+        self.assertEqual(len(fake_client.activities), 2)
         self.assertEqual(fake_client.final_sends, [])
-        self.assertEqual(len(fake_client.tool_events), 1)
+        self.assertEqual(fake_client.tool_events, [])
         self.assertEqual(fake_client.activities[0][2]["text"], "Let me search for that.")
+        self.assertEqual(fake_client.activities[1][2]["text"], '* search: "titanium prices"')
 
     async def test_final_answer_after_commentary_sends_exactly_one_kind_9(self):
         fake_client = _DeliveryRoutingFakeClient()
