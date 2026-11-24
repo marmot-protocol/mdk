@@ -992,9 +992,10 @@ pub struct AppClient {
     /// the durable engine outbox instead.
     pub(crate) pending_failed_sync_summary: crate::SyncSummary,
     /// Output about a chat whose record had changes no save had committed
-    /// when the worker went to announce it. Only that announcement touches
-    /// it, so a cancelled receive or sync cannot lose it (mdk#3359).
-    pub(crate) unannounced_summary: crate::SyncSummary,
+    /// when the worker went to announce it, one entry per announcement, in
+    /// order. Only announcing touches it, so a cancelled receive or sync
+    /// cannot lose it (mdk#3359).
+    pub(crate) unannounced_summaries: Vec<crate::SyncSummary>,
     /// Native checkpoints already committed; retained across drain cancellation.
     pub(super) pending_native_sync_summary: crate::SyncSummary,
     pub(super) native_sync_deliveries: u64,

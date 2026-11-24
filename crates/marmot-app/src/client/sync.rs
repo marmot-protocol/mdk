@@ -391,12 +391,31 @@ fn unknown_group_id(error: &AppError) -> Option<GroupId> {
     }
 }
 
-/// Move the items `hold` picks from `items` to the end of `held`, keeping
-/// their order.
-fn hold_back<T>(items: &mut Vec<T>, held: &mut Vec<T>, hold: impl Fn(&T) -> bool) {
-    let (kept, rest): (Vec<T>, Vec<T>) = std::mem::take(items).into_iter().partition(hold);
-    held.extend(kept);
-    *items = rest;
+/// Take out of `summary`, in order, everything about a chat in `unsaved`.
+fn hold_back_unsaved(summary: &mut SyncSummary, unsaved: &HashSet<String>) -> SyncSummary {
+    fn take<T>(items: &mut Vec<T>, hold: impl Fn(&T) -> bool) -> Vec<T> {
+        let (held, rest) = std::mem::take(items).into_iter().partition(hold);
+        *items = rest;
+        held
+    }
+    let unsaved_group = |group_id: &GroupId| unsaved.contains(&hex::encode(group_id.as_slice()));
+    SyncSummary {
+        joined_groups: take(&mut summary.joined_groups, |group_id| {
+            unsaved_group(group_id)
+        }),
+        messages: take(&mut summary.messages, |message| {
+            unsaved_group(&message.group_id)
+        }),
+        events: take(&mut summary.events, |event| {
+            event_group_id(event).is_some_and(unsaved_group)
+        }),
+        projection_updates: take(&mut summary.projection_updates, |update| {
+            unsaved.contains(&update.group_id_hex)
+        }),
+        epoch_stall_escalations: take(&mut summary.epoch_stall_escalations, |escalation| {
+            unsaved_group(&escalation.group_id)
+        }),
+    }
 }
 
 /// Skip a deferred group's event that is not yet projected. Engine-outbox
@@ -2197,8 +2216,10 @@ impl AppClient {
         for summary in [
             &mut self.pending_applied_sync_summary,
             &mut self.pending_failed_sync_summary,
-            &mut self.unannounced_summary,
-        ] {
+        ]
+        .into_iter()
+        .chain(&mut self.unannounced_summaries)
+        {
             summary.joined_groups.retain(|group| group != group_id);
             summary
                 .messages
@@ -2320,46 +2341,32 @@ impl AppClient {
         std::mem::take(&mut self.pending_applied_sync_summary)
     }
 
-    /// What of `summary` hosts may be told now: a chat's output goes out only
-    /// once its record holds no change a save has not committed, so a host
-    /// that reads the chat on hearing of it finds it (mdk#3359). Output kept
-    /// back waits on the client and goes out, ahead of later output, at the
-    /// first announcement after the save.
-    pub(crate) fn announceable_summary<'a>(
+    /// The batches of output hosts may be told now, oldest first. A chat's
+    /// output goes out only once its record holds no change a save has not
+    /// committed, so a host that reads the chat on hearing of it finds it
+    /// (mdk#3359). Output kept back waits on the client, batch by batch, and
+    /// goes out ahead of `summary` at the first announcement after the save.
+    pub(crate) fn announceable_summaries<'a>(
         &mut self,
         summary: &'a SyncSummary,
-    ) -> std::borrow::Cow<'a, SyncSummary> {
+    ) -> Vec<std::borrow::Cow<'a, SyncSummary>> {
         let unsaved = &self.pending_group_projection_updates;
-        if unsaved.is_empty() && self.unannounced_summary == SyncSummary::default() {
-            return std::borrow::Cow::Borrowed(summary);
+        if unsaved.is_empty() && self.unannounced_summaries.is_empty() {
+            return vec![std::borrow::Cow::Borrowed(summary)];
         }
-        let mut announced = std::mem::take(&mut self.unannounced_summary);
-        announced.merge(summary.clone());
-        let held = &mut self.unannounced_summary;
-        let unsaved_hex = |group_id_hex: &str| unsaved.contains(group_id_hex);
-        let unsaved_group = |group_id: &GroupId| unsaved_hex(&hex::encode(group_id.as_slice()));
-        hold_back(
-            &mut announced.joined_groups,
-            &mut held.joined_groups,
-            |group_id| unsaved_group(group_id),
-        );
-        hold_back(&mut announced.messages, &mut held.messages, |message| {
-            unsaved_group(&message.group_id)
-        });
-        hold_back(&mut announced.events, &mut held.events, |event| {
-            event_group_id(event).is_some_and(unsaved_group)
-        });
-        hold_back(
-            &mut announced.projection_updates,
-            &mut held.projection_updates,
-            |update| unsaved_hex(&update.group_id_hex),
-        );
-        hold_back(
-            &mut announced.epoch_stall_escalations,
-            &mut held.epoch_stall_escalations,
-            |escalation| unsaved_group(&escalation.group_id),
-        );
-        std::borrow::Cow::Owned(announced)
+        let mut batches = std::mem::take(&mut self.unannounced_summaries);
+        batches.push(summary.clone());
+        let mut announced = Vec::new();
+        for mut batch in batches {
+            let held = hold_back_unsaved(&mut batch, unsaved);
+            if held != SyncSummary::default() {
+                self.unannounced_summaries.push(held);
+            }
+            if batch != SyncSummary::default() {
+                announced.push(std::borrow::Cow::Owned(batch));
+            }
+        }
+        announced
     }
 
     /// Build an [`EventGroupProjection`] for `group_id`, returning `None` if any

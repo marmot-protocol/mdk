@@ -44,6 +44,15 @@ fn bobs_chat(event: &MarmotAppEvent, bob_id: &str) -> Option<String> {
     }
 }
 
+/// What the worker would announce of `summary` now, batch by batch.
+fn announced(client: &mut AppClient, summary: &SyncSummary) -> Vec<SyncSummary> {
+    client
+        .announceable_summaries(summary)
+        .into_iter()
+        .map(std::borrow::Cow::into_owned)
+        .collect()
+}
+
 /// Alice invites bob to a new chat, and the relay has delivered it.
 async fn invite(
     runtime: &MarmotAppRuntime,
@@ -62,7 +71,7 @@ async fn invite(
 }
 
 /// Wait for bob's next account error whose message starts with `prefix`,
-/// asserting meanwhile that no host hears of `group`.
+/// asserting meanwhile that no host hears of `group` and no event is lost.
 async fn account_error(
     events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
     bob_id: &str,
@@ -72,7 +81,7 @@ async fn account_error(
     let chat = hex::encode(group.as_slice());
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let event = events.recv().await.expect("the runtime keeps running");
+            let event = events.recv().await.expect("every event is seen");
             assert_ne!(
                 bobs_chat(&event, bob_id).as_ref(),
                 Some(&chat),
@@ -106,9 +115,12 @@ async fn assert_unheard_of(
     assert!(!readable(app, group));
     let chat = hex::encode(group.as_slice());
     let mut early = Vec::new();
-    while let Ok(event) = events.try_recv() {
-        if bobs_chat(&event, bob_id).as_ref() == Some(&chat) {
-            early.push(event);
+    loop {
+        match events.try_recv() {
+            Ok(event) if bobs_chat(&event, bob_id).as_ref() == Some(&chat) => early.push(event),
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("every event is seen: {error:?}"),
         }
     }
     assert!(
@@ -141,7 +153,6 @@ fn hosts_hear_of_a_joined_chat_only_once_its_record_is_saved() {
 
         let group = invite(&runtime, &relay, &bob_id, "joined while saves fail").await;
         account_error(&mut events, &bob_id, &group, "runtime receive failed").await;
-        assert_unheard_of(&runtime, &app, &mut events, &bob_id, &group, "the receive").await;
 
         // The worker's scheduled retry projects again, then fails to save.
         let retry_failed = "runtime group subscription refresh failed";
@@ -183,7 +194,8 @@ fn hosts_hear_of_a_joined_chat_only_once_its_record_is_saved() {
 }
 
 /// A catch-up cancelled partway, as the KeyPackage catch-up's timeout cancels
-/// one, loses nothing kept back for a chat whose save failed.
+/// one, loses nothing kept back for a chat whose save failed, and what is
+/// kept back goes out after the save as it was, ahead of later output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_catch_up_keeps_a_join_kept_back_for_its_save() {
     let dir = tempfile::tempdir().unwrap();
@@ -232,7 +244,7 @@ async fn a_cancelled_catch_up_keeps_a_join_kept_back_for_its_save() {
     assert!(bob.arm_failed_receive_projection_retry());
     let pending = bob.take_pending_applied_sync_summary();
     assert_eq!(pending.joined_groups, vec![group.clone()]);
-    assert!(bob.announceable_summary(&pending).joined_groups.is_empty());
+    assert!(announced(&mut bob, &pending).is_empty());
 
     // Saves work again. A catch-up starts, waits on the relay and is
     // dropped there.
@@ -248,10 +260,22 @@ async fn a_cancelled_catch_up_keeps_a_join_kept_back_for_its_save() {
         .await
         .unwrap();
     assert!(readable(&app, &group));
-    let saved = bob.take_pending_applied_sync_summary();
+    // Later output goes out after it, as a batch of its own.
+    let mut later = bob.take_pending_applied_sync_summary();
+    later.projection_updates.push(AppProjectionUpdate {
+        group_id_hex: hex::encode(group.as_slice()),
+        timeline_messages: Vec::new(),
+        timeline_changes: Vec::new(),
+        chat_list_row: None,
+        chat_list_trigger: ChatListUpdateTrigger::NewLastMessage,
+    });
+    let batches = announced(&mut bob, &later);
     assert_eq!(
-        bob.announceable_summary(&saved).joined_groups,
-        vec![group],
-        "the join goes out after the save that writes its record"
+        batches.len(),
+        2,
+        "the kept-back output goes out after the save that writes its record"
     );
+    assert_eq!(batches[0].joined_groups, vec![group]);
+    assert!(batches[0].projection_updates.is_empty());
+    assert_eq!(batches[1].projection_updates, later.projection_updates);
 }

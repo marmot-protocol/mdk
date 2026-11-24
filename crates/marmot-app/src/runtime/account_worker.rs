@@ -9404,17 +9404,17 @@ fn publish_app_runtime_summary_with_v5_at(
     account_label: &str,
     summary: &SyncSummary,
 ) {
-    let summary = client.announceable_summary(summary);
-    let client = &*client;
-    let at = unpublished.map_or(Emit::Quiescent(client), Emit::Unpublished);
-    let publication =
-        publish_app_runtime_summary(at, events, account_id_hex, account_label, &summary);
-    record_runtime_publication(
-        client,
-        marmot_forensics::v5::RuntimePublicationCategory::SyncSummary,
-        runtime_summary_message_ref(&summary),
-        publication,
-    );
+    for summary in client.announceable_summaries(summary) {
+        let at = unpublished.map_or(Emit::Quiescent(client), Emit::Unpublished);
+        let publication =
+            publish_app_runtime_summary(at, events, account_id_hex, account_label, &summary);
+        record_runtime_publication(
+            client,
+            marmot_forensics::v5::RuntimePublicationCategory::SyncSummary,
+            runtime_summary_message_ref(&summary),
+            publication,
+        );
+    }
 }
 
 pub(super) fn publish_app_runtime_projection_update(
