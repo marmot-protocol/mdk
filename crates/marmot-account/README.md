@@ -92,6 +92,7 @@ The development file store keeps plaintext receipts under `.owned-secrets-v1` wi
 It checks a nonsecret ID in the pinned directory. Moving the vault with that ID keeps its identity; creating another
 vault at the old path does not. Back up and restore the original `.credential-store-id-v1` from the vault root along
 with `.owned-secrets-v1`. MDK refuses to create a replacement marker over existing managed records.
+On Android, creating this development vault requires filesystem support for atomic no-replace rename.
 
 On Linux and BSD, select the intended Secret Service collection as the default before first use or legacy migration.
 MDK binds managed receipts to a nonsecret identity item in that collection. This identity survives keyring updates
