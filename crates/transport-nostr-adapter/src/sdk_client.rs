@@ -8890,7 +8890,8 @@ mod tests {
                 .unwrap();
             let id = subscription.subscription_id();
             sdk.subscribe(subscription.clone()).await.unwrap();
-            assert_eq!(wire.recv_kind("REQ").await[1], id);
+            let live = wire.recv_kind("REQ").await;
+            assert_eq!(live[1], id);
             let physical = sdk
                 .client()
                 .relay(original.as_str())
@@ -8899,11 +8900,6 @@ mod tests {
                 .unwrap();
             assert_eq!(physical.status(), RelayStatus::Connected);
             let attempts = physical.stats().attempts();
-            let subscriptions = physical
-                .subscriptions()
-                .await
-                .into_keys()
-                .collect::<HashSet<_>>();
 
             let result = sdk.reconnect_relay(&alias).await.unwrap();
             assert!(matches!(
@@ -8920,17 +8916,9 @@ mod tests {
                 "manual reconnect restarts the existing physical relay"
             );
             assert_eq!(
-                physical
-                    .subscriptions()
-                    .await
-                    .into_keys()
-                    .collect::<HashSet<_>>(),
-                subscriptions
-            );
-            assert_eq!(
-                wire.recv_kind("REQ").await[1],
-                id,
-                "the live REQ is restored"
+                wire.recv_kind("REQ").await,
+                live,
+                "the live REQ is restored, filters included"
             );
             sdk.unsubscribe(subscription).await.unwrap();
             assert_eq!(sdk.relay_health().await.total_relays, 0);

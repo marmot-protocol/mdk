@@ -5,6 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
+use nostr::nips::nip67::EoseHint;
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, Event, EventId, Filter, Kind, PublicKey, RelayMessage,
     RelayNotification, RelayStatus, RelayUrl, SingleLetterTag, SubscribeAutoCloseOptions,
@@ -1348,14 +1349,22 @@ async fn strict_fetch_endpoint(
                         }
                         RelayMessage::EndOfStoredEvents {
                             subscription_id: received_id,
-                            ..
+                            hints,
                         } if received_id.as_ref() == &subscription_id => {
+                            // NIP-67: a relay that has more, or holds more back
+                            // until authentication, did not send all it has.
+                            let withheld = hints.is_some_and(|hints| {
+                                hints
+                                    .iter()
+                                    .any(|hint| matches!(hint, EoseHint::More | EoseHint::Auth))
+                            });
                             // A filter that reaches its limit cannot establish absence,
                             // and neither can one that reaches the page a relay
                             // silently clamps every REQ to. A frame discarded before
                             // notifications cannot establish negative coverage, even
                             // after EOSE.
-                            break wire.event_count() == admitted_messages
+                            break !withheld
+                                && wire.event_count() == admitted_messages
                                 && queries.iter().zip(&query_counts).all(|(query, count)| {
                                     *count < query.limit.min(RELAY_REPLAY_PAGE_LIMIT)
                                 });
@@ -2597,6 +2606,46 @@ mod tests {
             panic!("{:?}", outcome.complete_endpoints);
         };
         assert!(crate::same_relay(named.as_str(), finished.as_str()));
+    }
+
+    /// A relay whose EOSE says NIP-67 `more` did not send all it holds: its
+    /// records are kept, but it does not establish absence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_directory_fetch_does_not_count_a_relay_that_says_more() {
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
+
+        let keys = Keys::generate();
+        let note = EventBuilder::new(Kind::TextNote, "kept")
+            .finalize(&keys)
+            .unwrap();
+        let (more, more_server) = spawn_query_relay(vec![note.clone()], QueryRelayEnd::More).await;
+        let (finished, finished_server) =
+            spawn_query_relay(vec![note.clone()], QueryRelayEnd::Eose).await;
+        let query = DirectoryEventQuery::new(1, vec![keys.public_key().to_hex()], 4);
+        let request =
+            DirectoryFetchRequest::new(vec![more, finished.clone()], vec![query]).unwrap();
+        let outcome = timeout(
+            Duration::from_secs(20),
+            NostrSdkDirectoryRelayFetcher::standalone()
+                .fetch_directory_events_with_completion(request),
+        )
+        .await
+        .expect("strict fetch completes")
+        .unwrap();
+        more_server.abort();
+        finished_server.abort();
+        assert!(!outcome.complete);
+        let [named] = outcome.complete_endpoints.as_slice() else {
+            panic!("{:?}", outcome.complete_endpoints);
+        };
+        assert!(crate::same_relay(named.as_str(), finished.as_str()));
+        assert!(
+            outcome
+                .records
+                .iter()
+                .all(|record| record.event.id == note.id.to_hex())
+        );
+        assert!(!outcome.records.is_empty());
     }
 
     #[test]
