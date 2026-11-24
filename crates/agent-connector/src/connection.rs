@@ -1,7 +1,8 @@
 //! Per-connection accept loop, authorization, and control-request dispatch.
 
 use agent_control::{
-    AgentControlEnvelope, AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
+    AGENT_CONTROL_PROTOCOL_V2, AgentControlEnvelope, AgentControlError, AgentControlRequest,
+    AgentControlResponse, read_frame, write_frame,
 };
 use serde::Serialize;
 use tokio::io::{AsyncWrite, BufReader};
@@ -59,20 +60,119 @@ where
     Ok(())
 }
 
+/// Longest request `id` a rejection echoes. Real ids are short; this keeps a
+/// rejection of an oversized frame well inside the frame limit.
+const MAX_ECHOED_REQUEST_ID_BYTES: usize = 256;
+
+/// Why the first frame on a connection could not become a request, as the
+/// `error` response reports it. Messages are fixed text: they never quote the
+/// frame.
+#[derive(Debug, PartialEq, Eq)]
+struct RejectedFrame {
+    id: Option<String>,
+    code: &'static str,
+    message: &'static str,
+}
+
+impl RejectedFrame {
+    fn invalid(id: Option<String>, message: &'static str) -> Self {
+        Self {
+            id,
+            code: "invalid_request",
+            message,
+        }
+    }
+
+    /// The frame is not a JSON value at all: empty, oversized or malformed.
+    fn unreadable(err: &AgentControlError) -> Self {
+        Self::invalid(
+            None,
+            match err {
+                AgentControlError::FrameTooLarge(_) => "control frame exceeds the size limit",
+                AgentControlError::EmptyFrame => "control frame is empty",
+                _ => "control frame is not valid JSON",
+            },
+        )
+    }
+
+    /// Decode `frame` as a request envelope, or say which part of it is wrong.
+    fn parse(frame: serde_json::Value) -> Result<AgentControlEnvelope<AgentControlRequest>, Self> {
+        let id = frame
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| id.len() <= MAX_ECHOED_REQUEST_ID_BYTES)
+            .map(str::to_owned);
+        let Some(fields) = frame.as_object() else {
+            return Err(Self::invalid(id, "control frame is not a JSON object"));
+        };
+        if fields
+            .get("marmot_agent_control")
+            .and_then(serde_json::Value::as_str)
+            != Some(AGENT_CONTROL_PROTOCOL_V2)
+        {
+            return Err(Self {
+                id,
+                code: "unsupported_protocol",
+                message: "marmot_agent_control must be \"marmot.agent-control.v2\"",
+            });
+        }
+        if !fields.get("type").is_some_and(serde_json::Value::is_string) {
+            return Err(Self::invalid(id, "request has no string \"type\" field"));
+        }
+        serde_json::from_value(frame).map_err(|err| {
+            // serde names an unrecognized tag "unknown variant `...`".
+            if err.to_string().starts_with("unknown variant") {
+                Self {
+                    id,
+                    code: "unknown_request",
+                    message: "unknown request type",
+                }
+            } else {
+                Self::invalid(id, "request fields do not match its type")
+            }
+        })
+    }
+}
+
 impl AgentConnector {
     pub(crate) async fn handle_connection(&self, stream: UnixStream) -> Result<(), ConnectorError> {
         let peer_uid = stream.peer_cred()?.uid();
         let peer_authorized_by_uid = peer_uid == current_effective_uid();
         let (read_half, mut write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
-        let Some(request): Option<AgentControlEnvelope<AgentControlRequest>> =
-            with_control_operation_timeout(
-                "initial_control_frame_read",
-                read_envelope(&mut reader),
-            )
-            .await??
-        else {
-            return Ok(());
+        let frame = match with_control_operation_timeout(
+            "initial_control_frame_read",
+            read_frame::<_, serde_json::Value>(&mut reader),
+        )
+        .await?
+        {
+            Ok(Some(frame)) => Ok(frame),
+            Ok(None) => return Ok(()),
+            Err(AgentControlError::Io(err)) => return Err(AgentControlError::Io(err).into()),
+            Err(err) => Err(RejectedFrame::unreadable(&err)),
+        };
+        let request = match frame.and_then(RejectedFrame::parse) {
+            Ok(request) => request,
+            Err(rejected) => {
+                // Answer a request that cannot be served instead of closing
+                // silently, so a client can tell it from a crash (#2242).
+                tracing::debug!(
+                    target: "agent_connector",
+                    method = "handle_connection",
+                    error_code = rejected.code,
+                    "rejected control frame"
+                );
+                let response = AgentControlEnvelope::new(
+                    rejected.id,
+                    AgentControlResponse::Error {
+                        code: rejected.code.to_owned(),
+                        message: rejected.message.to_owned(),
+                        retryable: false,
+                    },
+                );
+                write_control_frame(&mut write_half, &response).await?;
+                return Ok(());
+            }
         };
         if let Err(err) =
             self.authorize_control_request(peer_authorized_by_uid, request.auth_token.as_deref())

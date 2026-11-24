@@ -240,6 +240,95 @@ async fn subscription_capacity_error_echoes_request_id_and_is_retryable() {
     server.await.unwrap().unwrap();
 }
 
+/// A first frame that cannot become a request gets an `error` response naming
+/// the problem, with the request `id` when one could be read, instead of a
+/// silent close (#2242). The cases are the ones the issue reported.
+#[tokio::test]
+async fn rejected_control_frames_get_an_error_response() {
+    let v2 = agent_control::AGENT_CONTROL_PROTOCOL_V2;
+    let long_id = "x".repeat(300);
+    let cases: Vec<(String, Option<&str>, &str)> = vec![
+        (
+            r#"{"marmot_agent_control":"v2","id":"b","type":"diagnostic_status"}"#.to_owned(),
+            Some("b"),
+            "unsupported_protocol",
+        ),
+        (
+            r#"{"id":"c","type":"diagnostic_status"}"#.to_owned(),
+            Some("c"),
+            "unsupported_protocol",
+        ),
+        (
+            format!(r#"{{"marmot_agent_control":"{v2}","id":"d","type":"no_such_request"}}"#),
+            Some("d"),
+            "unknown_request",
+        ),
+        (
+            format!(r#"{{"marmot_agent_control":"{v2}","id":"e","type":"timeline_list"}}"#),
+            Some("e"),
+            "invalid_request",
+        ),
+        (
+            format!(r#"{{"marmot_agent_control":"{v2}","id":"f"}}"#),
+            Some("f"),
+            "invalid_request",
+        ),
+        ("hello".to_owned(), None, "invalid_request"),
+        ("[1,2]".to_owned(), None, "invalid_request"),
+        (
+            format!(r#"{{"marmot_agent_control":"{v2}","id":"{long_id}","type":"nope"}}"#),
+            None,
+            "unknown_request",
+        ),
+    ];
+    for (frame, id, code) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dev").join("wn-agent.sock");
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            Vec::new(),
+            false,
+            false,
+        ))
+        .unwrap();
+        let listener = bind_connector_socket(&socket).unwrap();
+        let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+        let client = UnixStream::connect(&socket).await.unwrap();
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let response: AgentControlEnvelope<AgentControlResponse> = read_envelope(&mut client_read)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no response to {frame:.60}"));
+        assert_eq!(response.id.as_deref(), id, "{frame:.60}");
+        let AgentControlResponse::Error {
+            code: got,
+            message,
+            retryable,
+        } = response.payload
+        else {
+            panic!(
+                "expected an error for {frame:.60}, got {:?}",
+                response.payload
+            );
+        };
+        assert_eq!(got, code, "{frame:.60}");
+        assert!(!retryable);
+        assert!(!message.is_empty());
+        assert!(
+            !message.contains("no_such_request") && !message.contains("hello"),
+            "the message never quotes the frame"
+        );
+        server.await.unwrap().unwrap();
+    }
+}
+
 #[test]
 fn poisoned_connector_store_mutex_recovers_inner_state() {
     let mutex = std::sync::Arc::new(std::sync::Mutex::new(vec![1]));
