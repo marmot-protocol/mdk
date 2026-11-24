@@ -1416,17 +1416,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let fallback_specs = fallback_records
             .into_iter()
             .map(|(index, (endpoints, observed_records))| {
-                (index, targets[index].clone(), endpoints, observed_records)
+                let account = targets[index].account_id_hex.clone();
+                (index, account, endpoints, observed_records)
             })
             .collect::<Vec<_>>();
         let directory = self.clone();
         let work =
             fallback_specs
                 .into_iter()
-                .map(move |(index, target, endpoints, observed_records)| {
+                .map(move |(index, account, endpoints, observed_records)| {
                     let directory = directory.clone();
                     async move {
-                        let queries = key_package_queries(vec![target.account_id_hex.clone()]);
+                        let queries = key_package_queries(vec![account.clone()]);
                         let result = async {
                             let fetched = directory
                                 .relay_plane
@@ -1435,12 +1436,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 .map_err(DirectoryError::RelayDirectory)?;
                             // The batch already journaled what it observed.
                             let fence = directory
-                                .key_package_journal_fence(&target.account_id_hex, &fetched.records)
+                                .key_package_journal_fence(&account, &fetched.records)
                                 .await?;
                             let records = directory
                                 .recover_key_package_records(
                                     super::key_package_recovery::KeyPackageRecoveryRequest {
-                                        account: &target.account_id_hex,
+                                        account: &account,
                                         searched: &endpoints,
                                         observed: fetched.records,
                                         // This lookup must not discard a valid
@@ -1458,10 +1459,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 .await?;
                             // Recovery journaled everything it read. Reread the
                             // journal before admitting what it found.
-                            let fence = directory
-                                .key_package_journal_fence(&target.account_id_hex, &[])
-                                .await?;
-                            records.select(&target.account_id_hex, requirements, Some(&fence))
+                            let fence = directory.key_package_journal_fence(&account, &[]).await?;
+                            records.select(&account, requirements, Some(&fence))
                         }
                         .await;
                         (index, result)
