@@ -45,6 +45,11 @@ const DIRECTORY_QUERY_CONCURRENCY: usize = 4;
 /// Serialized event JSON one relay's reply to one directory read may carry.
 const DIRECTORY_REPLY_MAX_BYTES: usize = 16 * 1024 * 1024;
 
+/// A plain directory lookup a relay's reply cut: past the byte budget, or at
+/// a frame that could not be read.
+const DIRECTORY_READ_OVER_BUDGET: &str = "directory read exceeded its byte budget";
+const DIRECTORY_READ_UNREADABLE: &str = "directory read stopped at an unreadable frame";
+
 /// The most filters one strict directory REQ carries. strfry allows 3 per
 /// REQ and refuses more with `CLOSED invalid:`, so a request with more
 /// queries is split into several REQs on the same connection (mdk#2269).
@@ -800,8 +805,9 @@ impl NostrSdkDirectoryRelayFetcher {
     /// ignores the filter cannot crowd out the events asked for. The relays
     /// share one byte budget for the events they keep, however their replies
     /// divide it, and the deadline bounds them. Frames not yet read are
-    /// bounded per relay, as for every finite request: each relay's queue
-    /// holds at most that budget plus one frame, and drains as it is read.
+    /// bounded per relay request, as for every finite request: its queue holds
+    /// at most that budget plus one frame and drains as it is read, so with
+    /// the batch its collector is reading, at most twice that is held.
     async fn fetch_each(
         &self,
         relay_urls: &[RelayUrl],
@@ -952,13 +958,19 @@ impl NostrSdkDirectoryRelayFetcher {
                         .await;
                     // A plain lookup cannot say it is partial, and a record a
                     // cut relay never sent would read as absent: the lookup
-                    // fails instead, which callers treat as unresolved.
-                    if replies
-                        .iter()
-                        .flatten()
-                        .any(|reply| reply.end == FiniteEnd::ByteLimit)
-                    {
-                        return Err("directory read exceeded its byte budget".to_owned());
+                    // fails instead, which callers treat as unresolved. The
+                    // SDK's own reads skipped an unreadable frame and went on;
+                    // a finite request stops at it, so it cuts the same way.
+                    for reply in replies.iter().flatten() {
+                        match reply.end {
+                            FiniteEnd::ByteLimit => {
+                                return Err(DIRECTORY_READ_OVER_BUDGET.to_owned());
+                            }
+                            FiniteEnd::InvalidMessage => {
+                                return Err(DIRECTORY_READ_UNREADABLE.to_owned());
+                            }
+                            _ => {}
+                        }
                     }
                     // The newest `limit` distinct events any relay sent.
                     let events = replies
@@ -2339,7 +2351,41 @@ mod tests {
         .await
         .expect("the relay answers");
         server.abort();
-        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), DIRECTORY_READ_OVER_BUDGET);
+    }
+
+    /// A relay that sends an unreadable EVENT before the record asked for
+    /// fails the lookup: the record would otherwise read as absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_directory_read_stopped_by_an_unreadable_frame_fails() {
+        use nostr_sdk::prelude::{EventBuilder, Keys};
+
+        let keys = Keys::generate();
+        let relays = EventBuilder::new(Kind::RelayList, "")
+            .finalize(&keys)
+            .unwrap();
+        let stored = vec![
+            serde_json::json!({"id": "not an event"}),
+            serde_json::to_value(&relays).unwrap(),
+        ];
+        let (endpoint, _, server) = spawn_filter_limited_relay(3, stored).await;
+        let request = DirectoryFetchRequest::new(
+            vec![endpoint],
+            vec![DirectoryEventQuery::new(
+                10002,
+                vec![keys.public_key().to_hex()],
+                1,
+            )],
+        )
+        .unwrap();
+        let result = timeout(
+            Duration::from_secs(5),
+            NostrSdkDirectoryRelayFetcher::standalone().fetch_directory_events(request),
+        )
+        .await
+        .expect("the relay answers");
+        server.abort();
+        assert_eq!(result.unwrap_err(), DIRECTORY_READ_UNREADABLE);
     }
 
     /// A relay that ignores the filter and sends other events first still
