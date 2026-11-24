@@ -273,7 +273,9 @@ pub(crate) fn open_durable_private_dir(owned_root: &Path, path: &Path) -> io::Re
     }
     #[cfg(unix)]
     {
-        unix_directory::create(owned_root, relative, |directory, _| directory.sync_all())
+        unix_directory::create(owned_root, relative, |directory, _| {
+            record_directory::sync(directory)
+        })
     }
     #[cfg(not(unix))]
     {
@@ -436,7 +438,7 @@ mod unix_directory {
         }
     }
 
-    fn mkdir_at(parent: &File, name: &CStr) -> io::Result<bool> {
+    pub(super) fn mkdir_at(parent: &File, name: &CStr) -> io::Result<bool> {
         // SAFETY: The parent handle and component remain live for the call.
         if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
             return Ok(true);
@@ -751,7 +753,7 @@ pub(crate) fn rename_for_commit(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    record_directory::sync(&File::open(path)?)
 }
 
 #[cfg(not(unix))]
@@ -858,7 +860,7 @@ mod tests {
             if directory == host {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
-            file.sync_all()
+            record_directory::sync(file)
         })
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EIO));
@@ -866,7 +868,7 @@ mod tests {
 
         let mut synced = Vec::new();
         unix_directory::create(&root, Path::new(""), |file, directory| {
-            file.sync_all()?;
+            record_directory::sync(file)?;
             synced.push(directory.to_path_buf());
             Ok(())
         })
@@ -898,7 +900,7 @@ mod tests {
             if directory == root {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
-            file.sync_all()
+            record_directory::sync(file)
         })
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EIO));
@@ -906,7 +908,7 @@ mod tests {
 
         let mut synced = Vec::new();
         unix_directory::create(&root, relative, |file, directory| {
-            file.sync_all()?;
+            record_directory::sync(file)?;
             synced.push(directory.to_path_buf());
             Ok(())
         })

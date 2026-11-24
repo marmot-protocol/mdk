@@ -14,10 +14,12 @@ use zeroize::Zeroizing;
 use crate::IosOptions;
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::home::{ACCOUNT_SECRET_FILE, LOCAL_FILE_SECRET_BACKEND};
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+use crate::io::open_durable_private_dir;
 use crate::io::record_directory::DirAccess;
 use crate::io::{
-    open_durable_private_dir, read_secret_json, read_secret_text_with, record_directory,
-    remove_file_then_scrub, write_private_record, write_secret_record,
+    read_secret_json, read_secret_text_with, record_directory, remove_file_then_scrub,
+    write_private_record, write_secret_record,
 };
 use crate::native_vault::NativeVault;
 use crate::owned_vault::{self, Addressing, RecordKind, StoredSecretKeyHex, VaultStorage};
@@ -95,6 +97,10 @@ pub struct LocalFileSecretStore {
 struct FileVaultDirectory {
     path: PathBuf,
     handle: File,
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    container: File,
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    relative: PathBuf,
     namespace: OnceLock<String>,
 }
 
@@ -169,7 +175,7 @@ impl FileVaultDirectory {
                 #[cfg(unix)]
                 if self.namespace.get().is_none() {
                     // Initialization can publish a marker before a failed directory sync.
-                    self.handle.sync_all()?;
+                    record_directory::sync(&self.handle)?;
                 }
                 self.pin_namespace(&marker).map(Some)
             }
@@ -206,6 +212,15 @@ impl FileVaultDirectory {
         let mut marker = [0; VAULT_ID_LEN];
         hex::encode_to_slice(random, &mut marker).expect("file vault marker length");
         self.verify()?;
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        if !self.relative.as_os_str().is_empty() {
+            // An earlier creation may have left unsynced directory entries.
+            record_directory::sync_anchored_directory(
+                &self.container,
+                &self.relative,
+                &self.handle,
+            )?;
+        }
         publish_vault_marker(&self.handle, &marker)?;
         if self.read_marker()? != Some(marker) {
             return Err(marker_changed());
@@ -396,49 +411,71 @@ impl LocalFileSecretStore {
             directory.verify()?;
             return Ok(directory);
         }
-        let (root, handle) = match self.root.canonicalize() {
+        let selected = self.select_directory()?;
+        selected.verify()?;
+        let raced = self.directory.set(selected).err();
+        let directory = self
+            .directory
+            .get()
+            .expect("vault directory already initialized");
+        if raced.is_some_and(|selected| directory.path != selected.path) {
+            return Err(vault_selection_changed());
+        }
+        directory.verify()?;
+        Ok(directory)
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    fn select_directory(&self) -> AccountHomeResult<FileVaultDirectory> {
+        let (path, create_missing) = match self.root.canonicalize() {
+            Ok(root) => (root, false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                (canonical_storage_candidate(&self.root)?, true)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // The canonical candidate selects names, not the directory to open.
+        // Every descendant must resolve without symlinks from the OS container.
+        let (container, relative, handle) =
+            crate::location::with_mobile_root(&path, &self.ios_options, |anchor, relative, _| {
+                let container = record_directory::open_root(anchor)?;
+                let handle = record_directory::open_anchored_directory(
+                    &container,
+                    relative,
+                    create_missing,
+                )?;
+                Ok((container, relative.to_path_buf(), handle))
+            })?;
+        Ok(FileVaultDirectory {
+            path,
+            handle,
+            container,
+            relative,
+            namespace: OnceLock::new(),
+        })
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    fn select_directory(&self) -> AccountHomeResult<FileVaultDirectory> {
+        let (path, handle) = match self.root.canonicalize() {
             Ok(root) => {
-                #[cfg(any(target_os = "ios", target_os = "android"))]
-                crate::location::root_hash(&root, &self.ios_options)?;
                 let handle = record_directory::open_root(&root)?;
                 (root, handle)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                #[cfg(any(target_os = "ios", target_os = "android"))]
-                {
-                    let root = canonical_storage_candidate(&self.root)?;
-                    crate::location::root_hash(&root, &self.ios_options)?;
-                    let handle = open_durable_private_dir(&root, &root)?;
-                    (root, handle)
-                }
-                #[cfg(not(any(target_os = "ios", target_os = "android")))]
-                {
-                    let handle = open_durable_private_dir(&self.root, &self.root)?;
-                    (self.root.canonicalize()?, handle)
-                }
+                let handle = open_durable_private_dir(&self.root, &self.root)?;
+                (self.root.canonicalize()?, handle)
             }
             Err(error) => return Err(error.into()),
         };
-        // Authorize the location independently of the random marker identity.
-        let selected = FileVaultDirectory {
-            path: root,
+        if path != self.root.canonicalize()? {
+            return Err(vault_selection_changed());
+        }
+        Ok(FileVaultDirectory {
+            path,
             handle,
             namespace: OnceLock::new(),
-        };
-        let configured = self.root.canonicalize()?;
-        let changed = || {
-            AccountHomeError::SecretStore("file vault directory changed during selection".into())
-        };
-        if selected.path != configured {
-            return Err(changed());
-        }
-        selected.verify()?;
-        let directory = self.directory.get_or_init(|| selected);
-        if directory.path != configured {
-            return Err(changed());
-        }
-        directory.verify()?;
-        Ok(directory)
+        })
     }
 
     fn storage_root(&self) -> AccountHomeResult<&Path> {
@@ -464,8 +501,12 @@ impl LocalFileSecretStore {
     }
 
     fn lock_directory(directory: &FileVaultDirectory) -> AccountHomeResult<FileVaultGuard> {
-        #[cfg(unix)]
+        #[cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))]
         crate::io::tighten_private_directory(&directory.handle)?;
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        if !directory.relative.as_os_str().is_empty() {
+            crate::io::tighten_private_directory(&directory.handle)?;
+        }
         let guard = acquire_vault_lease(&directory.handle)?;
         directory.verify()?;
         Ok(guard)
@@ -517,6 +558,10 @@ impl LocalFileSecretStore {
             .map(Some)
             .map_err(|_| AccountHomeError::InvalidSecretKey)
     }
+}
+
+fn vault_selection_changed() -> AccountHomeError {
+    AccountHomeError::SecretStore("file vault directory changed during selection".into())
 }
 
 #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -1053,6 +1098,51 @@ mod tests {
             store.load_secret(credential).unwrap().secret_key(),
             keys.secret_key()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mobile_vault_walk_uses_the_held_anchor_and_refuses_descendant_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let scratch = tempfile::tempdir().unwrap();
+        let top = scratch.path().canonicalize().unwrap();
+        let approved = top.join("approved");
+        let original = top.join("original");
+        let outside = top.join("outside");
+        let relative = Path::new("nested/vault");
+        fs::create_dir_all(approved.join("nested")).unwrap();
+        fs::create_dir_all(outside.join(relative)).unwrap();
+        fs::set_permissions(&approved, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(approved.join("nested"), fs::Permissions::from_mode(0o750)).unwrap();
+        let anchor = record_directory::open_root(&approved).unwrap();
+        fs::rename(&approved, &original).unwrap();
+        symlink(&outside, &approved).unwrap();
+
+        let vault = record_directory::open_anchored_directory(&anchor, relative, true).unwrap();
+        record_directory::sync_anchored_directory(&anchor, relative, &vault).unwrap();
+        publish_vault_marker(&vault, &[b'a'; VAULT_ID_LEN]).unwrap();
+        assert_eq!(
+            fs::read(original.join(relative).join(VAULT_ID_FILE)).unwrap(),
+            [b'a'; VAULT_ID_LEN]
+        );
+        assert!(!outside.join(relative).join(VAULT_ID_FILE).exists());
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&original), 0o755);
+        assert_eq!(mode(&original.join("nested")), 0o750);
+        assert_eq!(mode(&original.join(relative)), 0o700);
+
+        fs::rename(original.join("nested"), original.join("previous")).unwrap();
+        symlink(outside.join("nested"), original.join("nested")).unwrap();
+        for (path, create) in [(relative, false), (Path::new("nested/new-vault"), true)] {
+            let error =
+                record_directory::open_anchored_directory(&anchor, path, create).unwrap_err();
+            assert!(matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP | libc::EMLINK | libc::ENOTDIR)
+            ));
+        }
+        assert!(!outside.join("nested/new-vault").exists());
     }
 
     #[test]

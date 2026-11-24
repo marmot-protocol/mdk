@@ -47,6 +47,98 @@ mod unix {
         unix_directory::create_child(parent, &component_name(name, &mut [0; 256])?)
     }
 
+    #[cfg(any(test, target_os = "ios", target_os = "android"))]
+    pub(crate) fn open_anchored_directory(
+        anchor: &File,
+        relative: &Path,
+        create_missing: bool,
+    ) -> io::Result<File> {
+        let mode = if create_missing {
+            AnchoredWalk::Create
+        } else {
+            AnchoredWalk::Read
+        };
+        walk_anchored(anchor, relative.components(), mode, File::try_clone)
+    }
+
+    #[cfg(any(test, target_os = "ios", target_os = "android"))]
+    pub(crate) fn sync_anchored_directory(
+        anchor: &File,
+        relative: &Path,
+        selected: &File,
+    ) -> io::Result<()> {
+        walk_anchored(anchor, relative.components(), AnchoredWalk::Sync, |leaf| {
+            let held = selected.metadata()?;
+            let current = leaf.metadata()?;
+            if (held.dev(), held.ino()) != (current.dev(), current.ino()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "anchored directory changed before sync",
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(any(test, target_os = "ios", target_os = "android"))]
+    #[derive(Clone, Copy)]
+    enum AnchoredWalk {
+        Read,
+        Create,
+        Sync,
+    }
+
+    #[cfg(any(test, target_os = "ios", target_os = "android"))]
+    fn walk_anchored<T>(
+        parent: &File,
+        mut components: std::path::Components<'_>,
+        mode: AnchoredWalk,
+        leaf: impl FnOnce(&File) -> io::Result<T>,
+    ) -> io::Result<T> {
+        use std::path::Component;
+
+        let Some(part) = components.next() else {
+            let result = leaf(parent)?;
+            if !matches!(mode, AnchoredWalk::Read) {
+                sync(parent)?;
+            }
+            return Ok(result);
+        };
+        let Component::Normal(name) = part else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid anchored directory component",
+            ));
+        };
+        let access =
+            if matches!(mode, AnchoredWalk::Read) && !components.as_path().as_os_str().is_empty() {
+                DirAccess::Search
+            } else {
+                DirAccess::Read
+            };
+        let child = match open_dir(parent, name, access) {
+            Err(error)
+                if matches!(mode, AnchoredWalk::Create)
+                    && error.kind() == io::ErrorKind::NotFound =>
+            {
+                let mut buffer = [0; 256];
+                let name = component_name(name, &mut buffer)?;
+                let created = unix_directory::mkdir_at(parent, &name)?;
+                let child = open_directory_at(parent, &name)?;
+                if created {
+                    super::super::tighten_private_directory(&child)?;
+                }
+                child
+            }
+            result => result?,
+        };
+        let result = walk_anchored(&child, components, mode, leaf)?;
+        if !matches!(mode, AnchoredWalk::Read) {
+            sync(parent)?;
+        }
+        Ok(result)
+    }
+
     pub(crate) fn open_record(parent: &File, name: &OsStr) -> io::Result<File> {
         open_at(
             parent,
@@ -64,6 +156,19 @@ mod unix {
     }
 
     pub(crate) fn sync(parent: &File) -> io::Result<()> {
+        // File::sync_all uses F_FULLFSYNC on Darwin, which rejects directories.
+        #[cfg(target_vendor = "apple")]
+        loop {
+            // SAFETY: The borrowed directory descriptor is live for the call.
+            if unsafe { libc::fsync(parent.as_raw_fd()) } == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
         parent.sync_all()
     }
 

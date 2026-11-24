@@ -17,13 +17,11 @@ pub struct IosOptions {
 }
 
 pub(crate) fn root_hash(root: &Path, _ios_options: &IosOptions) -> AccountHomeResult<[u8; 32]> {
-    #[cfg(target_os = "ios")]
+    #[cfg(any(target_os = "ios", target_os = "android"))]
     {
-        ios::root_hash(root, _ios_options)
-    }
-    #[cfg(target_os = "android")]
-    {
-        android::capture()?.root_hash(root)
+        with_mobile_root(root, _ios_options, |_, relative, identity| {
+            Ok(mobile_hash(identity, relative))
+        })
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
@@ -41,6 +39,24 @@ pub(crate) fn root_hash(root: &Path, _ios_options: &IosOptions) -> AccountHomeRe
             }
         }
         Ok(hash.finalize().into())
+    }
+}
+
+/// Pass the OS-selected container and its relative root separately from the
+/// identity fields used by account homes.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub(crate) fn with_mobile_root<T>(
+    root: &Path,
+    _ios_options: &IosOptions,
+    selected: impl FnOnce(&Path, &Path, &[&[u8]]) -> AccountHomeResult<T>,
+) -> AccountHomeResult<T> {
+    #[cfg(target_os = "ios")]
+    {
+        ios::select_root(root, _ios_options, selected)
+    }
+    #[cfg(target_os = "android")]
+    {
+        android::capture()?.select_root(root, selected)
     }
 }
 
@@ -70,7 +86,11 @@ mod ios {
         AccountHomeError::SecretStore(message.to_owned())
     }
 
-    pub(super) fn root_hash(root: &Path, options: &IosOptions) -> AccountHomeResult<[u8; 32]> {
+    pub(super) fn select_root<T>(
+        root: &Path,
+        options: &IosOptions,
+        selected: impl FnOnce(&Path, &Path, &[&[u8]]) -> AccountHomeResult<T>,
+    ) -> AccountHomeResult<T> {
         // Public container APIs locate today's directories; hashes use logical identities.
         let home = std::fs::canonicalize(NSHomeDirectory().to_string())?;
         if let Ok(relative) = root.strip_prefix(&home) {
@@ -79,7 +99,7 @@ mod ios {
                 .map(|id| id.to_string())
                 .filter(|id| !id.is_empty() && !id.contains('*') && !id.contains('\0'))
                 .ok_or_else(|| failure("missing explicit iOS bundle identifier"))?;
-            return Ok(mobile_hash(&[b"ios-app", application.as_bytes()], relative));
+            return selected(&home, relative, &[b"ios-app", application.as_bytes()]);
         }
         let manager = NSFileManager::defaultManager();
         for group in &options.app_group_identifiers {
@@ -95,8 +115,8 @@ mod ios {
                 .path()
                 .ok_or_else(|| failure("iOS app-group container has no file path"))?;
             let container = std::fs::canonicalize(path.to_string())?;
-            if let Ok(relative) = root.strip_prefix(container) {
-                return Ok(mobile_hash(&[b"ios-app-group", group.as_bytes()], relative));
+            if let Ok(relative) = root.strip_prefix(&container) {
+                return selected(&container, relative, &[b"ios-app-group", group.as_bytes()]);
             }
         }
         Err(failure(
@@ -297,36 +317,41 @@ pub(crate) mod android {
     }
 
     impl Context {
-        fn hash(&self, device: bool, relative: &Path) -> [u8; 32] {
-            mobile_hash(
-                &[
-                    b"android-app",
-                    self.package.as_bytes(),
-                    &self.uid.to_le_bytes(),
-                    if device { b"device" } else { b"credential" },
-                ],
-                relative,
-            )
+        fn with_identity<T>(&self, device: bool, use_identity: impl FnOnce(&[&[u8]]) -> T) -> T {
+            use_identity(&[
+                b"android-app",
+                self.package.as_bytes(),
+                &self.uid.to_le_bytes(),
+                if device { b"device" } else { b"credential" },
+            ])
         }
 
         pub(crate) fn selected_root_hash(&self, root: &Path) -> AccountHomeResult<[u8; 32]> {
             let relative = root
                 .strip_prefix(&self.data)
                 .map_err(|_| failure("root is outside the captured Android private container"))?;
-            Ok(self.hash(self.device, relative))
+            Ok(self.with_identity(self.device, |identity| mobile_hash(identity, relative)))
         }
 
-        pub(super) fn root_hash(&self, root: &Path) -> AccountHomeResult<[u8; 32]> {
-            if root.starts_with(&self.data) {
-                return self.selected_root_hash(root);
+        pub(super) fn select_root<T>(
+            &self,
+            root: &Path,
+            selected: impl FnOnce(&Path, &Path, &[&[u8]]) -> AccountHomeResult<T>,
+        ) -> AccountHomeResult<T> {
+            if let Ok(relative) = root.strip_prefix(&self.data) {
+                return self.with_identity(self.device, |identity| {
+                    selected(&self.data, relative, identity)
+                });
             }
             if let Some(other) = &self.other {
                 let other = std::fs::canonicalize(other)?;
                 // dataDir is the default, which can itself be DE. Equal
                 // canonical anchors do not reveal a second CE container.
                 if other != self.data {
-                    if let Ok(relative) = root.strip_prefix(other) {
-                        return Ok(self.hash(!self.device, relative));
+                    if let Ok(relative) = root.strip_prefix(&other) {
+                        return self.with_identity(!self.device, |identity| {
+                            selected(&other, relative, identity)
+                        });
                     }
                 }
             }

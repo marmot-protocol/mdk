@@ -2776,7 +2776,10 @@ fn nip46_retirement_retry() {
                 Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
             ));
             reopened.resume_wipe_cleanup().unwrap();
-            assert_eq!(reopened.accounts_strict().unwrap(), [public.clone()]);
+            assert_eq!(
+                reopened.accounts_strict().unwrap().as_slice(),
+                std::slice::from_ref(&public)
+            );
             assert!(reopened.account_setup_state(&label).unwrap().is_some());
         } else {
             assert!(matches!(
