@@ -296,8 +296,9 @@ pub struct MemberKeyPackageResolutionStats {
 
 /// How completely relays answered the KeyPackage reads that selected
 /// accounts. Each selected account counts its deciding read of its own
-/// relays: its single-author batch, or its single-author fallback read, not
-/// the discovery relays recovery may add. Selection uses what an incomplete
+/// relays, with a tied relay list's outboxes when that read admits them: its
+/// single-author batch, or its single-author fallback read, not the
+/// discovery relays recovery may add. Selection uses what an incomplete
 /// read returned (D12), so a device whose only package sat on a relay that
 /// did not answer is left out; these counts show how often a selection was
 /// made from such a read.
