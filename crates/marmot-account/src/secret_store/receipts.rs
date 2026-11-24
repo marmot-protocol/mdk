@@ -255,13 +255,13 @@ fn publish_vault_marker(parent: &File, marker: &[u8; VAULT_ID_LEN]) -> io::Resul
         file.write_all(marker)?;
         file.sync_all()?;
         #[cfg(unix)]
-        let result = record_directory::link_new(parent, stage, name);
+        let result = record_directory::publish_new(parent, stage, name);
         #[cfg(windows)]
         let result = record_directory::publish_new(parent, &file, name);
         result
     })();
-    // POSIX publishes a second link. Windows renames the staging file itself.
-    let removed = if cfg!(unix) || published.is_err() {
+    // Android and Windows rename the stage; other Unix targets link it.
+    let removed = if cfg!(all(unix, not(target_os = "android"))) || published.is_err() {
         record_directory::discard_stage(parent, &file, stage)
     } else {
         Ok(())

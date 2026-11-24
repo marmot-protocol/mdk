@@ -39,6 +39,10 @@ mod unix {
         if matches!(access, DirAccess::Search) {
             return open_at(parent, &name, libc::O_PATH | libc::O_DIRECTORY);
         }
+        #[cfg(target_vendor = "apple")]
+        if matches!(access, DirAccess::Search) {
+            return open_at(parent, &name, libc::O_SEARCH);
+        }
         let _ = access;
         open_directory_at(parent, &name)
     }
@@ -189,13 +193,29 @@ mod unix {
         rename(parent, from, to)
     }
 
-    pub(crate) fn link_new(parent: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    pub(crate) fn publish_new(parent: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
         let (mut from_buffer, mut to_buffer) = ([0; 256], [0; 256]);
         let from = component_name(from, &mut from_buffer)?;
         let to = component_name(to, &mut to_buffer)?;
         let fd = parent.as_raw_fd();
+        // Android's app sandbox forbids hard links. Call the kernel directly
+        // so the no-replace rename does not require a new bionic symbol.
+        #[cfg(target_os = "android")]
         // SAFETY: Both components and the directory descriptor live through the call.
-        if unsafe { libc::linkat(fd, from.as_ptr(), fd, to.as_ptr(), 0) } == 0 {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                fd,
+                from.as_ptr(),
+                fd,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(not(target_os = "android"))]
+        // SAFETY: Both components and the directory descriptor live through the call.
+        let result = unsafe { libc::linkat(fd, from.as_ptr(), fd, to.as_ptr(), 0) };
+        if result == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
