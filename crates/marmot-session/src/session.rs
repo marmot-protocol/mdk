@@ -1273,13 +1273,24 @@ impl AccountDeviceSession {
             .own_device_leaves(group_id, roster, slot, tag_signature_key)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::own_account_self_signed_tags`].
+    pub fn own_account_self_signed_tags(
+        &self,
+        group_id: &GroupId,
+        leaf_tag_key: &[u8; 32],
+    ) -> SessionResult<Vec<(Vec<u8>, cgka_traits::app_components::DeviceSlotId)>> {
+        Ok(self
+            .engine
+            .own_account_self_signed_tags(group_id, leaf_tag_key)?)
+    }
+
     /// See [`cgka_engine::engine::Engine::own_account_leaves_tagged_by`].
     pub fn own_account_leaves_tagged_by(
         &self,
         group_id: &GroupId,
         leaf_tag_key: &[u8; 32],
         keys: &[RosterTagKey],
-    ) -> SessionResult<Vec<Vec<u8>>> {
+    ) -> SessionResult<Vec<(Vec<u8>, cgka_traits::app_components::DeviceSlotId)>> {
         Ok(self
             .engine
             .own_account_leaves_tagged_by(group_id, leaf_tag_key, keys)?)

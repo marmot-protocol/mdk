@@ -178,7 +178,7 @@ async fn a_member_leaf_reads_as_the_device_its_tag_names() {
             &tagged.leaf_tag_key,
             &[wrong_key.clone(), remembered.clone()]
         ),
-        vec![signature_key(&laptop, &gid)],
+        vec![(signature_key(&laptop, &gid), slot(2))],
         "remembered keys read the actual current leaf even without a current roster entry",
     );
     for keys in [

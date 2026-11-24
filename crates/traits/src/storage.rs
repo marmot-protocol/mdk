@@ -1275,7 +1275,9 @@ pub const ROSTER_TAG_KEYS_PER_SLOT: usize = 4;
 /// group and slot (mdk#2761). The engine records each roster state it
 /// applies; nothing in the engine reads them back. The app reads them to
 /// clean up after a device whose key the roster no longer lists, and to add
-/// no device in a slot held as removed to its chats.
+/// no device in a slot held as removed to its chats. It renews a removed
+/// slot's keys while a chat still holds that device's leaf, so they outlast
+/// the retention (mdk#3679).
 pub trait RosterTagKeyStorage {
     /// Record `keys` as seen in `group_id`'s roster at `seen_at`, in the
     /// order this device applied the roster states that listed them: a key
@@ -1293,6 +1295,21 @@ pub trait RosterTagKeyStorage {
     /// recently seen key held as removed: that one goes only by time, so the
     /// slot stays known to have held its `removed` record.
     fn prune_roster_tag_keys(&self, before: u64, per_slot: usize) -> StorageResult<()>;
+    /// Mark every key of `group_id`'s `slot` last seen at or after `since`
+    /// as last seen at `seen_at`, in one step, keeping the order they were
+    /// seen in (mdk#3679). A key keeps the later of the two times. A renewal
+    /// adds no key and moves none past another, and an interrupted renewal
+    /// renews either all of them or none. It extends only the time bound:
+    /// renewed keys still count toward the slot's `per_slot` most recently
+    /// seen, so a key a later sighting pushes past that limit is pruned as
+    /// any other.
+    fn renew_roster_tag_keys(
+        &self,
+        group_id: &GroupId,
+        slot: &[u8; 32],
+        since: u64,
+        seen_at: u64,
+    ) -> StorageResult<()>;
     /// What `group_id`'s rosters listed, last seen at or after `since`: by
     /// slot, and within a slot the most recently seen first.
     fn roster_tag_keys(&self, group_id: &GroupId, since: u64) -> StorageResult<Vec<RosterTagKey>>;
