@@ -52,8 +52,10 @@
   Whole-account wipe and setup rollback retire NIP-46 credentials after account removal or public-role restoration;
   pending retirement resumes before another pairing. A rejected precommit wipe retains its live NIP-46 binding.
   Account setup compensation and removal reap workers before catalog deletion or public-role restoration.
-  Destructive setup rollback rechecks the publication phase under the account mutation lease before removing data.
-  A failed promotion keeps its prior public role in the journal so the next pairing can finish compensation.
+  Setup cannot return to the initial rollback phase once publication starts. A matching import cannot authorize
+  rollback of an account that the setup journal records as already existing.
+  Reverting a promotion restores the prior public role and setup journal. If the promotion began publication,
+  restoring the public journal does not make the account eligible for destructive setup rollback.
   Rust callers receive `AppError::AccountSetupRollback` when compensation fails, with the setup and cleanup causes.
   Standalone session removal does not require decoding retained raw keys.
 - A newly linked device no longer waits up to an hour for its siblings' small state, showing a chat the account already

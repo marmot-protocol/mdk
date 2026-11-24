@@ -704,7 +704,17 @@ impl AccountHome {
         if let Some(kind) = setup_kind
             && (journal.is_none() || promoted)
         {
-            let prior_journal = journal.is_some();
+            // Keep the original snapshot if account publication was interrupted.
+            let promotion = prior_public
+                .filter(|_| {
+                    journal
+                        .as_ref()
+                        .is_none_or(|journal| journal.promotion.is_none())
+                })
+                .map(|public| PublicPromotion {
+                    account: public,
+                    prior_journal: journal.as_ref().map(PublicSetupSnapshot::capture),
+                });
             let mut journal = journal.unwrap_or_else(|| AccountSetupJournal {
                 state: AccountSetupState {
                     account_id_hex: account.account_id_hex.clone(),
@@ -715,18 +725,14 @@ impl AccountHome {
                 admission_role: None,
                 promotion: None,
                 created: Some(!has_record),
+                promotion_may_have_published: false,
             });
             journal.admission_role = Some(SetupAdmissionRole::of(&account));
-            if let Some(public) = prior_public {
-                let prior_created = journal.created;
+            if let Some(promotion) = promotion {
                 journal.created = Some(false);
-                journal.promotion.get_or_insert(PublicPromotion {
-                    account: public,
-                    prior_journal,
-                    prior_created,
-                });
+                journal.promotion = Some(promotion);
             }
-            self.write_account_setup_journal(&account.label, &journal)?;
+            self.write_account_setup_journal(&account.label, &mut journal)?;
         }
         if !has_record || promoted {
             self.write_account_record(&account)?;

@@ -684,6 +684,55 @@ fn setup_phase_update_fails_when_journal_is_missing() {
     ));
 }
 
+#[test]
+fn setup_phase_cannot_reopen_rollback_after_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account_for_setup().unwrap();
+    let label = &account.label;
+    home.set_account_setup_phase(label, AccountSetupPhase::LocalReady)
+        .unwrap();
+
+    for phase in [
+        AccountSetupPhase::BootstrapPublicationStarted,
+        // Recovery can revisit LocalReady without making rollback safe again.
+        AccountSetupPhase::LocalReady,
+    ] {
+        home.set_account_setup_phase(label, phase).unwrap();
+        let reopened = AccountHome::open(dir.path());
+        for attempt in [
+            reopened.set_account_setup_phase(label, AccountSetupPhase::LocalStateCreated),
+            reopened
+                .begin_account_setup_with(
+                    &account,
+                    false,
+                    AccountSetupKind::GeneratedIdentity,
+                    AccountSetupPhase::LocalStateCreated,
+                )
+                .map(drop),
+        ] {
+            assert!(matches!(attempt, Err(AccountHomeError::Io(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+                    && error.to_string() == "account setup cannot return to its initial phase"));
+        }
+        assert_eq!(
+            reopened.account_setup_state(label).unwrap().unwrap().phase,
+            phase
+        );
+        assert!(matches!(
+            reopened
+                .rollback_unpublished_account_setup(&account, None, None)
+                .unwrap(),
+            AccountSetupRollback::Skipped
+        ));
+    }
+    assert_eq!(home.account(label).unwrap(), account);
+    assert_eq!(
+        home.load_signing_keys(label).unwrap().public_key().to_hex(),
+        *label
+    );
+}
+
 /// Runtime readiness polls read the journal while background setup advances
 /// it. Holding a reader's handle across the phase write pins the widest race
 /// window deterministically: the reader must still see one complete journal.
@@ -1470,9 +1519,29 @@ fn setup_admission_keeps_journal() {
         if !external {
             assert_eq!(std::fs::read(&journal).unwrap(), bytes);
         }
-        assert_eq!(home.account_setup_state(&public_key).unwrap(), Some(state));
-        assert_eq!(home.accounts().unwrap(), [promoted]);
+        assert_eq!(
+            home.account_setup_state(&public_key).unwrap().as_ref(),
+            Some(&state)
+        );
+        assert_eq!(
+            home.accounts().unwrap().as_slice(),
+            std::slice::from_ref(&promoted)
+        );
         if external {
+            let advanced = home
+                .begin_account_setup_with(
+                    &promoted,
+                    false,
+                    AccountSetupKind::ExternalSigner,
+                    if created {
+                        AccountSetupPhase::LocalReady
+                    } else {
+                        AccountSetupPhase::KeyPackagePublicationStarted
+                    },
+                )
+                .unwrap();
+            assert_ne!(advanced.phase, state.phase);
+            assert_ne!(advanced.kind, state.kind);
             drop(home);
             let reopened = AccountHome::open(dir.path());
             reopened.set_account_signed_out(&public_key, true).unwrap();
@@ -1480,8 +1549,12 @@ fn setup_admission_keeps_journal() {
                 .revert_external_signer_upgrade(&public_key)
                 .unwrap();
             assert_eq!(reopened.account(&public_key).unwrap(), previous);
-            assert_eq!(std::fs::read(&journal).unwrap(), bytes);
+            assert_eq!(
+                reopened.account_setup_state(&public_key).unwrap(),
+                Some(state)
+            );
             if created {
+                assert_eq!(std::fs::read(&journal).unwrap(), bytes);
                 assert!(matches!(
                     reopened
                         .rollback_unpublished_account_setup(&previous, None, None)
@@ -1492,9 +1565,97 @@ fn setup_admission_keeps_journal() {
                     reopened.account(&public_key),
                     Err(AccountHomeError::UnknownAccount(_))
                 ));
+            } else {
+                let before: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let mut restored: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+                assert_eq!(
+                    restored
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("promotion_may_have_published"),
+                    Some(true.into())
+                );
+                assert_eq!(restored, before);
             }
         }
     }
+}
+
+#[test]
+fn published_promotion_demotion_preserves_public_setup_without_rearming_rollback() {
+    for rewind in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let label = nostr::prelude::Keys::generate().public_key().to_hex();
+        let public = home.add_public_account_for_setup(&label).unwrap();
+        let prior = home.account_setup_state(&label).unwrap().unwrap();
+        let external = home.add_external_signer_for_setup(&label).unwrap();
+        let path = home.account_dir(&label);
+        let payload = path.join("public-payload");
+        fs_private::write_private(&payload, b"keep public data").unwrap();
+
+        let begin = |phase| {
+            home.begin_account_setup_with(
+                &external,
+                false,
+                AccountSetupKind::ExternalSigner,
+                phase,
+            )
+            .unwrap();
+        };
+        if rewind {
+            home.set_account_setup_phase(&label, AccountSetupPhase::BootstrapPublicationStarted)
+                .unwrap();
+            begin(AccountSetupPhase::LocalReady);
+        } else {
+            begin(AccountSetupPhase::KeyPackagePublicationStarted);
+        }
+        drop(home);
+
+        let reopened = AccountHome::open(dir.path());
+        reopened.revert_external_signer_upgrade(&label).unwrap();
+        drop(reopened);
+
+        let demoted = AccountHome::open(dir.path());
+        assert_eq!(demoted.account_setup_state(&label).unwrap(), Some(prior));
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join(".account-setup.json")).unwrap())
+                .unwrap();
+        assert_eq!(journal["created"], true);
+        assert_eq!(journal["admission_role"], "public");
+        assert!(matches!(
+            demoted
+                .rollback_unpublished_account_setup(&public, None, None)
+                .unwrap(),
+            AccountSetupRollback::Skipped
+        ));
+        assert_eq!(demoted.account(&label).unwrap(), public);
+        assert_eq!(std::fs::read(&payload).unwrap(), b"keep public data");
+    }
+}
+
+#[test]
+fn incomplete_draft_promotion_cannot_make_a_public_setup_rollback_eligible() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let label = nostr::prelude::Keys::generate().public_key().to_hex();
+    home.add_public_account_for_setup(&label).unwrap();
+    let external = home.add_external_signer_for_setup(&label).unwrap();
+    let journal = home.account_dir(&label).join(".account-setup.json");
+    let mut draft: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    draft["promotion"]["prior_journal"] = true.into();
+    draft["promotion"]["prior_created"] = true.into();
+    let bytes = serde_json::to_vec(&draft).unwrap();
+    fs_private::write_private(&journal, &bytes).unwrap();
+    drop(home);
+
+    let reopened = AccountHome::open(dir.path());
+    assert!(matches!(reopened.revert_external_signer_upgrade(&label),
+        Err(AccountHomeError::Json(error)) if error.to_string().contains("invalid type: boolean")));
+    assert_eq!(reopened.account(&label).unwrap(), external);
+    assert_eq!(std::fs::read(journal).unwrap(), bytes);
 }
 
 #[test]
@@ -3259,6 +3420,98 @@ fn runtime_import_resumes_only_while_durable_setup_is_incomplete() {
         Err(AccountHomeError::AccountExists(account))
             if account == first.account().account_id_hex
     ));
+}
+
+#[test]
+fn runtime_import_checks_visible_setup_kind_and_role_before_vault_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    let home =
+        AccountHome::open_with_secret_store(dir.path(), store.clone(), IosOptions::default());
+    let keys = nostr::prelude::Keys::generate();
+    let secret = keys.secret_key().to_secret_hex();
+    let onboarding = home.import_nostr_account_for_onboarding(&secret).unwrap();
+    let label = &onboarding.account().label;
+    let journal = home.account_dir(label).join(".account-setup.json");
+    let original = std::fs::read(&journal).unwrap();
+    let vault_error = "injected unavailable vault";
+    *store.load_error.lock().unwrap() =
+        Some(AccountHomeError::SecretStoreUnavailable(vault_error.into()));
+
+    assert!(matches!(home.import_nostr_account_idempotent(&secret),
+        Err(AccountHomeError::AccountExists(account)) if account == *label));
+    assert_eq!(std::fs::read(&journal).unwrap(), original);
+
+    let mut wrong_role: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    wrong_role["admission_role"] = "external".into();
+    let wrong_role = serde_json::to_vec(&wrong_role).unwrap();
+    fs_private::write_private(&journal, &wrong_role).unwrap();
+    assert!(matches!(home.import_nostr_account_for_onboarding(&secret),
+        Err(AccountHomeError::AccountExists(account)) if account == *label));
+    assert_eq!(std::fs::read(&journal).unwrap(), wrong_role);
+
+    let legacy = serde_json::to_vec(&home.account_setup_state(label).unwrap().unwrap()).unwrap();
+    fs_private::write_private(&journal, &legacy).unwrap();
+    assert!(matches!(home.import_nostr_account_for_onboarding(&secret),
+        Err(AccountHomeError::SecretStoreUnavailable(error)) if error == vault_error));
+    assert_eq!(
+        home.import_nostr_account_for_onboarding(&secret).unwrap(),
+        onboarding
+    );
+}
+
+#[test]
+fn rollback_import_fallback_requires_missing_creation_provenance() {
+    for existing in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let keys = nostr::prelude::Keys::generate();
+        let secret = keys.secret_key().to_secret_hex();
+        let account = if existing {
+            let account = home.import_nostr_account(&secret).unwrap();
+            home.begin_account_setup(&account, false).unwrap();
+            account
+        } else {
+            let account = home
+                .import_nostr_account_idempotent(&secret)
+                .unwrap()
+                .account()
+                .clone();
+            let legacy = home.account_setup_state(&account.label).unwrap().unwrap();
+            let journal = home.account_dir(&account.label).join(".account-setup.json");
+            fs_private::write_private(&journal, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+            account
+        };
+        let payload = home.account_dir(&account.label).join("session.sqlite");
+        std::fs::write(&payload, b"local account payload").unwrap();
+        let receipt = file_receipts(dir.path()).pop().unwrap();
+        drop(home);
+
+        let reopened = AccountHome::open(dir.path());
+        let import = reopened.import_nostr_account_idempotent(&secret).unwrap();
+        assert_eq!(import.account(), &account);
+        let rolled_back = reopened
+            .rollback_unpublished_account_setup(&account, Some(&import), None)
+            .unwrap();
+        if existing {
+            assert!(matches!(rolled_back, AccountSetupRollback::Skipped));
+            assert_eq!(reopened.account(&account.label).unwrap(), account);
+            assert_eq!(std::fs::read(&payload).unwrap(), b"local account payload");
+            assert_eq!(
+                reopened
+                    .load_signing_keys(&account.label)
+                    .unwrap()
+                    .public_key(),
+                keys.public_key()
+            );
+            assert!(receipt.exists());
+        } else {
+            assert!(matches!(rolled_back, AccountSetupRollback::Removed));
+            assert!(reopened.accounts().unwrap().is_empty());
+            assert!(!payload.exists());
+            assert!(!receipt.exists());
+        }
+    }
 }
 
 #[test]

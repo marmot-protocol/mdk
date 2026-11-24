@@ -307,9 +307,8 @@ pub enum ExternalSecretMode {
 
 /// Provenance for a strict Nostr private-key import used by account setup.
 ///
-/// A live account record is never treated as idempotent by this flow. The
-/// only reusable state is an exact account-id-keyed signing credential whose
-/// filesystem account record is absent.
+/// A live account record can resume only the matching local setup. Without a
+/// record, an exact account-id-keyed credential can be adopted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrAccountImport {
     account: AccountSummary,
@@ -352,9 +351,23 @@ struct AccountSetupJournal {
     promotion: Option<PublicPromotion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created: Option<bool>,
+    // Restoring the public setup must not forget publication by the promotion.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    promotion_may_have_published: bool,
 }
 
 impl AccountSetupJournal {
+    fn matches_local_signing_admission(&self, account_id_hex: &str) -> bool {
+        self.state.account_id_hex == account_id_hex
+            && self
+                .admission_role
+                .is_none_or(|role| role == SetupAdmissionRole::Local)
+            && !matches!(
+                self.state.kind,
+                AccountSetupKind::PublicIdentity | AccountSetupKind::ExternalSigner
+            )
+    }
+
     fn promotion_for(
         &self,
         account: &AccountSummary,
@@ -372,9 +385,25 @@ impl AccountSetupJournal {
 #[derive(Deserialize, Serialize)]
 struct PublicPromotion {
     account: AccountSummary,
-    prior_journal: bool,
-    #[serde(default)]
-    prior_created: Option<bool>,
+    // Earlier drafts stored a boolean here. Do not infer a snapshot from it.
+    prior_journal: Option<PublicSetupSnapshot>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PublicSetupSnapshot {
+    state: AccountSetupState,
+    admission_role: Option<SetupAdmissionRole>,
+    created: Option<bool>,
+}
+
+impl PublicSetupSnapshot {
+    fn capture(journal: &AccountSetupJournal) -> Self {
+        Self {
+            state: journal.state.clone(),
+            admission_role: journal.admission_role,
+            created: journal.created,
+        }
+    }
 }
 
 impl PublicPromotion {
@@ -382,6 +411,10 @@ impl PublicPromotion {
         if self.account.label != account.label
             || self.account.account_id_hex != account.account_id_hex
             || self.account.can_sign()
+            || self
+                .prior_journal
+                .as_ref()
+                .is_some_and(|prior| prior.state.account_id_hex != account.account_id_hex)
         {
             return Err(AccountHomeError::AccountIdMismatch);
         }
@@ -445,6 +478,31 @@ pub enum AccountSetupPhase {
     /// exact signed bytes are persisted there before the first network send.
     KeyPackagePublicationStarted,
     KeyPackagePublicationConfirmed,
+}
+
+impl AccountSetupPhase {
+    fn may_have_published(self) -> bool {
+        match self {
+            Self::LocalStateCreated | Self::LocalReady => false,
+            Self::BootstrapPublicationStarted
+            | Self::BootstrapPublicationConfirmed
+            | Self::KeyPackagePublicationStarted
+            | Self::KeyPackagePublicationConfirmed => true,
+        }
+    }
+
+    fn check_transition(self, next: Self) -> AccountHomeResult<()> {
+        // Publication recovery can revisit a later phase, but only the initial
+        // phase authorizes setup rollback.
+        if next == Self::LocalStateCreated && self != next {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "account setup cannot return to its initial phase",
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 impl NostrAccountImport {
@@ -614,7 +672,7 @@ impl AccountHome {
         {
             return Err(AccountHomeError::AccountExists(account.label));
         }
-        let journal = AccountSetupJournal {
+        let mut journal = AccountSetupJournal {
             state: AccountSetupState {
                 account_id_hex: account.account_id_hex.clone(),
                 reused_account_id_credential: false,
@@ -624,8 +682,9 @@ impl AccountHome {
             admission_role: Some(SetupAdmissionRole::Local),
             promotion: None,
             created: Some(true),
+            promotion_may_have_published: false,
         };
-        self.write_account_setup_journal(&account.label, &journal)?;
+        self.write_account_setup_journal(&account.label, &mut journal)?;
         self.acquire_credential(
             &account,
             SecretCredentialKind::Signing,
@@ -816,12 +875,22 @@ impl AccountHome {
         let account_id_hex = keys.public_key().to_hex();
         let _guard = self.mutation_guard()?;
         validate_account_label(&account_id_hex)?;
+        let journal = self.raw_account_setup_journal(&account_id_hex)?;
+        if journal.as_ref().is_some_and(|journal| {
+            !journal.matches_local_signing_admission(&account_id_hex) || journal.state.kind != kind
+        }) {
+            return Err(AccountHomeError::AccountExists(account_id_hex));
+        }
         if self.account_record_path(&account_id_hex).try_exists()? {
             let account = self.account(&account_id_hex)?;
-            let Some(setup) = self.account_setup_state(&account_id_hex)? else {
-                return Err(AccountHomeError::AccountExists(account.label));
+            let Some(journal) = journal else {
+                return Err(AccountHomeError::AccountExists(account_id_hex));
             };
-            if !account.local_signing || setup.account_id_hex != account.account_id_hex {
+            if !account.local_signing
+                || account.external_signing
+                || account.label != account_id_hex
+                || account.account_id_hex != account_id_hex
+            {
                 return Err(AccountHomeError::AccountExists(account_id_hex));
             }
             let stored = match self.load_credential(&account, SecretCredentialKind::Signing) {
@@ -837,7 +906,7 @@ impl AccountHome {
             }
             return Ok(NostrAccountImport {
                 account,
-                reused_account_id_credential: setup.reused_account_id_credential,
+                reused_account_id_credential: journal.state.reused_account_id_credential,
             });
         }
         let account = AccountSummary {
@@ -848,16 +917,8 @@ impl AccountHome {
             signed_out: false,
             unlinked: false,
         };
-        let _ = self.pending_signing_admission(&account.label, &account.account_id_hex)?;
-        if let Some(mut journal) = self.raw_account_setup_journal(&account.label)? {
-            if journal.state.account_id_hex != account.account_id_hex
-                || journal.state.kind != kind
-                || journal
-                    .admission_role
-                    .is_some_and(|role| role != SetupAdmissionRole::Local)
-            {
-                return Err(AccountHomeError::AccountExists(account.label));
-            }
+        self.pending_signing_manifest(&account.label, &account.account_id_hex)?;
+        if let Some(mut journal) = journal {
             let acquired = self.acquire_credential(
                 &account,
                 SecretCredentialKind::Signing,
@@ -872,8 +933,8 @@ impl AccountHome {
                 journal.state.reused_account_id_credential = true;
             }
             journal.admission_role = Some(SetupAdmissionRole::Local);
-            journal.created = Some(true);
-            self.write_account_setup_journal(&account.label, &journal)?;
+            journal.created = Some(journal.created.unwrap_or(true));
+            self.write_account_setup_journal(&account.label, &mut journal)?;
             self.write_account_record(&account)?;
             return Ok(NostrAccountImport {
                 account,
@@ -901,8 +962,9 @@ impl AccountHome {
             admission_role: Some(SetupAdmissionRole::Local),
             promotion: None,
             created: Some(true),
+            promotion_may_have_published: false,
         };
-        self.write_account_setup_journal(&account.label, &journal)?;
+        self.write_account_setup_journal(&account.label, &mut journal)?;
         let mode = if reused {
             SecretClaimMode::MigrateLegacy
         } else {
@@ -916,7 +978,7 @@ impl AccountHome {
                 .has_secret_for_account_id(&account.account_id_hex)?
         {
             journal.state.reused_account_id_credential = true;
-            self.write_account_setup_journal(&account.label, &journal)?;
+            self.write_account_setup_journal(&account.label, &mut journal)?;
         }
         self.write_account_record(&account)?;
         Ok(NostrAccountImport {
@@ -959,6 +1021,7 @@ impl AccountHome {
             {
                 return Err(AccountHomeError::AccountExists(account.label.clone()));
             }
+            prior.state.phase.check_transition(phase)?;
         }
         if !has_record && let Some(manifest) = self.credential_manifest(&account.label)? {
             manifest.validate_identity(account)?;
@@ -972,16 +1035,19 @@ impl AccountHome {
             kind,
             phase,
         };
-        let journal = AccountSetupJournal {
+        let mut journal = AccountSetupJournal {
             state,
             admission_role: Some(role),
             created: prior
                 .as_ref()
                 .and_then(|journal| journal.created)
                 .or(Some(!has_record)),
+            promotion_may_have_published: prior
+                .as_ref()
+                .is_some_and(|journal| journal.promotion_may_have_published),
             promotion: prior.and_then(|journal| journal.promotion),
         };
-        self.write_account_setup_journal(&account.label, &journal)?;
+        self.write_account_setup_journal(&account.label, &mut journal)?;
         Ok(journal.state)
     }
 
@@ -1022,19 +1088,23 @@ impl AccountHome {
         let Some(mut journal) = self.raw_account_setup_journal(&account.label)? else {
             return Err(AccountHomeError::AccountSetupStateMissing);
         };
-        if journal.state.account_id_hex != account.account_id_hex {
+        let state = &mut journal.state;
+        if state.account_id_hex != account.account_id_hex {
             return Err(AccountHomeError::AccountIdMismatch);
         }
-        journal.state.phase = phase;
-        self.write_account_setup_journal(&account.label, &journal)
+        state.phase.check_transition(phase)?;
+        state.phase = phase;
+        self.write_account_setup_journal(&account.label, &mut journal)
     }
 
     fn write_account_setup_journal(
         &self,
         label: &str,
-        journal: &AccountSetupJournal,
+        journal: &mut AccountSetupJournal,
     ) -> AccountHomeResult<()> {
         validate_account_label(label)?;
+        journal.promotion_may_have_published |=
+            journal.promotion.is_some() && journal.state.phase.may_have_published();
         write_private_json(&self.root, self.account_setup_state_path(label), journal)
     }
 
@@ -1323,7 +1393,8 @@ impl AccountHome {
 
     /// Roll back a setup the caller owns after it has quiesced the account runtime.
     /// This checks the expected account and unpublished phase under the same guard
-    /// as phase writes. A promoted account keeps its public payload.
+    /// as phase writes. A promoted account keeps its public payload, even after
+    /// explicit demotion if the promotion may already have published.
     /// `before_wipe` runs under the guard only before destructive removal. It
     /// must not call back into `AccountHome`.
     pub fn rollback_unpublished_account_setup(
@@ -1368,7 +1439,11 @@ impl AccountHome {
         if import.is_some_and(|import| &import.account != expected) {
             return Err(AccountHomeError::AccountIdMismatch);
         }
-        if journal.created != Some(true) && !(account.local_signing && import.is_some()) {
+        if journal.promotion_may_have_published
+            || !journal
+                .created
+                .unwrap_or(account.local_signing && import.is_some())
+        {
             return Ok(AccountSetupRollback::Skipped);
         }
         let removal = if account.local_signing
@@ -1756,17 +1831,26 @@ impl AccountHome {
     }
 
     fn restore_public_setup_journal(&self, account: &AccountSummary) -> AccountHomeResult<()> {
-        let Some(mut journal) = self.raw_account_setup_journal(&account.label)? else {
-            return Ok(());
-        };
-        let Some(promotion) = journal.promotion.take() else {
+        let Some(AccountSetupJournal {
+            promotion: Some(promotion),
+            promotion_may_have_published,
+            ..
+        }) = self.raw_account_setup_journal(&account.label)?
+        else {
             return Ok(());
         };
         promotion.validate_account(account)?;
-        if promotion.prior_journal {
-            journal.admission_role = Some(SetupAdmissionRole::Public);
-            journal.created = promotion.prior_created;
-            self.write_account_setup_journal(&account.label, &journal)
+        if let Some(prior) = promotion.prior_journal {
+            self.write_account_setup_journal(
+                &account.label,
+                &mut AccountSetupJournal {
+                    state: prior.state,
+                    admission_role: prior.admission_role,
+                    promotion: None,
+                    created: prior.created,
+                    promotion_may_have_published,
+                },
+            )
         } else {
             self.remove_account_setup_journal(&account.label)
         }
@@ -2129,19 +2213,18 @@ impl AccountHome {
     ) -> AccountHomeResult<Option<CredentialManifest>> {
         if self
             .raw_account_setup_journal(label)?
-            .is_some_and(|journal| {
-                journal.state.account_id_hex != account_id_hex
-                    || matches!(
-                        journal.state.kind,
-                        AccountSetupKind::PublicIdentity | AccountSetupKind::ExternalSigner
-                    )
-                    || journal
-                        .admission_role
-                        .is_some_and(|role| role != SetupAdmissionRole::Local)
-            })
+            .is_some_and(|journal| !journal.matches_local_signing_admission(account_id_hex))
         {
             return Err(AccountHomeError::AccountExists(label.to_owned()));
         }
+        self.pending_signing_manifest(label, account_id_hex)
+    }
+
+    fn pending_signing_manifest(
+        &self,
+        label: &str,
+        account_id_hex: &str,
+    ) -> AccountHomeResult<Option<CredentialManifest>> {
         let manifest = self.credential_manifest(label)?;
         if manifest.as_ref().is_some_and(|manifest| {
             manifest.account.account_id_hex != account_id_hex

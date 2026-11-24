@@ -7065,47 +7065,72 @@ async fn generated_setup_resume_context_failures_do_not_block_runtime_start() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_identity_restart_resumes_every_durable_setup_phase() {
+    use marmot_account::AccountSetupPhase;
+
     for phase in [
-        marmot_account::AccountSetupPhase::LocalStateCreated,
-        marmot_account::AccountSetupPhase::LocalReady,
-        marmot_account::AccountSetupPhase::BootstrapPublicationStarted,
-        marmot_account::AccountSetupPhase::BootstrapPublicationConfirmed,
-        marmot_account::AccountSetupPhase::KeyPackagePublicationStarted,
-        marmot_account::AccountSetupPhase::KeyPackagePublicationConfirmed,
+        AccountSetupPhase::LocalStateCreated,
+        AccountSetupPhase::LocalReady,
+        AccountSetupPhase::BootstrapPublicationStarted,
+        AccountSetupPhase::BootstrapPublicationConfirmed,
+        AccountSetupPhase::KeyPackagePublicationStarted,
+        AccountSetupPhase::KeyPackagePublicationConfirmed,
     ] {
         let directory = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        relay.block_next_publish();
         let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let runtime = MarmotAppRuntime::new(app.clone());
-        let result = runtime
-            .create_identity_local_ready(AccountSetupRequest {
-                default_relays: vec![TransportEndpoint("wss://relay.example".into())],
-                bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
-                publish_initial_key_package: true,
-                ..AccountSetupRequest::default()
-            })
-            .await
+        let request = AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        };
+        let (account, signed_bytes) = if phase == AccountSetupPhase::LocalStateCreated {
+            let account = app.account_home().create_nostr_account_for_setup().unwrap();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+            app.install_local_open_gate(
+                &account.label,
+                AccountStartupStage::AccountState,
+                reached_tx,
+                proceed_rx,
+            )
             .unwrap();
-        relay.wait_for_blocked_publish().await;
-        let signed_bytes = app
-            .account_storage(&result.account.label)
-            .unwrap()
-            .key_package_lifecycle()
-            .unwrap()
-            .unwrap()
-            .pending_replacement
-            .unwrap()
-            .signed_event
-            .unwrap()
-            .bytes;
-        if phase == marmot_account::AccountSetupPhase::KeyPackagePublicationConfirmed {
+            // Setup has persisted its context but cannot prepare a KeyPackage yet.
+            let mut preparing = Box::pin(runtime.create_identity_local_ready(request));
+            tokio::select! {
+                reached = tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(10))) => {
+                    reached.unwrap().expect("local setup reached the account-state gate");
+                }
+                result = &mut preparing => panic!("local setup bypassed its gate: {result:?}"),
+            }
+            drop(preparing);
+            proceed_tx.send(()).unwrap();
+            (account, None)
+        } else {
+            relay.block_next_publish();
+            let result = runtime.create_identity_local_ready(request).await.unwrap();
+            relay.wait_for_blocked_publish().await;
+            let signed_bytes = app
+                .account_storage(&result.account.label)
+                .unwrap()
+                .key_package_lifecycle()
+                .unwrap()
+                .unwrap()
+                .pending_replacement
+                .unwrap()
+                .signed_event
+                .unwrap()
+                .bytes;
+            (result.account, Some(signed_bytes))
+        };
+        if phase == AccountSetupPhase::KeyPackagePublicationConfirmed {
             // This checkpoint is only valid after the exact pending package
             // has been promoted locally. Mirror that atomic durable state;
             // advancing only the setup journal would manufacture a torn state
             // the production path never writes.
-            let storage = app.account_storage(&result.account.label).unwrap();
+            let storage = app.account_storage(&account.label).unwrap();
             let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
             let mut replacement = lifecycle.pending_replacement.take().unwrap();
             let artifact = replacement.signed_event.take().unwrap();
@@ -7130,8 +7155,16 @@ async fn generated_identity_restart_resumes_every_durable_setup_phase() {
         drop(app);
 
         let home = AccountHome::open(directory.path());
-        home.set_account_setup_phase(&result.account.label, phase)
-            .unwrap();
+        if signed_bytes.is_some() {
+            home.set_account_setup_phase(&account.label, phase).unwrap();
+        }
+        assert_eq!(
+            home.account_setup_state(&account.label)
+                .unwrap()
+                .unwrap()
+                .phase,
+            phase
+        );
         let restarted_app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let restarted = MarmotAppRuntime::new(restarted_app.clone());
@@ -7139,7 +7172,7 @@ async fn generated_identity_restart_resumes_every_durable_setup_phase() {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if restarted
-                    .account_setup_readiness(&result.account.account_id_hex)
+                    .account_setup_readiness(&account.account_id_hex)
                     .unwrap()
                     == AccountSetupReadiness::NetworkReady
                 {
@@ -7151,26 +7184,26 @@ async fn generated_identity_restart_resumes_every_durable_setup_phase() {
         .await
         .unwrap_or_else(|_| panic!("restart did not resume phase {phase:?}"));
         let lifecycle = restarted_app
-            .account_storage(&result.account.label)
+            .account_storage(&account.label)
             .unwrap()
             .key_package_lifecycle()
             .unwrap()
             .unwrap();
         let resumed_signed_bytes = lifecycle.authored_signed_event.unwrap().bytes;
-        if phase == marmot_account::AccountSetupPhase::LocalStateCreated {
-            assert!(
-                !resumed_signed_bytes.is_empty(),
-                "restart before KeyPackage local durability must finish preparing one exact publication"
-            );
-        } else {
+        if let Some(signed_bytes) = signed_bytes {
             assert_eq!(
                 resumed_signed_bytes, signed_bytes,
                 "restart from {phase:?} must retain the exact signed KeyPackage publication"
             );
+        } else {
+            assert!(
+                !resumed_signed_bytes.is_empty(),
+                "restart before KeyPackage local durability must finish preparing one exact publication"
+            );
         }
         assert_eq!(
             restarted_app.account_home().accounts().unwrap(),
-            vec![result.account]
+            vec![account]
         );
         restarted.shutdown().await;
     }
