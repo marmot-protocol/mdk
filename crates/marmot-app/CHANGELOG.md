@@ -43,6 +43,16 @@
   is its author, neither notify nor wake members (D-122), and never count as unread or raise the @-badge. Items in a
   thread keep their own alert rule.
 
+### Changed
+
+- Usage diagnostics count a Welcome naming another KeyPackage of this account (`NotAddressedToThisDevice`) as
+  `mdk_welcome_summary` `process` `absent`, no longer `duplicate`: a device that sees only its siblings' Welcomes cannot
+  join, and counting them as copies hid it. No outcome value is added, so saved consent stays accepted.
+- Relay telemetry adds `app_runtime_member_key_package_read_*` and `app_runtime_member_key_package_relay_read_*`:
+  for each member a create, invite or invite recovery selects, whether its KeyPackage read heard every relay it asked,
+  and how many of those relays answered. `MemberKeyPackageResolutionStats::key_package_reads` carries the same counts.
+  Selection is unchanged.
+
 ### Fixed
 
 - A newly linked device no longer waits up to an hour for its siblings' small state, showing a chat the account already

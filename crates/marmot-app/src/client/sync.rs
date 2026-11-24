@@ -37,6 +37,36 @@ mod native_comparison_tests;
 mod native_ingress;
 pub(crate) use native_ingress::MAX_NATIVE_ADMISSION_PER_TURN;
 
+/// The product-analytics outcome an ingested delivery counts as, or `None`
+/// for one that is not an invitation or message metric.
+fn ingest_product_outcome(outcome: &IngestOutcome) -> Option<&'static str> {
+    use cgka_traits::InputRejectionCategory as Category;
+    match outcome {
+        IngestOutcome::Processed => Some("success"),
+        // Authenticated control is neither an invitation metric nor
+        // a reason to export a control-specific discriminator.
+        IngestOutcome::GroupRecovery { .. } => None,
+        IngestOutcome::Ignored {
+            category: Category::Duplicate | Category::OwnEcho,
+        } => Some("duplicate"),
+        // Another device's Welcome delivery is not a rejected Welcome, nor a
+        // copy of one this device holds: this device may have received only
+        // its siblings' Welcomes, and cannot join from them. `absent` keeps
+        // it apart without a new outcome value, which would change the
+        // registry revision and ask every consenting user to accept again.
+        IngestOutcome::Ignored {
+            category: Category::NotAddressedToThisDevice,
+        } => Some("absent"),
+        IngestOutcome::Buffered { .. }
+        | IngestOutcome::TransportDeferred { .. }
+        | IngestOutcome::LocalState { .. } => Some("deferred"),
+        IngestOutcome::ResourceRefused { .. } => Some("capacity"),
+        IngestOutcome::Ignored { .. }
+        | IngestOutcome::Stale { .. }
+        | IngestOutcome::Rejected { .. } => Some("rejected"),
+    }
+}
+
 /// The worker consumes committed output; direct clients retain full summaries.
 pub(crate) struct CommittedSyncProgress<'a> {
     pub(crate) publish: &'a (dyn Fn(&mut AppClient, &SyncSummary) + Send + Sync),
@@ -3497,27 +3527,7 @@ impl AppClient {
         if let Some(observation) = observation {
             let outcome = match &ingest {
                 _ if private_control => None,
-                Ok(effects) => match &effects.outcome {
-                    IngestOutcome::Processed => Some("success"),
-                    // Authenticated control is neither an invitation metric nor
-                    // a reason to export a control-specific discriminator.
-                    IngestOutcome::GroupRecovery { .. } => None,
-                    // Another device's Welcome delivery is one more copy of
-                    // the account's invitation here, not a rejected Welcome.
-                    IngestOutcome::Ignored {
-                        category:
-                            cgka_traits::InputRejectionCategory::Duplicate
-                            | cgka_traits::InputRejectionCategory::OwnEcho
-                            | cgka_traits::InputRejectionCategory::NotAddressedToThisDevice,
-                    } => Some("duplicate"),
-                    IngestOutcome::Buffered { .. }
-                    | IngestOutcome::TransportDeferred { .. }
-                    | IngestOutcome::LocalState { .. } => Some("deferred"),
-                    IngestOutcome::ResourceRefused { .. } => Some("capacity"),
-                    IngestOutcome::Ignored { .. }
-                    | IngestOutcome::Stale { .. }
-                    | IngestOutcome::Rejected { .. } => Some("rejected"),
-                },
+                Ok(effects) => ingest_product_outcome(&effects.outcome),
                 Err(_) => Some("failure"),
             };
             if let Some(outcome) = outcome {
@@ -8601,3 +8611,21 @@ mod routed_loss_observation_tests {
 
 #[cfg(test)]
 mod projection_retry_tests;
+
+#[cfg(test)]
+mod ingest_product_outcome_tests {
+    use cgka_traits::InputRejectionCategory as Category;
+    use cgka_traits::ingest::IngestOutcome;
+
+    /// A Welcome naming another KeyPackage of this account is counted apart
+    /// from a copy this device already has: a device that sees only its
+    /// siblings' Welcomes cannot join, and counting those as copies hid it.
+    #[test]
+    fn a_welcome_for_another_device_is_not_counted_as_a_copy() {
+        let ignored =
+            |category| super::ingest_product_outcome(&IngestOutcome::Ignored { category });
+        assert_eq!(ignored(Category::NotAddressedToThisDevice), Some("absent"));
+        assert_eq!(ignored(Category::Duplicate), Some("duplicate"));
+        assert_eq!(ignored(Category::OwnEcho), Some("duplicate"));
+    }
+}
