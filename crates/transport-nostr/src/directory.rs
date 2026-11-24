@@ -2025,8 +2025,8 @@ mod tests {
         /// REQ with EOSE once it has refused, and close an inbox REQ as
         /// `auth-required:`.
         RefusesAuthOnConnect,
-        /// Answer each REQ with an EOSE that says NIP-67 `more`.
-        SaysMore,
+        /// Answer each REQ with an EOSE carrying this NIP-67 hint.
+        SaysHint(&'static str),
         /// Accept the WebSocket handshake after the first delay, then answer
         /// each REQ's EOSE after the second.
         Slow { handshake: Duration, eose: Duration },
@@ -2114,9 +2114,9 @@ mod tests {
                         }
                         replies
                     }
-                    (Some("REQ"), InspectionRelay::SaysMore) => {
+                    (Some("REQ"), InspectionRelay::SaysHint(hint)) => {
                         counted.fetch_add(1, Ordering::SeqCst);
-                        vec![serde_json::json!(["EOSE", request[1], ["more"]])]
+                        vec![serde_json::json!(["EOSE", request[1], [hint]])]
                     }
                     (Some("REQ"), script) => {
                         counted.fetch_add(1, Ordering::SeqCst);
@@ -2199,30 +2199,35 @@ mod tests {
         assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    // A relay that says it holds more may hold a newer declaration than it
-    // sent: the source is not complete. The inbox probe needs only an answer.
+    // A relay that says it holds more, or holds events back until the client
+    // authenticates, may hold a newer declaration than it sent: the source is
+    // not complete. The inbox probe needs only an answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn inspection_of_a_relay_that_says_more_is_incomplete() {
+    async fn inspection_of_a_relay_that_withholds_events_is_incomplete() {
         let author = nostr::prelude::Keys::generate().public_key().to_hex();
-        let (endpoint, _, server) = spawn_inspection_relay(InspectionRelay::SaysMore).await;
-        let request = DirectoryFetchRequest::new(
-            vec![endpoint],
-            vec![DirectoryEventQuery::new(10002, vec![author], 4)],
-        )
-        .unwrap();
-        let result = timeout(
-            Duration::from_secs(5),
-            NostrSdkDirectoryRelayFetcher::standalone().inspect_directory_events(request, None),
-        )
-        .await
-        .expect("inspection completes");
-        server.abort();
-        assert_eq!(result, Err(DirectoryInspectionError::Incomplete));
+        for hint in ["more", "auth"] {
+            let (endpoint, _, server) =
+                spawn_inspection_relay(InspectionRelay::SaysHint(hint)).await;
+            let request = DirectoryFetchRequest::new(
+                vec![endpoint],
+                vec![DirectoryEventQuery::new(10002, vec![author.clone()], 4)],
+            )
+            .unwrap();
+            let result = timeout(
+                Duration::from_secs(5),
+                NostrSdkDirectoryRelayFetcher::standalone().inspect_directory_events(request, None),
+            )
+            .await
+            .expect("inspection completes");
+            server.abort();
+            assert_eq!(result, Err(DirectoryInspectionError::Incomplete), "{hint}");
 
-        let (endpoint, _, server) = spawn_inspection_relay(InspectionRelay::SaysMore).await;
-        let result = inspect_inbox(endpoint, None).await;
-        server.abort();
-        assert_eq!(result, Ok(Vec::new()));
+            let (endpoint, _, server) =
+                spawn_inspection_relay(InspectionRelay::SaysHint(hint)).await;
+            let result = inspect_inbox(endpoint, None).await;
+            server.abort();
+            assert_eq!(result, Ok(Vec::new()), "{hint}");
+        }
     }
 
     // An authentication the relay refused while the client connected, before
@@ -2621,46 +2626,50 @@ mod tests {
         assert!(crate::same_relay(named.as_str(), finished.as_str()));
     }
 
-    /// A relay whose EOSE says NIP-67 `more` did not send all it holds: its
-    /// records are kept, but it does not establish absence.
+    /// A relay whose EOSE says NIP-67 `more` or `auth` may not have sent all
+    /// it holds: its records are kept, but it does not establish absence.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn strict_directory_fetch_does_not_count_a_relay_that_says_more() {
+    async fn strict_directory_fetch_does_not_count_a_relay_that_withholds_events() {
         use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
 
         let keys = Keys::generate();
         let note = EventBuilder::new(Kind::TextNote, "kept")
             .finalize(&keys)
             .unwrap();
-        // Only the relay that says `more` holds the note, so it survives only
-        // if that relay's partial page is kept.
-        let (more, more_server) = spawn_query_relay(vec![note.clone()], QueryRelayEnd::More).await;
-        let (finished, finished_server) = spawn_query_relay(Vec::new(), QueryRelayEnd::Eose).await;
-        let query = DirectoryEventQuery::new(1, vec![keys.public_key().to_hex()], 4);
-        let request =
-            DirectoryFetchRequest::new(vec![more.clone(), finished.clone()], vec![query]).unwrap();
-        let outcome = timeout(
-            Duration::from_secs(20),
-            NostrSdkDirectoryRelayFetcher::standalone()
-                .fetch_directory_events_with_completion(request),
-        )
-        .await
-        .expect("strict fetch completes")
-        .unwrap();
-        more_server.abort();
-        finished_server.abort();
-        assert!(!outcome.complete);
-        let [named] = outcome.complete_endpoints.as_slice() else {
-            panic!("{:?}", outcome.complete_endpoints);
-        };
-        assert!(crate::same_relay(named.as_str(), finished.as_str()));
-        let [record] = outcome.records.as_slice() else {
-            panic!("{} records", outcome.records.len());
-        };
-        assert_eq!(record.event.id, note.id.to_hex());
-        let [source] = record.endpoints.as_slice() else {
-            panic!("{:?}", record.endpoints);
-        };
-        assert!(crate::same_relay(source.as_str(), more.as_str()));
+        for end in [QueryRelayEnd::More, QueryRelayEnd::Auth] {
+            // Only the withholding relay holds the note, so it survives only if
+            // that relay's partial page is kept.
+            let (partial, partial_server) = spawn_query_relay(vec![note.clone()], end).await;
+            let (finished, finished_server) =
+                spawn_query_relay(Vec::new(), QueryRelayEnd::Eose).await;
+            let query = DirectoryEventQuery::new(1, vec![keys.public_key().to_hex()], 4);
+            let request =
+                DirectoryFetchRequest::new(vec![partial.clone(), finished.clone()], vec![query])
+                    .unwrap();
+            let outcome = timeout(
+                Duration::from_secs(20),
+                NostrSdkDirectoryRelayFetcher::standalone()
+                    .fetch_directory_events_with_completion(request),
+            )
+            .await
+            .expect("strict fetch completes")
+            .unwrap();
+            partial_server.abort();
+            finished_server.abort();
+            assert!(!outcome.complete);
+            let [named] = outcome.complete_endpoints.as_slice() else {
+                panic!("{:?}", outcome.complete_endpoints);
+            };
+            assert!(crate::same_relay(named.as_str(), finished.as_str()));
+            let [record] = outcome.records.as_slice() else {
+                panic!("{} records", outcome.records.len());
+            };
+            assert_eq!(record.event.id, note.id.to_hex());
+            let [source] = record.endpoints.as_slice() else {
+                panic!("{:?}", record.endpoints);
+            };
+            assert!(crate::same_relay(source.as_str(), partial.as_str()));
+        }
     }
 
     #[test]

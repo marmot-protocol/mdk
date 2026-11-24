@@ -57,11 +57,11 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   relay's reply keeps its own end (EOSE, CLOSED reason, cut, deadline), and a relay that requires NIP-42 is asked once
   more after the signer authenticates. Authentication still under way at the deadline is `TimedOut`, not a refusal;
   inspection watches authentication from before the dial, so a refusal on connect still decides a later close, and an
-  EOSE with NIP-67 `more` is `Incomplete` (not for the inbox probe). Each query's relays share one byte budget
+  EOSE with NIP-67 `more` or `auth` is `Incomplete` (not for the inbox probe). Each query's relays share one byte budget
   (`FiniteRequests::sharing`); directory and public reads set no item cap, since a relay's every EVENT frame would count,
   matching or not. Frames not yet read are bounded per relay request, not per query: a queue of the budget plus one
   frame, and the batch its collector is reading, so up to twice that. A public read past `max_events`, cut, or ending
-  on `more` is incomplete; a plain directory read cut by its byte budget or stopped at an unreadable frame fails, since
+  on `more` or `auth` is incomplete; a plain directory read cut by its byte budget or stopped at an unreadable frame fails, since
   it cannot say it is partial and a record past the cut would read as absent.
 - Recovery debt, retry selection and native input qualification belong to the app's recovery runner.
   Bridge the runner's fence plans and borrowed source guards; never fetch history of the plane's own or schedule quiet-period
