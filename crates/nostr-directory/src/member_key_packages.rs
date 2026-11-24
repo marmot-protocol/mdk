@@ -302,6 +302,10 @@ impl MemberKeyPackageReadCoverage {
     }
 }
 
+/// One member's selected packages, with the coverage of the read that
+/// selected them.
+type MemberSelection = (Vec<KeyPackage>, MemberKeyPackageReadCoverage);
+
 impl From<MemberKeyPackageResolutionStats> for MemberKeyPackagePrewarmSummary {
     fn from(stats: MemberKeyPackageResolutionStats) -> Self {
         Self {
@@ -589,8 +593,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
 
         let mut outcomes = (0..targets.len())
             .map(|_| None)
-            .collect::<Vec<Option<Result<Vec<KeyPackage>, DirectoryError>>>>();
-        let mut read_coverage = vec![None; targets.len()];
+            .collect::<Vec<Option<Result<MemberSelection, DirectoryError>>>>();
         // Even a valid, unexpired cached package may have been consumed on
         // another device. Every purpose, including composition prewarm, must
         // fetch current relay publications; only discovery routes are reused.
@@ -663,7 +666,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             &targets,
                             &key_package_unresolved,
                             &mut outcomes,
-                            &mut read_coverage,
                             purpose,
                             requirements,
                             cut_offs.map(|cut_offs| cut_offs.key_package_batches),
@@ -705,7 +707,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             let Some(result) = outcome.take() else {
                 continue;
             };
-            *outcome = Some(result.and_then(|packages| {
+            *outcome = Some(result.and_then(|(packages, coverage)| {
                 if packages.is_empty() {
                     return Err(DirectoryError::MissingKeyPackage {
                         account: target.account_id_hex.clone(),
@@ -733,7 +735,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .map_err(|_| {
                         DirectoryError::DirectoryLookupIncomplete(target.account_id_hex.clone())
                     })?;
-                Ok(packages)
+                Ok((packages, coverage))
             }));
         }
         match purpose {
@@ -782,7 +784,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let mut key_packages = Vec::with_capacity(unique_members);
         let mut member_outcomes = Vec::with_capacity(unique_members);
         let mut key_package_reads = MemberKeyPackageReadCoverage::default();
-        for ((target, outcome), coverage) in targets.into_iter().zip(outcomes).zip(read_coverage) {
+        for (target, outcome) in targets.into_iter().zip(outcomes) {
             let outcome = outcome.unwrap_or_else(|| {
                 Err(DirectoryError::MissingKeyPackage {
                     account: target.account_id_hex.clone(),
@@ -790,10 +792,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 })
             });
             let (status, selected_device_count) = match outcome {
-                Ok(packages) => {
+                Ok((packages, coverage)) => {
                     let device_count = packages.len() as u32;
                     key_packages.extend(packages);
-                    key_package_reads.add(coverage.unwrap_or_default());
+                    key_package_reads.add(coverage);
                     (MemberResolutionStatus::Selected, device_count)
                 }
                 Err(error) => {
@@ -1192,8 +1194,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         &self,
         targets: &[MemberTarget],
         unresolved: &[usize],
-        outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
-        read_coverage: &mut [Option<MemberKeyPackageReadCoverage>],
+        outcomes: &mut [Option<Result<MemberSelection, DirectoryError>>],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         batch_cut_off: Option<tokio::time::Instant>,
@@ -1319,12 +1320,14 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 || !multiple_authors)
                             && !key_package_read_page_full(account_id, &account_records) =>
                     {
-                        outcomes[index] = Some(self.accept_fetched_key_packages(
-                            purpose,
-                            selected,
-                            &targets[index].relay_lists,
-                        ));
-                        read_coverage[index] = Some(coverage);
+                        outcomes[index] = Some(
+                            self.accept_fetched_key_packages(
+                                purpose,
+                                selected,
+                                &targets[index].relay_lists,
+                            )
+                            .map(|packages| (packages, coverage)),
+                        );
                     }
                     // Bounded multi-author results can hide some of an
                     // account's slots or their deletion requests. Relays may
@@ -1384,17 +1387,14 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     let directory = directory.clone();
                     async move {
                         let queries = key_package_queries(vec![target.account_id_hex.clone()]);
-                        let mut coverage = None;
                         let result = async {
                             let fetched = directory
                                 .relay_plane
                                 .fetch_directory_events_with_completion(endpoints.clone(), queries)
                                 .await
                                 .map_err(DirectoryError::RelayDirectory)?;
-                            coverage = Some(MemberKeyPackageReadCoverage::of_read(
-                                endpoints.len(),
-                                &fetched,
-                            ));
+                            let coverage =
+                                MemberKeyPackageReadCoverage::of_read(endpoints.len(), &fetched);
                             let mut records = fetched.records;
                             // This supplementary lookup must not discard a
                             // valid package observed in this call's batch.
@@ -1433,18 +1433,19 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             // complete negative, while a non-empty one may
                             // still leave out a device (D12).
                             .into_value_or_missing(&target.account_id_hex)
+                            .map(|selected| (selected, coverage))
                         }
                         .await;
-                        (index, result, coverage)
+                        (index, result)
                     }
                 });
         let mut fallback_results =
             stream::iter(work).buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY);
-        while let Some((index, result, coverage)) = fallback_results.next().await {
-            outcomes[index] = Some(result.and_then(|selected| {
+        while let Some((index, result)) = fallback_results.next().await {
+            outcomes[index] = Some(result.and_then(|(selected, coverage)| {
                 self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)
+                    .map(|packages| (packages, coverage))
             }));
-            read_coverage[index] = coverage;
         }
         Ok(())
     }
