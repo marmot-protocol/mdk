@@ -67,6 +67,8 @@
   for. The README's direct-chat section states what accounts for one and how long the journal keeps it.
 - A member lookup that finds no KeyPackage reports `DirectoryLookupIncomplete`, not a missing KeyPackage, while a relay
   list tied with the member's named a usable outbox that no KeyPackage read covered.
+- A member lookup treats a relay that the member's relay lists name twice, or with and without a trailing root slash, as
+  one relay: it reads the relay once and counts it once toward a read's limit.
 
 ### Fixed
 

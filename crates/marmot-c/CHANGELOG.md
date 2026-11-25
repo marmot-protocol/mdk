@@ -39,6 +39,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   it.
 - A member with no KeyPackage is `MARMOT_MEMBER_RESOLUTION_STATUS_INCOMPLETE`, not missing, while a relay list tied with
   theirs named a usable outbox that no KeyPackage read covered.
+- A member lookup treats a relay that the member's relay lists name twice, or with and without a trailing root slash, as
+  one relay: it reads the relay once and counts it once toward a read's limit.
 - Group creation, invites and direct-chat starts always discover the members' current relay routes after
   `marmot_prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm
   no longer makes them skip discovery.

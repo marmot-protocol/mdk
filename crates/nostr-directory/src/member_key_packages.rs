@@ -914,25 +914,26 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         if primary.is_empty() {
             primary = defaults.to_vec();
         }
+        // A list can name one relay twice, spelled the same or with an
+        // optional root slash, and a tied list can repeat the listed relays.
+        // Each relay is read once and counts once toward the limit.
+        let mut named = BTreeSet::new();
+        let mut distinct = |endpoints: Vec<TransportEndpoint>| {
+            endpoints
+                .into_iter()
+                .filter(|endpoint| {
+                    RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| named.insert(relay))
+                })
+                .collect::<Vec<_>>()
+        };
+        let primary = distinct(primary);
+        let tied = distinct(safe(&target.tied_relays));
         let admit = |tied: Vec<TransportEndpoint>| {
             self.relay_plane.sanitize_relay_endpoints(
                 primary.iter().cloned().chain(tied).collect(),
                 "member KeyPackage route admission",
             )
         };
-        // A tied list can repeat the listed relays, spelled the same or with
-        // an optional root slash. Only the relays it adds count toward the
-        // limit.
-        let mut named = primary
-            .iter()
-            .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
-            .collect::<BTreeSet<_>>();
-        let tied = safe(&target.tied_relays)
-            .into_iter()
-            .filter(|endpoint| {
-                RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| named.insert(relay))
-            })
-            .collect::<Vec<_>>();
         match admit(tied.clone()) {
             Ok(routes) => Ok((routes, Vec::new())),
             Err(_) => admit(Vec::new()).map(|routes| (routes, tied)),
@@ -1212,9 +1213,13 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .filter(|index| !completed_discovery.contains(index))
             .collect::<HashSet<_>>();
 
-        // The safe outboxes a relay list names, less the directory relays a
-        // complete first hop already read.
+        // Relays are compared as relays here: a list may spell one with an
+        // optional root slash the read's routes lack, or name it twice.
+        let first_hop_relays = endpoint_identities(&endpoints);
+        // The safe outboxes a relay list names, each once, less the directory
+        // relays a complete first hop already read.
         let outboxes = |index: usize, relays: &[String]| {
+            let mut named = BTreeSet::new();
             let mut outboxes = self
                 .relay_plane
                 .retain_safe_discovered_endpoints(
@@ -1223,7 +1228,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 )
                 .into_iter()
                 .filter(|endpoint| {
-                    !completed_discovery.contains(&index) || !endpoints.contains(endpoint)
+                    RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| {
+                        (!completed_discovery.contains(&index)
+                            || !first_hop_relays.contains(&relay))
+                            && named.insert(relay)
+                    })
                 })
                 .collect::<Vec<_>>();
             outboxes.sort();
@@ -1243,7 +1252,10 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         }
         let read_outboxes = by_outboxes
             .iter()
-            .flat_map(|(read, indices)| indices.iter().map(move |index| (*index, read.clone())))
+            .flat_map(|(read, indices)| {
+                let read = endpoint_identities(read);
+                indices.iter().map(move |index| (*index, read.clone()))
+            })
             .collect::<HashMap<_, _>>();
         let attempted_outbox = by_outboxes
             .values()
@@ -1330,7 +1342,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         .all(|outbox| {
                             read_outboxes
                                 .get(index)
-                                .is_some_and(|read| read.contains(outbox))
+                                .zip(RelayUrl::parse(outbox.as_str()).ok())
+                                .is_some_and(|(read, outbox)| read.contains(&outbox))
                         })
             })
             .collect();
@@ -1631,6 +1644,14 @@ fn relay_identities(relays: &[String]) -> BTreeSet<RelayUrl> {
     relays
         .iter()
         .filter_map(|relay| RelayUrl::parse(relay).ok())
+        .collect()
+}
+
+/// The relays `endpoints` name.
+fn endpoint_identities(endpoints: &[TransportEndpoint]) -> BTreeSet<RelayUrl> {
+    endpoints
+        .iter()
+        .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
         .collect()
 }
 

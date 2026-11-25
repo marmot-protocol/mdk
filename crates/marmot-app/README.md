@@ -360,16 +360,17 @@ its `d` slot. If it finds one, that KeyPackage is dropped and the peer's remaini
 of the three did not complete, the start returns `AppError::DirectoryLookupIncomplete`. Either refusal creates no chat.
 The lookup is bounded: discovery reads the peer's relay lists on the configured directory relays and on every outbox the
 newest list names, and KeyPackage reads cover those outboxes, a tied list's outboxes when one read admits them, and at
-most eight more configured directory relays. A compatible KeyPackage published only elsewhere is not seen. A start that
-finds no usable KeyPackage returns `AppError::DirectoryLookupIncomplete` while this device's KeyPackage journal keeps a
-publication of the peer in a `d` slot that the lookup did not account for: its reads returned neither that publication
-nor a newer one in the same slot (not counting one dated past the clock-skew allowance), the journal knows no newer one
-there either, and no deletion request covers it. The journal keeps a publication for 30 days and five minutes from its
-creation and holds a bounded number of publications and deletion requests. A publication it has dropped no longer blocks
-a verdict, and a deletion request it has dropped no longer accounts for one. A relay list published in the same second
-as the peer's and naming other relays never supports an incompatibility. It turns a missing KeyPackage into the same
-result only while it named a relay the lookup accepts as an outbox that no KeyPackage read covered, which can happen
-once the two lists name more outboxes than one read admits.
+most eight more configured directory relays. A relay that a list names twice, or with and without a trailing root slash,
+is one relay: it is read once and counts once toward a read's limit. A compatible KeyPackage published only elsewhere is
+not seen. A start that finds no usable KeyPackage returns `AppError::DirectoryLookupIncomplete` while this device's
+KeyPackage journal keeps a publication of the peer in a `d` slot that the lookup did not account for: its reads returned
+neither that publication nor a newer one in the same slot (not counting one dated past the clock-skew allowance), the
+journal knows no newer one there either, and no deletion request covers it. The journal keeps a publication for 30 days
+and five minutes from its creation and holds a bounded number of publications and deletion requests. A publication it
+has dropped no longer blocks a verdict, and a deletion request it has dropped no longer accounts for one. A relay list
+published in the same second as the peer's and naming other relays never supports an incompatibility. It turns a missing
+KeyPackage into the same result only while it named a relay the lookup accepts as an outbox that no KeyPackage read
+covered, which can happen once the two lists name more outboxes than one read admits.
 `start_direct_conversation` is the same call with default options, which leave disappearing messages disabled.
 
 There is no immutable cross-client DM provenance, so MDK cannot prove legacy groups eligible for automatic admin repair.

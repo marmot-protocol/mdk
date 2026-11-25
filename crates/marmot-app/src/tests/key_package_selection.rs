@@ -2777,6 +2777,206 @@ async fn a_tied_list_repeating_a_listed_relay_does_not_use_up_the_route_limit() 
     app.close_storage().unwrap();
 }
 
+/// A recipient's list can name one relay twice, with and without a root
+/// slash. It is one route, so fifteen listed relays and one a tied list adds
+/// fit one read, and the package only the tied relay holds is found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_listed_twice_counts_once_toward_the_route_limit() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let directory = app.directory();
+    let resolve = || {
+        directory.resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+    };
+    let more = (0..14)
+        .map(|relay| format!("wss://listed-{relay}.example"))
+        .collect::<Vec<_>>();
+    let listed = ["wss://shared.example", "wss://shared.example/"]
+        .into_iter()
+        .chain(more.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    advertise_updated_direct_outbox(&fetcher, &bob, &listed);
+    // The first lookup remembers that list.
+    let first = resolve().await;
+    assert!(
+        matches!(first, Err(DirectoryError::KeyPackageRequirements(_))),
+        "{:?}",
+        first.err()
+    );
+    tie_directory_relay_list(&fetcher, &bob, &["wss://tied.example"]);
+    let compatible = {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let compatible = by_endpoint[UPDATED_DIRECT_OUTBOX]
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap()
+            .clone();
+        for relay in ["wss://shared.example", "wss://directory.example"] {
+            by_endpoint
+                .get_mut(relay)
+                .unwrap()
+                .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        }
+        by_endpoint.insert("wss://tied.example".into(), vec![compatible.clone()]);
+        compatible.id
+    };
+    let resolved = resolve().await.unwrap();
+    assert_eq!(
+        resolved
+            .key_packages
+            .iter()
+            .map(|package| hex::encode(package.source.as_ref().unwrap().event_id.as_slice()))
+            .collect::<Vec<_>>(),
+        vec![compatible]
+    );
+    app.close_storage().unwrap();
+}
+
+/// A list naming as many relays as one read admits can also name one of them
+/// twice, with and without a root slash. Every relay it names is still read,
+/// in the relay list hop and for KeyPackages, so the incompatibility stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_route_list_naming_one_relay_twice_is_still_read() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let more = (0..15)
+        .map(|relay| format!("wss://listed-{relay}.example"))
+        .collect::<Vec<_>>();
+    let listed = ["wss://shared.example", "wss://shared.example/"]
+        .into_iter()
+        .chain(more.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    advertise_updated_direct_outbox(&fetcher, &bob, &listed);
+    let result = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DirectoryError::KeyPackageRequirements(_))),
+        "{:?}",
+        result.err()
+    );
+    app.close_storage().unwrap();
+}
+
+/// Serves `relay`'s events at its spelling with a root slash too, and has
+/// `source` serve a list for `bob`, one second newer, naming only that
+/// spelling.
+fn relist_with_a_root_slash(
+    fetcher: &MemberResolutionDirectoryFetcher,
+    bob: &AccountSummary,
+    source: &str,
+    relay: &str,
+) {
+    let slashed = format!("{relay}/");
+    let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+    let listed = by_endpoint
+        .get_mut(source)
+        .unwrap()
+        .iter_mut()
+        .find(|event| event.kind == KIND_NIP65_RELAY_LIST)
+        .unwrap();
+    *listed = NostrTransportEvent::new_unsigned_at(
+        bob.account_id_hex.clone(),
+        KIND_NIP65_RELAY_LIST,
+        vec![vec!["r".into(), slashed.clone(), "write".into()]],
+        String::new(),
+        listed.created_at + 1,
+    );
+    let served = by_endpoint[relay].clone();
+    by_endpoint.insert(slashed, served);
+}
+
+/// Whether some read asked `endpoint` for relay lists.
+fn relay_lists_were_read_from(fetcher: &MemberResolutionDirectoryFetcher, endpoint: &str) -> bool {
+    fetcher.requests.lock().unwrap().iter().any(|request| {
+        request
+            .queries
+            .iter()
+            .any(|query| query.kind == KIND_NIP65_RELAY_LIST)
+            && request.endpoints.iter().any(|read| read.0 == endpoint)
+    })
+}
+
+/// The outbox a recipient's list names can serve a newer list that names the
+/// same relay with a root slash. The lookup read that relay, so discovery is
+/// complete and the incompatibility stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_outbox_relisted_with_a_root_slash_was_already_read() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    relist_with_a_root_slash(
+        &fetcher,
+        &bob,
+        "wss://shared.example",
+        "wss://shared.example",
+    );
+    let result = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DirectoryError::KeyPackageRequirements(_))),
+        "{:?}",
+        result.err()
+    );
+    assert!(relay_lists_were_read_from(&fetcher, "wss://shared.example"));
+    app.close_storage().unwrap();
+}
+
+/// A list can name a directory relay as the outbox, spelled with a root
+/// slash. A complete first hop already read that relay, so no second relay
+/// list read goes to it under the other spelling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directory_relay_listed_with_a_root_slash_is_not_read_again() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    relist_with_a_root_slash(
+        &fetcher,
+        &bob,
+        "wss://directory.example",
+        "wss://directory.example",
+    );
+    let result = app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DirectoryError::KeyPackageRequirements(_))),
+        "{:?}",
+        result.err()
+    );
+    assert!(relay_lists_were_read_from(
+        &fetcher,
+        "wss://directory.example"
+    ));
+    assert!(!relay_lists_were_read_from(
+        &fetcher,
+        "wss://directory.example/"
+    ));
+    app.close_storage().unwrap();
+}
+
 /// A batch reply that stops early can still return the recipient's relay list
 /// or package. When the single-author retry and the later reads then finish
 /// without it, no completed read served it, so it supports no incompatibility
