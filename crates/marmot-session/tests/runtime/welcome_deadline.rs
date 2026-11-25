@@ -1,7 +1,9 @@
 // An invite's Welcome has a delivery deadline, and nothing sends it once
 // that passes (mdk#3589).
 
-use cgka_engine::WELCOME_DELIVERY_WINDOW_SECS;
+/// How long an invite's Welcome stays deliverable when its KeyPackage lasts
+/// longer, stated here rather than read from the engine.
+const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
 use cgka_traits::message::StoredMessagePayload;
 
 /// The owed-invite fixture's account opened again on its database in `dir`,
@@ -113,7 +115,7 @@ async fn an_invite_welcome_no_relay_acknowledges_ends_at_its_deadline() {
     assert_eq!(tried, 2, "retried once its backoff passed");
     runtime.take_welcome_delivery_changes();
 
-    wall.set(staged_before + WELCOME_DELIVERY_WINDOW_SECS);
+    wall.set(staged_before + SEVEN_DAYS);
     runtime.run_due_maintenance().await.unwrap();
     runtime.run_due_maintenance().await.unwrap();
     assert_eq!(
@@ -127,7 +129,7 @@ async fn an_invite_welcome_no_relay_acknowledges_ends_at_its_deadline() {
         .unwrap()
         .expect("an invite's Welcome has a delivery deadline");
     assert!(
-        (staged_after..=staged_before).contains(&(deadline.0 - WELCOME_DELIVERY_WINDOW_SECS)),
+        (staged_after..=staged_before).contains(&(deadline.0 - SEVEN_DAYS)),
         "the window from its staging"
     );
     assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
@@ -270,7 +272,7 @@ async fn a_welcome_owed_before_the_upgrade_ends_on_the_first_run_past_the_window
         &group_id,
         &welcome,
         adapter.clone(),
-        welcome.timestamp.0 + WELCOME_DELIVERY_WINDOW_SECS,
+        welcome.timestamp.0 + SEVEN_DAYS,
         &dir.path().join("upgraded-audit-v5.jsonl"),
     );
     assert_eq!(
@@ -279,7 +281,7 @@ async fn a_welcome_owed_before_the_upgrade_ends_on_the_first_run_past_the_window
             .sent_welcome_deliver_until(&welcome.id)
             .unwrap(),
         Some(Timestamp(
-            welcome.timestamp.0 + WELCOME_DELIVERY_WINDOW_SECS
+            welcome.timestamp.0 + SEVEN_DAYS
         ))
     );
     ask_every_publisher(&mut upgraded, &welcome).await;

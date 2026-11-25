@@ -5,8 +5,8 @@
 //! withdrawn. Every publish reads that row first (`welcome_hold`), so a
 //! withdrawn Welcome never goes out again, a staged one waits for its
 //! commit, and no Welcome goes out once its delivery deadline passes
-//! (a device link's at the end of the new device's wait, any other within
-//! `cgka_engine::WELCOME_DELIVERY_WINDOW_SECS`, mdk#3589). Per-endpoint
+//! (a device link's at the end of the new device's wait, any other seven
+//! days after it was staged, mdk#3589). Per-endpoint
 //! attempts and backoff live on the Welcome's `DurableTransportFanout`,
 //! which maintenance retries; only `redeliver_welcome` skips that backoff.
 

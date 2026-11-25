@@ -17,7 +17,7 @@ use cgka_traits::transport::Timestamp;
 /// to 7 days, so a Welcome is usually useless about 8 days after it was
 /// made, well inside the KeyPackage's 30-day lifetime. The number is a
 /// product choice and may change.
-pub const WELCOME_DELIVERY_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+pub(crate) const WELCOME_DELIVERY_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// The delivery deadline of an invite's or a founding create's Welcome
 /// staged at `staged_at` for a KeyPackage valid until

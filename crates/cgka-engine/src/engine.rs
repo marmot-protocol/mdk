@@ -4828,10 +4828,9 @@ impl<S: StorageProvider> Engine<S> {
 
     /// When the retained outbound Welcome `id`, staged or owed, stops being
     /// deliverable: a device link's at the end of the new device's wait
-    /// (mdk#2628 D40), any other within
-    /// [`crate::WELCOME_DELIVERY_WINDOW_SECS`] of its staging, and one stored
-    /// before Welcomes kept a deadline within that window of its transport
-    /// timestamp (mdk#3589). A missing row, or any other row, has none. A
+    /// (mdk#2628 D40), any other seven days after its staging or at its
+    /// KeyPackage's end if sooner, and one stored before Welcomes kept a
+    /// deadline seven days after its transport timestamp (mdk#3589). A missing row, or any other row, has none. A
     /// `Sent` row that cannot be read has none either: the publish check
     /// reads it as staged first ([`Self::sent_welcome_awaits_commit`]).
     pub fn sent_welcome_deliver_until(

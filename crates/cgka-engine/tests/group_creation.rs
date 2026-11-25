@@ -5481,15 +5481,16 @@ async fn founding_and_invite_welcomes(
     [founding[0].id.clone(), invited[0].id.clone()]
 }
 
-/// An invite's and a founding create's Welcome stay deliverable for
-/// `WELCOME_DELIVERY_WINDOW_SECS` from their staging, or until the
+/// An invite's and a founding create's Welcome stay deliverable for seven
+/// days from their staging, or until the
 /// KeyPackage they answer ends if that is sooner, and settle as expired from
 /// then on (mdk#3589). A device link's Welcome keeps the deadline its link
 /// gives it (`a_links_welcome_keeps_its_delivery_deadline`,
 /// `a_founding_welcome_keeps_its_delivery_deadline`).
 #[tokio::test]
 async fn invite_and_founding_welcomes_are_deliverable_for_the_window_or_their_key_packages_life() {
-    use cgka_engine::WELCOME_DELIVERY_WINDOW_SECS as WINDOW;
+    // Stated here, not read from the engine, so a changed policy fails it.
+    const WINDOW: u64 = 7 * 24 * 60 * 60;
     use cgka_engine::engine::{OutboundWelcomeStatus, WelcomeSettlement};
     let unix_now = || {
         std::time::SystemTime::now()

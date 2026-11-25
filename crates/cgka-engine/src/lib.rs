@@ -106,7 +106,6 @@ pub use engine_metrics::{
 pub use feature_registry::FeatureRegistry;
 pub use key_package::{KeyPackageMetadata, KeyPackageRetirementReport, key_package_metadata};
 pub use publish::RollbackPass;
-pub use welcome_deadline::WELCOME_DELIVERY_WINDOW_SECS;
 pub use wire_format::{
     DEFAULT_MAX_PAST_EPOCHS, PURE_PLAINTEXT_WIRE_FORMAT_POLICY, WIRE_FORMAT_POLICY_REVIEW_REQUIRED,
     application_message_len, default_join_config, join_config,
