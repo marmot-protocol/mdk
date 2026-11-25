@@ -1458,7 +1458,7 @@ once by `InviteDeliveryChanged`; it leaves
 possibly only for now, not that the refusal was permanent. A relay that stores it before the deadline still makes it
 `RelayAccepted`, and so does an attempt started before the deadline and acknowledged after it. MDK records the end
 durably the first time it sees the deadline passed, so a device clock set back afterwards does not reopen it. A Welcome
-whose deadline passes while the app is closed is announced on the next start. The `TooLarge` and
+whose deadline passes while the app is closed is announced on the next start, while its invite is still listed. The `TooLarge` and
 `KeyPackageRetired` problems are not produced yet. At startup MDK asks again only the relays it never asked and those
 whose retry backoff (30 seconds, doubling to an hour) has passed. The account
 database adds one table (schema 0225); older native builds cannot reopen it. There is no wire change.
