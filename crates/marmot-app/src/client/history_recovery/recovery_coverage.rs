@@ -1198,14 +1198,21 @@ impl AppClient {
                     .any(|now| now.key == fact.key && now.count == fact.count && !now.ended)
             })
             .collect::<Vec<_>>();
+        // One read for every route: a turn otherwise looks once per route
+        // and relay.
+        let released = match app
+            .recovery_coverage_newest_released(facts.iter().flat_map(|fact| &fact.routes))
+        {
+            Ok(released) => released,
+            Err(error) => return log_failure("record_native_coverage", &error.into()),
+        };
         live.tails = live.tails(&facts, |route, since| {
-            match app.recovery_coverage_newest_released(route, since) {
-                Ok(newest) => Some(newest.map_or(since, |second| second.saturating_add(1))),
-                Err(error) => {
-                    log_failure("record_native_coverage", &error.into());
-                    None
-                }
-            }
+            Some(
+                released
+                    .get(route)
+                    .filter(|second| **second >= since)
+                    .map_or(since, |second| second.saturating_add(1)),
+            )
         });
     }
 

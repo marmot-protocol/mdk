@@ -575,6 +575,57 @@ fn new_loss_over_a_park_earns_one_probe() {
     assert!(app.recovery_unit_spans(&route, RELAY).unwrap().is_empty());
 }
 
+/// One look at the ledger reads every unit's debt as one read per unit
+/// does, through each route's goal, parked and probing spans, and a limit
+/// below the goal, with each unit's state as its own read finds it.
+#[test]
+fn one_look_reads_each_units_debt_as_its_own_read_does() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (probing, parked, no_goal, ahead) = (group(1), group(2), group(3), group(4));
+    for route in [&probing, &parked] {
+        owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+        break_unit(&app, route, NOW);
+    }
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&probing),
+        NOW - 700,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
+    owing(&app, &ahead, NOW - 100, (NOW - 100, NOW - 100));
+    let units = [
+        (&probing, RELAY, NOW),
+        (&probing, OTHER, NOW),
+        (&parked, RELAY, NOW),
+        (&no_goal, RELAY, NOW),
+        (&ahead, RELAY, NOW - 200),
+    ];
+    let read = app.recovery_unit_debts(&units).unwrap();
+    assert_eq!(
+        read.iter()
+            .map(|(debt, _)| debt.clone())
+            .collect::<Vec<_>>(),
+        units
+            .iter()
+            .map(|(route, relay, until)| app.recovery_unit_debt(route, relay, *until).unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        read[0].0,
+        vec![range(NOW - 700, NOW)],
+        "a probe owes its park"
+    );
+    assert!(read[2].0.is_empty(), "a park owes nothing");
+    assert!(
+        read.iter().map(|(_, unit)| unit.clone()).eq(units
+            .iter()
+            .map(|(route, relay, _)| app.recovery_unit(route, relay).unwrap())),
+        "each unit's state as its own read finds it"
+    );
+    assert!(read[0].1.as_ref().is_some_and(|unit| unit.probe));
+}
+
 /// Loss is per route (mdk#2660 row 9): importing a loss on one route
 /// un-covers that route and earns its parked unit a probe, while another
 /// route's coverage, goal, unit, spans and debt, and the account's budget,

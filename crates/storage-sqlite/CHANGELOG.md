@@ -4,6 +4,8 @@
 
 ### Breaking changes
 
+- `SqliteAppStorage::recovery_coverage_newest_released` takes the routes to read and returns each one's newest
+  released second, from one look at the ledger. Callers that passed a `since` keep only a second at or after it.
 - Migration 0219 adds `message_timeline.timeline_order_seq`, rebuilds the canonical order index with it before the
   message id, and drops kind-1202 timeline rows. `TimelineMessageRecord` gains `agent_item` and
   `timeline_order_seq`, and `TimelineUpdateTrigger::AgentActivity`/`AgentOperation` become `AgentItem`.
@@ -18,6 +20,8 @@
 
 ### Added
 
+- `recovery_unit_debts` reads many units' debts, each with its unit state, and `staged_recovery_first_seconds`
+  reads the oldest staged second in many ranges, each under one connection lock.
 - `renew_roster_tag_keys` updates `last_seen_at` for a slot's unexpired roster tag keys in one statement and leaves
   `seen_seq` alone (mdk#3679).
 - Kind-1009 edits apply to kind-1201 agent items: the highest `v` replaces the row's content and tags, an older

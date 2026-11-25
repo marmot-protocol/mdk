@@ -26,6 +26,7 @@ use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt, TransportReconciliationRoute};
 use cgka_traits::storage::StorageResult;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::BTreeMap;
 
 const ACTIVE: i64 = 0;
 const BROKEN: i64 = 1;
@@ -600,24 +601,40 @@ fn unit_debt_tx(
     relay: &str,
     until_seconds: u64,
 ) -> StorageResult<Vec<RecoveryCoverageRange>> {
-    let (kind, id) = route.storage_key();
-    let Some(goal) = conn
-        .query_row_cached(
-            "SELECT since_seconds FROM account_recovery_coverage_goals
-             WHERE route_kind = ?1 AND route_id = ?2",
-            params![kind, id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .storage()?
-    else {
+    let Some(goal) = route_goal_tx(conn, route)?.filter(|goal| *goal <= until_seconds) else {
         return Ok(Vec::new());
     };
-    let goal = i64_to_u64(goal)?;
-    if goal > until_seconds {
-        return Ok(Vec::new());
-    }
     let probing = unit_tx(conn, route, relay)?.is_some_and(|unit| unit.probe);
+    debt_from_goal_tx(conn, route, relay, goal, until_seconds, probing)
+}
+
+/// The route's goal, if it has one.
+fn route_goal_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+) -> StorageResult<Option<u64>> {
+    let (kind, id) = route.storage_key();
+    conn.query_row_cached(
+        "SELECT since_seconds FROM account_recovery_coverage_goals
+         WHERE route_kind = ?1 AND route_id = ?2",
+        params![kind, id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .storage()?
+    .map(i64_to_u64)
+    .transpose()
+}
+
+/// [`unit_debt_tx`] from `goal`, at or before `until_seconds`.
+fn debt_from_goal_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    relay: &str,
+    goal: u64,
+    until_seconds: u64,
+    probing: bool,
+) -> StorageResult<Vec<RecoveryCoverageRange>> {
     let mut taken = relay_covered_tx(conn, route, relay)?;
     taken.extend(
         spans_tx(conn, route, relay, RETIRED_SPAN)?
@@ -2374,6 +2391,43 @@ impl SqliteAppStorage {
         until_seconds: u64,
     ) -> StorageResult<Vec<RecoveryCoverageRange>> {
         unit_debt_tx(&*self.lock()?, route, relay, until_seconds)
+    }
+
+    /// Each `(route, relay, until_seconds)` unit's debt, as
+    /// [`Self::recovery_unit_debt`] reads it, with its state (`None` when the
+    /// runner has not touched it), in order and from one look at the ledger.
+    pub fn recovery_unit_debts(
+        &self,
+        units: &[(&TransportReconciliationRoute, &str, u64)],
+    ) -> StorageResult<Vec<(Vec<RecoveryCoverageRange>, Option<RecoveryUnit>)>> {
+        let conn = self.lock()?;
+        let mut goals = BTreeMap::new();
+        units
+            .iter()
+            .map(|(route, relay, until_seconds)| {
+                let goal = match goals.get(*route) {
+                    Some(goal) => *goal,
+                    None => {
+                        let goal = route_goal_tx(&conn, route)?;
+                        goals.insert(*route, goal);
+                        goal
+                    }
+                };
+                let unit = unit_tx(&conn, route, relay)?;
+                let debt = match goal.filter(|goal| goal <= until_seconds) {
+                    Some(goal) => debt_from_goal_tx(
+                        &conn,
+                        route,
+                        relay,
+                        goal,
+                        *until_seconds,
+                        unit.as_ref().is_some_and(|unit| unit.probe),
+                    )?,
+                    None => Vec::new(),
+                };
+                Ok((debt, unit))
+            })
+            .collect()
     }
 
     /// Where a sweep of `[since, until]` on this relay resumes: the first

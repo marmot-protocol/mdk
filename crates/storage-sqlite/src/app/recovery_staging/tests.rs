@@ -586,4 +586,37 @@ fn staged_items_are_the_routes_from_every_relay_in_range() {
             .collect::<Vec<_>>(),
         vec![(2, 10), (3, 30), (1, 50)]
     );
+    // An id that is not 32 bytes is no Nostr event: neither read lists it.
+    app.lock()
+        .unwrap()
+        .execute_cached(
+            "UPDATE account_recovery_staged SET event_id = X'02' WHERE event_id = ?1",
+            [vec![2u8; 32]],
+        )
+        .unwrap();
+    assert_eq!(
+        app.staged_recovery_first_seconds(&[(&route, 10, 50)])
+            .unwrap(),
+        vec![Some(30)]
+    );
+    let other = group(2);
+    let ranges = [
+        (&route, 10, 50),
+        (&route, 31, 199),
+        (&route, 201, 300),
+        (&other, 0, 100),
+    ];
+    assert_eq!(
+        app.staged_recovery_first_seconds(&ranges).unwrap(),
+        ranges
+            .iter()
+            .map(|(route, since, until)| {
+                app.staged_recovery_items(route, *since, *until)
+                    .unwrap()
+                    .first()
+                    .map(|item| item.created_at)
+            })
+            .collect::<Vec<_>>(),
+        "one look finds each range's oldest as its own listing does"
+    );
 }

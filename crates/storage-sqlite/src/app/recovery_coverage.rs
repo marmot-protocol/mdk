@@ -36,7 +36,7 @@ use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt, TransportReconciliationRoute};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// How long the un-cover log keeps a range. A coverage write whose fetch
 /// started before the oldest pruned range records nothing, so this outlasts
@@ -1192,24 +1192,34 @@ impl SqliteAppStorage {
         Ok(covered.unwrap_or_default())
     }
 
-    /// The newest second at or after `since_seconds` on the route that is
-    /// released for replay and still held out of live boundaries.
-    pub fn recovery_coverage_newest_released(
+    /// Each of `routes`' newest second released for replay and still held
+    /// out of live boundaries, from one look at the ledger. A route with none
+    /// is left out.
+    pub fn recovery_coverage_newest_released<'r>(
         &self,
-        route: &TransportReconciliationRoute,
-        since_seconds: u64,
-    ) -> StorageResult<Option<u64>> {
-        let (kind, id) = route.storage_key();
-        let newest: Option<i64> = self
-            .lock()?
-            .query_row_cached(
-                "SELECT MAX(second) FROM account_recovery_coverage_released
-                 WHERE route_kind = ?1 AND route_id = ?2 AND second >= ?3",
-                params![kind, id, integer(since_seconds)?],
-                |row| row.get(0),
-            )
-            .storage()?;
-        newest.map(i64_to_u64).transpose()
+        routes: impl IntoIterator<Item = &'r TransportReconciliationRoute>,
+    ) -> StorageResult<BTreeMap<TransportReconciliationRoute, u64>> {
+        let conn = self.lock()?;
+        let mut read = BTreeSet::new();
+        let mut newest = BTreeMap::new();
+        for route in routes {
+            if !read.insert(route) {
+                continue;
+            }
+            let (kind, id) = route.storage_key();
+            let second: Option<i64> = conn
+                .query_row_cached(
+                    "SELECT MAX(second) FROM account_recovery_coverage_released
+                     WHERE route_kind = ?1 AND route_id = ?2",
+                    params![kind, id],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            if let Some(second) = second {
+                newest.insert(route.clone(), i64_to_u64(second)?);
+            }
+        }
+        Ok(newest)
     }
 
     /// Whether every one of `relays` covers `[since, until]` on the route.
@@ -2411,20 +2421,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            app.recovery_coverage_newest_released(&route, since)
-                .unwrap(),
-            Some(sent)
-        );
-        assert_eq!(
-            app.recovery_coverage_newest_released(&route, sent + 1)
-                .unwrap(),
-            None
+            app.recovery_coverage_newest_released([&route]).unwrap(),
+            BTreeMap::from([(route.clone(), sent)])
         );
         app.prune_recovery_coverage(sent + 1, &[]).unwrap();
-        assert_eq!(
-            app.recovery_coverage_newest_released(&route, since)
-                .unwrap(),
-            None
+        assert!(
+            app.recovery_coverage_newest_released([&route])
+                .unwrap()
+                .is_empty()
         );
         record(&app, &route, RELAY_A, sent - 10, now, live, 5);
         assert_eq!(
