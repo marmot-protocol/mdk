@@ -1720,6 +1720,8 @@ async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
         authored_event_created_at: None,
         authored_signed_event: None,
         publication_targets: Vec::new(),
+        setup_publication: false,
+        fallback_publication: None,
         refresh_at: None,
         upgrade_rotation_recorded: false,
         generation_revision: 0,
@@ -1727,6 +1729,7 @@ async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
         last_consumed_at: None,
         retained_private_material: Vec::new(),
         pending_replacement: None,
+        pending_setup_publication: false,
         unusable_artifact_replaced_by: None,
         slot_withdrawn_at: None,
     };

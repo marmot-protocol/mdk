@@ -1899,6 +1899,7 @@ mod tests {
             not_after: published.current_not_after.unwrap(),
             refresh_at: published.refresh_at.unwrap(),
             signed_event: Some(artifact),
+            fallback_publication_started: false,
             targets: published
                 .publication_targets
                 .into_iter()

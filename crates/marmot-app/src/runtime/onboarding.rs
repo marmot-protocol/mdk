@@ -230,7 +230,7 @@ enum OnboardingCancelOutcome {
 /// Numeric revisions are ordered only within an epoch. Recovery creates a
 /// random epoch, so unknown/exhausted historical counters never get reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OnboardingAttempt {
+pub(crate) struct OnboardingAttempt {
     revision: u64,
     epoch: Option<[u8; 32]>,
 }
@@ -849,6 +849,7 @@ impl OnboardingCheckpoint {
             && findings.iter().any(|finding| {
                 (finding.context == OnboardingFindingContext::DeclaredRoute
                     && finding.issue == OnboardingIssue::NoUsableRoute)
+                    || key_package_discovery_finding(finding)
                     || (finding.context == OnboardingFindingContext::RecordDiscovery
                         && finding.issue == OnboardingIssue::DiscoveryIncomplete
                         && self.records[step.index()].is_none())
@@ -1175,7 +1176,10 @@ fn check_inconclusive(findings: &[OnboardingFinding]) -> bool {
             finding.outcome != OnboardingCheckOutcome::Success
                 && finding.issue != OnboardingIssue::Missing
         }
-        OnboardingFindingContext::DeclaredRoute => finding.issue == OnboardingIssue::NoUsableRoute,
+        OnboardingFindingContext::DeclaredRoute => {
+            finding.issue == OnboardingIssue::NoUsableRoute
+                && finding.purpose != OnboardingCheckPurpose::EventPublication
+        }
         _ => false,
     })
 }
@@ -1288,6 +1292,26 @@ fn decode_onboarding_checkpoint(
             .retain(|action| *action != OnboardingAction::UseRecommendedRelays);
     }
     Ok(checkpoint)
+}
+
+pub(crate) fn initial_key_package_onboarding_attempt(
+    app: &MarmotApp,
+    account_ref: &str,
+) -> Result<Option<OnboardingAttempt>, AppError> {
+    let records = SetupRecords::new(app);
+    let Some(checkpoint) = records.onboarding_checkpoint(account_ref)? else {
+        return Ok(None);
+    };
+    if checkpoint.snapshot.ready {
+        return Ok(None);
+    }
+    if !matches!(
+        checkpoint.snapshot.steps[OnboardingStep::KeyPackage.index()].status,
+        OnboardingStatus::Checking | OnboardingStatus::WaitingForSigner
+    ) {
+        return Err(onboarding_error());
+    }
+    Ok(Some(checkpoint.attempt()))
 }
 
 impl<'a> SetupRecords<'a> {
@@ -2269,7 +2293,7 @@ impl AccountSetup<'_> {
                             if self.require_live_onboarding_attempt(c).is_err() {
                                 return Err(onboarding_error());
                             }
-                            set_operation_error(c, step, &error);
+                            set_initial_key_package_error(c, &error);
                         }
                     }
                 }
@@ -2347,6 +2371,26 @@ impl AccountSetup<'_> {
             self.run_onboarding_locked(&mut c).await?;
         } else {
             c.snapshot.proposal = None;
+            let step = if matches!(step, OnboardingStep::Relays | OnboardingStep::KeyPackage)
+                && c.snapshot.steps[OnboardingStep::Relays.index()]
+                    .findings
+                    .iter()
+                    .any(key_package_route_finding)
+            {
+                let relays = &c.snapshot.steps[OnboardingStep::Relays.index()];
+                let checked_at = relays.checked_at;
+                let findings = relays
+                    .findings
+                    .iter()
+                    .filter(|finding| !key_package_route_finding(finding))
+                    .cloned()
+                    .collect();
+                c.set(OnboardingStep::Relays, OnboardingStatus::Passed, findings);
+                c.snapshot.steps[OnboardingStep::Relays.index()].checked_at = checked_at;
+                OnboardingStep::KeyPackage
+            } else {
+                step
+            };
             // Rechecking earlier prerequisites invalidates publication readiness.
             // Only explicitly retrying a skipped step revokes that skip.
             if c.snapshot.steps[step.index()].status == OnboardingStatus::Skipped {
@@ -2430,6 +2474,94 @@ impl AccountSetup<'_> {
         self.run_onboarding_locked(&mut c).await?;
         Ok(c.snapshot)
     }
+}
+
+fn key_package_discovery_finding(finding: &OnboardingFinding) -> bool {
+    finding.context == OnboardingFindingContext::DeclaredRoute
+        && finding.purpose == OnboardingCheckPurpose::DirectoryQuery
+        && finding.issue == OnboardingIssue::DiscoveryIncomplete
+}
+
+fn key_package_route_finding(finding: &OnboardingFinding) -> bool {
+    (finding.purpose == OnboardingCheckPurpose::EventPublication
+        && matches!(
+            finding.context,
+            OnboardingFindingContext::DeclaredRoute | OnboardingFindingContext::Unknown
+        ))
+        || key_package_discovery_finding(finding)
+}
+
+fn set_initial_key_package_error(c: &mut OnboardingCheckpoint, error: &AppError) {
+    use cgka_traits::{
+        TransportEndpointFailureKind as Failure, TransportEndpointRejectionCategory as Rejection,
+    };
+
+    let relays = &c.snapshot.steps[OnboardingStep::Relays.index()];
+    let checked_at = relays.checked_at;
+    let mut findings = relays.findings.clone();
+    if matches!(error, AppError::DirectoryLookupIncomplete(_)) {
+        let lookup = finding(OnboardingIssue::DiscoveryIncomplete).in_context(
+            OnboardingFindingContext::DeclaredRoute,
+            OnboardingCheckPurpose::DirectoryQuery,
+        );
+        c.set(
+            OnboardingStep::KeyPackage,
+            OnboardingStatus::RetryableFailure,
+            vec![lookup.clone()],
+        );
+        findings.push(lookup);
+    } else {
+        set_operation_error(c, OnboardingStep::KeyPackage, error);
+        let AppError::Account(marmot_session::AccountError::KeyPackage(error)) = error else {
+            return;
+        };
+        if error.endpoint_failures.is_empty() {
+            return;
+        }
+        let route_finding = |issue| {
+            finding(issue).in_context(
+                OnboardingFindingContext::DeclaredRoute,
+                OnboardingCheckPurpose::EventPublication,
+            )
+        };
+        findings.push(route_finding(OnboardingIssue::NoUsableRoute));
+        let capabilities = c.records[OnboardingStep::Relays.index()]
+            .as_ref()
+            .map(|event| declared_capabilities(event, OnboardingStep::Relays))
+            .unwrap_or_default();
+        for failure in &error.endpoint_failures {
+            let issue = match (failure.kind, failure.rejection_category) {
+                (_, Some(Rejection::AuthRequired)) => OnboardingIssue::AuthenticationRequired,
+                (_, Some(Rejection::Restricted | Rejection::Blocked)) => {
+                    OnboardingIssue::AccessRestricted
+                }
+                (Failure::PossiblyExposed, None) => OnboardingIssue::TimedOut,
+                (Failure::RetryableUnavailable, None) if failure.pre_send => {
+                    OnboardingIssue::Unreachable
+                }
+                _ => OnboardingIssue::PublicationFailed,
+            };
+            let mut finding = route_finding(issue);
+            if failure.kind == Failure::TerminalRejected {
+                finding.outcome = OnboardingCheckOutcome::Failure;
+            }
+            finding.endpoint = Some(failure.endpoint.0.clone());
+            if let Some(capability) = capabilities.get(&relay_key(&failure.endpoint.0)) {
+                finding.declared_capability = *capability;
+            } else {
+                finding.context = OnboardingFindingContext::Unknown;
+            }
+            findings.push(finding);
+        }
+    }
+    // Reopen the NIP-65 decision so existing hosts can load its retained
+    // declaration into the standard editor and use review and approval.
+    c.set(
+        OnboardingStep::Relays,
+        OnboardingStatus::RetryableFailure,
+        findings,
+    );
+    c.snapshot.steps[OnboardingStep::Relays.index()].checked_at = checked_at;
 }
 
 fn set_operation_error(c: &mut OnboardingCheckpoint, step: OnboardingStep, error: &AppError) {

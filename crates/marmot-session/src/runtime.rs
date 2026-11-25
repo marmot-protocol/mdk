@@ -29,11 +29,11 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
 use cgka_traits::maintenance::{
     CommitRefusal, DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase,
-    GroupEvolutionSemantic, GroupMaintenanceStatus, KeyPackageLifecycleState,
-    MaintenanceObligation, MaintenancePhase, MaintenanceTrigger, PendingKeyPackageReplacement,
-    PeriodicMaintenancePolicy, PostJoinHistoryFetch, PostJoinHistoryFetchCompletion,
-    PostJoinHistoryFetchOutcome, RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition,
-    TransportFanoutAttemptState, TransportFanoutTarget,
+    GroupEvolutionSemantic, GroupMaintenanceStatus, KeyPackageFallbackPublication,
+    KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, MaintenanceTrigger,
+    PendingKeyPackageReplacement, PeriodicMaintenancePolicy, PostJoinHistoryFetch,
+    PostJoinHistoryFetchCompletion, PostJoinHistoryFetchOutcome, RetainedKeyPackagePrivateMaterial,
+    SendMaintenanceDisposition, TransportFanoutAttemptState, TransportFanoutTarget,
 };
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, RosterTagKey};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -58,7 +58,8 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{AccountError, AccountResult};
 use crate::key_package::{
-    KeyPackagePublication, KeyPackagePublisher, KeyPackageSlotWithdrawal, NoopKeyPackagePublisher,
+    KeyPackagePublication, KeyPackagePublicationRoutes, KeyPackagePublisher,
+    KeyPackageSlotWithdrawal, NoopKeyPackagePublisher,
 };
 use crate::routing::{
     StaticTransportRouting, TransportRoutingPolicy, publish_target_group_id, publish_target_kind,
@@ -1616,6 +1617,15 @@ where
     /// When no usable current package or signed artifact exists, this falls back to
     /// [`Self::publish_fresh_key_package`].
     pub async fn republish_key_package(&mut self) -> AccountResult<KeyPackage> {
+        self.republish_key_package_with_routes(None).await
+    }
+
+    /// Republish on explicitly selected routes, including when an obsolete
+    /// current publication needs replacement. The host chooses safe endpoints.
+    pub async fn republish_key_package_with_routes(
+        &mut self,
+        routes: Option<KeyPackagePublicationRoutes<'_>>,
+    ) -> AccountResult<KeyPackage> {
         self.ensure_key_package_slot_not_withdrawn()?;
         let Some(mut lifecycle) = self.session.key_package_lifecycle()? else {
             tracing::debug!(
@@ -1624,7 +1634,7 @@ where
                 fallback_reason = "no_lifecycle_state",
                 "no republishable current key package artifact; falling back to fresh publication"
             );
-            return self.publish_fresh_key_package().await;
+            return self.publish_fresh_key_package_with_routes(routes).await;
         };
         if lifecycle.pending_replacement.is_some() {
             return Err(AccountError::KeyPackageRotationInProgress);
@@ -1642,7 +1652,7 @@ where
                 fallback_reason,
                 "no republishable current key package artifact; falling back to fresh publication"
             );
-            return self.publish_fresh_key_package().await;
+            return self.publish_fresh_key_package_with_routes(routes).await;
         }
 
         tracing::debug!(
@@ -1652,10 +1662,30 @@ where
             "republishing current key package"
         );
 
-        let current_endpoints = self.routing.key_package_endpoints();
-        merge_republish_publication_targets(&mut lifecycle.publication_targets, &current_endpoints);
-        let endpoints = current_endpoints.to_vec();
-        if endpoints.is_empty() {
+        let (current_endpoints, authorized) = routes.map_or_else(
+            || {
+                let endpoints = self.routing.key_package_endpoints().to_vec();
+                (endpoints.clone(), endpoints)
+            },
+            |routes| (routes.attempt.to_vec(), routes.journaled_endpoints()),
+        );
+        if routes.is_some_and(|routes| routes.via_fallback && !routes.attempt.is_empty())
+            && lifecycle.fallback_publication.is_none()
+        {
+            // Record prior ACKs before applying the new route policy.
+            let acknowledged = lifecycle
+                .publication_targets
+                .iter()
+                .any(|target| target.state == TransportFanoutAttemptState::Accepted);
+            lifecycle.fallback_publication = Some(if acknowledged {
+                KeyPackageFallbackPublication::Acknowledged
+            } else {
+                KeyPackageFallbackPublication::Started
+            });
+        }
+        lifecycle.setup_publication |= routes.is_some();
+        merge_republish_publication_targets(&mut lifecycle.publication_targets, &authorized);
+        if current_endpoints.is_empty() {
             self.session.put_key_package_lifecycle(&lifecycle)?;
             return Err(crate::key_package::KeyPackagePublishError::unexposed(
                 "no KeyPackage publication endpoints are configured",
@@ -1670,7 +1700,7 @@ where
                 fallback_reason = "missing_authored_signed_event",
                 "no republishable current key package artifact; falling back to fresh publication"
             );
-            return self.publish_fresh_key_package().await;
+            return self.publish_fresh_key_package_with_routes(routes).await;
         };
         let Some(key_package) = lifecycle.current_key_package.clone() else {
             tracing::debug!(
@@ -1679,7 +1709,7 @@ where
                 fallback_reason = "missing_current_key_package",
                 "no republishable current key package artifact; falling back to fresh publication"
             );
-            return self.publish_fresh_key_package().await;
+            return self.publish_fresh_key_package_with_routes(routes).await;
         };
         self.ensure_key_package_announced(
             lifecycle
@@ -1695,7 +1725,7 @@ where
             key_package: key_package.clone(),
             slot_id: lifecycle.stable_slot_id.clone(),
             created_at: artifact.created_at,
-            endpoints: endpoints.clone(),
+            endpoints: current_endpoints,
         };
         match self
             .key_packages
@@ -1718,6 +1748,10 @@ where
                     )
                     .into());
                 }
+                if lifecycle.fallback_publication.is_some() {
+                    lifecycle.fallback_publication =
+                        Some(KeyPackageFallbackPublication::Acknowledged);
+                }
                 lifecycle.phase = if lifecycle.publication_targets.iter().all(|target| {
                     matches!(
                         target.state,
@@ -1734,7 +1768,7 @@ where
             }
             Err(error) if error.artifact_unusable && may_replace_unusable_artifact(&lifecycle) => {
                 self.replace_unusable_current_artifact(&mut lifecycle)?;
-                self.publish_fresh_key_package().await
+                self.publish_fresh_key_package_with_routes(routes).await
             }
             Err(error) => {
                 note_key_package_attempt(
@@ -1785,7 +1819,8 @@ where
         &mut self,
         endpoints: Vec<TransportEndpoint>,
     ) -> AccountResult<KeyPackage> {
-        self.prepare_key_package_replacement(endpoints, false).await
+        self.prepare_key_package_replacement(endpoints, false, None)
+            .await
     }
 
     /// [`Self::prepare_fresh_key_package`]. With `supersede_pending`, a
@@ -1796,6 +1831,7 @@ where
         &mut self,
         endpoints: Vec<TransportEndpoint>,
         supersede_pending: bool,
+        routes: Option<KeyPackagePublicationRoutes<'_>>,
     ) -> AccountResult<KeyPackage> {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -1833,6 +1869,8 @@ where
                     authored_event_created_at: None,
                     authored_signed_event: None,
                     publication_targets: Vec::new(),
+                    setup_publication: false,
+                    fallback_publication: None,
                     refresh_at: None,
                     upgrade_rotation_recorded: false,
                     generation_revision: 0,
@@ -1840,6 +1878,7 @@ where
                     last_consumed_at: None,
                     retained_private_material: Vec::new(),
                     pending_replacement: None,
+                    pending_setup_publication: false,
                     unusable_artifact_replaced_by: None,
                     slot_withdrawn_at: None,
                 }
@@ -1892,6 +1931,7 @@ where
                 // between the two can neither repeat nor lose it.
                 lifecycle.unusable_artifact_replaced_by = Some(KEY_PACKAGE_SIGNING_BUILD.into());
             }
+            lifecycle.pending_setup_publication |= routes.is_some();
             self.session.stage_key_package_replacement(
                 &mut lifecycle,
                 created_at,
@@ -1948,16 +1988,29 @@ where
     }
 
     pub async fn publish_fresh_key_package(&mut self) -> AccountResult<KeyPackage> {
+        self.publish_fresh_key_package_with_routes(None).await
+    }
+
+    /// Retarget a pending publication in place. Its signed bytes and private
+    /// material stay durable, as do old endpoints needed for slot withdrawal.
+    /// The host chooses safe endpoints.
+    pub async fn publish_fresh_key_package_with_routes(
+        &mut self,
+        routes: Option<KeyPackagePublicationRoutes<'_>>,
+    ) -> AccountResult<KeyPackage> {
+        let authorized = routes.map_or_else(
+            || self.routing.key_package_endpoints().to_vec(),
+            KeyPackagePublicationRoutes::journaled_endpoints,
+        );
         tracing::debug!(
             target: TRACE_TARGET,
             method = "publish_fresh_key_package",
-            endpoint_count = self.routing.key_package_endpoints().len(),
+            endpoint_count = routes.map_or(authorized.len(), |routes| routes.attempt.len()),
             "publishing fresh key package"
         );
-        let endpoints = self.routing.key_package_endpoints().to_vec();
         let mut supersede_pending = false;
         let (mut lifecycle, artifact, publication, receipt) = loop {
-            self.prepare_key_package_replacement(endpoints.clone(), supersede_pending)
+            self.prepare_key_package_replacement(authorized.clone(), supersede_pending, routes)
                 .await?;
             let mut lifecycle = self
                 .session
@@ -1966,6 +2019,21 @@ where
             // Promotion clears the marker, so move an old record's marker first.
             lifecycle.migrate_legacy_consumption_marker();
 
+            let pending = lifecycle
+                .pending_replacement
+                .as_mut()
+                .expect("pending replacement exists");
+            // Ordinary retries reapply current routing to setup targets.
+            let setup_publication = routes.is_some()
+                || lifecycle.pending_setup_publication
+                || pending.fallback_publication_started;
+            if setup_publication {
+                lifecycle.pending_setup_publication = true;
+                merge_republish_publication_targets(&mut pending.targets, &authorized);
+                pending.fallback_publication_started |=
+                    routes.is_some_and(|routes| routes.via_fallback && !routes.attempt.is_empty());
+                self.session.put_key_package_lifecycle(&lifecycle)?;
+            }
             let pending = lifecycle
                 .pending_replacement
                 .as_ref()
@@ -1983,12 +2051,26 @@ where
                 key_package: pending.key_package.clone(),
                 slot_id: lifecycle.stable_slot_id.clone(),
                 created_at: artifact.created_at,
-                endpoints: pending
-                    .targets
-                    .iter()
-                    .map(|target| target.endpoint.clone())
-                    .collect(),
+                endpoints: routes.map_or_else(
+                    || {
+                        pending
+                            .targets
+                            .iter()
+                            .filter(|target| {
+                                target.state != TransportFanoutAttemptState::PolicyProhibited
+                            })
+                            .map(|target| target.endpoint.clone())
+                            .collect()
+                    },
+                    |routes| routes.attempt.to_vec(),
+                ),
             };
+            if setup_publication && publication.endpoints.is_empty() {
+                return Err(crate::key_package::KeyPackagePublishError::unexposed(
+                    "no KeyPackage publication endpoints are configured",
+                )
+                .into());
+            }
             let error = match self
                 .key_packages
                 .publish_prepared_key_package(&publication, &artifact)
@@ -2123,6 +2205,10 @@ where
         self.note_slot_publication(artifact.created_at);
         lifecycle.authored_signed_event = Some(artifact);
         lifecycle.publication_targets = replacement.targets;
+        lifecycle.setup_publication = std::mem::take(&mut lifecycle.pending_setup_publication);
+        lifecycle.fallback_publication = replacement
+            .fallback_publication_started
+            .then_some(KeyPackageFallbackPublication::Acknowledged);
         lifecycle.refresh_at = Some(replacement.refresh_at);
         lifecycle.phase = if lifecycle.publication_targets.iter().all(|target| {
             matches!(
@@ -2147,6 +2233,26 @@ where
         self.session
             .promote_key_package_lifecycle(&retired, &lifecycle)?;
         Ok(replacement.key_package)
+    }
+
+    /// The previously acknowledged fallback publication that can still be
+    /// served as this device's current package. This allows a host to verify
+    /// discovery again when a new write cannot gain another acknowledgement.
+    pub fn acknowledged_fallback_key_package(&self) -> AccountResult<Option<KeyPackage>> {
+        let Some(lifecycle) = self.session.key_package_lifecycle()? else {
+            return Ok(None);
+        };
+        if lifecycle.fallback_publication != Some(KeyPackageFallbackPublication::Acknowledged)
+            || lifecycle.pending_replacement.is_some()
+            || lifecycle.stable_slot_id.is_empty()
+            || self.key_package_slot_withdrawn
+            || self
+                .current_key_package_republish_fallback(&lifecycle)
+                .is_some()
+        {
+            return Ok(None);
+        }
+        Ok(lifecycle.current_key_package)
     }
 
     pub fn key_package_maintenance_status(
@@ -2386,6 +2492,12 @@ where
         let Some(artifact) = lifecycle.authored_signed_event.clone() else {
             return Ok(());
         };
+        let policy_changed = (lifecycle.setup_publication
+            || lifecycle.fallback_publication.is_some())
+            && merge_republish_publication_targets(
+                &mut lifecycle.publication_targets,
+                &self.routing.key_package_endpoints(),
+            );
         let endpoints = lifecycle
             .publication_targets
             .iter()
@@ -2393,6 +2505,18 @@ where
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
         if endpoints.is_empty() {
+            if policy_changed {
+                if lifecycle.publication_targets.iter().all(|target| {
+                    matches!(
+                        target.state,
+                        TransportFanoutAttemptState::Accepted
+                            | TransportFanoutAttemptState::PolicyProhibited
+                    )
+                }) {
+                    lifecycle.phase = cgka_traits::MaintenancePhase::Complete;
+                }
+                self.session.put_key_package_lifecycle(&lifecycle)?;
+            }
             return Ok(());
         }
         let Some(key_package) = lifecycle.current_key_package.clone() else {
@@ -2429,6 +2553,10 @@ where
                     &receipt.failed,
                     self.wall_clock.now(),
                 );
+                if !receipt.accepted.is_empty() && lifecycle.fallback_publication.is_some() {
+                    lifecycle.fallback_publication =
+                        Some(KeyPackageFallbackPublication::Acknowledged);
+                }
                 lifecycle.phase = if lifecycle.publication_targets.iter().all(|target| {
                     matches!(
                         target.state,
@@ -2519,6 +2647,8 @@ where
             lifecycle.current_not_after = None;
             lifecycle.authored_signed_event = None;
             lifecycle.publication_targets.clear();
+            lifecycle.setup_publication = false;
+            lifecycle.fallback_publication = None;
             lifecycle.refresh_at = None;
             lifecycle.phase = cgka_traits::MaintenancePhase::Retry;
             retired.push(expired);
@@ -2529,6 +2659,7 @@ where
             .is_some_and(|pending| pending.not_after <= now)
             && let Some(expired) = lifecycle.pending_replacement.take()
         {
+            lifecycle.pending_setup_publication = false;
             lifecycle.phase = cgka_traits::MaintenancePhase::Failed;
             retired.push(expired.key_package);
         }
@@ -8475,7 +8606,8 @@ fn current_key_package_republish_blocker(
 fn merge_republish_publication_targets(
     targets: &mut Vec<TransportFanoutTarget>,
     current_endpoints: &[TransportEndpoint],
-) {
+) -> bool {
+    let mut changed = false;
     for endpoint in current_endpoints {
         if let Some(target) = targets
             .iter_mut()
@@ -8486,6 +8618,7 @@ fn merge_republish_publication_targets(
                 target.attempt_count = 0;
                 target.last_attempt_at = None;
                 target.failure_code = None;
+                changed = true;
             }
             continue;
         }
@@ -8496,6 +8629,7 @@ fn merge_republish_publication_targets(
             last_attempt_at: None,
             failure_code: None,
         });
+        changed = true;
     }
     for target in targets.iter_mut() {
         if current_endpoints.contains(&target.endpoint) {
@@ -8506,7 +8640,9 @@ fn merge_republish_publication_targets(
         }
         target.state = TransportFanoutAttemptState::PolicyProhibited;
         target.failure_code = Some("endpoint_removed_from_policy".into());
+        changed = true;
     }
+    changed
 }
 
 fn note_key_package_attempt(

@@ -9196,6 +9196,33 @@ impl AppKeyPackagePublisher {
     }
 }
 
+fn key_package_publish_failures(
+    endpoints: &[TransportEndpoint],
+    reported: &[cgka_traits::TransportEndpointFailure],
+) -> Vec<cgka_traits::TransportEndpointFailure> {
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            let evidence = reported
+                .iter()
+                .find(|failure| failure.endpoint == *endpoint);
+            // Keep one result per attempted relay. Absence of a receipt is
+            // ambiguous even when a custom transport supplied no detail.
+            cgka_traits::TransportEndpointFailure {
+                endpoint: endpoint.clone(),
+                reason: String::new(),
+                kind: evidence.map_or(
+                    cgka_traits::TransportEndpointFailureKind::PossiblyExposed,
+                    |failure| failure.kind,
+                ),
+                rejection_category: evidence.and_then(|failure| failure.rejection_category),
+                size_class: evidence.and_then(|failure| failure.size_class),
+                pre_send: evidence.is_some_and(|failure| failure.pre_send),
+            }
+        })
+        .collect()
+}
+
 #[async_trait]
 impl KeyPackagePublisher for AppKeyPackagePublisher {
     fn legacy_slot_id(
@@ -9290,10 +9317,24 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             .map_err(|error| {
                 // A size refusal by every relay reaches the caller typed
                 // (mdk#2334); the lifecycle sees the failure as before.
-                KeyPackagePublishError::exposed(error.to_string()).with_event_size_class(
-                    error::publish_size_refusal(&error).map(|cause| cause.size_class),
-                )
+                let mut publication_error = KeyPackagePublishError::exposed(error.to_string())
+                    .with_event_size_class(
+                        error::publish_size_refusal(&error).map(|cause| cause.size_class),
+                    );
+                let failures = error.publish_endpoint_failures();
+                if !failures.is_empty() {
+                    publication_error.endpoint_failures =
+                        key_package_publish_failures(&publication.endpoints, failures);
+                }
+                publication_error
             })?;
+        if outcome.accepted.is_empty() {
+            let mut error =
+                KeyPackagePublishError::exposed("no KeyPackage relay acknowledged the publication");
+            error.endpoint_failures =
+                key_package_publish_failures(&publication.endpoints, &outcome.failed);
+            return Err(error);
+        }
         let accepted = outcome
             .accepted
             .into_iter()

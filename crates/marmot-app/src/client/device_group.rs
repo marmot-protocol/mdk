@@ -62,7 +62,7 @@ use cgka_traits::storage::{
     MaintenanceStorage as _, StorageError,
 };
 use cgka_traits::{EpochId, Group, GroupId, KeyPackage, Timestamp, TransportGroupSubscription};
-use marmot_session::DeviceSelfReport;
+use marmot_session::{AccountError, DeviceSelfReport, KeyPackagePublicationRoutes};
 use rand::RngCore as _;
 use rand::rngs::OsRng;
 use std::collections::BTreeMap;
@@ -802,20 +802,39 @@ impl AppClient {
     pub(crate) async fn publish_fresh_key_package_announced(
         &mut self,
     ) -> Result<KeyPackage, AppError> {
-        self.sync_key_package_announcement_group()?;
-        self.set_device_tag_key().await?;
-        self.announce_and_publish_fresh_key_package().await
+        self.publish_fresh_key_package_announced_with_routes(None)
+            .await
     }
 
-    async fn announce_and_publish_fresh_key_package(&mut self) -> Result<KeyPackage, AppError> {
+    pub(super) async fn publish_fresh_key_package_announced_with_routes(
+        &mut self,
+        routes: Option<KeyPackagePublicationRoutes<'_>>,
+    ) -> Result<KeyPackage, AppError> {
+        self.sync_key_package_announcement_group()?;
+        self.set_device_tag_key().await?;
+        self.announce_and_publish_fresh_key_package(routes).await
+    }
+
+    async fn announce_and_publish_fresh_key_package(
+        &mut self,
+        routes: Option<KeyPackagePublicationRoutes<'_>>,
+    ) -> Result<KeyPackage, AppError> {
         self.announce_key_package(true).await?;
-        Ok(self.runtime.publish_fresh_key_package().await?)
+        Self::key_package_publication_result(
+            self.runtime
+                .publish_fresh_key_package_with_routes(routes)
+                .await,
+            routes,
+        )
     }
 
     /// [`Self::publish_fresh_key_package_announced`] for a republication of
     /// the current KeyPackage. When the runtime would publish a fresh one
     /// instead, that one is announced.
-    pub(crate) async fn republish_key_package_announced(&mut self) -> Result<KeyPackage, AppError> {
+    pub(super) async fn republish_key_package_announced_with_routes(
+        &mut self,
+        routes: Option<KeyPackagePublicationRoutes<'_>>,
+    ) -> Result<KeyPackage, AppError> {
         self.sync_key_package_announcement_group()?;
         // Set first: once this device tags, an untagged current KeyPackage is
         // stale, and the republish falls back to a fresh one.
@@ -823,10 +842,27 @@ impl AppClient {
         if self.runtime.key_package_announcement_group().is_some()
             && self.runtime.key_package_republish_falls_back()?
         {
-            return self.announce_and_publish_fresh_key_package().await;
+            return self.announce_and_publish_fresh_key_package(routes).await;
         }
         self.announce_key_package(false).await?;
-        Ok(self.runtime.republish_key_package().await?)
+        Self::key_package_publication_result(
+            self.runtime.republish_key_package_with_routes(routes).await,
+            routes,
+        )
+    }
+
+    fn key_package_publication_result(
+        result: Result<KeyPackage, AccountError>,
+        routes: Option<KeyPackagePublicationRoutes<'_>>,
+    ) -> Result<KeyPackage, AppError> {
+        result.map_err(|error| match &error {
+            AccountError::KeyPackage(error_details)
+                if routes.is_some() && error_details.externally_exposed =>
+            {
+                AppError::Account(error)
+            }
+            _ => error.into(),
+        })
     }
 
     /// Announce the KeyPackage about to go out: a fresh one, staged now if

@@ -457,6 +457,10 @@ pub struct PendingKeyPackageReplacement {
     pub not_after: Timestamp,
     pub refresh_at: Timestamp,
     pub signed_event: Option<SignedPublicationArtifact>,
+    /// A fallback send may have exposed this exact event, even if its
+    /// acknowledgement never reached this device.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback_publication_started: bool,
     pub targets: Vec<TransportFanoutTarget>,
     pub attempt_count: u32,
     pub last_failure_code: Option<String>,
@@ -559,6 +563,16 @@ impl RetainedKeyPackagePrivateMaterial {
     }
 }
 
+/// Publication evidence for a current event that was sent through fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyPackageFallbackPublication {
+    /// The fallback send was journaled before its outcome was known.
+    Started,
+    /// A relay acknowledged this exact event, possibly on a primary route.
+    Acknowledged,
+}
+
 /// The one stable replaceable-event slot for an account-device's last-resort
 /// KeyPackage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,6 +593,14 @@ pub struct KeyPackageLifecycleState {
     pub authored_signed_event: Option<SignedPublicationArtifact>,
     #[serde(default)]
     pub publication_targets: Vec<TransportFanoutTarget>,
+    /// Current publication targets were selected by interactive setup.
+    /// Ordinary fanout reconciles them to current routing before any send.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub setup_publication: bool,
+    /// Evidence about the current signed event survives changes to its
+    /// authorized delivery targets. Absence denotes no journaled fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_publication: Option<KeyPackageFallbackPublication>,
     pub refresh_at: Option<Timestamp>,
     pub upgrade_rotation_recorded: bool,
     /// Generator policy of the acknowledged current package, promoted atomically
@@ -604,6 +626,10 @@ pub struct KeyPackageLifecycleState {
     #[serde(default)]
     pub retained_private_material: Vec<RetainedKeyPackagePrivateMaterial>,
     pub pending_replacement: Option<PendingKeyPackageReplacement>,
+    /// Pending targets were selected by interactive setup. This is staged
+    /// with the replacement intent and promoted with the acknowledged event.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending_setup_publication: bool,
     /// The build that last replaced a KeyPackage because the publisher
     /// refused its signed bytes as unusable (mdk#2628, D8). Each build does so
     /// at most once, so a publisher that refuses what this build signs cannot
@@ -636,6 +662,8 @@ impl KeyPackageLifecycleState {
             authored_event_created_at: None,
             authored_signed_event: None,
             publication_targets: Vec::new(),
+            setup_publication: false,
+            fallback_publication: None,
             refresh_at: None,
             upgrade_rotation_recorded: false,
             generation_revision: 0,
@@ -643,6 +671,7 @@ impl KeyPackageLifecycleState {
             last_consumed_at: None,
             retained_private_material: Vec::new(),
             pending_replacement: None,
+            pending_setup_publication: false,
             unusable_artifact_replaced_by: None,
             slot_withdrawn_at: None,
         }
@@ -844,6 +873,7 @@ mod tests {
             not_after: Timestamp(5_000),
             refresh_at: Timestamp(4_000),
             signed_event: None,
+            fallback_publication_started: false,
             targets: Vec::new(),
             attempt_count: 0,
             last_failure_code: None,

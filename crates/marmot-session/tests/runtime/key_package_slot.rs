@@ -53,6 +53,154 @@ fn advertised_components(key_package: &cgka_traits::engine::KeyPackage) -> Vec<u
 }
 
 #[tokio::test]
+async fn key_package_pending_fallback_restarts_on_declared_routes_only() {
+    assert_key_package_pending_setup_restarts_on_declared_routes_only(true).await;
+}
+
+#[tokio::test]
+async fn key_package_pending_primary_setup_restarts_on_edited_outbox() {
+    assert_key_package_pending_setup_restarts_on_declared_routes_only(false).await;
+}
+
+async fn assert_key_package_pending_setup_restarts_on_declared_routes_only(via_fallback: bool) {
+    use cgka_traits::TransportFanoutAttemptState;
+    use marmot_session::KeyPackagePublicationRoutes;
+
+    let dir = relaxed_storage_dir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("kp pending setup route restart").unwrap();
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let primary = TransportEndpoint(KEY_ENDPOINT.into());
+    let removed = TransportEndpoint("wss://other.example".into());
+    let (attempt, retain) = if via_fallback {
+        (vec![removed.clone()], vec![primary.clone()])
+    } else {
+        (vec![primary.clone(), removed.clone()], Vec::new())
+    };
+    let original_routes = if via_fallback {
+        vec![KEY_ENDPOINT]
+    } else {
+        vec![KEY_ENDPOINT, removed.as_str()]
+    };
+    let publisher = FlakyKeyPackages::new(1);
+    let mut runtime = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &original_routes,
+    );
+    runtime
+        .publish_fresh_key_package_with_routes(Some(KeyPackagePublicationRoutes {
+            attempt: &attempt,
+            retain: &retain,
+            via_fallback,
+        }))
+        .await
+        .expect_err("the first send received no acknowledgement");
+    let pending = slot_lifecycle(&runtime).pending_replacement.unwrap();
+    drop(runtime);
+
+    let mut restarted = slot_runtime(
+        current_session(database, &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+    wall.set(wall.now().0 + 30);
+    restarted.run_due_maintenance().await.unwrap();
+    let calls = publisher.publications();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].endpoints, attempt);
+    assert_eq!(calls[1].endpoints, [primary]);
+    let lifecycle = slot_lifecycle(&restarted);
+    assert_eq!(lifecycle.authored_signed_event, pending.signed_event);
+    assert_eq!(
+        restarted.acknowledged_fallback_key_package().unwrap().is_some(),
+        via_fallback
+    );
+    assert!(lifecycle.publication_targets.iter().any(|target| {
+        target.endpoint == removed && target.state == TransportFanoutAttemptState::PolicyProhibited
+    }));
+}
+
+#[tokio::test]
+async fn key_package_current_fallback_fanout_restarts_on_declared_routes_only() {
+    assert_key_package_current_setup_fanout_restarts_on_declared_routes_only(true).await;
+}
+
+#[tokio::test]
+async fn key_package_current_primary_setup_fanout_restarts_on_edited_outbox() {
+    assert_key_package_current_setup_fanout_restarts_on_declared_routes_only(false).await;
+}
+
+async fn assert_key_package_current_setup_fanout_restarts_on_declared_routes_only(
+    via_fallback: bool,
+) {
+    use cgka_traits::TransportFanoutAttemptState;
+    use marmot_session::KeyPackagePublicationRoutes;
+
+    let dir = relaxed_storage_dir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("kp current setup route restart").unwrap();
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let primary = TransportEndpoint(KEY_ENDPOINT.into());
+    let old_targets = [
+        TransportEndpoint("wss://accepted.example".into()),
+        TransportEndpoint("wss://failed.example".into()),
+    ];
+    let (original_routes, retain) = if via_fallback {
+        (vec![KEY_ENDPOINT], std::slice::from_ref(&primary))
+    } else {
+        (old_targets.iter().map(TransportEndpoint::as_str).collect(), &[][..])
+    };
+    let publisher = PartialFanoutKeyPackages::default();
+    let mut runtime = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &original_routes,
+    );
+    let package = runtime
+        .publish_fresh_key_package_with_routes(Some(KeyPackagePublicationRoutes {
+            attempt: &old_targets,
+            retain,
+            via_fallback,
+        }))
+        .await
+        .unwrap();
+    drop(runtime);
+
+    let mut restarted = slot_runtime(
+        current_session(database, &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+    wall.set(wall.now().0 + 30);
+    restarted.run_due_maintenance().await.unwrap();
+    let calls = publisher.publications();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0.endpoints, old_targets);
+    assert_eq!(calls[1].0.endpoints, [primary]);
+    assert_eq!(calls[1].1, calls[0].1);
+    let lifecycle = slot_lifecycle(&restarted);
+    for removed in old_targets {
+        assert!(lifecycle.publication_targets.iter().any(|target| {
+            target.endpoint == removed
+                && target.state == TransportFanoutAttemptState::PolicyProhibited
+        }));
+    }
+    assert_eq!(
+        restarted.acknowledged_fallback_key_package().unwrap(),
+        via_fallback.then_some(package)
+    );
+}
+
+#[tokio::test]
 async fn the_slot_is_republished_weekly_with_a_thirty_day_lifetime() {
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot weekly refresh").unwrap();

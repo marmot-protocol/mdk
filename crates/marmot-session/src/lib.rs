@@ -24,9 +24,9 @@ pub use cgka_engine::change_generation::{ChangeStamp, GroupChangeGeneration};
 pub use cgka_engine::key_package::OwnedKeyPackages;
 pub use error::{AccountError, AccountResult};
 pub use key_package::{
-    KeyPackageEventDeletion, KeyPackagePublication, KeyPackagePublishError,
-    KeyPackagePublishReceipt, KeyPackagePublisher, KeyPackageSlotWithdrawal,
-    NoopKeyPackagePublisher,
+    KeyPackageEventDeletion, KeyPackagePublication, KeyPackagePublicationRoutes,
+    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
+    KeyPackageSlotWithdrawal, NoopKeyPackagePublisher,
 };
 pub use recovery_key::seal_to_recovery_key;
 pub use routing::{

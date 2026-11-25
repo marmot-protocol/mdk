@@ -367,6 +367,7 @@ impl<S: StorageProvider> Engine<S> {
                         .min(metadata.not_after),
                 ),
                 signed_event: None,
+                fallback_publication_started: false,
                 targets,
                 attempt_count: 0,
                 last_failure_code: None,

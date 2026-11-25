@@ -243,6 +243,21 @@ pub enum MemberResolutionPurpose {
     Prewarm,
 }
 
+#[derive(Clone, Copy)]
+struct MemberResolutionMode {
+    purpose: MemberResolutionPurpose,
+    cold: bool,
+}
+
+impl From<MemberResolutionPurpose> for MemberResolutionMode {
+    fn from(purpose: MemberResolutionPurpose) -> Self {
+        Self {
+            purpose,
+            cold: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemberResolutionStatus {
@@ -495,8 +510,31 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         purpose: MemberResolutionPurpose,
         policy: MemberResolutionPolicy,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
-        self.resolve_members_with_policy(member_refs, purpose, Some(requirements), policy)
+        self.resolve_members_with_policy(member_refs, purpose.into(), Some(requirements), policy)
             .await
+    }
+
+    /// Reproduce a new inviter's route and package selection for a single
+    /// account from configured directory relays. Publisher-local metadata
+    /// and previous package winners cannot steer this lookup; the shared
+    /// journal still vetoes any selected package it knows is obsolete or deleted.
+    pub async fn resolve_new_inviter_key_packages(
+        &self,
+        account_id_hex: &str,
+        requirements: &cgka_engine::key_package::KeyPackageRequirements,
+    ) -> Result<Vec<KeyPackage>, DirectoryError> {
+        Ok(self
+            .resolve_members_with_policy(
+                vec![account_id_hex.to_owned()],
+                MemberResolutionMode {
+                    purpose: MemberResolutionPurpose::CommitFresh,
+                    cold: true,
+                },
+                Some(requirements),
+                MemberResolutionPolicy::Partial,
+            )
+            .await?
+            .key_packages)
     }
 
     /// Prewarm group composition without reserving or consuming any package.
@@ -550,7 +588,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
         self.resolve_members_with_policy(
             member_refs,
-            purpose,
+            purpose.into(),
             requirements,
             MemberResolutionPolicy::Atomic,
         )
@@ -560,7 +598,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     async fn resolve_members_with_policy(
         &self,
         member_refs: Vec<String>,
-        purpose: MemberResolutionPurpose,
+        mode: MemberResolutionMode,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         policy: MemberResolutionPolicy,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
@@ -574,7 +612,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let result = self
             .resolve_member_key_packages_inner(
                 &member_refs,
-                purpose,
+                mode,
                 requirements,
                 deadline,
                 cut_offs,
@@ -600,7 +638,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     async fn resolve_member_key_packages_inner(
         &self,
         member_refs: &[String],
-        purpose: MemberResolutionPurpose,
+        mode: MemberResolutionMode,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         deadline: tokio::time::Instant,
         cut_offs: Option<PartialCutOffs>,
@@ -614,6 +652,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 ObservedUnit::Attempt,
             )
             .map(DirectoryObservation::counts_only);
+        let purpose = mode.purpose;
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
         let local_accounts = if member_refs.is_empty() {
@@ -635,10 +674,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             if !seen.insert(account_id_hex.clone()) {
                 continue;
             }
-            let relay_lists = self
-                .directory_entry(&account_id_hex)?
-                .map(|entry| entry.relay_lists)
-                .unwrap_or_else(AccountRelayListStatus::empty);
+            let relay_lists = if mode.cold {
+                AccountRelayListStatus::empty()
+            } else {
+                self.cached_relay_list_status(&account_id_hex)?
+            };
             targets.push(MemberTarget {
                 account_id_hex,
                 relay_lists: relay_lists.clone(),
@@ -722,7 +762,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         &targets,
                         &key_package_unresolved,
                         &mut outcomes,
-                        purpose,
+                        mode,
                         requirements,
                         cut_offs.map(|cut_offs| cut_offs.key_package_batches),
                     ),
@@ -964,10 +1004,20 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         purpose: MemberResolutionPurpose,
         selected: Vec<FetchedKeyPackage>,
         relay_lists: &AccountRelayListStatus,
+        journal_veto: Option<&KeyPackageJournalFence>,
     ) -> Result<Vec<KeyPackage>, DirectoryError> {
         let mut accepted = Vec::with_capacity(selected.len());
         let mut first_error = None;
         for mut fetched in selected {
+            if journal_veto.is_some_and(|fence| {
+                !fence.allows(
+                    &fetched.key_package_event_id,
+                    &fetched.key_package_id,
+                    fetched.created_at,
+                )
+            }) {
+                continue;
+            }
             match self.validate_member_key_package_current(
                 &fetched.account_id_hex,
                 fetched.key_package.clone(),
@@ -1391,7 +1441,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         targets: &[MemberTarget],
         unresolved: &[usize],
         outcomes: &mut [Option<Result<MemberSelection, DirectoryError>>],
-        purpose: MemberResolutionPurpose,
+        mode: MemberResolutionMode,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         batch_cut_off: Option<tokio::time::Instant>,
     ) -> Result<(), DirectoryError> {
@@ -1503,7 +1553,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     &account_records,
                     self.directory_freshness(),
                     requirements,
-                    Some(fence.over(&account_records)),
+                    (!mode.cold).then(|| fence.over(&account_records)),
                 )
                 .map(|selection| selection.value);
                 // Batch results prove no coverage; every absence or rejection
@@ -1512,15 +1562,16 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 match selected {
                     Ok(selected)
                         if !selected.is_empty()
-                            && (purpose == MemberResolutionPurpose::Prewarm
+                            && (mode.purpose == MemberResolutionPurpose::Prewarm
                                 || !multiple_authors)
                             && !key_package_read_page_full(account_id, &account_records) =>
                     {
                         outcomes[index] = Some(
                             self.accept_fetched_key_packages(
-                                purpose,
+                                mode.purpose,
                                 selected,
                                 &targets[index].relay_lists,
+                                mode.cold.then_some(&fence),
                             )
                             .map(|packages| (packages, coverage)),
                         );
@@ -1595,7 +1646,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                         primary_complete: fetched.complete,
                                         discovery: &directory.directory_source_relays(&[]),
                                         requirements,
-                                        fence: Some(&fence),
+                                        fence: (!mode.cold).then_some(&fence),
                                         cached_target: None,
                                         wanted: MAX_KEY_PACKAGES_PER_ACCOUNT,
                                     },
@@ -1605,8 +1656,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             // journal before admitting what it found.
                             let fence = directory.key_package_journal_fence(&account, &[]).await?;
                             records
-                                .select(&account, requirements, Some(&fence))
-                                .map(|selected| (selected, coverage))
+                                .select(&account, requirements, (!mode.cold).then_some(&fence))
+                                .map(|selected| (selected, coverage, fence))
                         }
                         .await;
                         (index, result)
@@ -1615,9 +1666,14 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let mut fallback_results =
             stream::iter(work).buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY);
         while let Some((index, result)) = fallback_results.next().await {
-            let result = result.and_then(|(selected, coverage)| {
-                self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)
-                    .map(|packages| (packages, coverage))
+            let result = result.and_then(|(selected, coverage, fence)| {
+                self.accept_fetched_key_packages(
+                    mode.purpose,
+                    selected,
+                    &targets[index].relay_lists,
+                    mode.cold.then_some(&fence),
+                )
+                .map(|packages| (packages, coverage))
             });
             // Decided as each member's result is stored, so a deadline that
             // cancels the remaining members cannot lose it.

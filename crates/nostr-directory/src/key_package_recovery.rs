@@ -12,10 +12,10 @@ use nostr_sdk::prelude::RelayUrl;
 use super::Directory;
 use super::resources::DirectoryResources;
 use crate::published_records::{
-    KeyPackageJournalFence, KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget,
-    key_package_queries, key_package_read_page_full, newest_publication_first, package_is_deleted,
-    select_fenced_key_packages, select_fenced_or_reject, verified_deletions,
-    without_revoked_slot_winners,
+    AccountRelayListState, KeyPackageJournalFence, KeyPackageRecoveryEvidence,
+    KeyPackageRecoveryTarget, key_package_queries, key_package_read_page_full,
+    newest_publication_first, package_is_deleted, select_fenced_key_packages,
+    select_fenced_or_reject, verified_deletions, without_revoked_slot_winners,
 };
 use crate::{DirectoryFreshness, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome, DirectoryRelayEventRecord};
@@ -352,8 +352,42 @@ impl<R: DirectoryResources> Directory<R> {
         }
     }
 
-    /// The safe routes among `searched`, and the supplementary routes
-    /// recovery reads from `discovery` when those find no usable package.
+    /// Operational relays a fresh inviter can query when no declared outbox
+    /// serves a usable KeyPackage. Directory-only relays and explicitly
+    /// read-only NIP-65 relays stay read-only.
+    /// Apply the same safety, identity and fanout bounds as the recovery read.
+    pub fn key_package_publication_fallback_relays(
+        &self,
+        outboxes: &[TransportEndpoint],
+        nip65: &AccountRelayListState,
+    ) -> Vec<TransportEndpoint> {
+        let writes = nip65
+            .relays
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
+            .collect::<BTreeSet<_>>();
+        let read_only = nip65
+            .read_relays
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
+            .filter(|relay| !writes.contains(relay))
+            .collect::<BTreeSet<_>>();
+        let operational = self
+            .config
+            .default_relays
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
+            .filter(|relay| !read_only.contains(relay))
+            .collect::<BTreeSet<_>>();
+        self.key_package_recovery_routes(outboxes, &self.directory_source_relays(&[]))
+            .1
+            .into_iter()
+            .filter(|endpoint| {
+                RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| operational.contains(&relay))
+            })
+            .collect()
+    }
+
     pub(super) fn key_package_recovery_routes(
         &self,
         searched: &[TransportEndpoint],

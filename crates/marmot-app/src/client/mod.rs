@@ -23,8 +23,8 @@ use cgka_traits::{
 use futures::StreamExt;
 use marmot_forensics::{AuditEventContext, ForensicRecorder as _};
 use marmot_session::{
-    AccountError, CompletedWelcomePublishTask, PreparedSessionSend, PreparedWelcomePublishTask,
-    PublishWork, SessionEffects, TransportRoutingPolicy,
+    AccountError, CompletedWelcomePublishTask, KeyPackagePublicationRoutes, PreparedSessionSend,
+    PreparedWelcomePublishTask, PublishWork, SessionEffects, TransportRoutingPolicy,
 };
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -1483,7 +1483,7 @@ impl AppClient {
             // when it matches the live one. An unfloored activation would replay
             // every held event on every route and leave a lag's loss unbounded.
             self.prepare_transport().await?;
-            self.publish_key_package_from_lifecycle().await
+            self.publish_key_package_from_lifecycle(None).await
         };
         observed
             .run_async(Box::pin(work), marmot_observability::success_or_failure)
@@ -1495,14 +1495,144 @@ impl AppClient {
     /// managed worker runs this only for `KeyPackagePublicationStarted`; all
     /// general publication continues through [`Self::publish_key_package`].
     pub(crate) async fn publish_setup_key_package(&mut self) -> Result<KeyPackage, AppError> {
-        self.app
-            .ensure_local_account_relay_lists(&self.state.label)
-            .await?;
+        let Some(attempt) =
+            crate::runtime::initial_key_package_onboarding_attempt(&self.app, &self.state.label)?
+        else {
+            self.app
+                .ensure_local_account_relay_lists(&self.state.label)
+                .await?;
+            self.refresh_routing()?;
+            return self.publish_key_package_from_lifecycle(None).await;
+        };
+        // Interactive preflight has already adopted or repaired the signed
+        // lists. A publication retry never writes relay declarations itself.
         self.refresh_routing()?;
-        self.publish_key_package_from_lifecycle().await
+        self.runtime.sweep_expired_key_package_private_material()?;
+        let outboxes = self.routing.key_package_endpoints().to_vec();
+        let directory = self.app.directory();
+        let primary = KeyPackagePublicationRoutes {
+            attempt: &outboxes,
+            retain: &[],
+            via_fallback: false,
+        };
+        let mut primary_error = match self.publish_key_package_from_lifecycle(Some(primary)).await {
+            Ok(package) => {
+                if self
+                    .runtime
+                    .key_package_maintenance_status()?
+                    .is_some_and(|lifecycle| lifecycle.fallback_publication.is_some())
+                {
+                    self.require_setup_key_package_discoverable(&directory, attempt, &package)
+                        .await?;
+                }
+                return Ok(package);
+            }
+            Err(AppError::Account(AccountError::KeyPackage(error))) if error.externally_exposed => {
+                error
+            }
+            result => return result,
+        };
+        let nip65 = self.app.account_relay_list_status(&self.state.label)?.nip65;
+        let fallback = directory.key_package_publication_fallback_relays(&outboxes, &nip65);
+        if !fallback.is_empty() {
+            self.require_current_key_package_onboarding_attempt(attempt)?;
+            let routes = KeyPackagePublicationRoutes {
+                attempt: &fallback,
+                retain: &outboxes,
+                via_fallback: true,
+            };
+            match self.publish_key_package_from_lifecycle(Some(routes)).await {
+                Ok(package) => {
+                    self.require_setup_key_package_discoverable(&directory, attempt, &package)
+                        .await?;
+                    return Ok(package);
+                }
+                Err(AppError::Account(AccountError::KeyPackage(mut error)))
+                    if !error.artifact_unusable =>
+                {
+                    primary_error
+                        .endpoint_failures
+                        .append(&mut error.endpoint_failures);
+                    primary_error.event_size_class = primary_error
+                        .event_size_class
+                        .zip(error.event_size_class)
+                        .map(|(primary, _)| primary);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // A relay can keep serving an already acknowledged event while
+        // refusing new writes. Retry the exact invite proof even then.
+        let Some(package) = self.runtime.acknowledged_fallback_key_package()? else {
+            return Err(AppError::Account(AccountError::KeyPackage(primary_error)));
+        };
+        self.require_setup_key_package_discoverable(&directory, attempt, &package)
+            .await?;
+        Ok(package)
     }
 
-    async fn publish_key_package_from_lifecycle(&mut self) -> Result<KeyPackage, AppError> {
+    fn require_current_key_package_onboarding_attempt(
+        &self,
+        attempt: crate::runtime::OnboardingAttempt,
+    ) -> Result<(), AppError> {
+        if crate::runtime::initial_key_package_onboarding_attempt(&self.app, &self.state.label)?
+            != Some(attempt)
+        {
+            return Err(AppError::OnboardingActionUnavailable);
+        }
+        Ok(())
+    }
+
+    async fn require_setup_key_package_discoverable(
+        &self,
+        directory: &nostr_directory::Directory<MarmotApp>,
+        attempt: crate::runtime::OnboardingAttempt,
+        expected: &KeyPackage,
+    ) -> Result<(), AppError> {
+        self.require_current_key_package_onboarding_attempt(attempt)?;
+        let account = self.app.account_home().account(&self.state.label)?;
+        let unavailable = || AppError::DirectoryLookupIncomplete(account.account_id_hex.clone());
+        let event_id = self
+            .runtime
+            .key_package_maintenance_status()?
+            .and_then(|lifecycle| lifecycle.authored_event_id)
+            .ok_or_else(unavailable)?;
+        let requirements = self
+            .runtime
+            .create_key_package_requirements(&CreateGroupRequest {
+                name: String::new(),
+                description: String::new(),
+                members: Vec::new(),
+                required_features: Vec::new(),
+                app_components: Vec::new(),
+                initial_admins: Vec::new(),
+            })
+            .map_err(marmot_session::SessionError::from)?;
+        let packages = directory
+            .resolve_new_inviter_key_packages(&account.account_id_hex, &requirements)
+            .await
+            .map_err(|error| match error {
+                nostr_directory::error::DirectoryError::RelayDirectory(_) => unavailable(),
+                error => error.into(),
+            })?;
+        if packages.iter().any(|package| {
+            package.bytes() == expected.bytes()
+                && package.protocol_profile == expected.protocol_profile
+                && package
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.event_id == event_id)
+        }) {
+            self.require_current_key_package_onboarding_attempt(attempt)
+        } else {
+            Err(unavailable())
+        }
+    }
+
+    async fn publish_key_package_from_lifecycle(
+        &mut self,
+        routes: Option<KeyPackagePublicationRoutes<'_>>,
+    ) -> Result<KeyPackage, AppError> {
         let lifecycle = self.runtime.key_package_maintenance_status()?;
         if lifecycle.as_ref().is_some_and(|lifecycle| {
             lifecycle.pending_replacement.is_some() || lifecycle.current_key_package.is_none()
@@ -1512,9 +1642,11 @@ impl AppClient {
             // stable slot that has not promoted a current package yet. Resume
             // or prepare that replacement; republish_key_package deliberately
             // rejects pending rotations and requires a current package.
-            self.publish_fresh_key_package_announced().await
+            self.publish_fresh_key_package_announced_with_routes(routes)
+                .await
         } else {
-            self.republish_key_package_announced().await
+            self.republish_key_package_announced_with_routes(routes)
+                .await
         }
     }
 

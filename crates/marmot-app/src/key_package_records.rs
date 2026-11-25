@@ -913,6 +913,7 @@ mod tests {
             not_after: Timestamp(2),
             refresh_at: Timestamp(2),
             signed_event: None,
+            fallback_publication_started: false,
             targets: Vec::new(),
             attempt_count: 0,
             last_failure_code: None,

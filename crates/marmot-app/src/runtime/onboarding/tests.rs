@@ -4,7 +4,7 @@ use cgka_traits::{MemberId, TransportAdapterError};
 use nostr::prelude::{FinalizeEvent, ToBech32};
 use parking_lot::Mutex as FixtureMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use transport_nostr::{DirectoryFetchRequest, DirectoryRelayFetcher};
+use transport_nostr::{DirectoryFetchOutcome, DirectoryFetchRequest, DirectoryRelayFetcher};
 use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscription};
 
 #[derive(Default)]
@@ -20,6 +20,11 @@ struct Network {
     inspection_errors: FixtureMutex<HashMap<String, transport_nostr::DirectoryInspectionError>>,
     inspected_endpoints: FixtureMutex<Vec<String>>,
     zero_acks: AtomicBool,
+    key_package_refusals: FixtureMutex<HashSet<String>>,
+    key_package_withheld_acks: FixtureMutex<HashSet<String>>,
+    key_package_locations: FixtureMutex<HashMap<String, HashSet<String>>>,
+    directory_offline: FixtureMutex<HashSet<String>>,
+    key_package_read_denials: FixtureMutex<HashSet<String>>,
     block_publish: AtomicBool,
     publishing: Notify,
     release_publish: Notify,
@@ -30,31 +35,25 @@ struct Network {
     /// relay.
     messages: Arc<transport_nostr::test_support::ScriptedRelayMessages>,
 }
-#[async_trait]
-impl DirectoryRelayFetcher for Network {
-    async fn fetch_directory_events(
-        &self,
-        request: DirectoryFetchRequest,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+impl Network {
+    fn directory_relay_available(&self, endpoint: &TransportEndpoint) -> bool {
+        !self.fail_reads.load(Ordering::SeqCst)
+            && !endpoint.0.starts_with("wss://relay.customtld")
+            && !(self.fail_index_only.load(Ordering::SeqCst)
+                && endpoint.0.contains("index.example"))
+            && !self
+                .directory_offline
+                .lock()
+                .contains(&relay_key(&endpoint.0))
+    }
+
+    fn directory_records(&self, request: &DirectoryFetchRequest) -> Vec<DirectoryRelayEventRecord> {
         assert!(
             transport_nostr::RelaySafetyPolicy::default()
                 .classify_endpoints(request.endpoints.iter().map(|e| e.0.clone()).collect())
                 .iter()
                 .all(|e| e.policy == RelayEndpointPolicy::Allowed)
         );
-        if self.fail_reads.load(Ordering::SeqCst)
-            || request
-                .endpoints
-                .iter()
-                .any(|e| e.0.starts_with("wss://relay.customtld"))
-            || (self.fail_index_only.load(Ordering::SeqCst)
-                && request
-                    .endpoints
-                    .iter()
-                    .any(|e| e.0.contains("index.example")))
-        {
-            return Err("timeout".into());
-        }
         let mut events = self.events.lock().clone();
         if request
             .endpoints
@@ -70,7 +69,8 @@ impl DirectoryRelayFetcher for Network {
         {
             events.extend(self.public_indexer_events.lock().iter().cloned());
         }
-        Ok(events
+        let key_package_locations = self.key_package_locations.lock();
+        events
             .iter()
             .filter(|event| {
                 if self.return_off_filter_events.load(Ordering::SeqCst) {
@@ -79,15 +79,95 @@ impl DirectoryRelayFetcher for Network {
                 request
                     .queries
                     .iter()
-                    .any(|q| q.kind == event.kind && q.authors.contains(&event.pubkey))
+                    .any(|query| query_matches_event(query, event))
             })
             .cloned()
-            .map(|event| DirectoryRelayEventRecord {
-                endpoints: request.endpoints.clone(),
-                event,
+            .filter_map(|event| {
+                let endpoints: Vec<_> = request
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| {
+                        key_package_locations
+                            .get(&event.id)
+                            .is_none_or(|stored| stored.contains(&relay_key(&endpoint.0)))
+                    })
+                    .cloned()
+                    .collect();
+                (!endpoints.is_empty()).then_some(DirectoryRelayEventRecord { endpoints, event })
             })
-            .collect())
+            .collect()
     }
+}
+
+fn query_matches_event(query: &DirectoryEventQuery, event: &NostrTransportEvent) -> bool {
+    query.kind == event.kind
+        && query.authors.contains(&event.pubkey)
+        && query.reference.as_ref().is_none_or(|(name, value)| {
+            event.tags.iter().any(|tag| {
+                tag.first().and_then(|tag| tag.parse::<char>().ok()) == Some(*name)
+                    && tag.get(1) == Some(value)
+            })
+        })
+}
+
+#[async_trait]
+impl DirectoryRelayFetcher for Network {
+    async fn fetch_directory_events(
+        &self,
+        request: DirectoryFetchRequest,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        if request
+            .endpoints
+            .iter()
+            .any(|endpoint| !self.directory_relay_available(endpoint))
+        {
+            return Err("timeout".into());
+        }
+        Ok(self.directory_records(&request))
+    }
+
+    async fn fetch_directory_events_with_completion(
+        &self,
+        request: DirectoryFetchRequest,
+    ) -> Result<DirectoryFetchOutcome, String> {
+        let mut outcome = DirectoryFetchOutcome::default();
+        for endpoint in &request.endpoints {
+            if !self.directory_relay_available(endpoint) {
+                continue;
+            }
+            let mut complete = true;
+            for query in &request.queries {
+                if matches!(
+                    query.kind,
+                    5 | transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE
+                ) && self
+                    .key_package_read_denials
+                    .lock()
+                    .contains(&relay_key(&endpoint.0))
+                {
+                    complete = false;
+                    continue;
+                }
+                let mut records = self.directory_records(&DirectoryFetchRequest {
+                    endpoints: vec![endpoint.clone()],
+                    queries: vec![query.clone()],
+                });
+                records.sort_by(|a, b| b.event.created_at.cmp(&a.event.created_at));
+                records.dedup_by(|a, b| a.event.id == b.event.id);
+                complete &= records.len() < query.limit;
+                outcome
+                    .records
+                    .extend(records.into_iter().take(query.limit));
+            }
+            if complete {
+                outcome.complete_endpoints.push(endpoint.clone());
+            }
+        }
+        outcome.complete = !request.endpoints.is_empty()
+            && outcome.complete_endpoints.len() == request.endpoints.len();
+        Ok(outcome)
+    }
+
     async fn inspect_directory_events(
         &self,
         request: DirectoryFetchRequest,
@@ -1448,8 +1528,40 @@ impl NostrRelayClient for Network {
         if self.zero_acks.load(Ordering::SeqCst) {
             return Ok(NostrPublishOutcome::default());
         }
-        self.events.lock().push(event.clone());
-        Ok(NostrPublishOutcome::accepted(endpoints.iter().cloned()))
+        let refusals = self.key_package_refusals.lock();
+        let withheld_acks = self.key_package_withheld_acks.lock();
+        let is_key_package = event.kind == transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
+        let (refused, stored): (Vec<_>, Vec<_>) = endpoints
+            .iter()
+            .cloned()
+            .partition(|endpoint| is_key_package && refusals.contains(&relay_key(&endpoint.0)));
+        if is_key_package && (!refusals.is_empty() || !withheld_acks.is_empty()) {
+            self.key_package_locations
+                .lock()
+                .entry(event.id.clone())
+                .or_default()
+                .extend(stored.iter().map(|endpoint| relay_key(&endpoint.0)));
+        }
+        if refused.is_empty() || !stored.is_empty() {
+            self.events.lock().push(event.clone());
+        }
+        let mut outcome = NostrPublishOutcome::accepted(stored.into_iter().filter(|endpoint| {
+            !is_key_package || !withheld_acks.contains(&relay_key(&endpoint.0))
+        }));
+        outcome.failed = refused
+            .into_iter()
+            .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                endpoint,
+                reason: "restricted".into(),
+                kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
+                rejection_category: Some(
+                    cgka_traits::TransportEndpointRejectionCategory::Restricted,
+                ),
+                size_class: None,
+                pre_send: false,
+            })
+            .collect();
+        Ok(outcome)
     }
 
     async fn publish_event_for_account(
@@ -1470,8 +1582,15 @@ fn options() -> OnboardingOptions {
     }
 }
 fn runtime(path: &std::path::Path, network: Arc<Network>) -> MarmotAppRuntime {
-    let mut app = MarmotApp::with_relay(path, "wss://default.example")
-        .with_test_relay_client(network.clone());
+    runtime_with_relay(path, network, "wss://default.example")
+}
+
+fn runtime_with_relay(
+    path: &std::path::Path,
+    network: Arc<Network>,
+    relay: &str,
+) -> MarmotAppRuntime {
+    let mut app = MarmotApp::with_relay(path, relay).with_test_relay_client(network.clone());
     app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
         Some(Duration::from_secs(120)),
         network.clone(),
@@ -4153,6 +4272,796 @@ async fn inbox_step(
         OnboardingStatus::Passed
     );
     snapshot
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_key_package_recovers_when_the_declared_outbox_refuses() {
+    let (_dir, publisher, network, keys, id) = fixture().await;
+    let outbox = "wss://declared.example";
+    let fallback = "wss://default.example";
+    network
+        .key_package_refusals
+        .lock()
+        .insert(relay_key(outbox));
+    let snapshot = inbox_step(
+        &publisher,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), outbox.into()]],
+        Some(vec![vec!["relay".into(), fallback.into()]]),
+    )
+    .await;
+    assert_eq!(
+        snapshot.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::NeedsInput,
+    );
+
+    let finished = publisher
+        .account_setup()
+        .acknowledge_onboarding_single_device(&id, snapshot.revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        publisher.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::NetworkReady,
+    );
+
+    // A separate directory has no cache from the publishing account, and
+    // the fixture will only return the KeyPackage from a relay that stored it.
+    let inviter_dir = tempfile::tempdir().unwrap();
+    let inviter = runtime(inviter_dir.path(), network.clone());
+    assert!(inviter.accounts().app.account_home().account(&id).is_err());
+    let packages = inviter
+        .accounts()
+        .app
+        .directory()
+        .resolve_member_key_packages(&[&id])
+        .await
+        .unwrap();
+    let publisher_lifecycle = publisher
+        .accounts()
+        .app
+        .account_storage(&id)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        packages[0].bytes(),
+        publisher_lifecycle.current_key_package.unwrap().bytes()
+    );
+    assert_eq!(
+        packages[0].source.as_ref().unwrap().event_id,
+        publisher_lifecycle.authored_event_id.unwrap()
+    );
+    assert!(
+        publisher_lifecycle
+            .publication_targets
+            .iter()
+            .any(|target| {
+                relay_key(&target.endpoint.0) == relay_key(outbox)
+                    && target.state == cgka_traits::TransportFanoutAttemptState::AttemptedFailed
+            })
+    );
+    inviter.shutdown_and_close().await.unwrap();
+    publisher.shutdown_and_close().await.unwrap();
+    let attempts = network.attempts.lock();
+    let endpoints = network.published_endpoints.lock();
+    let packages = attempts
+        .iter()
+        .zip(endpoints.iter())
+        .filter(|(event, _)| event.kind == transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        packages[0]
+            .1
+            .iter()
+            .map(|endpoint| relay_key(endpoint))
+            .collect::<Vec<_>>(),
+        [relay_key(outbox)]
+    );
+    assert!(
+        finished.ready,
+        "the host fallback accepts the initial KeyPackage"
+    );
+    assert!(packages[1..].iter().any(|(_, endpoints)| {
+        endpoints
+            .iter()
+            .any(|endpoint| relay_key(endpoint) == relay_key(fallback))
+    }));
+    assert!(packages.iter().all(|(event, _)| *event == packages[0].0));
+    assert!(attempts.iter().all(|event| event.kind != 10002));
+}
+
+fn assert_fallback_setup_discovery_blocked(
+    runtime: &MarmotAppRuntime,
+    id: &str,
+    snapshot: &OnboardingSnapshot,
+) {
+    assert!(!snapshot.ready);
+    assert_eq!(
+        runtime.account_setup_readiness(id).unwrap(),
+        AccountSetupReadiness::Initializing
+    );
+    assert_eq!(
+        runtime
+            .accounts()
+            .app
+            .account_home()
+            .account_setup_state(id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        AccountSetupPhase::KeyPackagePublicationStarted,
+    );
+    let relays = &snapshot.steps[OnboardingStep::Relays.index()];
+    assert_eq!(relays.status, OnboardingStatus::RetryableFailure);
+    assert!(relays.actions.contains(&OnboardingAction::EditRelays));
+    assert!(relays.findings.iter().any(key_package_discovery_finding));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_key_package_fallback_ack_requires_readable_outbox() {
+    for offline in [false, true] {
+        let (dir, publisher, network, keys, id) = fixture().await;
+        let outbox = "wss://declared.example";
+        let fallback = "wss://default.example";
+        network
+            .key_package_refusals
+            .lock()
+            .insert(relay_key(outbox));
+        let preflight = inbox_step(
+            &publisher,
+            &network,
+            &keys,
+            &id,
+            vec![vec!["r".into(), outbox.into()]],
+            Some(vec![vec!["relay".into(), fallback.into()]]),
+        )
+        .await;
+        let unavailable = if offline {
+            &network.directory_offline
+        } else {
+            &network.key_package_read_denials
+        };
+        unavailable.lock().insert(relay_key(outbox));
+        let blocked = publisher
+            .account_setup()
+            .acknowledge_onboarding_single_device(&id, preflight.revision)
+            .await
+            .unwrap();
+        assert_fallback_setup_discovery_blocked(&publisher, &id, &blocked);
+        let lifecycle = publisher
+            .accounts()
+            .app
+            .account_storage(&id)
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap()
+            .unwrap();
+        let event_id = lifecycle.authored_event_id.unwrap();
+        assert_eq!(
+            network
+                .key_package_locations
+                .lock()
+                .get(&hex::encode(event_id.as_slice())),
+            Some(&HashSet::from([relay_key(fallback)])),
+            "the relay actually stored the acknowledged fallback publication"
+        );
+        let package = lifecycle.current_key_package.unwrap();
+        publisher.shutdown_and_close().await.unwrap();
+
+        // Both relays now refuse writes. The existing acknowledgement and
+        // the recovered read path must suffice for the exact signed event.
+        network
+            .key_package_refusals
+            .lock()
+            .insert(relay_key(fallback));
+        unavailable.lock().clear();
+        let restarted = runtime(dir.path(), network.clone());
+        restarted.start().await.unwrap();
+        let finished = restarted
+            .account_setup()
+            .retry_onboarding_step(&id, OnboardingStep::Relays)
+            .await
+            .unwrap();
+        assert!(finished.ready);
+        let lifecycle = restarted
+            .accounts()
+            .app
+            .account_storage(&id)
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap()
+            .unwrap();
+        assert_eq!(lifecycle.authored_event_id.unwrap(), event_id);
+        assert_eq!(
+            lifecycle.current_key_package.unwrap().bytes(),
+            package.bytes()
+        );
+        assert!(
+            network
+                .attempts
+                .lock()
+                .iter()
+                .all(|event| event.kind != 10002)
+        );
+        restarted.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_key_package_fallback_ack_requires_proof_after_relay_removal() {
+    let (dir, publisher, network, keys, id) = fixture().await;
+    let outbox = "wss://declared.example";
+    let fallback = "wss://default.example";
+    network
+        .key_package_refusals
+        .lock()
+        .insert(relay_key(outbox));
+    let preflight = inbox_step(
+        &publisher,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), outbox.into()]],
+        Some(vec![vec!["relay".into(), fallback.into()]]),
+    )
+    .await;
+    network
+        .key_package_read_denials
+        .lock()
+        .insert(relay_key(outbox));
+    let blocked = publisher
+        .account_setup()
+        .acknowledge_onboarding_single_device(&id, preflight.revision)
+        .await
+        .unwrap();
+    assert_fallback_setup_discovery_blocked(&publisher, &id, &blocked);
+    let lifecycle = |app: &MarmotApp| {
+        app.account_storage(&id)
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap()
+            .unwrap()
+    };
+    let first = lifecycle(&publisher.accounts().app);
+    let event_id = hex::encode(first.authored_event_id.unwrap().as_slice());
+    assert_eq!(
+        network.key_package_locations.lock().get(&event_id),
+        Some(&HashSet::from([relay_key(fallback)]))
+    );
+    publisher.shutdown_and_close().await.unwrap();
+
+    // The host removes fallback. Keep the declared relay refusing this
+    // retry so the policy removal is stored before another relay can ACK.
+    network
+        .key_package_refusals
+        .lock()
+        .insert(relay_key(fallback));
+    let without_fallback = runtime_with_relay(dir.path(), network.clone(), outbox);
+    without_fallback.start().await.unwrap();
+    let blocked = without_fallback
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    assert!(!blocked.ready);
+    assert!(
+        lifecycle(&without_fallback.accounts().app)
+            .publication_targets
+            .iter()
+            .any(
+                |target| relay_key(&target.endpoint.0) == relay_key(fallback)
+                    && target.state == cgka_traits::TransportFanoutAttemptState::PolicyProhibited
+            )
+    );
+    without_fallback.shutdown_and_close().await.unwrap();
+
+    // The declared relay ACKs the replay, while callers still cannot read
+    // it. The setup must continue to require the exact discovery proof.
+    network
+        .key_package_refusals
+        .lock()
+        .remove(&relay_key(outbox));
+    let restarted = runtime_with_relay(dir.path(), network.clone(), outbox);
+    restarted.start().await.unwrap();
+    let blocked = restarted
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    assert_fallback_setup_discovery_blocked(&restarted, &id, &blocked);
+    assert_eq!(
+        network.key_package_locations.lock().get(&event_id),
+        Some(&HashSet::from([relay_key(outbox), relay_key(fallback)]))
+    );
+    assert_eq!(
+        lifecycle(&restarted.accounts().app).authored_signed_event,
+        first.authored_signed_event
+    );
+    restarted.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_key_package_fallback_ack_does_not_count_an_older_device_package() {
+    let (_dir, publisher, network, keys, id) = fixture().await;
+    let outbox = "wss://declared.example";
+    let fallback = "wss://default.example";
+    let replacement = "wss://edited.example";
+    network
+        .key_package_refusals
+        .lock()
+        .insert(relay_key(outbox));
+    let preflight = inbox_step(
+        &publisher,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), outbox.into()]],
+        Some(vec![vec!["relay".into(), fallback.into()]]),
+    )
+    .await;
+
+    let app = &publisher.accounts().app;
+    let account = publisher.accounts().resolve(&id).unwrap();
+    let old_package = crate::tests::fresh_key_package_for_account(app, &account, false).await;
+    let old = crate::tests::key_package_inventory::key_package_event(
+        &account,
+        old_package.clone(),
+        "another-device-slot",
+        unix_now_seconds() - 10,
+    );
+    let old = signed(
+        &keys,
+        old.kind as u16,
+        old.tags,
+        &old.content,
+        old.created_at,
+    );
+    network
+        .key_package_locations
+        .lock()
+        .insert(old.id.clone(), HashSet::from([relay_key(outbox)]));
+    network.events.lock().push(old.clone());
+
+    let setup = publisher.account_setup();
+    let blocked = setup
+        .acknowledge_onboarding_single_device(&id, preflight.revision)
+        .await
+        .unwrap();
+    assert_fallback_setup_discovery_blocked(&publisher, &id, &blocked);
+    let lifecycle = app
+        .account_storage(&id)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    let exact = lifecycle.authored_event_id.unwrap();
+    assert_eq!(
+        network
+            .key_package_locations
+            .lock()
+            .get(&hex::encode(exact.as_slice())),
+        Some(&HashSet::from([relay_key(fallback)]))
+    );
+
+    let inviter_dir = tempfile::tempdir().unwrap();
+    let inviter = runtime(inviter_dir.path(), network.clone());
+    let selected = inviter
+        .accounts()
+        .app
+        .directory()
+        .resolve_member_key_packages(&[&id])
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].bytes(), old_package.bytes());
+    assert_eq!(
+        hex::encode(selected[0].source.as_ref().unwrap().event_id.as_slice()),
+        old.id
+    );
+
+    let preview = setup
+        .propose_onboarding_relays(
+            &id,
+            OnboardingStep::Relays,
+            Some((vec![outbox.into()], vec![replacement.into()])),
+        )
+        .await
+        .unwrap();
+    assert!(!preview.proposal.as_ref().unwrap().inconclusive);
+    assert!(
+        network
+            .attempts
+            .lock()
+            .iter()
+            .all(|event| event.kind != 10002)
+    );
+    let approved = setup
+        .approve_onboarding_repair(&id, preview.revision)
+        .await
+        .unwrap();
+    let completed = if approved.steps[OnboardingStep::SingleDevice.index()].status
+        == OnboardingStatus::NeedsInput
+    {
+        setup
+            .acknowledge_onboarding_single_device(&id, approved.revision)
+            .await
+            .unwrap()
+    } else {
+        approved
+    };
+    assert!(completed.ready);
+    let found = inviter
+        .accounts()
+        .app
+        .directory()
+        .resolve_member_key_packages(&[&id])
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].source.as_ref().unwrap().event_id, exact);
+    assert_eq!(
+        found[0].bytes(),
+        lifecycle.current_key_package.unwrap().bytes()
+    );
+    assert_eq!(
+        network
+            .attempts
+            .lock()
+            .iter()
+            .filter(|event| event.kind == 10002)
+            .count(),
+        1
+    );
+    inviter.shutdown_and_close().await.unwrap();
+    publisher.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_key_package_refusals_offer_a_reviewed_write_relay_edit() {
+    assert_initial_key_package_reviewed_write_relay_edit(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_key_package_approved_edit_retires_an_outbox_still_in_host_defaults() {
+    assert_initial_key_package_reviewed_write_relay_edit(Some("write")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_key_package_does_not_write_to_a_declared_read_only_default() {
+    assert_initial_key_package_reviewed_write_relay_edit(Some("read")).await;
+}
+
+async fn assert_initial_key_package_reviewed_write_relay_edit(default_role: Option<&str>) {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let outbox = "wss://declared.example";
+    let fallback = "wss://default.example";
+    let replacement = "wss://edited.example";
+    network
+        .key_package_refusals
+        .lock()
+        .extend([relay_key(outbox), relay_key(fallback)]);
+    let mut nip65 = vec![vec!["r".into(), outbox.into()]];
+    if let Some(role) = default_role {
+        // A read-only declaration also covers the canonical host default.
+        let relay = if role == "read" {
+            format!("{fallback}/")
+        } else {
+            fallback.into()
+        };
+        nip65.push(vec!["r".into(), relay, role.into()]);
+    }
+    let snapshot = inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        nip65,
+        Some(vec![vec!["relay".into(), fallback.into()]]),
+    )
+    .await;
+    let setup = runtime.account_setup();
+    let failed = setup
+        .acknowledge_onboarding_single_device(&id, snapshot.revision)
+        .await
+        .unwrap();
+    assert!(!failed.ready);
+    let relays = &failed.steps[OnboardingStep::Relays.index()];
+    assert_eq!(relays.status, OnboardingStatus::RetryableFailure);
+    assert!(relays.actions.contains(&OnboardingAction::EditRelays));
+    for endpoint in [outbox, fallback] {
+        let refused = relays.findings.iter().any(|finding| {
+            finding.issue == OnboardingIssue::AccessRestricted
+                && finding.purpose == OnboardingCheckPurpose::EventPublication
+                && finding
+                    .endpoint
+                    .as_deref()
+                    .is_some_and(|url| relay_key(url) == relay_key(endpoint))
+        });
+        assert_eq!(refused, endpoint == outbox || default_role != Some("read"));
+    }
+    if default_role == Some("read") {
+        assert!(
+            !network
+                .published_endpoints
+                .lock()
+                .iter()
+                .flatten()
+                .any(|endpoint| { relay_key(endpoint) == relay_key(fallback) })
+        );
+    }
+    assert!(
+        network
+            .attempts
+            .lock()
+            .iter()
+            .all(|event| event.kind != 10002)
+    );
+    let exact_package = network.attempts.lock().first().unwrap().clone();
+
+    let preview = setup
+        .propose_onboarding_relays(
+            &id,
+            OnboardingStep::Relays,
+            Some((vec![outbox.into()], vec![replacement.into()])),
+        )
+        .await
+        .unwrap();
+    let proposal = preview.proposal.unwrap();
+    assert_eq!(proposal.write_relays, [replacement]);
+    assert!(
+        !proposal.inconclusive,
+        "publication failure is not incomplete discovery"
+    );
+    assert!(
+        network
+            .attempts
+            .lock()
+            .iter()
+            .all(|event| event.kind != 10002)
+    );
+    let attempts_before_approval = network.attempts.lock().len();
+    let snapshot = setup
+        .approve_onboarding_repair(&id, preview.revision)
+        .await
+        .unwrap();
+    let finished = if snapshot.steps[OnboardingStep::SingleDevice.index()].status
+        == OnboardingStatus::NeedsInput
+    {
+        setup
+            .acknowledge_onboarding_single_device(&id, snapshot.revision)
+            .await
+            .unwrap()
+    } else {
+        snapshot
+    };
+    assert!(finished.ready);
+    runtime.run_due_maintenance(&id).await.unwrap();
+    let lifecycle = runtime
+        .accounts()
+        .app
+        .account_storage(&id)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    if default_role != Some("read") {
+        assert!(lifecycle.publication_targets.iter().any(|target| {
+            relay_key(&target.endpoint.0) == relay_key(fallback)
+                && target.state == cgka_traits::TransportFanoutAttemptState::PolicyProhibited
+        }));
+    }
+    runtime.shutdown_and_close().await.unwrap();
+
+    let attempts = network.attempts.lock();
+    let endpoints = network.published_endpoints.lock();
+    assert_eq!(
+        attempts.iter().filter(|event| event.kind == 10002).count(),
+        1
+    );
+    let package_attempts_after_approval = attempts
+        .iter()
+        .zip(endpoints.iter())
+        .skip(attempts_before_approval)
+        .filter(|(event, _)| event.kind == exact_package.kind)
+        .collect::<Vec<_>>();
+    assert!(!package_attempts_after_approval.is_empty());
+    for (event, endpoints) in package_attempts_after_approval {
+        assert_eq!(event, &exact_package);
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| relay_key(endpoint))
+                .collect::<Vec<_>>(),
+            [relay_key(replacement)]
+        );
+    }
+    assert!(
+        attempts
+            .iter()
+            .filter(|event| event.kind == exact_package.kind)
+            .all(|event| *event == exact_package)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_key_package_reuses_stored_event_where_the_ack_was_lost_after_restart() {
+    let (dir, publisher, network, keys, id) = fixture().await;
+    let outbox = "wss://declared.example";
+    let fallback = "wss://default.example";
+    network
+        .key_package_withheld_acks
+        .lock()
+        .extend([relay_key(outbox), relay_key(fallback)]);
+    let snapshot = inbox_step(
+        &publisher,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), outbox.into()]],
+        Some(vec![vec!["relay".into(), fallback.into()]]),
+    )
+    .await;
+    let failed = publisher
+        .account_setup()
+        .acknowledge_onboarding_single_device(&id, snapshot.revision)
+        .await
+        .unwrap();
+    assert!(!failed.ready);
+    assert_ne!(
+        publisher.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::NetworkReady
+    );
+    assert!(
+        failed.steps[OnboardingStep::Relays.index()]
+            .findings
+            .iter()
+            .any(|finding| {
+                finding.issue == OnboardingIssue::TimedOut
+                    && finding.purpose == OnboardingCheckPurpose::EventPublication
+            })
+    );
+    assert_eq!(
+        network
+            .key_package_locations
+            .lock()
+            .values()
+            .next()
+            .unwrap()
+            .len(),
+        2
+    );
+    let lifecycle = publisher
+        .accounts()
+        .app
+        .account_storage(&id)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert!(lifecycle.current_key_package.is_none());
+    let pending = lifecycle.pending_replacement.unwrap();
+    let exact = pending.signed_event.unwrap();
+    publisher.shutdown_and_close().await.unwrap();
+
+    network
+        .key_package_withheld_acks
+        .lock()
+        .remove(&relay_key(outbox));
+    network
+        .key_package_read_denials
+        .lock()
+        .insert(relay_key(outbox));
+    let restarted = runtime(dir.path(), network.clone());
+    restarted.start().await.unwrap();
+    let snapshot = restarted
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
+    assert!(!snapshot.ready);
+    // Primary acknowledges the same event now. The pending fallback send
+    // survived restart, so promotion still needs exact read proof.
+    let blocked = restarted
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    assert_fallback_setup_discovery_blocked(&restarted, &id, &blocked);
+    network.key_package_read_denials.lock().clear();
+    let finished = restarted
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    assert!(finished.ready);
+    assert_eq!(
+        restarted.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::NetworkReady
+    );
+
+    let lifecycle = restarted
+        .accounts()
+        .app
+        .account_storage(&id)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(lifecycle.authored_signed_event.unwrap(), exact);
+    assert_eq!(lifecycle.current_key_package.unwrap(), pending.key_package);
+    restarted.shutdown_and_close().await.unwrap();
+    let attempts = network.attempts.lock();
+    assert!(attempts.len() >= 3);
+    assert!(
+        attempts
+            .iter()
+            .all(|event| event.id == hex::encode(exact.id.as_slice()))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_key_package_completion_cannot_revive_a_cancelled_attempt() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let outbox = "wss://declared.example";
+    let fallback = "wss://default.example";
+    let snapshot = inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), outbox.into()]],
+        Some(vec![vec!["relay".into(), fallback.into()]]),
+    )
+    .await;
+    let mut updates = runtime.account_setup().subscribe_onboarding(&id).unwrap();
+    network.block_publish.store(true, Ordering::SeqCst);
+    let publishing = tokio::spawn({
+        let manager = runtime.accounts().clone();
+        let id = id.clone();
+        async move {
+            manager
+                .account_setup()
+                .acknowledge_onboarding_single_device(&id, snapshot.revision)
+                .await
+        }
+    });
+    timeout(Duration::from_secs(5), network.publishing.notified())
+        .await
+        .unwrap();
+    let cancelling = tokio::spawn({
+        let manager = runtime.accounts().clone();
+        let id = id.clone();
+        async move { manager.account_setup().cancel_onboarding(&id).await }
+    });
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let update = updates.recv().await.unwrap();
+            assert!(!update.ready);
+            if update.cancellation_pending {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    network.release_publish.notify_waiters();
+    cancelling.await.unwrap().unwrap();
+    assert!(publishing.await.unwrap().is_err());
+
+    assert!(runtime.accounts().resolve(&id).unwrap().signed_out);
+    assert!(
+        runtime
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(network.attempts.lock().len(), 1);
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 fn offers_relay_edits(state: &OnboardingStepState) -> bool {

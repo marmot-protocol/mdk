@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::maintenance::SignedPublicationArtifact;
-use cgka_traits::{EventSizeClass, MemberId, MessageId, Timestamp, TransportEndpoint};
+use cgka_traits::{
+    EventSizeClass, MemberId, MessageId, Timestamp, TransportEndpoint, TransportEndpointFailure,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyPackagePublication {
@@ -14,6 +16,28 @@ pub struct KeyPackagePublication {
     /// Exact authored timestamp selected by lifecycle orchestration.
     pub created_at: Timestamp,
     pub endpoints: Vec<TransportEndpoint>,
+}
+
+/// One setup publication wave and the other routes still authorized for
+/// this exact artifact. The host admits both sets through its relay policy.
+#[derive(Clone, Copy, Debug)]
+pub struct KeyPackagePublicationRoutes<'a> {
+    pub attempt: &'a [TransportEndpoint],
+    pub retain: &'a [TransportEndpoint],
+    /// Journal this wave's fallback provenance before sending its event.
+    pub via_fallback: bool,
+}
+
+impl KeyPackagePublicationRoutes<'_> {
+    pub(crate) fn journaled_endpoints(self) -> Vec<TransportEndpoint> {
+        let mut endpoints = self.attempt.to_vec();
+        for endpoint in self.retain {
+            if !endpoints.contains(endpoint) {
+                endpoints.push(endpoint.clone());
+            }
+        }
+        endpoints
+    }
 }
 
 /// A request to stop serving this device's slot at sign-out
@@ -72,6 +96,8 @@ pub struct KeyPackagePublishError {
     pub externally_exposed: bool,
     pub artifact_unusable: bool,
     pub event_size_class: Option<EventSizeClass>,
+    /// Typed evidence for each unacknowledged relay, when available.
+    pub endpoint_failures: Vec<TransportEndpointFailure>,
 }
 
 impl KeyPackagePublishError {
@@ -82,6 +108,7 @@ impl KeyPackagePublishError {
             externally_exposed: false,
             artifact_unusable: false,
             event_size_class: None,
+            endpoint_failures: Vec::new(),
         }
     }
 
@@ -93,6 +120,7 @@ impl KeyPackagePublishError {
             externally_exposed: true,
             artifact_unusable: false,
             event_size_class: None,
+            endpoint_failures: Vec::new(),
         }
     }
 
@@ -104,6 +132,7 @@ impl KeyPackagePublishError {
             externally_exposed: false,
             artifact_unusable: true,
             event_size_class: None,
+            endpoint_failures: Vec::new(),
         }
     }
 
