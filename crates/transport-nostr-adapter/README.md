@@ -426,8 +426,8 @@ reported apart from "answered, nothing new". Each call reports its covered slice
 outcome for the caller's backoff. Fullness uses the raw received count before SDK validation: a raw page of
 500 with one invalid signature still counts as full even though only 499 events survive. The wire sweep regression
 keeps all 1,200 valid historical events exact and oldest first across that boundary. `SdkSweepRelay` (`sdk` feature) runs it over a relay already in a
-`NostrSdkRelayClient`'s pool. nostr-sdk drops NIP-67 hints, so a client built with `from_builder` reads `more` off
-the wire for the sweep's own REQs, and `more` splits a slice. No hint proves one: `finish` is ignored, since a misread
+`NostrSdkRelayClient`'s pool. The sweep reads NIP-67 hints from nostr-sdk's typed EOSE, and
+`more` splits a slice. No hint proves one: `finish` is ignored, since a misread
 `finish` would skip history. The sweep's requests go through the client's
 finite requests, which only a client built with `from_builder` has: over a client from `NostrSdkRelayClient::new`
 every slice reads as unreachable. A call cut by its deadline or cancellation ends the request in flight between

@@ -427,12 +427,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-utility"
+version = "0.3.2"
+source = "git+https://github.com/yukibtc/async-utility?rev=b323ae0c1c1424b78bf8bb8832b95e86771f1dee#b323ae0c1c1424b78bf8bb8832b95e86771f1dee"
+dependencies = [
+ "futures-util",
+ "gloo-timers",
+ "tokio",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "async-wsocket"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c92385c7c8b3eb2de1b78aeca225212e4c9a69a78b802832759b108681a5069"
 dependencies = [
- "async-utility",
+ "async-utility 0.3.1",
  "futures",
  "futures-util",
  "js-sys",
@@ -803,7 +814,7 @@ dependencies = [
  "marmot-account",
  "marmot-app",
  "marmot-forensics",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "nostr-relay-builder",
  "nostr-sdk",
  "openmls",
@@ -841,7 +852,7 @@ dependencies = [
  "hex",
  "k256",
  "marmot-forensics",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
@@ -3038,7 +3049,7 @@ dependencies = [
  "hex",
  "keyring-core",
  "libc",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3079,7 +3090,7 @@ dependencies = [
  "marmot-session",
  "media-store",
  "nostr 0.44.8",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "nostr-directory",
  "nostr-relay-builder",
  "nostr-sdk",
@@ -3123,7 +3134,7 @@ dependencies = [
  "keyring-core",
  "marmot-app",
  "marmot-uniffi",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "nostr-relay-builder",
  "nostr-sdk",
  "serde",
@@ -3223,7 +3234,7 @@ dependencies = [
  "hex",
  "marmot-forensics",
  "marmot-session",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
@@ -3276,7 +3287,7 @@ dependencies = [
  "marmot-app",
  "marmot-markdown",
  "marmot-uniffi-macros",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "nostr-relay-builder",
  "rand 0.8.6",
  "serde_json",
@@ -3449,8 +3460,8 @@ dependencies = [
 
 [[package]]
 name = "nostr"
-version = "0.45.5"
-source = "git+https://github.com/erskingardner/rust-nostr?rev=e93cc06b5624f06c21ecd8111a124176eb0c7589#e93cc06b5624f06c21ecd8111a124176eb0c7589"
+version = "0.45.7"
+source = "git+https://github.com/nostrdevkit/nostr?rev=4904ffb85f60178375a1dda659a61793f36f03b8#4904ffb85f60178375a1dda659a61793f36f03b8"
 dependencies = [
  "aes 0.8.4",
  "base64",
@@ -3487,9 +3498,9 @@ dependencies = [
 [[package]]
 name = "nostr-database"
 version = "0.45.2"
-source = "git+https://github.com/erskingardner/rust-nostr?rev=e93cc06b5624f06c21ecd8111a124176eb0c7589#e93cc06b5624f06c21ecd8111a124176eb0c7589"
+source = "git+https://github.com/nostrdevkit/nostr?rev=4904ffb85f60178375a1dda659a61793f36f03b8#4904ffb85f60178375a1dda659a61793f36f03b8"
 dependencies = [
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "opaquerr",
 ]
 
@@ -3503,7 +3514,7 @@ dependencies = [
  "fs-private",
  "futures",
  "hex",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "nostr-sdk",
  "reqwest",
  "rusqlite",
@@ -3524,19 +3535,19 @@ dependencies = [
 [[package]]
 name = "nostr-gossip"
 version = "0.45.1"
-source = "git+https://github.com/erskingardner/rust-nostr?rev=e93cc06b5624f06c21ecd8111a124176eb0c7589#e93cc06b5624f06c21ecd8111a124176eb0c7589"
+source = "git+https://github.com/nostrdevkit/nostr?rev=4904ffb85f60178375a1dda659a61793f36f03b8#4904ffb85f60178375a1dda659a61793f36f03b8"
 dependencies = [
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "opaquerr",
 ]
 
 [[package]]
 name = "nostr-memory"
 version = "0.45.2"
-source = "git+https://github.com/erskingardner/rust-nostr?rev=e93cc06b5624f06c21ecd8111a124176eb0c7589#e93cc06b5624f06c21ecd8111a124176eb0c7589"
+source = "git+https://github.com/nostrdevkit/nostr?rev=4904ffb85f60178375a1dda659a61793f36f03b8#4904ffb85f60178375a1dda659a61793f36f03b8"
 dependencies = [
  "btreecap",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "nostr-database 0.45.2",
  "tokio",
 ]
@@ -3547,7 +3558,7 @@ version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51ba8e48eaadd5644e7317ca2f892b89a394a8cc57e99fea9f624dc081df1a24"
 dependencies = [
- "async-utility",
+ "async-utility 0.3.1",
  "async-wsocket 0.13.2",
  "atomic-destructor",
  "hex",
@@ -3560,16 +3571,16 @@ dependencies = [
 
 [[package]]
 name = "nostr-sdk"
-version = "0.45.4"
-source = "git+https://github.com/erskingardner/rust-nostr?rev=e93cc06b5624f06c21ecd8111a124176eb0c7589#e93cc06b5624f06c21ecd8111a124176eb0c7589"
+version = "0.45.6"
+source = "git+https://github.com/nostrdevkit/nostr?rev=4904ffb85f60178375a1dda659a61793f36f03b8#4904ffb85f60178375a1dda659a61793f36f03b8"
 dependencies = [
- "async-utility",
+ "async-utility 0.3.2",
  "async-wsocket 0.17.0",
  "faster-hex",
  "futures",
  "lru 0.18.0",
  "negentropy",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "nostr-database 0.45.2",
  "nostr-gossip",
  "nostr-memory",
@@ -5289,7 +5300,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5692,7 +5703,7 @@ dependencies = [
  "cgka-traits",
  "futures",
  "hex",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "nostr-relay-builder",
  "nostr-sdk",
  "rand 0.8.6",
@@ -5717,7 +5728,7 @@ dependencies = [
  "futures",
  "hex",
  "marmot-pairing",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "nostr-gossip",
  "nostr-memory",
  "nostr-relay-builder",
@@ -5744,7 +5755,7 @@ dependencies = [
  "chacha20poly1305 0.10.1",
  "getrandom 0.2.17",
  "hex",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "rand 0.8.6",
  "serde",
  "serde_json",
@@ -6535,7 +6546,7 @@ dependencies = [
  "libc",
  "marmot-account",
  "marmot-app",
- "nostr 0.45.5",
+ "nostr 0.45.7",
  "nostr-relay-builder",
  "nostr-sdk",
  "serde",

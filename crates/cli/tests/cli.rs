@@ -1,3 +1,6 @@
+// These tests read a relay's stored events with nostr-sdk's `fetch_events`,
+// which upstream deprecates in favour of `stream_events`.
+#![allow(deprecated)]
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fmt;

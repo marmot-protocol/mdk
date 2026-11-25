@@ -441,9 +441,7 @@ impl ScriptedRelayMessages {
     }
 
     fn eose_message(subscription_id: &str) -> RelayMessage<'static> {
-        RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(SubscriptionId::new(
-            subscription_id,
-        )))
+        RelayMessage::eose(SubscriptionId::new(subscription_id))
     }
 
     fn notification(

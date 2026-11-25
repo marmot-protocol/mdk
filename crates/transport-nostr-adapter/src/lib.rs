@@ -867,11 +867,35 @@ impl NostrSubscribeReport {
     }
 }
 
+/// A notification, or a gap: the receiver skipped `skipped` of them.
+#[cfg(feature = "sdk")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotificationUpdate<T> {
+    Notification(T),
+    Lagged { skipped: u64 },
+}
+
+/// `stream`, reporting the notifications its receiver skips.
+#[cfg(feature = "sdk")]
+pub fn with_gaps<T>(
+    stream: nostr_sdk::prelude::NotificationStream<T>,
+) -> impl futures::Stream<Item = NotificationUpdate<T>> + Send + Unpin
+where
+    T: Clone + Send + Unpin + 'static,
+{
+    use futures::StreamExt;
+    stream.with_gaps().map(|item| match item {
+        Ok(notification) => NotificationUpdate::Notification(notification),
+        Err(gap) => NotificationUpdate::Lagged {
+            skipped: gap.skipped,
+        },
+    })
+}
+
 /// One receiver of a relay client's [`NostrSdkNotification`]s.
 #[cfg(feature = "sdk")]
-pub type NostrSdkNotificationStream = std::pin::Pin<
-    Box<dyn futures::Stream<Item = nostr_sdk::NotificationUpdate<NostrSdkNotification>> + Send>,
->;
+pub type NostrSdkNotificationStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = NotificationUpdate<NostrSdkNotification>> + Send>>;
 
 /// The messages an injected [`NostrRelayClient`]'s relays send it: EVENT,
 /// EOSE and `CLOSED` frames with their connection boundaries, which a relay

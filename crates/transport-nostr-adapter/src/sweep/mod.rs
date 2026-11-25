@@ -18,9 +18,9 @@
 //! relay's NIP-11 `limitation.max_limit` (strfry 500, wok's marmot preset
 //! 5,000), counting every EVENT the relay sent, valid or not; or, when the
 //! relay publishes no cap, a reply below the largest full reply seen from it.
-//! A NIP-67 `more` hint always splits, but no hint proves a slice: nostr-sdk
-//! drops hints, so the SDK relay reads them off the wire, and there a misread
-//! `finish` would skip history where a misread `more` only costs requests.
+//! A NIP-67 `more` hint always splits, but no hint proves a slice: a relay's
+//! wrong `finish` would skip history, where a wrong `more` only costs
+//! requests.
 //! Requested limits are lowered silently, so the cap is read, never assumed. Each slice REQ asks for
 //! exactly the cap with one filter, so on wok a reply below it was never cut
 //! (its 10,000 per-REQ total cannot bind first).

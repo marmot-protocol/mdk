@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
+use crate::NotificationUpdate;
 use async_trait::async_trait;
 use cgka_traits::{
     EventSizeClass, MemberId, TransportAdapterError, TransportEndpoint, TransportEndpointAckKind,
@@ -16,7 +17,6 @@ use cgka_traits::{
 };
 use futures::{Stream, StreamExt};
 use nostr_gossip::NostrGossip;
-use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     Client, ClientBuilder, ClientNotification, ErrorKind as SdkErrorKind, Event, EventBuilder,
     EventId, Filter, FinalizeEventAsync, Kind, MachineReadablePrefix, PublicKey, Relay,
@@ -940,13 +940,14 @@ impl From<RelayStatus> for RelayLivenessStatus {
     fn from(status: RelayStatus) -> Self {
         match status {
             RelayStatus::Initialized => Self::Unknown,
-            RelayStatus::Pending | RelayStatus::Connecting => Self::Connecting,
+            RelayStatus::Connecting => Self::Connecting,
             RelayStatus::Connected => Self::Connected,
             RelayStatus::Disconnected
-            | RelayStatus::Terminated
+            | RelayStatus::Idle
             | RelayStatus::Banned
             | RelayStatus::Sleeping
             | RelayStatus::Shutdown => Self::Offline,
+            _ => Self::Unknown,
         }
     }
 }
@@ -1164,7 +1165,7 @@ impl RelayObservations {
         } else {
             let weak = Arc::downgrade(self);
             let relay = relay.clone();
-            let mut notifications = relay.notifications_with_gaps();
+            let mut notifications = crate::with_gaps(relay.notifications());
             Some(tokio::spawn(async move {
                 while let Some(update) = notifications.next().await {
                     let Some(observations) = weak.upgrade() else {
@@ -1468,7 +1469,7 @@ impl SdkNotificationFrontier {
         }
         // This receiver is shutdown-only. Transport payloads never cross the
         // client pool's independent forwarding lane.
-        let mut notifications = client.notifications_with_gaps();
+        let mut notifications = crate::with_gaps(client.notifications());
         let weak = Arc::downgrade(self);
         state.shutdown_monitor = Some(tokio::spawn(async move {
             while let Some(update) = notifications.next().await {
@@ -1507,7 +1508,9 @@ impl SdkNotificationFrontier {
                 | RelayMessage::Closed {
                     subscription_id, ..
                 } => subscription_id.as_ref(),
-                RelayMessage::EndOfStoredEvents(subscription_id) => subscription_id.as_ref(),
+                RelayMessage::EndOfStoredEvents {
+                    subscription_id, ..
+                } => subscription_id.as_ref(),
                 _ => return true,
             },
             _ => return true,
@@ -1589,7 +1592,7 @@ impl SdkNotificationFrontier {
         // a later connection.
         let connections_seen = relay.stats().success();
         // Subscribe synchronously, before the caller can issue connect/REQ.
-        let mut notifications = relay.notifications_with_gaps();
+        let mut notifications = crate::with_gaps(relay.notifications());
         let connected = relay.status() == RelayStatus::Connected;
         let connected_at = connected
             .then(|| connection_stamp(relay, connections_seen))
@@ -1612,7 +1615,7 @@ impl SdkNotificationFrontier {
                         // native tail ambiguous. Subscribe at the new frontier
                         // instead of relabelling its old EOSE as fresh input.
                         let connections_seen = relay.stats().success();
-                        notifications = relay.notifications_with_gaps();
+                        notifications = crate::with_gaps(relay.notifications());
                         if !frontier.cutover_relay(
                             &relay,
                             &monitor_url,
@@ -1965,9 +1968,7 @@ impl PublishRelayCache {
                         || relays.get(*endpoint).is_none_or(|relay| {
                             !matches!(
                                 relay.status(),
-                                RelayStatus::Pending
-                                    | RelayStatus::Connecting
-                                    | RelayStatus::Connected
+                                RelayStatus::Connecting | RelayStatus::Connected
                             )
                         })
                         || idle_count > SDK_PUBLISH_RELAY_IDLE_LIMIT
@@ -2213,7 +2214,9 @@ async fn dispatch_sdk_notification(
                             .await;
                     }
                 }
-                RelayMessage::EndOfStoredEvents(subscription_id) => {
+                RelayMessage::EndOfStoredEvents {
+                    subscription_id, ..
+                } => {
                     let endpoint = TransportEndpoint(relay_url.to_string());
                     let sent_nothing = adapter
                         .relay_client
@@ -4753,10 +4756,7 @@ impl NostrSdkRelayClient {
         };
         matches!(
             relay.status(),
-            RelayStatus::Pending
-                | RelayStatus::Connecting
-                | RelayStatus::Connected
-                | RelayStatus::Disconnected
+            RelayStatus::Connecting | RelayStatus::Connected | RelayStatus::Disconnected
         ) && relay.capabilities().can_read()
             && relay.subscription(id).await.is_none()
     }
@@ -4824,12 +4824,12 @@ impl NostrSdkRelayClient {
             return Err(publish_connect_failure(transport_endpoint, false));
         };
         // Subscribe before reading the status, so no change is missed.
-        let mut updates = relay.notifications_with_gaps();
+        let mut updates = crate::with_gaps(relay.notifications());
         let connected = timeout_at(deadline, async {
             loop {
                 match relay.status() {
                     RelayStatus::Connected => return true,
-                    RelayStatus::Pending | RelayStatus::Connecting | RelayStatus::Disconnected => {}
+                    RelayStatus::Connecting | RelayStatus::Disconnected => {}
                     _ => return false,
                 }
                 if updates.next().await.is_none() {
@@ -6347,14 +6347,14 @@ impl NostrSdkRelayHealth {
     fn record_status(&mut self, status: RelayStatus) {
         match status {
             RelayStatus::Initialized => self.initialized += 1,
-            RelayStatus::Pending => self.pending += 1,
             RelayStatus::Connecting => self.connecting += 1,
             RelayStatus::Connected => self.connected += 1,
             RelayStatus::Disconnected => self.disconnected += 1,
-            RelayStatus::Terminated => self.terminated += 1,
+            RelayStatus::Idle => self.terminated += 1,
             RelayStatus::Banned => self.banned += 1,
             RelayStatus::Sleeping => self.sleeping += 1,
             RelayStatus::Shutdown => self.terminated += 1,
+            _ => {}
         }
     }
 }
@@ -6632,7 +6632,7 @@ async fn sync_watching_neg_cap_detailed(
     // The SDK exposes no completion handle for that task; unlike success, this
     // does not guarantee NEG-CLOSE reaches the socket queue before credit reuse.
     // Subscribe before the NEG-OPEN goes out, so the answer cannot be missed.
-    let mut notifications = relay.notifications_with_gaps();
+    let mut notifications = crate::with_gaps(relay.notifications());
     let sync = relay.sync(filter).items(items).opts(options).into_future();
     tokio::pin!(sync);
     let mut watch = NegWatch::default();
@@ -7414,7 +7414,8 @@ mod tests {
         let client = sdk.client.clone();
         client.add_relay(url.clone()).await.unwrap();
         client
-            .try_connect_relay(url.clone(), Duration::from_secs(2))
+            .try_connect_relay(url.clone())
+            .timeout(Duration::from_secs(2))
             .await
             .unwrap();
         let mut notifications = client.notifications();
@@ -8147,7 +8148,10 @@ mod tests {
                             } if subscription_id.as_str() == live_id => {
                                 old_raw = Some(notification.clone());
                             }
-                            RelayMessage::EndOfStoredEvents(id) if id.as_str() == live_id => {
+                            RelayMessage::EndOfStoredEvents {
+                                subscription_id: id,
+                                ..
+                            } if id.as_str() == live_id => {
                                 break notification;
                             }
                             _ => {}
@@ -8207,7 +8211,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut native = relay.notifications_with_gaps();
+            let mut native = crate::with_gaps(relay.notifications());
             let mut loss = self.sdk.notification_loss().unwrap();
             let previous = loss
                 .borrow()
@@ -8473,7 +8477,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut native = relay.notifications_with_gaps();
+        let mut native = crate::with_gaps(relay.notifications());
         let connections = replay.sdk.relay_connections();
         let endpoint = replay.wire.endpoint.0.clone();
         let connection = || connections.borrow().get(&endpoint).copied();
@@ -8516,8 +8520,9 @@ mod tests {
         assert_eq!(relay.stats().success(), 1);
         assert_eq!(
             relay
-                .subscription_received_eose(&SubscriptionId::new(replay.live_id.clone()))
-                .await,
+                .subscription(&SubscriptionId::new(replay.live_id.clone()))
+                .await
+                .map(|data| data.received_eose()),
             Some(true),
             "AUTH did not resend the active live REQ"
         );
@@ -8645,7 +8650,7 @@ mod tests {
                 if let Some(NotificationUpdate::Notification(NostrSdkNotification::Payload {
                     notification: ClientNotification::Message { message, .. }, ..
                 })) = notifications.next().await
-                    && matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(id) if id.as_str() == live_id)
+                    && matches!(message.as_ref(), RelayMessage::EndOfStoredEvents { subscription_id: id, .. } if id.as_str() == live_id)
                 {
                     break;
                 }
@@ -8885,7 +8890,8 @@ mod tests {
                 .unwrap();
             let id = subscription.subscription_id();
             sdk.subscribe(subscription.clone()).await.unwrap();
-            assert_eq!(wire.recv_kind("REQ").await[1], id);
+            let live = wire.recv_kind("REQ").await;
+            assert_eq!(live[1], id);
             let physical = sdk
                 .client()
                 .relay(original.as_str())
@@ -8894,7 +8900,6 @@ mod tests {
                 .unwrap();
             assert_eq!(physical.status(), RelayStatus::Connected);
             let attempts = physical.stats().attempts();
-            let subscriptions = physical.subscriptions().await;
 
             let result = sdk.reconnect_relay(&alias).await.unwrap();
             assert!(matches!(
@@ -8910,11 +8915,10 @@ mod tests {
                 physical.stats().attempts() > attempts,
                 "manual reconnect restarts the existing physical relay"
             );
-            assert_eq!(physical.subscriptions().await, subscriptions);
             assert_eq!(
-                wire.recv_kind("REQ").await[1],
-                id,
-                "the live REQ is restored"
+                wire.recv_kind("REQ").await,
+                live,
+                "the live REQ is restored, filters included"
             );
             sdk.unsubscribe(subscription).await.unwrap();
             assert_eq!(sdk.relay_health().await.total_relays, 0);
@@ -9308,7 +9312,7 @@ mod tests {
         let (sdk, url, mut connections) = connected_feed(&wire).await;
         let before = connections.borrow_and_update()[&url.to_string()];
         let relay = sdk.client.relay(&url).await.unwrap().unwrap();
-        let mut native = relay.notifications_with_gaps();
+        let mut native = crate::with_gaps(relay.notifications());
         let (held_tx, held_rx) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let frontier = sdk.frontier.clone();
@@ -10389,7 +10393,10 @@ mod tests {
                             RelayMessage::Event {
                                 subscription_id, ..
                             } if subscription_id.as_str() == group_req => continue,
-                            RelayMessage::EndOfStoredEvents(id) if id.as_str() == group_req => {
+                            RelayMessage::EndOfStoredEvents {
+                                subscription_id: id,
+                                ..
+                            } if id.as_str() == group_req => {
                                 lost.fetch_add(1, Ordering::SeqCst);
                                 continue;
                             }
@@ -10448,8 +10455,9 @@ mod tests {
         assert_eq!(live_ids.len(), 2);
         assert_eq!(
             live_relay
-                .subscription_received_eose(&SubscriptionId::new(group_req.clone()))
-                .await,
+                .subscription(&SubscriptionId::new(group_req.clone()))
+                .await
+                .map(|data| data.received_eose()),
             Some(true),
             "SDK raw EOSE state is not adapter admission of the withheld range"
         );
@@ -11038,7 +11046,7 @@ mod tests {
                 } = &notification
                 {
                     match message.as_ref() {
-                        RelayMessage::EndOfStoredEvents(_) => {
+                        RelayMessage::EndOfStoredEvents { .. } => {
                             deferred.push(notification);
                             continue;
                         }
@@ -11261,9 +11269,10 @@ mod tests {
                                 old_subscription = Some(subscription_id.to_string());
                                 old_raw = Some(notification.clone());
                             }
-                            RelayMessage::EndOfStoredEvents(id)
-                                if old_subscription.as_deref() == Some(id.as_str()) =>
-                            {
+                            RelayMessage::EndOfStoredEvents {
+                                subscription_id: id,
+                                ..
+                            } if old_subscription.as_deref() == Some(id.as_str()) => {
                                 // Leave a partial replay staged in the adapter,
                                 // although the SDK has already consumed EOSE.
                                 break notification;
@@ -11343,9 +11352,10 @@ mod tests {
                                 successor_subscription = Some(subscription_id.to_string());
                                 successor_raw = Some(notification.clone());
                             }
-                            RelayMessage::EndOfStoredEvents(id)
-                                if successor_subscription.as_deref() == Some(id.as_str()) =>
-                            {
+                            RelayMessage::EndOfStoredEvents {
+                                subscription_id: id,
+                                ..
+                            } if successor_subscription.as_deref() == Some(id.as_str()) => {
                                 assert!(adapter.take_replay_status(&account).await.pending);
                                 assert!(adapter.delivery_rx.lock().await.try_recv().is_err());
                                 replay_done = true;
@@ -11547,6 +11557,9 @@ mod tests {
         let filter = NostrSdkRelayClient::plan_subscription(&subscription)
             .unwrap()
             .filter;
+        // Upstream deprecates `fetch_events` for `stream_events`; this test
+        // only needs the SDK to have seen every event once.
+        #[allow(deprecated)]
         let seen = sdk
             .client
             .fetch_events(filter.limit(SDK_RECONCILIATION_SET_LIMIT))
@@ -13376,7 +13389,8 @@ mod tests {
         let client = sdk.client().clone();
         let connect = tokio::spawn(async move {
             client
-                .try_connect_relay(stalled, Duration::from_secs(30))
+                .try_connect_relay(stalled)
+                .timeout(Duration::from_secs(30))
                 .await
         });
         let (_stream, _) = listener.accept().await.unwrap();
@@ -14776,7 +14790,7 @@ mod tests {
         // Subscribe before the relay connects: unlike `handle_notifications`,
         // this synchronous receiver is installed before the first event can
         // arrive and cannot race the test relay's immediate response.
-        let mut notifications = client.notifications_with_gaps();
+        let mut notifications = crate::with_gaps(client.notifications());
         let sdk = NostrSdkRelayClient::new(client.clone());
 
         sdk.add_subscription_relay(endpoint.clone(), &SubscriptionId::new("cache-test"))
@@ -14816,7 +14830,7 @@ mod tests {
                     NotificationUpdate::Notification(ClientNotification::Message {
                         message,
                         ..
-                    }) if matches!(*message, RelayMessage::EndOfStoredEvents(_)) => {
+                    }) if matches!(*message, RelayMessage::EndOfStoredEvents { .. }) => {
                         break;
                     }
                     NotificationUpdate::Lagged { .. } => {
@@ -15480,9 +15494,9 @@ mod tests {
                         subscription_id,
                         event: received,
                     } if subscription_id.as_ref() == id && received.id == event => stored = true,
-                    RelayMessage::EndOfStoredEvents(subscription_id)
-                        if subscription_id.as_ref() == id =>
-                    {
+                    RelayMessage::EndOfStoredEvents {
+                        subscription_id, ..
+                    } if subscription_id.as_ref() == id => {
                         return;
                     }
                     _ => {}

@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
-use nostr_sdk::NotificationUpdate;
+use nostr::nips::nip67::EoseHint;
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, Event, EventId, Filter, Kind, PublicKey, RelayMessage,
     RelayNotification, RelayStatus, RelayUrl, SingleLetterTag, SubscribeAutoCloseOptions,
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+use transport_nostr_adapter::NotificationUpdate;
 use transport_nostr_adapter::{
     FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests, KIND_MARMOT_KEY_PACKAGE,
     NostrAcquisitionCancellation as CancellationToken, RELAY_REPLAY_PAGE_LIMIT,
@@ -1051,8 +1052,9 @@ pub async fn fetch_public_events(
                 complete = false;
                 continue;
             };
-            // NIP-67 `more`: the relay cut its own answer short.
-            complete &= reply.end == FiniteEnd::Eose && !reply.more;
+            // NIP-67 `more` or `auth`: the relay cut its own answer short, or
+            // holds events back until the client authenticates.
+            complete &= reply.end == FiniteEnd::Eose && !reply.more && !reply.auth;
             for event in reply.events {
                 let from = sources.entry(event.id).or_default();
                 let relay = TransportEndpoint(url.to_string());
@@ -1120,7 +1122,9 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         // EOSE window below is the relay's answer time alone.
         match timeout(
             DIRECTORY_RELAY_CONNECT_WAIT,
-            client.try_connect_relay(url.clone(), DIRECTORY_RELAY_CONNECT_WAIT),
+            client
+                .try_connect_relay(url.clone())
+                .timeout(DIRECTORY_RELAY_CONNECT_WAIT),
         )
         .await
         {
@@ -1154,9 +1158,12 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 .fetch_watching(&relay, vec![filter], limits, &cancel, &mut auth)
                 .await;
             match &result.end {
-                // NIP-67 `more`: the relay cut its answer, so a newer event
+                // NIP-67 `more` or `auth`: the relay cut its answer or holds
+                // events back until authentication, so a newer event
                 // may be unread. The inbox probe needs only an answer.
-                FiniteEnd::Eose if result.more && query.kind != 1059 => return Err(Incomplete),
+                FiniteEnd::Eose if (result.more || result.auth) && query.kind != 1059 => {
+                    return Err(Incomplete);
+                }
                 FiniteEnd::Eose => {}
                 FiniteEnd::Closed(reason) => return Err(directory_closed_reason(reason)),
                 FiniteEnd::TimedOut => return Err(TimedOut),
@@ -1282,7 +1289,7 @@ async fn strict_fetch_endpoint(
     }
 
     let max_records = queries.iter().map(|query| query.limit).sum::<usize>();
-    let mut notifications = relay.notifications_with_gaps();
+    let mut notifications = transport_nostr_adapter::with_gaps(relay.notifications());
     let mut records = Vec::new();
     let mut seen_event_ids = HashSet::new();
     // Every subscription this connection has carried. The wire counter sees
@@ -1320,124 +1327,127 @@ async fn strict_fetch_endpoint(
         // fills this chunk's queries toward their limits. Only the returned
         // records are deduplicated across chunks.
         let mut chunk_event_ids = HashSet::new();
-        let chunk_complete =
-            timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
-                loop {
-                    let received = match notifications.next().await {
-                        Some(NotificationUpdate::Notification(RelayNotification::Event {
+        let chunk_complete = timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
+            loop {
+                let received = match notifications.next().await {
+                    Some(NotificationUpdate::Notification(RelayNotification::Event {
+                        subscription_id: received_id,
+                        event,
+                    })) if received_id == subscription_id => Some((*event, false)),
+                    Some(NotificationUpdate::Notification(RelayNotification::Message {
+                        message,
+                    })) => match *message {
+                        RelayMessage::Event {
                             subscription_id: received_id,
                             event,
-                        })) if received_id == subscription_id => Some((*event, false)),
-                        Some(NotificationUpdate::Notification(RelayNotification::Message {
-                            message,
-                        })) => match *message {
-                            RelayMessage::Event {
-                                subscription_id: received_id,
-                                event,
-                            } if received_id.as_ref() == &subscription_id => {
-                                admitted_messages += 1;
-                                Some((event.into_owned(), false))
-                            }
-                            RelayMessage::Event {
-                                subscription_id: received_id,
-                                event,
-                            } if issued.contains(received_id.as_ref()) => {
-                                admitted_messages += 1;
-                                Some((event.into_owned(), true))
-                            }
-                            RelayMessage::EndOfStoredEvents(received_id)
-                                if received_id.as_ref() == &subscription_id =>
-                            {
-                                // A filter that reaches its limit cannot establish absence,
-                                // and neither can one that reaches the page a relay
-                                // silently clamps every REQ to. A frame discarded before
-                                // notifications cannot establish negative coverage, even
-                                // after EOSE.
-                                break wire.event_count() == admitted_messages
-                                    && queries.iter().zip(&query_counts).all(|(query, count)| {
-                                        *count < query.limit.min(RELAY_REPLAY_PAGE_LIMIT)
-                                    });
-                            }
-                            RelayMessage::Closed {
-                                subscription_id: received_id,
-                                ..
-                            } if received_id.as_ref() == &subscription_id => break false,
-                            _ => None,
-                        },
-                        Some(NotificationUpdate::Notification(
-                            RelayNotification::AuthenticationFailed,
-                        )) => {
-                            break false;
+                        } if received_id.as_ref() == &subscription_id => {
+                            admitted_messages += 1;
+                            Some((event.into_owned(), false))
                         }
-                        Some(NotificationUpdate::Notification(
-                            RelayNotification::RelayStatus {
-                                status:
-                                    RelayStatus::Disconnected
-                                    | RelayStatus::Terminated
-                                    | RelayStatus::Banned,
-                            },
-                        )) => {
-                            break false;
+                        RelayMessage::Event {
+                            subscription_id: received_id,
+                            event,
+                        } if issued.contains(received_id.as_ref()) => {
+                            admitted_messages += 1;
+                            Some((event.into_owned(), true))
                         }
-                        // Lag may have dropped an inbox EVENT immediately before
-                        // EOSE. Continuing cannot establish absence safely.
-                        Some(NotificationUpdate::Lagged { .. }) | None => break false,
-                        _ => None,
-                    };
-                    if let Some((event, late)) = received {
-                        if event.verify().is_err() {
-                            continue;
-                        }
-                        let Ok(event) = NostrTransportEvent::from_nostr_event(&event) else {
-                            continue;
-                        };
-                        if late {
-                            // An earlier chunk's subscription, after that chunk
-                            // settled: keep the record, but it says nothing about
-                            // this chunk's queries.
-                            if all_queries.iter().any(|query| query.matches(&event))
-                                && records.len() < max_records
-                                && seen_event_ids.insert(event.id.clone())
-                            {
-                                records.push(DirectoryRelayEventRecord {
-                                    endpoints: vec![endpoint.clone()],
-                                    event,
+                        RelayMessage::EndOfStoredEvents {
+                            subscription_id: received_id,
+                            hints,
+                        } if received_id.as_ref() == &subscription_id => {
+                            // NIP-67: a relay that has more, or holds more back
+                            // until authentication, did not send all it has.
+                            let withheld = hints.is_some_and(|hints| {
+                                hints
+                                    .iter()
+                                    .any(|hint| matches!(hint, EoseHint::More | EoseHint::Auth))
+                            });
+                            // A filter that reaches its limit cannot establish absence,
+                            // and neither can one that reaches the page a relay
+                            // silently clamps every REQ to. A frame discarded before
+                            // notifications cannot establish negative coverage, even
+                            // after EOSE.
+                            break !withheld
+                                && wire.event_count() == admitted_messages
+                                && queries.iter().zip(&query_counts).all(|(query, count)| {
+                                    *count < query.limit.min(RELAY_REPLAY_PAGE_LIMIT)
                                 });
-                            }
-                            continue;
                         }
-                        if !queries.iter().any(|query| query.matches(&event)) {
-                            // A filter-ignoring relay cannot establish a complete empty
-                            // scoped deletion result by filling its page with other posts.
-                            if queries.iter().any(|query| query.reference.is_some()) {
-                                break false;
-                            }
-                            continue;
-                        }
-                        if !chunk_event_ids.insert(event.id.clone()) {
-                            continue;
-                        }
-                        for (query, count) in queries.iter().zip(&mut query_counts) {
-                            if query.matches(&event) {
-                                *count += 1;
-                            }
-                        }
-                        if !seen_event_ids.insert(event.id.clone()) {
-                            continue;
-                        }
-                        if records.len() < max_records {
+                        RelayMessage::Closed {
+                            subscription_id: received_id,
+                            ..
+                        } if received_id.as_ref() == &subscription_id => break false,
+                        _ => None,
+                    },
+                    Some(NotificationUpdate::Notification(
+                        RelayNotification::AuthenticationFailed,
+                    )) => {
+                        break false;
+                    }
+                    Some(NotificationUpdate::Notification(RelayNotification::RelayStatus {
+                        status: RelayStatus::Disconnected | RelayStatus::Idle | RelayStatus::Banned,
+                    })) => {
+                        break false;
+                    }
+                    // Lag may have dropped an inbox EVENT immediately before
+                    // EOSE. Continuing cannot establish absence safely.
+                    Some(NotificationUpdate::Lagged { .. }) | None => break false,
+                    _ => None,
+                };
+                if let Some((event, late)) = received {
+                    if event.verify().is_err() {
+                        continue;
+                    }
+                    let Ok(event) = NostrTransportEvent::from_nostr_event(&event) else {
+                        continue;
+                    };
+                    if late {
+                        // An earlier chunk's subscription, after that chunk
+                        // settled: keep the record, but it says nothing about
+                        // this chunk's queries.
+                        if all_queries.iter().any(|query| query.matches(&event))
+                            && records.len() < max_records
+                            && seen_event_ids.insert(event.id.clone())
+                        {
                             records.push(DirectoryRelayEventRecord {
                                 endpoints: vec![endpoint.clone()],
                                 event,
                             });
-                        } else {
+                        }
+                        continue;
+                    }
+                    if !queries.iter().any(|query| query.matches(&event)) {
+                        // A filter-ignoring relay cannot establish a complete empty
+                        // scoped deletion result by filling its page with other posts.
+                        if queries.iter().any(|query| query.reference.is_some()) {
                             break false;
                         }
+                        continue;
+                    }
+                    if !chunk_event_ids.insert(event.id.clone()) {
+                        continue;
+                    }
+                    for (query, count) in queries.iter().zip(&mut query_counts) {
+                        if query.matches(&event) {
+                            *count += 1;
+                        }
+                    }
+                    if !seen_event_ids.insert(event.id.clone()) {
+                        continue;
+                    }
+                    if records.len() < max_records {
+                        records.push(DirectoryRelayEventRecord {
+                            endpoints: vec![endpoint.clone()],
+                            event,
+                        });
+                    } else {
+                        break false;
                     }
                 }
-            })
-            .await
-            .unwrap_or(false);
+            }
+        })
+        .await
+        .unwrap_or(false);
         let _ = relay.unsubscribe(&subscription_id).await;
         // Later chunks still run: their records are usable even when this
         // chunk cannot establish absence.
@@ -1474,6 +1484,9 @@ mod tests {
         Eose,
         /// EOSE with NIP-67's `more`: the relay cut its answer short.
         More,
+        /// EOSE with NIP-67's `auth` and `finish`: the relay holds events back
+        /// until the client authenticates.
+        Auth,
         Stalled,
     }
 
@@ -1516,6 +1529,9 @@ mod tests {
                     QueryRelayEnd::Eose => replies.push(serde_json::json!(["EOSE", request[1]])),
                     QueryRelayEnd::More => {
                         replies.push(serde_json::json!(["EOSE", request[1], ["more"]]));
+                    }
+                    QueryRelayEnd::Auth => {
+                        replies.push(serde_json::json!(["EOSE", request[1], ["auth", "finish"]]));
                     }
                     QueryRelayEnd::Stalled => {}
                 }
@@ -1797,22 +1813,25 @@ mod tests {
         let event = EventBuilder::new(Kind::from(1), "kept")
             .finalize(&keys)
             .unwrap();
-        let (relay, server) = spawn_query_relay(vec![event.clone()], QueryRelayEnd::More).await;
-        let fetched = timeout(
-            Duration::from_secs(5),
-            fetch_public_events(
-                std::slice::from_ref(&relay),
-                vec![Filter::new().kind(Kind::from(1)).author(keys.public_key())],
-                8,
-            ),
-        )
-        .await
-        .expect("the relay answers")
-        .unwrap();
-        server.abort();
-        let _ = server.await;
-        assert_eq!(fetched.events, vec![event]);
-        assert!(!fetched.complete);
+        // `auth` too: the relay may hold events back from an anonymous read.
+        for end in [QueryRelayEnd::More, QueryRelayEnd::Auth] {
+            let (relay, server) = spawn_query_relay(vec![event.clone()], end).await;
+            let fetched = timeout(
+                Duration::from_secs(5),
+                fetch_public_events(
+                    std::slice::from_ref(&relay),
+                    vec![Filter::new().kind(Kind::from(1)).author(keys.public_key())],
+                    8,
+                ),
+            )
+            .await
+            .expect("the relay answers")
+            .unwrap();
+            server.abort();
+            let _ = server.await;
+            assert_eq!(fetched.events, vec![event.clone()]);
+            assert!(!fetched.complete);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2006,8 +2025,8 @@ mod tests {
         /// REQ with EOSE once it has refused, and close an inbox REQ as
         /// `auth-required:`.
         RefusesAuthOnConnect,
-        /// Answer each REQ with an EOSE that says NIP-67 `more`.
-        SaysMore,
+        /// Answer each REQ with an EOSE carrying this NIP-67 hint.
+        SaysHint(&'static str),
         /// Accept the WebSocket handshake after the first delay, then answer
         /// each REQ's EOSE after the second.
         Slow { handshake: Duration, eose: Duration },
@@ -2095,9 +2114,9 @@ mod tests {
                         }
                         replies
                     }
-                    (Some("REQ"), InspectionRelay::SaysMore) => {
+                    (Some("REQ"), InspectionRelay::SaysHint(hint)) => {
                         counted.fetch_add(1, Ordering::SeqCst);
-                        vec![serde_json::json!(["EOSE", request[1], ["more"]])]
+                        vec![serde_json::json!(["EOSE", request[1], [hint]])]
                     }
                     (Some("REQ"), script) => {
                         counted.fetch_add(1, Ordering::SeqCst);
@@ -2180,30 +2199,35 @@ mod tests {
         assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    // A relay that says it holds more may hold a newer declaration than it
-    // sent: the source is not complete. The inbox probe needs only an answer.
+    // A relay that says it holds more, or holds events back until the client
+    // authenticates, may hold a newer declaration than it sent: the source is
+    // not complete. The inbox probe needs only an answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn inspection_of_a_relay_that_says_more_is_incomplete() {
+    async fn inspection_of_a_relay_that_withholds_events_is_incomplete() {
         let author = nostr::prelude::Keys::generate().public_key().to_hex();
-        let (endpoint, _, server) = spawn_inspection_relay(InspectionRelay::SaysMore).await;
-        let request = DirectoryFetchRequest::new(
-            vec![endpoint],
-            vec![DirectoryEventQuery::new(10002, vec![author], 4)],
-        )
-        .unwrap();
-        let result = timeout(
-            Duration::from_secs(5),
-            NostrSdkDirectoryRelayFetcher::standalone().inspect_directory_events(request, None),
-        )
-        .await
-        .expect("inspection completes");
-        server.abort();
-        assert_eq!(result, Err(DirectoryInspectionError::Incomplete));
+        for hint in ["more", "auth"] {
+            let (endpoint, _, server) =
+                spawn_inspection_relay(InspectionRelay::SaysHint(hint)).await;
+            let request = DirectoryFetchRequest::new(
+                vec![endpoint],
+                vec![DirectoryEventQuery::new(10002, vec![author.clone()], 4)],
+            )
+            .unwrap();
+            let result = timeout(
+                Duration::from_secs(5),
+                NostrSdkDirectoryRelayFetcher::standalone().inspect_directory_events(request, None),
+            )
+            .await
+            .expect("inspection completes");
+            server.abort();
+            assert_eq!(result, Err(DirectoryInspectionError::Incomplete), "{hint}");
 
-        let (endpoint, _, server) = spawn_inspection_relay(InspectionRelay::SaysMore).await;
-        let result = inspect_inbox(endpoint, None).await;
-        server.abort();
-        assert_eq!(result, Ok(Vec::new()));
+            let (endpoint, _, server) =
+                spawn_inspection_relay(InspectionRelay::SaysHint(hint)).await;
+            let result = inspect_inbox(endpoint, None).await;
+            server.abort();
+            assert_eq!(result, Ok(Vec::new()), "{hint}");
+        }
     }
 
     // An authentication the relay refused while the client connected, before
@@ -2600,6 +2624,52 @@ mod tests {
             panic!("{:?}", outcome.complete_endpoints);
         };
         assert!(crate::same_relay(named.as_str(), finished.as_str()));
+    }
+
+    /// A relay whose EOSE says NIP-67 `more` or `auth` may not have sent all
+    /// it holds: its records are kept, but it does not establish absence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_directory_fetch_does_not_count_a_relay_that_withholds_events() {
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
+
+        let keys = Keys::generate();
+        let note = EventBuilder::new(Kind::TextNote, "kept")
+            .finalize(&keys)
+            .unwrap();
+        for end in [QueryRelayEnd::More, QueryRelayEnd::Auth] {
+            // Only the withholding relay holds the note, so it survives only if
+            // that relay's partial page is kept.
+            let (partial, partial_server) = spawn_query_relay(vec![note.clone()], end).await;
+            let (finished, finished_server) =
+                spawn_query_relay(Vec::new(), QueryRelayEnd::Eose).await;
+            let query = DirectoryEventQuery::new(1, vec![keys.public_key().to_hex()], 4);
+            let request =
+                DirectoryFetchRequest::new(vec![partial.clone(), finished.clone()], vec![query])
+                    .unwrap();
+            let outcome = timeout(
+                Duration::from_secs(20),
+                NostrSdkDirectoryRelayFetcher::standalone()
+                    .fetch_directory_events_with_completion(request),
+            )
+            .await
+            .expect("strict fetch completes")
+            .unwrap();
+            partial_server.abort();
+            finished_server.abort();
+            assert!(!outcome.complete);
+            let [named] = outcome.complete_endpoints.as_slice() else {
+                panic!("{:?}", outcome.complete_endpoints);
+            };
+            assert!(crate::same_relay(named.as_str(), finished.as_str()));
+            let [record] = outcome.records.as_slice() else {
+                panic!("{} records", outcome.records.len());
+            };
+            assert_eq!(record.event.id, note.id.to_hex());
+            let [source] = record.endpoints.as_slice() else {
+                panic!("{:?}", record.endpoints);
+            };
+            assert!(crate::same_relay(source.as_str(), partial.as_str()));
+        }
     }
 
     #[test]

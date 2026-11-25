@@ -29,10 +29,11 @@ use nostr_relay_builder::prelude::{
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{
     Client, ClientMessage, ClientNotification, ErrorKind as SdkErrorKind, EventBuilder, Filter,
-    FinalizeEvent, Keys, Kind, NotificationUpdate, RelayMessage, RelayOptions, RelayStatus,
-    SubscriptionId, SyncOptions, Tag,
+    FinalizeEvent, Keys, Kind, RelayMessage, RelayOptions, RelayStatus, SubscriptionId,
+    SyncOptions, Tag,
 };
 use tokio::task::JoinHandle;
+use transport_nostr_adapter::NotificationUpdate;
 use transport_nostr_adapter::{
     GROUP_BATCH_ROUTES, NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient,
     NostrSdkNotification, NostrSdkRelayClient, NostrSubscription, NostrTransportAdapter,
@@ -812,7 +813,7 @@ async fn queued_eose_after_reconnect() {
             &notification,
             NostrSdkNotification::Payload {
                 notification: ClientNotification::Message { message, .. }, ..
-            } if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(_))
+            } if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents { .. })
         ) {
             held_eose.push(notification);
         } else {
@@ -1083,7 +1084,10 @@ async fn sdk_late_replay_proof(stored: usize) {
         } = &notification
         {
             match message.as_ref() {
-                RelayMessage::EndOfStoredEvents(subscription) if subscription.as_str() == id => {
+                RelayMessage::EndOfStoredEvents {
+                    subscription_id: subscription,
+                    ..
+                } if subscription.as_str() == id => {
                     ended.insert(endpoint.to_owned());
                 }
                 RelayMessage::Event { event, .. } if endpoint == b => {

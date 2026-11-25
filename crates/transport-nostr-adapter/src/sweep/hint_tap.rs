@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use async_wsocket::Message;
 use futures::{SinkExt, StreamExt, future};
-use nostr::message::relay::{RelayMessage, RelayMessageContext};
+use nostr::message::relay::RelayMessage;
 use nostr_sdk::prelude::{ClientMessage, RelayUrl, Url};
 use nostr_sdk::transport::websocket::{WebSocketSink, WebSocketStream, WebSocketTransport};
 
@@ -449,12 +449,13 @@ const MAX_EOSE_FRAME: usize = 1024;
 /// uses. None when the SDK would not take the frame as an EOSE, so it ends no
 /// REQ.
 fn read_eose(text: &str) -> Option<String> {
-    let Ok(RelayMessage::EndOfStoredEvents(id)) =
-        RelayMessage::from_json_with_context(text.trim(), &mut RelayMessageContext::Unknown)
+    let Ok(RelayMessage::EndOfStoredEvents {
+        subscription_id, ..
+    }) = RelayMessage::from_json(text.trim())
     else {
         return None;
     };
-    Some(id.as_str().to_owned())
+    Some(subscription_id.as_str().to_owned())
 }
 
 /// The longest verb token read, quotes excluded: the longest verb the SDK

@@ -1,5 +1,8 @@
 // Test fixtures dial local relays directly; the proxy policy is crate-private.
 #![allow(clippy::disallowed_methods)]
+// These tests read a relay's stored events with nostr-sdk's `fetch_events`,
+// which upstream deprecates in favour of `stream_events`.
+#![allow(deprecated)]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
