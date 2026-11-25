@@ -75,7 +75,7 @@ where
                 let Some(mut state) = derived_state(&status, &record) else {
                     continue;
                 };
-                if matches!(state, WelcomeDeliveryState::Undeliverable { .. })
+                if status == OutboundWelcomeStatus::PastDeadline
                     && self.expired_welcome_can_still_close(&record.welcome_id)?
                 {
                     state = WelcomeDeliveryState::Sending {
@@ -98,10 +98,11 @@ where
         Ok(outcomes)
     }
 
-    /// Whether a Welcome past its deadline may still close as delivered, so
-    /// it is not yet undeliverable: a detached pass started before the
-    /// deadline holds it, or its saved relay acceptances meet its policy and
-    /// only its delivered mark is missing. The watcher's
+    /// Whether a Welcome past its deadline, not yet marked expired, may still
+    /// close as delivered, so it is not yet undeliverable: a detached pass
+    /// started before the deadline holds it, or its saved relay acceptances
+    /// meet its policy and only its delivered mark is missing. A marked one
+    /// is undeliverable for good. The watcher's
     /// `expired_welcome_may_still_close` asks the same and also makes that
     /// mark; this read changes nothing.
     fn expired_welcome_can_still_close(
@@ -370,8 +371,10 @@ fn derived_state(
                 reason: WelcomeCancelReason::Withdrawn,
             }
         }
-        // Its delivery deadline passed with no relay holding it.
-        OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired) => {
+        // Its delivery deadline passed with no relay acknowledging it,
+        // marked expired or about to be.
+        OutboundWelcomeStatus::PastDeadline
+        | OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired) => {
             WelcomeDeliveryState::Undeliverable {
                 cause: record
                     .last_problem

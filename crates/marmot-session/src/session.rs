@@ -54,6 +54,7 @@ use cgka_traits::maintenance::{
     KeyPackageLifecycleState, MaintenanceObligation, PeriodicMaintenancePolicy,
     TransportFanoutTarget, WallClock,
 };
+pub use cgka_traits::message::WelcomeExpiry;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     DeviceGroupWelcomeExpectation, MaintenanceStorage, MessageStorage, OutboundFanoutStorage,
@@ -1121,6 +1122,36 @@ impl AccountDeviceSession {
             *hold = Some(WelcomeHold::Withdrawn);
         }
         Ok(withdrawal)
+    }
+
+    /// See `Engine::expire_sent_welcome`. A detached wave reserving the
+    /// Welcome skips every attempt it has not started, as after a withdrawal.
+    pub fn expire_sent_welcome(
+        &self,
+        id: &MessageId,
+        now: Timestamp,
+    ) -> SessionResult<Option<WelcomeExpiry>> {
+        let mut holds = self
+            .detached_welcome_holds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let expiry = self.engine.expire_sent_welcome(id, now)?;
+        if expiry.is_some()
+            && let Some(hold) = holds.get_mut(id)
+        {
+            *hold = Some(WelcomeHold::Withdrawn);
+        }
+        Ok(expiry)
+    }
+
+    /// See `Engine::record_sent_welcome_expiry`.
+    pub fn record_sent_welcome_expiry(&self, id: &MessageId) -> SessionResult<()> {
+        Ok(self.engine.record_sent_welcome_expiry(id)?)
+    }
+
+    /// See `Engine::unrecorded_welcome_expiries`.
+    pub(crate) fn unrecorded_welcome_expiries(&self) -> SessionResult<Vec<MessageId>> {
+        Ok(self.engine.unrecorded_welcome_expiries()?)
     }
 
     /// See `Engine::sent_welcomes_for_key_package`.

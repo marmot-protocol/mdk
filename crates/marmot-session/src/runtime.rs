@@ -7002,6 +7002,7 @@ where
                 self.mark_welcome_delivered_best_effort(fanout.message_id());
             } else if attempted_any
                 && matches!(fanout.mls_state(), FanoutMlsState::Confirmed)
+                && !self.welcome_past_deadline_now(fanout.message_id())
                 && let Some(recipient) = welcome_recipient(&fanout.request().message)
             {
                 output.welcome_failures.push(WelcomeDeliveryFailure {
