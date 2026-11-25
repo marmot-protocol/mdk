@@ -14,14 +14,18 @@
 
 mod error;
 mod event;
+mod inbox_sealer;
 mod nip59;
 mod peeler;
 mod signer;
 
 pub use error::NostrPeelerError;
 pub use event::NostrTransportEvent;
+pub use inbox_sealer::{
+    AccountGiftWrap, NostrInboxSealer, WelcomePeelProvenance, sealed_welcome_event_len,
+};
 pub use nip59::gift_wrap_rumor;
-pub use peeler::{AccountGiftWrap, NostrMlsPeeler, WelcomePeelProvenance};
+pub use peeler::NostrMlsPeeler;
 pub use signer::{MarmotNostrSigner, MarmotSignerError, SdkSigner, SignerFuture};
 
 /// Nostr kind used by Marmot group messages.

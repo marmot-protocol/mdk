@@ -28,15 +28,12 @@ async fn two_admins(
         })
         .await
         .unwrap();
-    let SendResult::GroupCreated {
-        pending,
-        mut welcomes,
-    } = created
-    else {
+    let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("legacy create")
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    join_raw(&mut bob, welcomes.remove(0)).await.unwrap();
     (alice, alice_storage, bob, gid)
 }
 
@@ -170,15 +167,12 @@ async fn step_down_and_leave_refuses_the_last_admin_and_is_a_leave_for_a_member(
         })
         .await
         .unwrap();
-    let SendResult::GroupCreated {
-        pending,
-        mut welcomes,
-    } = created
-    else {
+    let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("legacy create")
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    join_raw(&mut bob, welcomes.remove(0)).await.unwrap();
 
     let refused = alice
         .send(SendIntent::StepDownAndLeave {

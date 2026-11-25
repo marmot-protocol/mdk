@@ -86,7 +86,7 @@ async fn failed_private_issuance_preserves_keys_and_stock_through_reopen_and_ret
         storage,
         b"alice",
         &[ACCOUNT_DEVICES_COMPONENT_ID],
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
         None,
     );
     let public = phone.engine.fresh_key_package().await.unwrap();
@@ -176,7 +176,7 @@ async fn failed_private_issuance_preserves_keys_and_stock_through_reopen_and_ret
         storage,
         b"alice",
         &[ACCOUNT_DEVICES_COMPONENT_ID],
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
         None,
     );
     assert_eq!(
@@ -240,7 +240,7 @@ async fn failed_private_issuance_preserves_keys_and_stock_through_reopen_and_ret
         storage,
         b"alice",
         &[ACCOUNT_DEVICES_COMPONENT_ID],
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
         None,
     );
     assert_eq!(
@@ -516,7 +516,7 @@ async fn outdated_private_key_packages_stop_counting() {
         .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(supported)
-        .peeler(Box::<MockPeeler>::default())
+        .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
     assert_eq!(engine.uncount_outdated_private_key_packages().unwrap(), 3);
@@ -551,57 +551,6 @@ async fn an_ordinary_welcome_never_consumes_a_private_key_package() {
     );
     assert_eq!(phone.engine.issued_private_key_packages().unwrap().len(), 1);
     assert_eq!(phone.storage.stored_key_package_bundles().unwrap().len(), 1);
-}
-
-/// A Welcome that cannot be staged refuses its Add before anything is
-/// written. Bob invites the laptop with a private KeyPackage, which names no
-/// publication, so a peeler that wraps a Welcome only for a published
-/// KeyPackage, as the Nostr binding does, cannot wrap it. Bob's chat keeps
-/// every row and its record as they were, and no commit is left pending: his
-/// next send goes through.
-#[tokio::test]
-async fn an_invite_whose_welcome_cannot_be_wrapped_writes_nothing() {
-    let mut bob = device_with_peeler(b"bob", true, Box::<PublishedWelcomesOnly>::default());
-    let mut laptop = device(b"alice", true);
-    laptop
-        .engine
-        .issue_private_key_packages(&SLOT, 1, None, NOW)
-        .unwrap();
-    let private = private_key_packages(&laptop).remove(0);
-    let (gid, _) = create(&mut bob, vec![], vec![]).await.unwrap();
-    let rows = bob
-        .storage
-        .list_messages(&gid, cgka_traits::types::EpochId(0))
-        .unwrap();
-    let record = bob.engine.group_record(&gid).unwrap();
-
-    let refused = bob
-        .engine
-        .send(SendIntent::Invite {
-            group_id: gid.clone(),
-            key_packages: vec![private],
-            initial_admins: vec![],
-        })
-        .await;
-    assert!(
-        matches!(refused, Err(EngineError::Peeler(_))),
-        "{refused:?}"
-    );
-    assert_eq!(
-        bob.storage
-            .list_messages(&gid, cgka_traits::types::EpochId(0))
-            .unwrap(),
-        rows
-    );
-    assert_eq!(bob.engine.group_record(&gid).unwrap(), record);
-    send_commit(
-        &mut bob,
-        SendIntent::SelfUpdate {
-            group_id: gid.clone(),
-        },
-        &gid,
-    )
-    .await;
 }
 
 fn sibling_welcome(
@@ -805,6 +754,7 @@ async fn remove_and_add_back(
     else {
         panic!("expected GroupEvolution")
     };
+    let welcomes = seal_and_bind(&mut phone.engine, &welcomes);
     phone.engine.confirm_published(pending).await.unwrap();
     (remove, welcomes.into_iter().next().unwrap())
 }
@@ -1493,7 +1443,7 @@ async fn a_siblings_device_group_leaf_tells_whether_its_key_packages_could_serve
             .protocol_profile(ProtocolProfile::Current)
             .feature_registry(registry())
             .supported_app_components(supported)
-            .peeler(Box::<MockPeeler>::default())
+            .peeler(Box::new(MockPeeler))
             .build()
             .unwrap(),
         storage,

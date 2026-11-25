@@ -9,30 +9,32 @@ fn nostr_device_session(
     key: &SqlCipherKey,
     account: &[u8],
 ) -> AccountDeviceSession {
-    nostr_device_session_with_peeler(path, key, account, Box::new(nostr_peeler(account)))
+    nostr_device_session_with_sealer(path, key, account, Arc::new(nostr_sealer(account)))
 }
 
-fn nostr_peeler(account: &[u8]) -> transport_nostr_peeler::NostrMlsPeeler {
-    transport_nostr_peeler::NostrMlsPeeler::default()
-        .with_welcome_signer(deterministic_nostr_keys(account))
+fn nostr_sealer(account: &[u8]) -> transport_nostr_peeler::NostrInboxSealer {
+    transport_nostr_peeler::NostrInboxSealer::new(
+        Arc::new(deterministic_nostr_keys(account)),
+        Arc::new(marmot_session::SystemWallClock),
+    )
 }
 
 async fn recovery_control(
     account: &[u8],
     carrier: &TransportMessage,
 ) -> cgka_traits::AuthenticatedGroupRecovery {
-    let peeled = nostr_peeler(account).peel_welcome(carrier).await.unwrap();
+    let peeled = nostr_sealer(account).unseal(carrier).await.unwrap();
     let PeeledContent::GroupRecovery { recovery } = peeled.content else {
         panic!("expected authenticated recovery control");
     };
     *recovery
 }
 
-fn nostr_device_session_with_peeler(
+fn nostr_device_session_with_sealer(
     path: impl Into<std::path::PathBuf>,
     key: &SqlCipherKey,
     account: &[u8],
-    peeler: Box<dyn TransportPeeler>,
+    sealer: Arc<dyn InboxSealer>,
 ) -> AccountDeviceSession {
     use cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID;
     let keys = deterministic_nostr_keys(account);
@@ -43,7 +45,8 @@ fn nostr_device_session_with_peeler(
             path,
             SqlCipherKey::new(key.as_secret_str()).unwrap(),
             pad32(account),
-            peeler,
+            Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+            sealer,
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
         .protocol_profile(ProtocolProfile::Current)
@@ -91,7 +94,17 @@ impl TransportRoutingPolicy for SharedRouting {
         &self,
         message: &TransportMessage,
     ) -> Result<TransportPublishTarget, TransportRoutingError> {
-        TransportRoutingPolicy::publish_target(&*self.0.lock().unwrap(), message)
+        match &message.envelope {
+            TransportEnvelope::Welcome { recipient } => self.inbox_target(recipient),
+            _ => self.0.lock().unwrap().publish_target(message),
+        }
+    }
+
+    fn inbox_target(
+        &self,
+        recipient: &MemberId,
+    ) -> Result<TransportPublishTarget, TransportRoutingError> {
+        self.0.lock().unwrap().inbox_target(recipient)
     }
 
     fn required_acks(&self, target: &TransportPublishTarget) -> usize {
@@ -241,9 +254,7 @@ fn joins(results: &[marmot_session::IngestEffects]) -> Vec<(GroupId, MessageId)>
 /// Peel `welcome` as a device of `account` would: the KeyPackage publication
 /// its rumor names, and the MLS Welcome it carries.
 async fn rumor(welcome: &TransportMessage, account: &[u8]) -> (MessageId, Vec<u8>) {
-    let (peeled, provenance) = transport_nostr_peeler::NostrMlsPeeler::default()
-        .with_welcome_signer(deterministic_nostr_keys(account))
-        .peel_welcome_with_provenance(welcome)
+    let (peeled, provenance) = nostr_sealer(account).unseal_with_provenance(welcome)
         .await
         .unwrap();
     let PeeledContent::Welcome { bytes, .. } = peeled.content else {
@@ -264,19 +275,19 @@ async fn rewrapped(
     welcome_bytes: Vec<u8>,
     key_package_event_id: MessageId,
 ) -> TransportMessage {
-    transport_nostr_peeler::NostrMlsPeeler::default()
-        .with_welcome_signer(deterministic_nostr_keys(inviter))
-        .wrap_welcome_with_metadata(
-            &EncryptedPayload {
+    nostr_sealer(inviter)
+        .seal_welcome(&OutboundWelcome {
+            local_id: MessageId::new(Vec::new()),
+            recipient: MemberId::new(pad32(account)),
+            payload: EncryptedPayload {
                 ciphertext: welcome_bytes,
                 aad: Vec::new(),
             },
-            &MemberId::new(pad32(account)),
-            &cgka_traits::engine::WelcomeMetadata {
+            metadata: Some(cgka_traits::engine::WelcomeMetadata {
                 key_package_event_id,
                 relays: vec![TransportEndpoint("wss://group.example".into())],
-            },
-        )
+            }),
+        })
         .await
         .unwrap()
 }
@@ -343,8 +354,9 @@ async fn create_group(
     let welcomes = match &created.effects.publish[..] {
         [PublishWork::FoundingGroupCreated { welcomes }] => welcomes.clone(),
         [PublishWork::GroupCreated { welcomes, pending }] => {
+            let welcomes = seal_and_bind(inviter, welcomes).await;
             inviter.confirm_published(*pending).await.unwrap();
-            welcomes.clone()
+            welcomes
         }
         _ => panic!("expected group creation publish work"),
     };
@@ -361,8 +373,9 @@ async fn evolve(inviter: &mut AccountDeviceSession, intent: SendIntent) -> Vec<T
     else {
         panic!("expected one group evolution");
     };
+    let welcomes = seal_and_bind(inviter, welcomes).await;
     inviter.confirm_published(*pending).await.unwrap();
-    welcomes.clone()
+    welcomes
 }
 
 /// A device's KeyPackage records changed only by the consumption of
@@ -385,35 +398,12 @@ fn assert_only_consumed(
 
 /// Peels as releases before this check did: the rumor's KeyPackage claim never
 /// reached the engine.
-struct ClaimlessPeeler(transport_nostr_peeler::NostrMlsPeeler);
+struct ClaimlessSealer(transport_nostr_peeler::NostrInboxSealer);
 
 #[async_trait]
-impl TransportPeeler for ClaimlessPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        message: &cgka_traits::GroupRecoveryMessage,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.0.wrap_group_recovery(message, recipient).await
-    }
-
-    fn prepare_group_message<'a>(
-        &self,
-        msg: &'a TransportMessage,
-    ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
-        self.0.prepare_group_message(msg)
-    }
-
-    async fn peel_group_message(
-        &self,
-        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        self.0.peel_group_message(msg, ctx).await
-    }
-
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        let mut peeled = self.0.peel_welcome(msg).await?;
+impl InboxSealer for ClaimlessSealer {
+    async fn unseal(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        let mut peeled = self.0.unseal(msg).await?;
         if let PeeledContent::Welcome {
             key_package_event_id,
             ..
@@ -424,20 +414,20 @@ impl TransportPeeler for ClaimlessPeeler {
         Ok(peeled)
     }
 
-    async fn wrap_group_message(
-        &self,
-        payload: &EncryptedPayload,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.0.wrap_group_message(payload, ctx).await
+    async fn seal_welcome(&self, welcome: &OutboundWelcome) -> Result<TransportMessage, PeelerError> {
+        self.0.seal_welcome(welcome).await
     }
 
-    async fn wrap_welcome(
+    async fn seal_group_recovery(
         &self,
-        payload: &EncryptedPayload,
+        message: &cgka_traits::GroupRecoveryMessage,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
-        self.0.wrap_welcome(payload, recipient).await
+        self.0.seal_group_recovery(message, recipient).await
+    }
+
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        self.0.sealed_welcome_len(welcome)
     }
 }
 
@@ -800,11 +790,11 @@ async fn rejoin_before_the_upgrade(
 ) -> (Device, GroupId, TransportMessage, TransportMessage) {
     let path = dir.path().join("alice-phone.sqlite");
     let mut phone = Device::with_session(
-        nostr_device_session_with_peeler(
+        nostr_device_session_with_sealer(
             path,
             key,
             b"alice",
-            Box::new(ClaimlessPeeler(nostr_peeler(b"alice"))),
+            Arc::new(ClaimlessSealer(nostr_sealer(b"alice"))),
         ),
         cgka_traits::engine::KeyPackage::new(Vec::new()),
     );
@@ -983,7 +973,8 @@ mod same_account_welcome {
                 storage.clone(),
                 Duration::ZERO,
                 pad32(account),
-                Box::new(nostr_peeler(account)),
+                Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+                Arc::new(nostr_sealer(account)),
             )
             .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
                 keys: deterministic_nostr_keys(account),

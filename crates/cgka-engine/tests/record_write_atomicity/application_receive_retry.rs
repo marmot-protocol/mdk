@@ -265,17 +265,14 @@ async fn direct_application_recovers_after_pending_output_write_failure() {
         })
         .await
         .unwrap();
-    let SendResult::GroupCreated {
-        pending,
-        mut welcomes,
-    } = result
-    else {
+    let SendResult::GroupCreated { pending, welcomes } = result else {
         panic!("expected GroupCreated, got {result:?}");
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
     let welcome = welcomes.remove(0);
     let welcome_id = welcome.id.clone();
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     bob.drain_events();
     storage
         .delete_pending_application_events(&[welcome_id])
@@ -690,6 +687,7 @@ async fn welcome_state_audit_waits_for_the_callers_outermost_transaction() {
     let SendResult::GroupCreated { pending, welcomes } = result else {
         panic!("expected a legacy founding Welcome");
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
     let id = &welcomes[0].id;
     let before = audit_transitions(&audit_path, id);

@@ -12,8 +12,8 @@
 //! [`EpochSealedPeeler`] models exactly that: it seals on wrap and unseals on
 //! peel with the group-event exporter secret of the supplied context, and
 //! returns [`PeelerError::DecryptFailed`] when the receiving context is a
-//! different epoch state. Welcomes stay pass-through, mirroring NIP-59 welcome
-//! wrapping, which is addressed to a recipient rather than to an epoch.
+//! different epoch state. Welcomes never reach it: the account inbox is the
+//! session's, and tests seal Welcomes with `support::raw_inbox`.
 //!
 //! Install it with `EngineBuilder::peeler(Box::new(EpochSealedPeeler))` to opt
 //! a test into production epoch visibility. The engine already wraps every
@@ -23,8 +23,6 @@
 
 #![allow(dead_code)]
 
-use async_trait::async_trait;
-use cgka_traits::engine::WelcomeMetadata;
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -32,7 +30,7 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::MessageId;
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use sha2::{Digest, Sha256};
@@ -125,19 +123,8 @@ pub fn unseal_group_payload(
         .map_err(|_| PeelerError::DecryptFailed)
 }
 
-#[async_trait]
 impl TransportPeeler for EpochSealedPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
@@ -152,27 +139,7 @@ impl TransportPeeler for EpochSealedPeeler {
         })
     }
 
-    /// Welcomes stay pass-through, and the invitation creation time is taken
-    /// from the envelope timestamp — the same shape the Nostr binding has,
-    /// where `created_at` is read off the sender-signed welcome rumor. Tests
-    /// that care about that time stamp the welcome they route; an unstamped one
-    /// keeps the zero `wrap_welcome` writes and surfaces `None`, which is what
-    /// a transport that cannot establish the value reports.
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: (msg.timestamp.0 != 0).then_some(msg.timestamp),
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
@@ -188,31 +155,5 @@ impl TransportPeeler for EpochSealedPeeler {
                 transport_group_id: ctx.transport_group_id().unwrap_or_default().to_vec(),
             },
         })
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: transport_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("epoch-sealed".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        })
-    }
-
-    async fn wrap_welcome_with_metadata(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-        _metadata: &WelcomeMetadata,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.wrap_welcome(payload, recipient).await
     }
 }

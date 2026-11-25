@@ -113,9 +113,9 @@ async fn phantom_tie(passive_members: usize) -> PhantomTie {
     let SendResult::GroupCreated { pending, welcomes } = create else {
         panic!("expected GroupCreated");
     };
+    let welcomes = seal_and_bind(&mut x, &welcomes);
     x.confirm_published(pending).await.unwrap();
-    rival
-        .join_welcome(welcome_for(&welcomes, rival_name))
+    join_raw(&mut rival, welcome_for(&welcomes, rival_name))
         .await
         .unwrap();
 

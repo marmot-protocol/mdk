@@ -19,6 +19,7 @@ use cgka_traits::storage::{DeferredPeelGeneration, DeferredPeelGenerationStorage
 use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::AtomicUsize;
+use support::raw_inbox::raw_unseal;
 
 /// Carol observes a group Alice and Bob administer.
 struct Fork {
@@ -54,17 +55,8 @@ struct UnreadablePeeler {
     epochs: Option<Arc<Mutex<Vec<EpochId>>>>,
 }
 
-#[async_trait]
 impl TransportPeeler for UnreadablePeeler {
-    async fn wrap_group_recovery(
-        &self,
-        message: &cgka_traits::GroupRecoveryMessage,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_group_recovery(message, recipient).await
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
@@ -75,24 +67,12 @@ impl TransportPeeler for UnreadablePeeler {
         Err(PeelerError::DecryptFailed)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_welcome(payload, recipient).await
+        MockPeeler.wrap_group_message(payload, ctx)
     }
 }
 
@@ -145,15 +125,15 @@ async fn rival_invites_with_storage(storage: SqliteAccountStorage) -> Fork {
     let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("legacy fixture creates through a pending publish");
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice
         .confirm_published(pending)
         .await
         .expect("confirm create");
-    bob.join_welcome(welcome_for(&welcomes, b"bob-rewind-fault"))
+    join_raw(&mut bob, welcome_for(&welcomes, b"bob-rewind-fault"))
         .await
         .expect("bob joins");
-    carol
-        .join_welcome(welcome_for(&welcomes, CAROL))
+    join_raw(&mut carol, welcome_for(&welcomes, CAROL))
         .await
         .expect("carol joins");
     let (alice_commit, alice_pending) = invite(&mut alice, &group, b"david-rewind-fault").await;
@@ -931,6 +911,7 @@ async fn readd_welcome(fork: &mut Fork) -> TransportMessage {
     else {
         panic!("expected a staged evolution, got {readd:?}");
     };
+    let welcomes = seal_and_bind(&mut fork.alice, &welcomes);
     fork.alice
         .confirm_published(pending)
         .await
@@ -949,7 +930,7 @@ async fn a_failed_restore_refuses_a_rejoin_until_the_next_open() {
         .expect("alice confirms her invite");
     let welcome = readd_welcome(&mut fork).await;
     let anchor_state = image(&fork.storage, &fork.group);
-    let joined = fork.carol.join_welcome(welcome).await;
+    let joined = join_raw(&mut fork.carol, welcome).await;
     assert!(
         matches!(&joined, Err(EngineError::InvalidTransition(refused))
             if refused.from == "RewindRestoreFailed"),
@@ -976,7 +957,7 @@ async fn a_failed_restore_hides_a_rejoin_offer_until_the_next_open() {
         .await
         .expect("alice confirms her invite");
     let welcome = readd_welcome(&mut fork).await;
-    let held = fork.carol.join_welcome(welcome).await;
+    let held = join_raw(&mut fork.carol, welcome).await;
     assert!(
         matches!(&held, Err(EngineError::InvalidTransition(refused))
             if refused.from == "ActiveMember"),
@@ -1016,9 +997,10 @@ async fn a_failed_restore_hides_a_rejoin_offer_until_the_next_open() {
         "the refusal is a fact the group's change generation holds"
     );
     let anchor_state = image(&fork.storage, &fork.group);
+    let stored = fork.carol.stored_welcome(&offer.message_id).unwrap();
     unknown(
         fork.carol
-            .confirm_group_rejoin(&offer.message_id, &live_token)
+            .confirm_group_rejoin(&offer.message_id, &live_token, raw_unseal(&stored))
             .await,
         "confirm_group_rejoin",
         &fork.group,
@@ -1187,7 +1169,7 @@ async fn a_welcome_before_hydration_reads_live_state(how: Stranded) {
         .expect("alice confirms her invite");
     let welcome = readd_welcome(&mut fork).await;
     let mut reopened = reopen_without_hydrating(&fork);
-    let joined = reopened.join_welcome(welcome).await;
+    let joined = join_raw(&mut reopened, welcome).await;
     assert!(
         matches!(&joined, Err(EngineError::InvalidTransition(refused))
             if refused.from == "ActiveMember"),

@@ -1,7 +1,6 @@
 // Tests read stored records and OpenMLS state directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
-use async_trait::async_trait;
 use cgka_engine::{Engine, EngineBuilder, RollbackPass};
 use cgka_traits::capabilities::{CapabilityRequirement, Feature, GroupCapabilities};
 use cgka_traits::engine::{
@@ -43,6 +42,7 @@ use storage_sqlite::SqliteAccountStorage;
 mod rewind_restore_fault;
 mod support;
 use support::proof_signer;
+use support::raw_inbox::{join_raw, seal_and_bind};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     use k256::schnorr::SigningKey;
@@ -83,19 +83,8 @@ fn hash_id(bytes: &[u8]) -> MessageId {
     MessageId::new(h.finish().to_be_bytes().to_vec())
 }
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -111,21 +100,7 @@ impl TransportPeeler for MockPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -138,23 +113,6 @@ impl TransportPeeler for MockPeeler {
             source: TransportSource("mock".into()),
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: vec![],
-            },
-        })
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
             },
         })
     }
@@ -1664,7 +1622,11 @@ async fn welcome_delivery_accessors_hide_quarantined_groups() {
         .expect("create current-profile group");
     let welcome_id = match result {
         SendResult::FoundingGroupCreated { welcomes } => {
-            welcomes.into_iter().next().expect("founding Welcome").id
+            seal_and_bind(&mut alice, &welcomes)
+                .into_iter()
+                .next()
+                .expect("founding Welcome")
+                .id
         }
         other => panic!("expected founding group creation, got {other:?}"),
     };
@@ -2450,8 +2412,9 @@ async fn quarantined_alice_with_live_bob() -> (
     let SendResult::GroupCreated { pending, welcomes } = send_result else {
         panic!("expected group-created send result");
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.expect("confirm");
-    bob.join_welcome(welcome_for(&welcomes, b"bob-quarantine"))
+    join_raw(&mut bob, welcome_for(&welcomes, b"bob-quarantine"))
         .await
         .expect("bob joins");
     bob.drain_events();
@@ -2817,9 +2780,9 @@ async fn rejoin_welcome_clears_quarantine() {
     else {
         panic!("expected group evolution with welcomes");
     };
+    let welcomes = seal_and_bind(&mut bob, &welcomes);
     bob.confirm_published(pending).await.expect("bob confirms");
-    let joined = alice
-        .join_welcome(welcome_for(&welcomes, b"alice-rejoin"))
+    let joined = join_raw(&mut alice, welcome_for(&welcomes, b"alice-rejoin"))
         .await
         .expect("authenticated re-join succeeds for a quarantined id");
     assert_eq!(joined, group_id);
@@ -2918,9 +2881,9 @@ async fn rejoin_welcome_replays_and_retires_quarantine_retained_input() {
     else {
         panic!("expected group evolution with welcomes");
     };
+    let welcomes = seal_and_bind(&mut bob, &welcomes);
     bob.confirm_published(pending).await.expect("bob confirms");
-    alice
-        .join_welcome(welcome_for(&welcomes, b"alice-replay"))
+    join_raw(&mut alice, welcome_for(&welcomes, b"alice-replay"))
         .await
         .expect("re-join succeeds");
 

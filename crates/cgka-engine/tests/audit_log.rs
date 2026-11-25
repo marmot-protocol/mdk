@@ -7,15 +7,13 @@
 //!      (`IngestEntry` + `IngestOutcome`).
 //!   3. Default engine construction (no recorder) is a no-op — the audit
 //!      paths cost nothing when forensics is off.
-//!   4. A send or group creation dropped mid-await leaves no operation
+//!   4. A group creation dropped mid-await leaves no operation
 //!      context behind for later rows that carry none of their own.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use cgka_engine::{Engine, EngineBuilder};
-use cgka_traits::CgkaEngine;
 use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -25,6 +23,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{GroupId, MemberId, MessageId};
+use cgka_traits::{CgkaEngine, EventSizeClass, OutboundWelcome, WelcomeSizeCheck};
 use marmot_forensics::{
     AuditEvent, AuditEventContext, AuditEventKind, AuditHumanActionContext, AuditRecord,
     AuditTransportContext, AuditTransportWire, ForensicRecorder, JsonlRecorder, SharedRecorder,
@@ -33,6 +32,7 @@ use storage_sqlite::SqliteAccountStorage;
 
 mod support;
 use support::proof_signer;
+use support::raw_inbox::{join_raw, seal_and_bind};
 
 fn valid_identity(seed: &[u8]) -> Vec<u8> {
     use k256::schnorr::SigningKey;
@@ -54,19 +54,8 @@ fn valid_identity(seed: &[u8]) -> Vec<u8> {
 
 struct StubPeeler;
 
-#[async_trait]
 impl TransportPeeler for StubPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -74,78 +63,12 @@ impl TransportPeeler for StubPeeler {
         Err(PeelerError::Backend("test peeler".into()))
     }
 
-    async fn peel_welcome(&self, _msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Err(PeelerError::Backend("test peeler".into()))
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         _payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
         Err(PeelerError::Backend("test peeler".into()))
-    }
-
-    async fn wrap_welcome(
-        &self,
-        _payload: &EncryptedPayload,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Backend("test peeler".into()))
-    }
-}
-
-/// Parks every outbound wrap forever once the engine reaches it, so a test can
-/// stop a send or a group creation at the transport await deterministically.
-struct ParkingPeeler {
-    reached: Arc<AtomicBool>,
-}
-
-impl ParkingPeeler {
-    async fn park(&self) -> Result<TransportMessage, PeelerError> {
-        self.reached.store(true, Ordering::SeqCst);
-        std::future::pending().await
-    }
-}
-
-#[async_trait]
-impl TransportPeeler for ParkingPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
-        &self,
-        _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        _ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        Err(PeelerError::Backend("test peeler".into()))
-    }
-
-    async fn peel_welcome(&self, _msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Err(PeelerError::Backend("test peeler".into()))
-    }
-
-    async fn wrap_group_message(
-        &self,
-        _payload: &EncryptedPayload,
-        _ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.park().await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        _payload: &EncryptedPayload,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.park().await
     }
 }
 
@@ -660,15 +583,12 @@ async fn ignored_replays_record_only_their_outcome() {
         .create_group(group_request(vec![bob_key_package]))
         .await
         .unwrap();
-    let SendResult::GroupCreated {
-        pending,
-        mut welcomes,
-    } = created
-    else {
+    let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("expected group creation");
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    join_raw(&mut bob, welcomes.remove(0)).await.unwrap();
     let send = async |engine: &mut Engine<SqliteAccountStorage>, body: &str| {
         let payload = MarmotAppEvent::new(
             hex::encode(engine.self_id().as_slice()),
@@ -967,65 +887,20 @@ async fn queued_application_audit_correlates_preparation_after_restart() {
     assert_ne!(operation(queued[1]), operation(application[2]));
 }
 
-/// A send dropped while suspended at the transport await must not leave its
-/// audit context behind: the next rows without a context of their own (an
-/// engine row and an app row) carry none.
-#[tokio::test]
-async fn dropping_a_suspended_send_leaves_no_operation_context_behind() {
-    use cgka_traits::{MarmotAppEvent, SendIntent};
-
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("audit.jsonl");
-    let audit = jsonl_audit(&path, "test-engine-dropped-send");
-    let reached = Arc::new(AtomicBool::new(false));
-    let mut engine = current_profile_engine(
-        b"dropped-send",
-        Box::new(ParkingPeeler {
-            reached: reached.clone(),
-        }),
-        Some(&audit),
-    );
-    // A founding group with no invitees wraps nothing, so it completes.
-    let (group_id, _) = engine
-        .create_group(group_request(vec![]))
-        .await
-        .expect("create group");
-    assert!(!reached.load(Ordering::SeqCst));
-
-    let payload = MarmotAppEvent::new(hex::encode(engine.self_id().as_slice()), 1, 9, vec![], "hi")
-        .encode()
-        .unwrap();
-    let mut send = Box::pin(engine.send_with_audit_context(
-        SendIntent::AppMessage {
-            group_id,
-            payload,
-            expected_epoch: None,
-            only_to_members: None,
-        },
-        Some(human_action_context("send_message")),
-    ));
-    assert!(
-        futures::poll!(send.as_mut()).is_pending(),
-        "the send must suspend at the parked wrap"
-    );
-    assert!(
-        reached.load(Ordering::SeqCst),
-        "the send is suspended at the transport await, not before it"
-    );
-    drop(send);
-
-    record_context_free_rows(&engine, &audit);
-    drop((engine, audit));
-
-    assert_operation_context_ends_with_operation(
-        &read_events(&path),
-        |kind| matches!(kind, AuditEventKind::SendEntry { .. }),
-        "send_message",
-    );
+#[derive(Default)]
+struct ParkingWelcomeSizeCheck {
+    started: AtomicBool,
 }
 
-/// A group creation dropped while suspended at the Welcome wrap must not leave
-/// its audit context behind.
+#[async_trait]
+impl WelcomeSizeCheck for ParkingWelcomeSizeCheck {
+    async fn oversized_welcome(&self, _welcomes: &[OutboundWelcome]) -> Option<EventSizeClass> {
+        self.started.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+/// Dropping a group creation during the Welcome size check clears its audit context.
 #[tokio::test]
 async fn dropping_a_suspended_group_creation_leaves_no_operation_context_behind() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1033,26 +908,21 @@ async fn dropping_a_suspended_group_creation_leaves_no_operation_context_behind(
     let audit = jsonl_audit(&path, "test-engine-dropped-create");
     let mut bob = current_profile_engine(b"dropped-create-bob", Box::new(StubPeeler), None);
     let bob_kp = bob.fresh_key_package().await.expect("bob key package");
-    let reached = Arc::new(AtomicBool::new(false));
-    let mut engine = current_profile_engine(
-        b"dropped-create",
-        Box::new(ParkingPeeler {
-            reached: reached.clone(),
-        }),
-        Some(&audit),
-    );
+    let size_check = ParkingWelcomeSizeCheck::default();
+    let mut engine = current_profile_engine(b"dropped-create", Box::new(StubPeeler), Some(&audit));
 
-    let mut create = Box::pin(engine.create_group_with_audit_context(
-        group_request(vec![bob_kp]),
-        Some(human_action_context("create_group")),
-    ));
-    assert!(
-        futures::poll!(create.as_mut()).is_pending(),
-        "the creation must suspend at the parked Welcome wrap"
+    let mut create = Box::pin(
+        engine.create_group_with_optional_app_components_and_audit_context(
+            group_request(vec![bob_kp]),
+            Vec::new(),
+            Some(&size_check),
+            Some(human_action_context("create_group")),
+        ),
     );
+    assert!(futures::poll!(create.as_mut()).is_pending());
     assert!(
-        reached.load(Ordering::SeqCst),
-        "the creation is suspended at the transport await, not before it"
+        size_check.started.load(Ordering::SeqCst),
+        "the creation suspended in the Welcome size check"
     );
     drop(create);
 

@@ -24,14 +24,12 @@ use cgka_traits::app_components::{
     NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, default_group_components, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
-#[cfg(test)]
-use cgka_traits::engine::WelcomeMetadata;
 use cgka_traits::engine::{
-    CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
+    CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, OutboundWelcome, SealedWelcome,
+    SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
-#[cfg(test)]
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -40,7 +38,7 @@ use cgka_traits::ingest::PeeledMessage;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent};
 #[cfg(test)]
 use cgka_traits::peeler::GroupMessageMetadata;
-use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::peeler::{InboxSealer, TransportPeeler};
 use cgka_traits::storage::{ConvergencePassStorage, MessageStorage, StorageProvider};
 #[cfg(test)]
 use cgka_traits::transport::EncryptedPayload;
@@ -55,7 +53,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
-use transport_nostr_peeler::NostrMlsPeeler;
+use transport_nostr_peeler::{NostrInboxSealer, NostrMlsPeeler};
 
 const STORAGE_MODE_ENV: &str = "MDK_CONFORMANCE_SQLITE_STORAGE";
 const TEMP_FILE_KEY: &str = "marmot-conformance-sqlite-temp-key";
@@ -447,7 +445,6 @@ mod tests {
         decryptions: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
-    #[async_trait::async_trait]
     impl TransportPeeler for CountedNostrPeeler {
         fn prepare_group_message<'a>(
             &self,
@@ -463,45 +460,22 @@ mod tests {
             self.inner.prepare_group_message(msg)
         }
 
-        async fn peel_group_message(
+        fn peel_group_message(
             &self,
             prepared: &cgka_traits::peeler::PreparedGroupMessage<'_>,
             ctx: &GroupContextSnapshot,
         ) -> Result<cgka_traits::PeeledMessage, cgka_traits::PeelerError> {
             self.decryptions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.inner.peel_group_message(prepared, ctx).await
+            self.inner.peel_group_message(prepared, ctx)
         }
 
-        async fn peel_welcome(
-            &self,
-            msg: &TransportMessage,
-        ) -> Result<cgka_traits::PeeledMessage, cgka_traits::PeelerError> {
-            self.inner.peel_welcome(msg).await
-        }
-
-        async fn wrap_group_recovery(
-            &self,
-            msg: &cgka_traits::GroupRecoveryMessage,
-            recipient: &MemberId,
-        ) -> Result<TransportMessage, cgka_traits::PeelerError> {
-            self.inner.wrap_group_recovery(msg, recipient).await
-        }
-
-        async fn wrap_group_message(
+        fn wrap_group_message(
             &self,
             payload: &EncryptedPayload,
             ctx: &GroupContextSnapshot,
         ) -> Result<TransportMessage, cgka_traits::PeelerError> {
-            self.inner.wrap_group_message(payload, ctx).await
-        }
-
-        async fn wrap_welcome(
-            &self,
-            payload: &EncryptedPayload,
-            recipient: &MemberId,
-        ) -> Result<TransportMessage, cgka_traits::PeelerError> {
-            self.inner.wrap_welcome(payload, recipient).await
+            self.inner.wrap_group_message(payload, ctx)
         }
     }
 
@@ -580,7 +554,6 @@ mod tests {
                     },
                     &unrelated,
                 )
-                .await
                 .unwrap();
             assert!(matches!(
                 receiver.ingest(message).await.unwrap(),
@@ -817,36 +790,22 @@ mod tests {
         // The peeler models opaque ciphertext, not scheduler output. All
         // replay, snapshots, scheduling and guard assessment use the real engine.
         struct OpaquePeeler(NostrMlsPeeler);
-        #[async_trait::async_trait]
         impl TransportPeeler for OpaquePeeler {
-            async fn wrap_group_recovery(
-                &self,
-                message: &cgka_traits::GroupRecoveryMessage,
-                recipient: &MemberId,
-            ) -> Result<TransportMessage, PeelerError> {
-                self.0.wrap_group_recovery(message, recipient).await
-            }
-            async fn peel_group_message(
+            fn peel_group_message(
                 &self,
                 _: &cgka_traits::peeler::PreparedGroupMessage<'_>,
                 _: &GroupContextSnapshot,
             ) -> Result<PeeledMessage, PeelerError> {
                 Err(PeelerError::DecryptFailed)
             }
-            async fn peel_welcome(
-                &self,
-                msg: &TransportMessage,
-            ) -> Result<PeeledMessage, PeelerError> {
-                self.0.peel_welcome(msg).await
-            }
-            async fn wrap_group_message(
+            fn wrap_group_message(
                 &self,
                 payload: &EncryptedPayload,
                 context: &GroupContextSnapshot,
             ) -> Result<TransportMessage, PeelerError> {
-                self.0.wrap_group_message(payload, context).await
+                self.0.wrap_group_message(payload, context)
             }
-            async fn wrap_group_message_with_metadata(
+            fn wrap_group_message_with_metadata(
                 &self,
                 payload: &EncryptedPayload,
                 context: &GroupContextSnapshot,
@@ -854,14 +813,6 @@ mod tests {
             ) -> Result<TransportMessage, PeelerError> {
                 self.0
                     .wrap_group_message_with_metadata(payload, context, metadata)
-                    .await
-            }
-            async fn wrap_welcome(
-                &self,
-                payload: &EncryptedPayload,
-                recipient: &MemberId,
-            ) -> Result<TransportMessage, PeelerError> {
-                self.0.wrap_welcome(payload, recipient).await
             }
         }
         let bus = TransportBus::ordered();
@@ -877,9 +828,7 @@ mod tests {
                 }))
                 .protocol_profile(ProtocolProfile::Current)
                 .supported_app_components(harness_supported_app_components(false))
-                .peeler(Box::new(OpaquePeeler(
-                    NostrMlsPeeler::default().with_welcome_signer(client.signer.clone()),
-                )))
+                .peeler(Box::new(OpaquePeeler(NostrMlsPeeler::default())))
                 .build()
                 .unwrap(),
         );
@@ -1305,7 +1254,7 @@ mod tests {
             panic!("recovery must stage a real MLS evolution");
         };
         assert_eq!(welcomes.len(), 1);
-        let welcome_id = welcomes[0].id.clone();
+        let local_id = welcomes[0].local_id.clone();
         coordinator.restart();
         assert!(native_group(&coordinator).pending_commit().is_some());
         assert!(
@@ -1318,6 +1267,10 @@ mod tests {
         coordinator.drain_auto_publish().await;
         let pending = coordinator.pending_publication_refs();
         assert_eq!(pending.len(), 1);
+        let welcomes = &coordinator.pending_publication_artifacts[&pending[0]].deferred_welcomes;
+        assert_eq!(welcomes.len(), 1);
+        let welcome_id = welcomes[0].id.clone();
+        assert_ne!(welcome_id, local_id);
         (bus, coordinator, target, pending[0], welcome_id)
     }
 
@@ -1700,8 +1653,6 @@ impl ClientBuilder {
                 replay_probe_budget_override: self.replay_probe_budget_override,
                 deferred_peel_limits_override: self.deferred_peel_limits_override,
                 account_devices_supported: self.account_devices_supported,
-                #[cfg(test)]
-                welcome_wrap_refusal: self.welcome_wrap_refusal.as_ref(),
             },
         );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
@@ -1754,8 +1705,6 @@ struct HarnessEngineOptions<'a> {
     replay_probe_budget_override: Option<u64>,
     deferred_peel_limits_override: Option<(usize, usize, usize)>,
     account_devices_supported: bool,
-    #[cfg(test)]
-    welcome_wrap_refusal: Option<&'a Arc<AtomicBool>>,
 }
 
 fn build_harness_engine(
@@ -1778,18 +1727,8 @@ fn build_harness_engine(
     );
     let entropy = Arc::new(cgka_traits::OsEntropy);
     let clock = Arc::new(cgka_traits::SystemWallClock);
-    let inner_peeler =
-        NostrMlsPeeler::new(entropy.clone(), clock.clone()).with_welcome_signer(signer.clone());
-    #[cfg(test)]
-    let peeler: Box<dyn TransportPeeler> = match options.welcome_wrap_refusal {
-        Some(flag) => Box::new(WelcomeWrapRefusalPeeler {
-            inner: inner_peeler,
-            refuse: flag.clone(),
-        }),
-        None => Box::new(inner_peeler),
-    };
-    #[cfg(not(test))]
-    let peeler: Box<dyn TransportPeeler> = Box::new(inner_peeler);
+    let peeler: Box<dyn TransportPeeler> =
+        Box::new(NostrMlsPeeler::new(entropy.clone(), clock.clone()));
     let mut builder = EngineBuilder::new(storage.clone())
         .identity(identity.to_vec())
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
@@ -1893,92 +1832,6 @@ fn key_package_with_harness_source(key_package: KeyPackage) -> KeyPackage {
         MessageId::new(hasher.finalize().to_vec()),
     )
     .with_protocol_profile(protocol_profile)
-}
-
-/// Test-only peeler that delegates to the real signed Nostr peeler except for
-/// Welcome wrap. The refusal is per-instance and can be switched off.
-#[cfg(test)]
-struct WelcomeWrapRefusalPeeler {
-    inner: NostrMlsPeeler,
-    refuse: Arc<AtomicBool>,
-}
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl TransportPeeler for WelcomeWrapRefusalPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        message: &cgka_traits::GroupRecoveryMessage,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.inner.wrap_group_recovery(message, recipient).await
-    }
-    fn prepare_group_message<'a>(
-        &self,
-        msg: &'a TransportMessage,
-    ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
-        self.inner.prepare_group_message(msg)
-    }
-
-    async fn peel_group_message(
-        &self,
-        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        self.inner.peel_group_message(msg, ctx).await
-    }
-
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        self.inner.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
-        &self,
-        payload: &EncryptedPayload,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.inner.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_group_message_with_metadata(
-        &self,
-        payload: &EncryptedPayload,
-        ctx: &GroupContextSnapshot,
-        metadata: &GroupMessageMetadata,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.inner
-            .wrap_group_message_with_metadata(payload, ctx, metadata)
-            .await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        if self.refuse.load(Ordering::SeqCst) {
-            return Err(PeelerError::WrapFailed(
-                WELCOME_WRAP_REFUSAL_MARKER.to_owned(),
-            ));
-        }
-        self.inner.wrap_welcome(payload, recipient).await
-    }
-
-    async fn wrap_welcome_with_metadata(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-        metadata: &WelcomeMetadata,
-    ) -> Result<TransportMessage, PeelerError> {
-        if self.refuse.load(Ordering::SeqCst) {
-            return Err(PeelerError::WrapFailed(
-                WELCOME_WRAP_REFUSAL_MARKER.to_owned(),
-            ));
-        }
-        self.inner
-            .wrap_welcome_with_metadata(payload, recipient, metadata)
-            .await
-    }
 }
 
 /// Stable variant name for unexpected-result errors. Debug-formatting a
@@ -2212,8 +2065,6 @@ impl HarnessClient {
                 replay_probe_budget_override: self.replay_probe_budget_override,
                 deferred_peel_limits_override: self.deferred_peel_limits_override,
                 account_devices_supported: self.account_devices_supported,
-                #[cfg(test)]
-                welcome_wrap_refusal: self.welcome_wrap_refusal.as_ref(),
             },
         );
         engine
@@ -2524,6 +2375,9 @@ impl HarnessClient {
                 )));
             }
         };
+        // A seal failure fails the harness create. A founding create's group
+        // is already canonical then, but the harness never references it.
+        let welcomes = self.seal_and_bind(&welcomes, pending).await?;
         if let Some(action_id) = self.next_scenario_input_id.take()
             && pending.is_some()
         {
@@ -2557,6 +2411,59 @@ impl HarnessClient {
     /// "succeeds."
     pub async fn confirm(&mut self, pending: PendingStateRef) {
         self.try_confirm(pending).await.expect("confirm_published");
+    }
+
+    /// Seal `welcomes` with this client's account key, as its session would,
+    /// and bind their stored rows. A seal failure first rolls back `pending`.
+    async fn seal_and_bind(
+        &mut self,
+        welcomes: &[OutboundWelcome],
+        pending: Option<PendingStateRef>,
+    ) -> Result<Vec<TransportMessage>, EngineError> {
+        let sealer = self.sealer();
+        let mut sealed = Vec::with_capacity(welcomes.len());
+        for welcome in welcomes {
+            match self.seal_welcome(&sealer, welcome).await {
+                Ok(message) => sealed.push(SealedWelcome {
+                    local_id: welcome.local_id.clone(),
+                    message,
+                }),
+                Err(error) => {
+                    if let Some(pending) = pending {
+                        self.engine_mut().publish_failed(pending).await?;
+                    }
+                    return Err(EngineError::Peeler(error));
+                }
+            }
+        }
+        self.engine_mut().bind_sealed_welcomes(&sealed, None)?;
+        Ok(sealed.into_iter().map(|sealed| sealed.message).collect())
+    }
+
+    async fn seal_welcome(
+        &self,
+        sealer: &NostrInboxSealer,
+        welcome: &OutboundWelcome,
+    ) -> Result<TransportMessage, PeelerError> {
+        #[cfg(test)]
+        if self
+            .welcome_wrap_refusal
+            .as_ref()
+            .is_some_and(|refuse| refuse.load(Ordering::SeqCst))
+        {
+            return Err(PeelerError::WrapFailed(
+                WELCOME_WRAP_REFUSAL_MARKER.to_owned(),
+            ));
+        }
+        sealer.seal_welcome(welcome).await
+    }
+
+    /// This client's account-inbox sealer, over its account key.
+    fn sealer(&self) -> NostrInboxSealer {
+        NostrInboxSealer::new(
+            Arc::new(self.signer.clone()),
+            Arc::new(cgka_traits::SystemWallClock),
+        )
     }
 
     pub(crate) async fn try_confirm(
@@ -2650,6 +2557,10 @@ impl HarnessClient {
                 pending,
             } => {
                 let routed = route(msg, &gid);
+                let welcomes = self
+                    .seal_and_bind(&welcomes, Some(pending))
+                    .await
+                    .expect("upgrade Welcomes seal");
                 self.remember_pending_publication(
                     pending,
                     welcomes
@@ -3126,6 +3037,7 @@ impl HarnessClient {
                 // welcome and only then classify the commit echo as
                 // AlreadyAtEpoch.
                 let routed = route(msg, &gid);
+                let welcomes = self.seal_and_bind(&welcomes, Some(pending)).await?;
                 self.remember_pending_publication(
                     pending,
                     welcomes
@@ -3289,7 +3201,13 @@ impl HarnessClient {
         let mut outcomes = Vec::with_capacity(inbound.len());
         for msg in inbound {
             let scenario_input = self.bus.scenario_input_for_transport(&msg.id);
-            let result = self.engine_mut().ingest(msg).await;
+            let result = match self.engine_mut().ingest(msg.clone()).await {
+                Ok(IngestOutcome::InboxSealed) => {
+                    let unsealed = self.sealer().unseal(&msg).await;
+                    self.engine_mut().ingest_unsealed(msg, unsealed).await
+                }
+                result => result,
+            };
             if let Some(scenario_input) = scenario_input {
                 self.scenario_input_tracker
                     .record_ingest(&scenario_input, result.as_ref().map_err(|_| ()));
@@ -3577,6 +3495,7 @@ impl HarnessClient {
                 } else {
                     msg
                 };
+                let welcomes = self.seal_and_bind(&welcomes, Some(pending)).await?;
                 self.remember_pending_publication(
                     pending,
                     welcomes
@@ -3592,6 +3511,7 @@ impl HarnessClient {
                 self.bus.send(self.bus_id, routed);
             }
             SendResult::GroupCreated { welcomes, pending } => {
+                let welcomes = self.seal_and_bind(&welcomes, Some(pending)).await?;
                 self.remember_pending_publication(
                     pending,
                     welcomes.iter().map(|welcome| welcome.id.clone()),
@@ -3606,6 +3526,7 @@ impl HarnessClient {
                 self.confirm_empty_publication(pending).await?;
             }
             SendResult::FoundingGroupCreated { welcomes } => {
+                let welcomes = self.seal_and_bind(&welcomes, None).await?;
                 for welcome in welcomes {
                     self.bus.send(self.bus_id, welcome);
                 }
@@ -3630,9 +3551,13 @@ impl HarnessClient {
             };
             self.publish_commit_scenario_input(&routed, auto.pending)
                 .await;
+            let welcomes = self
+                .seal_and_bind(&auto.welcomes, Some(auto.pending))
+                .await
+                .expect("automatic Welcomes seal");
             self.remember_pending_publication(
                 auto.pending,
-                auto.welcomes
+                welcomes
                     .iter()
                     .map(|welcome| welcome.id.clone())
                     .chain(std::iter::once(routed.id.clone())),
@@ -3641,7 +3566,7 @@ impl HarnessClient {
             self.pending_publication_artifacts
                 .get_mut(&auto.pending)
                 .expect("auto publication was registered")
-                .deferred_welcomes = auto.welcomes;
+                .deferred_welcomes = welcomes;
             self.bus.send(self.bus_id, routed);
         }
         let proposals = self.engine_mut().drain_auto_proposals();
@@ -3974,7 +3899,6 @@ impl HarnessClient {
             .map_err(|e| format!("peel group message: {e}"))?;
         let peeled = peeler
             .peel_group_message(&prepared, &snapshot)
-            .await
             .map_err(|e| format!("peel group message: {e}"))?;
         match peeled.content {
             PeeledContent::MlsMessage { bytes } => Ok(TransportMessage {

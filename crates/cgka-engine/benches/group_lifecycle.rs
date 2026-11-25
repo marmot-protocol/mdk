@@ -4,7 +4,7 @@
 //! These benches drive the real OpenMLS-backed engine over in-memory SQLite
 //! storage with the same pass-through peeler style the Tier-2 tests use, so
 //! the measured work is the engine's own CPU + storage cost: KeyPackage
-//! parsing/validation, commit/welcome production, per-invitee wrapping, and
+//! parsing/validation, commit/Welcome production, staging, and
 //! the join transaction. Transport crypto is deliberately excluded.
 //!
 //! Run:
@@ -14,9 +14,8 @@
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use async_trait::async_trait;
 use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
@@ -25,7 +24,10 @@ use cgka_traits::app_components::{
     AppComponentData, GROUP_MESSAGE_RETENTION_COMPONENT_ID, default_group_components,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent, SendResult};
+use cgka_traits::engine::{
+    CgkaEngine, CreateGroupRequest, KeyPackage, OutboundWelcome, SealedWelcome, SendIntent,
+    SendResult,
+};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -36,7 +38,7 @@ use cgka_traits::storage::{DeferredPeelGeneration, DeferredPeelGenerationStorage
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::types::{EpochId, GroupId, MessageId};
 use criterion::{BatchSize, BenchmarkId, Criterion};
 use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
 use sha2::{Digest, Sha256};
@@ -96,21 +98,58 @@ fn hash_id(bytes: &[u8]) -> MessageId {
     MessageId::new(h.finish().to_be_bytes().to_vec())
 }
 
+fn raw_seal(welcome: &OutboundWelcome) -> TransportMessage {
+    let mut hasher = Sha256::new();
+    hasher.update(welcome.local_id.as_slice());
+    hasher.update(welcome.recipient.as_slice());
+    hasher.update(&welcome.payload.ciphertext);
+    TransportMessage {
+        id: MessageId::new(hasher.finalize().to_vec()),
+        payload: welcome.payload.ciphertext.clone(),
+        timestamp: Timestamp(0),
+        causal_deps: Vec::new(),
+        source: TransportSource("raw-inbox".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: welcome.recipient.clone(),
+        },
+    }
+}
+
+fn raw_unseal(msg: &TransportMessage) -> PeeledMessage {
+    PeeledMessage {
+        id: msg.id.clone(),
+        group_id: None,
+        sender: None,
+        content: PeeledContent::Welcome {
+            created_at: (msg.timestamp.0 != 0).then_some(msg.timestamp),
+            bytes: msg.payload.clone(),
+            key_package_event_id: None,
+        },
+        origin: msg.clone(),
+    }
+}
+
+fn seal_and_bind(
+    engine: &mut Engine<SqliteAccountStorage>,
+    welcomes: &[OutboundWelcome],
+) -> Vec<TransportMessage> {
+    let sealed: Vec<SealedWelcome> = welcomes
+        .iter()
+        .map(|welcome| SealedWelcome {
+            local_id: welcome.local_id.clone(),
+            message: raw_seal(welcome),
+        })
+        .collect();
+    engine
+        .bind_sealed_welcomes(&sealed, None)
+        .expect("bind sealed Welcomes");
+    sealed.into_iter().map(|sealed| sealed.message).collect()
+}
+
 struct BenchPeeler;
 
-#[async_trait]
 impl TransportPeeler for BenchPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -126,21 +165,7 @@ impl TransportPeeler for BenchPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
@@ -156,25 +181,6 @@ impl TransportPeeler for BenchPeeler {
             },
         })
     }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        let mut id_material = payload.ciphertext.clone();
-        id_material.extend_from_slice(recipient.as_slice());
-        Ok(TransportMessage {
-            id: hash_id(&id_material),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("bench".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        })
-    }
 }
 
 /// Peeler used by the #1176 outbound-preflight benchmark matrix. Synthetic
@@ -183,80 +189,39 @@ impl TransportPeeler for BenchPeeler {
 #[derive(Clone)]
 struct DeferredBenchPeeler {
     attempts: Arc<AtomicU64>,
-    block: Arc<AtomicBool>,
-    block_on_attempt: Arc<AtomicU64>,
 }
 
 impl DeferredBenchPeeler {
     fn new() -> Self {
         Self {
             attempts: Arc::new(AtomicU64::new(0)),
-            block: Arc::new(AtomicBool::new(false)),
-            block_on_attempt: Arc::new(AtomicU64::new(u64::MAX)),
         }
     }
 
     fn reset(&self) {
         self.attempts.store(0, Ordering::SeqCst);
     }
-
-    fn block_from_attempt(&self, attempt: u64) {
-        self.reset();
-        self.block_on_attempt.store(attempt, Ordering::SeqCst);
-        self.block.store(true, Ordering::SeqCst);
-    }
 }
 
-#[async_trait]
 impl TransportPeeler for DeferredBenchPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         if msg.message.payload.starts_with(b"deferred:") {
-            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            if self.block.load(Ordering::SeqCst)
-                && attempt >= self.block_on_attempt.load(Ordering::SeqCst)
-            {
-                // Foreground code bounds this wait by its remaining monotonic
-                // budget. The long sleep makes the budget, not this fixture,
-                // determine the observed latency.
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            }
+            self.attempts.fetch_add(1, Ordering::SeqCst);
             return Err(PeelerError::DecryptFailed);
         }
-        BenchPeeler.peel_group_message(msg, ctx).await
+        BenchPeeler.peel_group_message(msg, ctx)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        BenchPeeler.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        BenchPeeler.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        BenchPeeler.wrap_welcome(payload, recipient).await
+        BenchPeeler.wrap_group_message(payload, ctx)
     }
 }
 
@@ -425,6 +390,7 @@ fn report_storage_format_sizes(_: &mut Criterion) {
     let SendResult::FoundingGroupCreated { welcomes } = result else {
         panic!("expected FoundingGroupCreated");
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     let welcome = welcomes.first().expect("32-member group has Welcomes");
     let sizes = storage
         .storage_format_bench_sizes(&group_id, &welcome.id)
@@ -560,10 +526,8 @@ fn bench_join_welcome(c: &mut Criterion) {
                 .block_on(alice.create_group(create_request(vec![bob_kp.clone()])))
                 .expect("create_group succeeds");
             match result {
-                SendResult::FoundingGroupCreated {
-                    welcomes: mut wrapped,
-                } => {
-                    welcomes.push(wrapped.remove(0));
+                SendResult::FoundingGroupCreated { welcomes: outbound } => {
+                    welcomes.push(seal_and_bind(&mut alice, &outbound).remove(0));
                 }
                 other => panic!("expected FoundingGroupCreated, got {other:?}"),
             }
@@ -573,13 +537,17 @@ fn bench_join_welcome(c: &mut Criterion) {
             BenchmarkId::from_parameter(format!("{stored_key_packages} stored key packages")),
             |b| {
                 b.to_async(&rt).iter_batched(
-                    || welcomes.pop().expect("pre-generated welcome pool"),
-                    |welcome| {
+                    || {
+                        let welcome = welcomes.pop().expect("pre-generated welcome pool");
+                        let unsealed = raw_unseal(&welcome);
+                        (welcome, unsealed)
+                    },
+                    |(welcome, unsealed)| {
                         let bob = bob.clone();
                         async move {
                             bob.lock()
                                 .await
-                                .join_welcome(welcome)
+                                .join_welcome(welcome, unsealed)
                                 .await
                                 .expect("join succeeds")
                         }
@@ -618,11 +586,9 @@ fn bench_join_welcome_large_group(c: &mut Criterion) {
             .block_on(alice.create_group(create_request(members)))
             .expect("create_group succeeds");
         match result {
-            SendResult::FoundingGroupCreated {
-                welcomes: mut wrapped,
-            } => {
+            SendResult::FoundingGroupCreated { welcomes: outbound } => {
                 // bob's KeyPackage was last, so his Welcome is last.
-                welcomes.push(wrapped.remove(wrapped.len() - 1));
+                welcomes.push(seal_and_bind(&mut alice, &outbound).pop().unwrap());
             }
             other => panic!("expected FoundingGroupCreated, got {other:?}"),
         }
@@ -630,13 +596,17 @@ fn bench_join_welcome_large_group(c: &mut Criterion) {
     let bob = std::sync::Arc::new(tokio::sync::Mutex::new(bob));
     group.bench_function("32 members", |b| {
         b.to_async(&rt).iter_batched(
-            || welcomes.pop().expect("pre-generated welcome pool"),
-            |welcome| {
+            || {
+                let welcome = welcomes.pop().expect("pre-generated welcome pool");
+                let unsealed = raw_unseal(&welcome);
+                (welcome, unsealed)
+            },
+            |(welcome, unsealed)| {
                 let bob = bob.clone();
                 async move {
                     bob.lock()
                         .await
-                        .join_welcome(welcome)
+                        .join_welcome(welcome, unsealed)
                         .await
                         .expect("join succeeds")
                 }
@@ -712,7 +682,7 @@ impl DeferredPreflightCase {
         match self {
             Self::Clean => "clean",
             Self::UnchangedBacklog => "unchanged-backlog",
-            Self::ChangedContext => "changed-context-blocked",
+            Self::ChangedContext => "changed-context",
             Self::Contested => "contested",
             Self::Restart => "restart-resume",
             Self::EpochChurn => "epoch-churn",
@@ -885,9 +855,6 @@ fn prepare_deferred_preflight_fixture(
     }
 
     peeler.reset();
-    if matches!(case, DeferredPreflightCase::ChangedContext) {
-        peeler.block_from_attempt(4);
-    }
     let audit_dir = install_benchmark_recorder(&audit, recorder_enabled);
     DeferredPreflightFixture {
         engine,
@@ -991,10 +958,12 @@ fn prepare_app_ingest(
     let (group_id, create) = rt
         .block_on(alice.create_group(create_request(vec![bob_kp])))
         .expect("create_group succeeds");
-    let SendResult::FoundingGroupCreated { mut welcomes } = create else {
+    let SendResult::FoundingGroupCreated { welcomes } = create else {
         panic!("expected FoundingGroupCreated");
     };
-    rt.block_on(bob.join_welcome(welcomes.remove(0)))
+    let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+    let unsealed = raw_unseal(&welcome);
+    rt.block_on(bob.join_welcome(welcome, unsealed))
         .expect("bob joins");
     let result = rt
         .block_on(alice.send(SendIntent::AppMessage {
@@ -1033,7 +1002,11 @@ fn bench_app_message_ingest(c: &mut Criterion) {
 fn prepare_rejoin_with_history(
     rt: &tokio::runtime::Runtime,
     retained_commits: usize,
-) -> (Engine<SqliteAccountStorage>, TransportMessage) {
+) -> (
+    Engine<SqliteAccountStorage>,
+    TransportMessage,
+    PeeledMessage,
+) {
     let mut alice = build_client(b"bench-alice-rejoin");
     let bob_storage = SqliteAccountStorage::in_memory().unwrap();
     let mut bob = build_client_with_storage(b"bench-bob-rejoin", bob_storage.clone());
@@ -1044,10 +1017,12 @@ fn prepare_rejoin_with_history(
     let (group_id, create) = rt
         .block_on(alice.create_group(create_request(vec![bob_kp])))
         .expect("create_group succeeds");
-    let SendResult::FoundingGroupCreated { mut welcomes } = create else {
+    let SendResult::FoundingGroupCreated { welcomes } = create else {
         panic!("expected FoundingGroupCreated");
     };
-    rt.block_on(bob.join_welcome(welcomes.remove(0)))
+    let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+    let unsealed = raw_unseal(&welcome);
+    rt.block_on(bob.join_welcome(welcome, unsealed))
         .expect("initial join succeeds");
 
     // Build real canonical history on both peers. These commits become the
@@ -1092,16 +1067,16 @@ fn prepare_rejoin_with_history(
         }))
         .expect("re-invite succeeds");
     let SendResult::GroupEvolution {
-        mut welcomes,
-        pending,
-        ..
+        welcomes, pending, ..
     } = rejoin
     else {
         panic!("expected GroupEvolution");
     };
+    let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+    let unsealed = raw_unseal(&welcome);
     rt.block_on(alice.confirm_published(pending))
         .expect("confirm re-invite succeeds");
-    (bob, welcomes.remove(0))
+    (bob, welcome, unsealed)
 }
 
 /// Same-group rejoin after removal, scaled by the canonical commit history
@@ -1121,8 +1096,8 @@ fn bench_rejoin_welcome_with_history(c: &mut Criterion) {
             |b| {
                 b.iter_batched(
                     || prepare_rejoin_with_history(&rt, retained_commits),
-                    |(mut bob, welcome)| {
-                        rt.block_on(bob.join_welcome(welcome))
+                    |(mut bob, welcome, unsealed)| {
+                        rt.block_on(bob.join_welcome(welcome, unsealed))
                             .expect("rejoin succeeds")
                     },
                     BatchSize::PerIteration,

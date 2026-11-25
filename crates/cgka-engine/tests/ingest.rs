@@ -3,16 +3,16 @@
 // Tests load OpenMLS state directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
-use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
+use cgka_traits::OutboundWelcome;
 use cgka_traits::app_components::{
     AppComponentData, GROUP_MESSAGE_RETENTION_COMPONENT_ID, default_group_components,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
-use cgka_traits::error::PeelerError;
+use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{
     IngestOutcome, InputRejectionCategory, PeeledContent, PeeledMessage, StaleReason,
@@ -30,6 +30,7 @@ use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 mod support;
 use support::proof_signer;
+use support::raw_inbox::{ingest_raw, join_raw, raw_seal, raw_unseal, seal_and_bind};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
@@ -121,19 +122,8 @@ fn content_id(msg: &TransportMessage) -> MessageId {
     MessageId::new(Sha256::digest(&msg.payload).to_vec())
 }
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -149,21 +139,7 @@ impl TransportPeeler for MockPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -179,89 +155,38 @@ impl TransportPeeler for MockPeeler {
             },
         })
     }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        })
-    }
 }
 
-#[async_trait]
 impl TransportPeeler for RecordingPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_group_message(msg, ctx).await
+        MockPeeler.peel_group_message(msg, ctx)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_group_message(payload, ctx).await
+        MockPeeler.wrap_group_message(payload, ctx)
     }
 
-    async fn wrap_group_message_with_metadata(
+    fn wrap_group_message_with_metadata(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
         metadata: &GroupMessageMetadata,
     ) -> Result<TransportMessage, PeelerError> {
         self.seen_metadata.lock().unwrap().push(*metadata);
-        MockPeeler.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_welcome(payload, recipient).await
+        MockPeeler.wrap_group_message(payload, ctx)
     }
 }
 
-#[async_trait]
 impl TransportPeeler for FailOncePeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
@@ -273,43 +198,20 @@ impl TransportPeeler for FailOncePeeler {
         if should_fail {
             return Err(PeelerError::DecryptFailed);
         }
-        MockPeeler.peel_group_message(msg, ctx).await
+        MockPeeler.peel_group_message(msg, ctx)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_welcome(payload, recipient).await
+        MockPeeler.wrap_group_message(payload, ctx)
     }
 }
 
-#[async_trait]
 impl TransportPeeler for MalformedShortPayloadPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
@@ -319,49 +221,26 @@ impl TransportPeeler for MalformedShortPayloadPeeler {
                 "content too short for nonce-prefixed ciphertext".into(),
             ));
         }
-        MockPeeler.peel_group_message(msg, ctx).await
+        MockPeeler.peel_group_message(msg, ctx)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_welcome(payload, recipient).await
+        MockPeeler.wrap_group_message(payload, ctx)
     }
 }
 
-#[async_trait]
 impl TransportPeeler for BoundaryRejectionPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         if msg.message.payload != BOUNDARY_REJECTION_PAYLOAD {
-            return MockPeeler.peel_group_message(msg, ctx).await;
+            return MockPeeler.peel_group_message(msg, ctx);
         }
 
         match self.path {
@@ -380,27 +259,12 @@ impl TransportPeeler for BoundaryRejectionPeeler {
         }
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        if msg.payload == BOUNDARY_REJECTION_PAYLOAD {
-            return Err(self.rejection.peeler_error());
-        }
-        MockPeeler.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_welcome(payload, recipient).await
+        MockPeeler.wrap_group_message(payload, ctx)
     }
 }
 
@@ -420,19 +284,8 @@ struct SnapshotFallbackMalformedPeeler {
     malformed_below_epoch: u64,
 }
 
-#[async_trait]
 impl TransportPeeler for SnapshotFallbackMalformedPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
@@ -446,27 +299,15 @@ impl TransportPeeler for SnapshotFallbackMalformedPeeler {
                 Err(PeelerError::DecryptFailed)
             };
         }
-        MockPeeler.peel_group_message(msg, ctx).await
+        MockPeeler.peel_group_message(msg, ctx)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_welcome(payload, recipient).await
+        MockPeeler.wrap_group_message(payload, ctx)
     }
 }
 
@@ -477,45 +318,22 @@ struct CountingPeeler {
     peels: Arc<Mutex<usize>>,
 }
 
-#[async_trait]
 impl TransportPeeler for CountingPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         *self.peels.lock().unwrap() += 1;
-        MockPeeler.peel_group_message(msg, ctx).await
+        MockPeeler.peel_group_message(msg, ctx)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_welcome(payload, recipient).await
+        MockPeeler.wrap_group_message(payload, ctx)
     }
 }
 
@@ -768,8 +586,7 @@ async fn malformed_peeled_welcome_is_terminal_and_restart_deduplicated() {
         },
     };
 
-    let outcome = engine
-        .ingest(msg.clone())
+    let outcome = ingest_raw(&mut engine, msg.clone())
         .await
         .expect("malformed welcome is a per-message rejection outcome");
     assert!(matches!(
@@ -782,8 +599,7 @@ async fn malformed_peeled_welcome_is_terminal_and_restart_deduplicated() {
     drop(engine);
 
     let mut reopened = build_client_with_storage(storage, b"malformed-welcome");
-    let replay = reopened
-        .ingest(msg)
+    let replay = ingest_raw(&mut reopened, msg)
         .await
         .expect("poisoned welcome must not hard-error after restart");
     assert!(matches!(
@@ -811,18 +627,16 @@ async fn rewrapped_identical_welcome_uses_content_dedup() {
         .await
         .unwrap();
     let welcome = match created {
-        SendResult::GroupCreated {
-            mut welcomes,
-            pending,
-        } => {
+        SendResult::GroupCreated { welcomes, pending } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
             alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
+            welcome
         }
         other => panic!("expected group create, got {other:?}"),
     };
 
     assert!(matches!(
-        bob.ingest(welcome.clone()).await.unwrap(),
+        ingest_raw(&mut bob, welcome.clone()).await.unwrap(),
         IngestOutcome::Processed
     ));
     bob.drain_events();
@@ -831,7 +645,7 @@ async fn rewrapped_identical_welcome_uses_content_dedup() {
         id: MessageId::new(vec![0x68; 32]),
         ..welcome
     };
-    let outcome = bob.ingest(rewrapped).await.unwrap();
+    let outcome = ingest_raw(&mut bob, rewrapped).await.unwrap();
     assert!(matches!(
         outcome,
         IngestOutcome::Ignored {
@@ -862,14 +676,13 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
         .await
         .unwrap();
     let (pending, bob_welcome) = match result {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         _ => unreachable!(),
     };
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(bob_welcome).await.unwrap();
+    join_raw(&mut bob, bob_welcome).await.unwrap();
 
     let msg = match alice
         .send(SendIntent::AppMessage {
@@ -927,14 +740,13 @@ async fn malformed_group_message_is_rejected_and_does_not_wedge_ingest() {
         .await
         .unwrap();
     let (pending, bob_welcome) = match result {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         _ => unreachable!(),
     };
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(bob_welcome).await.unwrap();
+    join_raw(&mut bob, bob_welcome).await.unwrap();
 
     // Anyone can publish to a group's cleartext routing tag without being a
     // member, so structurally-invalid content is ordinary hostile input. It
@@ -1028,14 +840,13 @@ async fn assert_typed_terminal_transport_rejection(
         .await
         .unwrap();
     let (pending, bob_welcome) = match result {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         other => panic!("expected group create, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(bob_welcome).await.unwrap();
+    join_raw(&mut bob, bob_welcome).await.unwrap();
 
     let rejected = TransportMessage {
         id: hash_id(b"terminal transport rejection"),
@@ -1097,14 +908,13 @@ async fn assert_snapshot_fallback_terminal_transport_rejection(
         .await
         .unwrap();
     let (pending, bob_welcome) = match result {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         other => panic!("expected group create, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(bob_welcome).await.unwrap();
+    join_raw(&mut bob, bob_welcome).await.unwrap();
 
     let carol_kp = carol.fresh_key_package().await.unwrap();
     let invite = match alice
@@ -1185,13 +995,7 @@ async fn wrong_transport_recipient_is_typed_terminal_input() {
 
 #[tokio::test]
 async fn wrong_transport_welcome_recipient_is_typed_terminal_input() {
-    let mut engine = build_client_with_peeler(
-        b"welcome-wrong-recipient",
-        Box::new(BoundaryRejectionPeeler {
-            rejection: BoundaryRejection::WrongRecipient,
-            path: BoundaryRejectionPath::Direct,
-        }),
-    );
+    let mut engine = build_client(b"welcome-wrong-recipient");
     let rejected = TransportMessage {
         id: hash_id(b"wrong transport welcome recipient"),
         payload: BOUNDARY_REJECTION_PAYLOAD.to_vec(),
@@ -1199,7 +1003,7 @@ async fn wrong_transport_welcome_recipient_is_typed_terminal_input() {
         causal_deps: vec![],
         source: TransportSource("mock".into()),
         envelope: TransportEnvelope::Welcome {
-            recipient: engine.self_id(),
+            recipient: MemberId::new(pad32(b"another-client")),
         },
     };
 
@@ -1224,6 +1028,114 @@ async fn wrong_transport_welcome_recipient_is_typed_terminal_input() {
             category: InputRejectionCategory::Duplicate
         }
     );
+}
+
+#[tokio::test]
+async fn welcome_ingest_stops_before_unsealing() {
+    let mut alice = build_client(b"sealed-inbox-alice");
+    let mut bob = build_client(b"sealed-inbox-bob");
+    let key_package = bob.fresh_key_package().await.unwrap();
+    let (_, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "sealed inbox".into(),
+            description: String::new(),
+            members: vec![key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("expected legacy group creation")
+    };
+    let message = seal_and_bind(&mut alice, &welcomes).remove(0);
+    alice.confirm_published(pending).await.unwrap();
+
+    for _ in 0..2 {
+        assert_eq!(
+            bob.ingest(message.clone()).await.unwrap(),
+            IngestOutcome::InboxSealed
+        );
+    }
+    let mut other = welcomes.into_iter().next().unwrap();
+    other.recipient = alice.self_id();
+    assert_eq!(
+        bob.ingest(raw_seal(&other)).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::WrongRecipient,
+        }
+    );
+    let unsealed = raw_unseal(&message);
+    assert_eq!(
+        bob.ingest_unsealed(message, Ok(unsealed)).await.unwrap(),
+        IngestOutcome::Processed
+    );
+}
+
+#[tokio::test]
+async fn unseal_errors_keep_peel_dispositions() {
+    use InputRejectionCategory::{InvalidEncoding, InvalidSignature, WrongRecipient};
+
+    let mut engine = build_client(b"failed-inbox-unseal");
+    let cases = [
+        (PeelerError::WrongRecipient, Some(WrongRecipient)),
+        (PeelerError::InvalidSignature, Some(InvalidSignature)),
+        (
+            PeelerError::Malformed("invalid inbox bytes".into()),
+            Some(InvalidEncoding),
+        ),
+        (PeelerError::DecryptFailed, Some(InvalidEncoding)),
+        (
+            PeelerError::StaleEpoch {
+                message_epoch: EpochId(1),
+                context_epoch: EpochId(2),
+            },
+            None,
+        ),
+        (
+            PeelerError::MissingContext {
+                label: "signer".into(),
+            },
+            None,
+        ),
+        (PeelerError::WrapFailed("wrap failure".into()), None),
+        (PeelerError::Backend("inbox backend".into()), None),
+    ];
+    for (index, (error, rejection)) in cases.into_iter().enumerate() {
+        let message = raw_seal(&OutboundWelcome {
+            local_id: MessageId::new(index.to_be_bytes().to_vec()),
+            recipient: engine.self_id(),
+            payload: EncryptedPayload {
+                ciphertext: vec![],
+                aad: vec![],
+            },
+            metadata: None,
+        });
+        let expected_error = format!("{error:?}");
+        let replay = matches!(error, PeelerError::WrongRecipient).then(|| message.clone());
+        let outcome = engine.ingest_unsealed(message, Err(error)).await;
+        if let Some(category) = rejection {
+            assert_eq!(
+                outcome.unwrap(),
+                IngestOutcome::Ignored { category },
+                "{expected_error}"
+            );
+        } else {
+            let Err(EngineError::Peeler(actual)) = outcome else {
+                panic!("expected {expected_error}, got {outcome:?}");
+            };
+            assert_eq!(format!("{actual:?}"), expected_error);
+        }
+        if let Some(message) = replay {
+            assert_eq!(
+                engine.ingest(message).await.unwrap(),
+                IngestOutcome::Ignored {
+                    category: InputRejectionCategory::Duplicate,
+                }
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1269,14 +1181,13 @@ async fn post_peel_invalid_mls_inputs_are_terminal_and_restart_deduplicated() {
         .await
         .unwrap();
     let (pending, bob_welcome) = match result {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         other => panic!("expected group create, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(bob_welcome).await.unwrap();
+    join_raw(&mut bob, bob_welcome).await.unwrap();
 
     // The pass-through test peeler represents a valid authenticated wrapper;
     // only the carried MLS bytes are malformed. This must be a per-message
@@ -1512,14 +1423,13 @@ async fn malformed_via_snapshot_fallback_is_rejected_and_does_not_wedge_ingest()
         .await
         .unwrap();
     let (pending, bob_welcome) = match result {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         _ => unreachable!(),
     };
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(bob_welcome).await.unwrap();
+    join_raw(&mut bob, bob_welcome).await.unwrap();
 
     // Alice invites Carol so a commit advances the group and Bob retains an
     // anchor snapshot at the pre-commit epoch — the snapshot the fallback rolls
@@ -1696,12 +1606,13 @@ async fn buffered_legacy_own_echo_retires_raw_retry_row() {
         })
         .await
         .unwrap();
-    let (pending, mut welcomes) = match create {
+    let (pending, welcomes) = match create {
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
 
     // Roll the local store back across the send to model a legacy database
     // that has the MLS group state but no durable sent-content marker.
@@ -1942,14 +1853,13 @@ async fn welcome_before_commit_yields_already_at_epoch() {
         .await
         .unwrap();
     let (create_pending, bob_welcome) = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         _ => unreachable!(),
     };
     alice.confirm_published(create_pending).await.unwrap();
-    bob.join_welcome(bob_welcome).await.unwrap();
+    join_raw(&mut bob, bob_welcome).await.unwrap();
 
     let carol_kp = carol.fresh_key_package().await.unwrap();
     let invite = alice
@@ -1963,15 +1873,15 @@ async fn welcome_before_commit_yields_already_at_epoch() {
     let (invite_commit, carol_welcome, invite_pending) = match invite {
         SendResult::GroupEvolution {
             msg,
-            mut welcomes,
+            welcomes,
             pending,
-        } => (msg, welcomes.remove(0), pending),
+        } => (msg, seal_and_bind(&mut alice, &welcomes).remove(0), pending),
         _ => unreachable!(),
     };
     alice.confirm_published(invite_pending).await.unwrap();
 
     // Carol joins via welcome (epoch 2).
-    carol.join_welcome(carol_welcome).await.unwrap();
+    join_raw(&mut carol, carol_welcome).await.unwrap();
 
     // Carol ingests the invite commit (epoch 1 → 2) — her MLS is already
     // at epoch 2, so process_message returns WrongEpoch, which we classify
@@ -2017,13 +1927,12 @@ async fn send_app_message_round_trips_to_another_client() {
         SendResult::GroupCreated { pending, .. } => *pending,
         _ => unreachable!(),
     };
-    alice.confirm_published(pending).await.unwrap();
-
     let welcome = match result {
-        SendResult::GroupCreated { mut welcomes, .. } => welcomes.remove(0),
+        SendResult::GroupCreated { welcomes, .. } => seal_and_bind(&mut alice, &welcomes).remove(0),
         _ => unreachable!(),
     };
-    bob.join_welcome(welcome).await.unwrap();
+    alice.confirm_published(pending).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     bob.drain_events();
 
     // Alice sends an app message.
@@ -2083,15 +1992,14 @@ async fn pending_application_delivery_replays_after_restart_until_acknowledged()
         .await
         .unwrap();
     let (pending, welcome) = match result {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         _ => unreachable!(),
     };
     alice.confirm_published(pending).await.unwrap();
     let welcome_id = welcome.id.clone();
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     bob.drain_events();
     bob_storage
         .delete_pending_application_events(&[welcome_id])
@@ -2170,15 +2078,14 @@ async fn pending_group_join_replays_after_restart_until_acknowledged() {
         .await
         .unwrap();
     let (pending, welcome) = match result {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         _ => unreachable!(),
     };
     alice.confirm_published(pending).await.unwrap();
     let welcome_id = welcome.id.clone();
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     assert!(bob.drain_events().iter().any(
         |event| matches!(event, GroupEvent::GroupJoined { via_welcome, .. }
                 if via_welcome == &welcome_id)
@@ -2224,14 +2131,13 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
         .await
         .unwrap();
     let (create_pending, bob_welcome) = match result {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         _ => unreachable!(),
     };
     alice.confirm_published(create_pending).await.unwrap();
-    bob.join_welcome(bob_welcome).await.unwrap();
+    join_raw(&mut bob, bob_welcome).await.unwrap();
     alice.drain_events();
     bob.drain_events();
 
@@ -2325,14 +2231,13 @@ async fn buffered_retryable_peer_message_is_retired_terminal_after_replay() {
         .await
         .unwrap();
     let (create_pending, bob_welcome) = match result {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         _ => unreachable!(),
     };
     alice.confirm_published(create_pending).await.unwrap();
-    bob.join_welcome(bob_welcome).await.unwrap();
+    join_raw(&mut bob, bob_welcome).await.unwrap();
     alice.drain_events();
     bob.drain_events();
 
@@ -2457,14 +2362,13 @@ async fn alice_bob_in_group() -> (
         .await
         .unwrap();
     let (pending, welcome) = match result {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => (pending, welcomes.remove(0)),
+        SendResult::GroupCreated { pending, welcomes } => {
+            (pending, seal_and_bind(&mut alice, &welcomes).remove(0))
+        }
         _ => unreachable!(),
     };
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     bob.drain_events();
     (alice, bob, group_id)
 }

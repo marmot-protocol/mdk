@@ -1,6 +1,7 @@
 pub mod committed_roster;
 pub mod disband;
 pub mod epoch_sealed_peeler;
+pub mod raw_inbox;
 
 use std::sync::Arc;
 

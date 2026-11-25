@@ -41,8 +41,8 @@ async fn retained_welcome_retry_cutoff() {
         panic!("expected invite");
     };
     assert_eq!(welcomes.len(), 2);
-    let unfinished = welcomes[0].id.clone();
-    let rejected = welcomes[1].clone();
+    let unfinished = MockSealer.seal_welcome(&welcomes[0]).await.unwrap().id;
+    let rejected = MockSealer.seal_welcome(&welcomes[1]).await.unwrap();
     let inbox = TransportEndpoint("wss://welcome-retry-inbox.example".into());
     let endpoint = TransportEndpoint("wss://welcome-retry-group.example".into());
     let policy = StaticTransportRouting::new(vec![inbox.clone()])
@@ -241,8 +241,8 @@ async fn mixed_welcome_retry_cutoff() {
         };
         let commit = msg.clone();
         assert_eq!(welcomes.len(), 2);
-        let unfinished = welcomes[0].clone();
-        let rejected = welcomes[1].clone();
+        let unfinished = MockSealer.seal_welcome(&welcomes[0]).await.unwrap();
+        let rejected = MockSealer.seal_welcome(&welcomes[1]).await.unwrap();
         let primary = TransportEndpoint("wss://mixed-retry-primary.example".into());
         let secondary = TransportEndpoint("wss://mixed-retry-secondary.example".into());
         let inbox = TransportEndpoint("wss://mixed-retry-inbox.example".into());
@@ -912,7 +912,7 @@ async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
         .unwrap();
     let group_id = created.group_id;
     let (pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, seal_and_bind(&mut alice, welcomes).await.remove(0)),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
@@ -1088,7 +1088,7 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
         .unwrap();
     let group_id = created.group_id;
     let (pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, seal_and_bind(&mut alice, welcomes).await.remove(0)),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
@@ -1425,7 +1425,7 @@ async fn ambiguous_commit_retries_exact_event_after_restart_and_peer_can_advance
         .unwrap();
     let group_id = created.group_id.clone();
     let (create_pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, seal_and_bind(&mut alice, welcomes).await.remove(0)),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(create_pending).await.unwrap();
@@ -1556,7 +1556,7 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
         .unwrap();
     let group_id = created.group_id.clone();
     let (create_pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, seal_and_bind(&mut alice, welcomes).await.remove(0)),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(create_pending).await.unwrap();

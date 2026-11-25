@@ -45,7 +45,7 @@ fn ingest_product_outcome(outcome: &IngestOutcome) -> Option<&'static str> {
         IngestOutcome::Processed => Some("success"),
         // Authenticated control is neither an invitation metric nor
         // a reason to export a control-specific discriminator.
-        IngestOutcome::GroupRecovery { .. } => None,
+        IngestOutcome::GroupRecovery { .. } | IngestOutcome::InboxSealed => None,
         IngestOutcome::Ignored {
             category: Category::Duplicate | Category::OwnEcho,
         } => Some("duplicate"),

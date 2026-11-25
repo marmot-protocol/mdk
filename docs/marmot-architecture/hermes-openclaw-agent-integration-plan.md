@@ -151,10 +151,10 @@ GroupEvent::GroupJoined {
 }
 ```
 
-Populate `welcomer` from `PeeledMessage.sender` returned by `TransportPeeler::peel_welcome`.
+Populate `welcomer` from `PeeledMessage.sender` returned by `InboxSealer::unseal`.
 
 Do not infer welcomer from `marmot_members(&mls_group)`. The post-welcome group member set proves membership, not which
-account sent the welcome. For the Nostr transport, `NostrMlsPeeler::peel_welcome` already extracts the NIP-59 rumor
+account sent the welcome. For the Nostr transport, `NostrInboxSealer::unseal` already extracts the NIP-59 rumor
 sender, and that is the value the connector should authorize.
 
 App/runtime updates:

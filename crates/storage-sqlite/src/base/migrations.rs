@@ -433,6 +433,8 @@ mod migration_0225_welcome_delivery_ledger;
 mod migration_0226_local_submission_refused;
 #[path = "migrations/0227_welcome_expiry_mark.rs"]
 mod migration_0227_welcome_expiry_mark;
+#[path = "migrations/0228_unsealed_welcome.rs"]
+mod migration_0228_unsealed_welcome;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1649,6 +1651,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0227_welcome_expiry_mark",
         suspend_foreign_keys: &[],
         apply: migration_0227_welcome_expiry_mark::apply,
+    },
+    Migration {
+        version: 228,
+        name: "0228_unsealed_welcome",
+        suspend_foreign_keys: &[],
+        apply: migration_0228_unsealed_welcome::apply,
     },
 ];
 

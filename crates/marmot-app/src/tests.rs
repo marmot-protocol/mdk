@@ -8167,7 +8167,11 @@ async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
             &session_path,
             session_key,
             account_id.as_slice().to_vec(),
-            Box::new(NostrMlsPeeler::default().with_welcome_signer_arc(nostr_signer)),
+            Box::new(NostrMlsPeeler::default()),
+            Arc::new(NostrInboxSealer::new(
+                nostr_signer,
+                Arc::new(cgka_traits::SystemWallClock),
+            )),
         )
         .legacy_compatibility_profile()
         .account_identity_proof_signer(signer.as_proof_signer())
@@ -8230,7 +8234,11 @@ async fn fresh_key_package_with_components(
         session_path.to_path_buf(),
         session_key,
         account_id.as_slice().to_vec(),
-        Box::new(NostrMlsPeeler::default().with_welcome_signer_arc(signer.as_nostr_signer())),
+        Box::new(NostrMlsPeeler::default()),
+        Arc::new(NostrInboxSealer::new(
+            signer.as_nostr_signer(),
+            Arc::new(cgka_traits::SystemWallClock),
+        )),
     )
     .account_identity_proof_signer(signer.as_proof_signer())
     .feature_registry(app_feature_registry())

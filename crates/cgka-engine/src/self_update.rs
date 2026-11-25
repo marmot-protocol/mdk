@@ -205,7 +205,6 @@ impl<S: StorageProvider> Engine<S> {
                 },
                 &pre_commit_ctx,
             )
-            .await
             .map_err(EngineError::Peeler)?;
         let wrapped =
             crate::message_processor::route_wrapped_group_message(wrapped, &pre_commit_ctx);

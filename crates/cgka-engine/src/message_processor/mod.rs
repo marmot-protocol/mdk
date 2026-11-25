@@ -55,6 +55,7 @@ pub(crate) use store::fail_deferred_peel_rows_in_terminal_group;
 #[cfg(feature = "test-conformance-snapshot")]
 pub(crate) use store::normalized_deferred_peel_lifecycle;
 pub(crate) use store::transition_staged_invite_welcomes;
+pub(crate) use store::welcome_local_id;
 
 use crate::convergence_input::{ClassifiedConvergenceInput, ConvergenceInputContext};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
@@ -66,6 +67,7 @@ use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{
     DeferralLineage, InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState,
+    PeeledMessage,
 };
 use cgka_traits::message::{
     DeferredMessageMetadata, MessageRecord, MessageState, StoredMessagePayload,
@@ -949,6 +951,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         msg: &TransportMessage,
         recorded: Result<Option<RecordedIngest>, EngineError>,
+        unsealed: Option<Result<PeeledMessage, PeelerError>>,
     ) -> Result<IngestOutcome, EngineError> {
         // Clear a marker left by cancellation/panic in an earlier ingest; only
         // the current call may suppress its own seen-cache insertion.
@@ -971,13 +974,24 @@ impl<S: StorageProvider> Engine<S> {
             None => {}
         }
 
-        let outcome = match &msg.envelope {
-            TransportEnvelope::Welcome { recipient } => {
-                self.ingest_welcome(msg, recipient.clone()).await?
+        let outcome = match (&msg.envelope, unsealed) {
+            (TransportEnvelope::Welcome { recipient }, None) => self.ingest_welcome(recipient),
+            (TransportEnvelope::Welcome { recipient }, Some(unsealed)) => {
+                match self.ingest_welcome(recipient) {
+                    IngestOutcome::InboxSealed => {
+                        self.ingest_welcome_unsealed(msg, unsealed).await?
+                    }
+                    ignored => ignored,
+                }
             }
-            TransportEnvelope::GroupMessage { transport_group_id } => {
+            (TransportEnvelope::GroupMessage { transport_group_id }, None) => {
                 self.ingest_group_message(msg, transport_group_id.clone())
                     .await?
+            }
+            (TransportEnvelope::GroupMessage { .. }, Some(_)) => {
+                return Err(EngineError::Peeler(PeelerError::Malformed(
+                    "unsealed result for a group message".into(),
+                )));
             }
         };
 
@@ -989,12 +1003,14 @@ impl<S: StorageProvider> Engine<S> {
         // seen-cache insertion is also what it reports to callers holding a
         // dedup index of their own.
         self.last_ingest_left_object_unpersisted = retryable_unpersisted;
+        // A sealed inbox delivery stays unseen until its unsealed result
+        // comes back.
         if !retryable_unpersisted
             && !matches!(
                 outcome,
                 IngestOutcome::LocalState {
                     state: cgka_traits::ingest::LocalIngestState::RejoinConfirmationRequired,
-                }
+                } | IngestOutcome::InboxSealed
             )
             && self.should_remember_ingested_message(&msg.id)?
         {
@@ -3553,7 +3569,8 @@ impl<S: StorageProvider> Engine<S> {
                 self.release_cap_slot_if_row_left_peel_deferred(record, current);
                 Ok(!store::row_state_is_awaiting_retry(current))
             }
-            Ok(Outcome(IngestOutcome::GroupRecovery { .. })) => Err(EngineError::Peeler(
+            Ok(Outcome(IngestOutcome::GroupRecovery { .. }))
+            | Ok(Outcome(IngestOutcome::InboxSealed)) => Err(EngineError::Peeler(
                 PeelerError::Malformed("group retry returned account control".into()),
             )),
             Ok(Outcome(IngestOutcome::Processed)) => {
@@ -4901,42 +4918,18 @@ mod deferred_peel_accounting_tests {
         use cgka_traits::storage::MessageStorage;
         use cgka_traits::transport::{EncryptedPayload, Timestamp, TransportSource};
         struct OpaquePeeler;
-        #[async_trait::async_trait]
         impl TransportPeeler for OpaquePeeler {
-            async fn wrap_group_recovery(
-                &self,
-                _message: &cgka_traits::GroupRecoveryMessage,
-                _recipient: &cgka_traits::MemberId,
-            ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-                Err(cgka_traits::PeelerError::Malformed(
-                    "pass-through fixture has no authenticated account channel".into(),
-                ))
-            }
-
-            async fn peel_group_message(
+            fn peel_group_message(
                 &self,
                 _: &cgka_traits::peeler::PreparedGroupMessage<'_>,
                 _: &GroupContextSnapshot,
             ) -> Result<PeeledMessage, PeelerError> {
                 Err(PeelerError::DecryptFailed)
             }
-            async fn peel_welcome(
-                &self,
-                _: &TransportMessage,
-            ) -> Result<PeeledMessage, PeelerError> {
-                unreachable!()
-            }
-            async fn wrap_group_message(
+            fn wrap_group_message(
                 &self,
                 _: &EncryptedPayload,
                 _: &GroupContextSnapshot,
-            ) -> Result<TransportMessage, PeelerError> {
-                unreachable!()
-            }
-            async fn wrap_welcome(
-                &self,
-                _: &EncryptedPayload,
-                _: &MemberId,
             ) -> Result<TransportMessage, PeelerError> {
                 unreachable!()
             }

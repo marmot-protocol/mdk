@@ -89,6 +89,7 @@ async fn batch_reopen() {
         let SendResult::FoundingGroupCreated { welcomes } = created else {
             panic!("expected founding group");
         };
+        let welcomes = seal_and_bind(&mut admin, &welcomes);
         for ((_, target, _), welcome) in recipients.iter_mut().zip(welcomes) {
             assert_eq!(
                 welcome.envelope,
@@ -96,7 +97,7 @@ async fn batch_reopen() {
                     recipient: target.self_id()
                 }
             );
-            target.join_welcome(welcome.clone()).await.unwrap();
+            join_raw(target, welcome.clone()).await.unwrap();
             admin.mark_sent_welcome_delivered(&welcome.id).unwrap();
         }
         let admins = admin.admin_pubkeys(&group_id).unwrap();
@@ -186,6 +187,7 @@ async fn batch_reopen() {
         assert_eq!(restored[0].welcomes, welcomes);
         assert_eq!(restored[0].pending, pending);
         assert!(admin.outstanding_sent_welcomes().unwrap().is_empty());
+        let welcomes = seal_and_bind(&mut admin, &welcomes);
         admin.confirm_published(pending).await.unwrap();
         assert_eq!(admin.admin_pubkeys(&group_id).unwrap(), admins);
         let released = admin.outstanding_sent_welcomes().unwrap();
@@ -215,7 +217,7 @@ async fn batch_reopen() {
             target.hydrate_all_stored_groups().unwrap();
             let welcome = welcomes_by_recipient.get(&member).copied().unwrap();
             assert_eq!(released_by_id.get(&welcome.id).copied(), Some(welcome));
-            target.join_welcome(welcome.clone()).await.unwrap();
+            join_raw(&mut target, welcome.clone()).await.unwrap();
             assert_eq!(target.members(&group_id).unwrap().len(), count + 1);
             assert_eq!(target.admin_pubkeys(&group_id).unwrap(), admins);
             let (joined, _) = load_group_and_signer(&target_storage, &member, &group_id);
@@ -274,7 +276,7 @@ async fn recovery_artifact_quarantine() {
             }
             MissingArtifact::OwnLeaf => evolution.own_leaf_before_hash.as_mut().unwrap()[0] ^= 1,
             MissingArtifact::SignedCommit => evolution.signed_message_id = None,
-            MissingArtifact::Welcome => storage.delete_message(&welcomes[0].id).unwrap(),
+            MissingArtifact::Welcome => storage.delete_message(&welcomes[0].local_id).unwrap(),
         }
         storage.put_group_evolution(&evolution).unwrap();
         drop(admin);
@@ -325,9 +327,15 @@ async fn a_pending_recovery_commits_staged_welcome_is_never_marked_expired() {
     else {
         panic!("expected recovery evolution");
     };
-    let staged = &welcomes[0].id;
-    let deadline = admin.sent_welcome_deliver_until(staged).unwrap().unwrap();
-    assert_eq!(admin.expire_sent_welcome(staged, deadline).unwrap(), None);
+    // Until the session binds it with the commit's first fanout, the staged
+    // Welcome is unsealed: no clock marks it.
+    let staged = &welcomes[0].local_id;
+    assert_eq!(
+        admin
+            .expire_sent_welcome(staged, Timestamp(u64::MAX))
+            .unwrap(),
+        None
+    );
     drop(admin);
 
     let mut reopened = current_client(b"recovery-admin", storage.clone());

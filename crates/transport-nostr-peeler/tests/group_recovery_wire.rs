@@ -4,8 +4,8 @@ use std::sync::Mutex;
 
 use cgka_traits::{
     AuthenticatedGroupRecovery, EpochId, GroupId, GroupRecoveryBody, GroupRecoveryMessage,
-    GroupRecoverySource, KeyPackage, MAX_GROUP_RECOVERY_BODY_BYTES, MemberId, PeelerError,
-    TransportEnvelope, TransportMessage, TransportPeeler,
+    GroupRecoverySource, InboxSealer, KeyPackage, MAX_GROUP_RECOVERY_BODY_BYTES, MemberId,
+    PeelerError, SystemWallClock, TransportEnvelope, TransportMessage,
 };
 use nostr::nips::nip59::GiftWrapBuilder;
 use nostr::prelude::{
@@ -14,7 +14,8 @@ use nostr::prelude::{
 };
 use transport_nostr_peeler::{
     GROUP_RECOVERY_PROTOCOL_TAG, GROUP_RECOVERY_PROTOCOL_VERSION, KIND_MDK_GROUP_RECOVERY_RUMOR,
-    MAX_GROUP_RECOVERY_EVENT_BYTES, NostrMlsPeeler, NostrTransportEvent, gift_wrap_rumor,
+    MAX_GROUP_RECOVERY_EVENT_BYTES, MarmotNostrSigner, NostrInboxSealer, NostrTransportEvent,
+    gift_wrap_rumor,
 };
 
 #[derive(Debug)]
@@ -97,11 +98,15 @@ fn member(keys: &Keys) -> MemberId {
     MemberId::new(keys.public_key().to_bytes().to_vec())
 }
 
+fn sealer(signer: impl MarmotNostrSigner + 'static) -> NostrInboxSealer {
+    NostrInboxSealer::new(Arc::new(signer), Arc::new(SystemWallClock))
+}
+
 async fn peel_recovery(
-    peeler: &NostrMlsPeeler,
+    peeler: &NostrInboxSealer,
     message: &TransportMessage,
 ) -> Result<AuthenticatedGroupRecovery, PeelerError> {
-    match peeler.peel_welcome(message).await?.content {
+    match peeler.unseal(message).await?.content {
         cgka_traits::PeeledContent::GroupRecovery { recovery } => Ok(*recovery),
         _ => Err(PeelerError::Malformed(
             "expected authenticated recovery".into(),
@@ -154,24 +159,25 @@ fn signed_carrier(sender: &Keys, receiver: &Keys, rumor: UnsignedEvent) -> Trans
 async fn recovery_outer_is_private() {
     let sender = Keys::generate();
     let receiver = Keys::generate();
-    let from = NostrMlsPeeler::default().with_welcome_signer(sender);
+    let from = sealer(sender);
     let recipient = member(&receiver);
     let recovery = from
-        .wrap_group_recovery(&request(), &recipient)
+        .seal_group_recovery(&request(), &recipient)
         .await
         .unwrap();
     let welcome = from
-        .wrap_welcome_with_metadata(
-            &cgka_traits::EncryptedPayload {
+        .seal_welcome(&cgka_traits::OutboundWelcome {
+            local_id: cgka_traits::MessageId::new(vec![1; 32]),
+            recipient: recipient.clone(),
+            payload: cgka_traits::EncryptedPayload {
                 ciphertext: b"welcome bytes".to_vec(),
                 aad: Vec::new(),
             },
-            &recipient,
-            &cgka_traits::engine::WelcomeMetadata {
+            metadata: Some(cgka_traits::engine::WelcomeMetadata {
                 key_package_event_id: cgka_traits::MessageId::new(vec![4; 32]),
                 relays: vec!["wss://relay.example".into()],
-            },
-        )
+            }),
+        })
         .await
         .unwrap();
     let recovery_event = NostrTransportEvent::from_transport_message(&recovery).unwrap();
@@ -188,7 +194,7 @@ async fn recovery_outer_is_private() {
 async fn recovery_unmarked_dispatch() {
     let sender = Keys::generate();
     let receiver = Keys::generate();
-    let to = NostrMlsPeeler::default().with_welcome_signer(OnceSigner {
+    let to = sealer(OnceSigner {
         keys: receiver.clone(),
         consumed: Mutex::new(HashSet::new()),
     });
@@ -212,9 +218,8 @@ async fn recovery_unmarked_dispatch() {
             message: request()
         }
     );
-    let opened = NostrMlsPeeler::default()
-        .with_welcome_signer(receiver)
-        .peel_account_gift_wrap(&message)
+    let opened = sealer(receiver)
+        .open_account_gift_wrap(&message)
         .await
         .unwrap();
     assert!(matches!(
@@ -235,7 +240,7 @@ async fn recovery_unmarked_dispatch() {
 async fn welcome_stays_ordinary() {
     let sender = Keys::generate();
     let receiver = Keys::generate();
-    let to = NostrMlsPeeler::default().with_welcome_signer(receiver.clone());
+    let to = sealer(receiver.clone());
     // A protocol-looking tag alone cannot change an authenticated Welcome's kind.
     for markers in [Vec::new(), vec![protocol_tag()]] {
         let inner = EventBuilder::new(Kind::Custom(444), "d2VsY29tZSBieXRlcw==")
@@ -252,7 +257,7 @@ async fn welcome_stays_ordinary() {
             .unwrap()
             .to_transport_message()
             .unwrap();
-        let peeled = to.peel_welcome(&message).await.unwrap();
+        let peeled = to.unseal(&message).await.unwrap();
         assert!(matches!(
             peeled.content,
             cgka_traits::PeeledContent::Welcome { .. }
@@ -265,7 +270,7 @@ async fn welcome_stays_ordinary() {
 async fn unmarked_bad_inner_rejected() {
     let sender = Keys::generate();
     let receiver = Keys::generate();
-    let to = NostrMlsPeeler::default().with_welcome_signer(receiver.clone());
+    let to = sealer(receiver.clone());
     let content = String::from_utf8(request().encode().unwrap()).unwrap();
     for markers in [
         Vec::new(),
@@ -282,7 +287,7 @@ async fn unmarked_bad_inner_rejected() {
             .to_transport_message()
             .unwrap();
         assert!(peel_recovery(&to, &message).await.is_err());
-        assert!(to.peel_welcome(&message).await.is_err());
+        assert!(to.unseal(&message).await.is_err());
     }
     let mut unsupported = rumor(&sender, &receiver, content, vec![protocol_tag()]);
     unsupported.kind = Kind::TextNote;
@@ -294,15 +299,15 @@ async fn unmarked_bad_inner_rejected() {
         .to_transport_message()
         .unwrap();
     assert!(peel_recovery(&to, &message).await.is_err());
-    assert!(to.peel_welcome(&message).await.is_err());
+    assert!(to.unseal(&message).await.is_err());
 }
 
 #[tokio::test]
 async fn recovery_account_roundtrip() {
     let recovering = Keys::generate();
     let coordinator = Keys::generate();
-    let recovering_peeler = NostrMlsPeeler::default().with_welcome_signer(recovering.clone());
-    let coordinator_peeler = NostrMlsPeeler::default().with_welcome_signer(coordinator.clone());
+    let recovering_peeler = sealer(recovering.clone());
+    let coordinator_peeler = sealer(coordinator.clone());
     let source = GroupRecoverySource {
         epoch: EpochId(12),
         epoch_authenticator_hash: [4; 32],
@@ -351,7 +356,7 @@ async fn recovery_account_roundtrip() {
         ),
     ] {
         let wrapped = from
-            .wrap_group_recovery(&message, &member(receiver))
+            .seal_group_recovery(&message, &member(receiver))
             .await
             .unwrap();
         assert_eq!(
@@ -395,7 +400,7 @@ async fn recovery_account_roundtrip() {
         );
         assert!(
             matches!(
-                to.peel_welcome(&wrapped).await.unwrap().content,
+                to.unseal(&wrapped).await.unwrap().content,
                 cgka_traits::PeeledContent::GroupRecovery { .. }
             ),
             "authenticated recovery must not enter Welcome handling"
@@ -408,15 +413,15 @@ async fn recovery_rejects_wrong_route() {
     let sender = Keys::generate();
     let receiver = Keys::generate();
     let foreign = Keys::generate();
-    let from = NostrMlsPeeler::default().with_welcome_signer(sender.clone());
-    let to = NostrMlsPeeler::default().with_welcome_signer(receiver.clone());
-    let wrong = NostrMlsPeeler::default().with_welcome_signer(foreign.clone());
+    let from = sealer(sender.clone());
+    let to = sealer(receiver.clone());
+    let wrong = sealer(foreign.clone());
     let wrapped = from
-        .wrap_group_recovery(&request(), &member(&receiver))
+        .seal_group_recovery(&request(), &member(&receiver))
         .await
         .unwrap();
     assert!(
-        wrong.peel_welcome(&wrapped).await.is_err(),
+        wrong.unseal(&wrapped).await.is_err(),
         "wrong signer cannot authenticate or dispatch inbox control"
     );
     let mut forged_route = wrapped;
@@ -445,7 +450,7 @@ async fn recovery_forged_sender() {
     let sender = Keys::generate();
     let receiver = Keys::generate();
     let impersonated = Keys::generate();
-    let to = NostrMlsPeeler::default().with_welcome_signer(receiver.clone());
+    let to = sealer(receiver.clone());
     let forged_rumor = rumor(
         &impersonated,
         &receiver,
@@ -457,9 +462,8 @@ async fn recovery_forged_sender() {
         peel_recovery(&to, &forged).await.is_err(),
         "valid seal must not authenticate a different rumor author"
     );
-    let wrapped = NostrMlsPeeler::default()
-        .with_welcome_signer(sender)
-        .wrap_group_recovery(&request(), &member(&receiver))
+    let wrapped = sealer(sender)
+        .seal_group_recovery(&request(), &member(&receiver))
         .await
         .unwrap();
     let mut event = NostrTransportEvent::from_transport_message(&wrapped).unwrap();
@@ -475,7 +479,7 @@ async fn recovery_forged_sender() {
 async fn recovery_strict_tags() {
     let sender = Keys::generate();
     let receiver = Keys::generate();
-    let to = NostrMlsPeeler::default().with_welcome_signer(receiver.clone());
+    let to = sealer(receiver.clone());
     let content = String::from_utf8(request().encode().unwrap()).unwrap();
     for tags in [
         vec![],
@@ -559,7 +563,7 @@ async fn recovery_strict_tags() {
 async fn recovery_rejects_oversize() {
     let sender = Keys::generate();
     let receiver = Keys::generate();
-    let to = NostrMlsPeeler::default().with_welcome_signer(receiver.clone());
+    let to = sealer(receiver.clone());
     let mut content = String::from_utf8(request().encode().unwrap()).unwrap();
     content.extend(std::iter::repeat_n(
         ' ',

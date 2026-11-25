@@ -134,6 +134,7 @@ async fn kill_during_orphan_pending_recovery_preserves_retryable_state() {
         let SendResult::GroupEvolution { welcomes, .. } = invited else {
             panic!("expected invite")
         };
+        let welcomes = seal_and_bind(&mut alice, &welcomes);
         assert_eq!(welcomes.len(), 1);
         welcome = storage.get_message(&welcomes[0].id).unwrap();
         assert_eq!(welcome.state, MessageState::Sent);

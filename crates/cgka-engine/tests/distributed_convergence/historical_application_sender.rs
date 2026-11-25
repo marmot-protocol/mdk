@@ -65,12 +65,12 @@ async fn check_historical_sender(
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected group creation, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+    join_raw(&mut bob, welcome_for(&welcomes, b"bob"))
         .await
         .unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
+    join_raw(&mut carol, welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
     let source_epoch = bob.epoch(&group).unwrap();
@@ -116,14 +116,15 @@ async fn check_historical_sender(
             })
             .await
             .unwrap();
-        let (pending, mut welcomes) = match invite {
+        let (pending, welcomes) = match invite {
             SendResult::GroupEvolution {
                 pending, welcomes, ..
             } => (pending, welcomes),
             other => panic!("expected invite, got {other:?}"),
         };
+        let mut welcomes = seal_and_bind(&mut alice, &welcomes);
         alice.confirm_published(pending).await.unwrap();
-        joining.join_welcome(welcomes.remove(0)).await.unwrap();
+        join_raw(joining, welcomes.remove(0)).await.unwrap();
         assert_eq!(joining.own_leaf_index(&group).unwrap(), old_leaf);
     }
     assert!(alice.epoch(&group).unwrap() > source_epoch);

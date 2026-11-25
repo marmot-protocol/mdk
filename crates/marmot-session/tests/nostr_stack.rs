@@ -288,7 +288,13 @@ async fn invite_group_evolution_publishes_commit_and_welcome_through_stack() {
             msg,
             welcomes,
             pending,
-        } => (*pending, msg.clone(), welcomes[0].clone()),
+        } => (
+            *pending,
+            msg.clone(),
+            support::nostr_stack::seal_and_bind(&mut alice.session, welcomes)
+                .await
+                .remove(0),
+        ),
         other => panic!("expected group evolution publish work, got {other:?}"),
     };
 
@@ -371,7 +377,7 @@ async fn create_group_for_bob(alice: &mut StackClient, bob: &mut StackClient) ->
         })
         .await
         .unwrap();
-    CreatedGroup::from_effects(created)
+    CreatedGroup::from_effects(&mut alice.session, created).await
 }
 
 fn key_package_with_event_id(key_package: KeyPackage, marker: u8) -> KeyPackage {

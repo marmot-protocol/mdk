@@ -266,7 +266,6 @@ async fn proposal_authorization_vector_rejects_direct_and_nostr_wrapped_input() 
             },
             &snapshot,
         )
-        .await
         .expect("wrap proposal as Nostr group event");
     bus.inject(alice.bus_id, wrapped.clone());
     let outcomes = alice.tick_ingest_only().await;

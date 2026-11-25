@@ -13,7 +13,6 @@
 //!   and a peer accepts the refreshed leaf.
 //! - A leaf is reported stale only while a self-update would change it.
 
-use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{
@@ -35,6 +34,7 @@ use sha2::{Digest, Sha256};
 use storage_sqlite::SqliteAccountStorage;
 
 use crate::support::proof_signer;
+use crate::support::raw_inbox::{join_raw, seal_and_bind};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     use k256::schnorr::SigningKey;
@@ -55,19 +55,8 @@ fn pad32(name: &[u8]) -> Vec<u8> {
 
 struct MockPeeler;
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -83,21 +72,7 @@ impl TransportPeeler for MockPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -110,23 +85,6 @@ impl TransportPeeler for MockPeeler {
             source: TransportSource("mock".into()),
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: vec![],
-            },
-        })
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: MessageId::new(Sha256::digest(&payload.ciphertext).to_vec()),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
             },
         })
     }
@@ -224,8 +182,8 @@ async fn old_group(alice: &mut Device, bob: &mut Device) -> GroupId {
         SendResult::FoundingGroupCreated { welcomes } => welcomes,
         other => panic!("expected FoundingGroupCreated, got {other:?}"),
     };
-    bob.engine
-        .join_welcome(welcomes.into_iter().next().unwrap())
+    let welcomes = seal_and_bind(&mut alice.engine, &welcomes);
+    join_raw(&mut bob.engine, welcomes.into_iter().next().unwrap())
         .await
         .unwrap();
     assert!(

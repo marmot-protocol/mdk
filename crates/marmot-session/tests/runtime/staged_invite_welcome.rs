@@ -169,37 +169,200 @@ impl RetainedInvite {
     /// Stop the runtime and open it again over the same store, as an app
     /// restart does.
     fn restart(&mut self, dir: &std::path::Path) {
-        self.reopen(dir, session);
+        self.reopen(dir, SessionConfig::legacy_compatibility_profile, Arc::new(MockSealer));
     }
 
     /// [`Self::restart`], leaving the group unhydrated.
     fn restart_unhydrated(&mut self, dir: &std::path::Path) {
-        self.reopen(dir, deferred_session);
+        self.reopen(
+            dir,
+            |config| config.legacy_compatibility_profile().defer_group_hydration(),
+            Arc::new(MockSealer),
+        );
     }
 
     fn reopen(
         &mut self,
         dir: &std::path::Path,
-        open: fn(std::path::PathBuf, &SqlCipherKey, &[u8]) -> AccountDeviceSession,
+        configure: impl FnOnce(SessionConfig) -> SessionConfig,
+        sealer: Arc<dyn InboxSealer>,
     ) {
-        let reopened = open(
-            dir.join("alice.sqlite"),
-            &SqlCipherKey::new(STAGED_INVITE_KEY).unwrap(),
-            STAGED_INVITE_ALICE,
-        );
-        let restarted = AccountDeviceRuntime::new(
-            reopened,
-            self.adapter.clone(),
-            self.policy.clone(),
-            RecordingKeyPackages::default(),
-        )
-        .with_maintenance_sources(
-            self.wall.clone(),
-            Arc::new(TestMonotonicClock::default()),
-            Arc::new(TestRandom::new(0)),
+        let restarted = reopen_staged_invite_runtime(
+            dir, configure, sealer, self.adapter.clone(), self.policy.clone(), self.wall.clone(),
         );
         drop(std::mem::replace(&mut self.runtime, restarted));
     }
+}
+
+fn reopen_staged_invite_runtime(
+    dir: &std::path::Path,
+    configure: impl FnOnce(SessionConfig) -> SessionConfig,
+    sealer: Arc<dyn InboxSealer>,
+    adapter: RecordingAdapter,
+    routing: SharedRouting,
+    wall: Arc<TestWallClock>,
+) -> StagedInviteRuntime {
+    let config = mock_session_config(
+        dir.join("alice.sqlite"),
+        &SqlCipherKey::new(STAGED_INVITE_KEY).unwrap(),
+        STAGED_INVITE_ALICE,
+        sealer,
+    );
+    AccountDeviceRuntime::new(
+        AccountDeviceSession::open(configure(config)).unwrap(),
+        adapter,
+        routing,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    )
+}
+
+#[tokio::test]
+async fn founding_welcome_unsealed_at_stop_is_delivered_after_restart() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new(STAGED_INVITE_KEY).unwrap();
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"founding-bob");
+    let bob_id = bob.self_id();
+    let bob_inbox = TransportEndpoint("wss://bob-inbox.example".into());
+    let group_relay = TransportEndpoint("wss://group.example".into());
+    let adapter = RecordingAdapter::default();
+    let routing = SharedRouting(Arc::new(Mutex::new(
+        StaticTransportRouting::new(vec![])
+            .with_inbox_route(bob_id.clone(), vec![bob_inbox.clone()]),
+    )));
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let refusing = SwitchableSealer::default();
+    refusing.fail.store(true, Ordering::SeqCst);
+    let mut runtime = reopen_staged_invite_runtime(
+        dir.path(),
+        std::convert::identity,
+        Arc::new(refusing),
+        adapter.clone(),
+        routing.clone(),
+        wall.clone(),
+    );
+    let (group, _) = runtime
+        .create_group(CreateGroupRequest {
+            name: "founding Welcome retry".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(staged_welcome_publishes(&adapter).is_empty());
+    assert_eq!(runtime.session().unsealed_owed_welcomes().unwrap().len(), 1);
+    drop(runtime);
+
+    routing.update(|_| {
+        staged_invite_routing(&group, &group_relay)
+            .with_inbox_route(bob_id.clone(), vec![bob_inbox.clone()])
+    });
+    let mut runtime = reopen_staged_invite_runtime(
+        dir.path(),
+        std::convert::identity,
+        Arc::new(MockSealer),
+        adapter.clone(),
+        routing,
+        wall,
+    );
+    runtime.run_due_maintenance().await.unwrap();
+    let publishes = adapter.publishes();
+    let welcomes = publishes.iter().filter(|request| {
+        matches!(request.message.envelope, TransportEnvelope::Welcome { .. })
+    }).collect::<Vec<_>>();
+    let [published] = welcomes.as_slice() else {
+        panic!("maintenance must publish exactly one founding Welcome, got {}", welcomes.len());
+    };
+    assert_eq!(published.target.endpoints(), &[bob_inbox]);
+    assert_eq!(published.message.envelope, TransportEnvelope::Welcome { recipient: bob_id.clone() });
+    let outcomes = runtime.welcome_delivery_outcomes(Some(&group), Some(&bob_id)).unwrap();
+    let [outcome] = outcomes.as_slice() else { panic!("expected one founding invite") };
+    let [outcome] = outcome.as_slice() else { panic!("expected one founding Welcome") };
+    assert_eq!(outcome.record.welcome_id, published.message.id);
+    assert_eq!(outcome.state, cgka_traits::maintenance::WelcomeDeliveryState::RelayAccepted);
+    assert_eq!(
+        runtime.session().stored_message_state(&published.message.id).unwrap(),
+        Some(cgka_traits::MessageState::Processed),
+    );
+    let joined = bob.ingest(published.message.clone()).await.unwrap();
+    assert_eq!(joined.outcome, cgka_traits::IngestOutcome::Processed);
+    assert!(joined.effects.events.iter().any(|event| matches!(
+        event, GroupEvent::GroupJoined { group_id, .. } if group_id == &group
+    )));
+}
+
+#[tokio::test]
+async fn prepared_send_preserves_a_durably_queued_invite() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new(STAGED_INVITE_KEY).unwrap();
+    let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"queued-alice");
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"queued-bob");
+    let mut carol = current_session(dir.path().join("carol.sqlite"), &key, b"queued-carol");
+    let bob_id = bob.self_id();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "queued prepared invite".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: vec![bob_id],
+        })
+        .await
+        .unwrap();
+    let group = created.group_id;
+    let [PublishWork::FoundingGroupCreated { welcomes }] = created.effects.publish.as_slice() else {
+        panic!("expected a founding Welcome");
+    };
+    let joined = bob.ingest(welcomes[0].clone()).await.unwrap();
+    assert_eq!(joined.outcome, cgka_traits::IngestOutcome::Processed);
+
+    let effects = alice.send(SendIntent::SelfUpdate { group_id: group.clone() }).await.unwrap();
+    let [PublishWork::GroupEvolution { msg, pending, .. }] = effects.publish.as_slice() else {
+        panic!("expected a self-update commit");
+    };
+    alice.confirm_published(*pending).await.unwrap();
+    let mut commit = msg.clone();
+    commit.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group.as_slice().to_vec(),
+    };
+    bob.set_convergence_policy(cgka_engine::canonicalization::CanonicalizationPolicy {
+        settlement_quiescence_ms: 3_600_000,
+        ..Default::default()
+    }).unwrap();
+    assert!(matches!(bob.ingest(commit).await.unwrap().outcome, cgka_traits::IngestOutcome::Buffered { .. }));
+
+    let adapter = RecordingAdapter::default();
+    let mut runtime = AccountDeviceRuntime::new(
+        bob,
+        adapter.clone(),
+        staged_invite_routing(&group, &TransportEndpoint("wss://group.example".into())),
+        RecordingKeyPackages::default(),
+    );
+    let prepared = runtime.confirm_commit_without_publish_with_audit_context(
+        SendIntent::Invite {
+            group_id: group.clone(),
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: Vec::new(),
+        },
+        Default::default(),
+    ).await.unwrap();
+    let marmot_session::PreparedSessionSend::Queued(effects) = prepared else {
+        panic!("queued invite must not pretend to be staged");
+    };
+    let [queued] = effects.queued.as_slice() else { panic!("expected one queued invite") };
+    assert_eq!(queued.group_id, group);
+    assert!(runtime.session().is_queued_outbound_intent(queued).unwrap());
+    assert_eq!(effects.pending_convergence, [group]);
+    assert!(effects.publish.is_empty());
+    assert!(adapter.publishes().is_empty());
 }
 
 /// mdk#2726: an invite whose commit the relays leave unresolved keeps its

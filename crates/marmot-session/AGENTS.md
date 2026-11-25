@@ -190,7 +190,10 @@ multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome deliv
 ### Session
 
 - Keep SQLCipher keys app-provided. Do not add key derivation or recovery here.
-- Keep transport-specific code out. Inject a `TransportPeeler`; Nostr crates are dev-dependencies only.
+- Keep transport-specific code out. Inject a `TransportPeeler` and an `InboxSealer`; Nostr crates are dev-dependencies
+  only. The session owns the sealer: it seals a commit's Welcomes and binds them in the commit's first fanout write,
+  seals founding Welcomes before a create's effects leave it, and unseals inbox deliveries the engine stops at
+  `InboxSealed` (mdk#3498).
 - Surface engine effects as app events plus publishable transport work.
 - Own detached Welcome admission in the session. Every native-selection entry point, including roster sends and
   direct session calls, excludes queued adapter starts until its Welcome holds are refreshed.

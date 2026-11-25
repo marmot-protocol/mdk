@@ -9,6 +9,7 @@
 //! selection, and application-message validity.
 
 use crate::app_event::AppMessageRetentionDecision;
+use crate::engine::OutboundWelcome;
 use crate::engine_state::PendingStateRef;
 use crate::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
@@ -2206,6 +2207,16 @@ pub trait TransportAdapter: Send + Sync {
         None
     }
 
+    /// The size class of an event of `event_len` bytes that fits none of the
+    /// endpoints of `target` its publish would reach, or `None`.
+    async fn size_class_over_event_len(
+        &self,
+        _event_len: usize,
+        _target: &TransportPublishTarget,
+    ) -> Option<EventSizeClass> {
+        None
+    }
+
     /// The endpoints of `target` that [`Self::publish_commit`] would refuse
     /// `commit` on, unsent, for its size: over the endpoint's known limit or,
     /// where the limit is unknown, over the adapter's commit size floor
@@ -2276,8 +2287,8 @@ pub enum TransportReadBack {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait WelcomeSizeCheck: Send + Sync {
     /// The size class of the first of `welcomes` that fits none of the
-    /// endpoints its publish would reach, or `None` when each fits one.
-    async fn oversized_welcome(&self, welcomes: &[TransportMessage]) -> Option<EventSizeClass>;
+    /// endpoints its sealed publish would reach, or `None` when each fits one.
+    async fn oversized_welcome(&self, welcomes: &[OutboundWelcome]) -> Option<EventSizeClass>;
 }
 
 fn envelope_label(envelope: &TransportEnvelope) -> &'static str {

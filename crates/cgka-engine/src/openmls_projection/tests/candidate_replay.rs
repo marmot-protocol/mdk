@@ -13,7 +13,6 @@ use crate::convergence::V1_MAX_REWIND_COMMITS;
 use crate::message_processor::MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS;
 use crate::provider::EngineOpenMlsProvider;
 use crate::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
-use async_trait::async_trait;
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -29,6 +28,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::{OutboundWelcome, SealedWelcome};
 use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
 use openmls::group::MlsGroup;
 use openmls::prelude::{MlsMessageIn, ProcessedMessageContent};
@@ -83,20 +83,8 @@ impl AccountIdentityProofSigner for SeedProofSigner {
 /// Transport is not under test here: every message is carried verbatim.
 struct PassthroughPeeler;
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TransportPeeler for PassthroughPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -112,21 +100,7 @@ impl TransportPeeler for PassthroughPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -137,26 +111,6 @@ impl TransportPeeler for PassthroughPeeler {
                 transport_group_id: vec![],
             },
         ))
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        let mut message = transport_message(
-            &payload.ciphertext,
-            TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        );
-        // Current-profile founding sends a distinct envelope per invitee,
-        // even when the underlying MLS Welcome bytes are shared.
-        let mut digest = Sha256::new();
-        digest.update(&payload.ciphertext);
-        digest.update(recipient.as_slice());
-        message.id = MessageId::new(digest.finalize().to_vec());
-        Ok(message)
     }
 }
 
@@ -169,6 +123,53 @@ fn transport_message(payload: &[u8], envelope: TransportEnvelope) -> TransportMe
         source: TransportSource("candidate-branch-peel-test".into()),
         envelope,
     }
+}
+
+fn seal_and_bind(
+    engine: &mut Engine<SqliteAccountStorage>,
+    welcomes: &[OutboundWelcome],
+) -> Vec<TransportMessage> {
+    let sealed: Vec<_> = welcomes
+        .iter()
+        .map(|welcome| {
+            let mut message = transport_message(
+                &welcome.payload.ciphertext,
+                TransportEnvelope::Welcome {
+                    recipient: welcome.recipient.clone(),
+                },
+            );
+            // Co-invitees can share MLS Welcome bytes, but not a transport id.
+            message.id = MessageId::new(
+                Sha256::new()
+                    .chain_update(welcome.local_id.as_slice())
+                    .chain_update(welcome.recipient.as_slice())
+                    .chain_update(&message.payload)
+                    .finalize()
+                    .to_vec(),
+            );
+            SealedWelcome {
+                local_id: welcome.local_id.clone(),
+                message,
+            }
+        })
+        .collect();
+    engine.bind_sealed_welcomes(&sealed, None).unwrap();
+    sealed.into_iter().map(|welcome| welcome.message).collect()
+}
+
+async fn join_raw(engine: &mut Engine<SqliteAccountStorage>, welcome: TransportMessage) {
+    let unsealed = PeeledMessage {
+        id: welcome.id.clone(),
+        group_id: None,
+        sender: None,
+        content: PeeledContent::Welcome {
+            created_at: None,
+            bytes: welcome.payload.clone(),
+            key_package_event_id: None,
+        },
+        origin: welcome.clone(),
+    };
+    engine.join_welcome(welcome, unsealed).await.unwrap();
 }
 
 fn build_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
@@ -211,9 +212,10 @@ async fn group_with(
     let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("expected GroupCreated");
     };
+    let welcomes = seal_and_bind(creator, &welcomes);
     creator.confirm_published(pending).await.unwrap();
     for (joiner, welcome) in joiners.iter_mut().zip(welcomes) {
-        joiner.join_welcome(welcome).await.unwrap();
+        join_raw(joiner, welcome).await;
     }
     group_id
 }
@@ -266,13 +268,10 @@ async fn genuine_non_protocol_bodies_keep_their_projection_choices() {
         })
         .await
         .unwrap();
-    let SendResult::GroupCreated {
-        pending,
-        mut welcomes,
-    } = created
-    else {
+    let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("legacy compatibility creation returns its real Welcome");
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
     assert_eq!(welcomes.len(), 1);
     let welcome = welcomes.remove(0);
@@ -284,7 +283,7 @@ async fn genuine_non_protocol_bodies_keep_their_projection_choices() {
         protocol.is_none(),
         "a genuine Welcome is not a protocol message"
     );
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await;
 
     let crypto = RustCrypto::default();
     let provider =
@@ -782,8 +781,9 @@ async fn encrypted_replay_graph_fixture_with_apps(
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group");
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     for (joiner, welcome) in joiners.iter_mut().zip(welcomes) {
-        joiner.join_welcome(welcome).await.unwrap();
+        join_raw(joiner, welcome).await;
     }
     let mut messages = Vec::new();
     for _ in 0..width {

@@ -151,12 +151,12 @@ where
         }
     }
 
-    /// Note each Welcome a create retained ([`Self::note_retained_welcomes`]).
+    /// Note each founding Welcome a create retained and sealed
+    /// ([`Self::note_retained_welcomes`]). A legacy create's are noted when
+    /// its first fanout binds them.
     pub(super) fn note_founding_welcomes(&mut self, effects: &SessionEffects) {
         for work in &effects.publish {
-            if let PublishWork::FoundingGroupCreated { welcomes }
-            | PublishWork::GroupCreated { welcomes, .. } = work
-            {
+            if let PublishWork::FoundingGroupCreated { welcomes } = work {
                 self.note_retained_welcomes(welcomes);
             }
         }

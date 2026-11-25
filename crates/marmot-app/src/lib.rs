@@ -67,7 +67,7 @@ use transport_nostr_adapter::{
     NostrKeyPackagePublication, NostrKeyPackagePublisher, NostrNip65RelayListPublication,
     NostrNip65RelaySet, NostrRelayClient,
 };
-use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
+use transport_nostr_peeler::{NostrInboxSealer, NostrMlsPeeler, NostrTransportEvent};
 
 mod close_registry;
 mod unlinked_publish_gate;
@@ -5466,8 +5466,8 @@ impl MarmotApp {
         let nostr_signer = signer.as_nostr_signer();
         let entropy = Arc::new(cgka_traits::OsEntropy);
         let clock = Arc::new(cgka_traits::SystemWallClock);
-        let peeler = NostrMlsPeeler::new(entropy.clone(), clock.clone())
-            .with_welcome_signer_arc(nostr_signer.clone());
+        let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> =
+            Box::new(NostrMlsPeeler::new(entropy.clone(), clock.clone()));
         #[cfg(test)]
         let audit_v5_peel_slot = self
             .audit_v5_peel_slot
@@ -5485,9 +5485,9 @@ impl MarmotApp {
         } else {
             None
         };
-        let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> =
-            Box::new(client::audit_v5_probe::ProbePeeler {
-                inner: peeler,
+        let sealer: Arc<dyn cgka_traits::peeler::InboxSealer> =
+            Arc::new(client::audit_v5_probe::ProbeSealer {
+                inner: NostrInboxSealer::new(nostr_signer.clone(), clock.clone()),
                 slot: audit_v5_peel_slot.clone(),
                 storage: self.account_storage(label)?.app_storage(),
                 pairing: pairing_inbox.clone(),
@@ -5529,6 +5529,7 @@ impl MarmotApp {
             engine_storage_open,
             account_id.as_slice().to_vec(),
             peeler,
+            sealer,
         )
         .account_identity_proof_signer(signer.as_proof_signer())
         .maintenance_sources(clock, entropy)
@@ -9106,22 +9107,11 @@ impl TransportRoutingPolicy for AppTransportRouting {
         &self,
         message: &TransportMessage,
     ) -> Result<TransportPublishTarget, TransportRoutingError> {
-        let state = self.read();
         match &message.envelope {
-            TransportEnvelope::Welcome { recipient } => {
-                let endpoints = state
-                    .inbox_routes
-                    .get(recipient)
-                    .cloned()
-                    .unwrap_or(Err(MissingInboxRouteCause::NoList))
-                    .map_err(TransportRoutingError::MissingInboxRoute)?;
-                Ok(TransportPublishTarget::Inbox {
-                    recipient: recipient.clone(),
-                    endpoints,
-                })
-            }
+            TransportEnvelope::Welcome { recipient } => self.inbox_target(recipient),
             TransportEnvelope::GroupMessage { transport_group_id } => {
-                let route = state
+                let route = self
+                    .read()
                     .group_routes
                     .iter()
                     .find(|route| route.transport_group_id == *transport_group_id)
@@ -9134,6 +9124,23 @@ impl TransportRoutingPolicy for AppTransportRouting {
                 })
             }
         }
+    }
+
+    fn inbox_target(
+        &self,
+        recipient: &MemberId,
+    ) -> Result<TransportPublishTarget, TransportRoutingError> {
+        let endpoints = self
+            .read()
+            .inbox_routes
+            .get(recipient)
+            .cloned()
+            .unwrap_or(Err(MissingInboxRouteCause::NoList))
+            .map_err(TransportRoutingError::MissingInboxRoute)?;
+        Ok(TransportPublishTarget::Inbox {
+            recipient: recipient.clone(),
+            endpoints,
+        })
     }
 
     fn required_acks(&self, _target: &TransportPublishTarget) -> usize {

@@ -16,6 +16,11 @@ pub trait TransportRoutingPolicy: Send + Sync {
         &self,
         message: &TransportMessage,
     ) -> Result<TransportPublishTarget, TransportRoutingError>;
+    /// Where an account-inbox message for `recipient` is published.
+    fn inbox_target(
+        &self,
+        recipient: &MemberId,
+    ) -> Result<TransportPublishTarget, TransportRoutingError>;
     fn required_acks(&self, target: &TransportPublishTarget) -> usize;
 }
 
@@ -116,15 +121,7 @@ impl TransportRoutingPolicy for StaticTransportRouting {
         message: &TransportMessage,
     ) -> Result<TransportPublishTarget, TransportRoutingError> {
         match &message.envelope {
-            TransportEnvelope::Welcome { recipient } => {
-                let endpoints = self.inbox_routes.get(recipient).cloned().ok_or(
-                    TransportRoutingError::MissingInboxRoute(MissingInboxRouteCause::NoList),
-                )?;
-                Ok(TransportPublishTarget::Inbox {
-                    recipient: recipient.clone(),
-                    endpoints,
-                })
-            }
+            TransportEnvelope::Welcome { recipient } => self.inbox_target(recipient),
             TransportEnvelope::GroupMessage { transport_group_id } => {
                 let route = self
                     .group_routes
@@ -139,6 +136,19 @@ impl TransportRoutingPolicy for StaticTransportRouting {
                 })
             }
         }
+    }
+
+    fn inbox_target(
+        &self,
+        recipient: &MemberId,
+    ) -> Result<TransportPublishTarget, TransportRoutingError> {
+        let endpoints = self.inbox_routes.get(recipient).cloned().ok_or(
+            TransportRoutingError::MissingInboxRoute(MissingInboxRouteCause::NoList),
+        )?;
+        Ok(TransportPublishTarget::Inbox {
+            recipient: recipient.clone(),
+            endpoints,
+        })
     }
 
     fn required_acks(&self, _target: &TransportPublishTarget) -> usize {

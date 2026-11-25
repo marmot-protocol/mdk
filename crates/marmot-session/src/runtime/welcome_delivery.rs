@@ -850,6 +850,38 @@ where
         Ok(())
     }
 
+    /// Seal and bind founding Welcomes a create left unsealed, because its
+    /// seal failed or the process stopped first, and watch them so this pass
+    /// publishes them. Sealing stops at the first failure; the next pass
+    /// tries the rest again.
+    async fn seal_owed_welcomes(&mut self) -> AccountResult<()> {
+        let welcomes = self.session.unsealed_owed_welcomes()?;
+        let mut sealed = Vec::with_capacity(welcomes.len());
+        for welcome in &welcomes {
+            let Ok(message) = self.session.sealer.seal_welcome(welcome).await else {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    method = "seal_owed_welcomes",
+                    unsealed = welcomes.len() - sealed.len(),
+                    "founding Welcome seal failed; retried next pass"
+                );
+                break;
+            };
+            sealed.push(SealedWelcome {
+                local_id: welcome.local_id.clone(),
+                message,
+            });
+        }
+        if sealed.is_empty() {
+            return Ok(());
+        }
+        self.session.bind_sealed_welcomes(&sealed, None)?;
+        let messages: Vec<TransportMessage> =
+            sealed.into_iter().map(|sealed| sealed.message).collect();
+        self.note_retained_welcomes(&messages);
+        Ok(())
+    }
+
     /// Publish each watched Welcome that is owed and that no attempt record
     /// holds. A Welcome stays watched until its row is settled. While a stored
     /// fanout or a detached wave holds it, that record retries it;
@@ -860,6 +892,7 @@ where
         &mut self,
         output: &mut AccountDeviceEffects,
     ) -> AccountResult<()> {
+        self.seal_owed_welcomes().await?;
         self.read_welcome_store()?;
         let mut due: Vec<(GroupId, Vec<TransportMessage>)> = Vec::new();
         let mut watching = Vec::with_capacity(self.watched_welcomes.len());

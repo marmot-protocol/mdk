@@ -55,7 +55,8 @@ mod tagged_siblings {
                 dir.path().join(format!("{name}.sqlite")),
                 SqlCipherKey::new("tagged siblings").unwrap(),
                 pad32(account),
-                Box::new(nostr_peeler(account)),
+                Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+                Arc::new(nostr_sealer(account)),
             )
             .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
                 keys: deterministic_nostr_keys(account),

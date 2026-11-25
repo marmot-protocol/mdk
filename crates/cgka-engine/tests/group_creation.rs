@@ -27,7 +27,9 @@ use cgka_traits::app_components::{
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
+use cgka_traits::engine::{
+    CgkaEngine, CreateGroupRequest, OutboundWelcome, SealedWelcome, SendIntent, SendResult,
+};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -41,6 +43,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{GroupId, MemberId, MessageId};
+use cgka_traits::{EventSizeClass, WelcomeSizeCheck};
 use openmls::component::ComponentType;
 use openmls::extensions::{
     AppDataDictionary, AppDataDictionaryExtension, Extension, LastResortExtension,
@@ -58,6 +61,7 @@ use tls_codec::{Deserialize as _, Serialize as _};
 
 mod support;
 use support::proof_signer;
+use support::raw_inbox::{ingest_raw, join_raw, raw_seal, raw_unseal, seal_and_bind};
 
 /// Build a wire KeyPackage carrying a `BasicCredential` whose identity is the
 /// raw `identity` bytes, bypassing the engine's identity validation. Used to
@@ -445,11 +449,7 @@ fn pad32(name: &[u8]) -> Vec<u8> {
     }
 }
 
-#[derive(Default)]
-struct MockPeeler {
-    welcome_sender: Option<MemberId>,
-    collide_welcome_ids: bool,
-}
+struct MockPeeler;
 
 fn hash_id(bytes: &[u8]) -> MessageId {
     use std::collections::hash_map::DefaultHasher;
@@ -459,19 +459,8 @@ fn hash_id(bytes: &[u8]) -> MessageId {
     MessageId::new(h.finish().to_be_bytes().to_vec())
 }
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -486,24 +475,7 @@ impl TransportPeeler for MockPeeler {
             origin: msg.message.clone(),
         })
     }
-
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        // Pass-through: the engine put the raw MLS welcome bytes in
-        // `payload` on the wrap side; unwrap by returning them as-is.
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: self.welcome_sender.clone(),
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
@@ -519,81 +491,13 @@ impl TransportPeeler for MockPeeler {
             },
         })
     }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        let mut id_material = payload.ciphertext.clone();
-        id_material.extend_from_slice(recipient.as_slice());
-        Ok(TransportMessage {
-            id: if self.collide_welcome_ids {
-                MessageId::new(b"colliding-founding-welcome-id".to_vec())
-            } else {
-                hash_id(&id_material)
-            },
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        })
-    }
 }
 
-struct BlockingWelcomePeeler {
-    inner: MockPeeler,
-    started: Arc<tokio::sync::Notify>,
-}
-
+struct BlockingWelcomeSizeCheck(tokio::sync::Notify);
 #[async_trait]
-impl TransportPeeler for BlockingWelcomePeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    fn prepare_group_message<'a>(
-        &self,
-        msg: &'a TransportMessage,
-    ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
-        self.inner.prepare_group_message(msg)
-    }
-
-    async fn peel_group_message(
-        &self,
-        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        self.inner.peel_group_message(msg, ctx).await
-    }
-
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        self.inner.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
-        &self,
-        payload: &EncryptedPayload,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.inner.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        _payload: &EncryptedPayload,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.started.notify_one();
+impl WelcomeSizeCheck for BlockingWelcomeSizeCheck {
+    async fn oversized_welcome(&self, _welcomes: &[OutboundWelcome]) -> Option<EventSizeClass> {
+        self.0.notify_one();
         std::future::pending().await
     }
 }
@@ -607,7 +511,7 @@ fn build_client_with_components(
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .supported_app_components(components)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .expect("build engine")
 }
@@ -625,13 +529,13 @@ fn selfremove_registry() -> FeatureRegistry {
     r
 }
 
-fn build_client(identity: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
+fn build_client(identity: &[u8], registry: FeatureRegistry) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(registry)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .expect("build engine")
 }
@@ -641,7 +545,7 @@ fn build_current_client(identity: &[u8]) -> Engine<SqliteAccountStorage> {
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .expect("build current-profile engine")
 }
@@ -655,7 +559,7 @@ fn build_profile_client_on_storage(
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .protocol_profile(profile)
-        .peeler(Box::new(MockPeeler::default()));
+        .peeler(Box::new(MockPeeler));
     let builder = if profile == ProtocolProfile::Legacy {
         builder.legacy_compatibility_profile()
     } else {
@@ -664,35 +568,17 @@ fn build_profile_client_on_storage(
     builder.build().expect("build profile engine")
 }
 
-fn build_client_with_welcome_sender(
-    identity: &[u8],
-    registry: FeatureRegistry,
-    welcome_sender: MemberId,
-) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
-        .legacy_compatibility_profile()
-        .identity(pad32(identity))
-        .account_identity_proof_signer(proof_signer(identity))
-        .feature_registry(registry)
-        .peeler(Box::new(MockPeeler {
-            welcome_sender: Some(welcome_sender),
-            collide_welcome_ids: false,
-        }))
-        .build()
-        .expect("build engine")
-}
-
 fn build_client_on_storage(
     identity: &[u8],
     registry: FeatureRegistry,
     storage: SqliteAccountStorage,
-) -> impl CgkaEngine {
+) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
         .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(registry)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .expect("build engine")
 }
@@ -799,7 +685,7 @@ async fn create_group_with_three_members_happy_path() {
 
     // Every welcome is addressed (envelope discriminator populated).
     if let SendResult::GroupCreated { welcomes, .. } = result {
-        for w in welcomes {
+        for w in seal_and_bind(&mut alice, &welcomes) {
             match w.envelope {
                 TransportEnvelope::Welcome { .. } => {}
                 _ => panic!("welcome envelope"),
@@ -1084,7 +970,7 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
         .account_identity_proof_signer(proof_signer(b"alice-current-group"))
         .supported_app_components(current_components.clone())
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
     let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
@@ -1092,7 +978,7 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
         .account_identity_proof_signer(proof_signer(b"bob-current-group"))
         .supported_app_components(current_components)
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
     let mut legacy_carol = build_client(b"carol-legacy-group", FeatureRegistry::new());
@@ -1119,7 +1005,9 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
         .await
         .unwrap();
     let welcome = match result {
-        SendResult::FoundingGroupCreated { mut welcomes } => welcomes.remove(0),
+        SendResult::FoundingGroupCreated { welcomes } => {
+            seal_and_bind(&mut alice, &welcomes).remove(0)
+        }
         other => panic!("expected FoundingGroupCreated, got {other:?}"),
     };
     let welcome_id = welcome.id.clone();
@@ -1162,13 +1050,12 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
     );
     let mut duplicate_welcome = welcome.clone();
     duplicate_welcome.id = MessageId::new(b"distinct-transport-id-same-welcome".to_vec());
-    let joined = bob.join_welcome(welcome).await.unwrap();
+    let joined = join_raw(&mut bob, welcome).await.unwrap();
     assert_eq!(
         bob.group_record(&joined).unwrap().protocol_profile,
         ProtocolProfile::Current
     );
-    let duplicate_error = bob
-        .join_welcome(duplicate_welcome)
+    let duplicate_error = join_raw(&mut bob, duplicate_welcome)
         .await
         .expect_err("a duplicate founding Welcome must not mutate joined state");
     assert!(matches!(
@@ -1215,7 +1102,7 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
         .identity(pad32(b"alice-current-group"))
         .account_identity_proof_signer(proof_signer(b"alice-current-group"))
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
     reopened.hydrate_all_stored_groups().unwrap();
@@ -1293,7 +1180,7 @@ async fn welcome_scan_filters_rows() {
         .await
         .unwrap();
     let welcomes = match result {
-        SendResult::FoundingGroupCreated { welcomes } => welcomes,
+        SendResult::FoundingGroupCreated { welcomes } => seal_and_bind(&mut alice, &welcomes),
         other => panic!("expected founding Welcomes, got {other:?}"),
     };
     assert_eq!(welcomes.len(), 2);
@@ -1426,7 +1313,9 @@ async fn welcome_index_keeps_lifecycle() {
         .await
         .unwrap();
     let completed = match result {
-        SendResult::FoundingGroupCreated { mut welcomes } => welcomes.remove(0),
+        SendResult::FoundingGroupCreated { welcomes } => {
+            seal_and_bind(&mut alice, &welcomes).remove(0)
+        }
         other => panic!("expected founding Welcome, got {other:?}"),
     };
     alice.mark_sent_welcome_delivered(&completed.id).unwrap();
@@ -1445,10 +1334,8 @@ async fn welcome_index_keeps_lifecycle() {
         .unwrap()
     {
         SendResult::GroupEvolution {
-            pending,
-            mut welcomes,
-            ..
-        } => (pending, welcomes.remove(0)),
+            pending, welcomes, ..
+        } => (pending, seal_and_bind(&mut alice, &welcomes).remove(0)),
         other => panic!("expected staged invite, got {other:?}"),
     };
     assert_eq!(
@@ -1523,7 +1410,7 @@ async fn current_group_initial_retention_is_canonical_for_creator_invitee_and_re
         .account_identity_proof_signer(proof_signer(b"alice-founding-retention"))
         .supported_app_components(supported.clone())
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
     let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
@@ -1531,7 +1418,7 @@ async fn current_group_initial_retention_is_canonical_for_creator_invitee_and_re
         .account_identity_proof_signer(proof_signer(b"bob-founding-retention"))
         .supported_app_components(supported.clone())
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -1551,7 +1438,9 @@ async fn current_group_initial_retention_is_canonical_for_creator_invitee_and_re
         .await
         .unwrap();
     let welcome = match created {
-        SendResult::FoundingGroupCreated { mut welcomes } => welcomes.remove(0),
+        SendResult::FoundingGroupCreated { welcomes } => {
+            seal_and_bind(&mut alice, &welcomes).remove(0)
+        }
         other => panic!("expected one canonical founding result, got {other:?}"),
     };
 
@@ -1561,7 +1450,7 @@ async fn current_group_initial_retention_is_canonical_for_creator_invitee_and_re
             .unwrap(),
         Some(300u64.to_be_bytes().to_vec())
     );
-    let joined = bob.join_welcome(welcome).await.unwrap();
+    let joined = join_raw(&mut bob, welcome).await.unwrap();
     assert_eq!(joined, group_id);
     assert_eq!(
         bob.app_component(&joined, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
@@ -1577,7 +1466,7 @@ async fn current_group_initial_retention_is_canonical_for_creator_invitee_and_re
         .account_identity_proof_signer(proof_signer(b"alice-founding-retention"))
         .supported_app_components(supported)
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
     reopened.hydrate_all_stored_groups().unwrap();
@@ -1601,7 +1490,7 @@ async fn current_group_initial_retention_rejects_unsupported_invitee_before_stat
         .account_identity_proof_signer(proof_signer(b"alice-unsupported-retention"))
         .supported_app_components(supported)
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
     let mut bob = build_current_client(b"bob-unsupported-retention");
@@ -1632,7 +1521,7 @@ async fn current_group_initial_retention_rejects_unsupported_invitee_before_stat
     assert!(alice.live_group_ids().unwrap().is_empty());
 }
 
-/// Cancelling the real wrapping await must clean up provisional MLS state in
+/// Cancelling the Welcome size check must clean up provisional MLS state in
 /// either profile without dropping the engine that owns it (mdk#3061).
 #[tokio::test]
 async fn cancelling_founding_retention_before_canonicalization_leaves_no_group() {
@@ -1645,13 +1534,13 @@ async fn cancelling_founding_retention_before_canonicalization_leaves_no_group()
             .into_iter()
             .chain([GROUP_MESSAGE_RETENTION_COMPONENT_ID])
             .collect::<Vec<_>>();
-        let build_client = |identity: &[u8], storage, peeler: Box<dyn TransportPeeler>| {
+        let build_client = |identity: &[u8], storage| {
             let builder = EngineBuilder::new(storage)
                 .identity(pad32(identity))
                 .account_identity_proof_signer(proof_signer(identity))
                 .supported_app_components(supported.clone())
                 .protocol_profile(profile)
-                .peeler(peeler);
+                .peeler(Box::new(MockPeeler));
             if profile == ProtocolProfile::Legacy {
                 builder.legacy_compatibility_profile().build().unwrap()
             } else {
@@ -1661,7 +1550,6 @@ async fn cancelling_founding_retention_before_canonicalization_leaves_no_group()
         let mut bob = build_client(
             b"bob-cancel-founding-retention",
             SqliteAccountStorage::in_memory_for_test().unwrap(),
-            Box::<MockPeeler>::default(),
         );
         let bob_kp = bob.fresh_key_package().await.unwrap();
         let request = CreateGroupRequest {
@@ -1679,28 +1567,26 @@ async fn cancelling_founding_retention_before_canonicalization_leaves_no_group()
             },
             initial_admins: vec![],
         };
-        let started = Arc::new(tokio::sync::Notify::new());
-        let mut alice = build_client(
-            b"alice-cancel-founding-retention",
-            storage.clone(),
-            Box::new(BlockingWelcomePeeler {
-                inner: MockPeeler::default(),
-                started: started.clone(),
-            }),
-        );
+        let size_check = BlockingWelcomeSizeCheck(tokio::sync::Notify::new());
+        let mut alice = build_client(b"alice-cancel-founding-retention", storage.clone());
         let before = encrypted_openmls_rows(&database, &database_key);
         assert!(!before.is_empty(), "retain the creator's identity keys");
         {
-            let creation = alice.create_group(request.clone());
+            let creation = alice.create_group_with_optional_app_components_and_audit_context(
+                request.clone(),
+                Vec::new(),
+                Some(&size_check),
+                None,
+            );
             tokio::pin!(creation);
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 tokio::select! {
-                    _ = started.notified() => {},
-                    result = &mut creation => panic!("wrapping must still be pending: {result:?}"),
+                    _ = size_check.0.notified() => {},
+                    result = &mut creation => panic!("size check must still be pending: {result:?}"),
                 }
             })
             .await
-            .expect("creation must reach its Welcome wrapping await");
+            .expect("creation must reach its Welcome size check");
             assert!(
                 encrypted_openmls_rows(&database, &database_key) != before,
                 "{profile:?}: cancellation must happen after OpenMLS wrote group state"
@@ -1721,25 +1607,24 @@ async fn cancelling_founding_retention_before_canonicalization_leaves_no_group()
             encrypted_openmls_rows(&database, &database_key) == before,
             "{profile:?}: orphaned state survived encrypted reopen"
         );
-        let mut reopened = build_client(
-            b"alice-cancel-founding-retention",
-            storage,
-            Box::<MockPeeler>::default(),
-        );
+        let mut reopened = build_client(b"alice-cancel-founding-retention", storage);
         reopened.hydrate_all_stored_groups().unwrap();
         assert!(reopened.live_group_ids().unwrap().is_empty());
         let (group_id, result) = reopened.create_group(request).await.unwrap();
         let mut welcomes = match result {
             SendResult::GroupCreated { pending, welcomes } => {
+                let welcomes = seal_and_bind(&mut reopened, &welcomes);
                 reopened.confirm_published(pending).await.unwrap();
                 welcomes
             }
-            SendResult::FoundingGroupCreated { welcomes } => welcomes,
+            SendResult::FoundingGroupCreated { welcomes } => {
+                seal_and_bind(&mut reopened, &welcomes)
+            }
             other => panic!("expected founding creation, got {other:?}"),
         };
         assert_eq!(welcomes.len(), 1);
         assert_eq!(
-            bob.join_welcome(welcomes.remove(0)).await.unwrap(),
+            join_raw(&mut bob, welcomes.remove(0)).await.unwrap(),
             group_id
         );
         assert_eq!(
@@ -1777,7 +1662,7 @@ async fn late_founding_welcome_write_failure_restores_state_and_allows_retry() {
                 .account_identity_proof_signer(proof_signer(identity))
                 .supported_app_components(supported.clone())
                 .protocol_profile(profile)
-                .peeler(Box::<MockPeeler>::default());
+                .peeler(Box::new(MockPeeler));
             if profile == ProtocolProfile::Legacy {
                 builder.legacy_compatibility_profile().build().unwrap()
             } else {
@@ -1865,19 +1750,20 @@ async fn late_founding_welcome_write_failure_restores_state_and_allows_retry() {
         let (group_id, retry) = alice.create_group(request).await.unwrap();
         let mut welcomes = match retry {
             SendResult::GroupCreated { pending, welcomes } => {
+                let welcomes = seal_and_bind(&mut alice, &welcomes);
                 alice.confirm_published(pending).await.unwrap();
                 welcomes
             }
-            SendResult::FoundingGroupCreated { welcomes } => welcomes,
+            SendResult::FoundingGroupCreated { welcomes } => seal_and_bind(&mut alice, &welcomes),
             other => panic!("expected founding result: {other:?}"),
         };
         assert_eq!(welcomes.len(), 2);
         assert_eq!(
-            bob.join_welcome(welcomes.remove(0)).await.unwrap(),
+            join_raw(&mut bob, welcomes.remove(0)).await.unwrap(),
             group_id
         );
         assert_eq!(
-            carol.join_welcome(welcomes.remove(0)).await.unwrap(),
+            join_raw(&mut carol, welcomes.remove(0)).await.unwrap(),
             group_id
         );
         let sent = bob
@@ -1933,196 +1819,66 @@ fn encrypted_openmls_rows(
         .unwrap()
 }
 
-/// A legacy-profile create whose Welcome cannot be wrapped is refused before
-/// the group record or any Welcome is written. Its provisional OpenMLS state
-/// must also be removed, including after encrypted reopen (mdk#2808).
 #[tokio::test]
-async fn legacy_create_whose_welcome_cannot_be_wrapped_writes_no_group() {
-    struct RefusingWelcomes(MockPeeler);
-    #[async_trait]
-    impl TransportPeeler for RefusingWelcomes {
-        async fn wrap_group_recovery(
-            &self,
-            message: &cgka_traits::GroupRecoveryMessage,
-            recipient: &MemberId,
-        ) -> Result<TransportMessage, PeelerError> {
-            self.0.wrap_group_recovery(message, recipient).await
-        }
-
-        fn prepare_group_message<'a>(
-            &self,
-            msg: &'a TransportMessage,
-        ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
-            self.0.prepare_group_message(msg)
-        }
-
-        async fn peel_group_message(
-            &self,
-            msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-            ctx: &GroupContextSnapshot,
-        ) -> Result<PeeledMessage, PeelerError> {
-            self.0.peel_group_message(msg, ctx).await
-        }
-
-        async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-            self.0.peel_welcome(msg).await
-        }
-
-        async fn wrap_group_message(
-            &self,
-            payload: &EncryptedPayload,
-            ctx: &GroupContextSnapshot,
-        ) -> Result<TransportMessage, PeelerError> {
-            self.0.wrap_group_message(payload, ctx).await
-        }
-
-        async fn wrap_welcome(
-            &self,
-            _payload: &EncryptedPayload,
-            _recipient: &MemberId,
-        ) -> Result<TransportMessage, PeelerError> {
-            Err(PeelerError::MissingContext {
-                label: "welcome_metadata".into(),
-            })
-        }
-    }
-
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("refused-legacy-create.sqlite");
-    let database_key = SqlCipherKey::raw([0x28; 32]);
-    let storage = SqliteAccountStorage::open_encrypted(&database, &database_key).unwrap();
-    let mls_rows = || encrypted_openmls_rows(&database, &database_key);
-    let mut alice = EngineBuilder::new(storage.clone())
-        .legacy_compatibility_profile()
-        .identity(pad32(b"alice-unwrappable-welcome"))
-        .account_identity_proof_signer(proof_signer(b"alice-unwrappable-welcome"))
-        .peeler(Box::new(RefusingWelcomes(MockPeeler::default())))
-        .build()
-        .unwrap();
-    let mut bob = build_client(b"bob-unwrappable-welcome", FeatureRegistry::new());
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-
-    let before = mls_rows();
-    assert!(
-        !before.is_empty(),
-        "retain the creator identity key material"
-    );
-    let refused = alice
-        .create_group(CreateGroupRequest {
-            name: "unwrappable welcome".into(),
-            description: String::new(),
-            members: vec![bob_kp.clone()],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await;
-    assert!(
-        matches!(
-            refused,
-            Err(EngineError::Peeler(PeelerError::MissingContext { ref label }))
-                if label == "welcome_metadata"
-        ),
-        "{refused:?}"
-    );
-    assert!(storage.list_groups().unwrap().is_empty());
-    assert!(alice.drain_events().is_empty());
-    assert!(
-        mls_rows() == before,
-        "refused create left orphaned OpenMLS state"
-    );
-    drop(alice);
-    drop(storage);
-
-    let storage = SqliteAccountStorage::open_encrypted(&database, &database_key).unwrap();
-    assert!(
-        mls_rows() == before,
-        "orphaned state survived encrypted reopen"
-    );
-    let mut alice = build_profile_client_on_storage(
-        b"alice-unwrappable-welcome",
-        storage,
-        ProtocolProfile::Legacy,
-    );
-    alice.hydrate_all_stored_groups().unwrap();
-    assert!(alice.live_group_ids().unwrap().is_empty());
-    // The same creator and unconsumed recipient package remain usable after
-    // cleanup; success must hand its pending commit to normal confirmation.
-    let (group_id, result) = alice
-        .create_group(CreateGroupRequest {
-            name: "retry legacy create".into(),
-            description: String::new(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let (pending, mut welcomes) = match result {
-        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
-        other => panic!("legacy creation must await confirmation: {other:?}"),
-    };
-    assert_eq!(welcomes.len(), 1);
-    alice.confirm_published(pending).await.unwrap();
-    assert_eq!(
-        bob.join_welcome(welcomes.remove(0)).await.unwrap(),
-        group_id
-    );
-    assert_eq!(
-        alice.epoch(&group_id).unwrap(),
-        bob.epoch(&group_id).unwrap()
-    );
-    assert_eq!(alice.members(&group_id).unwrap().len(), 2);
-    drop(alice);
-    let storage = SqliteAccountStorage::open_encrypted(&database, &database_key).unwrap();
-    let mut reopened = build_profile_client_on_storage(
-        b"alice-unwrappable-welcome",
-        storage,
-        ProtocolProfile::Legacy,
-    );
-    reopened.hydrate_all_stored_groups().unwrap();
-    assert_eq!(reopened.live_group_ids().unwrap(), vec![group_id.clone()]);
-    assert_eq!(reopened.members(&group_id).unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn current_group_rejects_colliding_founding_welcome_ids_atomically() {
-    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
-        .identity(pad32(b"alice-colliding-welcomes"))
-        .account_identity_proof_signer(proof_signer(b"alice-colliding-welcomes"))
-        .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler {
-            welcome_sender: None,
-            collide_welcome_ids: true,
-        }))
-        .build()
-        .unwrap();
+async fn current_group_rejects_colliding_founding_welcome_delivery_ids_atomically() {
+    let mut alice = build_current_client(b"alice-colliding-welcomes");
     let mut bob = build_current_client(b"bob-colliding-welcomes");
     let mut carol = build_current_client(b"carol-colliding-welcomes");
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-    let carol_kp = carol.fresh_key_package().await.unwrap();
-
-    let error = alice
+    let (group_id, result) = alice
         .create_group(CreateGroupRequest {
             name: "colliding founding welcomes".into(),
             description: String::new(),
-            members: vec![bob_kp, carol_kp],
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
             required_features: vec![],
             app_components: vec![],
             initial_admins: vec![],
         })
         .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = result else {
+        panic!("expected a current-profile founding create");
+    };
+    assert_eq!(welcomes.len(), 2);
+    let colliding_id = MessageId::new(b"colliding-founding-welcome-id".to_vec());
+    let sealed: Vec<_> = welcomes
+        .iter()
+        .map(|welcome| {
+            let mut message = raw_seal(welcome);
+            message.id = colliding_id.clone();
+            SealedWelcome {
+                local_id: welcome.local_id.clone(),
+                message,
+            }
+        })
+        .collect();
+    let error = alice
+        .bind_sealed_welcomes(&sealed, None)
         .expect_err("two invitees must not share a Welcome delivery id");
-
     assert!(matches!(
         error,
-        EngineError::Backend(ref message)
-            if message == "founding creation did not produce one distinct Welcome per invitee"
+        EngineError::Backend(ref message) if message == "sealed Welcomes share a transport id"
     ));
-    assert!(
-        alice.live_group_ids().unwrap().is_empty(),
-        "the failed founding transaction must leave no live group"
+    assert!(alice.outstanding_sent_welcomes().unwrap().is_empty());
+    let owed = alice.unsealed_owed_welcomes().unwrap();
+    assert_eq!(owed.len(), welcomes.len());
+    assert!(welcomes.iter().all(|welcome| owed.contains(welcome)));
+    assert_eq!(alice.live_group_ids().unwrap(), vec![group_id.clone()]);
+
+    let mut deliveries = seal_and_bind(&mut alice, &welcomes).into_iter();
+    assert_eq!(
+        join_raw(&mut bob, deliveries.next().unwrap())
+            .await
+            .unwrap(),
+        group_id
+    );
+    assert_eq!(
+        join_raw(&mut carol, deliveries.next().unwrap())
+            .await
+            .unwrap(),
+        group_id
     );
 }
 
@@ -2192,7 +1948,7 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .convergence_clock(Arc::new(clock.clone()))
         .build()
         .expect("build current-profile engine");
@@ -2400,7 +2156,7 @@ async fn own_sends_survive_the_pass_that_settles_their_senders_disband() {
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .convergence_clock(Arc::new(clock.clone()))
         .build()
         .expect("build current-profile engine");
@@ -2487,7 +2243,7 @@ async fn settle_solo_disband(identity: &[u8]) -> (SqliteAccountStorage, cgka_tra
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .convergence_clock(Arc::new(clock.clone()))
         .build()
         .expect("build current-profile engine");
@@ -2668,7 +2424,7 @@ async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
         .legacy_compatibility_profile()
         .identity(pad32(b"legacy-reopen"))
         .account_identity_proof_signer(proof_signer(b"legacy-reopen"))
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
     let (group_id, result) = legacy
@@ -2693,7 +2449,7 @@ async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
         .identity(pad32(b"legacy-reopen"))
         .account_identity_proof_signer(proof_signer(b"legacy-reopen"))
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
     current.hydrate_all_stored_groups().unwrap();
@@ -3088,7 +2844,7 @@ fn engine_builder_defaults_to_current_and_requires_explicit_legacy_fixture_seam(
     let current = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(b"default-current"))
         .account_identity_proof_signer(proof_signer(b"default-current"))
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .expect("default engine builds");
     assert_eq!(current.new_protocol_profile(), ProtocolProfile::Current);
@@ -3097,7 +2853,7 @@ fn engine_builder_defaults_to_current_and_requires_explicit_legacy_fixture_seam(
         .identity(pad32(b"implicit-legacy"))
         .account_identity_proof_signer(proof_signer(b"implicit-legacy"))
         .protocol_profile(ProtocolProfile::Legacy)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build();
     let legacy_error = match legacy_result {
         Ok(_) => panic!("ordinary builder must refuse the legacy profile"),
@@ -3240,14 +2996,14 @@ async fn missing_welcome_key_package() {
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("expected founding welcome");
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     let welcome = welcomes.remove(0);
 
     // The account identity matches, but these fresh stores lack Bob's bundle.
-    let error = build_current_client(b"bob")
-        .join_welcome(welcome.clone())
+    let error = join_raw(&mut build_current_client(b"bob"), welcome.clone())
         .await
         .unwrap_err();
     assert!(matches!(error, EngineError::MissingWelcomeKeyPackage));
@@ -3258,14 +3014,14 @@ async fn missing_welcome_key_package() {
     let mut missing = EngineBuilder::new(storage.clone())
         .identity(pad32(b"bob"))
         .account_identity_proof_signer(proof_signer(b"bob"))
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .recorder(Box::new(
             JsonlRecorder::open(&path, "missing-kp".into()).unwrap(),
         ))
         .build()
         .unwrap();
     assert!(matches!(
-        missing.ingest(welcome.clone()).await.unwrap(),
+        ingest_raw(&mut missing, welcome.clone()).await.unwrap(),
         IngestOutcome::Ignored {
             category: InputRejectionCategory::MissingWelcomeKeyPackage
         }
@@ -3282,13 +3038,13 @@ async fn missing_welcome_key_package() {
 
     let mut reopened = build_profile_client_on_storage(b"bob", storage, ProtocolProfile::Current);
     assert!(matches!(
-        reopened.ingest(welcome.clone()).await.unwrap(),
+        ingest_raw(&mut reopened, welcome.clone()).await.unwrap(),
         IngestOutcome::Ignored {
             category: InputRejectionCategory::Duplicate
         }
     ));
     assert!(matches!(
-        bob.ingest(welcome).await.unwrap(),
+        ingest_raw(&mut bob, welcome).await.unwrap(),
         IngestOutcome::Processed
     ));
 }
@@ -3321,10 +3077,10 @@ async fn strict_cutover_rejects_new_and_replayed_legacy_welcomes_without_group_s
         .await
         .unwrap();
     let (welcome, pending) = match created {
-        SendResult::GroupCreated {
-            mut welcomes,
+        SendResult::GroupCreated { welcomes, pending } => (
+            seal_and_bind(&mut legacy_alice, &welcomes).remove(0),
             pending,
-        } => (welcomes.remove(0), pending),
+        ),
         other => panic!("expected legacy GroupCreated, got {other:?}"),
     };
     legacy_alice.confirm_published(pending).await.unwrap();
@@ -3335,8 +3091,7 @@ async fn strict_cutover_rejects_new_and_replayed_legacy_welcomes_without_group_s
         ProtocolProfile::Current,
     );
     let replay = welcome.clone();
-    let profile_error = current_bob
-        .join_welcome(welcome)
+    let profile_error = join_raw(&mut current_bob, welcome)
         .await
         .expect_err("current client must reject a legacy Welcome even before retirement");
     assert!(matches!(profile_error, EngineError::InvalidWelcome));
@@ -3354,8 +3109,7 @@ async fn strict_cutover_rejects_new_and_replayed_legacy_welcomes_without_group_s
     assert_eq!(retirement.legacy_retired, 1);
     assert!(bob_storage.stored_key_package_bundles().unwrap().is_empty());
 
-    let replay_error = current_bob
-        .join_welcome(replay)
+    let replay_error = join_raw(&mut current_bob, replay)
         .await
         .expect_err("cached/replayed legacy Welcome must remain terminal");
     assert!(matches!(replay_error, EngineError::WelcomeAlreadyProcessed));
@@ -3662,7 +3416,7 @@ async fn registry_defaults_are_implicit_for_key_packages_and_group_membership() 
             .account_identity_proof_signer(proof_signer(b"alice"))
             .protocol_profile(profile)
             .feature_registry(registry)
-            .peeler(Box::new(MockPeeler::default()));
+            .peeler(Box::new(MockPeeler));
         let builder = if profile == ProtocolProfile::Legacy {
             builder.legacy_compatibility_profile()
         } else {
@@ -3722,14 +3476,15 @@ async fn registry_defaults_are_implicit_for_key_packages_and_group_membership() 
             .await
             .unwrap();
         let welcomes = match result {
-            SendResult::FoundingGroupCreated { welcomes } => welcomes,
+            SendResult::FoundingGroupCreated { welcomes } => seal_and_bind(&mut alice, &welcomes),
             SendResult::GroupCreated { welcomes, pending } => {
+                let welcomes = seal_and_bind(&mut alice, &welcomes);
                 alice.confirm_published(pending).await.unwrap();
                 welcomes
             }
             other => panic!("expected founding result, got {other:?}"),
         };
-        bob.join_welcome(welcomes.into_iter().next().unwrap())
+        join_raw(&mut bob, welcomes.into_iter().next().unwrap())
             .await
             .unwrap();
         let group = openmls::group::MlsGroup::load(
@@ -3769,9 +3524,9 @@ async fn registry_defaults_are_implicit_for_key_packages_and_group_membership() 
         else {
             panic!("expected invite")
         };
+        let welcomes = seal_and_bind(&mut alice, &welcomes);
         alice.confirm_published(pending).await.unwrap();
-        carol
-            .join_welcome(welcomes.into_iter().next().unwrap())
+        join_raw(&mut carol, welcomes.into_iter().next().unwrap())
             .await
             .unwrap();
         assert_eq!(carol.members(&group_id).unwrap().len(), 3);
@@ -3978,6 +3733,7 @@ async fn delete_key_package_removes_bundle_so_welcome_cannot_be_joined() {
         .unwrap();
     let welcome = match result {
         SendResult::GroupCreated { welcomes, pending } => {
+            let welcomes = seal_and_bind(&mut alice, &welcomes);
             alice.confirm_published(pending).await.unwrap();
             welcomes.into_iter().next().unwrap()
         }
@@ -3986,8 +3742,7 @@ async fn delete_key_package_removes_bundle_so_welcome_cannot_be_joined() {
 
     // The private bundle was deleted, so Bob cannot join: OpenMLS finds no
     // matching KeyPackage in storage for the Welcome's referenced hash.
-    let error = bob
-        .join_welcome(welcome)
+    let error = join_raw(&mut bob, welcome)
         .await
         .expect_err("join must fail after the key package bundle was deleted");
     assert!(matches!(error, EngineError::MissingWelcomeKeyPackage));
@@ -4015,15 +3770,15 @@ async fn join_welcome_called_twice_for_same_welcome_errors_on_second_call() {
         .unwrap();
     let welcome = match result {
         SendResult::GroupCreated { welcomes, pending } => {
+            let welcomes = seal_and_bind(&mut alice, &welcomes);
             alice.confirm_published(pending).await.unwrap();
             welcomes.into_iter().next().unwrap()
         }
         _ => unreachable!(),
     };
 
-    bob.join_welcome(welcome.clone()).await.unwrap();
-    let err = bob
-        .join_welcome(welcome)
+    join_raw(&mut bob, welcome.clone()).await.unwrap();
+    let err = join_raw(&mut bob, welcome)
         .await
         .expect_err("second join_welcome must error");
     assert!(matches!(err, EngineError::WelcomeAlreadyProcessed));
@@ -4052,18 +3807,18 @@ async fn join_welcome_dedup_survives_engine_rebuild_on_same_storage() {
         .unwrap();
     let welcome = match result {
         SendResult::GroupCreated { welcomes, pending } => {
+            let welcomes = seal_and_bind(&mut alice, &welcomes);
             alice.confirm_published(pending).await.unwrap();
             welcomes.into_iter().next().unwrap()
         }
         _ => unreachable!(),
     };
 
-    bob.join_welcome(welcome.clone()).await.unwrap();
+    join_raw(&mut bob, welcome.clone()).await.unwrap();
     drop(bob);
 
     let mut rebuilt_bob = build_client_on_storage(b"bob", selfremove_registry(), bob_storage);
-    let err = rebuilt_bob
-        .join_welcome(welcome)
+    let err = join_raw(&mut rebuilt_bob, welcome)
         .await
         .expect_err("rebuilt engine must reject duplicate welcome");
     assert!(matches!(err, EngineError::WelcomeAlreadyProcessed));
@@ -4108,6 +3863,7 @@ async fn assert_required_capability_welcome_refusal(through_ingest: bool) {
         .unwrap();
     let welcome = match result {
         SendResult::GroupCreated { welcomes, pending } => {
+            let welcomes = seal_and_bind(&mut alice, &welcomes);
             alice.confirm_published(pending).await.unwrap();
             welcomes.into_iter().next().unwrap()
         }
@@ -4125,14 +3881,16 @@ async fn assert_required_capability_welcome_refusal(through_ingest: bool) {
         build_client_on_storage(b"carol", FeatureRegistry::new(), carol_storage.clone());
     if through_ingest {
         assert!(matches!(
-            downgraded_carol.ingest(welcome.clone()).await.unwrap(),
+            ingest_raw(&mut downgraded_carol, welcome.clone())
+                .await
+                .unwrap(),
             cgka_traits::ingest::IngestOutcome::Ignored {
                 category: cgka_traits::ingest::InputRejectionCategory::UnsupportedRequiredFeature
             }
         ));
         assert!(carol_storage.has_ingress_dedup_marker(&welcome.id).unwrap());
         assert!(matches!(
-            downgraded_carol.ingest(welcome).await.unwrap(),
+            ingest_raw(&mut downgraded_carol, welcome).await.unwrap(),
             cgka_traits::ingest::IngestOutcome::Ignored {
                 category: cgka_traits::ingest::InputRejectionCategory::Duplicate
             }
@@ -4144,8 +3902,7 @@ async fn assert_required_capability_welcome_refusal(through_ingest: bool) {
                 .all(|event| !matches!(event, cgka_traits::engine::GroupEvent::GroupJoined { .. }))
         );
     } else {
-        let err = downgraded_carol
-            .join_welcome(welcome)
+        let err = join_raw(&mut downgraded_carol, welcome)
             .await
             .expect_err("join must be rejected for an unsupported required capability");
         match err {
@@ -4178,11 +3935,14 @@ async fn assert_required_capability_welcome_refusal(through_ingest: bool) {
         build_client_on_storage(b"carol", selfremove_registry(), carol_storage.clone());
     if through_ingest {
         assert_eq!(
-            upgraded_carol.ingest(resend).await.unwrap(),
+            ingest_raw(&mut upgraded_carol, resend).await.unwrap(),
             cgka_traits::ingest::IngestOutcome::Processed
         );
     } else {
-        assert_eq!(upgraded_carol.join_welcome(resend).await.unwrap(), group_id);
+        assert_eq!(
+            join_raw(&mut upgraded_carol, resend).await.unwrap(),
+            group_id
+        );
     }
     assert_eq!(
         upgraded_carol.epoch(&group_id).unwrap(),
@@ -4211,7 +3971,7 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
         .supported_app_components(components)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .expect("build capable carol");
     let mut capable_carol = capable_carol;
@@ -4233,6 +3993,7 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
         .unwrap();
     let welcome = match result {
         SendResult::GroupCreated { welcomes, pending } => {
+            let welcomes = seal_and_bind(&mut alice, &welcomes);
             alice.confirm_published(pending).await.unwrap();
             welcomes.into_iter().next().unwrap()
         }
@@ -4245,11 +4006,10 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
         .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .expect("build downgraded carol");
-    let err = downgraded_carol
-        .join_welcome(welcome)
+    let err = join_raw(&mut downgraded_carol, welcome)
         .await
         .expect_err("join must be rejected for an unsupported required app component");
     assert!(
@@ -4264,11 +4024,7 @@ async fn two_engine_happy_path_create_and_join() {
     let mut alice = build_client(b"alice-id", selfremove_registry());
     let alice_id = alice.self_id();
     let transport_claimed_sender = MemberId::new(pad32(b"mallory-id"));
-    let mut bob = build_client_with_welcome_sender(
-        b"bob-id",
-        selfremove_registry(),
-        transport_claimed_sender.clone(),
-    );
+    let mut bob = build_client(b"bob-id", selfremove_registry());
 
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
@@ -4285,8 +4041,10 @@ async fn two_engine_happy_path_create_and_join() {
         .unwrap();
 
     // Alice confirms publish → Stable.
-    let pending = match &result {
-        SendResult::GroupCreated { pending, .. } => *pending,
+    let (pending, mut welcomes) = match &result {
+        SendResult::GroupCreated { pending, welcomes } => {
+            (*pending, seal_and_bind(&mut alice, welcomes))
+        }
         _ => unreachable!(),
     };
     let event = alice.confirm_published(pending).await.unwrap();
@@ -4298,14 +4056,14 @@ async fn two_engine_happy_path_create_and_join() {
     assert_eq!(alice.epoch(&alice_gid).unwrap().0, 1);
 
     // The welcomes addressed to bob flow to him.
-    let bob_welcome = match result {
-        SendResult::GroupCreated { welcomes, .. } => {
-            welcomes.into_iter().next().expect("one welcome")
-        }
-        _ => unreachable!(),
-    };
+    let bob_welcome = welcomes.remove(0);
 
-    let bob_gid = bob.join_welcome(bob_welcome).await.expect("bob joins");
+    let mut unsealed = raw_unseal(&bob_welcome);
+    unsealed.sender = Some(transport_claimed_sender.clone());
+    let bob_gid = bob
+        .join_welcome(bob_welcome, unsealed)
+        .await
+        .expect("bob joins");
 
     assert_eq!(alice_gid, bob_gid, "group ids must match across clients");
     assert_eq!(
@@ -4351,12 +4109,15 @@ async fn join_welcome_rejects_wrong_recipient() {
         .unwrap();
 
     let bob_welcome = match result {
-        SendResult::GroupCreated { welcomes, .. } => welcomes.into_iter().next().unwrap(),
+        SendResult::GroupCreated { welcomes, .. } => seal_and_bind(&mut alice, &welcomes)
+            .into_iter()
+            .next()
+            .unwrap(),
         _ => unreachable!(),
     };
 
     // Eve should not be able to consume bob's welcome.
-    let err = eve.join_welcome(bob_welcome).await.err().unwrap();
+    let err = join_raw(&mut eve, bob_welcome).await.err().unwrap();
     assert!(
         matches!(err, EngineError::Peeler(PeelerError::Malformed(reason))
         if reason == "welcome not addressed to this client")
@@ -4378,7 +4139,7 @@ async fn audit_log_records_welcome_recipient_expectation() {
         .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .recorder(Box::new(recorder))
         .build()
         .expect("build alice with recorder");
@@ -4494,7 +4255,7 @@ async fn audit_log_recipient_expectation_counts_each_account_once() {
         .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .recorder(Box::new(recorder))
         .build()
         .expect("build alice with recorder");
@@ -4612,7 +4373,7 @@ async fn one_convergence_pass_preserves_rename_before_disband() {
             .identity(pad32(seed))
             .account_identity_proof_signer(proof_signer(seed))
             .protocol_profile(ProtocolProfile::Current)
-            .peeler(Box::new(MockPeeler::default()))
+            .peeler(Box::new(MockPeeler))
     };
     let mut alice = build(b"alice-one-pass-disband")
         .convergence_clock(Arc::new(clock.clone()))
@@ -4631,10 +4392,12 @@ async fn one_convergence_pass_preserves_rename_before_disband() {
         .await
         .unwrap();
     let welcome = match created {
-        SendResult::FoundingGroupCreated { mut welcomes } => welcomes.remove(0),
+        SendResult::FoundingGroupCreated { welcomes } => {
+            seal_and_bind(&mut alice, &welcomes).remove(0)
+        }
         other => panic!("expected founding Welcome, got {other:?}"),
     };
-    assert_eq!(bob.join_welcome(welcome).await.unwrap(), group_id);
+    assert_eq!(join_raw(&mut bob, welcome).await.unwrap(), group_id);
     alice.drain_events();
     bob.drain_events();
     let (mut rename, pending) = match alice
@@ -4936,7 +4699,7 @@ async fn group_context_exports_the_staged_source_then_confirmation_or_rollback()
             .identity(pad32(b"context-source-alice"))
             .account_identity_proof_signer(proof_signer(b"context-source-alice"))
             .supported_app_components(components.clone())
-            .peeler(Box::new(MockPeeler::default()))
+            .peeler(Box::new(MockPeeler))
             .build()
             .unwrap();
         let mut bob = build_client_with_components(b"context-source-bob", components);
@@ -4958,16 +4721,13 @@ async fn group_context_exports_the_staged_source_then_confirmation_or_rollback()
             })
             .await
             .unwrap();
-        let SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } = created
-        else {
+        let SendResult::GroupCreated { pending, welcomes } = created else {
             panic!("expected a legacy founding publication");
         };
+        let mut welcomes = seal_and_bind(&mut alice, &welcomes);
         alice.confirm_published(pending).await.unwrap();
         assert_eq!(
-            bob.join_welcome(welcomes.remove(0)).await.unwrap(),
+            join_raw(&mut bob, welcomes.remove(0)).await.unwrap(),
             group_id
         );
         assert_ne!(group_id.as_slice(), route);
@@ -5140,7 +4900,7 @@ async fn encrypted_engine_reopen_reuses_identity_proof_in_fresh_key_packages() {
         let mut engine = EngineBuilder::new(storage.clone())
             .identity(pad32(seed))
             .account_identity_proof_signer(signer.clone())
-            .peeler(Box::new(MockPeeler::default()))
+            .peeler(Box::new(MockPeeler))
             .build()
             .unwrap();
         let proof = proof_from_key_package(&engine.fresh_key_package().await.unwrap());
@@ -5160,7 +4920,7 @@ async fn encrypted_engine_reopen_reuses_identity_proof_in_fresh_key_packages() {
     let mut engine = EngineBuilder::new(storage.clone())
         .identity(pad32(seed))
         .account_identity_proof_signer(signer.clone())
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
     let fresh = engine.fresh_key_package().await.unwrap();
@@ -5191,7 +4951,7 @@ async fn failed_legacy_founding_preserves_an_existing_live_route() {
             .supported_app_components(supported.clone())
             .protocol_profile(ProtocolProfile::Legacy)
             .legacy_compatibility_profile()
-            .peeler(Box::<MockPeeler>::default())
+            .peeler(Box::new(MockPeeler))
             .build()
             .unwrap()
     };
@@ -5227,16 +4987,13 @@ async fn failed_legacy_founding_preserves_an_existing_live_route() {
         })
         .await
         .unwrap();
-    let SendResult::GroupCreated {
-        pending,
-        mut welcomes,
-    } = created
-    else {
+    let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("expected legacy group")
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
     assert_eq!(
-        bob.join_welcome(welcomes.remove(0)).await.unwrap(),
+        join_raw(&mut bob, welcomes.remove(0)).await.unwrap(),
         existing_group
     );
     alice.drain_events();
@@ -5347,7 +5104,6 @@ async fn failed_legacy_founding_preserves_an_existing_live_route() {
 /// and the same founders can be added once the Welcomes fit (mdk#2334).
 #[tokio::test]
 async fn create_whose_welcome_fails_the_size_check_writes_no_group() {
-    use cgka_traits::{EventSizeClass, WelcomeSizeCheck};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Sizes {
@@ -5356,7 +5112,7 @@ async fn create_whose_welcome_fails_the_size_check_writes_no_group() {
     }
     #[async_trait]
     impl WelcomeSizeCheck for Sizes {
-        async fn oversized_welcome(&self, welcomes: &[TransportMessage]) -> Option<EventSizeClass> {
+        async fn oversized_welcome(&self, welcomes: &[OutboundWelcome]) -> Option<EventSizeClass> {
             self.judged.store(welcomes.len(), Ordering::SeqCst);
             self.answer
         }
@@ -5476,6 +5232,7 @@ async fn founding_and_invite_welcomes(
     let SendResult::FoundingGroupCreated { welcomes: founding } = created else {
         panic!("a current-profile founding create")
     };
+    let founding = seal_and_bind(alice, &founding);
     let SendResult::GroupEvolution {
         welcomes: invited, ..
     } = alice
@@ -5489,6 +5246,7 @@ async fn founding_and_invite_welcomes(
     else {
         panic!("an invite commit")
     };
+    let invited = seal_and_bind(alice, &invited);
     [founding[0].id.clone(), invited[0].id.clone()]
 }
 
@@ -5546,7 +5304,7 @@ async fn invite_and_founding_welcomes_are_deliverable_for_the_window_or_their_ke
         .identity(pad32(b"alice-late"))
         .account_identity_proof_signer(proof_signer(b"alice-late"))
         .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
+        .peeler(Box::new(MockPeeler))
         .maintenance_sources(clock.clone(), clock)
         .build()
         .unwrap();
@@ -5594,6 +5352,7 @@ async fn an_owed_welcome_marked_expired_stays_expired_and_a_staged_one_is_not_ma
     let SendResult::FoundingGroupCreated { welcomes: founding } = created else {
         panic!("a current-profile founding create")
     };
+    let founding = seal_and_bind(&mut alice, &founding);
     let SendResult::GroupEvolution {
         welcomes: invited,
         pending,
@@ -5609,6 +5368,7 @@ async fn an_owed_welcome_marked_expired_stays_expired_and_a_staged_one_is_not_ma
     else {
         panic!("an invite commit")
     };
+    let invited = seal_and_bind(&mut alice, &invited);
     let expired = Some(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired));
     // Staged with its unconfirmed commit, the invite's Welcome is never
     // marked: it reads past its deadline by the clock, and its commit can

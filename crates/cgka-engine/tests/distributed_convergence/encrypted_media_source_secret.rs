@@ -27,9 +27,9 @@ async fn replayed_media_application_carries_source_secret_past_anchor_horizon() 
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
+    join_raw(&mut carol, welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
     let start = carol.epoch(&group_id).unwrap().0;
@@ -120,9 +120,9 @@ async fn late_media_application_carries_source_secret_past_anchor_horizon() {
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
+    join_raw(&mut carol, welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
     let start = carol.epoch(&group_id).unwrap().0;

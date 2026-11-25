@@ -70,7 +70,7 @@ pub use convergence_pass::{
 pub use engine::{
     AutoPublish, CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
     EncryptedMediaSecret, EpochPin, GroupEvent, GroupStateChange, KeyPackage, KeyPackageSource,
-    SendAcceptDisposition, SendIntent, SendResult, WelcomeMetadata,
+    OutboundWelcome, SealedWelcome, SendAcceptDisposition, SendIntent, SendResult, WelcomeMetadata,
 };
 pub use engine_state::{
     Disbanded, EpochState, GroupLifecycleState, InvalidTransition, Merging, PendingPublish,
@@ -102,7 +102,7 @@ pub use message::{
     MessageRecord, MessageState, OwnApplicationConvergenceStamp, OwnCommitConvergenceStamp,
     StoredMessagePayload,
 };
-pub use peeler::{GroupMessageMetadata, TransportPeeler};
+pub use peeler::{GroupMessageMetadata, InboxSealer, TransportPeeler};
 pub use polls::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollDefinition, PollError,
     PollOptionDefinition, PollOptionResult, PollProjection, PollType, PollVote, PollVotePage,

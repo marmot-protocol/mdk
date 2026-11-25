@@ -22,7 +22,8 @@ use cgka_traits::app_components::{
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
     AutoPublish, CgkaEngine, CreateGroupRequest, EpochPin, GroupEvent,
-    GroupHydrationQuarantineReason, GroupStateChange, KeyPackage, SendIntent, SendResult,
+    GroupHydrationQuarantineReason, GroupStateChange, KeyPackage, SealedWelcome, SendIntent,
+    SendResult,
 };
 use cgka_traits::engine_state::{PendingStateRef, StagedCommitHandle};
 use cgka_traits::error::EngineError;
@@ -30,7 +31,9 @@ use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::group_context::GroupContext;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::{EntropySource, MonotonicClock, WallClock};
-use cgka_traits::message::{MessageState, StoredMessagePayload, WelcomeExpiry};
+use cgka_traits::message::{
+    MessageRecord, MessageState, StoredMessagePayload, UnsealedWelcomeOrigin, WelcomeExpiry,
+};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     LeaveRequest, OpenMlsContentFilter, RosterTagKey, StorageError, StorageProvider,
@@ -167,6 +170,14 @@ pub enum WelcomeWithdrawal {
 enum SendAcceptance {
     Prepare,
     QueueAppMessage,
+}
+
+/// Whether an ingest call still owes its delivery's entry audit row, or the
+/// delivery's sealed first half already wrote it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IngestEntry {
+    Unrecorded,
+    Recorded,
 }
 
 /// Holds the engine for one local operation and keeps its audit context as
@@ -340,6 +351,10 @@ pub struct Engine<S: StorageProvider> {
     /// durable trace, so only relay redelivery can present it again. See
     /// [`Engine::last_ingest_left_object_unpersisted`].
     pub(crate) last_ingest_left_object_unpersisted: bool,
+    /// The audit context of the last delivery ingest stopped as
+    /// [`IngestOutcome::InboxSealed`], so its unsealed half continues the same
+    /// evidence: one entry row and one outcome row per delivery.
+    sealed_ingest: Option<(MessageId, AuditEventContext)>,
 
     /// MessageIds this engine has produced via `send` or `create_group` /
     /// `invite`. Backs the typed own-echo exclusion when a message we produced
@@ -849,6 +864,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             seen_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             retryable_unpersisted_ingest_id: None,
             last_ingest_left_object_unpersisted: false,
+            sealed_ingest: None,
             sent_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             leave_requests: HashMap::new(),
             leaving_groups: HashSet::new(),
@@ -1220,6 +1236,116 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Replace each unsealed Welcome row with the sealed shape its origin names,
+    /// keyed by the sealed transport id, and write `fanout` in the same
+    /// transaction. Binding a pending commit's Welcomes together with its first
+    /// fanout write means a restart sees either unsealed rows and no fanout, or
+    /// both.
+    pub fn bind_sealed_welcomes(
+        &mut self,
+        sealed: &[SealedWelcome],
+        fanout: Option<&OutboundFanout>,
+    ) -> Result<(), EngineError> {
+        let mut transport_ids = HashSet::with_capacity(sealed.len());
+        if !sealed
+            .iter()
+            .all(|entry| transport_ids.insert(&entry.message.id))
+        {
+            return Err(EngineError::Backend(
+                "sealed Welcomes share a transport id".into(),
+            ));
+        }
+        if let Some(group_id) = fanout.and_then(OutboundFanout::group_id) {
+            self.ensure_group_live(group_id)?;
+        }
+        let bound = self.storage.with_transaction(|storage| {
+            let mut bound = Vec::with_capacity(sealed.len());
+            for entry in sealed {
+                let record = storage.get_message(&entry.local_id)?;
+                let payload = StoredMessagePayload::decode(&record.payload)
+                    .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+                let StoredMessagePayload::UnsealedWelcome {
+                    welcome,
+                    origin,
+                    key_package_ref,
+                    deliver_until,
+                    key_package_event_id,
+                } = payload
+                else {
+                    return Err(EngineError::InvalidWelcome);
+                };
+                if !matches!(
+                    &entry.message.envelope,
+                    TransportEnvelope::Welcome { recipient } if *recipient == welcome.recipient
+                ) {
+                    return Err(EngineError::Backend(
+                        "sealed Welcome does not match its recipient".into(),
+                    ));
+                }
+                let message = entry.message.clone();
+                let sealed_payload = match &origin {
+                    UnsealedWelcomeOrigin::StagedCommit(commit_id) => {
+                        StoredMessagePayload::staged_invite_welcome(
+                            message,
+                            commit_id.clone(),
+                            key_package_ref,
+                            deliver_until,
+                        )
+                        .with_key_package_event_id(key_package_event_id)
+                    }
+                    UnsealedWelcomeOrigin::Founding => StoredMessagePayload::outbound_welcome(
+                        message,
+                        None,
+                        key_package_ref,
+                        deliver_until,
+                    )
+                    .with_key_package_event_id(key_package_event_id),
+                    UnsealedWelcomeOrigin::LegacyCreate => {
+                        StoredMessagePayload::raw_transport(message)
+                    }
+                };
+                storage.put_message(&MessageRecord {
+                    id: entry.message.id.clone(),
+                    group_id: record.group_id.clone(),
+                    epoch: record.epoch,
+                    state: record.state,
+                    payload: sealed_payload
+                        .encode()
+                        .map_err(|error| EngineError::Serialize(format!("{error:?}")))?,
+                    deferred_peel: None,
+                })?;
+                storage.delete_message(&entry.local_id)?;
+                bound.push((record, origin));
+            }
+            if let Some(fanout) = fanout {
+                storage.put_outbound_fanout(fanout)?;
+            }
+            Ok::<_, EngineError>(bound)
+        })?;
+        // The sealed id is the transport id the audit trail and dedup know
+        // this Welcome by from here on.
+        for (entry, (record, origin)) in sealed.iter().zip(bound) {
+            self.sent_message_ids.insert(entry.message.id.clone());
+            let reason = match origin {
+                UnsealedWelcomeOrigin::Founding => "founding_welcome_persisted",
+                UnsealedWelcomeOrigin::StagedCommit(_) | UnsealedWelcomeOrigin::LegacyCreate => {
+                    "persist"
+                }
+            };
+            self.audit_group(
+                &record.group_id,
+                crate::audit_helpers::message_state_transition_event(
+                    hex::encode(entry.message.id.as_slice()),
+                    None,
+                    record.state,
+                    Some(record.epoch),
+                    reason,
+                ),
+            );
+        }
+        Ok(())
+    }
+
     /// Read all frozen fanouts in original staging order.
     pub fn outbound_fanouts(&self) -> Result<Vec<OutboundFanout>, EngineError> {
         Ok(self
@@ -1534,30 +1660,78 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         transport_context: Option<marmot_forensics::AuditTransportContext>,
     ) -> Result<IngestOutcome, EngineError> {
+        let context = self.ingest_audit_context(transport_context);
+        let result = self
+            .audited_ingest(msg, context.clone(), IngestEntry::Unrecorded, None)
+            .await;
+        if matches!(result, Ok(IngestOutcome::InboxSealed)) {
+            self.sealed_ingest = Some((msg.id.clone(), context));
+        }
+        result
+    }
+
+    /// Finish ingesting an account-inbox delivery that
+    /// [`Self::ingest_with_audit_context`] stopped as
+    /// [`IngestOutcome::InboxSealed`], with the caller's unseal result. The
+    /// delivery keeps the audit context its first half opened.
+    pub async fn ingest_unsealed_with_audit_context(
+        &mut self,
+        msg: &TransportMessage,
+        unsealed: Result<cgka_traits::ingest::PeeledMessage, cgka_traits::error::PeelerError>,
+    ) -> Result<IngestOutcome, EngineError> {
+        let (context, entry) = match self.sealed_ingest.take() {
+            Some((id, context)) if id == msg.id => (context, IngestEntry::Recorded),
+            _ => (self.ingest_audit_context(None), IngestEntry::Unrecorded),
+        };
+        self.audited_ingest(msg, context, entry, Some(unsealed))
+            .await
+    }
+
+    fn ingest_audit_context(
+        &mut self,
+        transport_context: Option<marmot_forensics::AuditTransportContext>,
+    ) -> AuditEventContext {
         let operation_id = self.next_audit_operation_id();
-        let msg_id_hex = hex::encode(msg.id.as_slice());
-        let mut context = AuditEventContext {
-            operation_id: Some(operation_id.clone()),
+        AuditEventContext {
+            operation_id: Some(operation_id),
             human_action: None,
             transport: transport_context,
             engine: None,
             group: None,
             convergence: None,
             source: None,
-        };
+        }
+    }
+
+    /// Ingest `msg` and record its evidence: the entry row unless `entry`
+    /// says the delivery's first half wrote it, then the outcome row, except
+    /// for [`IngestOutcome::InboxSealed`], whose outcome follows its unsealed
+    /// half.
+    async fn audited_ingest(
+        &mut self,
+        msg: &TransportMessage,
+        mut context: AuditEventContext,
+        entry: IngestEntry,
+        unsealed: Option<
+            Result<cgka_traits::ingest::PeeledMessage, cgka_traits::error::PeelerError>,
+        >,
+    ) -> Result<IngestOutcome, EngineError> {
+        let msg_id_hex = hex::encode(msg.id.as_slice());
         // A relay replay of a message this engine already holds or sent ends
         // `Ignored { Duplicate | OwnEcho }` before any work, and replay storms
         // repeat that per message. Learn it from the same reads ingest starts
         // with, so such a message records only its outcome row (mdk#3300).
         let recorded = self.recorded_ingest(msg);
         let replay = matches!(&recorded, Ok(Some(recorded)) if recorded.is_ignored_replay());
-        if !replay {
+        let record_entry = entry == IngestEntry::Unrecorded;
+        if !replay && record_entry {
             self.record_ingest_entry(msg, &context);
         }
-        let result = self.do_ingest(msg, recorded).await;
+        let result = self.do_ingest(msg, recorded, unsealed).await;
         // Only a failed echo write can turn a replay into something else.
         // Everything else keeps its full evidence, entry first.
         if replay
+            && record_entry
             && !result
                 .as_ref()
                 .is_ok_and(crate::message_processor::is_ignored_replay)
@@ -1565,6 +1739,7 @@ impl<S: StorageProvider> Engine<S> {
             self.record_ingest_entry(msg, &context);
         }
         match &result {
+            Ok(IngestOutcome::InboxSealed) => {}
             Ok(outcome) => {
                 let group_ref = crate::audit_helpers::ingest_outcome_group_ref(outcome);
                 self.recorder.record(AuditRecord {
@@ -1928,7 +2103,6 @@ impl<S: StorageProvider> Engine<S> {
         marmot_forensics::MessageRefHex,
         marmot_forensics::RecipientExpectation,
     )> {
-        use cgka_traits::transport::TransportEnvelope;
         use marmot_forensics::{MessageArtifactKind, RecipientExpectation, RecipientScope};
 
         let membership_epoch = self
@@ -1981,26 +2155,17 @@ impl<S: StorageProvider> Engine<S> {
             _ => [].as_slice(),
         };
         for welcome in welcomes {
-            let recipient = match &welcome.envelope {
-                TransportEnvelope::Welcome { recipient } => Some(recipient.clone()),
-                TransportEnvelope::GroupMessage { .. } => None,
-            };
-            let (expected_member_refs, expected_count) = match &recipient {
-                Some(recipient) => (
-                    vec![crate::audit_helpers::member_ref_hex(recipient)],
-                    Some(1),
-                ),
-                None => (Vec::new(), None),
-            };
             rows.push((
-                hex::encode(welcome.id.as_slice()),
+                hex::encode(welcome.local_id.as_slice()),
                 RecipientExpectation {
                     artifact_kind: MessageArtifactKind::Welcome,
                     recipient_scope: RecipientScope::AddedMemberOnly,
                     membership_epoch,
                     basis_commit_id: None,
-                    expected_member_refs,
-                    expected_count,
+                    expected_member_refs: vec![crate::audit_helpers::member_ref_hex(
+                        &welcome.recipient,
+                    )],
+                    expected_count: Some(1),
                 },
             ));
         }
@@ -3171,7 +3336,7 @@ impl<S: StorageProvider> Engine<S> {
             return recovery_failed();
         }
         let welcomes = if is_recovery {
-            match self.staged_welcomes_for_evolution(group_id, source_epoch, &message_id) {
+            match self.unsealed_welcomes_for_evolution(group_id, source_epoch, &message_id) {
                 Ok(welcomes) => welcomes,
                 Err(_) => return recovery_failed(),
             }
@@ -3299,6 +3464,48 @@ impl<S: StorageProvider> Engine<S> {
                 && matches!(message.envelope, TransportEnvelope::Welcome { .. })
             {
                 welcomes.push(message);
+            }
+        }
+        Ok(welcomes)
+    }
+
+    /// Load the current source epoch's unsealed Welcomes staged with the
+    /// immutable commit being resumed. Binding writes their sealed rows with
+    /// the commit's first fanout, which hydration restores first, so a sealed
+    /// staged Welcome here means a build before sealing moved to the session
+    /// stopped between sealing and freezing: refused, so the restore
+    /// quarantines the group.
+    fn unsealed_welcomes_for_evolution(
+        &self,
+        group_id: &GroupId,
+        source_epoch: EpochId,
+        origin_commit_id: &MessageId,
+    ) -> Result<Vec<cgka_traits::engine::OutboundWelcome>, EngineError> {
+        let mut welcomes = Vec::new();
+        for record in
+            self.storage
+                .list_messages_in_states(group_id, &[MessageState::Sent], source_epoch)?
+        {
+            if record.epoch != source_epoch {
+                continue;
+            }
+            let payload = StoredMessagePayload::decode(&record.payload)
+                .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+            match payload {
+                StoredMessagePayload::UnsealedWelcome {
+                    welcome,
+                    origin: cgka_traits::message::UnsealedWelcomeOrigin::StagedCommit(origin),
+                    ..
+                } if origin == *origin_commit_id => welcomes.push(welcome),
+                StoredMessagePayload::StagedInviteWelcome {
+                    origin_commit_id: origin,
+                    ..
+                } if origin == *origin_commit_id => {
+                    return Err(EngineError::Backend(
+                        "recovery Welcomes sealed before upgrade without a fanout".into(),
+                    ));
+                }
+                _ => {}
             }
         }
         Ok(welcomes)
@@ -4406,7 +4613,8 @@ impl<S: StorageProvider> Engine<S> {
             | StoredMessagePayload::SignedOpenMlsWire { .. }
             | StoredMessagePayload::OwnCommitWire { .. }
             | StoredMessagePayload::StagedSiblingWelcome { .. }
-            | StoredMessagePayload::OutboundSiblingWelcome { .. } => None,
+            | StoredMessagePayload::OutboundSiblingWelcome { .. }
+            | StoredMessagePayload::UnsealedWelcome { .. } => None,
         }
         .ok_or_else(|| {
             EngineError::Backend(
@@ -4482,6 +4690,33 @@ impl<S: StorageProvider> Engine<S> {
             self.read_outbound_welcome_work(&group_id, &mut work)?;
         }
         Ok(work)
+    }
+
+    /// Every live group's founding Welcomes still owed and not sealed yet: a
+    /// create whose session stopped, or failed to seal, before binding them.
+    /// Staged and legacy-create Welcomes are left out: their Commit's first
+    /// fanout binds them, or they roll back with it.
+    pub fn unsealed_owed_welcomes(
+        &self,
+    ) -> Result<Vec<cgka_traits::engine::OutboundWelcome>, EngineError> {
+        let mut welcomes = Vec::new();
+        for group_id in self.storage.list_groups()? {
+            if self.ensure_group_live(&group_id).is_err() {
+                continue;
+            }
+            self.visit_group_welcome_records(&group_id, &[MessageState::Sent], |_, _, payload| {
+                if let StoredMessagePayload::UnsealedWelcome {
+                    welcome,
+                    origin: UnsealedWelcomeOrigin::Founding,
+                    ..
+                } = payload
+                {
+                    welcomes.push(welcome);
+                }
+                Ok(())
+            })?;
+        }
+        Ok(welcomes)
     }
 
     /// [`Self::outbound_welcome_work`] for one group, or `None` while the
@@ -4752,7 +4987,8 @@ impl<S: StorageProvider> Engine<S> {
             | StoredMessagePayload::SignedOpenMlsWire { .. }
             | StoredMessagePayload::OwnCommitWire { .. }
             | StoredMessagePayload::StagedSiblingWelcome { .. }
-            | StoredMessagePayload::OutboundSiblingWelcome { .. } => None,
+            | StoredMessagePayload::OutboundSiblingWelcome { .. }
+            | StoredMessagePayload::UnsealedWelcome { .. } => None,
         };
         if !message
             .is_some_and(|message| matches!(message.envelope, TransportEnvelope::Welcome { .. }))
@@ -5006,13 +5242,14 @@ impl<S: StorageProvider> Engine<S> {
             | StoredMessagePayload::RawTransport(message) => {
                 matches!(message.envelope, TransportEnvelope::Welcome { .. })
             }
-            // A sibling Welcome is never a transport message, so no
-            // transport publish names its id.
+            // A sibling or unsealed Welcome is never a transport message, so
+            // no transport publish names its id.
             StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
             | StoredMessagePayload::OwnCommitWire { .. }
             | StoredMessagePayload::StagedSiblingWelcome { .. }
-            | StoredMessagePayload::OutboundSiblingWelcome { .. } => false,
+            | StoredMessagePayload::OutboundSiblingWelcome { .. }
+            | StoredMessagePayload::UnsealedWelcome { .. } => false,
         })
     }
 
@@ -5323,12 +5560,6 @@ impl<S: StorageProvider> Engine<S> {
         Ok(admins)
     }
 
-    /// Share the authenticated transport boundary with account-level control
-    /// workflows without moving their parsing or policy into the MLS engine.
-    pub fn transport_peeler(&self) -> Arc<dyn TransportPeeler> {
-        Arc::clone(&self.peeler)
-    }
-
     /// Durable-seeded, in-memory recovery candidates. This performs no storage
     /// scans or hydration; callers must still exclude departed copies using
     /// the per-group lifecycle gates before initiating account recovery.
@@ -5462,6 +5693,15 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.ingest_with_audit_context(&msg, None).await
     }
 
+    async fn ingest_unsealed(
+        &mut self,
+        msg: TransportMessage,
+        unsealed: Result<cgka_traits::ingest::PeeledMessage, cgka_traits::error::PeelerError>,
+    ) -> Result<IngestOutcome, EngineError> {
+        self.ingest_unsealed_with_audit_context(&msg, unsealed)
+            .await
+    }
+
     fn drain_events(&mut self) -> Vec<GroupEvent> {
         // A failed rewind restore that no later step has quarantined yet (a
         // past-epoch peel window fails its ingest call) does so here, so the
@@ -5557,10 +5797,12 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     async fn join_welcome(
         &mut self,
         welcome_msg: TransportMessage,
+        unsealed: cgka_traits::ingest::PeeledMessage,
     ) -> Result<GroupId, EngineError> {
+        let content_id = crate::welcome_content::WelcomeContentId::of(&unsealed)?;
         self.do_join_welcome(
             welcome_msg,
-            None,
+            (unsealed, content_id),
             crate::group_lifecycle::WelcomeRoute::Delivery,
         )
         .await

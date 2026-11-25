@@ -18,6 +18,10 @@ pub enum IngestOutcome {
     GroupRecovery {
         recovery: Box<crate::group_recovery::AuthenticatedGroupRecovery>,
     },
+    /// An account-inbox delivery addressed to this client. The caller unseals
+    /// it and passes the result to `ingest_unsealed`. The engine did not mark
+    /// it seen.
+    InboxSealed,
     /// Message was accepted into durable storage but not yet applied because
     /// the group is temporarily not ingestible, usually during a local
     /// publish-before-apply transition. The engine replays buffered messages
@@ -263,7 +267,7 @@ pub enum StaleReason {
 /// Decrypted inbound message ready for engine processing.
 ///
 /// Produced by [`crate::peeler::TransportPeeler::peel_group_message`] /
-/// [`crate::peeler::TransportPeeler::peel_welcome`]. The `kind` field is the
+/// [`crate::peeler::InboxSealer::unseal`]. The `kind` field is the
 /// structural discriminator — application messages, MLS commits, welcomes,
 /// etc.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

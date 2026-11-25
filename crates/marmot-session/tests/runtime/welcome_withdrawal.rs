@@ -9,56 +9,40 @@ struct OwedInviteWelcome {
     welcome: TransportMessage,
 }
 
-/// [`MockPeeler`] whose Welcomes carry what the Nostr transport gives its
+/// [`MockSealer`] whose Welcomes carry what the Nostr transport gives its
 /// own: a 32-byte event id and the `nostr` source, which the runtime's v5
 /// Welcome audit rows reference.
-struct NostrWelcomePeeler(MockPeeler);
+struct NostrWelcomeSealer;
 
 #[async_trait]
-impl TransportPeeler for NostrWelcomePeeler {
-    async fn wrap_group_recovery(
+impl InboxSealer for NostrWelcomeSealer {
+    async fn seal_group_recovery(
         &self,
         message: &cgka_traits::GroupRecoveryMessage,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
-        self.0.wrap_group_recovery(message, recipient).await
+        MockSealer.seal_group_recovery(message, recipient).await
     }
 
-    async fn peel_group_message(
-        &self,
-        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        self.0.peel_group_message(msg, ctx).await
+    async fn unseal(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockSealer.unseal(msg).await
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        self.0.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
-        &self,
-        payload: &EncryptedPayload,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.0.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
+    async fn seal_welcome(&self, outbound: &OutboundWelcome) -> Result<TransportMessage, PeelerError> {
         use sha2::{Digest, Sha256};
 
-        let mut welcome = self.0.wrap_welcome(payload, recipient).await?;
+        let mut welcome = MockSealer.seal_welcome(outbound).await?;
         welcome.id = MessageId::new(Sha256::digest(welcome.id.as_slice()).to_vec());
         welcome.source = TransportSource("nostr".into());
         Ok(welcome)
     }
+
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        MockSealer.sealed_welcome_len(welcome)
+    }
 }
 
-/// [`session`] wrapping its Welcomes as [`NostrWelcomePeeler`] does.
+/// [`session`] wrapping its Welcomes as [`NostrWelcomeSealer`] does.
 fn nostr_welcome_session(
     path: impl Into<std::path::PathBuf>,
     key: &SqlCipherKey,
@@ -69,7 +53,8 @@ fn nostr_welcome_session(
             path,
             SqlCipherKey::new(key.as_secret_str()).unwrap(),
             pad32(identity),
-            Box::new(NostrWelcomePeeler(MockPeeler)),
+            Box::new(MockPeeler),
+            Arc::new(NostrWelcomeSealer),
         )
         .legacy_compatibility_profile()
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
@@ -81,7 +66,7 @@ fn nostr_welcome_session(
     .unwrap()
 }
 
-/// [`current_session`] wrapping its Welcomes as [`NostrWelcomePeeler`] does.
+/// [`current_session`] wrapping its Welcomes as [`NostrWelcomeSealer`] does.
 fn current_nostr_welcome_session(
     path: impl Into<std::path::PathBuf>,
     key: &SqlCipherKey,
@@ -91,7 +76,7 @@ fn current_nostr_welcome_session(
 }
 
 /// [`deferred_current_session`] wrapping its Welcomes as
-/// [`NostrWelcomePeeler`] does.
+/// [`NostrWelcomeSealer`] does.
 fn deferred_current_nostr_welcome_session(
     path: impl Into<std::path::PathBuf>,
     key: &SqlCipherKey,
@@ -112,7 +97,8 @@ fn current_nostr_welcome_config(
         path,
         SqlCipherKey::new(key.as_secret_str()).unwrap(),
         pad32(identity),
-        Box::new(NostrWelcomePeeler(MockPeeler)),
+        Box::new(MockPeeler),
+        Arc::new(NostrWelcomeSealer),
     )
     .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
         keys: deterministic_nostr_keys(identity),
@@ -728,7 +714,7 @@ async fn legacy_create_welcome_cannot_be_withdrawn() {
         .await
         .unwrap();
     let welcome_id = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { welcomes, .. } => welcomes[0].id.clone(),
+        PublishWork::GroupCreated { welcomes, .. } => seal_and_bind(&mut alice, welcomes).await.remove(0).id,
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     let runtime = AccountDeviceRuntime::new(

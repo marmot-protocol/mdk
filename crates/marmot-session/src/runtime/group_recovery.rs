@@ -1052,8 +1052,8 @@ where
         if record.outbound.is_none() {
             let wrapped = self
                 .session
-                .recovery_peeler
-                .wrap_group_recovery(&record.message, &record.peer)
+                .sealer
+                .seal_group_recovery(&record.message, &record.peer)
                 .await
                 .map_err(EngineError::Peeler)?;
             record.outbound = Some(wrapped);
@@ -1197,12 +1197,6 @@ where
             let rollback = self.session.publish_failed(pending).await?;
             output.extend(self.publish_session_effects(rollback).await?);
             return Err(SessionError::from(error).into());
-        }
-        // Direct recovery sends bypass the prepared-send Welcome watcher.
-        for work in &effects.publish {
-            if let PublishWork::GroupEvolution { welcomes, .. } = work {
-                self.watch_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
-            }
         }
         output.extend(self.publish_session_effects(effects).await?);
         for record in &mut records {

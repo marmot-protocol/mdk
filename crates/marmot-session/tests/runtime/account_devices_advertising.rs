@@ -23,6 +23,7 @@ fn account_devices_session(
             SqlCipherKey::new(key.as_secret_str()).unwrap(),
             pad32(account),
             Box::new(MockPeeler),
+            Arc::new(MockSealer),
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
             keys: deterministic_nostr_keys(account),

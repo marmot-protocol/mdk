@@ -11,7 +11,7 @@ This crate owns the Nostr transport-edge peeler:
 - mapping kind `445` / `1059` events into `TransportMessage`,
 - kind `445` group envelope encryption and decryption (`content = base64(nonce || ciphertext)`, empty AAD),
 - per-event ephemeral signing of outbound kind `445` events,
-- NIP-59 welcome wrapping/peeling with injected signer/decrypter,
+- NIP-59 sealing/unsealing of the account inbox (Welcomes and recovery control) with an injected signer/decrypter,
 - explicit errors for malformed or unsupported Nostr boundary input.
 
 It must not own relay networking, relay selection, account-device sessions, app message projection, or application
@@ -23,7 +23,8 @@ storage. Keep those in adapters or the app layer above this crate.
 | --- | --- |
 | `src/lib.rs` | Public exports and Nostr/Marmot constants. |
 | `src/event.rs` | `NostrTransportEvent` DTO and `TransportMessage` conversion. |
-| `src/peeler.rs` | `TransportPeeler` implementation for Nostr/MLS group messages. |
+| `src/peeler.rs` | `TransportPeeler` implementation for Nostr/MLS group messages (`NostrMlsPeeler`). |
+| `src/inbox_sealer.rs` | `InboxSealer` implementation for the account inbox (`NostrInboxSealer`), and `sealed_welcome_event_len`, the exact length of a sealed Welcome event. |
 | `src/nip59.rs` | `gift_wrap_rumor`: the one NIP-59 wrap construction shared by Welcomes and moderation reports. |
 | `src/signer.rs` | `MarmotNostrSigner` account signer boundary and `SdkSigner` adapter over rust-nostr's signer traits. |
 | `src/error.rs` | Nostr boundary error vocabulary. |
@@ -61,9 +62,10 @@ skips content validation is a contract violation, not a style choice.
 - Prepare routing validation, event-hash binding and base64 decoding once per ingest. Candidate-context peeling uses
   the prepared bytes for AEAD only; it must not repeat envelope preparation or retain bytes across inputs.
 - Build every outbound NIP-59 wrap with `gift_wrap_rumor`; do not add a second wrap implementation.
-- Welcomes wrap/peel through NIP-59 only with a caller-injected signer/decrypter; this crate must not decide where that
-  signer comes from. The kind `444` rumor carries base64 content plus the required `["e", <keypackage event id>]` and
-  `["relays", ...]` tags supplied through `wrap_welcome_with_metadata`.
+- Welcomes seal/unseal through NIP-59 only with a caller-injected signer/decrypter; this crate must not decide where
+  that signer comes from. The kind `444` rumor carries base64 content plus the required `["e", <keypackage event id>]`
+  and `["relays", ...]` tags from the `OutboundWelcome`'s metadata. Keep `sealed_welcome_event_len` equal to the
+  sealed event's JSON length (`inbox_sealer::tests::sealed_len_matches_sealed_event_json`).
 
 ## Verification
 

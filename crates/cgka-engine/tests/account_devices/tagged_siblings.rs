@@ -23,7 +23,7 @@ pub(super) fn chat_device(account: &[u8]) -> Device {
     device_advertising(
         account,
         &[ACCOUNT_DEVICES_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID],
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
     )
 }
 
@@ -109,8 +109,9 @@ pub(super) async fn found_group_routed_with(
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
+    let welcomes = seal_and_bind(&mut founder.engine, &welcomes);
     for (joiner, welcome) in joiners.iter_mut().zip(welcomes) {
-        joiner.engine.join_welcome(welcome).await.unwrap();
+        join_raw(&mut joiner.engine, welcome).await.unwrap();
     }
     assert!(requires_account_devices(&founder.engine, &gid));
     gid

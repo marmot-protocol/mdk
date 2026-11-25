@@ -22,6 +22,7 @@ fn component_migration_session(
             SqlCipherKey::new(key.as_secret_str()).unwrap(),
             pad32(identity),
             Box::new(MockPeeler),
+            Arc::new(MockSealer),
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
         .protocol_profile(ProtocolProfile::Current)

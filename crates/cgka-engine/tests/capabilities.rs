@@ -3,7 +3,6 @@
 // Tests read stored records and OpenMLS state directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
-use async_trait::async_trait;
 use cgka_engine::canonicalization::ConvergenceStatus;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
@@ -32,6 +31,7 @@ mod leaf_advertisement;
 
 mod support;
 use support::proof_signer;
+use support::raw_inbox::{join_raw, seal_and_bind};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
@@ -65,19 +65,8 @@ fn hash_id(bytes: &[u8]) -> MessageId {
     MessageId::new(h.finish().to_be_bytes().to_vec())
 }
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -92,20 +81,7 @@ impl TransportPeeler for MockPeeler {
             origin: msg.message.clone(),
         })
     }
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -118,22 +94,6 @@ impl TransportPeeler for MockPeeler {
             source: TransportSource("mock".into()),
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: vec![],
-            },
-        })
-    }
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
             },
         })
     }
@@ -1006,15 +966,12 @@ async fn upgrade_group_capabilities_promotes_optional_to_required() {
         })
         .await
         .unwrap();
-    let SendResult::GroupCreated {
-        pending,
-        mut welcomes,
-    } = create
-    else {
+    let SendResult::GroupCreated { pending, welcomes } = create else {
         panic!("legacy create");
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    join_raw(&mut bob, welcomes.remove(0)).await.unwrap();
     assert!(matches!(
         alice
             .feature_status(&group_id, &Feature("optional-extension"))
@@ -1105,16 +1062,14 @@ async fn non_admin_cannot_upgrade_group_capabilities() {
         .await
         .unwrap();
     let welcome_for_bob = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
             alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
+            welcome
         }
         _ => unreachable!(),
     };
-    let group_id = bob.join_welcome(welcome_for_bob).await.unwrap();
+    let group_id = join_raw(&mut bob, welcome_for_bob).await.unwrap();
 
     let err = bob
         .upgrade_group_capabilities(&group_id)
@@ -1157,14 +1112,13 @@ async fn welcome_joiner_reads_earlier_members_capabilities_from_the_tree() {
         .await
         .unwrap();
     let (welcome_for_bob, create_pending) = match create {
-        SendResult::GroupCreated {
-            mut welcomes,
-            pending,
-        } => (welcomes.remove(0), pending),
+        SendResult::GroupCreated { welcomes, pending } => {
+            (seal_and_bind(&mut alice, &welcomes).remove(0), pending)
+        }
         _ => unreachable!(),
     };
     alice.confirm_published(create_pending).await.unwrap();
-    bob.join_welcome(welcome_for_bob).await.unwrap();
+    join_raw(&mut bob, welcome_for_bob).await.unwrap();
 
     for engine in [&alice, &bob] {
         let status = engine
@@ -1270,9 +1224,10 @@ async fn convergence_refreshes_recipient_required_capabilities_on_upgrade() {
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         _ => unreachable!(),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(alice_pending).await.unwrap();
     let welcome = welcomes.into_iter().next().unwrap();
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
 
     // Reactions is Optional and not required pre-upgrade.
     let bob_pre = bob_storage.get_group(&gid).unwrap();
@@ -1553,6 +1508,7 @@ async fn join_welcome_self_check_rejects_local_member_missing_required_role() {
         .expect("group with role-advertising bob creates");
     let welcome = match created {
         SendResult::GroupCreated { welcomes, pending } => {
+            let welcomes = seal_and_bind(&mut alice, &welcomes);
             alice.confirm_published(pending).await.unwrap();
             welcomes.into_iter().next().unwrap()
         }
@@ -1569,8 +1525,7 @@ async fn join_welcome_self_check_rejects_local_member_missing_required_role() {
         registry_selfremove_only(),
         agent_stream_supported_components(),
     );
-    let err = downgraded_bob
-        .join_welcome(welcome)
+    let err = join_raw(&mut downgraded_bob, welcome)
         .await
         .expect_err("downgraded bob no longer advertises the required receive role");
     assert!(
@@ -1709,10 +1664,11 @@ async fn mixed_device_group() -> MixedDeviceGroup {
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
-    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
+    join_raw(&mut carol, welcomes.remove(0)).await.unwrap();
     assert_test_component(&[&alice, &carol], &group_id, true);
 
     // The lacking device joins first, so its account's last-added leaf
@@ -1722,7 +1678,7 @@ async fn mixed_device_group() -> MixedDeviceGroup {
         let SendResult::GroupEvolution {
             msg,
             pending,
-            mut welcomes,
+            welcomes,
         } = alice
             .send(cgka_traits::engine::SendIntent::Invite {
                 group_id: group_id.clone(),
@@ -1734,8 +1690,9 @@ async fn mixed_device_group() -> MixedDeviceGroup {
         else {
             panic!("device invitation")
         };
+        let mut welcomes = seal_and_bind(&mut alice, &welcomes);
         alice.confirm_published(pending).await.unwrap();
-        device.join_welcome(welcomes.remove(0)).await.unwrap();
+        join_raw(device, welcomes.remove(0)).await.unwrap();
         for member in &mut joined {
             member.ingest(routed(msg.clone(), &group_id)).await.unwrap();
             apply(member, &group_id);

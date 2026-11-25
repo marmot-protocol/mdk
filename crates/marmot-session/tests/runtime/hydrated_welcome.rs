@@ -185,18 +185,6 @@ async fn queued_recovery_origin() {
 }
 
 #[tokio::test]
-#[cfg(feature = "test-policy-overrides")]
-async fn canonical_wave_waits() {
-    native_wave_waits(RecoveryPeelerGate::Peel).await;
-}
-
-#[tokio::test]
-#[cfg(feature = "test-policy-overrides")]
-async fn direct_send_wave_waits() {
-    native_wave_waits(RecoveryPeelerGate::Wrap).await;
-}
-
-#[tokio::test]
 async fn hydrated_welcome_stays_owned() {
     let (_dir, session, a, b, welcome, _) =
         hydrated_recovery_fixture(RecoveryFixtureMode::Staged).await;
@@ -390,10 +378,35 @@ async fn recovery_welcome_reopens() {
     );
 }
 
+// The staged recovery uses raw fixture Welcomes, but inbound control must
+// still authenticate the sender via NIP-59.
+struct RecoveryControlSealer(transport_nostr_peeler::NostrInboxSealer);
+
+#[async_trait]
+impl InboxSealer for RecoveryControlSealer {
+    async fn unseal(&self, message: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        self.0.unseal(message).await
+    }
+
+    async fn seal_welcome(&self, welcome: &OutboundWelcome) -> Result<TransportMessage, PeelerError> {
+        MockSealer.seal_welcome(welcome).await
+    }
+
+    async fn seal_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.seal_group_recovery(message, recipient).await
+    }
+
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        MockSealer.sealed_welcome_len(welcome)
+    }
+}
+
 #[tokio::test]
 async fn recovery_ingest_drains_native() {
-    use cgka_traits::peeler::TransportPeeler as _;
-
     enum OpenMode {
         Eager,
         Deferred,
@@ -435,7 +448,8 @@ async fn recovery_ingest_drains_native() {
             dir.path().join("alice.sqlite"),
             SqlCipherKey::new("hydrated welcome ownership key").unwrap(),
             pad32(b"hydrated-alice"),
-            Box::new(nostr_peeler(b"hydrated-alice")),
+            Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+            Arc::new(RecoveryControlSealer(nostr_sealer(b"hydrated-alice"))),
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
             keys: deterministic_nostr_keys(b"hydrated-alice"),
@@ -481,8 +495,8 @@ async fn recovery_ingest_drains_native() {
                 device_key_hash: [0x93; 32],
             },
         };
-        let carrier = nostr_peeler(b"hydrated-bob")
-            .wrap_group_recovery(&control, &account)
+        let carrier = nostr_sealer(b"hydrated-bob")
+            .seal_group_recovery(&control, &account)
             .await
             .unwrap();
 

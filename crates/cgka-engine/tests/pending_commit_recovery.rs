@@ -16,7 +16,6 @@
 // Tests read stored records and OpenMLS state directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
-use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{ConvergenceClock, EngineBuilder};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
@@ -29,12 +28,13 @@ use cgka_traits::storage::{CommittedRosterStorage, GroupStorage, MessageStorage}
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{EpochId, MemberId, MessageId};
+use cgka_traits::types::{EpochId, MessageId};
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 mod support;
 use support::committed_roster::checked_committed_roster;
 use support::proof_signer;
+use support::raw_inbox::{join_raw, seal_and_bind};
 
 #[path = "pending_commit_recovery/recovery_mirror.rs"]
 mod recovery_mirror;
@@ -67,19 +67,8 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 
 struct MockPeeler;
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -95,21 +84,7 @@ impl TransportPeeler for MockPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -122,23 +97,6 @@ impl TransportPeeler for MockPeeler {
             source: TransportSource("pending-commit-recovery".into()),
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: vec![],
-            },
-        })
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("pending-commit-recovery".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
             },
         })
     }
@@ -249,11 +207,13 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
             .await
             .unwrap();
         stranded_welcome_id = match invite {
-            SendResult::GroupEvolution { welcomes, .. } => welcomes
-                .first()
-                .expect("invite produces a Welcome")
-                .id
-                .clone(),
+            SendResult::GroupEvolution { welcomes, .. } => {
+                seal_and_bind(&mut alice, &welcomes)
+                    .into_iter()
+                    .next()
+                    .expect("invite produces a Welcome")
+                    .id
+            }
             other => panic!("expected GroupEvolution, got {other:?}"),
         };
         assert_eq!(
@@ -442,16 +402,14 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
             .unwrap();
         group_id = gid.clone();
         let (welcome_for_bob, _welcome_for_carol) = match create {
-            SendResult::GroupCreated {
-                pending,
-                mut welcomes,
-            } => {
+            SendResult::GroupCreated { pending, welcomes } => {
+                let mut welcomes = seal_and_bind(&mut alice, &welcomes);
                 alice.confirm_published(pending).await.unwrap();
                 (welcomes.remove(0), welcomes.remove(0))
             }
             other => panic!("expected GroupCreated, got {other:?}"),
         };
-        bob.join_welcome(welcome_for_bob).await.unwrap();
+        join_raw(&mut bob, welcome_for_bob).await.unwrap();
         assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
         assert_eq!(alice.members(&group_id).unwrap().len(), 3);
 

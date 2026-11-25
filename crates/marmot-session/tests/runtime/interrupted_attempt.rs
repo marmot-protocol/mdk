@@ -29,7 +29,7 @@ async fn interrupted_commit_attempt_stays_possibly_exposed_after_restart() {
         .unwrap();
     let group_id = created.group_id.clone();
     let (create_pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, seal_and_bind(&mut alice, welcomes).await.remove(0)),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(create_pending).await.unwrap();

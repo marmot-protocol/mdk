@@ -9,7 +9,6 @@
 // Tests load OpenMLS state directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
-use async_trait::async_trait;
 use cgka_engine::canonicalization::{CanonicalizationPolicy, DroppedMessageReason};
 use cgka_engine::commit_class::classify_staged_commit;
 use cgka_engine::convergence::ConvergencePolicy;
@@ -50,6 +49,7 @@ use tls_codec::{Deserialize as _, Serialize as _};
 
 mod support;
 use support::proof_signer;
+use support::raw_inbox::{join_raw, seal_and_bind};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
@@ -90,19 +90,8 @@ fn canonicalization_message_id(msg: &TransportMessage) -> String {
     hex::encode(Sha256::digest(&msg.payload))
 }
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -117,20 +106,7 @@ impl TransportPeeler for MockPeeler {
             origin: msg.message.clone(),
         })
     }
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -143,22 +119,6 @@ impl TransportPeeler for MockPeeler {
             source: TransportSource("mock".into()),
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: vec![],
-            },
-        })
-    }
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
             },
         })
     }
@@ -177,7 +137,7 @@ fn registry() -> FeatureRegistry {
     r
 }
 
-fn build(id: &[u8]) -> impl CgkaEngine {
+fn build(id: &[u8]) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -321,10 +281,12 @@ async fn establish_current_group(
         .await
         .unwrap();
     let welcome = match create {
-        SendResult::FoundingGroupCreated { mut welcomes } => welcomes.remove(0),
+        SendResult::FoundingGroupCreated { welcomes } => {
+            seal_and_bind(creator, &welcomes).remove(0)
+        }
         other => panic!("expected FoundingGroupCreated, got {other:?}"),
     };
-    invitee.join_welcome(welcome).await.unwrap();
+    join_raw(invitee, welcome).await.unwrap();
     group_id
 }
 
@@ -614,16 +576,14 @@ async fn inbound_self_update_rejects_account_identity_spoofing() {
         .await
         .unwrap();
     let welcome_for_bob = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
             alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
+            welcome
         }
         other => panic!("expected GroupCreated, got {other:?}"),
     };
-    bob.join_welcome(welcome_for_bob).await.unwrap();
+    join_raw(&mut bob, welcome_for_bob).await.unwrap();
 
     let before_epoch = alice.epoch(&group_id).expect("alice has group");
     let crypto = RustCrypto::default();
@@ -685,17 +645,15 @@ async fn inbound_by_reference_update_rejects_account_identity_spoofing() {
         .await
         .unwrap();
     let (welcome_for_bob, welcome_for_carol) = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let mut welcomes = seal_and_bind(&mut alice, &welcomes);
             alice.confirm_published(pending).await.unwrap();
             (welcomes.remove(0), welcomes.remove(0))
         }
         other => panic!("expected GroupCreated, got {other:?}"),
     };
-    bob.join_welcome(welcome_for_bob).await.unwrap();
-    carol.join_welcome(welcome_for_carol).await.unwrap();
+    join_raw(&mut bob, welcome_for_bob).await.unwrap();
+    join_raw(&mut carol, welcome_for_carol).await.unwrap();
 
     let crypto = RustCrypto::default();
     let spoofed_proposal = spoofed_update_proposal(
@@ -804,7 +762,7 @@ async fn current_by_reference_non_admin_update_is_rejected_at_commit() {
         })
         .await
         .unwrap();
-    let (commit, pending, mut welcomes) = match invite {
+    let (commit, pending, welcomes) = match invite {
         SendResult::GroupEvolution {
             msg,
             pending,
@@ -812,11 +770,12 @@ async fn current_by_reference_non_admin_update_is_rejected_at_commit() {
         } => (msg, pending, welcomes),
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
     bob.ingest(commit).await.unwrap();
     bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("bob applies Carol's invite");
-    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+    join_raw(&mut carol, welcomes.remove(0)).await.unwrap();
 
     let crypto = RustCrypto::default();
     let proposal = self_update_proposal(&bob_storage, &crypto, &bob.self_id(), &group_id);
@@ -893,16 +852,17 @@ async fn a_non_admin_committing_an_admins_proposal_fails_authorization_on_replay
     let SendResult::GroupEvolution {
         msg,
         pending,
-        mut welcomes,
+        welcomes,
     } = invite
     else {
         panic!("expected GroupEvolution, got {invite:?}");
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
     bob.ingest(msg).await.unwrap();
     bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("bob applies Carol's invite");
-    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+    join_raw(&mut carol, welcomes.remove(0)).await.unwrap();
 
     let crypto = RustCrypto::default();
     let dave_kp = build_current_with_storage(b"dave-committer-check")
@@ -1015,16 +975,14 @@ async fn standalone_update_authorization_is_profile_specific() {
         .await
         .unwrap();
     let welcome = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let welcome = seal_and_bind(&mut legacy_alice, &welcomes).remove(0);
             legacy_alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
+            welcome
         }
         other => panic!("expected GroupCreated, got {other:?}"),
     };
-    legacy_bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut legacy_bob, welcome).await.unwrap();
     let legacy_update = self_update_proposal(
         &legacy_bob_storage,
         &crypto,
@@ -1318,9 +1276,10 @@ async fn carol_holding_a_parent_dependent_fork_proposal() -> (
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcomes[0].clone()).await.unwrap();
-    carol.join_welcome(welcomes[1].clone()).await.unwrap();
+    join_raw(&mut bob, welcomes[0].clone()).await.unwrap();
+    join_raw(&mut carol, welcomes[1].clone()).await.unwrap();
     carol
         .set_convergence_policy(CanonicalizationPolicy {
             convergence: ConvergencePolicy {
@@ -1370,6 +1329,7 @@ async fn carol_holding_a_parent_dependent_fork_proposal() -> (
         } => (msg, pending, welcomes),
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
+    let bob_welcomes = seal_and_bind(&mut bob, &bob_welcomes);
     bob.confirm_published(bob_pending).await.unwrap();
     let eve_welcome = bob_welcomes
         .into_iter()
@@ -1380,7 +1340,7 @@ async fn carol_holding_a_parent_dependent_fork_proposal() -> (
             )
         })
         .expect("bob welcome for eve");
-    eve.join_welcome(eve_welcome).await.unwrap();
+    join_raw(&mut eve, eve_welcome).await.unwrap();
 
     let fork_proposal = match eve
         .send(SendIntent::Leave {
@@ -1619,13 +1579,14 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
         })
         .await
         .unwrap();
-    let (pending, mut welcomes) = match create {
+    let (pending, welcomes) = match create {
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
     let welcome_bob = welcomes.remove(0);
-    bob.join_welcome(welcome_bob).await.unwrap();
+    join_raw(&mut bob, welcome_bob).await.unwrap();
 
     // Bob (non-admin) self-removes -> SelfRemove proposal.
     let leave = bob
@@ -1705,16 +1666,14 @@ async fn own_selfremove_echo_is_ignored_without_auto_commit() {
         .await
         .unwrap();
     let (welcome_for_bob, _welcome_for_carol) = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let mut welcomes = seal_and_bind(&mut alice, &welcomes);
             alice.confirm_published(pending).await.unwrap();
             (welcomes.remove(0), welcomes.remove(0))
         }
         _ => unreachable!(),
     };
-    bob.join_welcome(welcome_for_bob).await.unwrap();
+    join_raw(&mut bob, welcome_for_bob).await.unwrap();
 
     // Bob produces his own SelfRemove proposal.
     let proposal = match bob
@@ -1868,16 +1827,14 @@ async fn admin_cannot_self_remove_even_when_co_admin_present() {
         .unwrap();
 
     let (welcome_for_bob, _welcome_for_carol) = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let mut welcomes = seal_and_bind(&mut alice, &welcomes);
             alice.confirm_published(pending).await.unwrap();
             (welcomes.remove(0), welcomes.remove(0))
         }
         _ => unreachable!(),
     };
-    bob.join_welcome(welcome_for_bob).await.unwrap();
+    join_raw(&mut bob, welcome_for_bob).await.unwrap();
 
     let res = alice
         .send(SendIntent::Leave {

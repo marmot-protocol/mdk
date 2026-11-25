@@ -28,7 +28,7 @@ use tempfile::TempDir;
 use transport_nostr_adapter::{
     NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrTransportAdapter,
 };
-use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
+use transport_nostr_peeler::{NostrInboxSealer, NostrMlsPeeler, NostrTransportEvent};
 
 pub struct NostrStackHarness {
     _dir: TempDir,
@@ -180,7 +180,11 @@ impl NostrStackHarness {
                 self._dir.path().join(format!("{label}.sqlite")),
                 SqlCipherKey::new(self.database_key_material).unwrap(),
                 keys.public_key().to_bytes().to_vec(),
-                Box::new(NostrMlsPeeler::default().with_welcome_signer(keys.clone())),
+                Box::new(NostrMlsPeeler::default()),
+                Arc::new(NostrInboxSealer::new(
+                    Arc::new(keys.clone()),
+                    Arc::new(marmot_session::SystemWallClock),
+                )),
             )
             .legacy_compatibility_profile()
             .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
@@ -390,10 +394,24 @@ pub fn nostr_routing_component(seed: &[u8]) -> AppComponentData {
     }
 }
 
+pub async fn seal_and_bind(
+    session: &mut AccountDeviceSession,
+    welcomes: &[cgka_traits::OutboundWelcome],
+) -> Vec<TransportMessage> {
+    let sealed = session.seal_welcomes(welcomes).await.unwrap();
+    session.bind_sealed_welcomes(&sealed, None).unwrap();
+    sealed.into_iter().map(|sealed| sealed.message).collect()
+}
+
 impl CreatedGroup {
-    pub fn from_effects(created: CreateGroupEffects) -> Self {
+    pub async fn from_effects(
+        sender: &mut AccountDeviceSession,
+        created: CreateGroupEffects,
+    ) -> Self {
         let (pending, welcome) = match &created.effects.publish[0] {
-            PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+            PublishWork::GroupCreated { pending, welcomes } => {
+                (*pending, seal_and_bind(sender, welcomes).await.remove(0))
+            }
             other => panic!("expected group creation publish work, got {other:?}"),
         };
         Self {

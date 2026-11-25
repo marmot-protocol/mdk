@@ -76,8 +76,8 @@ async fn recovery_control_identity() {
         expires_at: peers.wall.now().0,
         ..expected.message
     };
-    let carrier = nostr_peeler(b"cancel-alice")
-        .wrap_group_recovery(&expired, &peers.recipient.self_id())
+    let carrier = nostr_sealer(b"cancel-alice")
+        .seal_group_recovery(&expired, &peers.recipient.self_id())
         .await
         .unwrap();
     let rejected = peers
@@ -167,7 +167,8 @@ fn eligibility_legacy_session(
             path,
             SqlCipherKey::new(key.as_secret_str()).unwrap(),
             pad32(account),
-            Box::new(nostr_peeler(account)),
+            Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+            Arc::new(nostr_sealer(account)),
         )
         .legacy_compatibility_profile()
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {

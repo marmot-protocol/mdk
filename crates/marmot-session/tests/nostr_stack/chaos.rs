@@ -722,7 +722,7 @@ async fn create_group_for_bob(
         })
         .await
         .unwrap();
-    CreatedGroup::from_effects(created)
+    CreatedGroup::from_effects(&mut alice.session, created).await
 }
 
 async fn publish_confirm_and_deliver_welcome(
@@ -814,7 +814,9 @@ async fn invite_carol(
         } => InvitePublish {
             pending: *pending,
             commit: msg.clone(),
-            welcome: welcomes[0].clone(),
+            welcome: support::nostr_stack::seal_and_bind(&mut alice.session, welcomes)
+                .await
+                .remove(0),
         },
         other => panic!("expected group evolution publish work, got {other:?}"),
     }

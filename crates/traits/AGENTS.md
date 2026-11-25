@@ -24,7 +24,7 @@ what lives here is in [`README.md`](README.md#what-lives-in-here).
 | `src/types.rs` | Core id newtypes (`GroupId`/`MemberId`/`MessageId`), `EpochId`, and the `Backend` enum. |
 | `src/group.rs` | `Group` and `Member` storage records. |
 | `src/message.rs` | `MessageRecord`, `MessageState`, and the `StoredMessagePayload` envelope. |
-| `src/peeler.rs` | The `TransportPeeler` crypto-boundary trait (wasm32 builds drop the `Send` bound). |
+| `src/peeler.rs` | The synchronous group-message `TransportPeeler` and the async account-inbox `InboxSealer` (wasm32 builds drop the `Send` bound). |
 | `src/transport.rs` | Transport-facing message envelope types. |
 | `src/transport_adapter.rs` | Account-aware adapter trait, publish targets, delivery metadata. |
 | `src/ingest.rs` | Peeled-message content and ingest outcomes. |

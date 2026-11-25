@@ -57,14 +57,14 @@ async fn roster_departure_backend_read_failure_retains_public_apply_for_retry() 
         phone_storage.clone(),
         account,
         Some(&clock),
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
         None,
     );
     let mut laptop = build_roster_device(
         laptop_storage.clone(),
         account,
         Some(&clock),
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
         None,
     );
     let gid = found_device_group(
@@ -153,7 +153,7 @@ async fn roster_departure_backend_read_failure_retains_public_apply_for_retry() 
         storage.clone(),
         account,
         Some(&clock),
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
         None,
     );
     laptop.engine.hydrate_all_stored_groups().unwrap();
