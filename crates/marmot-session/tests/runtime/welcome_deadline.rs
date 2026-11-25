@@ -4,13 +4,6 @@
 use cgka_engine::WELCOME_DELIVERY_WINDOW_SECS;
 use cgka_traits::message::StoredMessagePayload;
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
 /// The owed-invite fixture's account opened again on its database in `dir`,
 /// as after a restart or an upgrade, with its runtime clock at `at`, its
 /// relays answering through a fresh `adapter` and its v5 audit at `audit`.
@@ -97,7 +90,10 @@ async fn an_invite_welcome_no_relay_acknowledges_ends_at_its_deadline() {
     let TransportEnvelope::Welcome { recipient } = welcome.envelope.clone() else {
         unreachable!("the fixture's Welcome")
     };
-    adapter.accept_only_endpoints(Vec::new());
+    adapter.fail_endpoints_as(
+        vec![TransportEndpoint("wss://carol-inbox.example".into())],
+        TransportEndpointFailureKind::RetryableUnavailable,
+    );
     // Retried, unanswered, until the deadline.
     wall.set(staged_before);
     runtime.run_due_maintenance().await.unwrap();

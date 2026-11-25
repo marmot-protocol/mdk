@@ -5427,3 +5427,124 @@ async fn create_whose_welcome_fails_the_size_check_writes_no_group() {
     assert_eq!(fits.judged.load(Ordering::SeqCst), 2);
     assert_eq!(alice.members(&group_id).unwrap().len(), 3);
 }
+
+/// An engine whose wall clock reads `now`.
+struct AtTime(u64);
+impl cgka_traits::maintenance::WallClock for AtTime {
+    fn now(&self) -> Timestamp {
+        Timestamp(self.0)
+    }
+    fn now_ms(&self) -> u64 {
+        self.0 * 1_000
+    }
+}
+impl cgka_traits::maintenance::MaintenanceRandom for AtTime {
+    fn next_u64(&self) -> u64 {
+        0
+    }
+}
+
+/// `alice`'s founding Welcome to `bob` and the staged Welcome of her invite
+/// of `carol` into the same group, as the KeyPackages they answer.
+async fn founding_and_invite_welcomes(
+    alice: &mut Engine<SqliteAccountStorage>,
+    bob: &cgka_traits::engine::KeyPackage,
+    carol: &cgka_traits::engine::KeyPackage,
+) -> [MessageId; 2] {
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "welcome deadline".into(),
+            description: String::new(),
+            members: vec![bob.clone()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes: founding } = created else {
+        panic!("a current-profile founding create")
+    };
+    let SendResult::GroupEvolution {
+        welcomes: invited, ..
+    } = alice
+        .send(SendIntent::Invite {
+            group_id,
+            key_packages: vec![carol.clone()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("an invite commit")
+    };
+    [founding[0].id.clone(), invited[0].id.clone()]
+}
+
+/// An invite's and a founding create's Welcome stay deliverable for
+/// `WELCOME_DELIVERY_WINDOW_SECS` from their staging, or until the
+/// KeyPackage they answer ends if that is sooner, and settle as expired from
+/// then on (mdk#3589). A device link's Welcome keeps the deadline its link
+/// gives it (`a_links_welcome_keeps_its_delivery_deadline`,
+/// `a_founding_welcome_keeps_its_delivery_deadline`).
+#[tokio::test]
+async fn invite_and_founding_welcomes_are_deliverable_for_the_window_or_their_key_packages_life() {
+    use cgka_engine::WELCOME_DELIVERY_WINDOW_SECS as WINDOW;
+    use cgka_engine::engine::{OutboundWelcomeStatus, WelcomeSettlement};
+    let unix_now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let bob = build_current_client(b"bob-window")
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let carol = build_current_client(b"carol-window")
+        .fresh_key_package()
+        .await
+        .unwrap();
+
+    let mut alice = build_current_client(b"alice-window");
+    let staged_after = unix_now();
+    let ids = founding_and_invite_welcomes(&mut alice, &bob, &carol).await;
+    let staged_before = unix_now();
+    for id in &ids {
+        let deadline = alice.sent_welcome_deliver_until(id).unwrap().unwrap();
+        assert!((staged_after..=staged_before).contains(&(deadline.0 - WINDOW)));
+    }
+    let founding = &ids[0];
+    let deadline = alice.sent_welcome_deliver_until(founding).unwrap().unwrap();
+    assert!(matches!(
+        alice
+            .outbound_welcome_status(founding, Timestamp(deadline.0 - 1))
+            .unwrap(),
+        OutboundWelcomeStatus::Owed { .. }
+    ));
+    assert_eq!(
+        alice.outbound_welcome_status(founding, deadline).unwrap(),
+        OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired)
+    );
+
+    // Staged a day before each KeyPackage ends, inside the window.
+    let ends = key_package_metadata(&carol).unwrap().not_after;
+    let clock = Arc::new(AtTime(ends - 24 * 60 * 60));
+    let mut late = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
+        .identity(pad32(b"alice-late"))
+        .account_identity_proof_signer(proof_signer(b"alice-late"))
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .maintenance_sources(clock.clone(), clock)
+        .build()
+        .unwrap();
+    let ids = founding_and_invite_welcomes(&mut late, &bob, &carol).await;
+    for (id, key_package) in ids.iter().zip([&bob, &carol]) {
+        assert_eq!(
+            late.sent_welcome_deliver_until(id).unwrap(),
+            Some(Timestamp(
+                key_package_metadata(key_package).unwrap().not_after
+            ))
+        );
+    }
+}
