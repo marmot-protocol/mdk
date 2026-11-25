@@ -69,6 +69,22 @@ impl AccountRelayListStatus {
         status
     }
 
+    pub(crate) fn discard_future_lists(&mut self, max_created_at: u64) {
+        let nip65_future = self.nip65.created_at > max_created_at;
+        let inbox_future = self.inbox.created_at > max_created_at;
+        if !nip65_future && !inbox_future {
+            return;
+        }
+        let empty = Self::empty();
+        if nip65_future {
+            self.nip65 = empty.nip65;
+        }
+        if inbox_future {
+            self.inbox = empty.inbox;
+        }
+        self.refresh();
+    }
+
     pub fn refresh(&mut self) {
         self.default_relays = self.nip65.relays.clone();
         self.missing = Vec::new();

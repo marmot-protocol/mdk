@@ -312,7 +312,23 @@ impl<R: DirectoryResources> Directory<R> {
                 hydrate_directory_record(user_directory_record_from_public(record)?, local_accounts)
             })
             .transpose()?;
-        Ok(select_newer_directory_entry(cached_entry, shared_entry))
+        Ok(self.select_current_directory_entry(cached_entry, shared_entry))
+    }
+
+    fn select_current_directory_entry(
+        &self,
+        cached: Option<UserDirectoryRecord>,
+        shared: Option<UserDirectoryRecord>,
+    ) -> Option<UserDirectoryRecord> {
+        // A clock correction can move an already cached declaration outside the
+        // window. Filter each tier before comparing timestamps so the eligible
+        // copy still wins, including when ingesting a current repair.
+        let max_created_at = self.directory_freshness().max_created_at;
+        let eligible_lists = |mut entry: UserDirectoryRecord| {
+            entry.relay_lists.discard_future_lists(max_created_at);
+            entry
+        };
+        select_newer_directory_entry(cached.map(eligible_lists), shared.map(eligible_lists))
     }
 
     pub fn remember_directory_relay_lists(
@@ -634,7 +650,7 @@ impl<R: DirectoryResources> Directory<R> {
                     )
                 })
                 .transpose()?;
-            let current = select_newer_directory_entry(cached_entry, shared_entry);
+            let current = self.select_current_directory_entry(cached_entry, shared_entry);
             if current.is_none() && !create_missing {
                 return Ok(());
             }

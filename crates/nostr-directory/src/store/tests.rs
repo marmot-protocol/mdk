@@ -90,6 +90,102 @@ fn check_snapshot(
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cached_relay_list_outside_the_clock_window_cannot_block_an_eligible_list() {
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use transport_nostr_peeler::NostrTransportEvent;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache = DirectoryCache::open(
+        temp.path().join("directory.sqlite3"),
+        &storage_sqlite::SqlCipherKey::raw([0x29; 32]),
+    )
+    .unwrap();
+    let shared = SqliteSharedStorage::in_memory().unwrap();
+    let keys = Keys::generate();
+    let author = keys.public_key().to_hex();
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let plane = MarmotRelayPlane::full_history();
+    let directory = Directory::new(
+        Resources {
+            account: DirectoryAccount {
+                account_id_hex: author.clone(),
+                label: "fixture".into(),
+                local_signing: true,
+                active_signing: true,
+            },
+            cache: cache.clone(),
+            shared: shared.clone(),
+            changed: None,
+        },
+        DirectoryConfig {
+            directory_relays: vec![],
+            default_relays: vec![],
+            max_future_skew: Duration::from_secs(60),
+            open_ranking: None,
+            fallback_seeds: vec![],
+            http_builder: Ok,
+            test_clock: Some(clock.clone()),
+        },
+        plane.clone(),
+        DirectoryState::default(),
+    );
+    let ingest = |kind, tag_name, endpoint, at| {
+        let event = EventBuilder::new(Kind::from(kind), "")
+            .tags([Tag::parse([tag_name, endpoint]).unwrap()])
+            .custom_created_at(Timestamp::from_secs(at))
+            .finalize(&keys)
+            .unwrap();
+        directory
+            .ingest_directory_relay_event(RelayEventRecord {
+                endpoints: vec![],
+                event: NostrTransportEvent::from_nostr_event(&event).unwrap(),
+            })
+            .unwrap();
+    };
+    ingest(10002_u16, "r", "wss://future.example", 1_000);
+    ingest(10050, "relay", "wss://future.example", 1_000);
+    assert!(
+        directory
+            .cached_relay_list_status(&author)
+            .unwrap()
+            .complete
+    );
+
+    clock.store(100, Ordering::SeqCst);
+    let missing = directory.cached_relay_list_status(&author).unwrap();
+    assert_eq!(missing, AccountRelayListStatus::empty());
+    assert_eq!(
+        cache
+            .entry(&author)
+            .unwrap()
+            .unwrap()
+            .relay_lists
+            .nip65
+            .created_at,
+        1_000
+    );
+
+    ingest(10002, "r", "wss://current.example", 120);
+    ingest(10050, "relay", "wss://current.example", 121);
+    ingest(10002, "r", "wss://older.example", 119);
+    ingest(10050, "relay", "wss://same-second.example", 121);
+
+    let stored = directory.cached_relay_list_status(&author).unwrap();
+    assert_eq!(stored.nip65.relays, ["wss://current.example"]);
+    assert_eq!(stored.inbox.relays, ["wss://current.example"]);
+    assert_eq!(cache.entry(&author).unwrap().unwrap().relay_lists, stored);
+    let public = shared.public_directory_user(&author).unwrap().unwrap();
+    assert_eq!(
+        user_directory_record_from_public(public)
+            .unwrap()
+            .relay_lists,
+        stored
+    );
+    plane.shutdown().await;
+}
+
 /// Independent kind-0 and relay-list writes must survive in both stored
 /// tiers. A whole-row read/modify/write without a shared mutation owner loses
 /// one component when writers from separate Directory values overlap.
