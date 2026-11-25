@@ -52,7 +52,7 @@ fi
 
 if [ "$fail" -ne 0 ]; then
     echo >&2
-    echo 'See the rename conventions in crates/cli/CHANGELOG.md (Unreleased) and PR #725.' >&2
+    echo 'See the rename conventions in crates/cli/CHANGELOG.md and PR #725.' >&2
     exit 1
 fi
 

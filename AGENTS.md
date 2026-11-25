@@ -75,6 +75,13 @@ user asks, and then own the queue result until the change merges.
   out of `AGENTS.md`; link instead of duplicating.
 - When you add, rename, or remove a crate, binary, `just` recipe, or user-facing command, update the root `README.md`
   crate map and the affected crate README in the same change.
+- Record a user-facing change as a new fragment file, `changelog.d/<slug>.md`, beside the `CHANGELOG.md` it belongs
+  to (repository root or crate). Never edit a `CHANGELOG.md` to add an entry: concurrent PRs that add lines at the same
+  spot conflict in the merge queue. A fragment holds one or more `### <Section>` headings
+  (`Breaking changes`, `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`), each followed by its
+  entries, and its kebab-case slug names the change. To revise an unreleased entry, edit or delete its fragment.
+  The release metadata PR folds the fragments in with `just changelog-release <version>`. Run `just changelog-gate`
+  when you add or edit one.
 - Do not add `CLAUDE.md` files or `CLAUDE.md` symlinks; `AGENTS.md` is the single agent-instruction file.
 - Shared agent skills live in `.agents/skills/<name>/SKILL.md`, which Codex and Cursor read. Claude Code reads only
   `.claude/skills`, so that path is a symlink to `../.agents/skills`; keep it, and add skills to `.agents/skills` only.

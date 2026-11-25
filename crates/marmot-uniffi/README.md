@@ -59,7 +59,7 @@ This is the current integration entry point for Swift/iOS, Swift/macOS and Kotli
 | --- | --- |
 | [Complete method reference](API-REFERENCE.md) | Every exported constructor, runtime method, object method, free function and host callback, with signatures, purpose, source and API-selection guidance. |
 | [Release integration index](../../docs/integration/README.md) | Per-release upgrade guides: required changes, changed defaults, optional adoption, examples and acceptance checks. Read every intervening guide when skipping versions. |
-| [Changelog](CHANGELOG.md) | Binding-level changes per release, including unreleased work on `master`. |
+| [Changelog](CHANGELOG.md) | Binding-level changes per release. Unreleased work on `master` is in `changelog.d/`, one file per change. |
 | [Distribution](DISTRIBUTION.md) | Exact artifact layout, platform setup, checksums, Apple resources and source/binary pairing. |
 | [Native-host tests](NATIVE-HOST-TESTS.md) | Runnable Swift XCTest with a local MockRelay, injected test-only secret storage, delivery assertions, and same-root reopening; corresponding Android configuration. |
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |

@@ -241,9 +241,11 @@ supplement link; do not silently rewrite the source/binary provenance.
 
 Keep the initial release PR limited to version fields, workspace package versions in `Cargo.lock`, vector
 `conformance_version` values, changelogs, release/integration documentation, README/install version pins, and other
-release metadata. Before opening it, run only:
+release metadata. Fold the unreleased changelog fragments in first, then run only the preflight, which fails while
+any fragment is left:
 
 ```sh
+just changelog-release <version>
 just release-pr-preflight <version>
 ```
 
@@ -376,7 +378,8 @@ GitHub CI runs the tests of every crate that depends on `storage-sqlite`.
 Use this for a versioned MDK source/library release.
 
 1. Update the workspace version in `Cargo.toml`.
-2. Move relevant `crates/cli/CHANGELOG.md` entries out of `Unreleased`.
+2. Run `just changelog-release <version>` to fold every `changelog.d/` fragment into its `CHANGELOG.md` under the
+   version heading; it deletes the fragments it folds.
 3. Update the current binding reference and both versioned documents using [Release documentation](#release-documentation).
 4. Run the preflight checks above.
 5. Create an annotated tag:
