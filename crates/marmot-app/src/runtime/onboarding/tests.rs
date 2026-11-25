@@ -1830,7 +1830,8 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_keeps_unusable_entries_and_adds_the_missing_role() {
     let (_dir, runtime, _network, keys, _id) = fixture().await;
-    let setup = runtime.accounts().account_setup();
+    let accounts = runtime.accounts();
+    let setup = accounts.account_setup();
     let default = "wss://default.example".to_owned();
     let tags = |entries: &[&[&str]]| -> Vec<Vec<String>> {
         entries
