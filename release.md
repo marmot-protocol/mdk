@@ -241,8 +241,8 @@ supplement link; do not silently rewrite the source/binary provenance.
 
 Keep the initial release PR limited to version fields, workspace package versions in `Cargo.lock`, vector
 `conformance_version` values, changelogs, release/integration documentation, README/install version pins, and other
-release metadata. Fold the unreleased changelog fragments in first, then run only the preflight, which fails while
-any fragment is left:
+release metadata. Fold the unreleased changelog fragments in first, then run only the preflight. It and
+`just release-all` both fail while any fragment is left:
 
 ```sh
 just changelog-release <version>

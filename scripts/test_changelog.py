@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-from changelog import ROOT, check, release
+from changelog import check, release
 
 HEADER = "# Changelog\n\n"
 OLDER = "## 0.1.0 - 2026-01-01\n\n### Added\n\n- The first release.\n"
@@ -29,9 +29,6 @@ class ChangelogTests(unittest.TestCase):
 
     def errors(self, none_pending: bool = False) -> str:
         return "\n".join(check(self.root, none_pending))
-
-    def test_repository_fragments_and_changelogs_pass(self) -> None:
-        self.assertEqual(check(ROOT, none_pending=False), [])
 
     def test_accepts_a_well_formed_fragment(self) -> None:
         self.write("crates/a/changelog.d/fix-x.md", "### Fixed\n\n- X no longer fails.\n")

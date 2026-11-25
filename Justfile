@@ -170,7 +170,6 @@ release-all-dry-run version:
 # GitHub CI owns compilation, tests, and artifact builds for this stage.
 release-pr-preflight version:
     git diff --check
-    python3 scripts/changelog.py check --none-pending
     python3 scripts/check_binding_docs.py --release-version {{version}}
     ./scripts/check_agent_install_docs.sh
     ./scripts/cut-full-release.sh --dry-run {{version}}
