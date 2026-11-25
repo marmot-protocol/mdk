@@ -5091,7 +5091,7 @@ async fn repairs_publish_to_host_and_declared_relays_never_to_indexers() {
         second
             .accounts()
             .account_setup()
-            .publish_onboarding_repair(&mut c)
+            .publish_onboarding_repair(&mut c, false)
             .await
             .unwrap()
     );
@@ -5285,7 +5285,7 @@ async fn zero_ack_repair_survives_restart_and_retries_exact_signed_bytes() {
         second
             .accounts()
             .account_setup()
-            .publish_onboarding_repair(&mut c)
+            .publish_onboarding_repair(&mut c, false)
             .await
             .unwrap()
     );
