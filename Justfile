@@ -670,6 +670,16 @@ binding-docs-gate:
     python3 scripts/check_binding_docs.py
     python3 scripts/test_check_binding_docs.py
 
+# Unreleased entries live as fragments in each changelog.d/ (see AGENTS.md).
+# Check the fragments, and that no CHANGELOG.md keeps an Unreleased section.
+changelog-gate:
+    python3 scripts/changelog.py check
+    python3 scripts/test_changelog.py
+
+# Release metadata PR: fold every changelog.d/ fragment into its CHANGELOG.md.
+changelog-release version *changelogs:
+    python3 scripts/changelog.py release {{version}} {{changelogs}}
+
 # Exercise release build phases without compiling Rust or requiring platform SDKs.
 binding-build-gate:
     python3 crates/marmot-uniffi/test-build-phases.py
@@ -705,6 +715,6 @@ release-profile-gate:
 # passes, and the release pin proof. Run it once for shared build-input or
 # workflow changes; ordinary pushes use the scoped checks in AGENTS.md.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test

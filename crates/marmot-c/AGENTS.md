@@ -71,8 +71,8 @@ across the boundary. That deserves its own focused design + tests rather than a 
 - Host-supplied `group_id_hex` values are variable-length MLS `GroupId` bytes — do not validate them with the
   32-byte route-id/pubkey/message-id rule.
 - No `tracing`/logging in this crate; error detail strings carry only what `MarmotKitError` Display already exposes.
-- Keep this crate in lockstep with `marmot-uniffi` surface changes. Document ABI layout changes in `CHANGELOG.md`
-  and require matching headers/libraries. Workspace version bumps belong to an explicit user-directed release
+- Keep this crate in lockstep with `marmot-uniffi` surface changes. Document ABI layout changes in a `changelog.d/`
+  fragment and require matching headers/libraries. Workspace version bumps belong to an explicit user-directed release
   operation, as required by the root `AGENTS.md`; do not bump versions during feature or review-feedback work.
 - `just c-parity-gate` enforces command parity for `impl Marmot` and the subscription handles.
   Two things stay silent: new *fields* on an existing

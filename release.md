@@ -241,9 +241,13 @@ supplement link; do not silently rewrite the source/binary provenance.
 
 Keep the initial release PR limited to version fields, workspace package versions in `Cargo.lock`, vector
 `conformance_version` values, changelogs, release/integration documentation, README/install version pins, and other
-release metadata. Before opening it, run only:
+release metadata. Fold the unreleased changelog fragments in first, then run only the preflight. It and
+`just release-all` both fail while any fragment is left. A fragment that merges after the release PR stops
+`release-all`; open a follow-up PR that runs `just changelog-release <version>` again, which adds it to that version.
+Once any track's tag for the version exists, the fold refuses it:
 
 ```sh
+just changelog-release <version>
 just release-pr-preflight <version>
 ```
 
@@ -376,7 +380,8 @@ GitHub CI runs the tests of every crate that depends on `storage-sqlite`.
 Use this for a versioned MDK source/library release.
 
 1. Update the workspace version in `Cargo.toml`.
-2. Move relevant `crates/cli/CHANGELOG.md` entries out of `Unreleased`.
+2. Run `just changelog-release <version>` to fold every `changelog.d/` fragment into its `CHANGELOG.md` under the
+   version heading; it deletes the fragments it folds.
 3. Update the current binding reference and both versioned documents using [Release documentation](#release-documentation).
 4. Run the preflight checks above.
 5. Create an annotated tag:
@@ -454,7 +459,13 @@ authorization. Existing OpenCode automation must pass at least one explicit
 `--allow-welcomer`; `WN_OPENCODE_ALLOWED_SENDERS_HEX` configures prompt senders
 only and no longer satisfies the bootstrap welcomer requirement.
 
-Cut the release tag from the current `origin/master` commit:
+Fold the CLI's changelog fragments in a PR first; the helper refuses while `crates/cli/changelog.d/` has any:
+
+```sh
+just changelog-release 0.9.3 crates/cli/CHANGELOG.md
+```
+
+Then cut the release tag from the current `origin/master` commit:
 
 ```sh
 just release-wn-agent 0.9.3

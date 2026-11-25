@@ -114,6 +114,8 @@ workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 
 # Verify the versioned companion documents and links before any tag or release mutation.
 python3 scripts/check_binding_docs.py --release-version "$version"
+# A fragment left in changelog.d/ would ship this release but be listed under the next one.
+python3 scripts/changelog.py check --none-pending || die "fold the changelog fragments first: just changelog-release $version"
 
 if [ -n "$(git status --porcelain)" ]; then
     if [ "$dry_run" -eq 1 ]; then

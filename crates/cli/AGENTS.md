@@ -25,8 +25,8 @@ user manual (commands, flags, JSON fields) is [`README.md`](README.md); keep it 
 - Keep the README user-facing and current, and verify documented commands and flags against `src/args.rs` (or
   `wn <command> --help`). Prefer installed `wn` examples; use `cargo run -p wn-cli --bin wn` only when documenting
   source-checkout work.
-- Keep `CHANGELOG.md` current for user-facing CLI, daemon, JSON, install, or packaging changes. Use the
-  `Unreleased` section until a version is tagged.
+- Record user-facing CLI, daemon, JSON, install, or packaging changes as a fragment in `changelog.d/` (see the root
+  `AGENTS.md` Documentation rules); a release folds it into `CHANGELOG.md`.
 - Keep local development installable with `cargo install --path crates/cli --locked --bins`.
 - Treat the namespaced Homebrew tap `marmot-protocol/tap` as the preferred public packaging path unless product
   direction changes. The formula should install both `wn` and `wnd`; crates.io install needs a separate publish plan
@@ -61,7 +61,7 @@ behavior and JSON fields are documented in the README; the rules below are the o
   account ids, group ids, subscription ids, or message ids.
 - `sync` is a diagnostic/repair path, not part of normal flows.
 - Reaction, delete, retry, encrypted media, and admin/member management JSON shapes: keep them aligned with the
-  `Unreleased` changelog entries when changing them.
+  unreleased changelog fragments when changing them.
 - Other namespaces: `chats`, `follows`, `profile`, `relays`, `settings`, `users`, `notifications`, `debug`,
   `usage-diagnostics`.
 - `devices` (list and start/status/confirm-match/approve/cancel) uses the existing daemon-owned runtime and refuses

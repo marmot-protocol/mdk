@@ -301,6 +301,10 @@ commit: the source snapshot (`v<version>`), the `wn-agent` connector (`wn-agent-
 (`marmotkit-v<version>`), and the C bindings (`marmotc-v<version>`). The [release guide](release.md) is the checklist;
 per-release notes live in [`docs/release/`](docs/release/).
 
+The root and crate `CHANGELOG.md` files list changes by release. Changes not yet released sit beside each one in
+`changelog.d/`, one Markdown file per change, so pull requests never edit the same changelog lines. The release PR folds
+them into `CHANGELOG.md` with `just changelog-release <version>`; `just changelog-gate` checks them.
+
 Nightly pre-releases such as `marmotkit-v0.14.0-nightly.20261020` are built every day from the newest master commit that
 passed CI. They are for testing only: pin a formal release for anything you ship, expect each nightly to be deleted
 after 30 days, and don't count on going back to an older nightly. See [nightly builds](release.md#nightly-builds).
