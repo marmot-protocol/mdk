@@ -1043,25 +1043,19 @@ async fn gift_wrap_counting_app(
 }
 
 #[derive(Clone, Debug)]
-struct RejectThenBlockGiftWraps {
-    rejecting: Arc<AtomicBool>,
+struct BlockGiftWraps {
     blocking: Arc<AtomicBool>,
     entered: Arc<Notify>,
     release: Arc<Notify>,
 }
 
-impl RejectThenBlockGiftWraps {
+impl BlockGiftWraps {
     fn new() -> Self {
         Self {
-            rejecting: Arc::new(AtomicBool::new(false)),
             blocking: Arc::new(AtomicBool::new(false)),
             entered: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
         }
-    }
-
-    fn reject(&self, rejecting: bool) {
-        self.rejecting.store(rejecting, Ordering::SeqCst);
     }
 
     fn block(&self) {
@@ -1078,7 +1072,7 @@ impl RejectThenBlockGiftWraps {
     }
 }
 
-impl WritePolicy for RejectThenBlockGiftWraps {
+impl WritePolicy for BlockGiftWraps {
     fn admit_event<'a>(
         &'a self,
         event: &'a nostr_relay_builder::prelude::Event,
@@ -1087,9 +1081,6 @@ impl WritePolicy for RejectThenBlockGiftWraps {
         Box::pin(async move {
             if event.kind != OldKind::GiftWrap {
                 return PolicyResult::Accept;
-            }
-            if self.rejecting.load(Ordering::SeqCst) {
-                return PolicyResult::Reject("injected gift-wrap rejection".into());
             }
             if self.blocking.load(Ordering::SeqCst) {
                 self.entered.notify_one();
@@ -15676,12 +15667,15 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
 
 /// mdk#1451: once an existing-group Add commit is confirmed, its exact
 /// Welcome is engine-authoritative and receives a startup retry after process
-/// death without staging another invite commit.
+/// death without staging another invite commit. The process dies while the
+/// Welcome's first publish is still in flight, so no attempt has failed and
+/// the startup pass sends it at once; a relay that had refused it would be
+/// asked again only after its backoff (mdk#3589).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn confirmed_invite_welcome_resumes_after_restart() {
     storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
-    let welcome_policy = RejectThenBlockGiftWraps::new();
+    let welcome_policy = BlockGiftWraps::new();
     let (_relay, url) = limited_relay::relay_publishing_with(
         RelayBuilder::default().write_policy(welcome_policy.clone()),
         Some(500),
@@ -15727,13 +15721,18 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     })
     .await;
 
-    welcome_policy.reject(true);
+    welcome_policy.block();
     runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await
         .unwrap()
         .operation
         .expect("eligible fixture members");
+    // Also takes the relay's notice of this first attempt, so the wait after
+    // the restart sees only the startup pass's.
+    timeout(Duration::from_secs(5), welcome_policy.wait_until_blocked())
+        .await
+        .expect("the invite's first Welcome publish reaches the relay");
     timeout(Duration::from_secs(5), async {
         loop {
             if !runtime
@@ -15748,13 +15747,11 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
         }
     })
     .await
-    .expect("rejected confirmed-invite Welcome must remain pending");
+    .expect("in-flight confirmed-invite Welcome must remain pending");
     runtime.shutdown().await;
     drop(runtime);
     drop(app);
 
-    welcome_policy.reject(false);
-    welcome_policy.block();
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
