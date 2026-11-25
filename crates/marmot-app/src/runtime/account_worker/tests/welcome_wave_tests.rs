@@ -123,6 +123,32 @@ pub(super) async fn close(runtime: &crate::MarmotAppRuntime) {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// Date every relay attempt on alice's stored Welcome retry records an hour
+/// earlier, past any relay's backoff, as if the app had stayed closed that
+/// long: the next start asks those relays again (mdk#3589).
+fn age_welcome_attempts(dir: &tempfile::TempDir) {
+    use cgka_traits::storage::MaintenanceStorage as _;
+    let storage = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .account_storage("alice")
+        .unwrap();
+    for mut fanout in storage.list_transport_fanouts().unwrap() {
+        if !matches!(
+            fanout.exact_message.envelope,
+            cgka_traits::TransportEnvelope::Welcome { .. }
+        ) {
+            continue;
+        }
+        for at in fanout
+            .targets
+            .iter_mut()
+            .filter_map(|target| target.last_attempt_at.as_mut())
+        {
+            at.0 = at.0.saturating_sub(60 * 60);
+        }
+        storage.put_transport_fanout(&fanout).unwrap();
+    }
+}
+
 /// How many times a gift wrap reached the relays.
 fn gift_wraps_published(relay: &ScriptedPushRelayClient) -> usize {
     published_gift_wraps(relay).len()
@@ -292,6 +318,7 @@ async fn a_startup_retry_settling_after_its_chat_is_deleted_leaves_it_alone() {
         "the first Welcome failed"
     );
     close(&runtime).await;
+    age_welcome_attempts(&dir);
 
     relay.block_next_publish_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
@@ -1230,6 +1257,7 @@ async fn invite_deliveries_answer_from_durable_records_and_announce_changes() {
     }
     assert_eq!(announced.last(), Some(invite), "{announced:?}");
     close(&runtime).await;
+    age_welcome_attempts(&dir);
 
     relay.allow_all_publish_kinds();
     let runtime = restart(&dir, &relay).await;
