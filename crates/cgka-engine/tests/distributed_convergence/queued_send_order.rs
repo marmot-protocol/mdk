@@ -45,6 +45,7 @@ async fn send(
             group_id: group_id.clone(),
             payload: event.encode().unwrap(),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -197,6 +198,7 @@ async fn a_pinned_send_behind_a_queued_one_is_refused() {
         group_id: group_id.clone(),
         payload: pinned_payload.clone(),
         expected_epoch: Some(pin),
+        only_to_members: None,
     };
 
     let outbox = alice
@@ -260,6 +262,7 @@ async fn a_drained_intent_awaiting_its_outcome_holds_no_later_send() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, "sent while the outbox message publishes"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -328,6 +331,7 @@ async fn a_queued_change_already_made_holds_no_later_send() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, "sent once the queue is done"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -498,6 +502,7 @@ async fn a_leave_behind_a_queued_message_goes_out_after_it() {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, "queued after accepting leave"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -847,6 +852,7 @@ async fn a_message_behind_a_queued_group_change_applies_after_it() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, "sent after the rename"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();

@@ -18,10 +18,21 @@ impl From<marmot_app::LocalSendAcceptance> for LocalSendAcceptanceFfi {
 
 #[derive(Clone, uniffi::Enum)]
 pub enum LocalSendStatusFfi {
-    Queued,
-    EngineOwned,
-    Completed { summary: SendSummaryFfi },
+    /// Admitted, not yet handed to the engine. Names the send's event.
+    Queued {
+        message_id_hex: String,
+    },
+    /// Held by the engine, which may still be publishing it. Names its event.
+    EngineOwned {
+        message_id_hex: String,
+    },
+    Completed {
+        summary: SendSummaryFfi,
+    },
     Rejected,
+    /// Not sent: the group gained a member account the send's member list
+    /// leaves out. Final.
+    RefusedNewMembers,
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -341,12 +352,17 @@ impl Marmot {
 
 fn local_send_status_ffi(status: marmot_app::LocalSendStatus) -> LocalSendStatusFfi {
     match status {
-        marmot_app::LocalSendStatus::Queued => LocalSendStatusFfi::Queued,
-        marmot_app::LocalSendStatus::EngineOwned => LocalSendStatusFfi::EngineOwned,
+        marmot_app::LocalSendStatus::Queued { message_id_hex } => {
+            LocalSendStatusFfi::Queued { message_id_hex }
+        }
+        marmot_app::LocalSendStatus::EngineOwned { message_id_hex } => {
+            LocalSendStatusFfi::EngineOwned { message_id_hex }
+        }
         marmot_app::LocalSendStatus::Completed(summary) => LocalSendStatusFfi::Completed {
             summary: summary.into(),
         },
         marmot_app::LocalSendStatus::Rejected => LocalSendStatusFfi::Rejected,
+        marmot_app::LocalSendStatus::RefusedNewMembers => LocalSendStatusFfi::RefusedNewMembers,
     }
 }
 
@@ -357,16 +373,24 @@ mod tests {
     #[test]
     fn local_send_status_preserves_the_host_tag_and_completed_summary() {
         assert!(matches!(
-            local_send_status_ffi(marmot_app::LocalSendStatus::Queued),
-            LocalSendStatusFfi::Queued
+            local_send_status_ffi(marmot_app::LocalSendStatus::Queued {
+                message_id_hex: "aa".into()
+            }),
+            LocalSendStatusFfi::Queued { message_id_hex } if message_id_hex == "aa"
         ));
         assert!(matches!(
-            local_send_status_ffi(marmot_app::LocalSendStatus::EngineOwned),
-            LocalSendStatusFfi::EngineOwned
+            local_send_status_ffi(marmot_app::LocalSendStatus::EngineOwned {
+                message_id_hex: "bb".into()
+            }),
+            LocalSendStatusFfi::EngineOwned { message_id_hex } if message_id_hex == "bb"
         ));
         assert!(matches!(
             local_send_status_ffi(marmot_app::LocalSendStatus::Rejected),
             LocalSendStatusFfi::Rejected
+        ));
+        assert!(matches!(
+            local_send_status_ffi(marmot_app::LocalSendStatus::RefusedNewMembers),
+            LocalSendStatusFfi::RefusedNewMembers
         ));
         let completed = local_send_status_ffi(marmot_app::LocalSendStatus::Completed(
             marmot_app::SendSummary {

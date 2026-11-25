@@ -857,6 +857,7 @@ async fn second_local_delete_discards_retry_that_crossed_the_old_frontier() {
                 group_id: group.clone(),
                 payload: payload.clone(),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();
@@ -1365,6 +1366,7 @@ async fn accepted_source_finalization_rolls_back_when_revival_conversion_fails()
             group_id: group.clone(),
             payload: event.encode().unwrap(),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -1563,6 +1565,7 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
                     group_id: group.clone(),
                     payload: event.encode().unwrap(),
                     expected_epoch: None,
+                    only_to_members: None,
                 })
                 .await
                 .unwrap();
@@ -2196,6 +2199,7 @@ async fn received_media_key_failure_rolls_back_source_and_replays_after_restart(
             group_id: group.clone(),
             payload: payload.clone(),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -2347,6 +2351,7 @@ async fn media_metadata_without_a_source_exporter_still_projects() {
             group_id: group.clone(),
             payload: payload.clone(),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();

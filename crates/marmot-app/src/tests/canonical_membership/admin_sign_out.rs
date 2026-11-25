@@ -111,6 +111,7 @@ impl AdminSignOut {
                 .queue_app_message_with_audit_context(
                     chat.clone(),
                     event.encode().unwrap(),
+                    None,
                     Default::default(),
                 )
                 .await

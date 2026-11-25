@@ -3714,6 +3714,7 @@ async fn post_eviction_app_message(
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -4025,6 +4026,7 @@ async fn send_after_realized_eviction_is_rejected_terminally() {
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -4062,6 +4064,7 @@ fn queue_app_message_intent(
                 group_id: group_id.clone(),
                 payload: app_payload_for(engine, b"queued before removal"),
                 expected_epoch: None,
+                only_to_members: None,
             },
             created_at_ms: 1,
             reissue_attempts: 0,
@@ -5189,6 +5192,7 @@ async fn assert_rejoin_refusal(marker: RejoinLocalMarker) {
             group_id,
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect("failed replacement must leave the original live group usable");
@@ -5864,6 +5868,7 @@ async fn selfremove_full_flow_with_auto_commit() {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"should not send after leave"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap_err();
@@ -5917,6 +5922,7 @@ async fn selfremove_full_flow_with_auto_commit() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"wait for auto confirm"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -6083,6 +6089,7 @@ async fn selfremove_leaving_gate_survives_engine_rebuild() {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"blocked before restart"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -6098,6 +6105,7 @@ async fn selfremove_leaving_gate_survives_engine_rebuild() {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"blocked after restart"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -6244,6 +6252,7 @@ async fn the_last_admins_leave_is_blocked_until_cancelled() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"still here"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect("a cancelled leave no longer gates sends");
@@ -6360,6 +6369,7 @@ async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"blocked while leave is current"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -6435,6 +6445,7 @@ async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"still blocked after stale self-remove"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -6621,6 +6632,7 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"hello before selfremove commit"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -6638,6 +6650,7 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
             group_id: group_id.clone(),
             payload: due_payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -6663,6 +6676,7 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
             group_id: group_id.clone(),
             payload: retained_payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -6696,6 +6710,7 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"after confirm"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -7083,6 +7098,7 @@ async fn public_remove_refusals_leave_no_state_and_duplicate_targets_remove_once
             group_id: gid,
             payload: app_payload_for(&bob, b"surviving member"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()

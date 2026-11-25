@@ -2983,6 +2983,7 @@ impl HarnessClient {
                 group_id: gid.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .expect("send app");
@@ -3053,6 +3054,7 @@ impl HarnessClient {
                 group_id: gid.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await?;
         match res {

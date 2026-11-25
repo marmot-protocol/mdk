@@ -429,6 +429,8 @@ mod migration_0223_local_deletion_invitation;
 mod migration_0224_epoch_gap_evidence_floor;
 #[path = "migrations/0225_welcome_delivery_ledger.rs"]
 mod migration_0225_welcome_delivery_ledger;
+#[path = "migrations/0226_local_submission_refused.rs"]
+mod migration_0226_local_submission_refused;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1633,6 +1635,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0225_welcome_delivery_ledger",
         suspend_foreign_keys: &[],
         apply: migration_0225_welcome_delivery_ledger::apply,
+    },
+    Migration {
+        version: 226,
+        name: "0226_local_submission_refused",
+        suspend_foreign_keys: &[],
+        apply: migration_0226_local_submission_refused::apply,
     },
 ];
 

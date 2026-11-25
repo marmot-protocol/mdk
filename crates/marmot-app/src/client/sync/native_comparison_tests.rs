@@ -107,6 +107,7 @@ async fn encrypted_texts(
                 group_id: group.clone(),
                 payload: encode_inner_event(&inner).unwrap(),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();

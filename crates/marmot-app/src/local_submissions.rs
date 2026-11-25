@@ -63,13 +63,23 @@ impl std::fmt::Debug for LocalSendAcceptance {
 }
 
 /// Queryable after restart; transport delivery is also reflected by the ordinary
-/// timeline source identity and invalidation updates.
+/// timeline source identity and invalidation updates. A send MDK still holds
+/// names its event, so a host that lost the acceptance learns it by asking,
+/// without handing the send again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocalSendStatus {
-    Queued,
-    EngineOwned,
+    Queued {
+        message_id_hex: String,
+    },
+    EngineOwned {
+        message_id_hex: String,
+    },
     Completed(crate::SendSummary),
     Rejected,
+    /// Not sent: the group gained a member account the send's member list
+    /// (`submit_custom_event_to_members`) leaves out. Final; nothing reached
+    /// the group.
+    RefusedNewMembers,
 }
 
 /// Decode for validation/projection, but preserve the bytes that bind engine
@@ -112,6 +122,10 @@ pub(crate) struct LocalMessageRequest {
     pub custom_kind: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typed: Option<LocalTypedSend>,
+    /// The member accounts (lowercase hex) the send may reach, enforced by
+    /// the engine when it encrypts (`SendIntent::AppMessage::only_to_members`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only_to_members: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -143,6 +157,26 @@ impl LocalMessageRequest {
         })
         .map_err(|_| AppError::InvalidAppMessagePayload("invalid local submission request".into()))
     }
+    pub(crate) fn only_to_members(&self) -> Result<Option<Vec<cgka_traits::MemberId>>, AppError> {
+        self.only_to_members
+            .as_ref()
+            .map(|members| {
+                members
+                    .iter()
+                    .map(|member| {
+                        hex::decode(member)
+                            .map(cgka_traits::MemberId::new)
+                            .map_err(|_| {
+                                AppError::InvalidAppMessagePayload(
+                                    "invalid local submission member".into(),
+                                )
+                            })
+                    })
+                    .collect()
+            })
+            .transpose()
+    }
+
     pub(crate) fn intent(&self) -> AppMessageIntent {
         if let Some(typed) = &self.typed {
             match typed {
@@ -220,6 +254,12 @@ impl MarmotApp {
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let storage = self.account_storage(label)?;
         let outcome = result.as_ref().ok().map(encode_local_outcome).transpose()?;
+        let refused = result.as_ref().is_err_and(|error| {
+            matches!(
+                error.as_engine_error(),
+                Some(cgka_traits::error::EngineError::AppMessageNewMembers)
+            )
+        });
         StorageProvider::with_transaction(&storage, |storage| {
             let Some(current) = storage
                 .app_storage()
@@ -237,13 +277,38 @@ impl MarmotApp {
             } else {
                 None
             };
-            storage.app_storage().finish_local_submission(
-                &submission.group_id_hex,
-                &submission.client_token,
-                outcome.as_deref(),
-            )?;
+            if refused {
+                storage
+                    .app_storage()
+                    .refuse_local_submission(&submission.group_id_hex, &submission.client_token)?;
+            } else {
+                storage.app_storage().finish_local_submission(
+                    &submission.group_id_hex,
+                    &submission.client_token,
+                    outcome.as_deref(),
+                )?;
+            }
             Ok(update)
         })
+    }
+
+    /// Retract, in one timeline rebuild, the group's rows of sends refused
+    /// for a new member. The engine settles a refused queued send in the
+    /// transaction that retires it; its row follows here, live when the
+    /// refusal is announced and at account open after a crash in between.
+    pub(crate) fn retract_refused_local_sends(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        self.account_storage(label)?
+            .app_storage()
+            .invalidate_refused_local_sends_for_group(
+                group_id_hex,
+                crate::LOCAL_PUBLISH_FAILED_REASON,
+            )?
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
     }
 
     #[cfg(test)]
@@ -457,7 +522,7 @@ impl MarmotApp {
                             "original local send was not found".into(),
                         )
                     })?;
-                if original.state == 3 {
+                if matches!(original.state, 3 | 4) {
                     return Err(AppError::InvalidAppMessagePayload(
                         "original local send was rejected".into(),
                     ));

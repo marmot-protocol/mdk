@@ -83,6 +83,7 @@ async fn future_cursor_keeps_old_text() {
             group_id: fixture.group.clone(),
             payload: encode_inner_event(&inner).unwrap(),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();

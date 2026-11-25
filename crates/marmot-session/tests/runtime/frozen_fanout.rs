@@ -815,8 +815,8 @@ async fn terminally_failed_queued_app_message_is_retired_instead_of_rearmed() {
         .queue_app_message_with_audit_context(
             group_id.clone(),
             app_payload_for(&sender_hex, b"terminal queued message"),
-            Default::default(),
-        )
+            None,
+            Default::default())
         .await
         .unwrap();
     assert!(queued.failures.is_empty());
@@ -874,8 +874,8 @@ async fn queued_app_message_with_missing_route_remains_retryable() {
         .queue_app_message_with_audit_context(
             group_id.clone(),
             app_payload_for(&sender_hex, b"wait for a route"),
-            Default::default(),
-        )
+            None,
+            Default::default())
         .await
         .unwrap();
 
@@ -941,8 +941,8 @@ async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
         .queue_app_message_with_audit_context(
             group_id.clone(),
             app_payload_for(&sender_hex, b"newer queued message"),
-            Default::default(),
-        )
+            None,
+            Default::default())
         .await
         .unwrap();
 
@@ -1115,8 +1115,8 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
         .queue_app_message_with_audit_context(
             group_id.clone(),
             app_payload_for(&sender_hex, b"queued behind met quorum"),
-            Default::default(),
-        )
+            None,
+            Default::default())
         .await
         .unwrap();
     let healthy = TransportEndpoint("wss://met-quorum-healthy.example".into());
@@ -1587,6 +1587,7 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -2302,6 +2303,7 @@ async fn send_skips_slow_relay() {
                     group_id: group_id.clone(),
                     payload,
                     expected_epoch: None,
+                    only_to_members: None,
                 })
                 .await
                 .unwrap();
@@ -2315,6 +2317,7 @@ async fn send_skips_slow_relay() {
             group_id,
             payload: app_payload_for(&sender, b"latency probe"),
             expected_epoch: None,
+            only_to_members: None,
         });
         // The first acknowledgement releases the caller while the second
         // relay remains stalled and its exact event stays durable for retry.
@@ -3418,6 +3421,7 @@ async fn assert_recovery_chat(
         .send(SendIntent::AppMessage {
             group_id: group.clone(),
             expected_epoch: None,
+            only_to_members: None,
             payload: payload.clone(),
         })
         .await

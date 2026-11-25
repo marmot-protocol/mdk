@@ -4,6 +4,8 @@
 
 ### Breaking changes
 
+- `LocalSendStatusFfi` gains `RefusedNewMembers`, for a send limited to member accounts that the group gained a member
+  it leaves out. `Queued` and `EngineOwned` carry the send's `message_id_hex`.
 - Swift: cancelling a `Task` that awaits a throwing async call, a command or a receive, now cancels its native future
   and throws `CancellationError` (mdk#3670). Before, the call ran to completion and returned its result. A call that
   completed first still returns its result, and calls whose work must finish, such as `shutdownAndClose()`,

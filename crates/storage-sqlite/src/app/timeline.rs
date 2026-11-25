@@ -1498,18 +1498,45 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         reason: &str,
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.invalidate_group_app_events(
+            group_id_hex,
+            "direction = 'sent' AND source_message_id_hex IS NULL",
+            reason,
+        )
+    }
+
+    /// Retract, in one timeline rebuild, the rows of the group's local sends
+    /// refused for a new member (state 4) that are still live.
+    pub fn invalidate_refused_local_sends_for_group(
+        &self,
+        group_id_hex: &str,
+        reason: &str,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.invalidate_group_app_events(
+            group_id_hex,
+            "message_id_hex IN (SELECT message_id_hex FROM local_message_submissions
+                WHERE group_id_hex = ?1 AND state = 4)",
+            reason,
+        )
+    }
+
+    /// Invalidate the group's live rows that `predicate` selects, a condition
+    /// over `app_events` that may bind the group as `?1`.
+    fn invalidate_group_app_events(
+        &self,
+        group_id_hex: &str,
+        predicate: &str,
+        reason: &str,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let rows: Vec<_> = {
                 let mut stmt = conn
-                    .prepare_cached(
+                    .prepare_cached(&format!(
                         "SELECT message_id_hex, kind, tags_json
                          FROM app_events
-                         WHERE group_id_hex = ?1
-                           AND direction = 'sent'
-                           AND source_message_id_hex IS NULL
-                           AND invalidated = 0",
-                    )
+                         WHERE group_id_hex = ?1 AND invalidated = 0 AND {predicate}"
+                    ))
                     .storage()?;
                 stmt.query_map(params![group_id_hex], |row| {
                     let kind: u64 = row.get::<_, i64>(1)?.try_into().unwrap_or_default();
@@ -1562,12 +1589,11 @@ impl SqliteAppStorage {
             let before =
                 timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
             conn.execute_cached(
-                "UPDATE app_events
-                 SET invalidated = 1, invalidation_reason = ?2
-                 WHERE group_id_hex = ?1
-                   AND direction = 'sent'
-                   AND source_message_id_hex IS NULL
-                   AND invalidated = 0",
+                &format!(
+                    "UPDATE app_events
+                     SET invalidated = 1, invalidation_reason = ?2
+                     WHERE group_id_hex = ?1 AND invalidated = 0 AND {predicate}"
+                ),
                 params![group_id_hex, reason],
             )
             .storage()?;

@@ -46,6 +46,7 @@ async fn measure_negative_application_discovery_prefix() {
         let SendResult::ApplicationMessage { mut msg, .. } = engine
             .send(SendIntent::AppMessage {
                 expected_epoch: None,
+                only_to_members: None,
                 group_id: group.clone(),
                 payload,
             })

@@ -1112,6 +1112,7 @@ async fn drive_intents(
                             payload.clone(),
                         ),
                         expected_epoch: None,
+                        only_to_members: None,
                     })
                     .await;
                 app_event_seq = app_event_seq

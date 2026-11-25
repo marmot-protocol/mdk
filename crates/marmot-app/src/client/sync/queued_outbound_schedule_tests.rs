@@ -67,7 +67,7 @@ async fn assert_restart_schedule(required_acks: usize, replay: InboundReplay) {
     client
         .runtime
         .session_mut()
-        .queue_app_message_with_audit_context(group.clone(), payload, Default::default())
+        .queue_app_message_with_audit_context(group.clone(), payload, None, Default::default())
         .await
         .unwrap();
     let now = crate::unix_now_seconds() * 1_000;

@@ -3985,12 +3985,15 @@ typedef struct MarmotLocalSendAcceptance {
 } MarmotLocalSendAcceptance;
 
 /**
- * Local submission status: 0 queued, 1 engine-owned, 2 completed, 3 rejected.
+ * Local submission status: 0 queued, 1 engine-owned, 2 completed, 3 rejected, 4 refused.
  * Summary is present only for completed attempts; inspect its disposition.
+ * `message_id_hex` names the send's event while MDK holds it (states 0 and
+ * 1), and is NULL otherwise.
  */
 typedef struct MarmotLocalSendStatus {
   uint32_t state;
   struct MarmotSendSummary *summary;
+  char *message_id_hex;
 } MarmotLocalSendStatus;
 
 /**

@@ -572,6 +572,11 @@ tags. MDK renames one tag of that design: a turn names the chat message that sta
 - **Later versions.** `submit_tagged_edit_for_local_send(original_token, content, tags, token)` with the original
   item's token sends a kind-1009 edit naming the item's first event and carrying the whole item again with a higher
   `v`. Resubmitting a token after a restart returns the same event and sends nothing new.
+- **Only to the members it was for.** `submit_custom_event_to_members` and
+  `submit_tagged_edit_for_local_send_to_members` take the member accounts (hex pubkeys, the sender's included) the
+  event may reach. The engine checks the group's member accounts when it encrypts the event, so an event still queued
+  when another account joins is not sent: `local_send_status` reports `RefusedNewMembers` and its row is retracted.
+  A listed account's devices, including ones it links later, receive it.
 - **Projection.** One row per item at its first event, holding the version with the highest `v`: its content and
   tags replace the row's, an older version that arrives late changes nothing, and an edit that arrives before its
   item is applied when the item arrives. The row is not marked edited. Within one second a turn's rows are
