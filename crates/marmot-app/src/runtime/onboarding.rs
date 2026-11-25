@@ -903,6 +903,14 @@ impl OnboardingCheckpoint {
                 OnboardingAction::Retry,
                 OnboardingAction::EditDiscoveryRelays,
             ],
+            OnboardingStatus::RetryableFailure
+                if step.relay()
+                    && transport_only_failures(findings.iter().filter(|finding| {
+                        finding.context == OnboardingFindingContext::DeclaredRoute
+                    })) =>
+            {
+                vec![OnboardingAction::Retry]
+            }
             OnboardingStatus::NeedsInput | OnboardingStatus::RetryableFailure => {
                 let mut actions = vec![
                     OnboardingAction::Retry,
@@ -1139,6 +1147,17 @@ fn refresh_finding_actions(snapshot: &mut OnboardingSnapshot) {
             );
         }
     }
+}
+
+fn transport_only_failures<'a>(findings: impl IntoIterator<Item = &'a OnboardingFinding>) -> bool {
+    let mut findings = findings.into_iter().peekable();
+    findings.peek().is_some()
+        && findings.all(|finding| {
+            matches!(
+                finding.issue,
+                OnboardingIssue::Unreachable | OnboardingIssue::TimedOut
+            )
+        })
 }
 
 fn evaluated_onboarding_status(
@@ -2891,7 +2910,18 @@ impl AccountSetup<'_> {
                     // connection. The declaration supplies read/write roles;
                     // one completed check on an allowed declared route proves
                     // the minimum local-use capability without editing it.
-                    let (_, failures, completed) = self
+                    let lookup_matches_probe = if step == OnboardingStep::Relays {
+                        endpoints
+                            .iter()
+                            .filter_map(|endpoint| {
+                                let key = relay_key(endpoint);
+                                completed.get(&key).map(|endpoint| (key, endpoint.clone()))
+                            })
+                            .collect::<HashMap<_, _>>()
+                    } else {
+                        HashMap::new()
+                    };
+                    let (_, failures, mut probe_completed) = self
                         .inspect_onboarding_relays(
                             &c.snapshot.account_id_hex,
                             if step == OnboardingStep::InboxRelays {
@@ -2902,6 +2932,29 @@ impl AccountSetup<'_> {
                             endpoints,
                         )
                         .await;
+                    // For the NIP-65 step the lookup used the exact same filter.
+                    // Its EOSE remains evidence even if a new connection fails.
+                    probe_completed.extend(lookup_matches_probe);
+                    let mut connection_lost = false;
+                    if probe_completed.is_empty()
+                        && transport_only_failures(&failures)
+                        && !completed.is_empty()
+                    {
+                        // Recheck the sources in parallel. A single stalled
+                        // source cannot rule out another that still answers.
+                        let (_, recheck_failures, recheck_completed) = self
+                            .inspect_onboarding_relays(
+                                &c.snapshot.account_id_hex,
+                                step.kind(),
+                                completed.into_values().collect(),
+                            )
+                            .await;
+                        connection_lost = recheck_completed.is_empty()
+                            && transport_only_failures(&recheck_failures);
+                        if connection_lost {
+                            findings.extend(recheck_failures);
+                        }
+                    }
                     findings.extend(failures.into_iter().map(|failure| {
                         let mut failure = failure.in_context(
                             OnboardingFindingContext::DeclaredRoute,
@@ -2916,20 +2969,22 @@ impl AccountSetup<'_> {
                         failure
                     }));
                     // Inspection only dials allowed routes from this declaration.
-                    if completed.is_empty() {
-                        let mut failure = finding(OnboardingIssue::NoUsableRoute).in_context(
-                            OnboardingFindingContext::DeclaredRoute,
-                            OnboardingCheckPurpose::DirectoryQuery,
-                        );
-                        failure.outcome = OnboardingCheckOutcome::Unknown;
-                        findings.push(failure);
+                    if probe_completed.is_empty() {
+                        if !connection_lost {
+                            let mut failure = finding(OnboardingIssue::NoUsableRoute).in_context(
+                                OnboardingFindingContext::DeclaredRoute,
+                                OnboardingCheckPurpose::DirectoryQuery,
+                            );
+                            failure.outcome = OnboardingCheckOutcome::Unknown;
+                            findings.push(failure);
+                        }
                         relay_status = Some(OnboardingStatus::RetryableFailure);
                     } else {
                         // The declared role is not the checked capability: EOSE
                         // proves a read query, never acceptance of a future write.
-                        let mut completed: Vec<_> = completed.into_iter().collect();
-                        completed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                        findings.extend(completed.into_iter().map(|(key, endpoint)| {
+                        let mut probe_completed: Vec<_> = probe_completed.into_iter().collect();
+                        probe_completed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                        findings.extend(probe_completed.into_iter().map(|(key, endpoint)| {
                             OnboardingFinding {
                                 declared_capability: capabilities
                                     .get(&key)

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use cgka_traits::{MemberId, TransportAdapterError};
 use nostr::prelude::{FinalizeEvent, ToBech32};
 use parking_lot::Mutex as FixtureMutex;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use transport_nostr::{DirectoryFetchRequest, DirectoryRelayFetcher};
 use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscription};
@@ -19,6 +20,7 @@ struct Network {
     fail_index_only: AtomicBool,
     inspection_errors: FixtureMutex<HashMap<String, transport_nostr::DirectoryInspectionError>>,
     inspected_endpoints: FixtureMutex<Vec<String>>,
+    inspection_scripts: FixtureMutex<InspectionScripts>,
     zero_acks: AtomicBool,
     block_publish: AtomicBool,
     publishing: Notify,
@@ -30,6 +32,9 @@ struct Network {
     /// relay.
     messages: Arc<transport_nostr::test_support::ScriptedRelayMessages>,
 }
+type InspectionScripts =
+    HashMap<(String, u64), VecDeque<Option<transport_nostr::DirectoryInspectionError>>>;
+
 #[async_trait]
 impl DirectoryRelayFetcher for Network {
     async fn fetch_directory_events(
@@ -96,6 +101,21 @@ impl DirectoryRelayFetcher for Network {
         self.inspected_endpoints
             .lock()
             .extend(request.endpoints.iter().map(|endpoint| endpoint.0.clone()));
+        if let Some(error) = request.endpoints.iter().find_map(|endpoint| {
+            self.inspection_scripts
+                .lock()
+                .get_mut(&(relay_key(&endpoint.0), request.queries[0].kind))
+                .and_then(|script| {
+                    if script.len() > 1 {
+                        script.pop_front()
+                    } else {
+                        script.front().copied()
+                    }
+                })
+                .flatten()
+        }) {
+            return Err(error);
+        }
         if let Some(error) = request.endpoints.iter().find_map(|endpoint| {
             self.inspection_errors
                 .lock()
@@ -909,6 +929,135 @@ async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_rou
             .any(|endpoint| endpoint.contains("read.example"))
     );
     runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_relay_list_lookup_survives_a_failed_probe() {
+    use transport_nostr::DirectoryInspectionError::TimedOut;
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let setup = runtime.account_setup();
+    let mut checkpoint = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    for step in [OnboardingStep::Profile, OnboardingStep::Follows] {
+        checkpoint.set(step, OnboardingStatus::Skipped, vec![]);
+    }
+    setup.save_onboarding(&mut checkpoint).unwrap();
+    let host = &options().discovery_relays[0];
+    network.events.lock().push(signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), host.clone()]],
+        "",
+        unix_now_seconds(),
+    ));
+    network.inspection_scripts.lock().insert(
+        (relay_key(host), 10002),
+        VecDeque::from([None, Some(TimedOut)]),
+    );
+
+    let snapshot = setup.run_onboarding(&id).await.unwrap();
+    let state = &snapshot.steps[OnboardingStep::Relays.index()];
+    assert_eq!(state.status, OnboardingStatus::Passed);
+    for issue in [
+        OnboardingIssue::TimedOut,
+        OnboardingIssue::InspectionCompleted,
+    ] {
+        assert!(state.findings.iter().any(|finding| {
+            finding.context == OnboardingFindingContext::DeclaredRoute && finding.issue == issue
+        }));
+    }
+    assert!(network.attempts.lock().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_declared_routes_can_be_edited_only_when_a_lookup_source_still_answers() {
+    use transport_nostr::DirectoryInspectionError::{TimedOut, Unreachable};
+    for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
+        for connection_lost in [true, false] {
+            let (_dir, runtime, network, keys, id) = fixture().await;
+            let setup = runtime.account_setup();
+            let mut checkpoint = runtime
+                .accounts()
+                .setup_records()
+                .onboarding_checkpoint(&id)
+                .unwrap()
+                .unwrap();
+            for index in 0..step.index() {
+                let earlier = checkpoint.snapshot.steps[index].step;
+                checkpoint.set(earlier, OnboardingStatus::Passed, vec![]);
+            }
+            let other_discovery = "wss://a-index.example";
+            checkpoint
+                .options
+                .discovery_relays
+                .push(other_discovery.into());
+            checkpoint.explicit_discovery = true;
+            setup.save_onboarding(&mut checkpoint).unwrap();
+            let declared = "wss://unreachable.example";
+            let tag = if step == OnboardingStep::Relays {
+                "r"
+            } else {
+                "relay"
+            };
+            network.events.lock().push(signed(
+                &keys,
+                step.kind() as u16,
+                vec![vec![tag.into(), declared.into()]],
+                "",
+                unix_now_seconds(),
+            ));
+            network
+                .inspection_errors
+                .lock()
+                .insert("unreachable.example".into(), TimedOut);
+            network.inspection_scripts.lock().insert(
+                (relay_key(other_discovery), step.kind()),
+                VecDeque::from([None, Some(Unreachable)]),
+            );
+            if connection_lost {
+                network.inspection_scripts.lock().insert(
+                    (relay_key(&options().discovery_relays[0]), step.kind()),
+                    VecDeque::from([None, Some(Unreachable)]),
+                );
+            }
+
+            let snapshot = setup.run_onboarding(&id).await.unwrap();
+            let state = &snapshot.steps[step.index()];
+            assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+            if connection_lost {
+                assert!(state.actions.contains(&OnboardingAction::Retry));
+                for action in [
+                    OnboardingAction::EditDiscoveryRelays,
+                    OnboardingAction::EditRelays,
+                    OnboardingAction::UseRecommendedRelays,
+                ] {
+                    assert!(!state.actions.contains(&action));
+                }
+                assert!(matches!(
+                    setup.propose_onboarding_relays(&id, step, None).await,
+                    Err(AppError::OnboardingActionUnavailable)
+                ));
+                assert!(state.findings.iter().any(|finding| {
+                    finding.context == OnboardingFindingContext::RecordDiscovery
+                        && finding.issue == OnboardingIssue::Unreachable
+                }));
+            } else {
+                assert!(
+                    state
+                        .actions
+                        .contains(&OnboardingAction::UseRecommendedRelays)
+                );
+                assert!(state.actions.contains(&OnboardingAction::EditRelays));
+            }
+            assert!(network.attempts.lock().is_empty());
+            runtime.shutdown_and_close().await.unwrap();
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
