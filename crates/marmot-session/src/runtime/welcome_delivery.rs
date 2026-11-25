@@ -4,9 +4,11 @@
 //! once the commit confirms (or at a founding create), delivered, or
 //! withdrawn. Every publish reads that row first (`welcome_hold`), so a
 //! withdrawn Welcome never goes out again, a staged one waits for its
-//! commit, and a device link's Welcome never goes out once its delivery
-//! deadline passes. Per-endpoint attempts and backoff live on the Welcome's
-//! `DurableTransportFanout`, which maintenance retries.
+//! commit, and no Welcome goes out once its delivery deadline passes
+//! (a device link's at the end of the new device's wait, any other within
+//! `cgka_engine::WELCOME_DELIVERY_WINDOW_SECS`, mdk#3589). Per-endpoint
+//! attempts and backoff live on the Welcome's `DurableTransportFanout`,
+//! which maintenance retries; only `redeliver_welcome` skips that backoff.
 
 use super::*;
 use crate::session::{OutboundWelcomeStatus, WelcomeSettlement};
@@ -25,7 +27,7 @@ where
         context: AuditEventContext,
     ) -> AccountResult<AccountDeviceEffects> {
         let mut output = AccountDeviceEffects::default();
-        self.publish_welcome_fanout(welcomes, group_id, &mut output, Some(context), false)
+        self.publish_welcome_fanout(welcomes, group_id, &mut output, Some(context))
             .await?;
         Ok(output)
     }
@@ -52,21 +54,22 @@ where
         }
         let mut output = AccountDeviceEffects::default();
         if !owed.is_empty() {
-            self.publish_welcome_fanout(owed, Some(group_id), &mut output, Some(context), false)
+            self.publish_welcome_fanout(owed, Some(group_id), &mut output, Some(context))
                 .await?;
         }
         Ok(output)
     }
 
-    /// Retry retained Welcome obligations immediately with the shared bounded
-    /// fanout, bypassing the automatic backoff for this explicit startup pass.
+    /// Retry retained Welcome obligations with the shared bounded fanout, as
+    /// the startup pass does: a relay that already failed one is asked again
+    /// only once its backoff has passed, and one never asked is asked now.
     pub async fn retry_welcome_messages_with_audit_context(
         &mut self,
         welcomes: Vec<TransportMessage>,
         context: AuditEventContext,
     ) -> AccountResult<AccountDeviceEffects> {
         let mut output = AccountDeviceEffects::default();
-        self.publish_welcome_fanout(welcomes, None, &mut output, Some(context), true)
+        self.publish_welcome_fanout(welcomes, None, &mut output, Some(context))
             .await?;
         Ok(output)
     }
@@ -88,7 +91,7 @@ where
     where
         A: Clone + 'static,
     {
-        let prepared = self.prepare_welcome_publish(welcomes, None, Some(context), true)?;
+        let prepared = self.prepare_welcome_publish(welcomes, None, Some(context))?;
         Ok(self.reserve_welcome_publish_task(Arc::new(self.adapter.clone()), prepared))
     }
 
@@ -192,9 +195,8 @@ where
         group_id: Option<GroupId>,
         output: &mut AccountDeviceEffects,
         context: Option<AuditEventContext>,
-        force_retry: bool,
     ) -> AccountResult<()> {
-        let prepared = self.prepare_welcome_publish(welcomes, group_id, context, force_retry)?;
+        let prepared = self.prepare_welcome_publish(welcomes, group_id, context)?;
         if !prepared.pending.is_empty()
             && let Some(adapter) = self.detached_welcome_adapter.clone()
         {
@@ -222,7 +224,6 @@ where
         welcomes: Vec<TransportMessage>,
         group_id: Option<GroupId>,
         context: Option<AuditEventContext>,
-        force_retry: bool,
     ) -> AccountResult<PreparedWelcomePublish> {
         let mut metadata = Vec::with_capacity(welcomes.len());
         let mut completions = Vec::with_capacity(welcomes.len());
@@ -232,12 +233,7 @@ where
             let recipient = welcome_recipient(&welcome);
             let welcome_id = welcome.id.clone();
             let mut effects = AccountDeviceEffects::default();
-            match self.prepare_legacy_publish(
-                welcome,
-                &mut effects,
-                context.clone(),
-                force_retry,
-            )? {
+            match self.prepare_legacy_publish(welcome, &mut effects, context.clone(), false)? {
                 PreparedLegacyPublish::Complete(status) => {
                     completions[index] = Some(LegacyPublishCompletion::Complete(status));
                 }
@@ -346,14 +342,35 @@ where
         if self.session.sent_welcome_awaits_commit(message_id)? {
             return Ok(Some(WelcomeHold::AwaitsCommit));
         }
-        if self
-            .session
-            .sent_welcome_deliver_until(message_id)?
-            .is_some_and(|deliver_until| self.wall_clock.now() >= deliver_until)
-        {
+        if self.welcome_past_deadline(message_id)? {
             return Ok(Some(WelcomeHold::Expired));
         }
         Ok(None)
+    }
+
+    /// Whether the retained Welcome `message_id` is past its delivery
+    /// deadline (`Engine::sent_welcome_deliver_until`) by this runtime's
+    /// wall clock, so that nothing publishes it again (mdk#3589).
+    fn welcome_past_deadline(&self, message_id: &cgka_traits::MessageId) -> AccountResult<bool> {
+        Ok(self
+            .session
+            .sent_welcome_deliver_until(message_id)?
+            .is_some_and(|deliver_until| self.wall_clock.now() >= deliver_until))
+    }
+
+    /// `welcomes` without those past their delivery deadline, which are no
+    /// longer owed to anyone.
+    fn welcomes_before_deadline(
+        &self,
+        welcomes: Vec<(GroupId, TransportMessage)>,
+    ) -> AccountResult<Vec<(GroupId, TransportMessage)>> {
+        let mut owed = Vec::with_capacity(welcomes.len());
+        for (group_id, welcome) in welcomes {
+            if !self.welcome_past_deadline(&welcome.id)? {
+                owed.push((group_id, welcome));
+            }
+        }
+        Ok(owed)
     }
 
     /// Re-publish a stored welcome whose original delivery failed after its
@@ -496,13 +513,14 @@ where
     }
 
     /// Retained outbound Welcome obligations that have not met their
-    /// acknowledgement policy. Unlike app projections, this list is rooted in
-    /// the engine transaction that made the corresponding group state
-    /// canonical, so non-app callers and cold restarts can recover it.
+    /// acknowledgement policy and are not past their delivery deadline.
+    /// Unlike app projections, this list is rooted in the engine transaction
+    /// that made the corresponding group state canonical, so non-app callers
+    /// and cold restarts can recover it.
     pub fn outstanding_welcome_deliveries(
         &self,
     ) -> AccountResult<Vec<(GroupId, TransportMessage)>> {
-        Ok(self.session.outstanding_sent_welcomes()?)
+        self.welcomes_before_deadline(self.session.outstanding_sent_welcomes()?)
     }
 
     /// IDs of delivery-aware outbound Welcomes, including completed ones.
@@ -515,8 +533,11 @@ where
     }
 
     /// Outstanding Welcome obligations and tracked IDs from one engine scan.
+    /// A Welcome past its delivery deadline is tracked but not outstanding.
     pub fn welcome_delivery_index(&self) -> AccountResult<crate::session::WelcomeDeliveryIndex> {
-        Ok(self.session.welcome_delivery_index()?)
+        let mut index = self.session.welcome_delivery_index()?;
+        index.outstanding = self.welcomes_before_deadline(index.outstanding)?;
+        Ok(index)
     }
 
     /// Delivery is already externally visible when this runs. A local state
@@ -575,11 +596,12 @@ where
     }
 
     /// Startup pass: one read of the message store prepares a detached retry
-    /// of every owed Welcome, as [`Self::prepare_welcome_retry_task_with_audit_context`]
-    /// does, and watches every staged or owed one, so maintenance publishes
-    /// each once it is owed, unless an attempt record holds it by then.
-    /// Returns the owed Welcomes' ids beside the task, or `None` when nothing
-    /// is owed.
+    /// of every owed Welcome not past its delivery deadline, as
+    /// [`Self::prepare_welcome_retry_task_with_audit_context`] does, and
+    /// watches every staged or owed one, so maintenance publishes each once it
+    /// is owed, unless an attempt record holds it by then. The retry respects
+    /// each relay's backoff. Returns the owed Welcomes' ids beside the task, or
+    /// `None` when nothing is owed.
     #[doc(hidden)]
     pub fn prepare_owed_welcome_retry_task_with_audit_context(
         &mut self,
@@ -593,12 +615,13 @@ where
         self.unread_welcome_groups = work.unread_groups;
         self.adopt_stored_welcomes(work.staged);
         self.adopt_stored_welcomes(work.owed.iter().map(|(_, welcome)| welcome.id.clone()));
-        if work.owed.is_empty() {
+        let owed = self.welcomes_before_deadline(work.owed)?;
+        if owed.is_empty() {
             return Ok(None);
         }
-        let (groups, welcomes): (Vec<_>, Vec<_>) = work.owed.into_iter().unzip();
+        let (groups, welcomes): (Vec<_>, Vec<_>) = owed.into_iter().unzip();
         let ids = welcomes.iter().map(|welcome| welcome.id.clone()).collect();
-        let mut prepared = self.prepare_welcome_publish(welcomes, None, Some(context), true)?;
+        let mut prepared = self.prepare_welcome_publish(welcomes, None, Some(context))?;
         // The retry spans groups: each Welcome keeps its own, so a host can
         // drop the results of a group it left while the retry ran.
         for (metadata, group_id) in prepared.metadata.iter_mut().zip(groups) {
@@ -752,7 +775,7 @@ where
             self.retain_welcome_route_retries(&owed);
         }
         for (group_id, welcomes) in due {
-            self.publish_welcome_fanout(welcomes, Some(group_id), output, None, false)
+            self.publish_welcome_fanout(welcomes, Some(group_id), output, None)
                 .await?;
         }
         Ok(())

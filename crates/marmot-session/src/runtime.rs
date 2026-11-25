@@ -6055,7 +6055,7 @@ where
             GroupEvent::GroupCreated { group_id } => Some(group_id.clone()),
             _ => None,
         });
-        self.publish_welcome_fanout(welcomes, group_id, output, context, false)
+        self.publish_welcome_fanout(welcomes, group_id, output, context)
             .await
     }
 
@@ -7314,7 +7314,7 @@ where
         {
             let welcomes = fanout.pending_post_confirmation_welcomes().to_vec();
             let group_id = fanout.group_id().cloned();
-            self.publish_welcome_fanout(welcomes, group_id, output, context, false)
+            self.publish_welcome_fanout(welcomes, group_id, output, context)
                 .await?;
             if fanout.mark_post_confirmation_welcomes_released() {
                 self.session.put_outbound_fanout(fanout)?;

@@ -8374,3 +8374,4 @@ async fn a_published_key_package_with_a_refused_relay_is_due_at_its_backoff() {
     assert!(!due.retry_while_owed, "{due:?}");
 }
 include!("runtime/welcome_delivery_record.rs");
+include!("runtime/welcome_deadline.rs");

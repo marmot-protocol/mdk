@@ -4616,8 +4616,7 @@ impl<S: StorageProvider> Engine<S> {
             }
             _ => {}
         }
-        if payload
-            .welcome_deliver_until()
+        if crate::welcome_deadline::stored_welcome_deliver_until(&payload)
             .is_some_and(|deliver_until| now >= deliver_until)
         {
             return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired));
@@ -4827,10 +4826,13 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// When the retained outbound Welcome `id`, staged or owed, stops being
-    /// deliverable, if it has a delivery deadline, as a device link's
-    /// Welcome does (mdk#2628 D40). A missing row, or any other row, has
-    /// none. A `Sent` row that cannot be read has none either: the publish
-    /// check reads it as staged first ([`Self::sent_welcome_awaits_commit`]).
+    /// deliverable: a device link's at the end of the new device's wait
+    /// (mdk#2628 D40), any other within
+    /// [`crate::WELCOME_DELIVERY_WINDOW_SECS`] of its staging, and one stored
+    /// before Welcomes kept a deadline within that window of its transport
+    /// timestamp (mdk#3589). A missing row, or any other row, has none. A
+    /// `Sent` row that cannot be read has none either: the publish check
+    /// reads it as staged first ([`Self::sent_welcome_awaits_commit`]).
     pub fn sent_welcome_deliver_until(
         &self,
         id: &MessageId,
@@ -4842,7 +4844,7 @@ impl<S: StorageProvider> Engine<S> {
         };
         Ok(StoredMessagePayload::decode(&record.payload)
             .ok()
-            .and_then(|payload| payload.welcome_deliver_until()))
+            .and_then(|payload| crate::welcome_deadline::stored_welcome_deliver_until(&payload)))
     }
 
     /// Whether `id` names a retained outbound Welcome that must never be

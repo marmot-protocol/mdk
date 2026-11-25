@@ -33,6 +33,8 @@ pub(crate) struct WrappedWelcome {
     /// The transport event of the KeyPackage it answers, when it came from
     /// one.
     pub(super) key_package_event_id: Option<MessageId>,
+    /// When that KeyPackage's lifetime ends, in Unix seconds.
+    pub(super) key_package_not_after: u64,
 }
 const MAX_RECOVERY_MEMBERS: usize = 32;
 
@@ -775,6 +777,7 @@ impl<S: StorageProvider> Engine<S> {
                     .source
                     .as_ref()
                     .map(|source| source.event_id.clone()),
+                key_package_not_after: parsed_kp.life_time().not_after(),
             });
         }
         Ok(welcomes)
@@ -782,20 +785,28 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Record wrapped Welcomes as staged delivery work of `commit_id`, once
     /// its Commit is recorded. Invites and same-account Adds deliver their
-    /// Welcomes this way. A device link's Welcome records `deliver_until`,
-    /// after which it is never published.
+    /// Welcomes this way. Each records a delivery deadline, after which it is
+    /// never published: a device link's `link_deliver_until`, any other
+    /// [`crate::welcome_deadline::welcome_deliver_until`] from now.
     pub(crate) fn persist_staged_welcomes(
         &self,
         welcomes: Vec<WrappedWelcome>,
         group_id: &GroupId,
         commit_id: &MessageId,
         source_epoch: EpochId,
-        deliver_until: Option<cgka_traits::transport::Timestamp>,
+        link_deliver_until: Option<cgka_traits::transport::Timestamp>,
     ) -> Result<Vec<TransportMessage>, EngineError> {
+        let now = self.wall_clock.now();
         welcomes
             .into_iter()
             .map(|welcome| {
                 let message = welcome.message.clone();
+                let deliver_until = link_deliver_until.unwrap_or_else(|| {
+                    crate::welcome_deadline::welcome_deliver_until(
+                        now,
+                        welcome.key_package_not_after,
+                    )
+                });
                 self.persist_staged_invite_welcome(
                     welcome,
                     commit_id,
