@@ -3351,28 +3351,40 @@ async fn defaults_preserve_relay_tags() {
             .propose_onboarding_relays(&id, step, None)
             .await
             .unwrap();
-        let revision = manager
+        let proposal = manager
             .account_setup()
             .onboarding_snapshot(&id)
             .unwrap()
             .unwrap()
-            .revision;
+            .proposal
+            .unwrap();
         assert!(network.attempts.lock().is_empty());
         runtime.shutdown_and_close().await.unwrap();
         let runtime = super::tests::runtime(dir.path(), network.clone());
         let manager = runtime.accounts();
         let result = manager
             .account_setup()
-            .approve_onboarding_repair(&id, revision)
+            .approve_onboarding_repair(&id, proposal.revision)
             .await
             .unwrap();
         if step == OnboardingStep::Relays {
-            // Unreachable and capped declared sources cannot authorize replacement.
+            // The save cannot publish after the source check becomes incomplete.
+            // Keep the same tags in a new preview that exposes the changed evidence.
             assert_eq!(
                 result.steps[step.index()].status,
-                OnboardingStatus::RetryableFailure
+                OnboardingStatus::NeedsInput
             );
-            assert!(result.proposal.is_none());
+            let renewed = result.proposal.unwrap();
+            assert_eq!(renewed.revision, result.revision);
+            assert!(renewed.revision > proposal.revision);
+            assert_eq!(
+                renewed,
+                OnboardingRepairProposal {
+                    revision: renewed.revision,
+                    inconclusive: true,
+                    ..proposal
+                }
+            );
             assert!(network.attempts.lock().is_empty());
             let c = manager
                 .setup_records()
