@@ -39,7 +39,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -488,11 +487,22 @@ impl FiniteRequests {
         let req = ClientMessage::req(subscription_id.clone(), filters.to_vec());
         let mut collector = Collector::new(filters, limits, self, relay.url(), &subscription_id);
         let mut deadline = std::pin::pin!(tokio::time::sleep_until(deadline));
+        // Queued on its own task: the SDK queues a REQ under its relay's
+        // subscription lock, and a caller that stopped polling while waiting
+        // for that lock would hold up every live frame on the connection.
+        // A REQ queued after the request ended never goes out (`sending`).
+        let send = tokio::spawn({
+            let relay = relay.clone();
+            async move { relay.send_msg(req).await }
+        });
         let queued = tokio::select! {
             biased;
             () = cancel.cancelled() => Err(FiniteEnd::Cancelled),
             () = &mut deadline => Err(FiniteEnd::TimedOut),
-            queued = relay.send_msg(req).into_future() => queued.map_err(|_| FiniteEnd::SetupFailed),
+            queued = send => match queued {
+                Ok(Ok(())) => Ok(()),
+                _ => Err(FiniteEnd::SetupFailed),
+            },
         };
         // Whether the collector read the frame that ended the request. What
         // the relay sent past that frame is not read and not charged, as the
