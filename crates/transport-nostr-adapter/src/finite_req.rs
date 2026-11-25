@@ -57,7 +57,7 @@ use nostr_sdk::prelude::{
     AdmitPolicy, AdmitStatus, ClientBuilder, ClientMessage, DatabaseEventStatus, Event, EventId,
     Filter, NostrDatabase, Relay, RelayUrl, Signature, SubscriptionId, Url,
 };
-use nostr_sdk::relay::{RelayEventLimits, RelayNotification};
+use nostr_sdk::relay::{RelayEventLimits, RelayNotification, RelayStatus};
 use nostr_sdk::transport::websocket::{WebSocketSink, WebSocketStream, WebSocketTransport};
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -78,6 +78,9 @@ const MAX_FRAME_BYTES: usize = 5 * 1024 * 1024;
 /// copy, from another relay or an overlapping request, then costs one hash
 /// instead of a signature check. About 1 MiB at capacity.
 const VERIFIED_CAPACITY: usize = 8_192;
+
+/// Grace for a fresh connection to send its NIP-42 challenge after a refusal.
+const AUTH_CHALLENGE_WAIT: Duration = Duration::from_secs(1);
 
 /// The SDK's filter matching, which leaves NIP-50 search to the relay.
 const MATCH: MatchEventOptions = MatchEventOptions::new().nip50(false);
@@ -399,9 +402,14 @@ impl FiniteRequests {
     /// `relay`'s authentication outcomes from now on, for [`Self::fetch_watching`];
     /// `None` when this client cannot authenticate.
     pub fn watch_auth(&self, relay: &Relay) -> Option<AuthWatch> {
-        self.0
-            .can_authenticate
-            .then(|| AuthWatch(Box::pin(crate::with_gaps(relay.notifications()))))
+        self.0.can_authenticate.then(|| {
+            let notifications = Box::pin(crate::with_gaps(relay.notifications()));
+            let before_connect = relay.status() == RelayStatus::Initialized;
+            AuthWatch {
+                notifications,
+                before_connect,
+            }
+        })
     }
 
     /// Ask `relay` for `filter`'s events until its EOSE, within `limits`. A
@@ -447,7 +455,7 @@ impl FiniteRequests {
         let Some(mut watch) = auth.take_if(|_| auth_required && self.0.can_authenticate) else {
             return first;
         };
-        match authenticated(&mut watch.0, deadline, cancel).await {
+        match authenticated(&mut watch, deadline, cancel).await {
             Ok(()) => {}
             // The refusal stands.
             Err(None) => return first,
@@ -556,27 +564,38 @@ pub(crate) fn is_auth_required(reason: &str) -> bool {
     reason.starts_with("auth-required:")
 }
 
-/// Wait until `deadline` for the SDK to authenticate to the relay whose
-/// notifications these are. Ok when it did, or when lost notifications may
-/// have hidden it; `Err(None)` when it failed or no longer can, and the
-/// request's end when the wait was cut first.
+/// Wait for the SDK to authenticate. If the watch predates the connection,
+/// allow a short grace for the challenge to arrive. An authentication in
+/// progress, or one that started before the watch, gets the request deadline.
 async fn authenticated(
-    notifications: &mut (impl Stream<Item = NotificationUpdate<RelayNotification>> + Unpin),
+    watch: &mut AuthWatch,
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> Result<(), Option<FiniteEnd>> {
     let wait = async {
-        while let Some(update) = notifications.next().await {
+        let mut waiting_for_challenge = watch.before_connect;
+        let grace = tokio::time::sleep(AUTH_CHALLENGE_WAIT);
+        tokio::pin!(grace);
+        loop {
+            let update = tokio::select! {
+                update = watch.notifications.next() => update,
+                () = &mut grace, if waiting_for_challenge => return Err(None),
+            };
             match update {
-                NotificationUpdate::Notification(RelayNotification::Authenticated)
-                | NotificationUpdate::Lagged { .. } => return Ok(()),
-                NotificationUpdate::Notification(RelayNotification::AuthenticationFailed) => {
-                    return Err(None);
+                Some(
+                    NotificationUpdate::Notification(RelayNotification::Authenticated)
+                    | NotificationUpdate::Lagged { .. },
+                ) => return Ok(()),
+                Some(NotificationUpdate::Notification(RelayNotification::AuthenticationFailed))
+                | None => return Err(None),
+                Some(NotificationUpdate::Notification(RelayNotification::Message { message }))
+                    if matches!(*message, RelayMessage::Auth { .. }) =>
+                {
+                    waiting_for_challenge = false;
                 }
-                NotificationUpdate::Notification(_) => {}
+                Some(NotificationUpdate::Notification(_)) => {}
             }
         }
-        Err(None)
     };
     tokio::select! {
         biased;
@@ -587,7 +606,11 @@ async fn authenticated(
 }
 
 /// A relay's authentication outcomes, from [`FiniteRequests::watch_auth`].
-pub struct AuthWatch(Pin<Box<dyn Stream<Item = NotificationUpdate<RelayNotification>> + Send>>);
+pub struct AuthWatch {
+    notifications: Pin<Box<dyn Stream<Item = NotificationUpdate<RelayNotification>> + Send>>,
+    // A watch started on a connected relay may have missed its challenge.
+    before_connect: bool,
+}
 
 impl fmt::Debug for AuthWatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

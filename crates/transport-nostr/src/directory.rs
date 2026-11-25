@@ -60,8 +60,9 @@ const DIRECTORY_MAX_FILTERS_PER_REQ: usize = 3;
 const ADDRESSABLE_KINDS: std::ops::Range<u64> = 30_000..40_000;
 
 /// Stable errors for a bounded, isolated relay inspection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirectoryInspectionError {
+    /// The relay could not serve the request now, including a transient CLOSED.
     Unreachable,
     TimedOut,
     AuthenticationRequired,
@@ -70,6 +71,12 @@ pub enum DirectoryInspectionError {
     InvalidRequest,
     /// The relay answered but said it holds more than it sent.
     Incomplete,
+    /// The inspection saw signed relay lists before its unsuccessful end.
+    /// The records establish presence while the cause leaves freshness open.
+    Partial {
+        records: Vec<DirectoryRelayEventRecord>,
+        cause: Box<DirectoryInspectionError>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1157,30 +1164,48 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             let result = finite
                 .fetch_watching(&relay, vec![filter], limits, &cancel, &mut auth)
                 .await;
-            match &result.end {
-                // NIP-67 `more` or `auth`: the relay cut its answer or holds
-                // events back until authentication, so a newer event
-                // may be unread. The inbox probe needs only an answer.
-                FiniteEnd::Eose if (result.more || result.auth) && query.kind != 1059 => {
-                    return Err(Incomplete);
+            let cause = match &result.end {
+                // A persistent NIP-67 hint leaves the lookup incomplete. The
+                // inbox route probe needs only an answer.
+                FiniteEnd::Eose if result.auth && query.kind != 1059 => {
+                    Some(AuthenticationRequired)
                 }
-                FiniteEnd::Eose => {}
-                FiniteEnd::Closed(reason) => return Err(directory_closed_reason(reason)),
-                FiniteEnd::TimedOut => return Err(TimedOut),
-                FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => return Err(Restricted),
-                _ => return Err(Unreachable),
+                FiniteEnd::Eose if result.more && query.kind != 1059 => Some(Incomplete),
+                FiniteEnd::Eose => None,
+                FiniteEnd::Closed(reason) => Some(directory_closed_reason(reason)),
+                FiniteEnd::TimedOut => Some(TimedOut),
+                FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => Some(Restricted),
+                _ => Some(Unreachable),
+            };
+            let matched: Vec<_> =
+                if query.kind != 1059 && (cause.is_none() || matches!(query.kind, 10002 | 10050)) {
+                    result
+                        .events
+                        .iter()
+                        .filter_map(|event| {
+                            validated_directory_event(event, &query).map(|event| {
+                                DirectoryRelayEventRecord {
+                                    endpoints: request.endpoints.clone(),
+                                    event,
+                                }
+                            })
+                        })
+                        .collect()
+                } else {
+                    // The inbox route probe never retains inbox payloads.
+                    Vec::new()
+                };
+            if let Some(cause) = cause {
+                return Err(if matched.is_empty() {
+                    cause
+                } else {
+                    Partial {
+                        records: matched,
+                        cause: Box::new(cause),
+                    }
+                });
             }
-            if query.kind == 1059 {
-                continue;
-            } // Read probe only; do not retain inbox payloads.
-            for event in &result.events {
-                if let Some(event) = validated_directory_event(event, &query) {
-                    records.push(DirectoryRelayEventRecord {
-                        endpoints: request.endpoints.clone(),
-                        event,
-                    });
-                }
-            }
+            records.extend(matched);
         }
         Ok(records)
     }
@@ -1237,16 +1262,17 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
 /// auth-required: ...`, mdk#3439); that wrapper alone is looked through.
 fn directory_closed_reason(reason: &str) -> DirectoryInspectionError {
     use DirectoryInspectionError::*;
-    let reason = reason
+    let wrapper = reason
         .get(..6)
-        .filter(|wrapper| wrapper.eq_ignore_ascii_case("error:"))
-        .map_or(reason, |_| reason[6..].trim_start());
-    if reason.starts_with("auth-required:") {
-        AuthenticationRequired
-    } else if reason.starts_with("payment-required:") {
-        PaymentRequired
-    } else {
-        Restricted
+        .filter(|wrapper| wrapper.eq_ignore_ascii_case("error:"));
+    let inner = wrapper.map_or(reason, |_| reason[6..].trim_start());
+    match inner.split_once(':').map(|(prefix, _)| prefix) {
+        Some("auth-required") => AuthenticationRequired,
+        Some("payment-required") => PaymentRequired,
+        Some("blocked" | "restricted" | "invalid" | "bad req") => Restricted,
+        Some("rate-limited") => Unreachable,
+        _ if wrapper.is_some() => Unreachable,
+        _ => Restricted,
     }
 }
 
@@ -1941,7 +1967,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn inspection_preserves_auth_and_payment_closed_reasons() {
+    async fn inspection_classifies_closed_reasons_by_prefix() {
         use futures::{SinkExt, StreamExt};
         use tokio::net::TcpListener;
         use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -1964,18 +1990,36 @@ mod tests {
                 "error: payment-required: pay",
                 DirectoryInspectionError::PaymentRequired,
             ),
-            // Only that one wrapper is looked through.
+            // A policy refusal: asking again cannot change the answer.
             (
-                "error: internal failure",
+                "restricted: members only",
+                DirectoryInspectionError::Restricted,
+            ),
+            (
+                "ERROR: restricted: members only",
+                DirectoryInspectionError::Restricted,
+            ),
+            (
+                "bad req: filter validation failed: kind not allowed: 10050",
                 DirectoryInspectionError::Restricted,
             ),
             (
                 "blocked: auth-required: sign in",
                 DirectoryInspectionError::Restricted,
             ),
+            // A relay that is busy or failing now may answer a later request.
+            (
+                "rate-limited: slow down",
+                DirectoryInspectionError::Unreachable,
+            ),
+            (
+                "error: shutting down",
+                DirectoryInspectionError::Unreachable,
+            ),
+            // Only one wrapper is looked through; past it, a relay error.
             (
                 "error: error: auth-required: sign in",
-                DirectoryInspectionError::Restricted,
+                DirectoryInspectionError::Unreachable,
             ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2010,7 +2054,7 @@ mod tests {
             .await
             .expect("inspection completes");
             server.abort();
-            assert_eq!(result, Err(expected));
+            assert_eq!(result, Err(expected), "{reason}");
         }
     }
 
@@ -2021,12 +2065,18 @@ mod tests {
         /// that wraps the NIP-01 prefix does, sending its challenge (if
         /// `challenge`) after the CLOSED. Answer EOSE once authenticated.
         WrappedAuthRequired { challenge: bool },
+        /// Close every REQ as `WrappedAuthRequired` does with its challenge,
+        /// then never answer the client's AUTH, as a relay does when
+        /// authentication remains in progress.
+        NeverAcknowledgesAuth,
         /// Challenge on connect and refuse the client's AUTH, then answer a
         /// REQ with EOSE once it has refused, and close an inbox REQ as
         /// `auth-required:`.
         RefusesAuthOnConnect,
         /// Answer each REQ with an EOSE carrying this NIP-67 hint.
         SaysHint(&'static str),
+        /// Ask for authentication using a NIP-67 hint.
+        AuthHint { persists: bool },
         /// Accept the WebSocket handshake after the first delay, then answer
         /// each REQ's EOSE after the second.
         Slow { handshake: Duration, eose: Duration },
@@ -2036,6 +2086,17 @@ mod tests {
     /// number of REQs it received.
     async fn spawn_inspection_relay(
         script: InspectionRelay,
+    ) -> (
+        TransportEndpoint,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_inspection_relay_with_record(script, None).await
+    }
+
+    async fn spawn_inspection_relay_with_record(
+        script: InspectionRelay,
+        record: Option<Event>,
     ) -> (
         TransportEndpoint,
         Arc<std::sync::atomic::AtomicUsize>,
@@ -2096,6 +2157,7 @@ mod tests {
                             continue;
                         }
                     }
+                    (Some("AUTH"), InspectionRelay::NeverAcknowledgesAuth) => continue,
                     (Some("AUTH"), _) => {
                         authenticated = true;
                         vec![serde_json::json!(["OK", request[1]["id"], true, ""])]
@@ -2114,9 +2176,38 @@ mod tests {
                         }
                         replies
                     }
+                    (Some("REQ"), InspectionRelay::NeverAcknowledgesAuth) => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        vec![
+                            serde_json::json!([
+                                "CLOSED",
+                                request[1],
+                                "ERROR: auth-required: requested filter requires auth"
+                            ]),
+                            serde_json::json!(["AUTH", "inspection-challenge"]),
+                        ]
+                    }
+                    (Some("REQ"), InspectionRelay::AuthHint { persists }) => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        if !authenticated {
+                            vec![
+                                serde_json::json!(["AUTH", "inspection-challenge"]),
+                                serde_json::json!(["EOSE", request[1], ["auth"]]),
+                            ]
+                        } else if persists {
+                            vec![serde_json::json!(["EOSE", request[1], ["auth"]])]
+                        } else {
+                            vec![serde_json::json!(["EOSE", request[1]])]
+                        }
+                    }
                     (Some("REQ"), InspectionRelay::SaysHint(hint)) => {
                         counted.fetch_add(1, Ordering::SeqCst);
-                        vec![serde_json::json!(["EOSE", request[1], [hint]])]
+                        let mut replies = Vec::new();
+                        if let Some(record) = &record {
+                            replies.push(serde_json::json!(["EVENT", request[1], record]));
+                        }
+                        replies.push(serde_json::json!(["EOSE", request[1], [hint]]));
+                        replies
                     }
                     (Some("REQ"), script) => {
                         counted.fetch_add(1, Ordering::SeqCst);
@@ -2190,12 +2281,32 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn signed_inspection_times_out_when_authentication_never_completes() {
         let (endpoint, reqs, server) =
-            spawn_inspection_relay(InspectionRelay::WrappedAuthRequired { challenge: false }).await;
+            spawn_inspection_relay(InspectionRelay::NeverAcknowledgesAuth).await;
         let signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner> =
             Arc::new(nostr::prelude::Keys::generate());
         let result = inspect_inbox(endpoint, Some(signer)).await;
         server.abort();
         assert_eq!(result, Err(DirectoryInspectionError::TimedOut));
+        assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // A relay that says `auth-required:` but never sends a challenge cannot
+    // be authenticated to: its refusal stands at once, not after the whole
+    // EOSE window as an undecided route.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_inspection_refuses_an_auth_required_close_without_a_challenge() {
+        let (endpoint, reqs, server) =
+            spawn_inspection_relay(InspectionRelay::WrappedAuthRequired { challenge: false }).await;
+        let signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner> =
+            Arc::new(nostr::prelude::Keys::generate());
+        let started = tokio::time::Instant::now();
+        let result = inspect_inbox(endpoint, Some(signer)).await;
+        server.abort();
+        assert_eq!(
+            result,
+            Err(DirectoryInspectionError::AuthenticationRequired)
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -2220,13 +2331,96 @@ mod tests {
             .await
             .expect("inspection completes");
             server.abort();
-            assert_eq!(result, Err(DirectoryInspectionError::Incomplete), "{hint}");
+            let error = if hint == "auth" {
+                DirectoryInspectionError::AuthenticationRequired
+            } else {
+                DirectoryInspectionError::Incomplete
+            };
+            assert_eq!(result, Err(error), "{hint}");
 
             let (endpoint, _, server) =
                 spawn_inspection_relay(InspectionRelay::SaysHint(hint)).await;
             let result = inspect_inbox(endpoint, None).await;
             server.abort();
             assert_eq!(result, Ok(Vec::new()), "{hint}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_relay_list_keeps_the_verified_record_and_the_hint() {
+        use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
+
+        let keys = Keys::generate();
+        let list = EventBuilder::new(Kind::from(10050_u16), "keep")
+            .tag(Tag::parse(["relay", "wss://inbox.example"]).unwrap())
+            .finalize(&keys)
+            .unwrap();
+        for (hint, expected) in [
+            ("more", DirectoryInspectionError::Incomplete),
+            ("auth", DirectoryInspectionError::AuthenticationRequired),
+        ] {
+            let (endpoint, _, server) = spawn_inspection_relay_with_record(
+                InspectionRelay::SaysHint(hint),
+                Some(list.clone()),
+            )
+            .await;
+            let request = DirectoryFetchRequest::new(
+                vec![endpoint],
+                vec![DirectoryEventQuery::new(
+                    10050,
+                    vec![keys.public_key().to_hex()],
+                    4,
+                )],
+            )
+            .unwrap();
+            let result = timeout(
+                Duration::from_secs(5),
+                NostrSdkDirectoryRelayFetcher::standalone().inspect_directory_events(request, None),
+            )
+            .await
+            .unwrap();
+            server.abort();
+            let Err(DirectoryInspectionError::Partial { records, cause }) = result else {
+                panic!("expected a partial {hint} reply, got {result:?}");
+            };
+            assert_eq!(*cause, expected, "{hint}");
+            assert_eq!(records.len(), 1, "{hint}");
+            assert_eq!(records[0].event.id, list.id.to_hex(), "{hint}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_inspection_reasks_after_an_auth_hint() {
+        use std::sync::atomic::Ordering;
+
+        for persists in [false, true] {
+            let (endpoint, reqs, server) =
+                spawn_inspection_relay(InspectionRelay::AuthHint { persists }).await;
+            let keys = nostr::prelude::Keys::generate();
+            let request = DirectoryFetchRequest::new(
+                vec![endpoint],
+                vec![DirectoryEventQuery::new(
+                    10002,
+                    vec![keys.public_key().to_hex()],
+                    4,
+                )],
+            )
+            .unwrap();
+            let result = timeout(
+                Duration::from_secs(5),
+                NostrSdkDirectoryRelayFetcher::standalone()
+                    .inspect_directory_events(request, Some(Arc::new(keys))),
+            )
+            .await
+            .unwrap();
+            server.abort();
+            let expected = if persists {
+                Err(DirectoryInspectionError::AuthenticationRequired)
+            } else {
+                Ok(Vec::new())
+            };
+            assert_eq!(result, expected, "persists={persists}");
+            assert_eq!(reqs.load(Ordering::SeqCst), 2, "persists={persists}");
         }
     }
 

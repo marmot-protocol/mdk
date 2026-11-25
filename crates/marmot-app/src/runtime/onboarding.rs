@@ -306,6 +306,7 @@ const _: () = assert!(
     CHECK_WAIT.as_millis() > transport_nostr::DIRECTORY_INSPECTION_WAIT.as_millis(),
     "CHECK_WAIT must outlast one relay inspection"
 );
+const SOURCE_RETRY_DELAY: Duration = Duration::from_millis(500);
 const ONBOARDING_CANCELLATION_WAIT: Duration = Duration::from_secs(15);
 const CHECK_MAX_AGE: u64 = 300;
 const FUTURE_CLOCK_SKEW: u64 = 300;
@@ -851,6 +852,7 @@ impl OnboardingCheckpoint {
                     && finding.issue == OnboardingIssue::NoUsableRoute)
                     || (finding.context == OnboardingFindingContext::RecordDiscovery
                         && finding.issue == OnboardingIssue::DiscoveryIncomplete
+                        && finding.endpoint.is_none()
                         && self.records[step.index()].is_none())
             })
     }
@@ -1008,6 +1010,17 @@ impl OnboardingFinding {
         };
         self
     }
+}
+
+/// NIP-01 orders replaceable events by timestamp and then the lower id.
+fn compare_record_recency(a: &NostrTransportEvent, b: &NostrTransportEvent) -> std::cmp::Ordering {
+    a.created_at
+        .cmp(&b.created_at)
+        .then_with(|| b.id.cmp(&a.id))
+}
+
+fn verified_lookup_record(event: &NostrTransportEvent, kind: u64, author: &str) -> bool {
+    event.kind == kind && event.pubkey == author && event.to_verified_nostr_event().is_ok()
 }
 
 fn declared_capabilities(
@@ -2284,7 +2297,11 @@ impl AccountSetup<'_> {
                     )
                     .await?;
                 self.require_live_onboarding_attempt(c)?;
-                c.records[index] = event.clone();
+                // A failed recheck tells us nothing about the prior relay list.
+                if event.is_some() || !step.relay() || status != OnboardingStatus::RetryableFailure
+                {
+                    c.records[index].clone_from(&event);
+                }
                 // Cache even imperfect signed data for settings visibility;
                 // routing still filters it through the relay safety chokepoint.
                 if let Some(event) = event {
@@ -2464,6 +2481,7 @@ impl AccountSetup<'_> {
         account_id: &str,
         kind: u64,
         endpoints: Vec<String>,
+        purpose: OnboardingCheckPurpose,
     ) -> (
         Vec<NostrTransportEvent>,
         Vec<OnboardingFinding>,
@@ -2481,6 +2499,11 @@ impl AccountSetup<'_> {
             Some(crate::external_signer::AccountSigner::Local(_))
         );
         let signer = account_signer.map(|signer| signer.as_nostr_signer());
+        let retry_transient =
+            purpose == OnboardingCheckPurpose::RecordLookup && matches!(kind, 10002 | 10050);
+        // A timed-out inspection with a remote signer may still be waiting
+        // on a signing prompt. Do not send a second one in this check.
+        let retry_timeout = signer.is_none() || local_key_held;
         let mut tasks = JoinSet::new();
         let classifications = self.app().relay_plane.classify_relay_endpoints(endpoints);
         let mut failures = Vec::new();
@@ -2537,77 +2560,116 @@ impl AccountSetup<'_> {
             let query =
                 DirectoryEventQuery::new(kind, vec![account_id.to_owned()], DISCOVERY_PAGE_LIMIT);
             tasks.spawn(async move {
-                let result = timeout(
-                    CHECK_WAIT,
-                    plane.inspect_directory_events(
-                        TransportEndpoint(endpoint.clone()),
-                        query,
-                        signer,
-                    ),
-                )
-                .await;
-                let result = match result {
-                    Ok(result) => result,
-                    Err(_) => Err(transport_nostr::DirectoryInspectionError::TimedOut),
+                use transport_nostr::DirectoryInspectionError::{
+                    Incomplete, Partial, TimedOut, Unreachable,
                 };
-                (endpoint, result)
+                let deadline = tokio::time::Instant::now() + CHECK_WAIT;
+                let inspect = || async {
+                    let result = tokio::time::timeout_at(
+                        deadline,
+                        plane.inspect_directory_events(
+                            TransportEndpoint(endpoint.clone()),
+                            query.clone(),
+                            signer.clone(),
+                        ),
+                    )
+                    .await
+                    .unwrap_or(Err(TimedOut));
+                    match result {
+                        Ok(records) => (records, None),
+                        Err(Partial { records, cause }) => (records, Some(*cause)),
+                        Err(error) => (Vec::new(), Some(error)),
+                    }
+                };
+                let (mut records, mut error) = inspect().await;
+                if retry_transient
+                    && (matches!(error, Some(Incomplete | Unreachable))
+                        || (retry_timeout && matches!(error, Some(TimedOut))))
+                    && tokio::time::Instant::now() + SOURCE_RETRY_DELAY < deadline
+                {
+                    tokio::time::sleep(SOURCE_RETRY_DELAY).await;
+                    let (retry_records, retry_error) = inspect().await;
+                    // A completed retry that fails to corroborate a signed
+                    // record seen on the first reply leaves freshness open.
+                    let verified = |event: &&NostrTransportEvent| {
+                        verified_lookup_record(event, kind, &query.authors[0])
+                    };
+                    let newest_retry = retry_records
+                        .iter()
+                        .map(|record| &record.event)
+                        .filter(verified)
+                        .max_by(|a, b| compare_record_recency(a, b));
+                    let contradicted = records
+                        .iter()
+                        .map(|record| &record.event)
+                        .filter(verified)
+                        .any(|event| {
+                            newest_retry
+                                .is_none_or(|newest| compare_record_recency(event, newest).is_gt())
+                        });
+                    error = if retry_error.is_none() && contradicted {
+                        Some(Incomplete)
+                    } else {
+                        retry_error
+                    };
+                    records.extend(retry_records);
+                }
+                (endpoint, records, error)
             });
         }
         let mut records = Vec::new();
         let mut completed = HashMap::new();
         while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok((endpoint, Ok(events))) => {
-                    completed.insert(relay_key(&endpoint), endpoint);
-                    // A full bounded page may omit another installation's slot.
-                    if kind == 30443
-                        && events
-                            .iter()
-                            .filter(|r| r.event.kind == kind && r.event.pubkey == account_id)
-                            .count()
-                            >= DISCOVERY_PAGE_LIMIT
-                    {
-                        failures.push(finding(OnboardingIssue::DiscoveryIncomplete));
-                    }
-                    records.extend(events.into_iter().map(|r| r.event));
+            let Ok((endpoint, events, error)) = result else {
+                failures.push(finding(OnboardingIssue::Interrupted));
+                continue;
+            };
+            if let Some(error) = error {
+                use transport_nostr::DirectoryInspectionError::*;
+                let issue = match error {
+                    TimedOut => OnboardingIssue::TimedOut,
+                    AuthenticationRequired => OnboardingIssue::AuthenticationRequired,
+                    PaymentRequired => OnboardingIssue::PaymentRequired,
+                    Restricted => OnboardingIssue::AccessRestricted,
+                    Unreachable => OnboardingIssue::Unreachable,
+                    InvalidRequest => OnboardingIssue::InvalidRelay,
+                    Incomplete | Partial { .. } => OnboardingIssue::DiscoveryIncomplete,
+                };
+                failures.push(OnboardingFinding {
+                    endpoint: Some(endpoint),
+                    local_key_held: local_key_held
+                        && matches!(
+                            issue,
+                            OnboardingIssue::AuthenticationRequired
+                                | OnboardingIssue::PaymentRequired
+                        ),
+                    ..finding(issue)
+                });
+            } else {
+                completed.insert(relay_key(&endpoint), endpoint);
+                // A full bounded page may omit another installation's slot.
+                if kind == 30443
+                    && events
+                        .iter()
+                        .filter(|r| r.event.kind == kind && r.event.pubkey == account_id)
+                        .count()
+                        >= DISCOVERY_PAGE_LIMIT
+                {
+                    failures.push(finding(OnboardingIssue::DiscoveryIncomplete));
                 }
-                Ok((endpoint, Err(error))) => {
-                    use transport_nostr::DirectoryInspectionError::*;
-                    let issue = match error {
-                        TimedOut => OnboardingIssue::TimedOut,
-                        AuthenticationRequired => OnboardingIssue::AuthenticationRequired,
-                        PaymentRequired => OnboardingIssue::PaymentRequired,
-                        Restricted => OnboardingIssue::AccessRestricted,
-                        Unreachable => OnboardingIssue::Unreachable,
-                        InvalidRequest => OnboardingIssue::InvalidRelay,
-                        Incomplete => OnboardingIssue::DiscoveryIncomplete,
-                    };
-                    failures.push(OnboardingFinding {
-                        endpoint: Some(endpoint),
-                        local_key_held: local_key_held
-                            && matches!(
-                                issue,
-                                OnboardingIssue::AuthenticationRequired
-                                    | OnboardingIssue::PaymentRequired
-                            ),
-                        ..finding(issue)
-                    });
-                }
-                Err(_) => failures.push(finding(OnboardingIssue::Interrupted)),
             }
+            records.extend(events.into_iter().map(|r| r.event));
         }
         // Enforce the event boundary even for injected fetchers. Never let an
         // older valid event hide a newer signed but malformed declaration.
         records.retain(|event| {
-            let valid = event.kind == kind
-                && event.pubkey == account_id
-                && event.to_verified_nostr_event().is_ok();
+            let valid = verified_lookup_record(event, kind, account_id);
             if kind == 30443 && event.kind == kind && event.pubkey == account_id && !valid {
                 failures.push(finding(OnboardingIssue::Malformed));
             }
             valid
         });
-        records.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+        records.sort_by(|a, b| compare_record_recency(b, a));
         records.dedup_by(|a, b| a.id == b.id);
         let failures = failures
             .into_iter()
@@ -2684,11 +2746,16 @@ impl AccountSetup<'_> {
         } else if step.optional() {
             let mut lookup = sources.clone();
             append_public_indexers(&mut lookup, &c.options, indexers);
-            self.inspect_onboarding_relays(&c.snapshot.account_id_hex, 10002, lookup)
-                .await
-                .0
-                .into_iter()
-                .next()
+            self.inspect_onboarding_relays(
+                &c.snapshot.account_id_hex,
+                10002,
+                lookup,
+                OnboardingCheckPurpose::RecordLookup,
+            )
+            .await
+            .0
+            .into_iter()
+            .next()
         } else {
             None
         };
@@ -2739,42 +2806,55 @@ impl AccountSetup<'_> {
         }
         let sources = self.onboarding_sources(c, step).await;
         let (records, mut failures, completed) = self
-            .inspect_onboarding_relays(&c.snapshot.account_id_hex, step.kind(), sources.clone())
+            .inspect_onboarding_relays(
+                &c.snapshot.account_id_hex,
+                step.kind(),
+                sources.clone(),
+                OnboardingCheckPurpose::RecordLookup,
+            )
             .await;
-        let Some(event) = records.into_iter().next() else {
-            return if completed.is_empty() || !failures.is_empty() {
-                if !failures.is_empty() && self.authoritative_answered(c, &sources, &completed) {
-                    // Absent where it answered, unknown where it failed.
-                    failures.insert(
-                        0,
-                        finding(OnboardingIssue::DiscoveryIncomplete).in_context(
-                            OnboardingFindingContext::RecordDiscovery,
-                            OnboardingCheckPurpose::RecordLookup,
-                        ),
-                    );
-                }
-                (
-                    OnboardingStatus::RetryableFailure,
-                    if failures.is_empty() {
-                        vec![finding(OnboardingIssue::Unreachable).in_context(
-                            OnboardingFindingContext::RecordDiscovery,
-                            OnboardingCheckPurpose::RecordLookup,
-                        )]
-                    } else {
-                        failures
-                    },
-                    None,
-                )
-            } else {
-                (
-                    OnboardingStatus::NeedsInput,
-                    vec![finding(OnboardingIssue::Missing).in_context(
-                        OnboardingFindingContext::RecordDiscovery,
-                        OnboardingCheckPurpose::RecordLookup,
-                    )],
-                    None,
+        let newest = records.into_iter().next().filter(|found| {
+            // A partial reply can establish presence, but an older record
+            // cannot displace the checkpoint's newer signed declaration.
+            !step.relay()
+                || failures.is_empty()
+                || c.records[step.index()].as_ref().is_none_or(|prior| {
+                    prior.created_at > unix_now_seconds() + FUTURE_CLOCK_SKEW
+                        || !compare_record_recency(prior, found).is_gt()
+                })
+        });
+        let Some(event) = newest else {
+            let lookup_finding = |issue| {
+                finding(issue).in_context(
+                    OnboardingFindingContext::RecordDiscovery,
+                    OnboardingCheckPurpose::RecordLookup,
                 )
             };
+            if failures.is_empty() && !completed.is_empty() {
+                return (
+                    OnboardingStatus::NeedsInput,
+                    vec![lookup_finding(OnboardingIssue::Missing)],
+                    None,
+                );
+            }
+
+            if self.authoritative_answered(c, &sources, &completed)
+                && !failures
+                    .iter()
+                    .any(|f| f.issue == OnboardingIssue::Interrupted)
+            {
+                failures.insert(0, lookup_finding(OnboardingIssue::DiscoveryIncomplete));
+                if step.relay() && c.records[step.index()].is_none() {
+                    // Offer an edit while preserving the incomplete-lookup warning
+                    // and the requirement for explicit approval of the risk.
+                    failures.insert(0, lookup_finding(OnboardingIssue::Missing));
+                    return (OnboardingStatus::NeedsInput, failures, None);
+                }
+            }
+            if failures.is_empty() {
+                failures.push(lookup_finding(OnboardingIssue::Unreachable));
+            }
+            return (OnboardingStatus::RetryableFailure, failures, None);
         };
         if event.created_at > unix_now_seconds() + FUTURE_CLOCK_SKEW {
             return (
@@ -2900,6 +2980,7 @@ impl AccountSetup<'_> {
                                 10002
                             },
                             endpoints,
+                            OnboardingCheckPurpose::DirectoryQuery,
                         )
                         .await;
                     findings.extend(failures.into_iter().map(|failure| {
@@ -3284,6 +3365,7 @@ impl AccountSetup<'_> {
                     &c.snapshot.account_id_hex,
                     proposal.step.kind(),
                     sources.clone(),
+                    OnboardingCheckPurpose::SourceFreshness,
                 ),
             )
             .await?;
@@ -3309,10 +3391,7 @@ impl AccountSetup<'_> {
             .as_ref()
             .filter(|event| Some(&event.id) == proposal.previous_event_id.as_ref());
         let newer_seen = records.first().is_some_and(|event| {
-            basis.is_none_or(|basis| {
-                event.created_at > basis.created_at
-                    || (event.created_at == basis.created_at && event.id < basis.id)
-            })
+            basis.is_none_or(|basis| compare_record_recency(event, basis).is_gt())
         });
         if !basis_newest && (complete || (accepted_risk && newer_seen)) {
             c.records[proposal.step.index()] = records.first().cloned();

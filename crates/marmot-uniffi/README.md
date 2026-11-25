@@ -672,15 +672,16 @@ Imported identities can use the durable preflight API instead of `login`:
    A missing discovery result is not global proof of absence: hosts must
    not automatically approve publication for imported identities.
 
-   A general or inbox relay step whose check was inconclusive also offers `EditRelays`
-   and, when appending the defaults can change the list, `UseRecommendedRelays`. That
-   covers two `RetryableFailure` states: no declared route answered (`NoUsableRoute`
-   in the `DeclaredRoute` context), or no record was found while one lookup source
-   failed and another answered (`DiscoveryIncomplete` in the `RecordDiscovery`
-   context). Only the account's declared relays and the public indexers count as
-   answering sources there. The host's discovery relays count only when no indexer
-   was searched (explicit discovery relays). The propose methods, including
-   `propose_onboarding_relay_repair`, accept those states. A proposal built on any
+   The general and inbox relay steps offer `EditRelays` and, when appending
+   defaults can change the list, `UseRecommendedRelays`. If a lookup finds no
+   list and an authoritative source answers, the step reports `NeedsInput` with
+   `Missing` and retains `DiscoveryIncomplete` beside any failed-source findings.
+   An empty partial recheck of a previously observed list retains that list and reports
+   `RetryableFailure`. The account's declared relays and the public indexers are
+   authoritative for discovery. The host's discovery relays count when no indexer
+   was searched (explicit discovery relays). The relay step also offers edits
+   when no declared route answered (`NoUsableRoute` in the `DeclaredRoute`
+   context). A proposal built on any
    inconclusive check, including a `NeedsInput` or `Passed` step that retains
    lookup-source failures, has `inconclusive` set. Before approving one, show an
    explicit at-your-own-risk confirmation: a newer record may sit on a source that did
@@ -881,8 +882,9 @@ a retry resumes that repair before other checks. It cannot be cancelled as if
 nothing had been published: a relay may already have accepted it. Signed bytes
 are retained before the first send and replayed unchanged on retry.
 
-Discovery reads require a completed relay query. Failed/partial empty discovery
-is distinct from absence and never offers automatic replacement. A valid record
+Discovery reads require a completed relay query. If an empty relay-list lookup
+has failed sources, replacing the list requires explicit approval of an
+inconclusive proposal. A valid record
 from a partially successful lookup may pass while retaining `DiscoveryIncomplete`
 and source failures in its findings; a passed step is not necessarily warning-free.
 Off-filter records are ignored. Single-device discovery remains incomplete if

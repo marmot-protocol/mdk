@@ -18,6 +18,10 @@ struct Network {
     return_off_filter_events: AtomicBool,
     fail_index_only: AtomicBool,
     inspection_errors: FixtureMutex<HashMap<String, transport_nostr::DirectoryInspectionError>>,
+    /// Like `inspection_errors`, but each fails only the next inspection of
+    /// a matching endpoint.
+    one_shot_inspection_errors:
+        FixtureMutex<HashMap<String, transport_nostr::DirectoryInspectionError>>,
     inspected_endpoints: FixtureMutex<Vec<String>>,
     zero_acks: AtomicBool,
     block_publish: AtomicBool,
@@ -96,11 +100,24 @@ impl DirectoryRelayFetcher for Network {
         self.inspected_endpoints
             .lock()
             .extend(request.endpoints.iter().map(|endpoint| endpoint.0.clone()));
+        let one_shot = {
+            let mut errors = self.one_shot_inspection_errors.lock();
+            let needle = errors.keys().find(|needle| {
+                request
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.0.contains(needle.as_str()))
+            });
+            needle.cloned().and_then(|needle| errors.remove(&needle))
+        };
+        if let Some(error) = one_shot {
+            return Err(error);
+        }
         if let Some(error) = request.endpoints.iter().find_map(|endpoint| {
             self.inspection_errors
                 .lock()
                 .iter()
-                .find_map(|(needle, error)| endpoint.0.contains(needle).then_some(*error))
+                .find_map(|(needle, error)| endpoint.0.contains(needle).then(|| error.clone()))
         }) {
             return Err(error);
         }
@@ -816,7 +833,7 @@ async fn transient_endpoint_failures_are_warnings_when_another_declared_route_co
         network
             .inspection_errors
             .lock()
-            .insert("degraded.example".into(), error);
+            .insert("degraded.example".into(), error.clone());
         let (status, findings, _) = manager
             .account_setup()
             .check_onboarding_step(&c, OnboardingStep::Relays)
@@ -4273,7 +4290,7 @@ async fn an_inbox_list_no_declared_route_answers_can_be_extended_with_consent() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_inconclusive_inbox_lookup_offers_an_edit_whose_approval_tolerates_the_failed_source() {
+async fn a_missing_inbox_list_past_a_failed_source_offers_an_edit_whose_approval_tolerates_it() {
     use transport_nostr::DirectoryInspectionError;
 
     #[derive(Debug, PartialEq)]
@@ -4288,7 +4305,8 @@ async fn an_inconclusive_inbox_lookup_offers_an_edit_whose_approval_tolerates_th
         AtApproval::OnlyHostAnswers,
     ] {
         let (_dir, runtime, network, keys, id) = fixture().await;
-        // One declared relay is dead, so no lookup of the missing inbox list completes.
+        // One declared relay is dead. The other and the public indexers
+        // answer, so the inbox list is missing and the dead relay is advice.
         network
             .inspection_errors
             .lock()
@@ -4306,7 +4324,8 @@ async fn an_inconclusive_inbox_lookup_offers_an_edit_whose_approval_tolerates_th
         )
         .await;
         let state = &snapshot.steps[OnboardingStep::InboxRelays.index()];
-        assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+        assert_eq!(state.status, OnboardingStatus::NeedsInput);
+        assert_eq!(state.findings[0].issue, OnboardingIssue::Missing);
         assert!(offers_relay_edits(state), "{:?}", state.actions);
         let incomplete = state
             .findings
@@ -4484,7 +4503,7 @@ async fn a_host_relay_the_account_declares_vouches_while_public_indexers_fail() 
     )
     .await;
     let state = &snapshot.steps[OnboardingStep::InboxRelays.index()];
-    assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+    assert_eq!(state.status, OnboardingStatus::NeedsInput);
     assert!(offers_relay_edits(state), "{:?}", state.actions);
     let setup = runtime.account_setup();
     let proposed = setup
@@ -4501,14 +4520,255 @@ async fn a_host_relay_the_account_declares_vouches_while_public_indexers_fail() 
     runtime.shutdown_and_close().await.unwrap();
 }
 
+// The public indexers answer, but the account's sole declared relay may
+// hold a list they lack. Keep the failed source visible when offering an edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authoritative_empty_lookup_reports_failures_and_retries_transient_sources() {
+    use transport_nostr::DirectoryInspectionError::*;
+
+    for (error, one_shot, attempts, issue) in [
+        (Unreachable, true, 2, None),
+        (TimedOut, true, 2, None),
+        (Incomplete, true, 2, None),
+        (Unreachable, false, 2, Some(OnboardingIssue::Unreachable)),
+        (
+            Incomplete,
+            false,
+            2,
+            Some(OnboardingIssue::DiscoveryIncomplete),
+        ),
+        (
+            Restricted,
+            false,
+            1,
+            Some(OnboardingIssue::AccessRestricted),
+        ),
+        (
+            PaymentRequired,
+            false,
+            1,
+            Some(OnboardingIssue::PaymentRequired),
+        ),
+        (
+            AuthenticationRequired,
+            false,
+            1,
+            Some(OnboardingIssue::AuthenticationRequired),
+        ),
+    ] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        let errors = if one_shot {
+            &network.one_shot_inspection_errors
+        } else {
+            &network.inspection_errors
+        };
+        errors.lock().insert("flaky.example".into(), error.clone());
+        let mut c = runtime
+            .accounts()
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        c.records[OnboardingStep::Relays.index()] = Some(signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), "wss://flaky.example".into()]],
+            "",
+            unix_now_seconds(),
+        ));
+        let (status, observed, record) = runtime
+            .account_setup()
+            .check_onboarding_step(&c, OnboardingStep::InboxRelays)
+            .await;
+        let label = format!("{error:?} one_shot={one_shot}");
+        assert_eq!(status, OnboardingStatus::NeedsInput, "{label}");
+        assert!(record.is_none(), "{label}");
+        assert_eq!(observed[0].issue, OnboardingIssue::Missing, "{label}");
+        assert_eq!(check_inconclusive(&observed), issue.is_some(), "{label}");
+        if let Some(issue) = issue {
+            assert_eq!(
+                observed[1].issue,
+                OnboardingIssue::DiscoveryIncomplete,
+                "{label}"
+            );
+            assert_eq!(observed[2].issue, issue, "{label}");
+            assert_eq!(
+                observed[2].endpoint.as_deref(),
+                Some("wss://flaky.example"),
+                "{label}"
+            );
+        } else {
+            assert_eq!(observed.len(), 1, "{label}");
+        }
+        let asked = network
+            .inspected_endpoints
+            .lock()
+            .iter()
+            .filter(|endpoint| endpoint.contains("flaky.example"))
+            .count();
+        assert_eq!(asked, attempts, "{label}");
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_list_returned_before_an_incomplete_reply_remains_discovered() {
+    use transport_nostr::DirectoryInspectionError::{Incomplete, Partial};
+
+    for (one_shot, retry_delta, retry_signed) in [
+        (false, None, true),
+        (true, None, true),
+        (true, Some(-1), true),
+        (true, Some(1), false),
+    ] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        let mut checkpoint = runtime
+            .accounts()
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        checkpoint.records[OnboardingStep::Relays.index()] = Some(signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), "wss://outbox.example".into()]],
+            "",
+            unix_now_seconds(),
+        ));
+        let inbox = signed(
+            &keys,
+            10050,
+            vec![vec!["relay".into(), "wss://inbox.example".into()]],
+            "keep",
+            unix_now_seconds(),
+        );
+        if let Some(delta) = retry_delta {
+            let mut candidate = signed(
+                &keys,
+                10050,
+                vec![vec!["relay".into(), "wss://older.example".into()]],
+                "",
+                inbox.created_at.saturating_add_signed(delta),
+            );
+            if !retry_signed {
+                candidate.sig = None;
+            }
+            network.events.lock().push(candidate);
+        }
+        let errors = if one_shot {
+            &network.one_shot_inspection_errors
+        } else {
+            &network.inspection_errors
+        };
+        errors.lock().insert(
+            "outbox.example".into(),
+            Partial {
+                records: vec![DirectoryRelayEventRecord {
+                    endpoints: vec![TransportEndpoint("wss://outbox.example".into())],
+                    event: inbox.clone(),
+                }],
+                cause: Box::new(Incomplete),
+            },
+        );
+
+        let (status, findings, record) = runtime
+            .account_setup()
+            .check_onboarding_step(&checkpoint, OnboardingStep::InboxRelays)
+            .await;
+        assert_eq!(status, OnboardingStatus::Passed, "one-shot {one_shot}");
+        assert_eq!(record, Some(inbox), "one-shot {one_shot}");
+        assert!(!findings.iter().any(|f| f.issue == OnboardingIssue::Missing));
+        assert!(check_inconclusive(&findings));
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_recheck_preserves_the_newest_previously_observed_inbox_list() {
+    use transport_nostr::DirectoryInspectionError::{Partial, Restricted};
+
+    for returns_older in [false, true] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        let snapshot = inbox_step(
+            &runtime,
+            &network,
+            &keys,
+            &id,
+            vec![vec!["r".into(), "wss://outbox.example".into()]],
+            Some(vec![vec!["relay".into(), "wss://inbox.example".into()]]),
+        )
+        .await;
+        assert_eq!(
+            snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::Passed
+        );
+        let prior = {
+            let mut events = network.events.lock();
+            let index = events.iter().position(|event| event.kind == 10050).unwrap();
+            events.remove(index)
+        };
+        let error = if returns_older {
+            Partial {
+                records: vec![DirectoryRelayEventRecord {
+                    endpoints: vec![TransportEndpoint("wss://outbox.example".into())],
+                    event: signed(
+                        &keys,
+                        10050,
+                        vec![vec!["relay".into(), "wss://old-inbox.example".into()]],
+                        "",
+                        prior.created_at - 1,
+                    ),
+                }],
+                cause: Box::new(Restricted),
+            }
+        } else {
+            Restricted
+        };
+        network
+            .inspection_errors
+            .lock()
+            .insert("outbox.example".into(), error);
+
+        let snapshot = runtime
+            .account_setup()
+            .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+            .await
+            .unwrap();
+        let state = &snapshot.steps[OnboardingStep::InboxRelays.index()];
+        assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+        assert!(!state.actions.contains(&OnboardingAction::EditRelays));
+        assert!(
+            state
+                .findings
+                .iter()
+                .any(|f| f.issue == OnboardingIssue::AccessRestricted)
+        );
+        let retained = runtime
+            .accounts()
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained.records[OnboardingStep::InboxRelays.index()].as_ref(),
+            Some(&prior)
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unanswered_lookup_offers_no_relay_edit() {
-    // Nothing answers, or only the host's own relays answer while every
-    // public indexer fails: nothing vouches that the lists are absent.
-    for only_host_answers in [false, true] {
+    use transport_nostr::DirectoryInspectionError::{Incomplete, TimedOut};
+
+    // Nothing answers, or only the host's own relays finish their lookup.
+    for indexer_failure in [None, Some(TimedOut), Some(Incomplete)] {
         let (_dir, runtime, network, _keys, id) = fixture().await;
-        if only_host_answers {
-            fail_public_indexers(&network);
+        if let Some(failure) = indexer_failure {
+            let mut errors = network.inspection_errors.lock();
+            for indexer in crate::MarmotDeployment::white_noise().discovery_indexer_endpoints() {
+                errors.insert(indexer.0, failure.clone());
+            }
         } else {
             network.fail_reads.store(true, Ordering::SeqCst);
         }
@@ -10256,7 +10516,7 @@ async fn a_passed_step_offers_removing_a_relay_that_refused_the_local_key() {
         network
             .inspection_errors
             .lock()
-            .insert("members.example".into(), error);
+            .insert("members.example".into(), error.clone());
         let checked = checked_relay_step(&runtime, &id, OnboardingStep::InboxRelays).await;
         assert_eq!(
             checked.steps[OnboardingStep::InboxRelays.index()].status,
@@ -10376,7 +10636,7 @@ async fn only_a_policy_refusal_of_the_local_key_nominates_a_route_for_removal() 
         network
             .inspection_errors
             .lock()
-            .insert("flaky.example".into(), error);
+            .insert("flaky.example".into(), error.clone());
         let checked = checked_relay_step(&runtime, &id, OnboardingStep::InboxRelays).await;
         assert_eq!(
             checked.steps[OnboardingStep::InboxRelays.index()].status,

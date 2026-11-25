@@ -271,7 +271,8 @@ for reconnect/backoff and relay status mechanics.
   deadline, connection) charges every EVENT frame it was sent and did not read. An
   `auth-required:` refusal, or an EOSE carrying NIP-67 `auth`, is retried once under a new id after the client
   authenticates; the retry spends what the first attempt left of the budget, and the reply keeps both attempts' events and counts. Authentication still
-  under way at the deadline ends the request `TimedOut` (undecided), never as the refusal. The relay plane's own
+  under way at the deadline ends the request `TimedOut` (undecided), never as the refusal. A watch on a newly
+  created relay returns the refusal after `AUTH_CHALLENGE_WAIT` if it sees no challenge. The relay plane's own
   one-shot clients get finite requests through `FiniteRequests::install`; keep that surface to `install`, `fetch`,
   `fetch_watching` with `watch_auth` (an authentication watch started before the dial), `sharing` (one byte budget
   for a read's relays, charged per kept event) and their types.

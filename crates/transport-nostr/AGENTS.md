@@ -55,9 +55,13 @@ drop: storage imports loss by count, so a token's count must cover every drop un
 - One-shot directory reads (`fetch_directory_events`, `fetch_public_events`, `inspect_directory_events`) send each
   relay's REQ as one of the adapter's finite requests, on an owned client built with `FiniteRequests::install`: each
   relay's reply keeps its own end (EOSE, CLOSED reason, cut, deadline), and a relay that requires NIP-42 is asked once
-  more after the signer authenticates. Authentication still under way at the deadline is `TimedOut`, not a refusal;
-  inspection watches authentication from before the dial, so a refusal on connect still decides a later close, and an
-  EOSE with NIP-67 `more` or `auth` is `Incomplete` (not for the inbox probe). Each query's relays share one byte budget
+  more after the signer authenticates. An inspection watches authentication before dialing. An `auth-required:`
+  close with no challenge within the grace period is `AuthenticationRequired`. Authentication in progress at
+  the deadline is `TimedOut`. A remaining NIP-67 `auth` hint means `AuthenticationRequired`, and `more`
+  means `Incomplete`; the inbox route probe accepts EOSE with either hint. A CLOSED `rate-limited:` or
+  unclassified `error:` is `Unreachable`. An incomplete relay-list inspection returns any verified lists
+  with its failure cause. Its records establish presence without certifying that the source completed.
+  Each query's relays share one byte budget
   (`FiniteRequests::sharing`); directory and public reads set no item cap, since a relay's every EVENT frame would count,
   matching or not. Frames not yet read are bounded per relay request, not per query: a queue of the budget plus one
   frame, and the batch its collector is reading, so up to twice that. A public read past `max_events`, cut, or ending
