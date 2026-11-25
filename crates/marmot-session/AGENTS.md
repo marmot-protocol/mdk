@@ -108,7 +108,7 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     that finds the deadline passed refuses by clock and leaves the mark to the next maintenance pass. Marked, it is never published again
     at any clock, `redeliver_welcome` publishes nothing for it, and a late acknowledgement cannot mark it delivered;
     the watcher never marks while a detached wave holds it, and withdrawing a Welcome past its deadline marks it
-    expired. An attempt that ends past the deadline reports no `WelcomeDeliveryFailure`. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
+    expired, wave or not, unless a saved acceptance or an unreadable retry record may still deliver it. An attempt that ends past the deadline reports no `WelcomeDeliveryFailure`. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
     maintenance pass) finds staged or owed; a group skipped because it was not live is read again on each pass until it
     is. A Welcome stays watched until its row is settled. Maintenance publishes each watched Welcome that is owed and
     that no attempt record (stored fanout or detached wave) holds, so one whose fanout expired goes out again on the

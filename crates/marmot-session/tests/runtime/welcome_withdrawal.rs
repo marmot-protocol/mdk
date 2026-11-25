@@ -1362,3 +1362,48 @@ async fn a_link_welcome_withdrawn_after_its_deadline_is_audited_as_expired() {
         }
     }
 }
+
+/// A device link's Welcome withdrawn after its deadline while a detached
+/// wave still holds it ends expired, its row and its audit row agreeing: the
+/// withdrawal stops the wave either way, and the deadline is why it was never
+/// delivered. The wave then finishes without sending it or reporting it
+/// pending.
+#[tokio::test]
+async fn a_link_welcome_withdrawn_past_its_deadline_while_a_wave_holds_it_ends_expired() {
+    let dir = relaxed_storage_dir().unwrap();
+    let LinkWelcome {
+        mut runtime,
+        wall,
+        welcome,
+        audit_path,
+    } = link_welcome(dir.path(), false).await;
+    let task = runtime
+        .prepare_welcome_retry_task_with_audit_context(vec![welcome.clone()], Default::default())
+        .unwrap();
+    assert_eq!(task.message_ids(), std::slice::from_ref(&welcome.id));
+
+    wall.set(300_200);
+    assert_eq!(
+        runtime.withdraw_welcome(&welcome.id).unwrap(),
+        WelcomeWithdrawal::Withdrawn
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .expire_sent_welcome(&welcome.id, Timestamp(0))
+            .unwrap(),
+        Some(cgka_traits::message::WelcomeExpiry::Recorded)
+    );
+    let finished = runtime
+        .finish_welcome_publish_task(task.run().await)
+        .await
+        .unwrap();
+    assert!(finished.welcome_failures.is_empty());
+    runtime.run_due_maintenance().await.unwrap();
+    let rows = v5_audit_rows(&audit_path)
+        .into_iter()
+        .filter(|row| row["event"]["type"] == "welcome_withdrawn")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["event"]["reason"], "expired");
+}

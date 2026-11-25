@@ -776,6 +776,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// Welcomes whose withdrawal `withdraw_welcome` recorded, so the
     /// watcher does not record it again.
     v5_withdrawn_welcomes: std::sync::Mutex<HashSet<cgka_traits::MessageId>>,
+    /// Welcomes whose expiry notice and row this process recorded while the
+    /// write marking that done has not landed yet, so a retry only writes it.
+    v5_expired_welcomes: std::sync::Mutex<HashSet<cgka_traits::MessageId>>,
     /// The `(group, recipient)` pairs whose Welcome delivery state changed
     /// and that no host has taken yet (`take_welcome_delivery_changes`).
     welcome_delivery_changes: std::sync::Mutex<Vec<(GroupId, MemberId)>>,
@@ -861,6 +864,7 @@ where
             watched_welcomes: Vec::new(),
             v5_prepared_welcomes: HashSet::new(),
             v5_withdrawn_welcomes: std::sync::Mutex::new(HashSet::new()),
+            v5_expired_welcomes: std::sync::Mutex::new(HashSet::new()),
             welcome_delivery_changes: std::sync::Mutex::new(Vec::new()),
             welcome_route_retries: std::sync::Mutex::default(),
             welcome_store_read: false,

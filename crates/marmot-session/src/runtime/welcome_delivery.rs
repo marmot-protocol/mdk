@@ -492,25 +492,34 @@ where
         // saved acceptance that meets its policy, whose mark a stop
         // interrupted, is reconciled first. A record that cannot be read now
         // does not stop the withdrawal.
-        if let Ok(Some(fanout)) = self.session.transport_fanout(message_id) {
+        let fanout = self.session.transport_fanout(message_id);
+        if let Ok(Some(fanout)) = &fanout {
             self.settle_met_welcome(
                 &fanout.exact_message,
-                accepted_fanout_targets(&fanout),
+                accepted_fanout_targets(fanout),
                 fanout.required_acks,
             );
         }
+        // An acceptance whose delivered mark did not land, or a record that
+        // cannot be read now, may still deliver it.
+        let may_deliver = match &fanout {
+            Ok(Some(fanout)) => accepted_fanout_targets(fanout) >= fanout.required_acks.max(1),
+            Ok(None) => false,
+            Err(_) => true,
+        };
         // Read before the withdrawal hides it, from the stored rows, so a
         // group not loaded yet reads as its rows stand: one past its deadline
         // ends expired, not withdrawn.
         let now = self.wall_clock.now();
         let status = self.session.stored_outbound_welcome_status(message_id, now);
         // A Welcome past its deadline has expired, which is why it was never
-        // delivered: withdrawing it marks and records that expiry, once,
-        // unless an acceptance it holds, or one it cannot read now, may still
-        // deliver it. A record step that fails now is retried by the watcher
-        // or the next start; a mark that cannot be written fails the call.
+        // delivered: withdrawing it marks and records that expiry, once, even
+        // while a wave holds it, since the withdrawal stops that wave too,
+        // unless `may_deliver`. A record step that fails now is retried by
+        // the watcher or the next start; a mark that cannot be written fails
+        // the call.
         if matches!(status, Ok(OutboundWelcomeStatus::PastDeadline))
-            && !self.expired_welcome_may_still_close(message_id)
+            && !may_deliver
             && self.session.expire_sent_welcome(message_id, now)?.is_some()
         {
             self.record_welcome_expiry(message_id);
@@ -519,21 +528,18 @@ where
             }
             return Ok(WelcomeWithdrawal::Withdrawn);
         }
-        // The Welcome's terminal reason: `withdrawn` for a live one; for one
-        // past its deadline or whose commit lost that the watcher has not
-        // recorded yet, that. One no watcher holds was recorded when it
-        // settled, or settled before this process watched it. An expired one
-        // was recorded when marked.
+        // The Welcome's terminal reason, as its row will read: `withdrawn`
+        // for a live one, or one past its deadline withdrawn as is; for one
+        // whose commit lost that the watcher has not recorded yet, that. One
+        // no watcher holds was recorded when it settled, or settled before
+        // this process watched it. An expired one was recorded when marked.
         let reason = match status {
             _ if !self.audit.records_v5() => None,
-            Ok(OutboundWelcomeStatus::Owed { .. } | OutboundWelcomeStatus::Waiting) => {
-                Some(audit_v5::WithdrawalReason::Withdrawn)
-            }
-            Ok(OutboundWelcomeStatus::PastDeadline)
-                if self.watched_welcomes.contains(message_id) =>
-            {
-                Some(audit_v5::WithdrawalReason::Expired)
-            }
+            Ok(
+                OutboundWelcomeStatus::Owed { .. }
+                | OutboundWelcomeStatus::Waiting
+                | OutboundWelcomeStatus::PastDeadline,
+            ) => Some(audit_v5::WithdrawalReason::Withdrawn),
             Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::CommitSuperseded))
                 if self.watched_welcomes.contains(message_id) =>
             {

@@ -466,14 +466,26 @@ where
     /// steps of [`Self::expire_welcome`] after the mark. False when one could
     /// not be done now; the watcher, or else the next start, retries.
     pub(super) fn record_welcome_expiry(&self, welcome_id: &cgka_traits::MessageId) -> bool {
-        // The notice goes first, so a retry never records the row twice.
-        if !self.note_welcome_delivery_changed(welcome_id)
-            || !self.record_v5_welcome_settled(welcome_id, WelcomeSettlement::Expired)
-        {
-            return false;
+        let recorded = || {
+            self.v5_expired_welcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        // The notice goes first, so a retry never records the row twice; one
+        // this process already recorded only has its flag written again.
+        if !recorded().contains(welcome_id) {
+            if !self.note_welcome_delivery_changed(welcome_id)
+                || !self.record_v5_welcome_settled(welcome_id, WelcomeSettlement::Expired)
+            {
+                return false;
+            }
+            recorded().insert(welcome_id.clone());
         }
         match self.session.record_sent_welcome_expiry(welcome_id) {
-            Ok(()) => true,
+            Ok(()) => {
+                recorded().remove(welcome_id);
+                true
+            }
             Err(error) => {
                 log_unrecorded_welcome_expiry(&error);
                 false
