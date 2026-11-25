@@ -1224,7 +1224,7 @@ mod tests {
         AgentControlRelayListDirection, AgentControlRelayListType, AgentControlRelayLists,
         AgentControlRequest, AgentControlResponse, AgentControlSendMaintenanceDisposition,
         AgentControlTimelineCursor, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, decode_frame,
-        encode_frame, read_envelope, read_frame, write_frame,
+        encode_frame, read_envelope, read_frame, read_frame_bytes, write_frame,
     };
 
     #[test]
@@ -1901,6 +1901,25 @@ mod tests {
         let received: AgentControlEnvelope<AgentControlRequest> =
             read_envelope(&mut reader).await.unwrap().unwrap();
         assert_eq!(received, request);
+    }
+
+    #[tokio::test]
+    async fn read_frame_bytes_returns_each_raw_line_under_the_cap() {
+        let oversized = vec![b'x'; MAX_AGENT_CONTROL_FRAME_BYTES + 1];
+        let mut input = b"{\"id\":\"a\",\"id\":\"b\"}\n".to_vec();
+        input.extend_from_slice(&oversized);
+        let mut reader = BufReader::new(input.as_slice());
+        // The frame comes back byte for byte, repeated keys and all.
+        assert_eq!(
+            read_frame_bytes(&mut reader).await.unwrap().as_deref(),
+            Some(&b"{\"id\":\"a\",\"id\":\"b\"}\n"[..])
+        );
+        assert!(matches!(
+            read_frame_bytes(&mut reader).await,
+            Err(AgentControlError::FrameTooLarge(_))
+        ));
+        let mut empty = BufReader::new(&b""[..]);
+        assert_eq!(read_frame_bytes(&mut empty).await.unwrap(), None);
     }
 
     #[tokio::test]

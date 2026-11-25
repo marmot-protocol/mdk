@@ -127,8 +127,10 @@ impl RejectedFrame {
                 message: "marmot_agent_control must be \"marmot.agent-control.v2\"".to_owned(),
             };
         }
-        if !fields.get("type").is_some_and(serde_json::Value::is_string) {
-            return Self::invalid(id, "missing field `type`");
+        match fields.get("type") {
+            None => return Self::invalid(id, "missing field `type`"),
+            Some(kind) if !kind.is_string() => return Self::invalid(id, "`type` must be a string"),
+            Some(_) => {}
         }
         // Decode the `type` on its own, so a known type with a bad field value
         // (which serde also reports as an unknown variant) stays invalid.

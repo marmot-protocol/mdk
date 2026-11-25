@@ -310,6 +310,13 @@ async fn rejected_control_frames_get_an_error_response() {
             "invalid_request",
             "duplicate field `auth_token`",
         ),
+        // A present `type` of the wrong JSON type is not reported missing.
+        (
+            format!(r#"{{"marmot_agent_control":"{v2}","id":"l","type":null}}"#),
+            Some("l"),
+            "invalid_request",
+            "`type` must be a string",
+        ),
         ("hello".to_owned(), None, "invalid_request", "JSON"),
         ("[1,2]".to_owned(), None, "invalid_request", "JSON object"),
         (

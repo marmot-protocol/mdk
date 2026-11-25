@@ -166,7 +166,9 @@ def main():
                 if not line.endswith(b"\n"):
                     sys.exit("error: truncated or oversized reply")
                 reply = json.loads(line)
-                if reply.get("id") != envelope["id"]:
+                # A request wn-agent cannot read may be rejected without an id.
+                unmatched_rejection = reply.get("type") == "error" and "id" not in reply
+                if not unmatched_rejection and reply.get("id") != envelope["id"]:
                     sys.exit("error: reply id does not match the request")
                 replies += 1
                 print(json.dumps(reply), flush=True)
