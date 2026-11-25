@@ -795,19 +795,6 @@ fn snapshot_group_events() {
             reason: "not_group_admin".into(),
             artifact: None,
             size_class: None,
-            app_event_id: None,
-        }
-    );
-    insta::assert_json_snapshot!(
-        "event_queued_intent_refused_app_message",
-        GroupEvent::QueuedIntentRefused {
-            group_id: gid(),
-            intent_id: mid(),
-            intent_kind: "app_message".into(),
-            reason: "app_message_new_members".into(),
-            artifact: None,
-            size_class: None,
-            app_event_id: Some("ab".repeat(32)),
         }
     );
     insta::assert_json_snapshot!(
@@ -819,7 +806,6 @@ fn snapshot_group_events() {
             reason: "event_too_large".into(),
             artifact: Some(cgka_traits::OversizedArtifact::Welcome),
             size_class: Some(cgka_traits::EventSizeClass::From64To128Kib),
-            app_event_id: None,
         }
     );
     insta::assert_json_snapshot!(

@@ -292,28 +292,23 @@ impl MarmotApp {
         })
     }
 
-    /// Retract the timeline row of every send refused for a new member that
-    /// still shows one. The engine settles a refused queued send in the
+    /// Retract, in one timeline rebuild, the group's rows of sends refused
+    /// for a new member. The engine settles a refused queued send in the
     /// transaction that retires it; its row follows here, live when the
     /// refusal is announced and at account open after a crash in between.
     pub(crate) fn retract_refused_local_sends(
         &self,
         label: &str,
-    ) -> Result<Vec<AppProjectionUpdate>, AppError> {
-        let refused = self
-            .account_storage(label)?
+        group_id_hex: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        self.account_storage(label)?
             .app_storage()
-            .refused_local_submissions_with_live_rows()?;
-        let mut updates = Vec::new();
-        for (group_id_hex, message_id_hex) in refused {
-            updates.extend(self.invalidate_timeline_app_event(
-                label,
-                &group_id_hex,
-                &message_id_hex,
+            .invalidate_refused_local_sends_for_group(
+                group_id_hex,
                 crate::LOCAL_PUBLISH_FAILED_REASON,
-            )?);
-        }
-        Ok(updates)
+            )?
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
     }
 
     #[cfg(test)]
@@ -527,7 +522,7 @@ impl MarmotApp {
                             "original local send was not found".into(),
                         )
                     })?;
-                if original.state == 3 {
+                if matches!(original.state, 3 | 4) {
                     return Err(AppError::InvalidAppMessagePayload(
                         "original local send was rejected".into(),
                     ));

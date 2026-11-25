@@ -1085,7 +1085,6 @@ mod tests {
                     reason: "not_group_admin".into(),
                     artifact: None,
                     size_class: None,
-                    app_event_id: None,
                 },
             }));
         let MarmotEventFfi::GroupEvent {
@@ -1156,7 +1155,6 @@ mod tests {
                     reason: "event_too_large".into(),
                     artifact: Some(marmot_app::OversizedArtifact::Welcome),
                     size_class: Some(marmot_app::EventSizeClass::From64To128Kib),
-                    app_event_id: None,
                 },
             }));
         assert!(

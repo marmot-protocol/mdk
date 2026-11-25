@@ -146,15 +146,14 @@ impl SqliteAppStorage {
         Ok(())
     }
 
-    /// Refused sends whose timeline row has not been retracted yet, as
-    /// `(group_id_hex, message_id_hex)`.
-    pub fn refused_local_submissions_with_live_rows(&self) -> StorageResult<Vec<(String, String)>> {
+    /// The groups holding a refused send whose timeline row is still live.
+    pub fn groups_with_refused_live_local_sends(&self) -> StorageResult<Vec<String>> {
         let conn = self.lock()?;
         let mut statement = conn.prepare_cached(
-            "SELECT local.group_id_hex, local.message_id_hex FROM local_message_submissions local JOIN app_events event ON event.group_id_hex=local.group_id_hex AND event.message_id_hex=local.message_id_hex WHERE local.state=4 AND event.invalidated=0",
+            "SELECT DISTINCT local.group_id_hex FROM local_message_submissions local JOIN app_events event ON event.group_id_hex=local.group_id_hex AND event.message_id_hex=local.message_id_hex WHERE local.state=4 AND event.invalidated=0",
         ).storage()?;
         statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| row.get(0))
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()

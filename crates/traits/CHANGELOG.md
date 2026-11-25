@@ -9,7 +9,6 @@
 - `SendIntent::AppMessage` gains `only_to_members`: the member accounts the payload may reach. The engine checks the
   group's member accounts when it encrypts, so a send queued while an Add merged is refused
   (`EngineError::AppMessageNewMembers`, new) rather than sent to the new member. `None` keeps today's behavior.
-- `GroupEvent::QueuedIntentRefused` gains `app_event_id`, the inner event id of a refused application message.
 - `OutboundIntentStorage::retire_refused_queued_outbound_intent` (defaulting to a delete) retires a queued intent the
   settled state refused, given the refusal's kind, so a host's storage can settle its own state in the same
   transaction.

@@ -875,10 +875,6 @@ pub enum GroupEvent {
         /// other reason.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size_class: Option<crate::EventSizeClass>,
-        /// For an application message, the id of its inner app event, which
-        /// names the message to its sender. `None` for every other intent.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        app_event_id: Option<String>,
     },
     /// A change the host asked for directly was not applied (mdk#2332): the
     /// call that staged its commit returned with the commit unresolved, and a

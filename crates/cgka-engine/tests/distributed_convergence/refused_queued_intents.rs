@@ -125,7 +125,6 @@ fn assert_refused_and_retired(drain: &DemotedDrain, intent_kind: &str) {
                 reason,
                 artifact: None,
                 size_class: None,
-                app_event_id: None,
             },
         ] => {
             assert_eq!(group_id, &drain.group_id);
@@ -373,14 +372,15 @@ async fn a_queued_message_not_for_a_new_member_is_refused_once_the_add_merges() 
     let carol_hex = hex::encode(carol.self_id().as_slice());
     let members = vec![alice.self_id(), carol.self_id()];
     let payload = |created_at| {
-        let event = MarmotAppEvent::new(
+        MarmotAppEvent::new(
             carol_hex.clone(),
             created_at,
             MARMOT_APP_EVENT_KIND_CHAT,
             vec![],
             "x".to_owned(),
-        );
-        (event.id.clone(), event.encode().unwrap())
+        )
+        .encode()
+        .unwrap()
     };
     let message = |payload, only_to_members| SendIntent::AppMessage {
         group_id: group_id.clone(),
@@ -393,7 +393,7 @@ async fn a_queued_message_not_for_a_new_member_is_refused_once_the_add_merges() 
         other => panic!("the message waits in the queue: {other:?}"),
     };
 
-    let (outbox_event_id, outbox_payload) = payload(1_700_000_000);
+    let outbox_payload = payload(1_700_000_000);
     let outbox_intent = queued(
         carol
             .queue_app_message_with_audit_context(
@@ -420,9 +420,9 @@ async fn a_queued_message_not_for_a_new_member_is_refused_once_the_add_merges() 
         carol.ingest(route(add, &group_id)).await.unwrap(),
         IngestOutcome::Buffered { .. }
     ));
-    let (sent_event_id, sent_payload) = payload(1_700_000_001);
+    let sent_payload = payload(1_700_000_001);
     let sent_intent = queued(carol.send(message(sent_payload, members.clone())).await);
-    let (_, for_dave) = payload(1_700_000_002);
+    let for_dave = payload(1_700_000_002);
     queued(
         carol
             .send(message(
@@ -443,33 +443,22 @@ async fn a_queued_message_not_for_a_new_member_is_refused_once_the_add_merges() 
         matches!(drained.as_slice(), [SendResult::ApplicationMessage { .. }]),
         "only the message that lists dave is published: {drained:?}"
     );
-    let mut refusals = events
+    let refusals = events
         .iter()
         .filter_map(|event| match event {
             GroupEvent::QueuedIntentRefused {
-                intent_id,
-                reason,
-                app_event_id,
-                ..
-            } => Some((intent_id.clone(), reason.as_str(), app_event_id.clone())),
+                intent_id, reason, ..
+            } => Some((intent_id, reason.as_str())),
             _ => None,
         })
         .collect::<Vec<_>>();
-    refusals.sort_by_key(|refusal| refusal.2.clone());
-    let mut expected = vec![
-        (
-            outbox_intent.clone(),
-            "app_message_new_members",
-            Some(outbox_event_id),
-        ),
-        (
-            sent_intent.clone(),
-            "app_message_new_members",
-            Some(sent_event_id),
-        ),
-    ];
-    expected.sort_by_key(|refusal| refusal.2.clone());
-    assert_eq!(refusals, expected);
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    for intent in [&outbox_intent, &sent_intent] {
+        assert!(
+            refusals.contains(&(intent, "app_message_new_members")),
+            "{refusals:?}"
+        );
+    }
     assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
@@ -479,7 +468,7 @@ async fn a_queued_message_not_for_a_new_member_is_refused_once_the_add_merges() 
         "the refused messages are no longer queued"
     );
 
-    let (_, direct) = payload(1_700_000_003);
+    let direct = payload(1_700_000_003);
     assert!(matches!(
         carol.send(message(direct, members)).await,
         Err(cgka_traits::error::EngineError::AppMessageNewMembers)

@@ -1922,8 +1922,8 @@ async fn custom_event_to_members_is_refused_while_a_member_is_unlisted() {
 /// A send the engine took into its queue, which the worker recorded as
 /// accepted pending, is settled as refused in the transaction that retires its
 /// intent for a new member. Its row is retracted when the refusal is announced,
-/// or at the next account open if a crash came first. While the engine holds
-/// the send, its status names the event.
+/// or at the next account open if a crash came first; a refused send takes no
+/// edit. While the engine holds the send, its status names the event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
     use cgka_traits::storage::OutboundIntentStorage;
@@ -1931,8 +1931,7 @@ async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
     let group_hex = hex::encode(h.group.as_slice());
     let storage = h.app.account_storage("alice").unwrap();
     let runtime = MarmotAppRuntime::new(h.app.clone());
-    let mut queued = Vec::new();
-    for token in ["announced", "crashed"] {
+    let refuse = |token: &str| {
         let (accepted, _) = h
             .app
             .admit_local_message(
@@ -1941,7 +1940,6 @@ async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
                 token.into(),
                 LocalMessageRequest {
                     content: format!("{{\"token\":\"{token}\"}}"),
-                    custom_kind: Some(41201),
                     only_to_members: Some(vec![h.account.clone()]),
                     ..Default::default()
                 },
@@ -1994,8 +1992,8 @@ async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
             runtime.local_send_status("alice", &h.group, token).unwrap(),
             Some(crate::LocalSendStatus::RefusedNewMembers)
         );
-        queued.push((record, accepted.message_id_hex));
-    }
+        (record, accepted.message_id_hex)
+    };
     let retracted = |message_id_hex: &str| {
         storage
             .app_storage()
@@ -2007,7 +2005,29 @@ async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
             == Some(crate::LOCAL_PUBLISH_FAILED_REASON)
     };
 
-    let (announced, announced_id) = &queued[0];
+    let (_, crashed) = refuse("crashed");
+    assert!(!retracted(&crashed), "no announcement reached the host");
+    drop(h.app.client("alice").await.unwrap());
+    assert!(retracted(&crashed), "the account open retracts the row");
+    assert!(
+        h.app
+            .admit_local_message_with_edit_at(
+                "alice",
+                &h.group,
+                "edit-of-crashed".into(),
+                LocalMessageRequest {
+                    content: "later version".into(),
+                    ..Default::default()
+                },
+                None,
+                Some("crashed".into()),
+                crate::unix_now_seconds(),
+            )
+            .is_err(),
+        "a refused send takes no edit"
+    );
+
+    let (announced, announced_id) = refuse("announced");
     let refusal = cgka_traits::engine::GroupEvent::QueuedIntentRefused {
         group_id: h.group.clone(),
         intent_id: announced.id.clone(),
@@ -2015,7 +2035,6 @@ async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
         reason: "app_message_new_members".into(),
         artifact: None,
         size_class: None,
-        app_event_id: Some(announced_id.clone()),
     };
     assert!(
         h.app
@@ -2023,11 +2042,6 @@ async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
             .unwrap()
             .is_some()
     );
-    assert!(retracted(announced_id));
-    let crashed_id = &queued[1].1;
-    assert!(!retracted(crashed_id), "no announcement reached the host");
-
-    drop(h.app.client("alice").await.unwrap());
-    assert!(retracted(crashed_id), "the account open retracts the row");
+    assert!(retracted(&announced_id));
     runtime.shutdown_and_close().await.unwrap();
 }

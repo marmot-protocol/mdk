@@ -190,8 +190,9 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Retire a queued intent the settled state refused and tell the host.
-    /// Nothing was staged for it, so the durable delete is the only write; the
-    /// announcement follows it.
+    /// Nothing was staged for it, so the storage retirement is the whole
+    /// durable step (a host's storage may settle its own state for the refusal
+    /// in that transaction); the announcement follows it.
     pub(crate) fn retire_refused_queued_intent(
         &mut self,
         record: &QueuedOutboundIntent,
@@ -239,14 +240,6 @@ impl<S: StorageProvider> Engine<S> {
             }) => (Some(*artifact), Some(*size_class)),
             _ => (None, None),
         };
-        let app_event_id = match &record.intent {
-            SendIntent::AppMessage { payload, .. } => {
-                cgka_traits::app_event::MarmotAppEvent::decode(payload)
-                    .ok()
-                    .map(|event| event.id)
-            }
-            _ => None,
-        };
         self.events_buf.push_back(GroupEvent::QueuedIntentRefused {
             group_id: record.group_id.clone(),
             intent_id: record.id.clone(),
@@ -254,7 +247,6 @@ impl<S: StorageProvider> Engine<S> {
             reason: reason.to_string(),
             artifact,
             size_class,
-            app_event_id,
         });
     }
 }
