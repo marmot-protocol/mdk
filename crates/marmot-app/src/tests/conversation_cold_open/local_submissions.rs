@@ -2039,6 +2039,27 @@ async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
         artifact: None,
         size_class: None,
     };
+    // A chat-list refresh that fails takes the retraction back with it, so
+    // the retried announcement retracts the rows and builds the update.
+    let faults = projection_fault_connection(&h.app);
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_chat_list_update BEFORE UPDATE ON chat_list_rows
+                BEGIN SELECT RAISE(FAIL, 'injected chat list'); END;",
+        )
+        .unwrap();
+    assert!(
+        h.app
+            .projection_update_for_invalidation_event("alice", &refusal)
+            .is_err()
+    );
+    assert!(
+        !retracted(&announced_id),
+        "the failed refresh retracted nothing"
+    );
+    faults
+        .execute_batch("DROP TRIGGER fail_chat_list_update")
+        .unwrap();
     assert!(
         h.app
             .projection_update_for_invalidation_event("alice", &refusal)
@@ -2047,5 +2068,54 @@ async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
     );
     assert!(retracted(&announced_id));
     assert!(retracted(&also_refused));
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A raw connection to alice's account database, for installing failure
+/// triggers beside the app's own connection.
+fn projection_fault_connection(app: &MarmotApp) -> rusqlite::Connection {
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+        .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+}
+
+/// A member-limited edit carries the item again in full, so it is refused,
+/// not sent, while a member is unlisted, as the send it edits would be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_to_members_is_refused_while_a_member_is_unlisted() {
+    let h = History::new(0).await;
+    let runtime = MarmotAppRuntime::new(h.app.clone());
+    runtime
+        .submit_text("alice", &h.group, "first".into(), "original".into())
+        .await
+        .unwrap();
+    local_send_completed(&runtime, &h.group, "original").await;
+    runtime
+        .submit_tagged_edit_for_local_send_to_members(
+            "alice",
+            &h.group,
+            "original".into(),
+            "second".into(),
+            vec![],
+            vec!["cc".repeat(32)],
+            "edit".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        local_send_settled(&runtime, &h.group, "edit").await,
+        crate::LocalSendStatus::RefusedNewMembers
+    );
     runtime.shutdown_and_close().await.unwrap();
 }

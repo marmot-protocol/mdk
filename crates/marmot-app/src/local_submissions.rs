@@ -301,14 +301,19 @@ impl MarmotApp {
         label: &str,
         group_id_hex: &str,
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
-        self.account_storage(label)?
-            .app_storage()
-            .invalidate_refused_local_sends_for_group(
-                group_id_hex,
-                crate::LOCAL_PUBLISH_FAILED_REASON,
-            )?
-            .map(|update| self.app_projection_update(label, update))
-            .transpose()
+        // One transaction with the chat-list refresh: if that fails, the rows
+        // stay live and a retry retracts them and builds the update again.
+        let storage = self.account_storage(label)?;
+        StorageProvider::with_transaction(&storage, |storage| {
+            storage
+                .app_storage()
+                .invalidate_refused_local_sends_for_group(
+                    group_id_hex,
+                    crate::LOCAL_PUBLISH_FAILED_REASON,
+                )?
+                .map(|update| self.app_projection_update(label, update))
+                .transpose()
+        })
     }
 
     #[cfg(test)]
