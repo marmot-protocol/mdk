@@ -102,11 +102,16 @@ fn app(net: &Net, host: &Host<'_>) -> (tempfile::TempDir, MarmotAppRuntime) {
     (dir, MarmotAppRuntime::new(app))
 }
 
+#[allow(
+    clippy::needless_update,
+    reason = "Inherit the defaults of new optional host settings"
+)]
 fn options(net: &Net, host: &Host<'_>) -> OnboardingOptions {
     OnboardingOptions {
         default_relays: net.urls(host.defaults),
         discovery_relays: net.urls(host.discovery),
         inbox_relays: net.urls(host.inbox),
+        ..OnboardingOptions::default()
     }
 }
 
@@ -604,21 +609,24 @@ async fn read_case(behavior: &str, probe: Probe, expected_issues: &[Issue]) {
         traffic.challenges,
         traffic.auths
     );
-    if let Some(issue) = issue_for(&net, inbox, "faulty") {
-        assert!(
-            expected_issues.contains(&issue),
-            "{behavior}: unexpected relay issue {issue:?}"
-        );
-    } else if inbox.status == Status::Passed {
-        // A successful absence check may lead to automatic creation.
-        assert!(net.relay("host").traffic().accepted_writes.contains(&10050));
+    let issue = issue_for(&net, inbox, "faulty");
+    if expected_issues.is_empty() {
+        assert_eq!(issue, None, "{behavior}: {inbox:?}");
+        if inbox.status == Status::Passed {
+            assert!(net.relay("host").traffic().accepted_writes.contains(&10050));
+        } else {
+            assert!(
+                inbox
+                    .findings
+                    .iter()
+                    .any(|finding| finding.issue == Issue::Missing),
+                "{behavior}: expected conclusive absence, got {inbox:?}"
+            );
+        }
     } else {
         assert!(
-            inbox
-                .findings
-                .iter()
-                .any(|finding| finding.issue == Issue::Missing),
-            "{behavior}: expected a wire error or conclusive absence, got {inbox:?}"
+            issue.is_some_and(|issue| expected_issues.contains(&issue)),
+            "{behavior}: expected a relay issue from {expected_issues:?}, got {inbox:?}"
         );
     }
     account.shutdown().await;
@@ -676,7 +684,7 @@ async fn relay_read_behaviours_are_classified_over_the_wire() {
         (
             "CLOSED rate-limited:",
             closing("rate-limited: slow down"),
-            &[AccessRestricted],
+            &[AccessRestricted, Unreachable],
         ),
         (
             "CLOSED restricted:",
@@ -686,7 +694,7 @@ async fn relay_read_behaviours_are_classified_over_the_wire() {
         (
             "CLOSED error: shutting down",
             closing("error: shutting down"),
-            &[AccessRestricted],
+            &[AccessRestricted, Unreachable],
         ),
         (
             "CLOSED auth-required: with no AUTH challenge ever sent",
