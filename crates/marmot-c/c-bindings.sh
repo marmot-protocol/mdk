@@ -74,10 +74,10 @@ esac
 cp "$TARGET_DIR/release/lib$LIB_BASENAME.$DYLIB_EXT" "$OUT_DIR/lib/"
 cp "$TARGET_DIR/release/lib$LIB_BASENAME.a" "$OUT_DIR/lib/"
 cp "$CRATE_DIR/include/marmot.h" "$OUT_DIR/include/"
-for crate in marmot-c marmot-uniffi; do
-  mkdir -p "$OUT_DIR/references/$crate"
-  cp "crates/$crate/API-REFERENCE.md" "$OUT_DIR/references/$crate/"
-done
+mkdir -p "$OUT_DIR/references/marmot-c" "$OUT_DIR/references/marmot-uniffi"
+sed 's|^\[Header contract\](include/marmot\.h#L|[Header contract](../../include/marmot.h#L|' \
+  "$CRATE_DIR/API-REFERENCE.md" > "$OUT_DIR/references/marmot-c/API-REFERENCE.md"
+cp crates/marmot-uniffi/API-REFERENCE.md "$OUT_DIR/references/marmot-uniffi/"
 
 echo "==> Generating pkg-config file"
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$WORKSPACE_DIR/Cargo.toml" | head -n 1)"

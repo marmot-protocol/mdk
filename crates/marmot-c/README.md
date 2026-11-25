@@ -86,8 +86,8 @@ Install cbindgen 0.29.4 and Python 3.11 or later to build the bundle locally:
 ```
 
 Tagged releases (`marmotc-v*`) publish a Linux x86_64 zip (`marmot-c-linux-x86_64-<version>.zip`) with the same
-contents plus this README. To follow source links, copy the contents of `references/` into `crates/` at
-the matching source revision and copy `include/marmot.h` into `crates/marmot-c/include/`.
+contents plus this README. The C reference links to the header inside the bundle. To follow Rust source links,
+copy `references/marmot-uniffi/API-REFERENCE.md` into `crates/marmot-uniffi/` at the matching source revision.
 
 ## Binary compatibility
 
