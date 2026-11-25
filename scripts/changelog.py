@@ -37,17 +37,19 @@ SECTIONS = ("Breaking changes", "Added", "Changed", "Deprecated", "Removed", "Fi
 FRAGMENT_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]*\.md$")
 VERSION = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$")
 UNRELEASED = re.compile(r"^##\s+\[?unreleased\]?", re.IGNORECASE)
+# Keep a Changelog compare links, e.g. `[Unreleased]: https://.../compare/marmotc-v0.19.0...HEAD`.
+UNRELEASED_LINK = re.compile(r"^\[Unreleased\]: (?P<compare>\S+/compare/)(?P<prefix>[A-Za-z-]*)(?P<previous>\S+)\.\.\.HEAD$")
 
 
-def git_files(root: Path, *patterns: str) -> list[Path]:
-    """Tracked and untracked (not ignored) files matching the patterns."""
+def repo_files(root: Path) -> list[Path]:
+    """Tracked and untracked (not ignored) files."""
     out = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "--", *patterns],
+        ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout
-    return sorted({root / line for line in out.splitlines() if (root / line).is_file()})
+    return sorted({root / name for name in out.split("\0") if name and (root / name).is_file()})
 
 
 def parse_fragment(path: Path) -> tuple[dict[str, list[str]], list[str]]:
@@ -84,8 +86,10 @@ def fragments_by_changelog(root: Path) -> tuple[dict[Path, list[Path]], list[str
     """Group fragment files under the CHANGELOG.md beside their directory."""
     grouped: dict[Path, list[Path]] = {}
     errors: list[str] = []
-    for path in git_files(root, f"{FRAGMENT_DIR}/*", f"*/{FRAGMENT_DIR}/*"):
+    for path in repo_files(root):
         rel = path.relative_to(root)
+        if FRAGMENT_DIR not in rel.parts[:-1]:
+            continue
         changelog = path.parent.parent / "CHANGELOG.md"
         if path.parent.name != FRAGMENT_DIR:
             errors.append(f"{rel}: fragments go directly in {FRAGMENT_DIR}/, not a subdirectory")
@@ -100,7 +104,7 @@ def fragments_by_changelog(root: Path) -> tuple[dict[Path, list[Path]], list[str
 
 def check(root: Path, none_pending: bool) -> list[str]:
     grouped, errors = fragments_by_changelog(root)
-    for changelog in git_files(root, "CHANGELOG.md", "*/CHANGELOG.md"):
+    for changelog in (path for path in repo_files(root) if path.name == "CHANGELOG.md"):
         for number, line in enumerate(changelog.read_text(encoding="utf-8").splitlines(), 1):
             if UNRELEASED.match(line):
                 rel = changelog.relative_to(root)
@@ -146,6 +150,14 @@ def release(root: Path, version: str, date: str) -> list[str]:
         heading = f"## [{version}] - {date}" if bracketed else f"## {version} - {date}"
         at = next((i for i, line in enumerate(lines) if line.startswith("## ")), len(lines))
         lines[at:at] = release_section(heading, fragments)
+        for i, line in enumerate(lines):
+            if link := UNRELEASED_LINK.match(line):
+                compare, prefix = link["compare"], link["prefix"]
+                lines[i:i + 1] = [
+                    f"[Unreleased]: {compare}{prefix}{version}...HEAD",
+                    f"[{version}]: {compare}{prefix}{link['previous']}...{prefix}{version}",
+                ]
+                break
         changelog.write_text("\n".join(lines) + "\n", encoding="utf-8")
         for path in fragments:
             path.unlink()

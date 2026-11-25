@@ -80,12 +80,22 @@ class ChangelogTests(unittest.TestCase):
         self.assertFalse(first.exists() or second.exists())
         self.assertEqual(self.errors(none_pending=True), "")
 
-    def test_release_keeps_a_bracketed_heading_style(self) -> None:
-        self.write("crates/a/CHANGELOG.md", HEADER + "## [0.1.0] - 2026-01-01\n\n- Old.\n")
+    def test_release_keeps_bracketed_headings_and_their_compare_links(self) -> None:
+        # Keep a Changelog files render `## [0.2.0]` as a link only with a `[0.2.0]:` definition.
+        compare = "https://example.test/compare/"
+        self.write(
+            "crates/a/CHANGELOG.md",
+            HEADER + "## [0.1.0] - 2026-01-01\n\n- Old.\n\n"
+            + f"[Unreleased]: {compare}marmotc-v0.1.0...HEAD\n[0.1.0]: {compare}marmotc-v0.0.9...marmotc-v0.1.0\n",
+        )
         self.write("crates/a/changelog.d/x.md", "### Added\n\n- X.\n")
         self.assertEqual(release(self.root, "0.2.0", "2026-02-02"), [])
-        self.assertIn("## [0.2.0] - 2026-02-02\n\n### Added\n\n- X.\n\n## [0.1.0]",
-                      (self.root / "crates/a/CHANGELOG.md").read_text())
+        self.assertEqual(
+            (self.root / "crates/a/CHANGELOG.md").read_text(),
+            HEADER + "## [0.2.0] - 2026-02-02\n\n### Added\n\n- X.\n\n## [0.1.0] - 2026-01-01\n\n- Old.\n\n"
+            + f"[Unreleased]: {compare}marmotc-v0.2.0...HEAD\n[0.2.0]: {compare}marmotc-v0.1.0...marmotc-v0.2.0\n"
+            + f"[0.1.0]: {compare}marmotc-v0.0.9...marmotc-v0.1.0\n",
+        )
 
     def test_release_refuses_a_version_already_released_or_a_bad_fragment(self) -> None:
         fragment = self.write("crates/a/changelog.d/x.md", "### Added\n\n- X.\n")

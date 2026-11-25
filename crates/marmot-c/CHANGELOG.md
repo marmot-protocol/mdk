@@ -1243,7 +1243,7 @@ record layouts changed. See the [client upgrade guide](../../docs/integration/0.
 - Account storage advances through migrations 70–74 for local group reset boundaries,
   chat navigation, revisioned drafts and invitation attention.
   Back up before upgrading; downgrade is unsupported. See the cohort upgrade notes in
-  [the CLI changelog](../cli/CHANGELOG.md#unreleased).
+  [the CLI changelog](../cli/CHANGELOG.md#0100---2026-09-16).
 - `marmot_account_id_hex` now decodes `nprofile` / `nostr:nprofile`
   references and discards relay hints. Existing hex, `npub`, and
   `marmot://profile/` forms keep their established OK-plus-NULL contract.
