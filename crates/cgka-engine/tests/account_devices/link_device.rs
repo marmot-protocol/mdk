@@ -13,12 +13,14 @@ use super::device_roster::{
     key_package_ref, phone_and_laptop, roster, roster_device, roster_of, roster_update, slot,
 };
 use super::send_intents::{pending_proposals, queue, store_pending_add};
+use super::support::raw_inbox::raw_seal;
 use super::*;
 use cgka_engine::engine::{OutboundWelcomeStatus, WelcomeWithdrawal};
 use cgka_traits::app_components::{
     DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1, MAX_LEAVES_PER_ACCOUNT,
     RejectedSlotReasonV1, RejectedSlotV1, encode_device_roster_update_v1,
 };
+use cgka_traits::engine::SealedWelcome;
 use openmls::prelude::ProposalOrRefType;
 
 /// The sender rule's refusal of an Add without its roster entry.

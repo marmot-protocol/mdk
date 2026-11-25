@@ -43,8 +43,8 @@ use cgka_traits::app_components::{
 };
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
-    CgkaEngine, CommitOrderingPriority, CreateGroupRequest, GroupEvent, KeyPackage, SealedWelcome,
-    SendIntent, SendResult, SiblingKeyPackage,
+    CgkaEngine, CommitOrderingPriority, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent,
+    SendResult, SiblingKeyPackage,
 };
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
@@ -79,7 +79,7 @@ use tls_codec::{Deserialize as _, Serialize as _};
 
 mod support;
 use support::proof_signer;
-use support::raw_inbox::{ingest_raw, join_raw, raw_seal, seal_and_bind};
+use support::raw_inbox::{ingest_raw, join_raw, seal_and_bind};
 
 #[path = "account_devices/send_intents.rs"]
 mod send_intents;
