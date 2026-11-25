@@ -15733,21 +15733,21 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     timeout(Duration::from_secs(5), welcome_policy.wait_until_blocked())
         .await
         .expect("the invite's first Welcome publish reaches the relay");
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if !runtime
-                .pending_welcome_deliveries(&alice_id)
-                .await
-                .unwrap()
-                .is_empty()
-            {
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("in-flight confirmed-invite Welcome must remain pending");
+    // Owed, with no attempt finished. (The pending list answers only once
+    // every earlier Welcome wave has settled, so it cannot be read here.)
+    let invites = runtime
+        .invite_deliveries(&alice_id, Some(&group_id))
+        .await
+        .unwrap();
+    let carol_invite = invites
+        .iter()
+        .find(|invite| invite.recipient_hex == carol_id)
+        .expect("carol's invite is listed");
+    assert_eq!(
+        carol_invite.state,
+        marmot_app::WelcomeDeliveryState::Sending { last_problem: None },
+        "in-flight confirmed-invite Welcome must remain owed"
+    );
     runtime.shutdown().await;
     drop(runtime);
     drop(app);
