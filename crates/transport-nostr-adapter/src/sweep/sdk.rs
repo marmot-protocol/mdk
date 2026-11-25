@@ -233,14 +233,20 @@ impl SweepRelay for SdkSweepRelay {
             let Some(fresh) = self.acquire(query.filter(), limit.saturating_add(1)).await else {
                 return SliceReply::Unreachable(UnreachableKind::Disconnected);
             };
+            // A relay that asked to authenticate again may still hold events
+            // back, however the retry ended: no further ask.
+            if fresh.retried {
+                return SliceReply::Closed(ClosedReason(Some(
+                    TransportEndpointRejectionCategory::AuthRequired,
+                )));
+            }
             reply = fresh;
         }
         match failed_end(reply.end) {
-            // NIP-67 `auth` after the finite request's retry, or a relay that
-            // asked to authenticate again on the fresh ask: it may still hold
-            // events back, so it stands as an `auth-required:` refusal would;
-            // splitting the slice cannot help.
-            Ok(()) if reply.auth || reply.retried => SliceReply::Closed(ClosedReason(Some(
+            // NIP-67 `auth` after the finite request's retry: the relay may
+            // still hold events back, so it stands as an `auth-required:`
+            // refusal would; splitting the slice cannot help.
+            Ok(()) if reply.auth => SliceReply::Closed(ClosedReason(Some(
                 TransportEndpointRejectionCategory::AuthRequired,
             ))),
             Ok(()) => SliceReply::Answered {

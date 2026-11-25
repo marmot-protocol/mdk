@@ -603,13 +603,15 @@ async fn an_auth_hint_leaves_the_slice_owed() {
     );
 }
 
-/// A relay that answers one REQ before NIP-42 finishes with the oldest
-/// `before_auth` of the events its `since`/`until` match, ends it with the
-/// AUTH challenge and NIP-67 `auth`, and once the client authenticates
-/// answers each REQ with the newest `cap` of them: a cap it publishes
-/// nowhere. A REQ before authentication is refused.
+/// A relay that answers each REQ whose number `challenged` lists with the
+/// oldest `before_auth` of the events its `since`/`until` match, a new AUTH
+/// challenge and NIP-67 `auth`, holding the rest back until the client
+/// authenticates again. Once authenticated it answers each other REQ with the
+/// newest `cap` of them: a cap it publishes nowhere. A REQ sent while it
+/// awaits AUTH is refused.
 async fn auth_gated_clamping_relay(
     events: Vec<Event>,
+    challenged: &'static [usize],
     before_auth: usize,
     cap: usize,
 ) -> (RelayUrl, tokio::task::JoinHandle<()>) {
@@ -638,14 +640,15 @@ async fn auth_gated_clamping_relay(
                         .filter(|event| (since..=until).contains(&event.created_at.as_secs()))
                         .collect::<Vec<_>>();
                     matched.sort_by_key(|event| std::cmp::Reverse(event.created_at));
-                    if reqs == 1 {
+                    if challenged.contains(&reqs) {
+                        authenticated = false;
                         let mut frames = matched
                             .iter()
                             .rev()
                             .take(before_auth)
                             .map(|event| serde_json::json!(["EVENT", id, event]))
                             .collect::<Vec<_>>();
-                        frames.push(serde_json::json!(["AUTH", "challenge"]));
+                        frames.push(serde_json::json!(["AUTH", format!("challenge {reqs}")]));
                         frames.push(serde_json::json!(["EOSE", id, ["auth"]]));
                         frames
                     } else if !authenticated {
@@ -710,7 +713,8 @@ async fn a_slice_retried_after_authentication_proves_nothing() {
     let keys = Keys::generate();
     let older = group_event(&keys, GROUP, T0 + 10, 0);
     let newer = group_event(&keys, GROUP, T0 + 20, 1);
-    let (url, server) = auth_gated_clamping_relay(vec![older.clone(), newer.clone()], 1, 1).await;
+    let (url, server) =
+        auth_gated_clamping_relay(vec![older.clone(), newer.clone()], &[1], 1, 1).await;
     let (sdk, relay) = authenticating_sweep(
         url,
         RelayCaps {
@@ -779,7 +783,7 @@ async fn a_one_second_slice_retried_after_authentication_is_proven() {
         let stored = (0..events)
             .map(|n| group_event(&keys, GROUP, T0 + 10, n))
             .collect::<Vec<_>>();
-        let (url, server) = auth_gated_clamping_relay(stored.clone(), before_auth, 500).await;
+        let (url, server) = auth_gated_clamping_relay(stored.clone(), &[1], before_auth, 500).await;
         let (sdk, relay) = authenticating_sweep(
             url,
             RelayCaps {
@@ -819,6 +823,62 @@ async fn a_one_second_slice_retried_after_authentication_is_proven() {
         sdk.shutdown().await;
         server.abort();
     }
+}
+
+/// A relay that challenges the fresh ask again leaves its retry on what that
+/// ask's first attempt left of the budget, so the retry's cut proves nothing
+/// either: the slice stands as an `auth-required` refusal and stays owed,
+/// rather than a second the relay cannot prove (mdk#3689).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_ask_challenged_again_stands_as_a_refusal() {
+    let keys = Keys::generate();
+    let stored = (0..6)
+        .map(|n| group_event(&keys, GROUP, T0 + 10, n))
+        .collect::<Vec<_>>();
+    // REQ 1 and the fresh ask (REQ 3) are challenged; each retry is cut.
+    let (url, server) = auth_gated_clamping_relay(stored, &[1, 3], 6, 500).await;
+    let (sdk, relay) = authenticating_sweep(
+        url,
+        RelayCaps {
+            max_limit: Some(10),
+            negentropy: false,
+        },
+    )
+    .await;
+    let store = MemoryStore::default();
+    let mut sink = Sink::default();
+    let report = run_sweep(
+        request(SweepRange {
+            since: T0 + 10,
+            until: T0 + 10,
+        }),
+        &relay,
+        &mut sink,
+        &store,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        report.end,
+        SweepEnd::Refused(ClosedReason(Some(
+            TransportEndpointRejectionCategory::AuthRequired
+        ))),
+        "{report:?}"
+    );
+    assert!(
+        report.covered.is_empty() && sink.events.is_empty(),
+        "{report:?}"
+    );
+    assert!(
+        store
+            .0
+            .lock()
+            .unwrap()
+            .is_none_or(|cursor| cursor.next_since == T0 + 10),
+        "the cursor stays at the slice"
+    );
+    sdk.shutdown().await;
+    server.abort();
 }
 
 /// wok's marmot preset: cap 5,000, default page 500. A saturated second over
