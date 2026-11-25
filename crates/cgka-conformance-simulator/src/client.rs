@@ -2423,21 +2423,31 @@ impl HarnessClient {
         let sealer = self.sealer();
         let mut sealed = Vec::with_capacity(welcomes.len());
         for welcome in welcomes {
-            match self.seal_welcome(&sealer, welcome).await {
-                Ok(message) => sealed.push(SealedWelcome {
-                    local_id: welcome.local_id.clone(),
-                    message,
-                }),
-                Err(error) => {
-                    if let Some(pending) = pending {
-                        self.engine_mut().publish_failed(pending).await?;
-                    }
-                    return Err(EngineError::Peeler(error));
-                }
-            }
+            let message = match self.seal_welcome(&sealer, welcome).await {
+                Ok(message) => message,
+                Err(error) => return self.unstage(pending, EngineError::Peeler(error)).await,
+            };
+            sealed.push(SealedWelcome {
+                local_id: welcome.local_id.clone(),
+                message,
+            });
         }
-        self.engine_mut().bind_sealed_welcomes(&sealed, None)?;
+        if let Err(error) = self.engine_mut().bind_sealed_welcomes(&sealed, None) {
+            return self.unstage(pending, error).await;
+        }
         Ok(sealed.into_iter().map(|sealed| sealed.message).collect())
+    }
+
+    /// Roll back `pending`, which published nothing, and fail with `error`.
+    async fn unstage<T>(
+        &mut self,
+        pending: Option<PendingStateRef>,
+        error: EngineError,
+    ) -> Result<T, EngineError> {
+        if let Some(pending) = pending {
+            self.engine_mut().publish_failed(pending).await?;
+        }
+        Err(error)
     }
 
     async fn seal_welcome(

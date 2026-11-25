@@ -997,7 +997,10 @@ async fn a_failed_restore_hides_a_rejoin_offer_until_the_next_open() {
         "the refusal is a fact the group's change generation holds"
     );
     let anchor_state = image(&fork.storage, &fork.group);
-    let stored = fork.carol.stored_welcome(&offer.message_id).unwrap();
+    // The load that refuses the confirmation also refuses `stored_welcome`,
+    // so the offer's own bytes stand in for what the session would unseal.
+    let stored: cgka_traits::TransportMessage =
+        serde_json::from_slice(&offer.welcome_bytes).unwrap();
     unknown(
         fork.carol
             .confirm_group_rejoin(&offer.message_id, &live_token, raw_unseal(&stored))

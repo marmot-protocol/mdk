@@ -11901,7 +11901,7 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
         .find(|offer| offer.message_id == replacement.id)
         .unwrap();
     let token = offer.rejoin.unwrap().local_state_token;
-    let stored = carol.stored_welcome(&replacement.id).unwrap();
+    let stored = carol.stored_welcome(&replacement.id, &token).unwrap();
     assert!(matches!(
         carol
             .confirm_group_rejoin(&replacement.id, &[0; 32], raw_unseal(&stored))
@@ -11926,10 +11926,20 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
             .unwrap(),
     );
     carol.confirm_published(pending).await.unwrap();
-    let stored = carol.stored_welcome(&replacement.id).unwrap();
+    // The stale token is refused before the offer reaches the signer.
+    assert!(matches!(
+        carol.stored_welcome(&replacement.id, &token),
+        Err(cgka_traits::EngineError::InvalidTransition(
+            cgka_traits::engine_state::InvalidTransition {
+                from: "ActiveMember",
+                to: "JoinWelcome",
+                ..
+            }
+        ))
+    ));
     assert!(matches!(
         carol
-            .confirm_group_rejoin(&replacement.id, &token, raw_unseal(&stored))
+            .confirm_group_rejoin(&replacement.id, &token, raw_unseal(&replacement))
             .await,
         Err(cgka_traits::EngineError::InvalidTransition(
             cgka_traits::engine_state::InvalidTransition {
@@ -11951,7 +11961,7 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
     // The offer survives reconstruction without consuming its KeyPackage.
     drop(carol);
     let mut carol = build_client_with_storage(b"carol", carol_storage.clone());
-    let stored = carol.stored_welcome(&replacement.id).unwrap();
+    let stored = carol.stored_welcome(&replacement.id, &token).unwrap();
     carol
         .confirm_group_rejoin(&replacement.id, &token, raw_unseal(&stored))
         .await

@@ -852,32 +852,14 @@ where
 
     /// Seal and bind founding Welcomes a create left unsealed, because its
     /// seal failed or the process stopped first, and watch them so this pass
-    /// publishes them. Sealing stops at the first failure; the next pass
-    /// tries the rest again.
+    /// publishes them. One that fails to seal stays owed for the next pass
+    /// and holds back none of the others.
     async fn seal_owed_welcomes(&mut self) -> AccountResult<()> {
         let welcomes = self.session.unsealed_owed_welcomes()?;
-        let mut sealed = Vec::with_capacity(welcomes.len());
-        for welcome in &welcomes {
-            let Ok(message) = self.session.sealer.seal_welcome(welcome).await else {
-                tracing::debug!(
-                    target: TRACE_TARGET,
-                    method = "seal_owed_welcomes",
-                    unsealed = welcomes.len() - sealed.len(),
-                    "founding Welcome seal failed; retried next pass"
-                );
-                break;
-            };
-            sealed.push(SealedWelcome {
-                local_id: welcome.local_id.clone(),
-                message,
-            });
-        }
-        if sealed.is_empty() {
+        if welcomes.is_empty() {
             return Ok(());
         }
-        self.session.bind_sealed_welcomes(&sealed, None)?;
-        let messages: Vec<TransportMessage> =
-            sealed.into_iter().map(|sealed| sealed.message).collect();
+        let messages = self.session.seal_founding_welcomes(&welcomes).await;
         self.note_retained_welcomes(&messages);
         Ok(())
     }

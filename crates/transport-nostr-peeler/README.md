@@ -69,19 +69,21 @@ Welcome peeling still decodes an SDK event for NIP-59, whose unwrap verifies the
 Inbound:
 
 ```text
-real Nostr event -> NostrTransportEvent -> TransportMessage -> NostrMlsPeeler -> PeeledMessage
+kind 445:  real Nostr event -> NostrTransportEvent -> TransportMessage -> NostrMlsPeeler   -> PeeledMessage
+kind 1059: real Nostr event -> NostrTransportEvent -> TransportMessage -> NostrInboxSealer -> PeeledMessage
 ```
 
 Outbound:
 
 ```text
-EncryptedPayload + GroupContextSnapshot -> NostrMlsPeeler -> TransportMessage
+kind 445:  EncryptedPayload + GroupContextSnapshot -> NostrMlsPeeler   -> TransportMessage
+kind 1059: OutboundWelcome                         -> NostrInboxSealer -> TransportMessage
 ```
 
 The outbound `TransportMessage` carries a Nostr DTO payload. Outbound kind `445` events are signed at wrap time with a
 fresh ephemeral Nostr key generated per event, so the event id is final and the adapter publishes the event as-is (no
-pre-signing-id replacement). Welcome outputs are already signed NIP-59 gift wraps because NIP-59 construction needs the
-local signer.
+pre-signing-id replacement). `NostrInboxSealer` returns Welcomes as signed NIP-59 gift wraps, because NIP-59
+construction needs the account signer.
 
 ## Run tests
 

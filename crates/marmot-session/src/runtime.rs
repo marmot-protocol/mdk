@@ -736,6 +736,11 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     entropy: Arc<dyn EntropySource>,
     maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
+    /// The staged commit whose Welcomes are being sealed, set only across
+    /// that await (see [`Self::seal_commit_welcomes`]). Still set when no
+    /// call is sealing, it names a commit whose call was dropped mid-seal,
+    /// which maintenance rolls back.
+    sealing_commit: Option<PendingStateRef>,
     /// This runtime was asked to withdraw the device's slot for sign-out, so
     /// it publishes nothing more, whether or not a relay accepted. The next
     /// runtime for the account republishes.
@@ -863,6 +868,7 @@ where
             entropy: Arc::new(OsEntropy),
             maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
+            sealing_commit: None,
             key_package_slot_withdrawn: false,
             key_package_announcement_group: None,
             slot_superseded_through: None,
@@ -2943,6 +2949,8 @@ where
             let recovered = boxed(|| self.publish_session_effects(recovered)).await?;
             output.absorb_account_effects(recovered);
         }
+        let settled = boxed(|| self.settle_dropped_seal()).await?;
+        output.absorb_account_effects(settled);
         let now = self.wall_clock.now();
         // Before anything reads an evolution or an obligation: repair the
         // supersessions whose announcement never reached
@@ -4176,7 +4184,15 @@ where
             .into());
         };
         let welcomes = take_deferred_welcomes(&mut effects);
-        let sealed = match self.session.seal_welcomes(&welcomes).await {
+        let bound = match self.seal_commit_welcomes(pending, &welcomes).await {
+            Ok(sealed) => self
+                .session
+                .bind_sealed_welcomes(&sealed, None)
+                .map(|()| sealed)
+                .map_err(AccountError::from),
+            Err(error) => Err(EngineError::Peeler(error).into()),
+        };
+        let sealed = match bound {
             Ok(sealed) => sealed,
             Err(error) => {
                 let commit = PreparedSessionCommit {
@@ -4186,10 +4202,9 @@ where
                 };
                 self.rollback_prepared_session_commit_refused(commit, None)
                     .await?;
-                return Err(EngineError::Peeler(error).into());
+                return Err(error);
             }
         };
-        self.session.bind_sealed_welcomes(&sealed, None)?;
         Ok(PreparedSessionSend::Commit(PreparedSessionCommit {
             effects,
             welcomes: sealed.into_iter().map(|sealed| sealed.message).collect(),
@@ -6101,7 +6116,7 @@ where
             output.absorb_session_effects(effects, queue);
             return Ok(());
         }
-        let sealed = match self.session.seal_welcomes(&welcomes).await {
+        let sealed = match self.seal_commit_welcomes(pending, &welcomes).await {
             Ok(sealed) => sealed,
             Err(error) => {
                 self.rollback_unstaged_pending(Some(pending), output, queue)
@@ -6181,7 +6196,7 @@ where
 
         // A Welcome that cannot be sealed rolls its commit back before any
         // relay I/O, as a publish that reached no relay would.
-        let sealed = match self.session.seal_welcomes(&welcomes).await {
+        let sealed = match self.seal_commit_welcomes(pending, &welcomes).await {
             Ok(sealed) => sealed,
             Err(error) => {
                 self.rollback_unstaged_pending(Some(pending), output, queue)
@@ -6199,7 +6214,11 @@ where
         {
             // Bound first, so the rollback fails the sealed rows by their
             // transport ids and they are recorded as refused.
-            self.session.bind_sealed_welcomes(&sealed, None)?;
+            if let Err(error) = self.session.bind_sealed_welcomes(&sealed, None) {
+                self.rollback_unstaged_pending(Some(pending), output, queue)
+                    .await?;
+                return Err(error.into());
+            }
             self.note_retained_welcomes(&welcomes);
             let unretired =
                 self.unretired_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
@@ -6757,6 +6776,37 @@ where
             output.absorb_session_effects(effects, queue);
         }
         Ok(())
+    }
+
+    /// Seal the Welcomes of the staged commit `pending`. A remote signer can
+    /// hold the seal for minutes, and no fanout names the commit yet, so a
+    /// call dropped here would leave it pending for good. The commit is noted
+    /// across the await for [`Self::settle_dropped_seal`] to roll back, as a
+    /// seal failure would.
+    async fn seal_commit_welcomes(
+        &mut self,
+        pending: PendingStateRef,
+        welcomes: &[OutboundWelcome],
+    ) -> Result<Vec<SealedWelcome>, cgka_traits::error::PeelerError> {
+        self.sealing_commit = Some(pending);
+        let sealed = self.session.seal_welcomes(welcomes).await;
+        self.sealing_commit = None;
+        sealed
+    }
+
+    /// Roll back the commit a call dropped mid-seal left staged; see
+    /// [`Self::seal_commit_welcomes`].
+    async fn settle_dropped_seal(&mut self) -> AccountResult<AccountDeviceEffects> {
+        let mut output = AccountDeviceEffects::default();
+        let Some(pending) = self.sealing_commit else {
+            return Ok(output);
+        };
+        let mut queue = VecDeque::new();
+        self.rollback_unstaged_pending(Some(pending), &mut output, &mut queue)
+            .await?;
+        self.sealing_commit = None;
+        self.publish_queue(&mut output, &mut queue, None).await?;
+        Ok(output)
     }
 
     /// Drive one frozen fanout's pass. `pass` says whether it runs inside the

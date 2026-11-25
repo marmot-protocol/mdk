@@ -1757,13 +1757,10 @@ async fn run_stale_ordinary_recovery(phase: GroupEvolutionPhase) {
         .unwrap()
         .pop()
         .unwrap();
-    let stored = target.stored_welcome(&offer.message_id).unwrap();
+    let token = offer.rejoin.unwrap().local_state_token;
+    let stored = target.stored_welcome(&offer.message_id, &token).unwrap();
     target
-        .confirm_group_rejoin(
-            &offer.message_id,
-            &offer.rejoin.unwrap().local_state_token,
-            raw_unseal(&stored),
-        )
+        .confirm_group_rejoin(&offer.message_id, &token, raw_unseal(&stored))
         .await
         .unwrap();
     assert_eq!(
@@ -1972,13 +1969,10 @@ async fn run_pending_ref_restart(mode: &str) {
         .unwrap()
         .pop()
         .unwrap();
-    let stored = target.stored_welcome(&offer.message_id).unwrap();
+    let token = offer.rejoin.unwrap().local_state_token;
+    let stored = target.stored_welcome(&offer.message_id, &token).unwrap();
     target
-        .confirm_group_rejoin(
-            &offer.message_id,
-            &offer.rejoin.unwrap().local_state_token,
-            raw_unseal(&stored),
-        )
+        .confirm_group_rejoin(&offer.message_id, &token, raw_unseal(&stored))
         .await
         .unwrap();
     assert_eq!(
@@ -2210,13 +2204,10 @@ fn run_recovery_parent(point: &str) {
             let mut offers = target.pending_group_rejoins_for(Some(group_id)).unwrap();
             assert_eq!(offers.len(), 1);
             let offer = offers.pop().unwrap();
-            let stored = target.stored_welcome(&offer.message_id).unwrap();
+            let token = offer.rejoin.unwrap().local_state_token;
+            let stored = target.stored_welcome(&offer.message_id, &token).unwrap();
             target
-                .confirm_group_rejoin(
-                    &offer.message_id,
-                    &offer.rejoin.unwrap().local_state_token,
-                    raw_unseal(&stored),
-                )
+                .confirm_group_rejoin(&offer.message_id, &token, raw_unseal(&stored))
                 .await
                 .unwrap();
             assert_eq!(target.epoch(group_id).unwrap(), descriptor.target_epoch);

@@ -298,6 +298,127 @@ async fn founding_welcome_unsealed_at_stop_is_delivered_after_restart() {
     )));
 }
 
+/// Refuses every Welcome to the first recipient it is asked to seal for and
+/// seals the rest as [`MockSealer`] does: a founding Welcome that never seals.
+#[derive(Default)]
+struct FirstRecipientRefusingSealer {
+    refused: Mutex<Option<MemberId>>,
+}
+
+#[async_trait]
+impl InboxSealer for FirstRecipientRefusingSealer {
+    async fn unseal(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockSealer.unseal(msg).await
+    }
+
+    async fn seal_welcome(
+        &self,
+        welcome: &OutboundWelcome,
+    ) -> Result<TransportMessage, PeelerError> {
+        let refused = self
+            .refused
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| welcome.recipient.clone())
+            .clone();
+        if refused == welcome.recipient {
+            return Err(PeelerError::MissingContext {
+                label: "welcome_metadata".into(),
+            });
+        }
+        MockSealer.seal_welcome(welcome).await
+    }
+
+    async fn seal_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockSealer.seal_group_recovery(message, recipient).await
+    }
+
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        MockSealer.sealed_welcome_len(welcome)
+    }
+}
+
+/// Maintenance seals and sends every founding Welcome it can: one that never
+/// seals, whichever row maintenance reads first, stays owed and holds back no
+/// other recipient's.
+#[tokio::test]
+async fn an_unsealable_founding_welcome_holds_back_no_other() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new(STAGED_INVITE_KEY).unwrap();
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"founding-bob-2");
+    let mut carol = current_session(dir.path().join("carol.sqlite"), &key, b"founding-carol-2");
+    let (bob_id, carol_id) = (bob.self_id(), carol.self_id());
+    let bob_inbox = TransportEndpoint("wss://bob-inbox.example".into());
+    let carol_inbox = TransportEndpoint("wss://carol-inbox.example".into());
+    let group_relay = TransportEndpoint("wss://group.example".into());
+    let inboxes = |routing: StaticTransportRouting| {
+        routing
+            .with_inbox_route(bob_id.clone(), vec![bob_inbox.clone()])
+            .with_inbox_route(carol_id.clone(), vec![carol_inbox.clone()])
+    };
+    let adapter = RecordingAdapter::default();
+    let routing = SharedRouting(Arc::new(Mutex::new(inboxes(StaticTransportRouting::new(
+        vec![],
+    )))));
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let refusing = SwitchableSealer::default();
+    refusing.fail.store(true, Ordering::SeqCst);
+    let mut runtime = reopen_staged_invite_runtime(
+        dir.path(),
+        std::convert::identity,
+        Arc::new(refusing),
+        adapter.clone(),
+        routing.clone(),
+        wall.clone(),
+    );
+    let (group, _) = runtime
+        .create_group(CreateGroupRequest {
+            name: "one unsealable founding Welcome".into(),
+            description: String::new(),
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(runtime.session().unsealed_owed_welcomes().unwrap().len(), 2);
+    drop(runtime);
+
+    routing.update(|_| inboxes(staged_invite_routing(&group, &group_relay)));
+    let mut runtime = reopen_staged_invite_runtime(
+        dir.path(),
+        std::convert::identity,
+        Arc::new(FirstRecipientRefusingSealer::default()),
+        adapter.clone(),
+        routing,
+        wall,
+    );
+    runtime.run_due_maintenance().await.unwrap();
+    let publishes = staged_welcome_publishes(&adapter);
+    let [published] = publishes.as_slice() else {
+        panic!("maintenance must publish the one sealable founding Welcome");
+    };
+    let TransportEnvelope::Welcome { recipient } = &published.envelope else {
+        unreachable!("a Welcome publish")
+    };
+    let unsealed = runtime.session().unsealed_owed_welcomes().unwrap();
+    let [still_owed] = unsealed.as_slice() else {
+        panic!("the unsealable founding Welcome stays owed");
+    };
+    assert_ne!(&still_owed.recipient, recipient);
+    let joiner = if *recipient == bob_id { &mut bob } else { &mut carol };
+    let joined = joiner.ingest(published.clone()).await.unwrap();
+    assert_eq!(joined.outcome, cgka_traits::IngestOutcome::Processed);
+}
+
 #[tokio::test]
 async fn prepared_send_preserves_a_durably_queued_invite() {
     let dir = relaxed_storage_dir().unwrap();

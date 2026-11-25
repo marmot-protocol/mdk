@@ -440,7 +440,9 @@ pub enum PublishWork {
         pending: PendingStateRef,
     },
     /// Founding Welcomes, sealed and bound before the effects leave the
-    /// session.
+    /// session. Only those that sealed are listed: one whose seal failed stays
+    /// owed and unsealed, and maintenance seals and sends it later, so this is
+    /// not a complete list of the founding recipients.
     FoundingGroupCreated { welcomes: Vec<TransportMessage> },
     AutoPublish {
         msg: TransportMessage,
@@ -2116,7 +2118,7 @@ impl AccountDeviceSession {
         welcome_id: &MessageId,
         token: &[u8],
     ) -> Result<GroupId, EngineError> {
-        let welcome = self.engine.stored_welcome(welcome_id)?;
+        let welcome = self.engine.stored_welcome(welcome_id, token)?;
         let unsealed = self
             .sealer
             .unseal(&welcome)
@@ -2815,37 +2817,58 @@ impl AccountDeviceSession {
 
     /// A create's effects. Founding Welcomes are sealed and bound here, before
     /// the effects leave the session, because the app reads their transport
-    /// ids. A seal failure does not fail the create: the group is already
-    /// canonical, and maintenance seals the Welcomes left unsealed.
+    /// ids. A failure to seal or bind does not fail the create: the group is
+    /// already canonical, the effects list only the Welcomes bound, and
+    /// maintenance seals the rest.
     async fn create_effects(&mut self, result: SendResult) -> SessionResult<SessionEffects> {
         let SendResult::FoundingGroupCreated { welcomes } = result else {
             return Ok(self.collect_effects(vec![result]));
         };
-        let mut sealed = Vec::with_capacity(welcomes.len());
-        for welcome in &welcomes {
-            let Ok(message) = self.sealer.seal_welcome(welcome).await else {
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "create_effects",
-                    unsealed = welcomes.len() - sealed.len(),
-                    "founding Welcomes left unsealed for maintenance"
-                );
-                break;
-            };
-            sealed.push(SealedWelcome {
-                local_id: welcome.local_id.clone(),
-                message,
-            });
-        }
-        self.bind_sealed_welcomes(&sealed, None)?;
+        let welcomes = self.seal_founding_welcomes(&welcomes).await;
         let mut effects = self.collect_effects(Vec::new());
-        effects.publish.insert(
-            0,
-            PublishWork::FoundingGroupCreated {
-                welcomes: sealed.into_iter().map(|sealed| sealed.message).collect(),
-            },
-        );
+        effects
+            .publish
+            .insert(0, PublishWork::FoundingGroupCreated { welcomes });
         Ok(effects)
+    }
+
+    /// Seal and bind each of the founding `welcomes` it can, and return the
+    /// sealed messages bound. Their group is already canonical, so a Welcome
+    /// that fails to seal, or a failed bind, stays unsealed and owed for
+    /// maintenance to retry; one Welcome that never seals holds back no other.
+    pub(super) async fn seal_founding_welcomes(
+        &mut self,
+        welcomes: &[OutboundWelcome],
+    ) -> Vec<TransportMessage> {
+        let mut sealed = Vec::with_capacity(welcomes.len());
+        for welcome in welcomes {
+            if let Ok(message) = self.sealer.seal_welcome(welcome).await {
+                sealed.push(SealedWelcome {
+                    local_id: welcome.local_id.clone(),
+                    message,
+                });
+            }
+        }
+        let unsealed = welcomes.len() - sealed.len();
+        if let Err(error) = self.bind_sealed_welcomes(&sealed, None) {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                method = "seal_founding_welcomes",
+                transient = error.is_transient(),
+                unbound = sealed.len(),
+                "sealed founding Welcomes left unbound for maintenance"
+            );
+            sealed.clear();
+        }
+        if unsealed > 0 {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                method = "seal_founding_welcomes",
+                unsealed,
+                "founding Welcomes left unsealed for maintenance"
+            );
+        }
+        sealed.into_iter().map(|sealed| sealed.message).collect()
     }
 
     fn collect_effects(&mut self, results: Vec<SendResult>) -> SessionEffects {

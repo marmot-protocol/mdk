@@ -252,10 +252,12 @@ impl InboxSealer for MockSealer {
     }
 }
 
-/// [`MockSealer`] whose Welcome sealing fails while `fail` is set.
+/// [`MockSealer`] whose Welcome sealing fails while `fail` is set and never
+/// finishes while `park` is set, as a remote signer left waiting.
 #[derive(Default)]
 struct SwitchableSealer {
     fail: AtomicBool,
+    park: AtomicBool,
 }
 
 #[async_trait]
@@ -268,6 +270,9 @@ impl InboxSealer for SwitchableSealer {
         &self,
         welcome: &OutboundWelcome,
     ) -> Result<TransportMessage, PeelerError> {
+        if self.park.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.fail.load(Ordering::SeqCst) {
             return Err(PeelerError::WrapFailed(
                 "test sealer refuses Welcomes".into(),
@@ -1241,6 +1246,87 @@ async fn invite_seal_failure_rolls_back_staged_commit() {
     assert_eq!(runtime.members(&group).unwrap(), members);
 
     sealer.fail.store(false, Ordering::SeqCst);
+    let sent = runtime.send(invite).await.unwrap();
+    assert!(matches!(
+        sent.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    assert!(
+        runtime
+            .members(&group)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == bob_id)
+    );
+    assert_eq!(staged_welcome_publishes(&adapter).len(), 1);
+}
+
+/// A send dropped while its Welcomes are sealed (a remote signer can hold
+/// the seal for minutes) leaves its commit staged with no fanout. Maintenance
+/// rolls it back, so the group takes a new change again.
+#[tokio::test]
+async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("invite dropped mid seal key").unwrap();
+    let sealer = Arc::new(SwitchableSealer::default());
+    let alice = AccountDeviceSession::open(mock_session_config(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice",
+        sealer.clone(),
+    ))
+    .unwrap();
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_id = bob.self_id();
+    let key_package = bob.fresh_key_package().await.unwrap();
+    let adapter = RecordingAdapter::default();
+    let routing = SharedRouting(Arc::new(Mutex::new(StaticTransportRouting::new(vec![]))));
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        routing.clone(),
+        RecordingKeyPackages::default(),
+    );
+    let (group, _) = runtime
+        .create_group(CreateGroupRequest {
+            name: "invite dropped mid seal".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let relay = TransportEndpoint("wss://group.example".into());
+    let inbox = TransportEndpoint("wss://bob-inbox.example".into());
+    routing.update(|_| {
+        staged_invite_routing(&group, &relay).with_inbox_route(bob_id.clone(), vec![inbox])
+    });
+    let members = runtime.members(&group).unwrap();
+    let invite = SendIntent::Invite {
+        group_id: group.clone(),
+        key_packages: vec![key_package],
+        initial_admins: Vec::new(),
+    };
+    sealer.park.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_millis(200), runtime.send(invite.clone()))
+        .await
+        .expect_err("the parked seal holds the send until it is dropped");
+    assert!(adapter.inner.commit_publishes.lock().unwrap().is_empty());
+    assert!(runtime.maintenance_due(&[]).unwrap().retry_while_owed);
+
+    sealer.park.store(false, Ordering::SeqCst);
+    let maintained = runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        maintained
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::RolledBack { .. }))
+    );
+    assert_eq!(runtime.members(&group).unwrap(), members);
+    assert!(adapter.inner.commit_publishes.lock().unwrap().is_empty());
+
     let sent = runtime.send(invite).await.unwrap();
     assert!(matches!(
         sent.pending.as_slice(),

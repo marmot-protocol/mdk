@@ -1387,24 +1387,7 @@ impl<S: StorageProvider> Engine<S> {
         local_state_token: &[u8],
         unsealed: cgka_traits::ingest::PeeledMessage,
     ) -> Result<GroupId, EngineError> {
-        let candidate = self
-            .storage
-            .list_welcomes()?
-            .into_iter()
-            .find(|candidate| &candidate.message_id == welcome_id)
-            .ok_or(EngineError::InvalidWelcome)?;
-        candidate
-            .rejoin
-            .as_ref()
-            .ok_or(EngineError::InvalidWelcome)?;
-        // The load refuses a group whose rewind restore failed: its local
-        // branch is a retained anchor's until the next open (mdk#3272), so no
-        // token can consent to discarding it. The offer stays stored and is
-        // offered again then.
-        let group = self.load_mls_group(&candidate.group_id)?;
-        if Sha256::digest(group.epoch_authenticator().as_slice()).as_slice() != local_state_token {
-            return Err(rejoin_confirmation_required());
-        }
+        let candidate = self.consented_rejoin_offer(welcome_id, local_state_token)?;
         self.ensure_hydrated(&candidate.group_id)?;
         // Recheck the live token inside the replacement transaction below.
         let welcome: TransportMessage = serde_json::from_slice(&candidate.welcome_bytes)
@@ -1424,8 +1407,26 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// The sealed delivery of the stored rejoin offer `welcome_id`, for the
-    /// session to unseal before [`Self::confirm_group_rejoin`].
-    pub fn stored_welcome(&self, welcome_id: &MessageId) -> Result<TransportMessage, EngineError> {
+    /// session to unseal before [`Self::confirm_group_rejoin`]. It answers only
+    /// while `local_state_token` still names the local branch, so a stale
+    /// confirmation never reaches the signer.
+    pub fn stored_welcome(
+        &self,
+        welcome_id: &MessageId,
+        local_state_token: &[u8],
+    ) -> Result<TransportMessage, EngineError> {
+        let candidate = self.consented_rejoin_offer(welcome_id, local_state_token)?;
+        serde_json::from_slice(&candidate.welcome_bytes)
+            .map_err(|error| EngineError::Serialize(error.to_string()))
+    }
+
+    /// The stored rejoin offer `welcome_id`, while `local_state_token` names
+    /// the local branch it would replace.
+    fn consented_rejoin_offer(
+        &self,
+        welcome_id: &MessageId,
+        local_state_token: &[u8],
+    ) -> Result<PendingWelcome, EngineError> {
         let candidate = self
             .storage
             .list_welcomes()?
@@ -1436,8 +1437,15 @@ impl<S: StorageProvider> Engine<S> {
             .rejoin
             .as_ref()
             .ok_or(EngineError::InvalidWelcome)?;
-        serde_json::from_slice(&candidate.welcome_bytes)
-            .map_err(|error| EngineError::Serialize(error.to_string()))
+        // The load refuses a group whose rewind restore failed: its local
+        // branch is a retained anchor's until the next open (mdk#3272), so no
+        // token can consent to discarding it. The offer stays stored and is
+        // offered again then.
+        let group = self.load_mls_group(&candidate.group_id)?;
+        if Sha256::digest(group.epoch_authenticator().as_slice()).as_slice() != local_state_token {
+            return Err(rejoin_confirmation_required());
+        }
+        Ok(candidate)
     }
 
     /// Reject only the selected offer. Redelivery cannot re-open it.

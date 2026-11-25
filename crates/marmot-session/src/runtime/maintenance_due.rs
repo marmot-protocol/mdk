@@ -65,6 +65,7 @@ where
         if !self.watched_welcomes.is_empty()
             || !self.pending_leaf_reconciliations.is_empty()
             || self.welcome_expiries_unfinished()
+            || self.sealing_commit.is_some()
         {
             due.owed();
         }
