@@ -218,6 +218,14 @@ impl<'a> AccountSetup<'a> {
         &self.manager.app
     }
 
+    fn record_check_time(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(clock) = self.lookup_clock {
+            return clock.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        unix_now_seconds()
+    }
+
     fn shared(&self) -> &'a RuntimeSharedServices {
         &self.manager.shared
     }
@@ -2173,11 +2181,15 @@ impl AccountSetup<'_> {
                 _ => c.stale_device_acknowledgment.clone(),
             };
             let mut rechecked = false;
+            let now = self.record_check_time();
             for index in 0..OnboardingStep::SingleDevice.index() {
                 if c.snapshot.steps[index].status == OnboardingStatus::Passed
-                    && c.snapshot.steps[index]
+                    && (c.snapshot.steps[index]
                         .checked_at
-                        .is_none_or(|at| unix_now_seconds().saturating_sub(at) > CHECK_MAX_AGE)
+                        .is_none_or(|at| now.saturating_sub(at) > CHECK_MAX_AGE)
+                        || c.records[index]
+                            .as_ref()
+                            .is_some_and(|event| event.created_at > now + FUTURE_CLOCK_SKEW))
                 {
                     let step = c.snapshot.steps[index].step;
                     c.reset_step(step);
@@ -2639,13 +2651,7 @@ impl AccountSetup<'_> {
                 Err(_) => failures.push(finding(OnboardingIssue::Interrupted)),
             }
         }
-        #[cfg(test)]
-        let now = self.lookup_clock.map_or_else(unix_now_seconds, |clock| {
-            clock.load(std::sync::atomic::Ordering::SeqCst)
-        });
-        #[cfg(not(test))]
-        let now = unix_now_seconds();
-        let latest_allowed_timestamp = now + FUTURE_CLOCK_SKEW;
+        let latest_allowed_timestamp = self.record_check_time() + FUTURE_CLOCK_SKEW;
         if replaceable {
             records.retain(|event| event.created_at <= latest_allowed_timestamp);
         }

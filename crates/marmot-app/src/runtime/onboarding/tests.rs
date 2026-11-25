@@ -5004,6 +5004,61 @@ async fn a_record_can_enter_the_clock_window_during_lookup() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resuming_rechecks_a_relay_list_after_the_clock_moves_back() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let now = unix_now_seconds();
+    let clock = AtomicU64::new(now);
+    let relay_list = |relay: &str, created_at| {
+        signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), relay.into()]],
+            "",
+            created_at,
+        )
+    };
+    let newest = relay_list("wss://healthy.example", now + FUTURE_CLOCK_SKEW);
+    let fallback = relay_list("wss://fallback.example", now - 10);
+    *network.events.lock() = vec![fallback.clone()];
+    *network.index_events.lock() = vec![newest.clone()];
+
+    let mut setup = runtime.account_setup();
+    setup.lookup_clock = Some(&clock);
+    setup.run_onboarding(&id).await.unwrap();
+    for step in [OnboardingStep::Profile, OnboardingStep::Follows] {
+        setup.continue_onboarding_without(&id, step).await.unwrap();
+    }
+    let relays = OnboardingStep::Relays.index();
+    let checkpoint = || setup.records().onboarding_checkpoint(&id).unwrap().unwrap();
+    let paused = checkpoint();
+    assert_eq!(
+        paused.snapshot.steps[relays].status,
+        OnboardingStatus::Passed
+    );
+    assert_eq!(paused.records[relays].as_ref(), Some(&newest));
+    assert_eq!(
+        paused.snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::NeedsInput,
+    );
+
+    clock.store(now - 1, Ordering::SeqCst);
+    let resumed = setup.run_onboarding(&id).await.unwrap();
+    assert_eq!(resumed.steps[relays].status, OnboardingStatus::Passed);
+    assert_eq!(
+        checkpoint().records[relays].as_ref(),
+        Some(&fallback),
+        "resume must replace a record that moved outside the clock window",
+    );
+    assert!(resumed.steps[relays].findings.iter().any(|finding| {
+        finding.issue == OnboardingIssue::FutureDated
+            && finding.outcome == OnboardingCheckOutcome::Success
+            && finding.endpoint.as_deref() == Some("wss://index.example")
+    }));
+    assert!(network.attempts.lock().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 /// A repair checks the newest eligible record again after consent, even if
 /// the relay that serves the new record also serves a far-future copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
