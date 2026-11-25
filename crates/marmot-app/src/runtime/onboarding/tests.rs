@@ -1467,6 +1467,7 @@ fn options() -> OnboardingOptions {
         default_relays: vec!["wss://default.example".into()],
         discovery_relays: vec!["wss://index.example".into()],
         inbox_relays: Vec::new(),
+        ..Default::default()
     }
 }
 fn runtime(path: &std::path::Path, network: Arc<Network>) -> MarmotAppRuntime {
@@ -1487,6 +1488,18 @@ async fn fixture() -> (
     nostr::prelude::Keys,
     String,
 ) {
+    fixture_with_options(options()).await
+}
+
+async fn fixture_with_options(
+    options: OnboardingOptions,
+) -> (
+    tempfile::TempDir,
+    MarmotAppRuntime,
+    Arc<Network>,
+    nostr::prelude::Keys,
+    String,
+) {
     let dir = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
     let runtime = runtime(dir.path(), network.clone());
@@ -1496,7 +1509,7 @@ async fn fixture() -> (
         .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
-            options(),
+            options,
         )
         .await
         .unwrap();
@@ -3697,8 +3710,18 @@ async fn partial_lookup_is_not_fresh() {
                 .await
                 .unwrap();
             let state = &result.steps[step.index()];
-            assert_eq!(state.status, OnboardingStatus::RetryableFailure);
-            assert!(result.proposal.is_none());
+            if fail_index {
+                assert_eq!(state.status, OnboardingStatus::NeedsInput);
+                let kept = result
+                    .proposal
+                    .as_ref()
+                    .expect("the repair preview should remain");
+                assert!(kept.inconclusive);
+                assert_eq!(kept.revision, result.revision);
+            } else {
+                assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+                assert!(result.proposal.is_none());
+            }
             assert!(network.attempts.lock().is_empty());
             let issue = if fail_index {
                 OnboardingIssue::TimedOut
@@ -3813,8 +3836,18 @@ async fn declared_lookup_is_not_fresh() {
                 .await
                 .unwrap();
             let state = &result.steps[step.index()];
-            assert_eq!(state.status, OnboardingStatus::RetryableFailure);
-            assert!(result.proposal.is_none());
+            if fail_index {
+                assert_eq!(state.status, OnboardingStatus::NeedsInput);
+                let kept = result
+                    .proposal
+                    .as_ref()
+                    .expect("the repair preview should remain");
+                assert!(kept.inconclusive);
+                assert_eq!(kept.revision, result.revision);
+            } else {
+                assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+                assert!(result.proposal.is_none());
+            }
             assert!(network.attempts.lock().is_empty());
             let issue = if fail_index {
                 OnboardingIssue::TimedOut
@@ -3892,10 +3925,7 @@ async fn partial_lookup_is_not_absence() {
         .approve_onboarding_repair(&id, proposal.revision)
         .await
         .unwrap();
-    assert_eq!(
-        result.steps[OnboardingStep::Relays.index()].status,
-        OnboardingStatus::RetryableFailure
-    );
+    assert!(result.proposal.as_ref().unwrap().inconclusive);
     assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -4153,6 +4183,273 @@ async fn inbox_step(
         OnboardingStatus::Passed
     );
     snapshot
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatically_create_an_inbox_list_only_after_complete_absence() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let cases = [
+        (false, None, false, OnboardingStatus::NeedsInput),
+        (true, None, false, OnboardingStatus::Passed),
+        (true, Some(vec![]), false, OnboardingStatus::NeedsInput),
+        (
+            true,
+            Some(vec![vec!["relay".into(), "wss://existing.example".into()]]),
+            false,
+            OnboardingStatus::Passed,
+        ),
+        (true, None, true, OnboardingStatus::RetryableFailure),
+    ];
+    for (opt_in, existing, unreachable, expected_status) in cases {
+        let earlier_list = existing.as_ref().is_some_and(|tags| !tags.is_empty());
+        let creates = opt_in && existing.is_none() && !unreachable;
+        let recommended = "wss://inbox-default.example";
+        let (_dir, runtime, network, keys, id) = fixture_with_options(OnboardingOptions {
+            inbox_relays: vec![recommended.into(), "wss://spare.example".into()],
+            create_missing_inbox_list: opt_in,
+            ..options()
+        })
+        .await;
+        if unreachable {
+            network.inspection_errors.lock().insert(
+                "outbox.example".into(),
+                DirectoryInspectionError::Unreachable,
+            );
+        }
+        let snapshot = inbox_step(
+            &runtime,
+            &network,
+            &keys,
+            &id,
+            vec![
+                vec!["r".into(), "wss://healthy.example".into()],
+                vec!["r".into(), "wss://outbox.example".into()],
+            ],
+            existing,
+        )
+        .await;
+        assert_eq!(
+            snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+            expected_status,
+        );
+        let attempts = network.attempts.lock().clone();
+        assert_eq!(attempts.len(), usize::from(creates));
+        if creates {
+            let event = &attempts[0];
+            assert_eq!(event.kind, 10050);
+            assert_eq!(
+                event.tags,
+                [vec!["relay".to_owned(), recommended.to_owned()]]
+            );
+            let created = snapshot.created_inbox_list.unwrap();
+            assert_eq!(created.event_id, event.id);
+            assert_eq!(created.relays, [recommended]);
+        } else {
+            assert!(snapshot.created_inbox_list.is_none());
+        }
+        if earlier_list {
+            network.events.lock().retain(|event| event.kind != 10050);
+            for _ in 0..2 {
+                let snapshot = runtime
+                    .account_setup()
+                    .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+                    OnboardingStatus::NeedsInput
+                );
+                assert!(network.attempts.lock().is_empty());
+            }
+        }
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_repair_requires_fresh_consent_when_a_source_stops_answering() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let snapshot = inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![
+            vec!["r".into(), "wss://healthy.example".into()],
+            vec!["r".into(), "wss://flaky.example".into()],
+        ],
+        None,
+    )
+    .await;
+    let step = OnboardingStep::InboxRelays;
+    assert_eq!(
+        snapshot.steps[step.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    let setup = runtime.account_setup();
+    let proposed = setup
+        .propose_onboarding_relay_repair(&id, step)
+        .await
+        .unwrap();
+    assert!(!proposed.proposal.as_ref().unwrap().inconclusive);
+    network.inspection_errors.lock().insert(
+        "flaky.example".into(),
+        DirectoryInspectionError::Unreachable,
+    );
+
+    let kept = setup
+        .approve_onboarding_repair(&id, proposed.revision)
+        .await
+        .unwrap();
+    let proposal = kept.proposal.as_ref().unwrap();
+    assert!(proposal.inconclusive);
+    assert_ne!(kept.revision, proposed.revision);
+    assert_eq!(kept.revision, proposal.revision);
+    assert_eq!(
+        proposal.relay_repair,
+        proposed.proposal.unwrap().relay_repair
+    );
+    let state = &kept.steps[step.index()];
+    assert!(state.actions.contains(&OnboardingAction::ApproveRepair));
+    assert!(state.findings.iter().any(|finding| {
+        finding.context == OnboardingFindingContext::RepairApproval
+            && finding.issue == OnboardingIssue::Unreachable
+    }));
+    assert!(network.attempts.lock().is_empty());
+    assert!(
+        setup
+            .approve_onboarding_repair(&id, proposed.revision)
+            .await
+            .is_err()
+    );
+
+    let completed = setup
+        .approve_onboarding_repair(&id, kept.revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        completed.steps[step.index()].status,
+        OnboardingStatus::Passed
+    );
+    assert!(completed.proposal.is_none());
+    assert_eq!(network.attempts.lock()[0].kind, 10050);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// For an external signer, creating the missing inbox list is a signing
+/// request, not a relay question. Its approval is checkpointed before the
+/// signature. A list the user publishes while signing is paused wins over
+/// the automatic event when onboarding resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_inbox_creation_resumes_without_superseding_a_later_list() {
+    let directory = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = runtime(directory.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    let block = Arc::new(AtomicBool::new(true));
+    let started = Arc::new(Notify::new());
+    runtime
+        .account_setup()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            BlockingSigner {
+                keys: keys.clone(),
+                block: block.clone(),
+                started: started.clone(),
+            },
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+    *network.events.lock() = vec![signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://healthy.example".into()]],
+        "",
+        unix_now_seconds() - 10,
+    )];
+    let setup = runtime.account_setup();
+    setup.run_onboarding(&id).await.unwrap();
+    setup
+        .continue_onboarding_without(&id, OnboardingStep::Profile)
+        .await
+        .unwrap();
+    let task = tokio::spawn({
+        let manager = runtime.accounts();
+        let id = id.clone();
+        async move {
+            manager
+                .account_setup()
+                .continue_onboarding_without(&id, OnboardingStep::Follows)
+                .await
+        }
+    });
+    timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("onboarding never asked the signer to sign the inbox list");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let checkpoint = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert!(checkpoint.approved);
+    assert_eq!(
+        checkpoint.snapshot.proposal.as_ref().map(|p| p.step),
+        Some(OnboardingStep::InboxRelays)
+    );
+    assert_eq!(
+        checkpoint.snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::WaitingForSigner
+    );
+    assert!(network.attempts.lock().is_empty());
+
+    let manual = signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://chosen.example".into()]],
+        "",
+        unix_now_seconds(),
+    );
+    network.events.lock().push(manual.clone());
+    block.store(false, Ordering::SeqCst);
+    let snapshot = setup.run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::Passed
+    );
+    let attempts = network.attempts.lock().clone();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].kind, 10050);
+    assert!(attempts[0].created_at < manual.created_at);
+    let checkpoint = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        checkpoint.records[OnboardingStep::InboxRelays.index()],
+        Some(manual)
+    );
+    assert_eq!(
+        attempts[0].tags,
+        vec![vec!["relay".to_owned(), "wss://default.example".to_owned()]]
+    );
+    assert_eq!(
+        snapshot.created_inbox_list.map(|created| created.relays),
+        Some(vec!["wss://default.example".to_owned()])
+    );
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 fn offers_relay_edits(state: &OnboardingStepState) -> bool {
@@ -4628,7 +4925,7 @@ fn public_indexers_join_discovery_except_on_loopback_routes() {
         let local = OnboardingOptions {
             default_relays: vec![loopback.into()],
             discovery_relays: vec![loopback.into()],
-            inbox_relays: Vec::new(),
+            ..Default::default()
         };
         let mut sources = local.discovery_relays.clone();
         append_public_indexers(&mut sources, &local, &indexers);

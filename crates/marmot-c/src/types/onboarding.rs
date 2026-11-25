@@ -53,6 +53,7 @@ mod tests {
             revision: 4,
             ready: false,
             cancellation_pending: false,
+            created_inbox_list: None,
             steps: vec![OnboardingStepStateFfi {
                 step: OnboardingStepFfi::Follows,
                 status: OnboardingStatusFfi::NeedsInput,

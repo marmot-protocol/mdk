@@ -3627,6 +3627,7 @@ pub unsafe extern "C" fn marmot_begin_onboarding(
             default_relays,
             discovery_relays,
             inbox_relays,
+            create_missing_inbox_list: false,
         };
         unsafe {
             deliver(

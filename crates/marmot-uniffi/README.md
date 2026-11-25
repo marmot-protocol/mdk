@@ -634,6 +634,11 @@ Imported identities can use the durable preflight API instead of `login`:
 3. Localize the typed status, findings, and actions. A healthy account advances
    automatically until the notice acknowledgment. `NeedsInput` offers a repair or, for profile/follows, an
    explicit `continue_onboarding_without`. Empty follow lists are valid.
+   Hosts may set `create_missing_inbox_list` (default off) to create a missing
+   inbox list after discovery and the approval recheck both finish with no list.
+   Onboarding uses the same additive repair as the suggested change and the
+   account's signer. Once a relay accepts the event, `created_inbox_list`
+   reports which relay was set up.
 4. `propose_onboarding_relay_repair` previews the smallest safe change to a
    general or inbox relay declaration, preserving the original ordered tags,
    duplicate/custom entries, direction markers, and content. NIP-65 read/write
@@ -651,7 +656,7 @@ Imported identities can use the durable preflight API instead of `login`:
    suggested. On a passed step the preview only removes entries and keeps a
    role's last allowed route; on a failing step it may also add a default.
    It is advice: `ready` never depends on it, and declining costs nothing.
-   No proposal signs or publishes until explicit approval. The older
+   Other repairs require explicit approval. The older
    `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
    a proposal. Recommended relays append missing defaults to the observed list,
@@ -669,8 +674,8 @@ Imported identities can use the durable preflight API instead of `login`:
    re-fetches the record and requires every lookup source to complete, unless the
    proposal has `inconclusive` set (below).
    This bounded check cannot rule out newer records on unreachable or unqueried sources.
-   A missing discovery result is not global proof of absence: hosts must
-   not automatically approve publication for imported identities.
+   Hosts should use the missing inbox list option above for automatic creation.
+   It requires a complete lookup within the searched relay set.
 
    A general or inbox relay step whose check was inconclusive also offers `EditRelays`
    and, when appending the defaults can change the list, `UseRecommendedRelays`. That
@@ -686,8 +691,11 @@ Imported identities can use the durable preflight API instead of `login`:
    explicit at-your-own-risk confirmation: a newer record may sit on a source that did
    not answer, and the declared relays may work for other clients. Its approval goes
    past failed sources, but at least one source that counts must answer, and the
-   proposal's record must still be the newest any answering source holds. Otherwise it
-   fails with `RecordChanged` or the source failures, as before. Cancelling a relay
+   proposal's record must still be the newest any answering source holds.
+   If a source fails during approval and an authoritative answer still
+   supports the proposal, show the preserved proposal at its new revision
+   and ask the user to confirm the `inconclusive` warning. Finding a newer
+   record invalidates the proposal with `RecordChanged`. Cancelling a relay
    proposal keeps the step's status.
    Profile fields left unset preserve their current values; an
    explicit empty string clears a field. Display the proposed edits, then pass the returned

@@ -489,20 +489,33 @@ impl AccountSetup<'_> {
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;
+        let preview = self.relay_repair_preview(&c, step)?;
+        c.set_relay_repair_proposal(step, preview)?;
+        self.save_onboarding(&mut c)?;
+        Ok(c.snapshot)
+    }
+}
+
+impl OnboardingCheckpoint {
+    pub(super) fn set_relay_repair_proposal(
+        &mut self,
+        step: OnboardingStep,
+        preview: RelayRepairPreview,
+    ) -> Result<(), AppError> {
         let RelayRepairPreview {
             repair,
             read_relays,
             write_relays,
             unusable,
-        } = self.relay_repair_preview(&c, step)?;
+        } = preview;
         let manual = repair.mode == OnboardingRelayRepairMode::ManualReview;
-        let inconclusive = check_inconclusive(&c.snapshot.steps[step.index()].findings);
+        let inconclusive = check_inconclusive(&self.snapshot.steps[step.index()].findings);
         // A typed preview replaces any earlier append-only editor proposal.
-        c.append_relays = false;
-        c.manual_relay_edit = false;
-        c.snapshot.proposal = Some(OnboardingRepairProposal {
+        self.append_relays = false;
+        self.manual_relay_edit = false;
+        self.snapshot.proposal = Some(OnboardingRepairProposal {
             step,
-            revision: c
+            revision: self
                 .snapshot
                 .revision
                 .checked_add(1)
@@ -516,7 +529,7 @@ impl AccountSetup<'_> {
             inconclusive,
             unusable_routes: if manual { BTreeMap::new() } else { unusable },
         });
-        c.snapshot.steps[step.index()].actions = if manual {
+        self.snapshot.steps[step.index()].actions = if manual {
             vec![OnboardingAction::EditRelays, OnboardingAction::CancelRepair]
         } else {
             vec![
@@ -524,8 +537,7 @@ impl AccountSetup<'_> {
                 OnboardingAction::CancelRepair,
             ]
         };
-        self.save_onboarding(&mut c)?;
-        Ok(c.snapshot)
+        Ok(())
     }
 }
 

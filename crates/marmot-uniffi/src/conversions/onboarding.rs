@@ -486,7 +486,8 @@ pub struct OnboardingRepairProposalFfi {
     pub relay_repair: Option<OnboardingRelayRepairFfi>,
     /// The check this proposal was built on was inconclusive: a lookup source
     /// failed, or no declared route answered. Confirm explicitly, at the
-    /// user's own risk, before approving.
+    /// user's own risk, before approving. An approval that could not confirm
+    /// the record is still current can keep the proposal and set it.
     #[uniffi(default = false)]
     pub inconclusive: bool,
 }
@@ -515,6 +516,28 @@ pub struct OnboardingSnapshotFfi {
     pub proposal: Option<OnboardingRepairProposalFfi>,
     pub single_device_notice: Option<OnboardingSingleDeviceNoticeFfi>,
     pub cancellation_pending: bool,
+    /// The inbox list onboarding published for an account that had none,
+    /// when `create_missing_inbox_list` was set. Tell the user which relays
+    /// it set up.
+    #[uniffi(default = None)]
+    pub created_inbox_list: Option<OnboardingCreatedInboxListFfi>,
+}
+/// An inbox list (kind 10050) onboarding published without asking.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct OnboardingCreatedInboxListFfi {
+    pub relays: Vec<String>,
+    pub event_id: String,
+    /// Unix seconds when a relay accepted it.
+    pub published_at: u64,
+}
+impl From<marmot_app::OnboardingCreatedInboxList> for OnboardingCreatedInboxListFfi {
+    fn from(value: marmot_app::OnboardingCreatedInboxList) -> Self {
+        Self {
+            relays: value.relays,
+            event_id: value.event_id,
+            published_at: value.published_at,
+        }
+    }
 }
 impl From<marmot_app::OnboardingSnapshot> for OnboardingSnapshotFfi {
     fn from(value: marmot_app::OnboardingSnapshot) -> Self {
@@ -527,6 +550,7 @@ impl From<marmot_app::OnboardingSnapshot> for OnboardingSnapshotFfi {
             single_device_notice: value.single_device_notice.map(Into::into),
             cancellation_pending: value.cancellation_pending,
             proposal: value.proposal.map(Into::into),
+            created_inbox_list: value.created_inbox_list.map(Into::into),
         }
     }
 }
@@ -537,6 +561,11 @@ pub struct OnboardingOptionsFfi {
     /// Recommended kind-10050 inbox relays. Empty uses `default_relays`.
     #[uniffi(default = [])]
     pub inbox_relays: Vec<String>,
+    /// Publish an inbox list of the inbox defaults, without asking, for an
+    /// account that has none. Off by default; the snapshot's
+    /// `created_inbox_list` reports it.
+    #[uniffi(default = false)]
+    pub create_missing_inbox_list: bool,
 }
 impl From<marmot_app::OnboardingOptions> for OnboardingOptionsFfi {
     fn from(value: marmot_app::OnboardingOptions) -> Self {
@@ -544,6 +573,7 @@ impl From<marmot_app::OnboardingOptions> for OnboardingOptionsFfi {
             default_relays: value.default_relays,
             discovery_relays: value.discovery_relays,
             inbox_relays: value.inbox_relays,
+            create_missing_inbox_list: value.create_missing_inbox_list,
         }
     }
 }
@@ -553,6 +583,7 @@ impl From<OnboardingOptionsFfi> for marmot_app::OnboardingOptions {
             default_relays: value.default_relays,
             discovery_relays: value.discovery_relays,
             inbox_relays: value.inbox_relays,
+            create_missing_inbox_list: value.create_missing_inbox_list,
         }
     }
 }

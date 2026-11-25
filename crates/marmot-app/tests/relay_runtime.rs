@@ -17177,6 +17177,7 @@ async fn onboarding_fixture() -> (
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -17441,6 +17442,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -17468,6 +17470,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
+                ..Default::default()
             },
         )
         .await
@@ -17498,6 +17501,7 @@ async fn onboarding_cancellation_retains_external_signer_for_explicit_sign_in() 
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
+                ..Default::default()
             },
         )
         .await
@@ -17560,6 +17564,7 @@ async fn onboarding_payment_required_query_is_not_a_missing_record() {
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
+                ..Default::default()
             },
         )
         .await
@@ -17604,6 +17609,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -17808,6 +17814,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -17910,6 +17917,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -17976,6 +17984,7 @@ async fn onboarding_single_device_unknown_discovery_still_offers_explicit_contin
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -18027,6 +18036,7 @@ async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_
         default_relays: vec![url.clone()],
         inbox_relays: Vec::new(),
         discovery_relays: vec![url.clone()],
+        ..Default::default()
     };
     assert!(
         runtime
@@ -18132,6 +18142,7 @@ async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await

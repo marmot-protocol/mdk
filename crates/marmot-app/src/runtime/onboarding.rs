@@ -1,6 +1,6 @@
-//! Durable, host-driven onboarding. Discovery never authorizes publication.
-//! A repair is a separate proposal and revision-checked approval; its signed
-//! bytes are checkpointed before they can reach a relay.
+//! Durable, host-driven onboarding. Repairs require revision-checked approval.
+//! A host can authorize automatic creation of a missing inbox list. Signed
+//! bytes are checkpointed before any publication.
 use super::*;
 use nostr::prelude::{EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp};
 use std::collections::BTreeMap;
@@ -619,6 +619,17 @@ pub struct OnboardingSnapshot {
     pub single_device_notice: Option<OnboardingSingleDeviceNotice>,
     #[serde(default)]
     pub cancellation_pending: bool,
+    /// The inbox list created under the host's opt-in, once a relay accepts it.
+    #[serde(default)]
+    pub created_inbox_list: Option<OnboardingCreatedInboxList>,
+}
+/// An inbox list created during onboarding.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnboardingCreatedInboxList {
+    pub relays: Vec<String>,
+    pub event_id: String,
+    /// Unix seconds when a relay accepted it.
+    pub published_at: u64,
 }
 /// Hosts pass the same default relay sets used by account creation. Discovery
 /// relays are independent indexers. They are not advertised as account relays;
@@ -632,6 +643,10 @@ pub struct OnboardingOptions {
     /// `default_relays`, which otherwise serve both relay-list steps.
     #[serde(default)]
     pub inbox_relays: Vec<String>,
+    /// Create a missing inbox list from the host's recommendations after a
+    /// complete lookup and freshness check.
+    #[serde(default)]
+    pub create_missing_inbox_list: bool,
 }
 impl OnboardingOptions {
     /// The recommended relays for a relay-list step.
@@ -675,6 +690,13 @@ struct OnboardingCheckpoint {
     // The pauses this attempt has counted in usage diagnostics (mdk#3440).
     #[serde(default)]
     reported_pauses: Vec<analytics::OnboardingPauseKey>,
+    // Remember a signed list even if a subsequent lookup returns nothing.
+    #[serde(default)]
+    inbox_list_seen: bool,
+    // An automatic repair uses the time of its freshness check even if
+    // signing resumes later. A later list can supersede it.
+    #[serde(default)]
+    automatic_inbox_event_time: Option<u64>,
 }
 
 /// A device notice the user acknowledged, with the findings shown beside it.
@@ -786,6 +808,7 @@ impl OnboardingCheckpoint {
                 proposal: None,
                 single_device_notice: None,
                 cancellation_pending: false,
+                created_inbox_list: None,
             },
             options,
             records: vec![None; STEP_COUNT],
@@ -799,6 +822,8 @@ impl OnboardingCheckpoint {
             attempt_start_revision: 0,
             explicit_discovery: false,
             reported_pauses: Vec::new(),
+            inbox_list_seen: false,
+            automatic_inbox_event_time: None,
         }
     }
     fn new_attempt(
@@ -2178,10 +2203,14 @@ impl AccountSetup<'_> {
         } else if c.snapshot.proposal.is_some() {
             return Ok(());
         }
-        for index in 0..STEP_COUNT {
+        let mut index = 0;
+        while index < STEP_COUNT {
             let step = c.snapshot.steps[index].step;
             match c.snapshot.steps[index].status {
-                OnboardingStatus::Passed | OnboardingStatus::Skipped => continue,
+                OnboardingStatus::Passed | OnboardingStatus::Skipped => {
+                    index += 1;
+                    continue;
+                }
                 OnboardingStatus::NeedsInput
                 | OnboardingStatus::RetryableFailure
                 | OnboardingStatus::WaitingForSigner => return Ok(()),
@@ -2284,6 +2313,9 @@ impl AccountSetup<'_> {
                     )
                     .await?;
                 self.require_live_onboarding_attempt(c)?;
+                if step == OnboardingStep::InboxRelays {
+                    c.inbox_list_seen |= c.records[index].is_some() || event.is_some();
+                }
                 c.records[index] = event.clone();
                 // Cache even imperfect signed data for settings visibility;
                 // routing still filters it through the relay safety chokepoint.
@@ -2302,6 +2334,18 @@ impl AccountSetup<'_> {
                     )?;
                 }
                 c.set(step, status, findings);
+                if step == OnboardingStep::InboxRelays && self.prepare_missing_inbox_list(c)? {
+                    let event_time = unix_now_seconds().saturating_sub(1);
+                    self.approve_repair_if_current(c).await?;
+                    if c.approved {
+                        c.automatic_inbox_event_time = Some(event_time);
+                        self.save_onboarding(c)?;
+                        if !self.publish_onboarding_repair(c).await? {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                }
             }
             self.require_live_onboarding_attempt(c)?;
             if c.snapshot.ready {
@@ -2314,6 +2358,7 @@ impl AccountSetup<'_> {
                     .await?;
                 return Ok(());
             }
+            index += 1;
         }
         if c.snapshot.ready {
             #[cfg(test)]
@@ -2382,9 +2427,8 @@ impl AccountSetup<'_> {
             return Err(onboarding_error());
         }
         let options = OnboardingOptions {
-            default_relays: c.options.default_relays.clone(),
             discovery_relays,
-            inbox_relays: c.options.inbox_relays.clone(),
+            ..c.options.clone()
         };
         self.validate_onboarding_options(&options)?;
         c.options = options;
@@ -2963,6 +3007,28 @@ impl AccountSetup<'_> {
         }
         (status, findings, Some(event))
     }
+    fn prepare_missing_inbox_list(&self, c: &mut OnboardingCheckpoint) -> Result<bool, AppError> {
+        let step = OnboardingStep::InboxRelays;
+        let state = &c.snapshot.steps[step.index()];
+        if !c.options.create_missing_inbox_list
+            || c.inbox_list_seen
+            || state.status != OnboardingStatus::NeedsInput
+            || check_inconclusive(&state.findings)
+            || !state.findings.iter().any(|finding| {
+                finding.issue == OnboardingIssue::Missing
+                    && finding.context == OnboardingFindingContext::RecordDiscovery
+            })
+        {
+            return Ok(false);
+        }
+        let preview = self.relay_repair_preview(c, step)?;
+        if preview.repair.mode != OnboardingRelayRepairMode::Additive {
+            return Ok(false);
+        }
+        c.set_relay_repair_proposal(step, preview)?;
+        Ok(true)
+    }
+
     /// Prepare a relay replacement without signing or publishing it. Passing
     /// None appends the recommended defaults to the observed list, preserving
     /// existing tags and read/write roles, independently of local dial policy.
@@ -3267,15 +3333,30 @@ impl AccountSetup<'_> {
         if c.approved || c.snapshot.revision != revision || proposal.revision != revision {
             return Err(onboarding_error());
         }
-        self.validate_typed_onboarding_repair(&c, &proposal)?;
+        self.approve_repair_if_current(&mut c).await?;
+        self.save_onboarding(&mut c)?;
+        if c.approved {
+            self.run_onboarding_locked(&mut c).await?;
+        }
+        Ok(c.snapshot)
+    }
+
+    async fn approve_repair_if_current(
+        &self,
+        c: &mut OnboardingCheckpoint,
+    ) -> Result<(), AppError> {
+        let proposal = c.snapshot.proposal.clone().ok_or_else(onboarding_error)?;
+        self.validate_typed_onboarding_repair(c, &proposal)?;
+        let account_id = c.snapshot.account_id_hex.clone();
+        let attempt = c.attempt();
         let sources = self
             .await_while_onboarding_live(
                 &account_id,
                 attempt,
-                self.onboarding_sources(&c, proposal.step),
+                self.onboarding_sources(c, proposal.step),
             )
             .await?;
-        self.require_live_onboarding_attempt(&c)?;
+        self.require_live_onboarding_attempt(c)?;
         let (records, failures, completed) = self
             .await_while_onboarding_live(
                 &account_id,
@@ -3287,7 +3368,7 @@ impl AccountSetup<'_> {
                 ),
             )
             .await?;
-        self.require_live_onboarding_attempt(&c)?;
+        self.require_live_onboarding_attempt(c)?;
         // Every source, including declared relays and public indexers, must
         // finish: a timeout may hide a newer record even if another source answers.
         let complete = !completed.is_empty()
@@ -3299,9 +3380,8 @@ impl AccountSetup<'_> {
         // source that vouches for the account's records must answer, and the
         // proposal's record must still be the newest that any answering source
         // holds; a record only an unanswered source holds is the accepted risk.
-        let accepted_risk = !complete
-            && proposal.inconclusive
-            && self.authoritative_answered(&c, &sources, &completed);
+        let authoritative = !complete && self.authoritative_answered(c, &sources, &completed);
+        let accepted_risk = authoritative && proposal.inconclusive;
         let basis_newest = records.first().map(|e| &e.id) == proposal.previous_event_id.as_ref();
         // Past a failed source, only a record that replaces the proposal's own
         // counts as a change; an older copy must not displace it.
@@ -3314,7 +3394,10 @@ impl AccountSetup<'_> {
                     || (event.created_at == basis.created_at && event.id < basis.id)
             })
         });
-        if !basis_newest && (complete || (accepted_risk && newer_seen)) {
+        if !basis_newest && (complete || (newer_seen && (accepted_risk || proposal.step.relay()))) {
+            if proposal.step == OnboardingStep::InboxRelays && !records.is_empty() {
+                c.inbox_list_seen = true;
+            }
             c.records[proposal.step.index()] = records.first().cloned();
             c.snapshot.proposal = None;
             c.set(
@@ -3331,20 +3414,42 @@ impl AccountSetup<'_> {
             } else {
                 failures
             };
-            c.set(
-                proposal.step,
-                OnboardingStatus::RetryableFailure,
-                failures
-                    .into_iter()
-                    .map(|failure| {
-                        failure.in_context(
-                            OnboardingFindingContext::RepairApproval,
-                            OnboardingCheckPurpose::SourceFreshness,
-                        )
-                    })
-                    .collect(),
-            );
-            c.snapshot.proposal = None;
+            let failures = failures.into_iter().map(|failure| {
+                failure.in_context(
+                    OnboardingFindingContext::RepairApproval,
+                    OnboardingCheckPurpose::SourceFreshness,
+                )
+            });
+            if proposal.step.relay() && authoritative && basis_newest {
+                let step = proposal.step;
+                let state = &c.snapshot.steps[step.index()];
+                let status = state.status;
+                let mut findings = state.findings.clone();
+                findings
+                    .retain(|finding| finding.context != OnboardingFindingContext::RepairApproval);
+                findings.extend(failures);
+                c.set(proposal.step, status, findings);
+                c.snapshot.proposal = Some(OnboardingRepairProposal {
+                    revision: c
+                        .snapshot
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(onboarding_error)?,
+                    inconclusive: true,
+                    ..proposal
+                });
+                c.snapshot.steps[step.index()].actions = vec![
+                    OnboardingAction::ApproveRepair,
+                    OnboardingAction::CancelRepair,
+                ];
+            } else {
+                c.set(
+                    proposal.step,
+                    OnboardingStatus::RetryableFailure,
+                    failures.collect(),
+                );
+                c.snapshot.proposal = None;
+            }
         } else {
             c.approved = true;
             // The sources this approval went past stay visible.
@@ -3368,11 +3473,7 @@ impl AccountSetup<'_> {
                 Vec::new(),
             );
         }
-        self.save_onboarding(&mut c)?;
-        if c.approved {
-            self.run_onboarding_locked(&mut c).await?;
-        }
-        Ok(c.snapshot)
+        Ok(())
     }
     // Validate persisted approved previews again before their first signature, including after restart.
     fn validate_typed_onboarding_repair(
@@ -3459,6 +3560,7 @@ impl AccountSetup<'_> {
                 // Policy or persisted preview changes invalidate approval. Keep
                 // the error fail-closed, but allow a new inspection/preview.
                 c.approved = false;
+                c.automatic_inbox_event_time = None;
                 c.snapshot.proposal = None;
                 c.append_relays = false;
                 c.manual_relay_edit = false;
@@ -3483,6 +3585,7 @@ impl AccountSetup<'_> {
                 self.save_onboarding(c)?;
             }
             let (tags, content, created_at) = relay_repair_event(c, &proposal);
+            let created_at = c.automatic_inbox_event_time.unwrap_or(created_at);
             let tags = tags
                 .into_iter()
                 .map(Tag::parse)
@@ -3582,6 +3685,13 @@ impl AccountSetup<'_> {
                         endpoints,
                         event: event.clone(),
                     })?;
+                if c.automatic_inbox_event_time.take().is_some() {
+                    c.snapshot.created_inbox_list = Some(OnboardingCreatedInboxList {
+                        relays: proposal.read_relays.clone(),
+                        event_id: event.id.clone(),
+                        published_at: unix_now_seconds(),
+                    });
+                }
                 c.records[proposal.step.index()] = Some(event);
                 c.approved = false;
                 c.signed_repair = None;
