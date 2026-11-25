@@ -19,6 +19,7 @@ struct Network {
     fail_index_only: AtomicBool,
     inspection_errors: FixtureMutex<HashMap<String, transport_nostr::DirectoryInspectionError>>,
     inspected_endpoints: FixtureMutex<Vec<String>>,
+    inspect_after: FixtureMutex<Option<std::time::SystemTime>>,
     zero_acks: AtomicBool,
     block_publish: AtomicBool,
     publishing: Notify,
@@ -103,6 +104,12 @@ impl DirectoryRelayFetcher for Network {
                 .find_map(|(needle, error)| endpoint.0.contains(needle).then_some(*error))
         }) {
             return Err(error);
+        }
+        let inspect_after = *self.inspect_after.lock();
+        if let Some(at) = inspect_after
+            && let Ok(delay) = at.duration_since(std::time::SystemTime::now())
+        {
+            tokio::time::sleep(delay).await;
         }
         self.fetch_directory_events(request)
             .await
@@ -4972,6 +4979,33 @@ async fn future_dated_records_are_set_aside_with_an_advisory() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_can_enter_the_clock_window_during_lookup() {
+    use std::time::UNIX_EPOCH;
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let eligible_at = unix_now_seconds() + 2;
+    let list = signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://healthy.example".into()]],
+        "",
+        eligible_at + FUTURE_CLOCK_SKEW,
+    );
+    *network.events.lock() = vec![list.clone()];
+    *network.inspect_after.lock() =
+        Some(UNIX_EPOCH + Duration::from_secs(eligible_at) + Duration::from_millis(50));
+    assert!(list.created_at > unix_now_seconds() + FUTURE_CLOCK_SKEW);
+
+    let (records, findings, _) = runtime
+        .account_setup()
+        .inspect_onboarding_relays(&id, 10002, options().discovery_relays)
+        .await;
+    assert_eq!(records, vec![list]);
+    assert!(findings.is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 /// A repair checks the newest eligible record again after consent, even if
 /// the relay that serves the new record also serves a far-future copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5018,6 +5052,11 @@ async fn a_repair_past_a_future_dated_relay_list_builds_on_the_selected_record()
             .await
             .unwrap();
         let relays = &approved.steps[OnboardingStep::Relays.index()];
+        assert!(relays.findings.iter().any(|finding| {
+            finding.issue == OnboardingIssue::FutureDated
+                && finding.endpoint.as_deref() == Some("wss://index.example")
+                && finding.outcome == OnboardingCheckOutcome::Success
+        }));
         if changed {
             assert!(network.attempts.lock().is_empty());
             assert!(approved.proposal.is_none());
