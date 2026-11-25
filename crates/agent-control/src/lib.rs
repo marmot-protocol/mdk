@@ -1159,6 +1159,18 @@ where
     R: AsyncBufRead + Unpin,
     T: DeserializeOwned,
 {
+    match read_frame_bytes(reader).await? {
+        Some(frame) => decode_frame(&frame).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Read one newline-delimited frame without decoding it, under the same size
+/// cap as [`read_frame`]. `None` means the peer closed the stream first.
+pub async fn read_frame_bytes<R>(reader: &mut R) -> Result<Option<Vec<u8>>, AgentControlError>
+where
+    R: AsyncBufRead + Unpin,
+{
     let mut frame = Vec::new();
     // Cap the read itself so a client that never sends a newline cannot make us
     // buffer unbounded memory before the size check runs. We allow one byte past
@@ -1175,7 +1187,7 @@ where
     if frame.len() > MAX_AGENT_CONTROL_FRAME_BYTES {
         return Err(AgentControlError::FrameTooLarge(frame.len()));
     }
-    decode_frame(&frame).map(Some)
+    Ok(Some(frame))
 }
 
 pub async fn read_envelope<R, T>(

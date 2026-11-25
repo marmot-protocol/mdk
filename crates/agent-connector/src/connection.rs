@@ -2,7 +2,7 @@
 
 use agent_control::{
     AGENT_CONTROL_PROTOCOL_V2, AgentControlEnvelope, AgentControlError, AgentControlRequest,
-    AgentControlResponse, read_frame, write_frame,
+    AgentControlResponse, decode_envelope, read_frame_bytes, write_frame,
 };
 use serde::Serialize;
 use tokio::io::{AsyncWrite, BufReader};
@@ -65,25 +65,25 @@ where
 const MAX_ECHOED_REQUEST_ID_BYTES: usize = 256;
 
 /// Why the first frame on a connection could not become a request, as the
-/// `error` response reports it. Messages are fixed text: they never quote the
-/// frame.
+/// `error` response reports it. A message never quotes a value from the frame;
+/// it names at most a field of the request schema.
 #[derive(Debug, PartialEq, Eq)]
 struct RejectedFrame {
     id: Option<String>,
     code: &'static str,
-    message: &'static str,
+    message: String,
 }
 
 impl RejectedFrame {
-    fn invalid(id: Option<String>, message: &'static str) -> Self {
+    fn invalid(id: Option<String>, message: impl Into<String>) -> Self {
         Self {
             id,
             code: "invalid_request",
-            message,
+            message: message.into(),
         }
     }
 
-    /// The frame is not a JSON value at all: empty, oversized or malformed.
+    /// The frame could not be read as one line: empty or oversized.
     fn unreadable(err: &AgentControlError) -> Self {
         Self::invalid(
             None,
@@ -95,46 +95,80 @@ impl RejectedFrame {
         )
     }
 
-    /// Decode `frame` as a request envelope, or say which part of it is wrong.
-    fn parse(frame: serde_json::Value) -> Result<AgentControlEnvelope<AgentControlRequest>, Self> {
+    /// Explain why the typed decode refused `frame` with `err`. This never
+    /// admits a request: it only chooses the error the client gets.
+    fn explain(frame: &[u8], err: &AgentControlError) -> Self {
+        let frame: serde_json::Value = match agent_control::decode_frame(frame) {
+            Ok(frame) => frame,
+            Err(err) => return Self::unreadable(&err),
+        };
+        let duplicate = schema_field(err, "duplicate field");
+        // With a repeated `id` no single value is the client's id.
         let id = frame
             .get("id")
             .and_then(serde_json::Value::as_str)
-            .filter(|id| id.len() <= MAX_ECHOED_REQUEST_ID_BYTES)
+            .filter(|id| {
+                id.len() <= MAX_ECHOED_REQUEST_ID_BYTES && duplicate.as_deref() != Some("id")
+            })
             .map(str::to_owned);
         let Some(fields) = frame.as_object() else {
-            return Err(Self::invalid(id, "control frame is not a JSON object"));
+            return Self::invalid(id, "control frame is not a JSON object");
         };
+        if let Some(field) = duplicate {
+            return Self::invalid(id, format!("duplicate field `{field}`"));
+        }
         if fields
             .get("marmot_agent_control")
             .and_then(serde_json::Value::as_str)
             != Some(AGENT_CONTROL_PROTOCOL_V2)
         {
-            return Err(Self {
+            return Self {
                 id,
                 code: "unsupported_protocol",
-                message: "marmot_agent_control must be \"marmot.agent-control.v2\"",
-            });
+                message: "marmot_agent_control must be \"marmot.agent-control.v2\"".to_owned(),
+            };
         }
         if !fields.get("type").is_some_and(serde_json::Value::is_string) {
-            return Err(Self::invalid(id, "request has no string \"type\" field"));
+            return Self::invalid(id, "missing field `type`");
         }
-        // Decode the `type` on its own first, so a known type with a bad field
-        // value (which serde also reports as an unknown variant) stays an
-        // invalid request. serde names an unrecognized tag "unknown variant".
+        // Decode the `type` on its own, so a known type with a bad field value
+        // (which serde also reports as an unknown variant) stays invalid.
         let type_only = serde_json::json!({ "type": fields["type"] });
         if serde_json::from_value::<AgentControlRequest>(type_only)
             .is_err_and(|err| err.to_string().starts_with("unknown variant"))
         {
-            return Err(Self {
+            return Self {
                 id,
                 code: "unknown_request",
-                message: "unknown request type",
-            });
+                message: "unknown request type".to_owned(),
+            };
         }
-        serde_json::from_value(frame)
-            .map_err(|_| Self::invalid(id, "request fields do not match its type"))
+        match schema_field(err, "missing field") {
+            Some(field) => Self::invalid(id, format!("missing field `{field}`")),
+            None => Self::invalid(id, "a field has a value its request type does not accept"),
+        }
     }
+}
+
+/// The field named in a serde error such as "missing field `account_id_hex`",
+/// when it reads as a schema field name. serde names schema fields in missing
+/// and duplicate field errors, never request values.
+fn schema_field(err: &AgentControlError, kind: &str) -> Option<String> {
+    let AgentControlError::Json(err) = err else {
+        return None;
+    };
+    let text = err.to_string();
+    let name = text
+        .strip_prefix(kind)?
+        .strip_prefix(" `")?
+        .split('`')
+        .next()?;
+    (!name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'))
+    .then(|| name.to_owned())
 }
 
 impl AgentConnector {
@@ -145,7 +179,7 @@ impl AgentConnector {
         let mut reader = BufReader::new(read_half);
         let frame = match with_control_operation_timeout(
             "initial_control_frame_read",
-            read_frame::<_, serde_json::Value>(&mut reader),
+            read_frame_bytes(&mut reader),
         )
         .await?
         {
@@ -154,7 +188,12 @@ impl AgentConnector {
             Err(AgentControlError::Io(err)) => return Err(AgentControlError::Io(err).into()),
             Err(err) => Err(RejectedFrame::unreadable(&err)),
         };
-        let request = match frame.and_then(RejectedFrame::parse) {
+        // Only the typed decode decides what runs. A frame it refuses is read
+        // again, loosely, only to explain the refusal.
+        let request = match frame.and_then(|frame| {
+            decode_envelope::<AgentControlRequest>(&frame)
+                .map_err(|err| RejectedFrame::explain(&frame, &err))
+        }) {
             Ok(request) => request,
             Err(rejected) => {
                 // Answer a request that cannot be served instead of closing
@@ -169,7 +208,7 @@ impl AgentConnector {
                     rejected.id,
                     AgentControlResponse::Error {
                         code: rejected.code.to_owned(),
-                        message: rejected.message.to_owned(),
+                        message: rejected.message,
                         retryable: false,
                     },
                 );

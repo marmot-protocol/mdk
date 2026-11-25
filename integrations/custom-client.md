@@ -122,11 +122,14 @@ connectors do.
 Open a new connection for each request. `wn-agent` writes one reply line and closes the connection.
 `subscribe_inbound` is the exception: it keeps the connection open and streams events. A failed request answers with
 `{"type": "error", "code": "...", "message": "...", "retryable": false}`. A request that does not parse gets the same
-error line, with your `id` when it could be read, and the connection closes:
+error line and the connection closes. The reply echoes your `id` when it can be read as one string of at most 256
+bytes; a longer or repeated `id` is not echoed. The message names what is wrong, such as a missing or repeated field,
+and never repeats a value you sent:
 
 - `unsupported_protocol`: `marmot_agent_control` is missing or not the full `"marmot.agent-control.v2"`;
 - `unknown_request`: `type` names no request;
-- `invalid_request`: the line is not a JSON object, has no `type`, or its fields do not match its `type`.
+- `invalid_request`: the line is not a JSON object, has no `type`, misses or repeats a field, or has a value its
+  `type` does not accept.
 
 This standard-library helper sends the request on its stdin and prints each reply line. Save it as
 `wn_agent_request.py`:

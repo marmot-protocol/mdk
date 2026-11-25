@@ -242,36 +242,43 @@ async fn subscription_capacity_error_echoes_request_id_and_is_retryable() {
 
 /// A first frame that cannot become a request gets an `error` response naming
 /// the problem, with the request `id` when one could be read, instead of a
-/// silent close (#2242). The cases are the ones the issue reported.
+/// silent close (#2242). The cases are the ones the issue reported, plus a bad
+/// field value and a repeated `id`, which the typed decode refuses.
 #[tokio::test]
 async fn rejected_control_frames_get_an_error_response() {
     let v2 = agent_control::AGENT_CONTROL_PROTOCOL_V2;
     let long_id = "x".repeat(300);
-    let cases: Vec<(String, Option<&str>, &str)> = vec![
+    // (frame, echoed id, code, text the message names)
+    let cases: Vec<(String, Option<&str>, &str, &str)> = vec![
         (
             r#"{"marmot_agent_control":"v2","id":"b","type":"diagnostic_status"}"#.to_owned(),
             Some("b"),
             "unsupported_protocol",
+            "marmot.agent-control.v2",
         ),
         (
             r#"{"id":"c","type":"diagnostic_status"}"#.to_owned(),
             Some("c"),
             "unsupported_protocol",
+            "marmot.agent-control.v2",
         ),
         (
             format!(r#"{{"marmot_agent_control":"{v2}","id":"d","type":"no_such_request"}}"#),
             Some("d"),
             "unknown_request",
+            "unknown request type",
         ),
         (
             format!(r#"{{"marmot_agent_control":"{v2}","id":"e","type":"timeline_list"}}"#),
             Some("e"),
             "invalid_request",
+            "`account_id_hex`",
         ),
         (
             format!(r#"{{"marmot_agent_control":"{v2}","id":"f"}}"#),
             Some("f"),
             "invalid_request",
+            "`type`",
         ),
         // A known type with a bad field value is invalid, not unknown.
         (
@@ -281,16 +288,28 @@ async fn rejected_control_frames_get_an_error_response() {
             ),
             Some("g"),
             "invalid_request",
+            "value",
         ),
-        ("hello".to_owned(), None, "invalid_request"),
-        ("[1,2]".to_owned(), None, "invalid_request"),
+        // An otherwise valid request with a repeated `id` is refused, and
+        // neither id is echoed.
+        (
+            format!(
+                r#"{{"marmot_agent_control":"{v2}","id":"h","id":"i","type":"diagnostic_status"}}"#
+            ),
+            None,
+            "invalid_request",
+            "duplicate field `id`",
+        ),
+        ("hello".to_owned(), None, "invalid_request", "JSON"),
+        ("[1,2]".to_owned(), None, "invalid_request", "JSON object"),
         (
             format!(r#"{{"marmot_agent_control":"{v2}","id":"{long_id}","type":"nope"}}"#),
             None,
             "unknown_request",
+            "unknown request type",
         ),
     ];
-    for (frame, id, code) in cases {
+    for (frame, id, code, names) in cases {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("dev").join("wn-agent.sock");
         let connector = AgentConnector::open(test_config(
@@ -329,11 +348,10 @@ async fn rejected_control_frames_get_an_error_response() {
         };
         assert_eq!(got, code, "{frame:.60}");
         assert!(!retryable);
-        assert!(!message.is_empty());
-        assert!(
-            !message.contains("no_such_request") && !message.contains("hello"),
-            "the message never quotes the frame"
-        );
+        assert!(message.contains(names), "{message:?} names {names:?}");
+        for value in ["no_such_request", "hello", "bogus", "\"v2\""] {
+            assert!(!message.contains(value), "{message:?} quotes the frame");
+        }
         server.await.unwrap().unwrap();
     }
 }
