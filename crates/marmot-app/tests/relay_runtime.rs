@@ -1045,6 +1045,8 @@ async fn gift_wrap_counting_app(
 #[derive(Clone, Debug)]
 struct BlockGiftWraps {
     blocking: Arc<AtomicBool>,
+    /// The id of each gift wrap held, in order.
+    held: Arc<std::sync::Mutex<Vec<String>>>,
     entered: Arc<Notify>,
     release: Arc<Notify>,
 }
@@ -1053,6 +1055,7 @@ impl BlockGiftWraps {
     fn new() -> Self {
         Self {
             blocking: Arc::new(AtomicBool::new(false)),
+            held: Arc::default(),
             entered: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
         }
@@ -1064,6 +1067,10 @@ impl BlockGiftWraps {
 
     async fn wait_until_blocked(&self) {
         self.entered.notified().await;
+    }
+
+    fn held(&self) -> Vec<String> {
+        self.held.lock().unwrap().clone()
     }
 
     fn release(&self) {
@@ -1083,6 +1090,7 @@ impl WritePolicy for BlockGiftWraps {
                 return PolicyResult::Accept;
             }
             if self.blocking.load(Ordering::SeqCst) {
+                self.held.lock().unwrap().push(event.id.to_hex());
                 self.entered.notify_one();
                 self.release.notified().await;
             }
@@ -14900,6 +14908,12 @@ async fn direct_retry_survives_restart() {
 
     rejecting.store(false, Ordering::Relaxed);
     runtime.restart_account(alice_id).await.unwrap();
+    // The restart sends nothing: the relay that refused the Welcome is inside
+    // its backoff (mdk#3589). The host's explicit redelivery skips it.
+    runtime
+        .redeliver_welcome(alice_id, &pending[0].message_id_hex)
+        .await
+        .unwrap();
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -15760,22 +15774,15 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     let runtime = MarmotAppRuntime::new(app);
     let mut restarted_events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
-    timeout(Duration::from_secs(10), async {
-        loop {
-            match runtime.pending_welcome_deliveries(&alice_id).await {
-                Ok(pending) if !pending.is_empty() => break,
-                Ok(_) | Err(AppError::AccountWorkerBusy) | Err(AppError::TransportClosed) => {
-                    sleep(Duration::from_millis(25)).await;
-                }
-                Err(error) => panic!("pending Welcome query failed: {error}"),
-            }
-        }
-    })
-    .await
-    .expect("confirmed Welcome must remain pending before startup retry");
     timeout(Duration::from_secs(15), welcome_policy.wait_until_blocked())
         .await
         .expect("startup recovery must begin the retained Welcome publish");
+    let held = welcome_policy.held();
+    assert_eq!(held.len(), 2, "{held:?}");
+    assert_eq!(
+        held[0], held[1],
+        "startup recovery resends the exact Welcome"
+    );
 
     runtime
         .send_message(
