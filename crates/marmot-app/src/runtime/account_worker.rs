@@ -1868,7 +1868,7 @@ async fn run_app_runtime_account_worker(
         // answer is saved, and the next start sends and applies it.
         // Nor once this worker alone is told to stop: the select below
         // takes that signal, which checking it here leaves in place.
-        if client.invitation_decisions_changed
+        if client.invitation_turn_owed()
             && !lifecycle.is_stopping()
             && shutdown.is_empty()
             && Box::pin(client.drive_changed_invitation_decisions()).await

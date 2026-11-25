@@ -401,6 +401,21 @@ impl AppClient {
         let payload = event
             .encode()
             .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
+        // The engine refuses a pinned send while this device's own commit
+        // resolves (`outbound_queue_reason`). Refuse it here first, so that
+        // each retry until then writes no record.
+        if let Some(pin) = expected_epoch
+            && self
+                .runtime
+                .epoch_state(group_id)
+                .is_some_and(|state| state.is_resolving_local_publish())
+        {
+            return Err(AppError::Session(marmot_session::SessionError::Engine(
+                cgka_traits::error::EngineError::AppMessageEpochUnsettled {
+                    expected: pin.epoch,
+                },
+            )));
+        }
         // Recorded before the send: the message it becomes is filled in from
         // the effects of whichever drain publishes it.
         if withdrawal_handled(kind) {

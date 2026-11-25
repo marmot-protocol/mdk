@@ -819,8 +819,9 @@ pub struct AppClient {
     /// turn, not at the next maintenance pass (mdk#3566).
     pub(crate) invitation_decisions_changed: bool,
     /// A send of invitation answers was refused while the device group's
-    /// epoch settled ([`Self::answers_await_epoch`]); the worker's next
-    /// invitation turn sends them again.
+    /// epoch settled ([`Self::answers_await_epoch`]); the worker's next turn
+    /// sends them again ([`Self::invitation_turn_owed`]), whatever ran in
+    /// between.
     pub(crate) invitation_answers_await_epoch: bool,
     /// The last invitation pass left work it retries once the reason passes
     /// on its own: a chat's projection still saving, a chat not quiet or a
@@ -1710,10 +1711,6 @@ impl AppClient {
             )
         })
         .await;
-        // This pass cleared the worker's invitation flag above. An answer a
-        // settling epoch held back here goes out on a worker turn after it
-        // settles, not at the next pass (mdk#3573).
-        self.invitation_decisions_changed |= self.invitation_answers_await_epoch;
         boxed(|| self.sibling_key_package_upkeep(&held)).await;
         // One second for both, so a heartbeat sent on the pass that restarts
         // the inactivity clock counts as sent since the restart.
