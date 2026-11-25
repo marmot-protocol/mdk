@@ -672,3 +672,42 @@ async fn the_startup_pass_respects_a_relays_backoff() {
         .unwrap();
     assert_eq!(welcome_publishes(&adapter), vec![welcome]);
 }
+
+/// A host's redelivery that finds the deadline passed marks the Welcome
+/// expired and records it, with no maintenance pass in between, so a clock
+/// set back before the next pass does not let a second redelivery, or that
+/// pass, publish it.
+#[tokio::test]
+async fn a_redelivery_past_the_deadline_marks_the_welcome_expired() {
+    let dir = relaxed_storage_dir().unwrap();
+    let OwedInviteWelcome {
+        mut runtime,
+        adapter,
+        wall,
+        welcome,
+        ..
+    } = owed_invite_tried_now(dir.path()).await;
+    let deadline = runtime
+        .session()
+        .sent_welcome_deliver_until(&welcome.id)
+        .unwrap()
+        .unwrap();
+    let tried = welcome_publishes(&adapter).len();
+
+    wall.set(deadline.0 + 1);
+    let redelivered = runtime.redeliver_welcome(&welcome.id).await.unwrap();
+    assert!(redelivered.welcome_failures.is_empty());
+    let audit = owed_invite_audit_path(dir.path());
+    assert_eq!(expired_rows(&audit).len(), 1);
+
+    wall.set(deadline.0 - 3_600);
+    let redelivered = runtime.redeliver_welcome(&welcome.id).await.unwrap();
+    assert!(redelivered.welcome_failures.is_empty());
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(welcome_publishes(&adapter).len(), tried);
+    assert!(matches!(
+        delivery_of(&runtime, &welcome).state,
+        WelcomeDeliveryState::Undeliverable { .. }
+    ));
+    assert_eq!(expired_rows(&audit).len(), 1);
+}

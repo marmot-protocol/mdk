@@ -754,8 +754,16 @@ async fn legacy_create_welcome_cannot_be_withdrawn() {
 
 /// Withdrawal needs no hydration: a restart can stop a Welcome before its
 /// group is hydrated, and nothing publishes it afterwards, hydrated or not.
+/// One withdrawn past its delivery deadline ends expired, read from its
+/// stored rows, not withdrawn (mdk#3589).
 #[tokio::test]
 async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
+    for past_deadline in [false, true] {
+        withdraw_before_hydration(past_deadline).await;
+    }
+}
+
+async fn withdraw_before_hydration(past_deadline: bool) {
     let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot unhydrated withdrawal key").unwrap();
@@ -800,7 +808,15 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
     let welcome = welcome_publishes(&adapter)
         .pop()
         .expect("creation tried Bob's Welcome");
+    let deadline = runtime
+        .session()
+        .sent_welcome_deliver_until(&welcome.id)
+        .unwrap()
+        .unwrap();
     drop(runtime);
+    if past_deadline {
+        wall.set(deadline.0 + 60);
+    }
 
     adapter.accept_only_endpoints(vec![bob_inbox]);
     let mut runtime = open(deferred_current_nostr_welcome_session(
@@ -826,6 +842,13 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
             .transport_fanout(&welcome.id)
             .unwrap()
             .is_none()
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .expire_sent_welcome(&welcome.id, Timestamp(0))
+            .unwrap(),
+        past_deadline.then_some(cgka_traits::message::WelcomeExpiry::Recorded)
     );
     runtime
         .publish_welcome_messages_with_audit_context(
@@ -870,7 +893,10 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
         .filter(|row| row["event"]["type"] == "welcome_withdrawn")
         .collect::<Vec<_>>();
     assert_eq!(withdrawals.len(), 1, "{withdrawals:?}");
-    assert_eq!(withdrawals[0]["event"]["reason"], "withdrawn");
+    assert_eq!(
+        withdrawals[0]["event"]["reason"],
+        if past_deadline { "expired" } else { "withdrawn" }
+    );
 }
 
 /// mdk#2628 D40: a device link's Welcome is never published from its delivery

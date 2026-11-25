@@ -417,14 +417,24 @@ where
         message_id: &cgka_traits::MessageId,
     ) -> AccountResult<AccountDeviceEffects> {
         let mut output = AccountDeviceEffects::default();
-        // An expired Welcome is never published again, as one past its
-        // deadline is not: nothing is published and no failure recorded.
-        if self
-            .session
-            .outbound_welcome_status(message_id, self.wall_clock.now())?
-            == OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired)
-        {
-            return Ok(output);
+        // An expired Welcome is never published again: nothing is published
+        // and no failure recorded. One this call finds past its deadline is
+        // marked expired and recorded here (mdk#3589), after any acceptance
+        // it holds is reconciled, unless that acceptance or a wave may still
+        // deliver it, so a clock set back before the next maintenance pass
+        // cannot let a second call publish it.
+        let now = self.wall_clock.now();
+        match self.session.outbound_welcome_status(message_id, now)? {
+            OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired) => return Ok(output),
+            OutboundWelcomeStatus::PastDeadline => {
+                if !self.expired_welcome_may_still_close(message_id)
+                    && self.session.expire_sent_welcome(message_id, now)?.is_some()
+                {
+                    self.record_welcome_expiry(message_id);
+                }
+                return Ok(output);
+            }
+            _ => {}
         }
         let (group_id, message) = self.session.stored_sent_welcome(message_id)?;
         // A detached wave holds this Welcome: it is the Welcome's one
@@ -489,9 +499,11 @@ where
                 fanout.required_acks,
             );
         }
-        // Read before the withdrawal hides it.
+        // Read before the withdrawal hides it, from the stored rows, so a
+        // group not loaded yet reads as its rows stand: one past its deadline
+        // ends expired, not withdrawn.
         let now = self.wall_clock.now();
-        let status = self.session.outbound_welcome_status(message_id, now);
+        let status = self.session.stored_outbound_welcome_status(message_id, now);
         // A Welcome past its deadline has expired, which is why it was never
         // delivered: withdrawing it marks and records that expiry, once,
         // unless an acceptance it holds, or one it cannot read now, may still
@@ -649,10 +661,10 @@ where
     /// of every owed Welcome not past its delivery deadline, as
     /// [`Self::prepare_welcome_retry_task_with_audit_context`] does, and
     /// watches every staged or owed one, so maintenance publishes each once it
-    /// is owed, unless an attempt record holds it by then. It watches every
-    /// one past its deadline too, and every one marked expired whose expiry a
-    /// stop left unrecorded, so the first maintenance pass marks and records
-    /// each expiry once (mdk#3589). The retry respects
+    /// is owed, unless an attempt record holds it by then. It marks and
+    /// records the expiry of every one past its deadline itself, and records
+    /// every mark a stop left unrecorded, once each (mdk#3589); only what
+    /// cannot be done now is left to maintenance. The retry respects
     /// each relay's backoff. Returns the owed Welcomes' ids beside the task, or
     /// `None` when nothing is owed.
     #[doc(hidden)]

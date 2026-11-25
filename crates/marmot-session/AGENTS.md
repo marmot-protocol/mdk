@@ -102,8 +102,10 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     can does the watcher mark it expired (`expire_welcome`, `Engine::expire_sent_welcome`) and maintenance drop its
     retry record. The mark is durable and written first; the delivery notice, the `welcome_withdrawn` (`expired`) row
     and the mark's recorded flag follow, so each expiry is recorded once whether the deadline passed while running or
-    while stopped: the startup pass watches every Welcome past its deadline and every mark a stop left unrecorded (a
-    stop between the row and the flag records the row again, same operation id). Marked, it is never published again
+    while stopped: the startup pass itself marks and records every Welcome past its deadline and every mark a stop left
+    unrecorded, leaving to maintenance only what it cannot do now (a stop between the row and the flag records the row
+    again, same operation id). `redeliver_welcome` marks one it finds past its deadline the same way; any other pass
+    that finds the deadline passed refuses by clock and leaves the mark to the next maintenance pass. Marked, it is never published again
     at any clock, `redeliver_welcome` publishes nothing for it, and a late acknowledgement cannot mark it delivered;
     the watcher never marks while a detached wave holds it, and withdrawing a Welcome past its deadline marks it
     expired. An attempt that ends past the deadline reports no `WelcomeDeliveryFailure`. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
