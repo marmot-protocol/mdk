@@ -60,7 +60,8 @@
   Selection is unchanged.
 - Group creation, invites and direct-chat starts always discover the members' current relay routes after
   `prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm no longer
-  makes them skip discovery. An `IncompatibleKeyPackage` verdict needs that discovery to complete.
+  makes them skip discovery. An `IncompatibleKeyPackage` verdict needs that discovery to complete, and a completed read
+  that finds no deletion request for the refused KeyPackage or its slot.
 - A member lookup that finds no usable KeyPackage reports `DirectoryLookupIncomplete`, not a missing or incompatible
   KeyPackage, while this device's KeyPackage journal keeps a publication of that member that the lookup did not account
   for. The README's direct-chat section states what accounts for one and how long the journal keeps it.

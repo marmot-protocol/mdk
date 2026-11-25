@@ -1224,6 +1224,9 @@ async fn direct_start_retries_after_incomplete_outbox_discovery() {
     app.close_storage().unwrap();
 }
 
+/// An incompatibility needs complete discovery, complete KeyPackage reads and
+/// a completed read for a deletion of the refused slot. A recipient that
+/// deleted its only slot has no KeyPackage, whichever relay still serves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_start_requires_complete_discovery_for_incompatibility() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
@@ -1257,12 +1260,150 @@ async fn direct_start_requires_complete_discovery_for_incompatibility() {
         Some(cgka_traits::EngineError::MissingRequiredCapabilities { .. })
     ));
     assert!(app.groups("alice").unwrap().is_empty());
+    // That verdict followed a read for a deletion of the refused slot.
+    let slot = slot_address(&bob, "limited").remove(1);
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
+        request
+            .queries
+            .iter()
+            .any(|query| query.kind == 5 && query.reference == Some(('a', slot.clone())))
+    }));
+
+    // While that read does not finish, the slot may be deleted.
+    *fetcher.incomplete_query_kind.lock().unwrap() = Some(5);
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://directory.example".into());
+    let error = runtime
+        .start_direct_conversation_with_options("alice", &bob.account_id_hex, options)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::DirectoryLookupIncomplete(account) if account == &bob.account_id_hex),
+        "{error}"
+    );
+    assert!(app.groups("alice").unwrap().is_empty());
+
+    // The recipient deleted its only slot. The outbox still serves the
+    // package. The directory relay dropped it and holds the deletion
+    // request, which names no kind, so no KeyPackage read returns it.
+    *fetcher.incomplete_endpoint.lock().unwrap() = None;
+    {
+        let mut by_endpoint = fetcher.events_by_endpoint.lock().unwrap();
+        let records = by_endpoint.get_mut("wss://directory.example").unwrap();
+        let published_at = records
+            .iter()
+            .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap()
+            .created_at;
+        records.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        records.push(signed_deletion(
+            &app,
+            &bob,
+            vec![slot_address(&bob, "limited")],
+            published_at,
+        ));
+    }
+    let error = runtime
+        .start_direct_conversation_with_options("alice", &bob.account_id_hex, options)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::MissingKeyPackage { .. }),
+        "{error}"
+    );
+    assert!(app.groups("alice").unwrap().is_empty());
 
     runtime.shutdown().await;
     {
         let client = app.client("alice").await.unwrap();
         assert!(client.runtime.live_group_ids().unwrap().is_empty());
     }
+    app.close_storage().unwrap();
+}
+
+/// A recipient publishes two incompatible slots and deleted the newer one,
+/// with a request no KeyPackage read returns. The newer slot drops out and
+/// the older one is refused instead, once its own deletion read finds
+/// nothing. With both deleted the recipient has no KeyPackage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deleted_incompatible_slot_leaves_the_next_one_to_decide() {
+    let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
+    let requirements = retention_requirements(&app).await;
+    let directory = app.directory();
+    let resolve = || {
+        directory.resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            nostr_directory::MemberResolutionPurpose::Commit,
+            nostr_directory::MemberResolutionPolicy::Atomic,
+        )
+    };
+    let older = fresh_key_package_with_components(
+        &app,
+        &bob,
+        false,
+        app.supported_app_component_ids()
+            .into_iter()
+            .filter(|id| *id != cgka_traits::app_components::GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+            .collect(),
+    )
+    .await;
+    let now = unix_now_seconds();
+    let older = candidate(&bob, older, "older", None, now - 60);
+    let delete = |slot: &str| {
+        let deletion = signed_deletion(&app, &bob, vec![slot_address(&bob, slot)], now);
+        fetcher
+            .events_by_endpoint
+            .lock()
+            .unwrap()
+            .get_mut("wss://directory.example")
+            .unwrap()
+            .push(deletion);
+    };
+    let proof_reads = |slot: &str| {
+        let slot = slot_address(&bob, slot).remove(1);
+        fetcher
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request
+                    .queries
+                    .iter()
+                    .any(|query| query.kind == 5 && query.reference == Some(('a', slot.clone())))
+            })
+            .count()
+    };
+    for relay in ["wss://shared.example", "wss://directory.example"] {
+        fetcher
+            .events_by_endpoint
+            .lock()
+            .unwrap()
+            .get_mut(relay)
+            .unwrap()
+            .push(older.clone());
+    }
+    delete("limited");
+    let refused = resolve().await;
+    assert!(
+        matches!(
+            refused,
+            Err(DirectoryError::KeyPackageRequirements(
+                cgka_traits::EngineError::MissingRequiredCapabilities { .. }
+            ))
+        ),
+        "{:?}",
+        refused.err()
+    );
+    assert_eq!((proof_reads("limited"), proof_reads("older")), (1, 1));
+
+    delete("older");
+    let deleted = resolve().await;
+    assert!(
+        matches!(deleted, Err(DirectoryError::MissingKeyPackage { .. })),
+        "{:?}",
+        deleted.err()
+    );
     app.close_storage().unwrap();
 }
 
@@ -3152,11 +3293,12 @@ async fn a_deletion_journaled_during_the_proof_leaves_an_unproven_alternate() {
 }
 
 /// Recovery returns a package from its first read without reading the
-/// supplementary relays. If final selection then loses that package, as
-/// wall-clock revalidation can, the incompatibility left behind is a verdict
-/// only when no supplementary relay was skipped.
+/// supplementary relays or any slot's deletion requests. If final selection
+/// then loses that package, the incompatibility left behind refuses a slot
+/// no deletion read covered, so it is no verdict, whether or not a
+/// supplementary relay was skipped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lost_early_package_decides_only_when_no_relay_was_skipped() {
+async fn a_lost_early_package_leaves_no_incompatibility_verdict() {
     let (_dir, app, bob, fetcher) = direct_start_outbox_fixture().await;
     let requirements = retention_requirements(&app).await;
     let observed = {
@@ -3187,26 +3329,14 @@ async fn a_lost_early_package_decides_only_when_no_relay_was_skipped() {
                 &requirements,
             )
             .await;
-        if skipped.is_none() {
-            assert!(
-                matches!(
-                    result,
-                    Err(DirectoryError::KeyPackageRequirements(
-                        cgka_traits::EngineError::MissingRequiredCapabilities { .. }
-                    ))
-                ),
-                "{result:?}"
-            );
-        } else {
-            assert!(
-                matches!(
-                    &result,
-                    Err(DirectoryError::DirectoryLookupIncomplete(account))
-                        if account == &bob.account_id_hex
-                ),
-                "{result:?}"
-            );
-        }
+        assert!(
+            matches!(
+                &result,
+                Err(DirectoryError::DirectoryLookupIncomplete(account))
+                    if account == &bob.account_id_hex
+            ),
+            "{result:?}"
+        );
     }
     app.close_storage().unwrap();
 }

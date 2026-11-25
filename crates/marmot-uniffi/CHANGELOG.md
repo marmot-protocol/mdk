@@ -39,8 +39,9 @@
 
 ### Changed
 
-- A member's `MemberResolutionStatusFfi::IncompatibleKeyPackage` now requires completed relay-list discovery
-  and complete KeyPackage reads. If either is incomplete, the status is `MemberResolutionStatusFfi::Incomplete`.
+- A member's `MemberResolutionStatusFfi::IncompatibleKeyPackage` now requires completed relay-list discovery,
+  complete KeyPackage reads and a completed read that finds no deletion request for the refused KeyPackage or its
+  slot. If any is incomplete, the status is `MemberResolutionStatusFfi::Incomplete`.
 - A member with no usable KeyPackage is `MemberResolutionStatusFfi::Incomplete`, not missing or incompatible, while
   this device's KeyPackage journal keeps a publication of theirs that the lookup did not account for. The API
   reference for `start_direct_conversation_with_options` states what accounts for one and how long the journal keeps

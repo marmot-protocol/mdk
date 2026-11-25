@@ -739,9 +739,22 @@ pub(crate) fn select_fenced_key_packages(
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     fence: Option<FencedLookup<'_>>,
 ) -> Result<KeyPackageSelection, DirectoryError> {
+    select_fenced_or_reject(account_id_hex, records, freshness, requirements, fence)
+        .map_err(|(error, _)| error)
+}
+
+/// [`select_fenced_key_packages`]. An error that is the newest rejection
+/// comes with the publication rejected.
+pub(crate) fn select_fenced_or_reject(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    fence: Option<FencedLookup<'_>>,
+) -> Result<KeyPackageSelection, (DirectoryError, Option<KeyPackageRecoveryTarget>)> {
     let SlotCandidates {
         mut candidates,
-        newest_error,
+        newest_rejection,
         rejected_future,
         legacy_slots,
         unread_publication,
@@ -750,14 +763,15 @@ pub(crate) fn select_fenced_key_packages(
     // account's packages only when the lookup accounted for every
     // publication the journal keeps.
     if unread_publication {
-        return Err(DirectoryError::DirectoryLookupIncomplete(
-            account_id_hex.to_owned(),
+        return Err((
+            DirectoryError::DirectoryLookupIncomplete(account_id_hex.to_owned()),
+            None,
         ));
     }
     if candidates.is_empty()
-        && let Some(error) = newest_error
+        && let Some((rejected, error)) = newest_rejection
     {
-        return Err(error);
+        return Err((error, Some(rejected)));
     }
     candidates.sort_by(|a, b| {
         a.last_resort
@@ -793,8 +807,9 @@ pub(crate) fn select_fenced_key_packages(
 /// not deleted, valid, current profile and, with `requirements`, compatible.
 struct SlotCandidates {
     candidates: Vec<RankedKeyPackage>,
-    /// The newest publication's rejection, of every slot rejected.
-    newest_error: Option<DirectoryError>,
+    /// The newest rejected publication, of every slot rejected, and its
+    /// rejection.
+    newest_rejection: Option<(KeyPackageRecoveryTarget, DirectoryError)>,
     rejected_future: bool,
     legacy_slots: bool,
     /// No candidate was found, and the journal keeps a publication the
@@ -818,7 +833,7 @@ fn slot_candidates(
         .collect::<Vec<_>>();
     records.sort_by(|a, b| newest_publication_first(&a.event, b.event.created_at, &b.event.id));
     let mut rejected_future = false;
-    let mut newest_error = None;
+    let mut newest_rejection = None;
     let mut slots = BTreeSet::new();
     let mut legacy_slots = false;
     let mut candidates = Vec::new();
@@ -844,6 +859,11 @@ fn slot_candidates(
         }) {
             continue;
         }
+        let rejected = || KeyPackageRecoveryTarget {
+            event_id: record.event.id.clone(),
+            slot: slot.to_owned(),
+            created_at: record.event.created_at,
+        };
         let (fetched, metadata) = match key_package_and_metadata_from_borrowed_record(record) {
             Ok((fetched, metadata))
                 if fetched.key_package.protocol_profile == ProtocolProfile::Current =>
@@ -859,14 +879,15 @@ fn slot_candidates(
                 continue;
             }
             Err(error) => {
-                newest_error.get_or_insert(error);
+                newest_rejection.get_or_insert_with(|| (rejected(), error));
                 continue;
             }
         };
         if let Some(requirements) = requirements
             && let Err(error) = requirements.validate(&fetched.key_package)
         {
-            newest_error.get_or_insert(DirectoryError::KeyPackageRequirements(error));
+            newest_rejection
+                .get_or_insert_with(|| (rejected(), DirectoryError::KeyPackageRequirements(error)));
             continue;
         }
         let Ok(key_package_ref) = hex::decode(&metadata.key_package_ref_hex) else {
@@ -884,7 +905,7 @@ fn slot_candidates(
             .is_some_and(|lookup| lookup.misses_a_journaled_publication(account_id_hex, freshness));
     SlotCandidates {
         candidates,
-        newest_error,
+        newest_rejection,
         rejected_future,
         legacy_slots,
         unread_publication,

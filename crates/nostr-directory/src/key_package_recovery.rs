@@ -14,7 +14,8 @@ use super::resources::DirectoryResources;
 use crate::published_records::{
     KeyPackageJournalFence, KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget,
     key_package_queries, key_package_read_page_full, newest_publication_first, package_is_deleted,
-    select_fenced_key_packages, verified_deletions, without_revoked_slot_winners,
+    select_fenced_key_packages, select_fenced_or_reject, verified_deletions,
+    without_revoked_slot_winners,
 };
 use crate::{DirectoryFreshness, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome, DirectoryRelayEventRecord};
@@ -61,6 +62,14 @@ impl RecoveredKeyPackageRecords {
             // Losing an incomplete read's package to revalidation says
             // nothing about what the recipient published.
             _ if !self.complete => Err(recovery_incomplete(account)),
+            // Recovery reports an incompatibility itself, once the refused
+            // slot is proven undeleted. One that first appears here refuses a
+            // slot no deletion read covered.
+            Err(DirectoryError::KeyPackageRequirements(error))
+                if key_package_requirements_are_incompatible(&error) =>
+            {
+                Err(recovery_incomplete(account))
+            }
             selection => selection?.into_value_or_missing(account),
         }
     }
@@ -188,9 +197,12 @@ impl<R: DirectoryResources> Directory<R> {
         // time passing during a deletion read must never swap in a different
         // candidate.
         let mut targets = None;
+        // Whether the selection being proven is the package an
+        // incompatibility refuses.
+        let mut refusal = false;
         let mut revocations = 0;
-        // Every pass proves a candidate not proven before or revokes one, so
-        // the selection's size and the revocation limit bound the loop.
+        // Every pass proves a publication not proven before or revokes one,
+        // so what the lookup observed and the revocation limit bound the loop.
         loop {
             let current = match &mut targets {
                 Some(current) => current,
@@ -203,51 +215,67 @@ impl<R: DirectoryResources> Directory<R> {
                         &deletions,
                         freshness,
                     );
-                    // A compatibility refusal describes the recipient's
-                    // available packages and requires complete coverage.
                     let journal = refreshed.as_ref().or(fence);
-                    let selection = match select_fenced_key_packages(
+                    let selected = match select_fenced_or_reject(
                         account,
                         &records,
                         freshness,
                         requirements,
                         journal.map(|fence| fence.over(&observed)),
                     ) {
-                        Err(DirectoryError::KeyPackageRequirements(error))
-                            if !verdict_coverage(&deletions, journal)
-                                && key_package_requirements_are_incompatible(&error) =>
+                        Err((DirectoryError::KeyPackageRequirements(error), Some(refused)))
+                            if key_package_requirements_are_incompatible(&error) =>
                         {
-                            return Err(recovery_incomplete(account));
+                            // A compatibility refusal describes the recipient's
+                            // available packages and requires complete coverage.
+                            if !verdict_coverage(&deletions, journal) {
+                                return Err(recovery_incomplete(account));
+                            }
+                            // It also says the recipient still publishes the
+                            // refused package. The KeyPackage reads ask only
+                            // for deletion requests tagged with the kind, so
+                            // the refused slot is proven undeleted like a
+                            // selected one. A deleted slot drops out and the
+                            // rest are drawn again.
+                            if proven.contains(&refused.event_id) {
+                                return Err(DirectoryError::KeyPackageRequirements(error));
+                            }
+                            refusal = true;
+                            vec![refused]
                         }
-                        result => result?,
+                        Err((error, _)) => return Err(error),
+                        Ok(selection) => {
+                            let mut selected = selection
+                                .value
+                                .iter()
+                                .take(wanted)
+                                .map(KeyPackageRecoveryTarget::from_fetched)
+                                .collect::<Vec<_>>();
+                            if selected.is_empty()
+                                && selection.rejected_future
+                                && let Some(cached) = cached_target
+                                    .as_ref()
+                                    .filter(|target| evidence.allows_target(target))
+                            {
+                                selected.push(cached.clone());
+                            }
+                            if selected.is_empty() {
+                                // Absence is a verdict too, with the same coverage.
+                                if !verdict_coverage(&deletions, journal) {
+                                    return Err(recovery_incomplete(account));
+                                }
+                                return Ok(RecoveredKeyPackageRecords {
+                                    freshness,
+                                    records,
+                                    seen: Some(observed),
+                                    cache_evidence: Some(evidence),
+                                    complete: true,
+                                });
+                            }
+                            refusal = false;
+                            selected
+                        }
                     };
-                    let mut selected = selection
-                        .value
-                        .iter()
-                        .take(wanted)
-                        .map(KeyPackageRecoveryTarget::from_fetched)
-                        .collect::<Vec<_>>();
-                    if selected.is_empty()
-                        && selection.rejected_future
-                        && let Some(cached) = cached_target
-                            .as_ref()
-                            .filter(|target| evidence.allows_target(target))
-                    {
-                        selected.push(cached.clone());
-                    }
-                    if selected.is_empty() {
-                        // Absence is a verdict too, with the same coverage.
-                        if !verdict_coverage(&deletions, journal) {
-                            return Err(recovery_incomplete(account));
-                        }
-                        return Ok(RecoveredKeyPackageRecords {
-                            freshness,
-                            records,
-                            seen: Some(observed),
-                            cache_evidence: Some(evidence),
-                            complete: true,
-                        });
-                    }
                     targets.insert(selected)
                 }
             };
@@ -315,6 +343,12 @@ impl<R: DirectoryResources> Directory<R> {
                 return Err(recovery_incomplete(account));
             }
             proven.insert(target.event_id);
+            if refusal {
+                // The refusal is drawn again from the journal as it is after
+                // the proof read, and returned once its slot is proven.
+                targets = None;
+                refreshed = self.journal_and_refresh_fence(account, &[], fence).await?;
+            }
         }
     }
 
