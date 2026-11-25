@@ -3723,7 +3723,7 @@ Approve the displayed revision for a non-recovered attempt; recovered attempts r
 pub async fn cancel_onboarding_repair( &self, account_ref: String, ) -> Result<OnboardingSnapshotFfi, MarmotKitError>
 ```
 
-Dismiss an unapproved repair proposal; this cannot undo already-approved publication intent.
+Dismiss a proposal when the step offers `CancelRepair`. An approved proposal offers this action after a definitive publication failure across all targets.
 
 [Source](src/commands/onboarding.rs#L289)
 

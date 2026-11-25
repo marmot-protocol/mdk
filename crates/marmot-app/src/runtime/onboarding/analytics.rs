@@ -112,6 +112,7 @@ fn issue_label(issue: OnboardingIssue) -> &'static str {
         OnboardingIssue::UnsafeRelay => "unsafe_relay",
         OnboardingIssue::Unreachable => "unreachable",
         OnboardingIssue::TimedOut => "timed_out",
+        OnboardingIssue::RateLimited => "rate_limited",
         OnboardingIssue::AuthenticationRequired => "authentication_required",
         OnboardingIssue::PaymentRequired => "payment_required",
         OnboardingIssue::AccessRestricted => "access_restricted",

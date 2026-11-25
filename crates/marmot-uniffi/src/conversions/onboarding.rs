@@ -94,6 +94,7 @@ pub enum OnboardingIssueFfi {
     OtherInstallationPossible,
     DiscoveryIncomplete,
     InspectionCompleted,
+    RateLimited,
 }
 impl From<marmot_app::OnboardingIssue> for OnboardingIssueFfi {
     fn from(value: marmot_app::OnboardingIssue) -> Self {
@@ -122,6 +123,7 @@ impl From<marmot_app::OnboardingIssue> for OnboardingIssueFfi {
             }
             marmot_app::OnboardingIssue::DiscoveryIncomplete => Self::DiscoveryIncomplete,
             marmot_app::OnboardingIssue::InspectionCompleted => Self::InspectionCompleted,
+            marmot_app::OnboardingIssue::RateLimited => Self::RateLimited,
         }
     }
 }
@@ -150,6 +152,7 @@ impl From<OnboardingIssueFfi> for marmot_app::OnboardingIssue {
             OnboardingIssueFfi::OtherInstallationPossible => Self::OtherInstallationPossible,
             OnboardingIssueFfi::DiscoveryIncomplete => Self::DiscoveryIncomplete,
             OnboardingIssueFfi::InspectionCompleted => Self::InspectionCompleted,
+            OnboardingIssueFfi::RateLimited => Self::RateLimited,
         }
     }
 }
@@ -834,6 +837,10 @@ mod tests {
             (
                 marmot_app::OnboardingIssue::InspectionCompleted,
                 OnboardingIssueFfi::InspectionCompleted,
+            ),
+            (
+                marmot_app::OnboardingIssue::RateLimited,
+                OnboardingIssueFfi::RateLimited,
             ),
         ] {
             assert_eq!(OnboardingIssueFfi::from(native), foreign);

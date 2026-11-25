@@ -292,6 +292,7 @@ pub(crate) const ONBOARDING_PAUSE_ISSUES: &[&str] = &[
     "unsafe_relay",
     "unreachable",
     "timed_out",
+    "rate_limited",
     "authentication_required",
     "payment_required",
     "access_restricted",

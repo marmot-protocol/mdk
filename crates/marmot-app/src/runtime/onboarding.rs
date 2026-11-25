@@ -2,6 +2,7 @@
 //! A repair is a separate proposal and revision-checked approval; its signed
 //! bytes are checkpointed before they can reach a relay.
 use super::*;
+use cgka_traits::{TransportEndpointFailureKind, TransportEndpointRejectionCategory};
 use nostr::prelude::{EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -307,6 +308,9 @@ const _: () = assert!(
     "CHECK_WAIT must outlast one relay inspection"
 );
 const ONBOARDING_CANCELLATION_WAIT: Duration = Duration::from_secs(15);
+// Up to three publish calls, including any host fallback. The SDK bounds
+// each call at 20 seconds. Only transient failures are retried.
+const REPAIR_PUBLISH_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
 const CHECK_MAX_AGE: u64 = 300;
 const FUTURE_CLOCK_SKEW: u64 = 300;
 const DISCOVERY_PAGE_LIMIT: usize = 32;
@@ -357,6 +361,8 @@ pub enum OnboardingIssue {
     DiscoveryIncomplete,
     /// A bounded declared-route query completed; not publication evidence.
     InspectionCompleted,
+    /// A relay explicitly rate-limited publication of the signed event.
+    RateLimited,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OnboardingAction {
@@ -653,6 +659,14 @@ struct OnboardingCheckpoint {
     // a retry republishes precisely the same event once signed.
     approved: bool,
     signed_repair: Option<NostrTransportEvent>,
+    // None on older checkpoints, where an already signed repair may have
+    // been sent without a receipt. Persist true before the first send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repair_may_have_published: Option<bool>,
+    // A relay that acknowledged a repair may be outside the normal lookup
+    // set. Query it when checking the published record or a later edit.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    repair_discovery_relays: BTreeMap<u64, String>,
     #[serde(default)]
     append_relays: bool,
     #[serde(default)]
@@ -791,6 +805,8 @@ impl OnboardingCheckpoint {
             records: vec![None; STEP_COUNT],
             approved: false,
             signed_repair: None,
+            repair_may_have_published: None,
+            repair_discovery_relays: BTreeMap::new(),
             append_relays: false,
             manual_relay_edit: false,
             single_device_acknowledged: false,
@@ -849,6 +865,8 @@ impl OnboardingCheckpoint {
             && findings.iter().any(|finding| {
                 (finding.context == OnboardingFindingContext::DeclaredRoute
                     && finding.issue == OnboardingIssue::NoUsableRoute)
+                    || (finding.context == OnboardingFindingContext::RepairPublication
+                        && finding.issue == OnboardingIssue::PublicationFailed)
                     || (finding.context == OnboardingFindingContext::RecordDiscovery
                         && finding.issue == OnboardingIssue::DiscoveryIncomplete
                         && self.records[step.index()].is_none())
@@ -877,6 +895,21 @@ impl OnboardingCheckpoint {
         step.relay()
             && (state.status == OnboardingStatus::NeedsInput
                 || self.relay_check_failed_editably(step, state.status, &state.findings))
+    }
+    // A failed repair can be replaced once every attempted send is accounted
+    // for. Keep the signed event when an acknowledgment could have been lost.
+    fn unpublished_repair_step(&self) -> Option<OnboardingStep> {
+        let step = self.snapshot.proposal.as_ref()?.step;
+        let state = &self.snapshot.steps[step.index()];
+        (self.approved
+            && self.signed_repair.is_some()
+            && self.repair_may_have_published == Some(false)
+            && state.status == OnboardingStatus::RetryableFailure
+            && state.findings.iter().any(|finding| {
+                finding.context == OnboardingFindingContext::RepairPublication
+                    && finding.issue == OnboardingIssue::PublicationFailed
+            }))
+        .then_some(step)
     }
     fn attempt(&self) -> OnboardingAttempt {
         use sha2::{Digest, Sha256};
@@ -1127,9 +1160,12 @@ fn refresh_finding_actions(snapshot: &mut OnboardingSnapshot) {
                 OnboardingFindingContext::DeclaredRoute => {
                     &[OnboardingAction::Retry, OnboardingAction::ReconnectSigner]
                 }
-                OnboardingFindingContext::RepairPublication => {
-                    &[OnboardingAction::Retry, OnboardingAction::ReconnectSigner]
-                }
+                OnboardingFindingContext::RepairPublication => &[
+                    OnboardingAction::Retry,
+                    OnboardingAction::ReconnectSigner,
+                    OnboardingAction::EditRelays,
+                    OnboardingAction::CancelRepair,
+                ],
             };
             finding.actions.extend(
                 applicable
@@ -1766,6 +1802,7 @@ impl AccountSetup<'_> {
                     state.actions.push(OnboardingAction::CancelOnboarding);
                 }
             }
+            let unpublished = checkpoint.unpublished_repair_step();
             if checkpoint.approved
                 && let Some(proposal) = &checkpoint.snapshot.proposal
             {
@@ -1777,7 +1814,15 @@ impl AccountSetup<'_> {
                         OnboardingAction::CancelOnboarding,
                     ],
                     OnboardingStatus::RetryableFailure => {
-                        vec![OnboardingAction::Retry, OnboardingAction::CancelOnboarding]
+                        let mut actions = vec![OnboardingAction::Retry];
+                        if unpublished.is_some() {
+                            if proposal.step.relay() {
+                                actions.push(OnboardingAction::EditRelays);
+                            }
+                            actions.push(OnboardingAction::CancelRepair);
+                        }
+                        actions.push(OnboardingAction::CancelOnboarding);
+                        actions
                     }
                     _ => vec![OnboardingAction::CancelOnboarding],
                 };
@@ -2187,7 +2232,14 @@ impl AccountSetup<'_> {
                 | OnboardingStatus::WaitingForSigner => return Ok(()),
                 _ => {}
             }
-            c.set(step, OnboardingStatus::Checking, Vec::new());
+            // A published repair's refused relays (mdk#3723) outlast its recheck.
+            let refusals = c.snapshot.steps[index]
+                .findings
+                .iter()
+                .filter(|finding| finding.context == OnboardingFindingContext::RepairPublication)
+                .cloned()
+                .collect::<Vec<_>>();
+            c.set(step, OnboardingStatus::Checking, refusals.clone());
             self.save_onboarding(c)?;
             self.require_live_onboarding_attempt(c)?;
             if step == OnboardingStep::SingleDevice {
@@ -2302,6 +2354,7 @@ impl AccountSetup<'_> {
                     )?;
                 }
                 c.set(step, status, findings);
+                c.snapshot.steps[index].findings.extend(refusals);
             }
             self.require_live_onboarding_attempt(c)?;
             if c.snapshot.ready {
@@ -2464,6 +2517,7 @@ impl AccountSetup<'_> {
         account_id: &str,
         kind: u64,
         endpoints: Vec<String>,
+        repair_relay: Option<&str>,
     ) -> (
         Vec<NostrTransportEvent>,
         Vec<OnboardingFinding>,
@@ -2485,14 +2539,15 @@ impl AccountSetup<'_> {
         let classifications = self.app().relay_plane.classify_relay_endpoints(endpoints);
         let mut failures = Vec::new();
         let mut seen = HashSet::new();
-        // Public indexers are dialed on top of the cap, so they never take a
-        // host or declared relay's slot and are never dropped themselves.
-        let indexers: HashSet<String> = self
+        // Public indexers and a relay that acknowledged this repair get
+        // separate slots so they cannot hide a host or declared relay.
+        let mut uncapped: HashSet<String> = self
             .app()
             .discovery_indexer_relays()
             .iter()
             .map(|endpoint| relay_key(&endpoint.0))
             .collect();
+        uncapped.extend(repair_relay.map(relay_key));
         let mut capped = 0;
         for c in classifications {
             // Retain Tor declarations, but never send them to the direct dialer.
@@ -2523,7 +2578,7 @@ impl AccountSetup<'_> {
             if !seen.insert(url) {
                 continue;
             }
-            if !indexers.contains(&relay_key(&endpoint)) {
+            if !uncapped.contains(&relay_key(&endpoint)) {
                 capped += 1;
                 if capped > MAX_RELAYS {
                     if capped == MAX_RELAYS + 1 {
@@ -2670,7 +2725,11 @@ impl AccountSetup<'_> {
         } else {
             self.app().discovery_indexer_relays()
         };
-        self.onboarding_sources_with(c, step, &indexers).await
+        let mut sources = self.onboarding_sources_with(c, step, &indexers).await;
+        if let Some(relay) = c.repair_discovery_relays.get(&step.kind()) {
+            sources.push(relay.clone());
+        }
+        sources
     }
     async fn onboarding_sources_with(
         &self,
@@ -2684,11 +2743,18 @@ impl AccountSetup<'_> {
         } else if step.optional() {
             let mut lookup = sources.clone();
             append_public_indexers(&mut lookup, &c.options, indexers);
-            self.inspect_onboarding_relays(&c.snapshot.account_id_hex, 10002, lookup)
-                .await
-                .0
-                .into_iter()
-                .next()
+            let repair_relay = c.repair_discovery_relays.get(&10002);
+            lookup.extend(repair_relay.cloned());
+            self.inspect_onboarding_relays(
+                &c.snapshot.account_id_hex,
+                10002,
+                lookup,
+                repair_relay.map(String::as_str),
+            )
+            .await
+            .0
+            .into_iter()
+            .next()
         } else {
             None
         };
@@ -2739,7 +2805,14 @@ impl AccountSetup<'_> {
         }
         let sources = self.onboarding_sources(c, step).await;
         let (records, mut failures, completed) = self
-            .inspect_onboarding_relays(&c.snapshot.account_id_hex, step.kind(), sources.clone())
+            .inspect_onboarding_relays(
+                &c.snapshot.account_id_hex,
+                step.kind(),
+                sources.clone(),
+                c.repair_discovery_relays
+                    .get(&step.kind())
+                    .map(String::as_str),
+            )
             .await;
         let Some(event) = records.into_iter().next() else {
             return if completed.is_empty() || !failures.is_empty() {
@@ -2900,6 +2973,7 @@ impl AccountSetup<'_> {
                                 10002
                             },
                             endpoints,
+                            None,
                         )
                         .await;
                     findings.extend(failures.into_iter().map(|failure| {
@@ -2986,13 +3060,21 @@ impl AccountSetup<'_> {
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;
         let status = c.snapshot.steps[step.index()].status;
-        if c.approved
-            || !c.relay_step_editable(step)
-            || (selection.is_none()
-                && status != OnboardingStatus::NeedsInput
-                && !c.recommended_relays_apply(step, status))
+        // An explicit edit can replace an approved repair after a definitive failure.
+        let replaces_unpublished = selection.is_some() && c.unpublished_repair_step() == Some(step);
+        if !replaces_unpublished
+            && (c.approved
+                || !c.relay_step_editable(step)
+                || (selection.is_none()
+                    && status != OnboardingStatus::NeedsInput
+                    && !c.recommended_relays_apply(step, status)))
         {
             return Err(onboarding_error());
+        }
+        if replaces_unpublished {
+            c.approved = false;
+            c.signed_repair = None;
+            c.repair_may_have_published = None;
         }
         c.append_relays = selection.is_none();
         c.manual_relay_edit = selection.is_some();
@@ -3209,7 +3291,12 @@ impl AccountSetup<'_> {
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;
         if c.approved {
-            return Err(onboarding_error());
+            if c.unpublished_repair_step().is_none() {
+                return Err(onboarding_error());
+            }
+            c.approved = false;
+            c.signed_repair = None;
+            c.repair_may_have_published = None;
         }
         let proposal = c.snapshot.proposal.take().ok_or_else(onboarding_error)?;
         // A relay proposal changes actions, not the retained inspection result,
@@ -3284,6 +3371,9 @@ impl AccountSetup<'_> {
                     &c.snapshot.account_id_hex,
                     proposal.step.kind(),
                     sources.clone(),
+                    c.repair_discovery_relays
+                        .get(&proposal.step.kind())
+                        .map(String::as_str),
                 ),
             )
             .await?;
@@ -3523,6 +3613,7 @@ impl AccountSetup<'_> {
             c.signed_repair = Some(
                 NostrTransportEvent::from_nostr_event(&signed).map_err(|_| onboarding_error())?,
             );
+            c.repair_may_have_published = Some(false);
             c.set(proposal.step, OnboardingStatus::Checking, Vec::new());
             self.save_onboarding(c)?;
         }
@@ -3530,27 +3621,39 @@ impl AccountSetup<'_> {
         if self.require_live_onboarding_attempt(c).is_err() {
             return Ok(false);
         }
-        // Repairs publish where they did before indexers were searched: the
-        // host's discovery relays and the account's declared relays. Indexers
-        // pick up replaceable records from those relays themselves.
-        let mut endpoints = self
+        // Indexers pick up replaceable records from other relays. Send to
+        // the normal sources and the proposed list before trying more relays.
+        let mut sources = self
             .await_while_onboarding_live(
                 &c.snapshot.account_id_hex,
                 c.attempt(),
                 self.onboarding_sources_with(c, proposal.step, &[]),
             )
             .await?;
-        endpoints.extend(
+        sources.extend(
             proposal
                 .read_relays
                 .iter()
                 .chain(&proposal.write_relays)
                 .cloned(),
         );
-        let endpoints = self.app().relay_plane.retain_safe_discovered_endpoints(
-            endpoints.into_iter().map(TransportEndpoint).collect(),
+        let mut targets = self.app().relay_plane.retain_safe_discovered_endpoints(
+            sources.into_iter().map(TransportEndpoint).collect(),
             "onboarding repair",
         );
+        let mut fallbacks = self.app().relay_plane.retain_safe_discovered_endpoints(
+            c.options
+                .default_relays
+                .iter()
+                .chain(&c.options.inbox_relays)
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            "onboarding repair fallback",
+        );
+        let mut unique = HashSet::new();
+        targets.retain(|endpoint| unique.insert(relay_key(endpoint.as_str())));
+        fallbacks.retain(|endpoint| unique.insert(relay_key(endpoint.as_str())));
         self.require_live_onboarding_attempt(c)?;
         #[cfg(test)]
         self.await_onboarding_test_hold(&self.state.onboarding_test_holds.publication)
@@ -3558,66 +3661,174 @@ impl AccountSetup<'_> {
         if self.require_live_under_state_lock(c).is_err() {
             return Ok(false);
         }
+        let previously_uncertain = c.repair_may_have_published != Some(false);
+        c.repair_may_have_published = Some(true);
+        c.set(proposal.step, OnboardingStatus::Checking, Vec::new());
+        self.save_onboarding(c)?;
+        let client = self
+            .app()
+            .relay_client_for_account_id(&account.account_id_hex, signer);
+        let attempt = c.attempt();
         let outcome = self
             .await_while_onboarding_live(
                 &c.snapshot.account_id_hex,
-                c.attempt(),
-                self.app()
-                    .relay_client_for_account_id(&account.account_id_hex, signer)
-                    .publish_event(&endpoints, &event, 1),
+                attempt,
+                publish_approved_repair(&*client, &event, targets, fallbacks),
             )
             .await;
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(_) => return Ok(false),
+        let Ok((accepted, findings, uncertain)) = outcome else {
+            return Ok(false);
         };
         if self.require_live_onboarding_attempt(c).is_err() {
             return Ok(false);
         }
-        match outcome {
-            Ok(outcome) if !outcome.accepted.is_empty() => {
-                self.app()
-                    .directory()
-                    .ingest_directory_relay_event(DirectoryRelayEventRecord {
-                        endpoints,
-                        event: event.clone(),
-                    })?;
-                c.records[proposal.step.index()] = Some(event);
-                c.approved = false;
-                c.signed_repair = None;
-                c.snapshot.proposal = None;
-                c.reset_step(proposal.step);
-                c.reset_step(OnboardingStep::SingleDevice);
-                c.reset_step(OnboardingStep::KeyPackage);
-                if proposal.step == OnboardingStep::Relays {
-                    c.set(
-                        OnboardingStep::InboxRelays,
-                        OnboardingStatus::Pending,
-                        Vec::new(),
-                    );
-                    for step in [OnboardingStep::Profile, OnboardingStep::Follows] {
-                        if c.snapshot.steps[step.index()].status != OnboardingStatus::Skipped {
-                            c.reset_step(step);
-                        }
-                    }
+        let Some(acknowledged) = accepted.first() else {
+            c.repair_may_have_published = Some(previously_uncertain || uncertain);
+            c.set(
+                proposal.step,
+                OnboardingStatus::RetryableFailure,
+                std::iter::once(finding(OnboardingIssue::PublicationFailed).in_context(
+                    OnboardingFindingContext::RepairPublication,
+                    OnboardingCheckPurpose::EventPublication,
+                ))
+                .chain(findings)
+                .collect(),
+            );
+            self.save_onboarding(c)?;
+            return Ok(false);
+        };
+        c.repair_discovery_relays
+            .insert(proposal.step.kind(), acknowledged.0.clone());
+        self.app()
+            .directory()
+            .ingest_directory_relay_event(DirectoryRelayEventRecord {
+                endpoints: accepted,
+                event: event.clone(),
+            })?;
+        c.records[proposal.step.index()] = Some(event);
+        c.approved = false;
+        c.signed_repair = None;
+        c.repair_may_have_published = None;
+        c.snapshot.proposal = None;
+        c.set(proposal.step, OnboardingStatus::Pending, findings);
+        c.reset_step(OnboardingStep::SingleDevice);
+        c.reset_step(OnboardingStep::KeyPackage);
+        if proposal.step == OnboardingStep::Relays {
+            c.set(
+                OnboardingStep::InboxRelays,
+                OnboardingStatus::Pending,
+                Vec::new(),
+            );
+            for step in [OnboardingStep::Profile, OnboardingStep::Follows] {
+                if c.snapshot.steps[step.index()].status != OnboardingStatus::Skipped {
+                    c.reset_step(step);
                 }
-                self.save_onboarding(c)?;
-                Ok(true)
-            }
-            _ => {
-                c.set(
-                    proposal.step,
-                    OnboardingStatus::RetryableFailure,
-                    vec![finding(OnboardingIssue::PublicationFailed).in_context(
-                        OnboardingFindingContext::RepairPublication,
-                        OnboardingCheckPurpose::EventPublication,
-                    )],
-                );
-                self.save_onboarding(c)?;
-                Ok(false)
             }
         }
+        self.save_onboarding(c)?;
+        Ok(true)
     }
+}
+
+async fn publish_approved_repair(
+    client: &dyn transport_nostr_adapter::NostrRelayClient,
+    event: &NostrTransportEvent,
+    mut targets: Vec<TransportEndpoint>,
+    mut fallbacks: Vec<TransportEndpoint>,
+) -> (Vec<TransportEndpoint>, Vec<OnboardingFinding>, bool) {
+    use TransportEndpointFailureKind::{PossiblyExposed, RetryableUnavailable};
+    use TransportEndpointRejectionCategory::{
+        AuthRequired, Blocked, Error, RateLimited, Restricted,
+    };
+
+    if targets.is_empty() {
+        targets = std::mem::take(&mut fallbacks);
+    }
+    let mut delays = REPAIR_PUBLISH_RETRY_DELAYS.into_iter();
+    let mut findings = BTreeMap::new();
+    let mut uncertain = false;
+    while !targets.is_empty() {
+        let (accepted, failed) = match client.publish_event(&targets, event, 1).await {
+            Ok(outcome) => (
+                outcome
+                    .accepted
+                    .into_iter()
+                    .map(|receipt| receipt.endpoint)
+                    .collect::<Vec<_>>(),
+                outcome.failed,
+            ),
+            Err(error) => (Vec::new(), error.publish_endpoint_failures().to_vec()),
+        };
+        let accepted_keys = accepted
+            .iter()
+            .map(|endpoint| relay_key(endpoint.as_str()))
+            .collect::<HashSet<_>>();
+        let failures = failed
+            .into_iter()
+            .map(|failure| (relay_key(failure.endpoint.as_str()), failure))
+            .collect::<HashMap<_, _>>();
+        let mut retry = Vec::new();
+        for endpoint in targets {
+            let key = relay_key(endpoint.as_str());
+            if accepted_keys.contains(&key) {
+                findings.remove(&key);
+                continue;
+            }
+            let failure = failures.get(&key);
+            // Keep the last known answer if the quorum canceled this send.
+            if !accepted.is_empty() && failure.is_none() {
+                continue;
+            }
+            let issue = match failure {
+                Some(failure) => {
+                    uncertain |= failure.kind == PossiblyExposed
+                        || (failure.kind == RetryableUnavailable
+                            && failure.rejection_category.is_none()
+                            && !failure.proves_nothing_sent());
+                    match (failure.rejection_category, failure.kind) {
+                        (Some(RateLimited), _) => OnboardingIssue::RateLimited,
+                        (Some(AuthRequired), _) => OnboardingIssue::AuthenticationRequired,
+                        (None | Some(Error), PossiblyExposed) => OnboardingIssue::TimedOut,
+                        (None, RetryableUnavailable) => OnboardingIssue::Unreachable,
+                        (Some(Blocked | Restricted), _) => OnboardingIssue::AccessRestricted,
+                        _ => OnboardingIssue::PublicationFailed,
+                    }
+                }
+                None => {
+                    uncertain = true;
+                    OnboardingIssue::TimedOut
+                }
+            };
+            if matches!(
+                issue,
+                OnboardingIssue::RateLimited
+                    | OnboardingIssue::TimedOut
+                    | OnboardingIssue::Unreachable
+            ) {
+                retry.push(endpoint.clone());
+            }
+            findings.insert(
+                key,
+                OnboardingFinding {
+                    endpoint: Some(endpoint.0),
+                    ..finding(issue).in_context(
+                        OnboardingFindingContext::RepairPublication,
+                        OnboardingCheckPurpose::EventPublication,
+                    )
+                },
+            );
+        }
+        if !accepted.is_empty() {
+            return (accepted, findings.into_values().collect(), uncertain);
+        }
+        let Some(delay) = delays.next() else { break };
+        if !retry.is_empty() {
+            tokio::time::sleep(delay).await;
+        }
+        retry.append(&mut fallbacks);
+        targets = retry;
+    }
+    (Vec::new(), findings.into_values().collect(), uncertain)
 }
 
 // A published declaration can retain Tor endpoints even without a Tor transport.

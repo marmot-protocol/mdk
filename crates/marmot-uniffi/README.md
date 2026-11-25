@@ -692,8 +692,17 @@ Imported identities can use the durable preflight API instead of `login`:
    Profile fields left unset preserve their current values; an
    explicit empty string clears a field. Display the proposed edits, then pass the returned
    snapshot revision to `approve_onboarding_repair`. For an inbox proposal use
-   `read_relays` and an empty `write_relays`. `cancel_onboarding_repair` dismisses
-   a proposal until approval has been recorded.
+   `read_relays` and an empty `write_relays`. An approved repair tries the usual
+   publication targets first. If none acknowledges it, MDK tries the host's
+   remaining default and inbox relays. MDK backs off before retrying rate-limited
+   or silent relays, with up to three publication calls in all. Reported refusals
+   remain visible after a successful publication.
+   A failed publication reports `PublicationFailed` and endpoint-specific
+   `RepairPublication` findings such as `AccessRestricted`, `RateLimited`, and
+   `TimedOut`. `Retry` resends the same signed event. After a definitive failure,
+   the step also offers `CancelRepair` and, on a relay step, `EditRelays`. An edit
+   needs a new approval and signature. A missing acknowledgment keeps the
+   approved event pending since a relay may have stored it.
 5. `retry_onboarding_step` requires an offered `Retry` action; `set_onboarding_discovery_relays`
    retries with explicitly chosen discovery sources without publishing them.
    After process restart, read `onboarding_snapshot`, register the external
