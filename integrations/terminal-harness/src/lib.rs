@@ -8,6 +8,7 @@ mod control;
 mod error;
 mod group_profile;
 pub mod process;
+pub mod reply;
 mod repo_picker;
 mod store;
 #[cfg(all(feature = "test-support", unix))]
@@ -143,6 +144,9 @@ pub struct Invocation {
     pub prompt: String,
     /// Backend completion-file contract for typed artifact output.
     pub artifact_output: Option<ArtifactOutputRequest>,
+    /// Reply context the backend passes to its process unrendered, so it is
+    /// checked after the backend's own preflight.
+    pub reply: Option<reply::DeferredReply>,
 }
 
 impl fmt::Debug for Invocation {
@@ -369,6 +373,7 @@ mod privacy_tests {
             session_id: Some("secret-session".to_owned()),
             prompt: "secret prompt".to_owned(),
             artifact_output: None,
+            reply: None,
         };
         let invocation_debug = format!("{invocation:?}");
         for secret in ["/secret", "secret-session", "secret prompt"] {

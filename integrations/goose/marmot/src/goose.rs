@@ -115,6 +115,7 @@ async fn run_with_bin(
         session_id,
         prompt,
         artifact_output: _,
+        reply,
     } = invocation;
     let resume = session_id.is_some();
     let session_name = match session_id {
@@ -133,6 +134,7 @@ async fn run_with_bin(
             backend_name: "goose",
             total_timeout: timeout,
             idle_timeout,
+            reply,
         },
         tx,
         move |line| parser.parse_line(line),
@@ -721,6 +723,7 @@ mod tests {
             session_id: session_id.map(str::to_owned),
             prompt: prompt.to_owned(),
             artifact_output: None,
+            reply: None,
         }
     }
 
@@ -1044,6 +1047,7 @@ exit 1
             session_id,
             prompt: prompt.to_owned(),
             artifact_output: None,
+            reply: None,
         };
 
         let (tx, mut rx) = mpsc::channel(8);

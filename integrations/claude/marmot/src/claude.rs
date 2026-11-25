@@ -65,6 +65,7 @@ async fn run_with_bin(
         session_id,
         prompt,
         artifact_output: _,
+        reply,
     } = invocation;
     let resume = session_id.is_some();
     let session_id = match session_id {
@@ -83,6 +84,7 @@ async fn run_with_bin(
             backend_name: "claude",
             total_timeout: timeout,
             idle_timeout,
+            reply,
         },
         tx,
         move |line| parse_event_line(line, &expected_session_id),
@@ -633,6 +635,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"reply: %
                     session_id: None,
                     prompt: "--stdin-only".to_owned(),
                     artifact_output: None,
+                    reply: None,
                 },
                 tx,
             ),
@@ -678,6 +681,7 @@ exit 64
                 session_id: None,
                 prompt: "private prompt".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             tx,
         )
@@ -718,6 +722,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"session_i
                 session_id: Some(SESSION.to_owned()),
                 prompt: "resume".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             tx,
         )
@@ -752,6 +757,7 @@ sleep 5
                 session_id: None,
                 prompt: "private prompt".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             tx,
         )
@@ -777,6 +783,7 @@ sleep 5
                 session_id: None,
                 prompt: "Reply with exactly CLAUDE_CONNECTOR_OK and nothing else.".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             tx,
         )
@@ -800,6 +807,7 @@ sleep 5
                 session_id: Some(session_id.clone()),
                 prompt: "Reply with exactly CLAUDE_RESUME_OK and nothing else.".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             resume_tx,
         )

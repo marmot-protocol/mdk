@@ -72,6 +72,7 @@ fn process_spec(
         backend_name: "test",
         total_timeout: Duration::from_secs(5),
         idle_timeout: Duration::from_secs(2),
+        reply: None,
     }
 }
 
@@ -166,6 +167,80 @@ printf '{"type":"text","text":"argument:%s"}\n' "$3"
         );
         assert!(rx.recv().await.is_none());
     }
+}
+
+/// An argument prompt is readable from spawn on, so its reply block is checked
+/// and rendered before the process starts: the lookup runs before the backend
+/// has run at all, and the argument carries the checked copy.
+#[tokio::test]
+async fn an_argument_prompt_renders_its_checked_reply_before_spawn() {
+    use agent_control::{
+        AgentControlReferencedMessage, AgentControlReferencedMessageAvailability,
+        AgentControlTimelineMessageAvailability,
+    };
+    use marmot_terminal_harness::reply::DeferredReply;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let started = root.path().join("started");
+    let script = executable_script(
+        root.path(),
+        "argument-backend",
+        &format!(
+            r#"#!/bin/sh
+: > "{}"
+printf '%s' "$2" > "{}"
+printf '{{"type":"text","text":"done"}}\n'
+"#,
+            started.display(),
+            root.path().join("argument").display(),
+        ),
+    );
+    let quote = AgentControlReferencedMessage {
+        message_id_hex: "ab".repeat(32),
+        availability: AgentControlReferencedMessageAvailability::Available,
+        sender: None,
+        recorded_at: Some(1_700_000_000),
+        text_excerpt: Some("the secret plan".to_owned()),
+        text_truncated: false,
+        attachments: Vec::new(),
+        attachments_truncated: false,
+    };
+    let backend_had_run = Arc::new(AtomicBool::new(true));
+    let seen = backend_had_run.clone();
+    let marker = started.clone();
+    let reply = DeferredReply::new(
+        quote,
+        0,
+        Arc::new(move |_message_id_hex| {
+            seen.store(marker.exists(), Ordering::SeqCst);
+            Box::pin(async { Ok(Some(AgentControlTimelineMessageAvailability::Deleted)) })
+        }),
+    );
+    let (tx, mut rx) = mpsc::channel(2);
+    let mut spec = process_spec(
+        &script,
+        root.path(),
+        PromptTransport::DelimitedArgument {
+            delimiter: "--",
+            prompt: "is this the one?".to_owned(),
+        },
+    );
+    spec.reply = Some(reply);
+    let outcome = run_jsonl_process(spec, tx, parse_event).await.unwrap();
+
+    assert_eq!(outcome.exit_code, Some(0));
+    assert_eq!(rx.recv().await, Some(RunnerEvent::Text("done".to_owned())));
+    assert!(
+        !backend_had_run.load(Ordering::SeqCst),
+        "the reply is checked before the backend starts"
+    );
+    let argument = fs::read_to_string(root.path().join("argument")).unwrap();
+    assert!(argument.contains(r#""availability":"deleted""#));
+    assert!(argument.contains(&"ab".repeat(32)));
+    assert!(!argument.contains("the secret plan"));
+    assert!(argument.ends_with("is this the one?"));
 }
 
 #[tokio::test]
@@ -907,6 +982,7 @@ fn process_debug_output_redacts_paths_arguments_prompts_and_events() {
         backend_name: "safe_backend",
         total_timeout: Duration::from_secs(5),
         idle_timeout: Duration::from_secs(2),
+        reply: None,
     };
     let debug = format!("{spec:?}");
     for secret in [

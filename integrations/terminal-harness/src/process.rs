@@ -284,6 +284,9 @@ pub struct ProcessSpec {
     pub total_timeout: Duration,
     /// Presentation-idle interval. Expiry reports unknown liveness but never kills work.
     pub idle_timeout: Duration,
+    /// Reply context checked and rendered into the prompt at the last moment:
+    /// before the first prompt write for stdin, before spawn for an argument.
+    pub reply: Option<crate::reply::DeferredReply>,
 }
 
 impl fmt::Debug for ProcessSpec {
@@ -382,7 +385,14 @@ where
         backend_name,
         total_timeout,
         idle_timeout,
+        reply,
     } = spec;
+    let mut prompt = prompt;
+    // An argument prompt is readable from spawn on.
+    if let (Some(reply), PromptTransport::DelimitedArgument { prompt, .. }) = (&reply, &mut prompt)
+    {
+        reply.render_into(prompt).await;
+    }
     let mut command = Command::new(executable);
     crate::group_profile::configure_command(&mut command);
     command
@@ -423,8 +433,15 @@ where
     let mut process_group = ProcessGroupGuard::new(&child);
     let total_deadline = Instant::now() + total_timeout;
     let mut writer_task = match prompt {
-        PromptTransport::Stdin(prompt) => match child.stdin.take() {
-            Some(stdin) => Some(write_stdin(stdin, prompt)),
+        PromptTransport::Stdin(mut prompt) => match child.stdin.take() {
+            Some(stdin) => {
+                // A stdin prompt is readable from its first write on, after
+                // any backend preflight and spawn.
+                if let Some(reply) = &reply {
+                    reply.render_into(&mut prompt).await;
+                }
+                Some(write_stdin(stdin, prompt))
+            }
             None => {
                 kill_and_reap(&mut child, &mut process_group).await;
                 return Err(spawn_failure());

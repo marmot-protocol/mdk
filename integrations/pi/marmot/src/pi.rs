@@ -95,6 +95,7 @@ async fn run_with_bin(
         session_id,
         prompt,
         artifact_output: _,
+        reply,
     } = invocation;
     let prepared = prepare_attachments(attachments).map_err(|error| RunFailure {
         error,
@@ -117,6 +118,7 @@ async fn run_with_bin(
             backend_name: "pi",
             total_timeout: timeout,
             idle_timeout,
+            reply,
         },
         tx,
         |line| parser.parse(line),
@@ -502,6 +504,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
                     session_id: None,
                     prompt: "--prompt-via-stdin".to_owned(),
                     artifact_output: None,
+                    reply: None,
                 },
                 &[],
                 tx,
@@ -558,6 +561,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
                 session_id: Some("missing-session".to_owned()),
                 prompt: "p".repeat(60_000),
                 artifact_output: None,
+                reply: None,
             },
             &[],
             tx,
@@ -602,6 +606,7 @@ exit 64
                 session_id: None,
                 prompt: "p".repeat(60_000),
                 artifact_output: None,
+                reply: None,
             },
             &[],
             tx,
@@ -637,6 +642,7 @@ exit 64
                 session_id: Some("wn-pi-real-contract".to_owned()),
                 prompt: "Reply with exactly PI_CONNECTOR_OK and nothing else.".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             &[],
             tx,
@@ -724,6 +730,7 @@ exit 64
             session_id: session_id.map(str::to_owned),
             prompt: "caption on stdin".to_owned(),
             artifact_output: None,
+            reply: None,
         }
     }
 
@@ -1335,6 +1342,7 @@ printf '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type
             session_id: session_id.map(str::to_owned),
             prompt: prompt.to_owned(),
             artifact_output: None,
+            reply: None,
         };
 
         let (tx, mut rx) = mpsc::channel(8);

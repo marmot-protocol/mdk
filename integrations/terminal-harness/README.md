@@ -392,8 +392,11 @@ built it: a deleted or invalidated target keeps its sender and time but no text
 or attachments, and a missing target carries only its id and availability. `//`
 literal forwards omit it. A snapshot can be older than the turn that renders
 it: a reply may wait in the group queue, and a recovery record keeps the
-snapshot for `/retry-last`. So once a turn starts, the harness asks `wn-agent`
-for an available target again before rendering it. A target that was deleted,
+snapshot for `/retry-last`. So the shared process runner asks `wn-agent` for an
+available target again at the last moment before the backend process can read
+the prompt: before the first prompt write for a stdin prompt, before spawn for
+an argument prompt, after any queue wait, attachment staging and backend
+preflight. A target that was deleted,
 invalidated or is gone since keeps its id and attribution but loses its text
 and attachments, and the recovery record keeps that copy. A target that cannot
 be checked is rendered the same way for that attempt only; the record keeps the

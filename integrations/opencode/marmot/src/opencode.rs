@@ -106,6 +106,7 @@ async fn run_with_bin(
         session_id,
         prompt,
         artifact_output: _,
+        reply,
     } = invocation;
     let files = prepare_attachments(attachments).map_err(|error| RunFailure {
         error,
@@ -133,6 +134,7 @@ async fn run_with_bin(
             backend_name: "opencode",
             total_timeout: timeout,
             idle_timeout,
+            reply,
         },
         tx,
         parse_event_line,
@@ -367,6 +369,7 @@ printf '%s\n' '{"type":"text","sessionID":"ses_control","part":{"type":"text","t
             session_id: None,
             prompt: scenario.to_owned(),
             artifact_output: None,
+            reply: None,
         }
     }
 
@@ -632,6 +635,7 @@ printf '%s\n' '{"type":"text","sessionID":"ses_control","part":{"type":"text","t
             session_id: session_id.map(str::to_owned),
             prompt: "caption: compare these files".to_owned(),
             artifact_output: None,
+            reply: None,
         }
     }
 
@@ -1077,6 +1081,7 @@ exec sleep 30
             session_id,
             prompt: prompt.to_owned(),
             artifact_output: None,
+            reply: None,
         };
         async fn collect(mut rx: mpsc::Receiver<RunnerEvent>) -> String {
             let mut reply = String::new();

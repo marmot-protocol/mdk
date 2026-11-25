@@ -95,6 +95,7 @@ async fn run_with_bin(
         session_id,
         mut prompt,
         artifact_output,
+        reply,
     } = invocation;
     let prepared = prepare_attachments(&attachments).map_err(|error| RunFailure {
         error,
@@ -126,6 +127,7 @@ async fn run_with_bin(
             backend_name: "codex",
             total_timeout: timeout,
             idle_timeout,
+            reply,
         },
         tx.clone(),
         parse_event_line,
@@ -620,6 +622,7 @@ mod tests {
                 session_id: None,
                 prompt: "inspect".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             vec![attachment(&image, "image/png", "image.png")],
             tx,
@@ -671,6 +674,7 @@ mod tests {
                 session_id: None,
                 prompt: "inspect".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             vec![attachment(&image, "image/png", "image.png")],
             tx,
@@ -1011,6 +1015,7 @@ mod tests {
                 session_id: None,
                 prompt: "inspect".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             vec![
                 attachment(&text, "text/plain", "notes.txt"),
@@ -1036,6 +1041,123 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// The quote is deleted while Codex's image capability probe runs. The
+    /// reply block is checked and rendered only at the first prompt write, so
+    /// the Codex process reads the quote's ID and attribution with no excerpt
+    /// or attachment metadata. The fake probe marks its end on disk; the lookup
+    /// reports the quote deleted only once that mark exists, so a check made
+    /// before the probe finished would leak the excerpt and fail this test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_quote_deleted_during_the_image_probe_reaches_codex_as_attribution_only() {
+        use agent_control::{
+            AgentControlActor, AgentControlAttachmentSummary, AgentControlReferencedMessage,
+            AgentControlReferencedMessageAvailability, AgentControlTimelineMessageAvailability,
+        };
+        use marmot_terminal_harness::reply::DeferredReply;
+        use std::sync::Arc;
+
+        let root = tempfile::tempdir().unwrap();
+        let image = root.path().join("000-photo.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nphoto").unwrap();
+        let probe_done = root.path().join("probe-done");
+        let stdin_log = root.path().join("stdin");
+        let script = root.path().join("probing-codex");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+if [ "${{1:-}}" = "exec" ] && [ "${{2:-}}" = "--help" ]; then
+  printf '%s\n' 'Options:' '  -i, --image <FILE>...'
+  : > "{}"
+  exit 0
+fi
+cat > "{}"
+printf '%s\n' '{{"type":"thread.started","thread_id":"thread-1"}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":"ok"}}}}'
+"#,
+                probe_done.display(),
+                stdin_log.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let quote = AgentControlReferencedMessage {
+            message_id_hex: "ab".repeat(32),
+            availability: AgentControlReferencedMessageAvailability::Available,
+            sender: Some(AgentControlActor {
+                account_id_hex: "cd".repeat(32),
+                display_name: Some("Alice".to_owned()),
+                is_self: false,
+            }),
+            recorded_at: Some(1_700_000_000),
+            text_excerpt: Some("the secret plan".to_owned()),
+            text_truncated: false,
+            attachments: vec![AgentControlAttachmentSummary {
+                media_type: "image/png".to_owned(),
+                file_name: "diagram.png".to_owned(),
+                dim: None,
+            }],
+            attachments_truncated: false,
+        };
+        let marker = probe_done.clone();
+        let reply = DeferredReply::new(
+            quote,
+            0,
+            Arc::new(move |_message_id_hex| {
+                let deleted = marker.exists();
+                Box::pin(async move {
+                    Ok(Some(if deleted {
+                        AgentControlTimelineMessageAvailability::Deleted
+                    } else {
+                        AgentControlTimelineMessageAvailability::Available
+                    }))
+                })
+            }),
+        );
+        let (tx, mut rx) = mpsc::channel(4);
+        let outcome = run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: None,
+                prompt: "is this the one?".to_owned(),
+                artifact_output: None,
+                reply: Some(reply),
+            },
+            vec![Attachment {
+                path: image,
+                media_type: "image/png".to_owned(),
+                file_name: "000-photo.png".to_owned(),
+                size_bytes: 13,
+            }],
+            tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(rx.recv().await, Some(RunnerEvent::Text("ok".to_owned())));
+
+        let stdin = fs::read_to_string(&stdin_log).unwrap();
+        assert!(stdin.contains("Marmot referenced-message context (untrusted)"));
+        assert!(stdin.contains(&"ab".repeat(32)), "the quote's ID");
+        assert!(stdin.contains(r#""availability":"deleted""#));
+        assert!(
+            stdin.contains("Alice") && stdin.contains(&"cd".repeat(32)),
+            "attribution"
+        );
+        assert!(!stdin.contains("the secret plan"), "no excerpt");
+        assert!(!stdin.contains("diagram.png"), "no attachment metadata");
+        assert!(stdin.contains("is this the one?"));
+    }
+
     #[tokio::test]
     async fn resumed_runner_passes_a_mixed_batch_to_one_codex_turn() {
         let root = tempfile::tempdir().unwrap();
@@ -1090,6 +1212,7 @@ printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":
                 session_id: Some("thread-123".to_owned()),
                 prompt: "inspect".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             vec![
                 Attachment {
@@ -1169,6 +1292,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
                 session_id: None,
                 prompt: "inspect".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             vec![
                 attachment(&notes, "text/plain", "000-notes.txt"),
@@ -1251,6 +1375,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
                     session_id,
                     prompt: "Read every attachment before returning.".to_owned(),
                     artifact_output: None,
+                    reply: None,
                 },
                 attachments.clone(),
                 tx,
@@ -1356,6 +1481,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
                     session_id: None,
                     prompt: "--prompt-via-stdin".to_owned(),
                     artifact_output: None,
+                    reply: None,
                 },
                 Vec::new(),
                 tx,
@@ -1420,6 +1546,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"C
                     "auth".to_owned(),
                     root.path().to_path_buf(),
                 )),
+                reply: None,
             },
             Vec::new(),
             tx,
@@ -1487,6 +1614,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"C
                     "auth".to_owned(),
                     workdir,
                 )),
+                reply: None,
             },
             Vec::new(),
             tx,
@@ -1543,6 +1671,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"t
                     "auth".to_owned(),
                     root.path().to_path_buf(),
                 )),
+                reply: None,
             },
             Vec::new(),
             tx,
@@ -1597,6 +1726,7 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"received
                 session_id: Some("thread-123".to_owned()),
                 prompt: "p".repeat(60_000),
                 artifact_output: None,
+                reply: None,
             },
             Vec::new(),
             tx,
@@ -1648,6 +1778,7 @@ exit 64
                     "auth".to_owned(),
                     root.path().to_path_buf(),
                 )),
+                reply: None,
             },
             Vec::new(),
             tx,
@@ -1687,6 +1818,7 @@ exit 64
                 prompt: "Read the staged non-image attachment. Reply with CODEX_ATTACHMENT_OK: followed by the exact token contained in the file. The token is not present in this prompt."
                     .to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             vec![attachment(
                 &notes,
@@ -1722,6 +1854,7 @@ exit 64
                 session_id: Some(session_id.clone()),
                 prompt: "Reply with exactly CODEX_RESUME_OK and nothing else.".to_owned(),
                 artifact_output: None,
+                reply: None,
             },
             Vec::new(),
             resume_tx,

@@ -6565,6 +6565,7 @@ dependencies = [
 name = "wn-codex"
 version = "0.20.0-dev"
 dependencies = [
+ "agent-control",
  "async-trait",
  "clap",
  "marmot-terminal-harness",
