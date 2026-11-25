@@ -1,4 +1,5 @@
 use super::*;
+use crate::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 use crate::{DirectoryAccount, DirectoryConfig, DirectoryState};
 use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::time::Duration;
@@ -52,6 +53,38 @@ impl DirectoryResources for Resources {
     }
 
     fn account_key_package_published(&self, _: &str) {}
+}
+
+impl DirectoryObserver for Resources {
+    type Observation = NoObservation;
+
+    fn begin(&self, _: ObservedFamily, _: &'static str, _: ObservedUnit) -> Option<NoObservation> {
+        None
+    }
+}
+
+enum NoObservation {}
+
+impl DirectoryObservation for NoObservation {
+    fn counts_only(self) -> Self {
+        match self {}
+    }
+
+    fn count(&self, _: &str, _: ObservedUnit, _: u64) {
+        match *self {}
+    }
+
+    fn directory_sample(&self, _: &str, _: &str, _: u64) {
+        match *self {}
+    }
+
+    fn finish(self, _: &str) {
+        match self {}
+    }
+
+    fn discard(self) {
+        match self {}
+    }
 }
 
 fn relay_lists(created_at: u64) -> AccountRelayListStatus {
