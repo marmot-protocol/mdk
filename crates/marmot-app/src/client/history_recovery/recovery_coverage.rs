@@ -73,20 +73,22 @@ impl LiveTails {
 /// Past that the REQ vouches only provisionally, while it lasts
 /// ([`LiveTails`]).
 ///
-/// A generation that loss may have reached proves nothing again. The
-/// recorder reads the un-cover generation before each observation of the
-/// adapter, so a generation that one observation did not see began after that
-/// observation's mark, and every loss imported since that mark (all of it
-/// account-wide until loss carries routes) is checked against every
-/// generation seen now. The first mark is read when the client opens; the
+/// A route that loss may have reached proves nothing again on any generation
+/// carrying it. The recorder reads the un-cover generation before each
+/// observation of the adapter, so a generation that one observation did not
+/// see began after that observation's mark, and every loss imported since
+/// that mark is checked against every generation seen now: loss that names
+/// its routes breaks only those routes there, since it lost nothing the same
+/// batched REQ carried for another route, and loss that names none breaks
+/// every route. The first mark is read when the client opens; the
 /// shared adapter may still report generations an earlier session of the
 /// account saw begin, and loss imported before that mark could have reached
 /// them, so none of those is trusted.
 pub(crate) struct LiveCoverage {
     mark: Option<RecoveryCoverageMark>,
-    /// Generations loss may have reached, while the adapter still reports
-    /// them.
-    broken: HashSet<GenerationKey>,
+    /// The routes of each generation loss may have reached, while the adapter
+    /// still reports it.
+    broken: HashMap<GenerationKey, Broken>,
     /// The routes on which each generation's count is settled: written, or
     /// unable to prove anything. A count is written once on each route.
     settled: HashMap<GenerationKey, BTreeSet<TransportReconciliationRoute>>,
@@ -104,7 +106,10 @@ impl LiveCoverage {
         let (_, _, inherited) = observe_live_counts(&adapter.replay_admission().await, true);
         Self {
             mark,
-            broken: inherited.into_keys().collect(),
+            broken: inherited
+                .into_keys()
+                .map(|key| (key, Broken::All))
+                .collect(),
             settled: HashMap::new(),
             tails: LiveTails::default(),
         }
@@ -114,42 +119,72 @@ impl LiveCoverage {
     fn opened_at(mark: Option<RecoveryCoverageMark>) -> Self {
         Self {
             mark,
-            broken: HashSet::new(),
+            broken: HashMap::new(),
             settled: HashMap::new(),
             tails: LiveTails::default(),
         }
     }
 
-    /// Break every generation in `present` whose routes `lost` touches; with
-    /// no route list (account-wide loss, or a log that no longer reaches the
-    /// mark), every one.
+    /// Break the routes `lost` names on every generation in `present` that
+    /// carries them; with no route list (account-wide loss, or a log that no
+    /// longer reaches the mark), every route of every one.
     fn break_reached(
         &mut self,
         present: &HashMap<GenerationKey, Vec<TransportReconciliationRoute>>,
         lost: Option<&[TransportReconciliationRoute]>,
     ) {
+        if lost.is_some_and(<[_]>::is_empty) {
+            return;
+        }
         for (key, routes) in present {
-            if lost.is_none_or(|lost| lost.iter().any(|route| routes.contains(route))) {
-                self.broken.insert(key.clone());
+            let Some(lost) = lost else {
+                self.broken.insert(key.clone(), Broken::All);
+                continue;
+            };
+            let mut reached = routes
+                .iter()
+                .filter(|route| lost.contains(route))
+                .peekable();
+            if reached.peek().is_none() {
+                continue;
             }
+            match self
+                .broken
+                .entry(key.clone())
+                .or_insert_with(|| Broken::Routes(BTreeSet::new()))
+            {
+                Broken::All => {}
+                Broken::Routes(routes) => routes.extend(reached.cloned()),
+            }
+        }
+    }
+
+    /// Whether loss may have reached `route` on the generation `key`: loss
+    /// on one route of a batched REQ leaves its other routes' frames intact.
+    fn route_broken(&self, key: &GenerationKey, route: &TransportReconciliationRoute) -> bool {
+        match self.broken.get(key) {
+            None => false,
+            Some(Broken::All) => true,
+            Some(Broken::Routes(routes)) => routes.contains(route),
         }
     }
 
     /// The counts `facts` settle now, each with the range it proves, if any,
     /// and the routes its filter carries that it settles on: from
     /// [`live_boundary_since`] through the second before its `requested_at`.
-    /// Generations loss may have reached prove nothing, and a route whose
+    /// A route loss may have reached proves nothing there, and a route whose
     /// group's live frames a fence holds waits until they are released.
     fn durable<'a>(&self, facts: &'a [LiveCountFact]) -> Vec<Settling<'a>> {
         facts
             .iter()
-            .filter(|fact| fact.placed && !self.broken.contains(&fact.key))
+            .filter(|fact| fact.placed)
             .filter_map(|fact| {
                 let routes = fact
                     .routes
                     .iter()
                     .filter(|route| {
-                        !fact.held.contains(route)
+                        !self.route_broken(&fact.key, route)
+                            && !fact.held.contains(route)
                             && !self
                                 .settled
                                 .get(&fact.key)
@@ -181,9 +216,10 @@ impl LiveCoverage {
         mut released: impl FnMut(&TransportReconciliationRoute, u64) -> Option<u64>,
     ) -> LiveTails {
         let mut tails = LiveTails::default();
-        for fact in facts.iter().filter(|fact| {
-            !fact.ended && fact.placed && !fact.count.withheld && !self.broken.contains(&fact.key)
-        }) {
+        for fact in facts
+            .iter()
+            .filter(|fact| !fact.ended && fact.placed && !fact.count.withheld)
+        {
             let count = &fact.count;
             let since = match count.oldest {
                 Some(oldest) if count.events > 0 && oldest >= count.live_from => {
@@ -191,7 +227,11 @@ impl LiveCoverage {
                 }
                 _ => count.live_from,
             };
-            for route in &fact.routes {
+            for route in fact
+                .routes
+                .iter()
+                .filter(|route| !self.route_broken(&fact.key, route))
+            {
                 if let Some(since) = released(route, since) {
                     tails.start(route, &fact.key.1, since);
                 }
@@ -199,6 +239,17 @@ impl LiveCoverage {
         }
         tails
     }
+}
+
+/// The routes of one generation loss may have reached. Not `Debug`: it
+/// carries routes.
+enum Broken {
+    /// Every route it carries: account-wide loss, or a generation inherited
+    /// from before this client's first mark.
+    All,
+    /// Only these: loss that names its routes reaches no other route the
+    /// same batched REQ carries.
+    Routes(BTreeSet<TransportReconciliationRoute>),
 }
 
 /// A count [`LiveCoverage::durable`] settles now: the range it proves, if
@@ -1113,8 +1164,9 @@ impl AppClient {
     /// provisional tail
     /// ([`LiveTails`]). Healthy means the cursor seal's guards: input placed,
     /// no loss or spill hand-off pending. Loss may have dropped what a
-    /// generation delivered, so a generation it may have reached proves
-    /// nothing again (see [`LiveCoverage`]). Storage keeps released seconds
+    /// generation delivered on the routes it names (every route when it names
+    /// none), so those routes prove nothing again there (see
+    /// [`LiveCoverage`]). Storage keeps released seconds
     /// out of every live boundary.
     pub(crate) async fn record_native_coverage(&self, app: &SqliteAppStorage) {
         self.record_native_coverage_at(app, unix_now_seconds())
@@ -1141,7 +1193,7 @@ impl AppClient {
             let observation = self.adapter.replay_admission().await;
             observe_live_counts(&observation, self.app.vouches_for_relay_replies())
         };
-        live.broken.retain(|key| present.contains_key(key));
+        live.broken.retain(|key, _| present.contains_key(key));
         live.settled.retain(|key, _| present.contains_key(key));
         live.break_reached(&present, lost.as_deref());
         live.mark = Some(mark);
