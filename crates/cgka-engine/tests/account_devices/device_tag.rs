@@ -481,13 +481,15 @@ fn tag_is_due(device: &Device, gid: &GroupId) -> bool {
         .contains(DEVICE_TAG_COMPONENT_ID)
 }
 
-/// The laptop sets its own key in a roster update whose UpdatePath already
-/// carries a tag under that key, so its device-group leaf reads as its own
-/// from that Commit on. Every KeyPackage it builds then carries a fresh tag,
-/// and one built before is due for replacement. Without a device group named
-/// by its host it tags nothing.
+/// The Add that links the laptop binds its key to its entry (marmot#521), so
+/// once it joins, a tag for its device-group leaf is due. Until its first
+/// device-group Commit tags that leaf, the link is not made, and it tags
+/// nothing else: its KeyPackages carry no tag. Any Commit is that first one,
+/// a self-update included. From it on, every KeyPackage it builds carries a
+/// fresh tag, and one built before is due for replacement. Without a device
+/// group named by its host it tags nothing.
 #[tokio::test]
-async fn setting_its_own_key_starts_tagging() {
+async fn a_joined_device_tags_from_its_first_device_group_commit() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
     hold_slot(&laptop, slot(2));
     laptop
@@ -502,9 +504,20 @@ async fn setting_its_own_key_starts_tagging() {
             .key_package_advertises_current_capabilities(&untagged)
             .unwrap()
     );
-    assert!(!tag_is_due(&laptop, &gid), "the laptop cannot tag yet");
+    assert!(
+        tag_is_due(&laptop, &gid),
+        "its first Commit tags the leaf the Add bound"
+    );
 
-    set_own_key(&mut laptop, slot(2), &gid, &mut [&mut phone]).await;
+    let first_commit = send_commit(
+        &mut laptop,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut phone, &first_commit, &gid).await;
     let tagged = roster_of(&phone, &gid);
     assert_eq!(
         tagged.devices[&slot(2)].tag_signature_key,
@@ -581,11 +594,17 @@ async fn only_the_entry_at_its_own_slot_tags() {
         .engine
         .set_device_tag_group(Some(gid.clone()))
         .unwrap();
+    // The key the Add bound moves to another entry.
+    let mut keyless = roster_of(&phone, &gid).devices[&slot(2)].clone();
+    keyless.tag_signature_key = None;
     let mut elsewhere = entry("Tablet");
     elsewhere.tag_signature_key = Some(laptop.engine.own_signature_key());
     let update = roster_update(
         &gid,
-        vec![DeviceRosterOperationV1::SetDevice(slot(3), elsewhere)],
+        vec![
+            DeviceRosterOperationV1::SetDevice(slot(2), keyless),
+            DeviceRosterOperationV1::SetDevice(slot(3), elsewhere),
+        ],
     );
     let commit = send_commit(&mut phone, update, &gid).await;
     assert_accepted(&mut laptop, &commit, &gid).await;

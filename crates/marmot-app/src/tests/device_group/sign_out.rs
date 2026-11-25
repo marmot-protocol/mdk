@@ -241,9 +241,7 @@ async fn a_device_without_a_made_link_signs_out_on_its_own() {
 
     let (mut devices, group) = linked_devices().await;
     assert!(
-        roster(&devices.laptop, &group).devices[&slot_of(&devices.laptop)]
-            .tag_signature_key
-            .is_none(),
+        !link_made(&devices.laptop, &group, &slot_of(&devices.laptop)),
         "the laptop has not made its first commit"
     );
     let _laptop_signing_out = devices
@@ -427,19 +425,15 @@ async fn a_held_sign_out_owes_no_device_group_maintenance() {
     );
 }
 
-/// A sibling's `leaving` entry without its tag signature key is never
-/// decided: no device may remove an entry that has none. The phone sets the
-/// laptop's entry, whose first commit has not landed, to `leaving`, as a
-/// faulty device might.
+/// A sibling's `leaving` entry whose link is not made is never decided: no
+/// device may remove a device before its first commit in the device group
+/// (marmot#521). The phone sets the laptop's entry, whose first commit has
+/// not landed, to `leaving`, as a faulty device might.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_leaving_entry_without_its_key_is_not_removed() {
+async fn a_leaving_entry_whose_link_is_not_made_is_not_removed() {
     let (mut devices, group) = linked_devices().await;
     let laptop_slot = slot_of(&devices.laptop);
-    assert!(
-        roster(&devices.phone, &group).devices[&laptop_slot]
-            .tag_signature_key
-            .is_none()
-    );
+    assert!(!link_made(&devices.phone, &group, &laptop_slot));
     assert!(matches!(
         devices
             .phone

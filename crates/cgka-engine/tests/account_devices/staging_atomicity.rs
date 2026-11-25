@@ -1,8 +1,8 @@
 //! Late device-operation staging faults must leave no unowned outbound rows.
 
 use super::device_roster::{
-    NO_WELCOME_DEADLINE, entry, expect_link_welcome, found_device_group, key_package_ref, roster,
-    roster_device, roster_device_on, roster_of, slot,
+    NO_WELCOME_DEADLINE, entry, expect_link_welcome, found_device_group, key_package_ref,
+    leaf_signature_key, roster, roster_device, roster_device_on, roster_of, slot,
 };
 use super::tagged_siblings::{
     assert_joins_from, chat_device, handed, owed, routed_members, tag_devices,
@@ -91,6 +91,7 @@ async fn late_staging_failure(kind: StagingKind) {
                 DeviceEntryV1 {
                     linked_by: Some(slot(1)),
                     announced_key_package: Some(key_package_ref(&key_package)),
+                    tag_signature_key: Some(leaf_signature_key(&key_package)),
                     ..entry("Tablet")
                 },
             )])

@@ -1128,6 +1128,17 @@ where
         Ok(self.session.own_account_leaf_claims(group_id, roster)?)
     }
 
+    /// The slots of `roster`, `group_id`'s current roster, whose link that
+    /// device group's current tree shows made. See
+    /// [`cgka_engine::engine::Engine::made_device_links`].
+    pub fn made_device_links(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> AccountResult<std::collections::BTreeSet<cgka_traits::app_components::DeviceSlotId>> {
+        Ok(self.session.made_device_links(group_id, roster)?)
+    }
+
     /// This account's leaves in `group_id` of its device in `slot`, each
     /// with the lifetime of the KeyPackage its Add built it from while it is
     /// still that leaf (mdk#3042). See

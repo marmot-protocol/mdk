@@ -1339,6 +1339,9 @@ impl AppClient {
         wait_ends: u64,
     ) -> Result<(GroupId, HashSet<MessageId>), AppError> {
         let key_package_ref_hex = hex::encode(link.key_package_ref.as_slice());
+        let leaf_signature_key = marmot_session::key_package_metadata(&key_package)
+            .map_err(|_| AppError::DeviceGroupRefused("key_package_not_confirmed"))?
+            .leaf_signature_key;
         let roster_update = if self.trusted_device_group()?.as_ref() == Some(&link.device_group_id)
         {
             // A fresh rename id (3.6a): a slot linked again after a failed
@@ -1350,6 +1353,9 @@ impl AppClient {
                 linked_by: Some(self.own_slot()?),
                 settings: device_settings(choices),
                 announced_key_package: Some(link.key_package_ref.as_slice().to_vec()),
+                // The Add binds the new device's key to the leaf it adds
+                // (marmot#521).
+                tag_signature_key: Some(leaf_signature_key.clone()),
                 ..DeviceEntryV1::default()
             };
             let update =
@@ -1362,14 +1368,11 @@ impl AppClient {
         } else {
             None
         };
-        let leaf_signature_key = marmot_session::key_package_metadata(&key_package)
-            .map_err(|_| AppError::DeviceGroupRefused("key_package_not_confirmed"))?
-            .leaf_signature_key;
         // Record the approval before its commit, so no crash can lose it,
         // with the KeyPackage's ref, which also finds the link's Welcome, and
-        // the leaf it adds: the new device's first commit sets that key as
-        // its tag key, and a failed link removes that leaf. One whose commit
-        // never lands fails.
+        // the leaf it adds: the Add sets that key as the new device's tag key,
+        // and a failed link removes that leaf. One whose commit never lands
+        // fails.
         self.app
             .account_storage(&self.state.label)?
             .app_storage()
@@ -1709,7 +1712,12 @@ impl AppClient {
         };
         let slot = device_slot(&link.slot_hex).ok()?;
         let leaf_signature_key = hex::decode(&link.leaf_signature_key_hex).ok()?;
-        match link_verdict(&roster, &slot, own_slot, &leaf_signature_key, now) {
+        let made = self
+            .runtime
+            .made_device_links(&group_id, &roster)
+            .ok()?
+            .contains(&slot);
+        match link_verdict(&roster, &slot, own_slot, &leaf_signature_key, made, now) {
             LinkVerdict::Made => Some(DeviceLinkOutcome::Linked),
             LinkVerdict::Waiting => {
                 self.device_pairing.quiet_since.remove(key);
@@ -2067,7 +2075,7 @@ impl AppClient {
 
     /// Whether this device's first commit in its trusted device group is on
     /// the selected branch: the group is stable with no convergence input
-    /// left, and this device's roster entry carries its tag signature key.
+    /// left, and this device's leaf there shows its link made (marmot#521).
     fn own_first_commit_landed(&mut self) -> Result<bool, AppError> {
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Ok(false);
@@ -2076,12 +2084,11 @@ impl AppClient {
             self.runtime.epoch_state(&group_id),
             Some(EpochState::Stable { .. })
         ) && !self.runtime.has_pending_convergence_inputs(&group_id)?;
-        let own_key = self.runtime.own_signature_key();
         Ok(quiet
-            && roster
-                .devices
-                .get(&self.own_slot()?)
-                .is_some_and(|device| device.tag_signature_key.as_ref() == Some(&own_key)))
+            && self
+                .runtime
+                .made_device_links(&group_id, &roster)?
+                .contains(&self.own_slot()?))
     }
 
     /// End sessions whose time ran out, and send the cancels owed.
@@ -2324,16 +2331,17 @@ fn roster_entry<'a>(
 }
 
 /// Where the link of `slot` this device approved stands in `roster` at
-/// `now`. The link stands only as this device's link of the slot; the
+/// `now`. The link stands only as this device's link of the slot, whose entry
+/// carries `leaf_signature_key`, the key of the leaf the link added; the
 /// announced KeyPackage is no evidence, since the device replaces it whenever
-/// it refreshes its KeyPackage. It is made once the entry carries
-/// `leaf_signature_key`, the key of the leaf the link added, as its tag
-/// signature key: only that device's first commit sets it.
+/// it refreshes its KeyPackage. It is made once `made` says that leaf shows
+/// it: only that device's first commit tags it (marmot#521).
 fn link_verdict(
     roster: &DeviceRosterV1,
     slot: &DeviceSlotId,
     own_slot: &DeviceSlotId,
     leaf_signature_key: &[u8],
+    made: bool,
     now: u64,
 ) -> LinkVerdict {
     let Some(device) = roster
@@ -2343,7 +2351,7 @@ fn link_verdict(
     else {
         return LinkVerdict::Lost;
     };
-    if device.tag_signature_key.as_deref() == Some(leaf_signature_key) {
+    if device.tag_signature_key.as_deref() == Some(leaf_signature_key) && made {
         LinkVerdict::Made
     } else if now >= device.linked_at.saturating_add(LINK_DEADLINE_SECS) {
         LinkVerdict::TimedOut
@@ -2497,50 +2505,45 @@ mod tests {
     fn a_link_is_made_only_by_the_new_devices_first_commit_before_the_deadline() {
         let (phone, laptop, tablet) = ([1; 32], [2; 32], [3; 32]);
         let leaf_key = vec![9; 32];
-        let roster = |linked_by: DeviceSlotId, tag_key: Option<Vec<u8>>| DeviceRosterV1 {
+        // The Add sets the key of the leaf it adds (marmot#521).
+        let roster = |linked_by: DeviceSlotId, tag_key: Vec<u8>| DeviceRosterV1 {
             devices: [(
                 tablet,
                 DeviceEntryV1 {
                     linked_by: Some(linked_by),
                     linked_at: 1_000,
                     announced_key_package: Some(vec![7; 32]),
-                    tag_signature_key: tag_key,
+                    tag_signature_key: Some(tag_key),
                     ..DeviceEntryV1::default()
                 },
             )]
             .into(),
             ..DeviceRosterV1::default()
         };
-        let verdict =
-            |roster: &DeviceRosterV1, now| link_verdict(roster, &tablet, &phone, &leaf_key, now);
+        let added = roster(phone, leaf_key.clone());
+        let verdict = |roster: &DeviceRosterV1, made, now| {
+            link_verdict(roster, &tablet, &phone, &leaf_key, made, now)
+        };
         let deadline = 1_000 + LINK_DEADLINE_SECS;
 
-        assert_eq!(verdict(&roster(phone, None), 1_000), LinkVerdict::Waiting);
+        // The key the Add set is no evidence: only the leaf's first commit.
+        assert_eq!(verdict(&added, false, 1_000), LinkVerdict::Waiting);
+        assert_eq!(verdict(&added, false, deadline - 1), LinkVerdict::Waiting);
+        assert_eq!(verdict(&added, false, deadline), LinkVerdict::TimedOut);
+        // The first commit tagged the leaf: made, even past the deadline.
+        assert_eq!(verdict(&added, true, deadline + 5), LinkVerdict::Made);
+        // An entry that no longer names the link's leaf is not its link.
         assert_eq!(
-            verdict(&roster(phone, None), deadline - 1),
-            LinkVerdict::Waiting
-        );
-        assert_eq!(
-            verdict(&roster(phone, None), deadline),
-            LinkVerdict::TimedOut
-        );
-        // The first commit set the leaf's key: made, even past the deadline.
-        assert_eq!(
-            verdict(&roster(phone, Some(leaf_key.clone())), deadline + 5),
-            LinkVerdict::Made
-        );
-        // A key the link's leaf does not hold is no evidence.
-        assert_eq!(
-            verdict(&roster(phone, Some(vec![8; 32])), 1_000),
+            verdict(&roster(phone, vec![8; 32]), true, 1_000),
             LinkVerdict::Waiting
         );
         // Another device's link of the same slot won.
         assert_eq!(
-            verdict(&roster(laptop, Some(leaf_key.clone())), 1_000),
+            verdict(&roster(laptop, leaf_key.clone()), true, 1_000),
             LinkVerdict::Lost
         );
         assert_eq!(
-            verdict(&DeviceRosterV1::default(), 1_000),
+            verdict(&DeviceRosterV1::default(), true, 1_000),
             LinkVerdict::Lost
         );
     }

@@ -180,7 +180,8 @@ pub(crate) fn authorize_own_staged_commit(
 /// device-group.md, "Linking a device": in a device group a leaf joins only by
 /// a link. An own Commit there that adds a leaf adds exactly one, by value,
 /// and its roster update sets a device entry for a slot the parent roster does
-/// not list, announcing the added KeyPackage. Every own Commit passes here,
+/// not list, announcing the added KeyPackage, with the added leaf's signature
+/// key as its `tag_signature_key` (marmot#521). Every own Commit passes here,
 /// whatever intent built it or took from the proposal store. Merging two
 /// device groups (mdk#2628 item 3.7) will widen this shape.
 fn check_device_group_add(parent: &MlsGroup, staged: &StagedCommit) -> Result<(), EngineError> {
@@ -206,6 +207,7 @@ fn check_device_group_add(parent: &MlsGroup, staged: &StagedCommit) -> Result<()
         return Err(refused("a device group's Commit carries its Add by value"));
     };
     let added = crate::key_package::key_package_ref(add.key_package())?;
+    let added_leaf_key = add.key_package().leaf_node().signature_key().as_slice();
     let roster =
         crate::app_components::app_component_data_of_group(parent, DEVICE_ROSTER_COMPONENT_ID)
             .ok_or_else(|| {
@@ -232,13 +234,14 @@ fn check_device_group_add(parent: &MlsGroup, staged: &StagedCommit) -> Result<()
                             if !roster.devices.contains_key(slot)
                                 && device.announced_key_package.as_deref()
                                     == Some(added.as_slice())
+                                && device.tag_signature_key.as_deref() == Some(added_leaf_key)
                     )
                 })
             })
     });
     if !announced {
         return Err(refused(
-            "a device group's Commit that adds a device sets its roster entry, for a new slot, announcing the added KeyPackage",
+            "a device group's Commit that adds a device sets its roster entry, for a new slot, announcing the added KeyPackage with its leaf signature key",
         ));
     }
     Ok(())

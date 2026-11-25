@@ -301,6 +301,7 @@ pub(super) fn announced_entry(
 ) -> DeviceEntryV1 {
     DeviceEntryV1 {
         announced_key_package: Some(key_package_ref(key_package)),
+        tag_signature_key: Some(leaf_signature_key(key_package)),
         ..initial.devices[slot].clone()
     }
 }
@@ -312,6 +313,14 @@ pub(super) fn key_package_ref(key_package: &KeyPackage) -> Vec<u8> {
             .key_package_ref_hex,
     )
     .unwrap()
+}
+
+/// The signature key of the leaf `key_package` adds, which the Add binds to
+/// the new device's entry.
+pub(super) fn leaf_signature_key(key_package: &KeyPackage) -> Vec<u8> {
+    cgka_engine::key_package::key_package_metadata(key_package)
+        .unwrap()
+        .leaf_signature_key
 }
 
 /// Whether `device` holds any OpenMLS state for `gid`.
@@ -419,17 +428,16 @@ fn test_policy_builds_may_advertise_the_device_roster() {
 async fn a_device_group_holds_its_roster_from_creation() {
     let (phone, laptop, gid) = phone_and_laptop().await;
     // The founding Add set the laptop's entry, announcing the KeyPackage it
-    // joined with (D41).
+    // joined with (D41) and binding the signature key of the leaf it added
+    // (marmot#521).
     let mut expected = roster(&[(1, "Phone"), (2, "Laptop")]);
     let announced = roster_of(&phone, &gid).devices[&slot(2)]
         .announced_key_package
         .clone();
     assert!(announced.is_some());
-    expected
-        .devices
-        .get_mut(&slot(2))
-        .unwrap()
-        .announced_key_package = announced;
+    let laptop_entry = expected.devices.get_mut(&slot(2)).unwrap();
+    laptop_entry.announced_key_package = announced;
+    laptop_entry.tag_signature_key = Some(laptop.engine.own_signature_key());
     for device in [&phone, &laptop] {
         assert!(requires_roster(device, &gid));
         assert_eq!(roster_of(device, &gid), expected);
@@ -485,7 +493,7 @@ async fn a_device_groups_founding_add_sets_exactly_its_one_devices_entry() {
     };
     let exactly_one = "adds exactly one device and sets its roster entry";
     let needs_founding_add = "a founding roster update needs a device group's founding Add";
-    let announcement = "a device group's Commit that adds a device sets its roster entry, for a new slot, announcing the added KeyPackage";
+    let announcement = "a device group's Commit that adds a device sets its roster entry, for a new slot, announcing the added KeyPackage with its leaf signature key";
     let refusals = [
         (
             "no roster update",

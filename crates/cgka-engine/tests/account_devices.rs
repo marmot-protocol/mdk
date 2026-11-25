@@ -952,7 +952,7 @@ fn crafted_welcome(
     group_info_extensions: Vec<Extension>,
     recipient: &Device,
 ) -> TransportMessage {
-    let (_, bundle) = craft_bundle(
+    crafted_welcome_of(
         sender,
         gid,
         Parts {
@@ -961,7 +961,19 @@ fn crafted_welcome(
             group_info_extensions,
             ..Parts::default()
         },
-    );
+        recipient,
+    )
+}
+
+/// The Welcome of the Commit `sender` builds from `parts` as [`craft_bundle`]
+/// does, for `recipient`'s account.
+fn crafted_welcome_of(
+    sender: &Device,
+    gid: &GroupId,
+    parts: Parts,
+    recipient: &Device,
+) -> TransportMessage {
+    let (_, bundle) = craft_bundle(sender, gid, parts);
     let payload = bundle
         .into_welcome_msg()
         .expect("a Commit that adds members has a Welcome")

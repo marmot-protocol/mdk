@@ -477,7 +477,8 @@ impl<S: StorageProvider> Engine<S> {
     /// trusts. Each KeyPackage names no publication (D14) and passes the check
     /// a hand-off from its named slot passes: this account's, single-use,
     /// unexpired, its device tag reading as that slot in that roster, another
-    /// roster device, one KeyPackage each. The chat names one to 16 relays for
+    /// roster device whose link that group's tree shows made, one KeyPackage
+    /// each. The chat names one to 16 relays for
     /// the new member to fetch from.
     pub(crate) fn sibling_welcome_plan(
         &self,
@@ -511,6 +512,9 @@ impl<S: StorageProvider> Engine<S> {
                 Err(EngineError::Storage(StorageError::NotFound)) => Default::default(),
                 Err(error) => return Err(error),
             };
+        let made = self
+            .own_device_group_made_links(&self.storage, own.roster())?
+            .unwrap_or_default();
         let mut slots = HashSet::new();
         for sibling in siblings {
             if sibling.key_package.source.is_some() {
@@ -577,6 +581,14 @@ impl<S: StorageProvider> Engine<S> {
             }
             if departed.contains(&sibling.slot) {
                 return refused(SiblingAddRefusal::SiblingLeft, "the sibling left this chat");
+            }
+            // The Add that linked the sibling set its key, so its KeyPackage
+            // verifies before its link is made (marmot#521).
+            if !made.contains(&sibling.slot) {
+                return refused(
+                    SiblingAddRefusal::LinkPending,
+                    "the sibling's link is not made yet",
+                );
             }
         }
         let Some(relays) = sibling_welcome_relays(mls_group)? else {

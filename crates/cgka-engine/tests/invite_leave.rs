@@ -1798,12 +1798,8 @@ async fn recovery_device_group_refusal() {
     let (mut admin, storage) = client();
     let (mut target, target_storage) = client();
     let key_package = target.fresh_key_package().await.unwrap();
-    let key_package_ref = hex::decode(
-        cgka_engine::key_package::key_package_metadata(&key_package)
-            .unwrap()
-            .key_package_ref_hex,
-    )
-    .unwrap();
+    let metadata = cgka_engine::key_package::key_package_metadata(&key_package).unwrap();
+    let key_package_ref = hex::decode(&metadata.key_package_ref_hex).unwrap();
     let chosen = GroupId::new(vec![0x42; 16]);
     target
         .expect_device_group_welcome(&DeviceGroupWelcomeExpectation {
@@ -1822,6 +1818,7 @@ async fn recovery_device_group_refusal() {
         [2; 32],
         DeviceEntryV1 {
             announced_key_package: Some(key_package_ref),
+            tag_signature_key: Some(metadata.leaf_signature_key),
             ..DeviceEntryV1::default()
         },
     )])

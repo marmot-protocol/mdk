@@ -63,11 +63,13 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     (`AccountEntryChanged` and `AccountEntryUnsettled` map to `Busy`).
     `send_device_roster_update` carries rejected-slot operations only.
   - `runtime/device_tag_key.rs` — this device's tag signature key (mdk#2628 3.1d): the host names the device group to
-    tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication
-    (`set_device_tag_key_holding`), set this device's MLS signature key in its own roster entry when the entry lacks
-    it, through `edit_device_roster_entry` like the announcement. No KeyPackage is staged, announced or published
-    while the key is due and not in the merged roster, and a staged one that no longer advertises what this device
-    would build is replaced. The engine tags only from the entry at this device's slot. A refresh held back this way
+    tag from (`set_device_tag_group`). The Add that linked this device set its MLS signature key in its entry
+    (marmot#521). Maintenance, and the host before each KeyPackage publication (`set_device_tag_key_holding`), make
+    this device's first commit there while `made_device_links` does not list its slot: through
+    `edit_device_roster_entry` like the announcement, writing its history key and, after an earlier approver's
+    keyless Add, its key, or a self-update when the entry needs no change. No KeyPackage is staged, announced or
+    published while that commit is due, and a staged one that no longer advertises what this device would build is
+    replaced. The engine tags only from the entry at this device's slot. A refresh held back this way
     counts toward `key_package_refresh_overdue` like one held back by its announcement.
   - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records 30 days after their `rejected_at`, by
     this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps. `not_me` records stay.
