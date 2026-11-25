@@ -232,8 +232,9 @@ async fn an_invite_welcome_no_relay_acknowledges_ends_at_its_deadline() {
 }
 
 /// The deadline passes while no runtime runs, as on a phone whose app is
-/// closed (mdk#3589). The next start marks the Welcome expired with one
-/// `welcome_withdrawn` (`expired`) row and one delivery notice, and the
+/// closed (mdk#3589). The next start's startup pass marks the Welcome
+/// expired with one `welcome_withdrawn` (`expired`) row and one delivery
+/// notice, and the
 /// host reads it `Undeliverable` with what its last attempt found. A start
 /// after that, at a later clock or one set back before the deadline,
 /// publishes nothing and records and announces nothing again.
@@ -273,11 +274,20 @@ async fn a_deadline_that_passes_while_stopped_is_recorded_once_on_the_next_start
             .is_none(),
         "nothing is owed"
     );
-    next.run_due_maintenance().await.unwrap();
-    next.run_due_maintenance().await.unwrap();
+    // The startup pass itself marks and records it, so a clock set back
+    // before the first maintenance pass cannot re-owe it.
     let rows = expired_rows(&audit);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["event"]["reason"], "expired");
+    assert_eq!(
+        next.session()
+            .expire_sent_welcome(&welcome.id, Timestamp(0))
+            .unwrap(),
+        Some(WelcomeExpiry::Recorded)
+    );
+    next.run_due_maintenance().await.unwrap();
+    next.run_due_maintenance().await.unwrap();
+    assert_eq!(expired_rows(&audit).len(), 1);
     assert_eq!(
         next.take_welcome_delivery_changes(),
         vec![(group_id.clone(), recipient)]

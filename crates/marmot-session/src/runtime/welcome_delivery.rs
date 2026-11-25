@@ -373,11 +373,17 @@ where
     }
 
     /// Whether an attempt on `message_id` that fell short ended past its
-    /// deadline, so its Welcome is never published again and is not pending:
-    /// no delivery failure is reported for it. A deadline that cannot be read
-    /// now reports the failure, as before deadlines existed.
+    /// deadline, or with its Welcome marked expired whatever the clock, so it
+    /// is never published again and is not pending: no delivery failure is
+    /// reported for it. A row that cannot be read now reports the failure, as
+    /// before deadlines existed.
     pub(super) fn welcome_past_deadline_now(&self, message_id: &cgka_traits::MessageId) -> bool {
         self.welcome_past_deadline(message_id).unwrap_or(false)
+            || matches!(
+                self.session
+                    .outbound_welcome_status(message_id, self.wall_clock.now()),
+                Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired))
+            )
     }
 
     /// `welcomes` without those past their delivery deadline, which are no
@@ -487,23 +493,34 @@ where
         let now = self.wall_clock.now();
         let status = self.session.outbound_welcome_status(message_id, now);
         // A Welcome past its deadline has expired, which is why it was never
-        // delivered: withdrawing it marks and records that expiry, once.
+        // delivered: withdrawing it marks and records that expiry, once,
+        // unless an acceptance it holds, or one it cannot read now, may still
+        // deliver it. A record step that fails now is retried by the watcher
+        // or the next start; a mark that cannot be written fails the call.
         if matches!(status, Ok(OutboundWelcomeStatus::PastDeadline))
-            && self.expire_welcome(message_id, now)
+            && !self.expired_welcome_may_still_close(message_id)
+            && self.session.expire_sent_welcome(message_id, now)?.is_some()
         {
+            self.record_welcome_expiry(message_id);
             if !self.session.detached_welcome_publishes.contains(message_id) {
                 self.session.delete_transport_fanout(message_id)?;
             }
             return Ok(WelcomeWithdrawal::Withdrawn);
         }
         // The Welcome's terminal reason: `withdrawn` for a live one; for one
-        // whose commit lost that the watcher has not recorded yet, that. One
-        // no watcher holds was recorded when it settled, or settled before
-        // this process watched it. An expired one was recorded when marked.
+        // past its deadline or whose commit lost that the watcher has not
+        // recorded yet, that. One no watcher holds was recorded when it
+        // settled, or settled before this process watched it. An expired one
+        // was recorded when marked.
         let reason = match status {
             _ if !self.audit.records_v5() => None,
             Ok(OutboundWelcomeStatus::Owed { .. } | OutboundWelcomeStatus::Waiting) => {
                 Some(audit_v5::WithdrawalReason::Withdrawn)
+            }
+            Ok(OutboundWelcomeStatus::PastDeadline)
+                if self.watched_welcomes.contains(message_id) =>
+            {
+                Some(audit_v5::WithdrawalReason::Expired)
             }
             Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::CommitSuperseded))
                 if self.watched_welcomes.contains(message_id) =>
@@ -688,21 +705,29 @@ where
     /// again, so its settlement is neither this process's to audit nor to
     /// announce. A host reads it from the delivery query. The exception is
     /// expiry, which is recorded once from its durable mark (mdk#3589): one
-    /// past its deadline while no process ran is marked and recorded by the
-    /// watcher, as is one marked before a stop that came before its record.
+    /// whose deadline passed while no process ran is marked and recorded
+    /// here, unless an acceptance may still deliver it, and so is one marked
+    /// before a stop that came before its record. Whatever cannot be done now
+    /// is left to the watcher.
     fn adopt_stored_welcomes(&mut self, ids: impl IntoIterator<Item = cgka_traits::MessageId>) {
         let now = self.wall_clock.now();
         for id in ids {
-            if self.watched_welcomes.contains(&id)
-                || matches!(
-                    self.session.outbound_welcome_status(&id, now),
-                    Ok(OutboundWelcomeStatus::Settled(settlement))
-                        if settlement != WelcomeSettlement::Expired
-                )
-            {
+            if self.watched_welcomes.contains(&id) {
                 continue;
             }
-            self.watched_welcomes.push(id);
+            let settled = match self.session.outbound_welcome_status(&id, now) {
+                Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired)) => {
+                    self.expire_welcome(&id, now)
+                }
+                Ok(OutboundWelcomeStatus::PastDeadline) => {
+                    !self.expired_welcome_may_still_close(&id) && self.expire_welcome(&id, now)
+                }
+                Ok(OutboundWelcomeStatus::Settled(_)) => true,
+                _ => false,
+            };
+            if !settled {
+                self.watched_welcomes.push(id);
+            }
         }
     }
 

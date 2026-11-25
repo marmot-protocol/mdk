@@ -452,14 +452,20 @@ where
         now: Timestamp,
     ) -> bool {
         match self.session.expire_sent_welcome(welcome_id, now) {
-            Ok(Some(WelcomeExpiry::Unrecorded)) => {}
-            Ok(Some(WelcomeExpiry::Recorded)) => return true,
-            Ok(None) => return false,
+            Ok(Some(WelcomeExpiry::Unrecorded)) => self.record_welcome_expiry(welcome_id),
+            Ok(Some(WelcomeExpiry::Recorded)) => true,
+            Ok(None) => false,
             Err(error) => {
                 log_unrecorded_welcome_expiry(&error);
-                return false;
+                false
             }
         }
+    }
+
+    /// Record the expiry of `welcome_id`, marked and not yet recorded: the
+    /// steps of [`Self::expire_welcome`] after the mark. False when one could
+    /// not be done now; the watcher, or else the next start, retries.
+    pub(super) fn record_welcome_expiry(&self, welcome_id: &cgka_traits::MessageId) -> bool {
         // The notice goes first, so a retry never records the row twice.
         if !self.note_welcome_delivery_changed(welcome_id)
             || !self.record_v5_welcome_settled(welcome_id, WelcomeSettlement::Expired)
