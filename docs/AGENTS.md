@@ -41,7 +41,8 @@ implementation checklist.
 ## Client integration and release documentation
 
 `../crates/marmot-uniffi/README.md` is the current client integration entry point;
-its method reference and the C symbol reference enumerate all exports. Versioned
+the binding crates' `API-GUIDE.md` files explain each export. CI generates both
+references with signatures and source links. Versioned
 `integration/<version>.md` guides explain the exact upgrade delta, while
 `release/<version>.md` remains concise. Starting with 0.10.2, each release requires
 both, with reciprocal links and an entry in `integration/README.md`.

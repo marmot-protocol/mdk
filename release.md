@@ -293,6 +293,7 @@ the relevant surface, run the missing checks before tagging:
 just fmt-check
 just check
 just clippy
+just binding-docs-gate
 just test
 ```
 

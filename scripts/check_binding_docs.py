@@ -164,6 +164,9 @@ def main() -> int:
         except ValueError as error:
             parser.exit(1, f"{guide.relative_to(REPO)}:\n{error}\n")
         if not args.release_version:
+            if args.with_c:
+                peer = "marmot-uniffi" if language == "c" else "marmot-c"
+                reference = reference.replace(f"../{peer}/API-GUIDE.md", f"../{peer}/API-REFERENCE.md")
             output = crate / "API-REFERENCE.md"
             output.write_text("<!-- Generated from API-GUIDE.md and declarations. Do not edit. -->\n\n" + reference)
             print(f"{output.relative_to(REPO)}: {len(exports)} callables")
