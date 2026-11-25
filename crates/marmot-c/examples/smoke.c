@@ -50,6 +50,7 @@ _Static_assert(MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE == 
 
 _Static_assert(MARMOT_BACKGROUND_BACKUP_OUTCOME_NOT_STARTED == 0, "backup not-started ABI value");
 _Static_assert(MARMOT_BACKGROUND_BACKUP_OUTCOME_FINISHED_ATTEMPT == 1, "backup attempt ABI value");
+_Static_assert(MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST == 1, "inbox list option ABI value");
 
 static int failures = 0;
 
@@ -451,6 +452,18 @@ int main(int argc, char **argv) {
     st = marmot_collect_notifications_after_wake(client, 0, 9999, &collection);
     check(st == MARMOT_STATUS_INVALID_ARGUMENT && collection == NULL,
           "out-of-range wake source -> MARMOT_STATUS_INVALID_ARGUMENT");
+
+    MarmotOnboardingSnapshot onboarding_sentinel = {0};
+    MarmotOnboardingSnapshot *onboarding = &onboarding_sentinel;
+    st = marmot_begin_onboarding_with_options(client, NULL, NULL, 0, NULL, 0, NULL, 0,
+                                              UINT32_MAX, &onboarding);
+    check(st == MARMOT_STATUS_INVALID_ARGUMENT && onboarding == NULL,
+          "unknown onboarding flags clear the output and are rejected before reading inputs");
+    st = marmot_begin_onboarding_with_options(client, NULL, NULL, 0, NULL, 0, NULL, 0,
+                                              MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST,
+                                              &onboarding);
+    check(st == MARMOT_STATUS_NULL_POINTER && onboarding == NULL,
+          "the inbox-list flag passes option validation");
 
     /* A NULL required out-pointer is caught before the command runs. */
     st = marmot_chat_list(client, "no-such-account", 0, NULL);

@@ -3599,7 +3599,13 @@ where
 }
 
 use crate::types::onboarding::{MarmotOnboardingSnapshot, MarmotOnboardingStep};
-/// Import an identity and persist its onboarding gate without publishing. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+
+/// During onboarding, permit publishing the recommended inbox list for an account that has none.
+pub const MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST: u32 = 1;
+
+/// Import an identity and persist its onboarding gate without publishing.
+/// Equivalent to `marmot_begin_onboarding_with_options` with zero flags.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -3615,8 +3621,50 @@ pub unsafe extern "C" fn marmot_begin_onboarding(
     inbox_relays_len: usize,
     out: *mut *mut MarmotOnboardingSnapshot,
 ) -> MarmotStatus {
+    // The options entry point guards and validates both calls.
+    unsafe {
+        marmot_begin_onboarding_with_options(
+            client,
+            nsec,
+            default_relays,
+            default_relays_len,
+            discovery_relays,
+            discovery_relays_len,
+            inbox_relays,
+            inbox_relays_len,
+            0,
+            out,
+        )
+    }
+}
+
+/// Import an identity and persist its onboarding gate without publishing.
+/// Pass zero for default behavior or set `MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST`
+/// to allow later onboarding steps to publish a missing inbox list.
+/// Unknown flag bits return `MARMOT_STATUS_INVALID_ARGUMENT`.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_begin_onboarding_with_options(
+    client: *const MarmotClient,
+    nsec: *const c_char,
+    default_relays: *const *const c_char,
+    default_relays_len: usize,
+    discovery_relays: *const *const c_char,
+    discovery_relays_len: usize,
+    inbox_relays: *const *const c_char,
+    inbox_relays_len: usize,
+    flags: u32,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
     ffi_guard(|| {
         try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        if flags & !MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST != 0 {
+            crate::status::set_last_error("invalid onboarding option flags");
+            return MarmotStatus::InvalidArgument;
+        }
         let client = try_arg!(unsafe { client_ref(client) });
         let nsec = try_arg!(unsafe { required_str(nsec) });
         let default_relays = try_arg!(unsafe { str_array(default_relays, default_relays_len) });
@@ -3627,7 +3675,7 @@ pub unsafe extern "C" fn marmot_begin_onboarding(
             default_relays,
             discovery_relays,
             inbox_relays,
-            create_missing_inbox_list: false,
+            create_missing_inbox_list: flags & MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST != 0,
         };
         unsafe {
             deliver(

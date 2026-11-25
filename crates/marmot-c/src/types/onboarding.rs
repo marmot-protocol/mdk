@@ -33,7 +33,8 @@ c_mirror! { MarmotOnboardingRelayTag from OnboardingRelayTagFfi { #[doc = "Each 
 c_mirror! { MarmotOnboardingRelayTagChange from OnboardingRelayTagChangeFfi { copy disposition: MarmotOnboardingRelayTagDisposition, opt_copy has_before_index/before_index: u64, opt_copy has_after_index/after_index: u64, #[doc = "Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths."] json_str_vec fields/fields_len, #[doc = "NULL or a JSON string literal; decode once preserving embedded NULs."] json_opt_str endpoint, copy role: MarmotOnboardingRelayTagRole, copy restores: MarmotOnboardingRelayCapability, copy removal_reason: MarmotOnboardingRelayRemovalReason, } }
 c_mirror! { MarmotOnboardingRelayRepair from OnboardingRelayRepairFfi { copy mode: MarmotOnboardingRelayRepairMode, opt_str original_event_id, #[doc = "JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths."] json_str original_content, #[doc = "JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths."] json_str proposed_content, vec before_tags/before_tags_len: MarmotOnboardingRelayTag, vec after_tags/after_tags_len: MarmotOnboardingRelayTag, vec changes/changes_len: MarmotOnboardingRelayTagChange, } }
 c_mirror! { MarmotOnboardingRepairProposal from OnboardingRepairProposalFfi { copy step: MarmotOnboardingStep, copy revision: u64, opt_str previous_event_id, str_vec read_relays/read_relays_len, str_vec write_relays/write_relays_len, opt_rec profile: MarmotUserProfileMetadata, opt_rec follows: MarmotStringList, opt_rec relay_repair: MarmotOnboardingRelayRepair, copy inconclusive: bool, } }
-c_mirror! { MarmotOnboardingSnapshot from OnboardingSnapshotFfi, free marmot_onboarding_snapshot_free { str account_id_hex, opt_str recovery_epoch, copy revision: u64, copy ready: bool, vec steps/steps_len: MarmotOnboardingStepState, opt_rec proposal: MarmotOnboardingRepairProposal, opt_rec single_device_notice: MarmotOnboardingSingleDeviceNotice, copy cancellation_pending: bool, } }
+c_mirror! { MarmotOnboardingCreatedInboxList from OnboardingCreatedInboxListFfi { str_vec relays/relays_len, str event_id, #[doc = "Unix seconds when a relay accepted the inbox list."] copy published_at: u64, } }
+c_mirror! { MarmotOnboardingSnapshot from OnboardingSnapshotFfi, free marmot_onboarding_snapshot_free { str account_id_hex, opt_str recovery_epoch, copy revision: u64, copy ready: bool, vec steps/steps_len: MarmotOnboardingStepState, opt_rec proposal: MarmotOnboardingRepairProposal, opt_rec single_device_notice: MarmotOnboardingSingleDeviceNotice, copy cancellation_pending: bool, #[doc = "Inbox list published by onboarding for an account that had none. NULL if none was created. Owned by the snapshot."] opt_rec created_inbox_list: MarmotOnboardingCreatedInboxList, } }
 
 c_enum! { MarmotOnboardingDeviceDiscovery from OnboardingDeviceDiscoveryFfi { NoneFound, OtherInstallationPossible, Unknown } }
 c_mirror! { MarmotOnboardingDevicePackage from OnboardingDevicePackageFfi { str slot_id, opt_str key_package_ref_hex, str event_id_hex, copy published_at: u64, opt_copy has_expires_at/expires_at: u64, copy usable: bool, #[doc = "NULL or a sanitized, peer-controlled app label from the record's first `client` tag. Render as untrusted text; never use it for trust or security decisions."] opt_str client, } }
@@ -42,7 +43,7 @@ c_mirror! { MarmotOnboardingSingleDeviceNotice from OnboardingSingleDeviceNotice
 #[cfg(all(test, feature = "alloc-audit"))]
 mod tests {
     use super::*;
-    use crate::memory::{audit, boxed, free_boxed};
+    use crate::memory::{audit, boxed};
     #[test]
     fn onboarding_snapshot_deep_free_releases_nested_proposal_and_actions() {
         let _guard = audit::test_lock();
@@ -53,7 +54,11 @@ mod tests {
             revision: 4,
             ready: false,
             cancellation_pending: false,
-            created_inbox_list: None,
+            created_inbox_list: Some(OnboardingCreatedInboxListFfi {
+                relays: vec!["wss://inbox.example".into()],
+                event_id: "inbox-event".into(),
+                published_at: 41,
+            }),
             steps: vec![OnboardingStepStateFfi {
                 step: OnboardingStepFfi::Follows,
                 status: OnboardingStatusFfi::NeedsInput,
@@ -156,8 +161,25 @@ mod tests {
                 inconclusive: true,
             }),
         };
+        let mut without_created_list = ffi.clone();
+        without_created_list.created_inbox_list = None;
+        let without_created_list = boxed(MarmotOnboardingSnapshot::from(without_created_list));
+        assert!(unsafe { (*without_created_list).created_inbox_list }.is_null());
+        unsafe { marmot_onboarding_snapshot_free(without_created_list) };
+
         let value = boxed(MarmotOnboardingSnapshot::from(ffi));
         assert!(audit::live_allocations() > before);
+        let inbox_list = unsafe { (*value).created_inbox_list.as_ref() }.unwrap();
+        assert_eq!(inbox_list.relays_len, 1);
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(*inbox_list.relays) }.to_bytes(),
+            b"wss://inbox.example"
+        );
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(inbox_list.event_id) }.to_bytes(),
+            b"inbox-event"
+        );
+        assert_eq!(inbox_list.published_at, 41);
         let step = unsafe { &*(*value).steps };
         let finding = unsafe { &*step.findings };
         assert_eq!(
@@ -219,7 +241,7 @@ mod tests {
             MarmotOnboardingRelayRemovalReason::PaymentRequired
         );
         unsafe {
-            free_boxed(value);
+            marmot_onboarding_snapshot_free(value);
         }
         assert_eq!(audit::live_allocations(), before);
     }

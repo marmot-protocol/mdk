@@ -220,6 +220,14 @@ context retain nonblocking cleanup to avoid deadlock and are not a process-teard
 
 ## Onboarding relay repair
 
+For existing-key sign-in, `marmot_begin_onboarding_with_options` accepts
+`MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST` to let onboarding publish the
+recommended inbox list for an account that has none. The legacy
+`marmot_begin_onboarding` uses zero flags. Both calls persist onboarding before
+network checks begin. When a later step publishes the list, show the user the
+relays in `MarmotOnboardingSnapshot.created_inbox_list`. That field is NULL until
+onboarding has created a list, and its contents are owned by the snapshot.
+
 `MarmotOnboardingFinding` includes typed context, check purpose and outcome,
 declared capability, an owned `actions`/`actions_len` array, and optional
 `has_observed_revision`/`observed_revision`. Free all nested findings and actions
