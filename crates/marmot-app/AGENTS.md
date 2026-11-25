@@ -320,11 +320,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   through `renew_roster_tag_keys`, every kept key of a slot with a `held_as_removed` key whose leaf a scanned chat
   still holds, in one step that moves only their sighting time and keeps their order, so a leftover outlives the
   30-day retention and no prune drops the key that reads it. The deciding device commits a lone `removed` record after a
-  failed link's undo, only through the runtime's `record_removed_slot`, which the engine never queues or re-issues, and
-  only while the decision is under 30 days old, the group is settled and quiet, and no roster state this device
-  applied has held a `removed` record for the slot, as the engine's remembered keys record (`held_as_removed`): a send
-  that went nowhere or failed is made again, a record a sibling's expiry pass or branch selection dropped is not, even
-  within one pass or after a restart.
+  failed link's undo, with no tag signature key (marmot#520), only through the runtime's `record_removed_slot`, which
+  the engine never queues or re-issues, and only while the decision is under 30 days old, the group is settled and
+  quiet, this device remembers a key for the slot, and no roster state this device applied has held a `removed` record
+  for the slot, as the engine's remembered keys record (`held_as_removed`, set on every kept key of a slot whose record
+  keeps none): a send that went nowhere or failed is made again, a record a sibling's expiry pass or branch selection
+  dropped is not, even within one pass or after a restart. A `removed` record carried into a move's destination keeps
+  no tag signature key either: the destination cannot check a key from another group.
 - The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a and 3.7b, D53) is storage's
   (`account_compromise_warning_items`): every `not_me` slot in the trusted roster, plus this device's own rejected
   sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and restoring an item,

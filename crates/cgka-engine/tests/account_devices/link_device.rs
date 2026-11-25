@@ -398,10 +398,7 @@ async fn a_link_needs_a_device_group() {
         .await;
     let refused_record = alice
         .engine
-        .send(record_removed_slot(
-            &gid,
-            vec![removed_slot(3, Some(vec![0x44; 32]))],
-        ))
+        .send(record_removed_slot(&gid, vec![removed_slot(3, None)]))
         .await;
     let refused_unlink = alice
         .engine
@@ -1288,7 +1285,8 @@ fn record_removed_slot(gid: &GroupId, operations: Vec<DeviceRosterOperationV1>) 
 
 /// A removed slot's lone record (mdk#2761) records exactly one slot the
 /// roster holds neither as a device nor as a rejected slot, as `removed`
-/// with a tag signature key; anything else is refused with nothing staged.
+/// with no tag signature key (marmot#520): nothing in the Commit proves a
+/// key. Anything else is refused with nothing staged.
 /// Like an unlink, it is refused, not queued, while this device's Commit is
 /// in flight or convergence input is unsettled, so no drain makes it later.
 #[tokio::test]
@@ -1296,13 +1294,12 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
     let commit = send_commit(&mut phone, roster_update(&gid, vec![reject_slot(5)]), &gid).await;
     assert_accepted(&mut laptop, &commit, &gid).await;
-    let key = || Some(vec![0x44; 32]);
     let epoch = phone.engine.epoch(&gid).unwrap();
     let held = roster_of(&phone, &gid);
 
     let cases = [
         (
-            vec![removed_slot(3, key()), removed_slot(4, key())],
+            vec![removed_slot(3, None), removed_slot(4, None)],
             "it must set exactly one rejected slot",
         ),
         (
@@ -1311,18 +1308,18 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
         ),
         (
             vec![reject_slot(3)],
-            "it has reason removed and keeps a tag signature key",
+            "it has reason removed and keeps no tag signature key",
         ),
         (
-            vec![removed_slot(3, None)],
-            "it has reason removed and keeps a tag signature key",
+            vec![removed_slot(3, Some(vec![0x44; 32]))],
+            "it has reason removed and keeps no tag signature key",
         ),
         (
-            vec![removed_slot(2, key())],
+            vec![removed_slot(2, None)],
             "the roster already holds the slot",
         ),
         (
-            vec![removed_slot(5, key())],
+            vec![removed_slot(5, None)],
             "the roster already holds the slot",
         ),
     ];
@@ -1338,7 +1335,7 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
     assert_eq!(phone.engine.epoch(&gid).unwrap(), epoch);
     assert_eq!(roster_of(&phone, &gid), held);
 
-    let intent = record_removed_slot(&gid, vec![removed_slot(3, key())]);
+    let intent = record_removed_slot(&gid, vec![removed_slot(3, None)]);
     let assert_unsettled = |refused: Result<SendResult, EngineError>, phone: &Device| {
         assert!(
             matches!(&refused, Err(EngineError::LinkDeviceUnsettled { group_id }) if *group_id == gid),
@@ -1380,7 +1377,7 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
             RejectedSlotV1 {
                 reason: RejectedSlotReasonV1::Removed,
                 rejected_at: 7,
-                tag_signature_key: key(),
+                tag_signature_key: None,
             }
         );
     }
@@ -1392,7 +1389,7 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
 #[tokio::test]
 async fn a_lone_removed_record_a_lost_fork_drops_is_not_reissued() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
-    let record = record_removed_slot(&gid, vec![removed_slot(3, Some(vec![0x44; 32]))]);
+    let record = record_removed_slot(&gid, vec![removed_slot(3, None)]);
     send_commit(&mut phone, record, &gid).await;
     // The laptop's branch is longer, so it wins.
     let mut rivals = Vec::new();

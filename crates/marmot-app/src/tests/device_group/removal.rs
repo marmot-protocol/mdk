@@ -2116,44 +2116,27 @@ async fn a_lone_removed_record_a_fork_drops_is_not_made_again() {
 
 /// A failed link's undo can take the entry of a device the user decided to
 /// remove, and it writes no `removed` record. The deciding device commits
-/// that record alone, with the tag signature key it remembers for the slot
-/// and the decision's time, so devices that never applied a roster listing
-/// the key learn it (mdk#2761). Once the phone has seen the record it does
-/// not make it again this run: a sibling whose clock drops it early gets no
-/// second one. A decision 30 days old makes no record, since the next expiry
-/// pass would drop it.
+/// that record alone, with the decision's time and no tag signature key,
+/// since nothing in that Commit proves one (mdk#2761, marmot#520), and still
+/// removes the device's chat leaf. Once the phone has seen the record it
+/// does not make it again this run: a sibling whose clock drops it early gets
+/// no second one. A decision 30 days old makes no record, since the next
+/// expiry pass would drop it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removal_a_failed_link_undid_is_recorded_alone() {
     for (days_ago, recorded) in [(0, true), (31, false)] {
-        let (
-            Devices {
-                _dirs,
-                relay,
-                phone_app,
-                mut phone,
-                laptop,
-                ..
-            },
-            group,
-        ) = tagging_devices().await;
+        let (mut devices, group) = tagging_devices().await;
+        let chat = chat_with_both(&mut devices).await;
+        let Devices {
+            _dirs,
+            relay,
+            phone_app,
+            mut phone,
+            laptop,
+            ..
+        } = devices;
         let laptop_slot = slot_of(&laptop);
-        // Later roster states list another key for the laptop's slot, then
-        // its own again: the record carries the key listed last, not the
-        // one listed first.
         let entry = roster(&phone, &group).devices[&laptop_slot].clone();
-        let tag_signature_key = entry.tag_signature_key.clone();
-        for key in [Some(vec![0x01; 32]), tag_signature_key.clone()] {
-            let entry = DeviceEntryV1 {
-                tag_signature_key: key,
-                ..entry.clone()
-            };
-            commit_roster(
-                &mut phone,
-                &group,
-                vec![DeviceRosterOperationV1::SetDevice(laptop_slot, entry)],
-            )
-            .await;
-        }
         let decided_at = crate::unix_now_seconds() - days_ago * 24 * 60 * 60 - 60;
         phone_app
             .account_storage("alice")
@@ -2184,8 +2167,12 @@ async fn a_removal_a_failed_link_undid_is_recorded_alone() {
             Some(RejectedSlotV1 {
                 reason: RejectedSlotReasonV1::Removed,
                 rejected_at: decided_at,
-                tag_signature_key,
+                tag_signature_key: None,
             })
+        );
+        assert!(
+            chat_claims(&phone, &chat, &group).is_empty(),
+            "the laptop's chat leaf is gone"
         );
         commit_roster(
             &mut phone,

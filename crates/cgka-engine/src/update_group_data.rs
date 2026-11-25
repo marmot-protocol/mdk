@@ -99,9 +99,11 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Stage a [`cgka_traits::engine::SendIntent::RecordRemovedSlot`]: one
-    /// roster `SetRejectedSlot` with reason `removed` and a tag signature
-    /// key, in a group that requires the roster, for a slot the roster lists
-    /// neither as a device nor as a rejected slot (mdk#2761). It goes out as a component update; its
+    /// roster `SetRejectedSlot` with reason `removed` and no tag signature
+    /// key, since the Commit removes no leaf and the roster has no entry to
+    /// prove one (marmot#520), in a group that requires the roster, for a
+    /// slot the roster lists neither as a device nor as a rejected slot
+    /// (mdk#2761). It goes out as a component update; its
     /// intent kind is what keeps it out of the queue and out of re-issue.
     /// Like an unlink, it is refused with
     /// [`EngineError::LinkDeviceUnsettled`] while a Commit is in flight.
@@ -125,9 +127,9 @@ impl<S: StorageProvider> Engine<S> {
                 "invalid removed-slot record: it must set exactly one rejected slot".into(),
             ));
         };
-        if record.reason != RejectedSlotReasonV1::Removed || record.tag_signature_key.is_none() {
+        if record.reason != RejectedSlotReasonV1::Removed || record.tag_signature_key.is_some() {
             return Err(EngineError::Other(
-                "invalid removed-slot record: it has reason removed and keeps a tag signature key"
+                "invalid removed-slot record: it has reason removed and keeps no tag signature key"
                     .into(),
             ));
         }

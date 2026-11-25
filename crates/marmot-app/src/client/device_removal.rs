@@ -21,8 +21,9 @@
 //!   decision's time, so once that is 30 days past its record drops at the
 //!   next expiry pass. When a failed link's undo took the entry instead,
 //!   which writes no record, the deciding device commits the `removed`
-//!   record alone, with the tag signature key it remembers for the slot
-//!   (mdk#2761), so devices that never saw that key learn it.
+//!   record alone (mdk#2761), with no tag signature key: that Commit
+//!   removes no leaf and the roster has no entry, so nothing in it proves
+//!   one (marmot#520). Devices that applied the entry keep its key.
 //! - **The slot.** Once the settled roster no longer lists the slot as a
 //!   device, whether it records it as `removed` or that record has expired,
 //!   the device that decided the removal deletes the removed device's public
@@ -341,16 +342,19 @@ impl AppClient {
 
     /// A failed link's undo can take the entry of a device the user decided
     /// to remove, and it writes no `removed` record. Commit that record
-    /// alone, with the tag signature key this device remembers a roster
-    /// listing for the slot and the decision's time, so every device that
-    /// applies it learns the key and cleans up after the device, even one
-    /// that never applied the branch that listed it (mdk#2761).
+    /// alone, with the decision's time, so every device that applies it
+    /// cleans up after the device (mdk#2761), by the keys it remembers for
+    /// the slot. The record keeps no tag signature key (marmot#520): this
+    /// Commit removes no leaf and the roster has no entry, so nothing in it
+    /// proves one. It is made only while this device remembers a key a
+    /// roster listed for the slot.
     ///
     /// Only while the decision is under 30 days old, so a record the expiry
     /// pass drops is not made again; the undo comes about an hour after the
     /// link, which comes before the decision. Only until a roster state this
     /// device applied has held a `removed` record for the slot, as its
-    /// remembered keys say (`held_as_removed`): a record a sibling's expiry
+    /// remembered keys say (`held_as_removed`, which a record with no key
+    /// sets on every key kept for the slot): a record a sibling's expiry
     /// pass or branch selection dropped is not made again, even when one pass
     /// applied it and its drop, or after a restart, while a send that went
     /// nowhere, or whose Commit failed or was rolled back, is made again.
@@ -380,16 +384,10 @@ impl AppClient {
         if remembered
             .iter()
             .any(|key| key.slot == *slot && key.held_as_removed)
+            || !remembered.iter().any(|key| key.slot == *slot)
         {
             return Ok(());
         }
-        let Some(tag_signature_key) = remembered
-            .into_iter()
-            .find(|key| key.slot == *slot)
-            .map(|key| key.tag_signature_key)
-        else {
-            return Ok(());
-        };
         let held = self.epoch_gap_held_groups()?;
         let context = Self::local_human_action_context(
             "record_removed_device",
@@ -400,7 +398,7 @@ impl AppClient {
         let record = RejectedSlotV1 {
             reason: RejectedSlotReasonV1::Removed,
             rejected_at: removal.requested_at,
-            tag_signature_key: Some(tag_signature_key),
+            tag_signature_key: None,
         };
         let effects = match self
             .runtime

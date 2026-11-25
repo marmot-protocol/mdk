@@ -90,6 +90,21 @@ impl RosterTagKeyStorage for SqliteAccountStorage {
         Ok(())
     }
 
+    fn hold_roster_tag_keys_as_removed(
+        &self,
+        group_id: &GroupId,
+        slot: &[u8; 32],
+    ) -> StorageResult<()> {
+        let conn = self.lock()?;
+        conn.execute_cached(
+            "UPDATE cgka_roster_tag_keys SET held_as_removed = 1
+             WHERE group_id = ?1 AND slot = ?2",
+            params![group_id.as_slice(), slot.as_slice()],
+        )
+        .storage()?;
+        Ok(())
+    }
+
     fn roster_tag_keys(&self, group_id: &GroupId, since: u64) -> StorageResult<Vec<RosterTagKey>> {
         let conn = self.lock()?;
         let mut stmt = conn
@@ -306,6 +321,36 @@ mod tests {
             .unwrap();
         assert_eq!(store.roster_tag_keys(&gid(1), 0).unwrap(), slot_1);
         assert_eq!(store.roster_tag_keys(&gid(2), 0).unwrap(), vec![key(1, 7)]);
+    }
+
+    /// Holding a slot as removed (marmot#520) marks each of its keys and
+    /// moves neither their order nor their sighting time. Another slot's
+    /// keys, and the same slot in another group, stay as they were.
+    #[test]
+    fn holding_a_slot_as_removed_marks_its_keys_only() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 1)).unwrap();
+        store.put_group(&sample_group(gid(2), 0, 1)).unwrap();
+        store
+            .record_roster_tag_keys(&gid(1), &[key(1, 1), key(1, 2), key(2, 1)], 100)
+            .unwrap();
+        store
+            .record_roster_tag_keys(&gid(2), &[key(1, 3)], 100)
+            .unwrap();
+
+        store
+            .hold_roster_tag_keys_as_removed(&gid(1), &[1; 32])
+            .unwrap();
+
+        let held = |n| RosterTagKey {
+            held_as_removed: true,
+            ..key(1, n)
+        };
+        assert_eq!(
+            store.roster_tag_keys(&gid(1), 100).unwrap(),
+            vec![held(2), held(1), key(2, 1)]
+        );
+        assert_eq!(store.roster_tag_keys(&gid(2), 0).unwrap(), vec![key(1, 3)]);
     }
 
     /// A branch-selection rewind keeps the keys the dropped branch listed; a
