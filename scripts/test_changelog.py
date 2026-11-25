@@ -83,7 +83,11 @@ class ChangelogTests(unittest.TestCase):
 
     def test_none_pending_fails_while_a_fragment_is_left(self) -> None:
         self.write("crates/a/changelog.d/fix-x.md", "### Fixed\n\n- X.\n")
-        self.assertIn("fix-x.md: still pending", self.errors(none_pending=True))
+        # The fold takes only committed fragments, so another fold would not clear this one.
+        (self.root / "crates/a/changelog.d/local.md").write_text("### Fixed\n\n- Y.\n")
+        errors = self.errors(none_pending=True)
+        self.assertIn("fix-x.md: still pending; run `just changelog-release <version>`", errors)
+        self.assertIn("local.md: still pending; commit or remove it", errors)
 
     def test_release_folds_fragments_in_section_order_and_deletes_them(self) -> None:
         first = self.write("crates/a/changelog.d/a-fix.md", "### Fixed\n\n- X no longer fails.\n")

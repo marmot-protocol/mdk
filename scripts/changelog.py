@@ -167,7 +167,10 @@ def check(tree: Tree, none_pending: bool, only: list[Path] | None = None) -> lis
         for path in paths:
             errors += [f"{path.relative_to(root)}: {e}" for e in parse_fragment(tree.read(path))[1]]
     if none_pending:
-        errors += [f"{p.relative_to(root)}: still pending; run `just changelog-release <version>`"
+        # The fold takes only what HEAD holds.
+        committed = set(Tree(root, "HEAD").files)
+        errors += [f"{p.relative_to(root)}: still pending; "
+                   + ("run `just changelog-release <version>`" if p in committed else "commit or remove it")
                    for changelog, paths in grouped.items() if only is None or changelog in only for p in paths]
     return errors
 
