@@ -1815,15 +1815,15 @@ async fn assert_managed_worker_retains_activity(late_checkpoint: bool) {
     app.relay_plane
         .route_account_delivery_for_test(later_delivery);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    // The worker's 15 s maintenance tick also reaches the activity, by
-    // replaying the delivery; count it so a delivery that waited for it fails.
+    // A maintenance pass also reaches the activity, by replaying the
+    // delivery; count it so a delivery that waited for one fails.
     let ticks = || {
         runtime
             .app_performance_snapshot()
             .runtime_operations
             .into_iter()
             .find(|snapshot| {
-                snapshot.operation == crate::RuntimePerformanceOperation::WorkerMaintenance
+                snapshot.operation == crate::RuntimePerformanceOperation::WorkerMaintenanceDue
             })
             .expect("every runtime operation is exported")
             .completed
@@ -1852,7 +1852,7 @@ async fn assert_managed_worker_retains_activity(late_checkpoint: bool) {
     assert_eq!(
         ticks(),
         ticks_before,
-        "the bounded projection retry delivers it, not the next maintenance tick"
+        "the bounded projection retry delivers it, not the next maintenance pass"
     );
     assert_eq!(timeline.take_snapshot().messages.len(), baseline + 2);
     runtime.shutdown().await;

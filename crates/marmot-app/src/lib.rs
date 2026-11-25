@@ -2471,6 +2471,7 @@ impl MarmotApp {
             received_private_key_package_generation: 0,
             acceptances_recorded: false,
             invitation_decisions_changed: false,
+            invitation_answers_await_epoch: false,
             invitation_work_held: false,
             invitations_settled: Vec::new(),
             device_group_work_changed: true,

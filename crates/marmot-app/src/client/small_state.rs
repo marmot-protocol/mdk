@@ -53,6 +53,7 @@ impl AppClient {
         };
         if let Err(error) = result {
             self.device_group_work_changed = true;
+            self.answers_await_epoch(&error);
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "drive_small_state",

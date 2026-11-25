@@ -673,6 +673,9 @@ async fn siblings_exchange_small_state_through_the_device_group() {
         Some(cgka_traits::EpochState::PendingPublish(_))
     ));
     assert!(devices.phone.drive_changed_invitation_decisions().await);
+    // A maintenance pass in between clears the turn's flag and is refused
+    // the same way; it must leave the send owed to the next turn too.
+    devices.phone.run_due_maintenance().await.unwrap();
     assert_eq!(
         phone_storage().unsent_invitation_decisions().unwrap(),
         std::slice::from_ref(&decision),
