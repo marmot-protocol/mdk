@@ -246,7 +246,8 @@ for reconnect/backoff and relay status mechanics.
 - No NIP-67 hint proves a slice; only counting does. `more` splits, `auth` asks for authentication as an
   `auth-required:` refusal does (the finite request retries once after it; a slice still hinted stays owed), and
   `finish` is never read. A reply retried after authentication (`FiniteReply::retried`) joins two pages, so it proves
-  nothing and its slice splits, never teaching an observed cap: a misread `finish`
+  nothing: the slice is asked once more, authenticated, and only that page counts (a relay that asks to
+  authenticate again stands as the `auth-required` refusal): a misread `finish`
   would skip history while a misread `more` only costs requests. The collector takes hints from nostr-sdk's typed
   EOSE (`RelayMessage::EndOfStoredEvents { hints }`). Do not add a hint-based `SliceProof`.
 - Every `SdkSweepRelay` REQ and every `acquire_history` request is a finite request (`src/finite_req.rs`), which

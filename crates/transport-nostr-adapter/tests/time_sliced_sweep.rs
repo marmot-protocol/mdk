@@ -684,32 +684,41 @@ async fn auth_gated_clamping_relay(
     (url, server)
 }
 
+/// An SDK client that authenticates, connected to `url`, and its sweep
+/// relay with `caps`.
+async fn authenticating_sweep(
+    url: RelayUrl,
+    caps: RelayCaps,
+) -> (NostrSdkRelayClient, SdkSweepRelay) {
+    let sdk = NostrSdkRelayClient::from_builder(
+        Client::builder().authenticator(SignerAuthenticator::new(Keys::generate())),
+    );
+    sdk.client().add_relay(&url).await.unwrap();
+    sdk.client().connect().await;
+    let relay = SdkSweepRelay::new(&sdk, url, caps, Duration::from_secs(5));
+    (sdk, relay)
+}
+
 /// A slice retried after authentication carries two pages: the one the
 /// relay answered while holding events back, and the authenticated one
 /// (mdk#3689). Counting them as one would teach a relay with no published
 /// cap one larger than it is, and the next clamped page would then pass as
-/// complete. A retried reply proves nothing, so no slice is covered without
-/// every event in it.
+/// complete. Only a fresh authenticated page proves, so no slice is covered
+/// without every event in it, and the cap learned is the relay's own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slice_retried_after_authentication_proves_nothing() {
     let keys = Keys::generate();
     let older = group_event(&keys, GROUP, T0 + 10, 0);
     let newer = group_event(&keys, GROUP, T0 + 20, 1);
     let (url, server) = auth_gated_clamping_relay(vec![older.clone(), newer.clone()], 1).await;
-    let sdk = NostrSdkRelayClient::from_builder(
-        Client::builder().authenticator(SignerAuthenticator::new(Keys::generate())),
-    );
-    sdk.client().add_relay(&url).await.unwrap();
-    sdk.client().connect().await;
-    let relay = SdkSweepRelay::new(
-        &sdk,
+    let (sdk, relay) = authenticating_sweep(
         url,
         RelayCaps {
             max_limit: None,
             negentropy: false,
         },
-        Duration::from_secs(5),
-    );
+    )
+    .await;
     let mut sink = Sink::default();
     let report = run_sweep(
         request(SweepRange {
@@ -722,6 +731,18 @@ async fn a_slice_retried_after_authentication_proves_nothing() {
         &CancellationToken::new(),
     )
     .await;
+    assert!(
+        report
+            .covered
+            .first()
+            .is_some_and(|slice| slice.since == T0),
+        "the empty seconds before the first event are covered: {report:?}"
+    );
+    assert_eq!(
+        report.cursor.and_then(|cursor| cursor.observed_cap),
+        Some(1),
+        "{report:?}"
+    );
     let admitted = sink
         .events
         .iter()
@@ -740,6 +761,50 @@ async fn a_slice_retried_after_authentication_proves_nothing() {
             );
         }
     }
+    sdk.shutdown().await;
+    server.abort();
+}
+
+/// A one-second slice cannot split, so a reply retried after authentication
+/// there must not fall through to NIP-77 (mdk#3689): on a relay without it,
+/// that records a second the relay cannot prove while the authenticated
+/// relay would answer it. A fresh authenticated page proves it by count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_one_second_slice_retried_after_authentication_is_proven() {
+    let event = group_event(&Keys::generate(), GROUP, T0 + 10, 0);
+    let (url, server) = auth_gated_clamping_relay(vec![event.clone()], 500).await;
+    let (sdk, relay) = authenticating_sweep(
+        url,
+        RelayCaps {
+            max_limit: Some(500),
+            negentropy: false,
+        },
+    )
+    .await;
+    let mut sink = Sink::default();
+    let report = run_sweep(
+        request(SweepRange {
+            since: T0 + 10,
+            until: T0 + 10,
+        }),
+        &relay,
+        &mut sink,
+        &MemoryStore::default(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.end, SweepEnd::Finished, "{report:?}");
+    assert!(
+        matches!(
+            report.covered.as_slice(),
+            [slice] if matches!(slice.proof, SliceProof::BelowCap { received: 1, cap: 500 })
+        ),
+        "{report:?}"
+    );
+    assert_eq!(
+        sink.events.iter().map(|event| event.id).collect::<Vec<_>>(),
+        [event.id]
+    );
     sdk.shutdown().await;
     server.abort();
 }
