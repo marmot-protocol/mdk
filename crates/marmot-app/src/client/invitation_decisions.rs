@@ -578,16 +578,23 @@ impl AppClient {
     pub(crate) async fn drive_changed_invitation_decisions(&mut self) -> bool {
         if self.runtime.maintenance_is_paused()
             || !matches!(self.maintenance_passes(), Ok(super::MaintenancePasses::Run))
-            || !std::mem::take(&mut self.invitation_decisions_changed)
+            || !self.invitation_turn_owed()
         {
             return false;
         }
+        self.invitation_decisions_changed = false;
         self.acceptances_recorded |= std::mem::take(&mut self.invitation_answers_await_epoch);
         self.send_recorded_acceptances().await;
         self.drive_invitation_decisions().await;
-        // The epoch settles in a worker unit: try again on the turn after.
-        self.invitation_decisions_changed |= self.invitation_answers_await_epoch;
         true
+    }
+
+    /// Whether the worker's next turn drives invitation decisions: one
+    /// changed, or answers a settling epoch refused wait to be sent again.
+    /// The epoch settles in a worker unit, so a refusal is retried on the
+    /// turn after, whatever ran in between (mdk#3573).
+    pub(crate) fn invitation_turn_owed(&self) -> bool {
+        self.invitation_decisions_changed || self.invitation_answers_await_epoch
     }
 
     pub(crate) async fn drive_invitation_decisions(&mut self) {
