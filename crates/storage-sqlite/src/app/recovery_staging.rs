@@ -263,6 +263,33 @@ impl SqliteAppStorage {
         Ok(items)
     }
 
+    /// For each `(route, since_seconds, until_seconds)`, when the oldest
+    /// event [`Self::staged_recovery_items`] lists there was sent, in order
+    /// and from one look at staging.
+    pub fn staged_recovery_first_seconds(
+        &self,
+        ranges: &[(&TransportReconciliationRoute, u64, u64)],
+    ) -> StorageResult<Vec<Option<u64>>> {
+        let conn = self.lock()?;
+        ranges
+            .iter()
+            .map(|(route, since_seconds, until_seconds)| {
+                let (kind, id) = route.storage_key();
+                let first: Option<i64> = conn
+                    .query_row_cached(
+                        "SELECT MIN(created_at_seconds) FROM account_recovery_staged
+                         WHERE route_kind = ?1 AND route_id = ?2
+                         AND created_at_seconds >= ?3 AND created_at_seconds <= ?4
+                         AND length(event_id) = 32",
+                        params![kind, id, integer(*since_seconds)?, integer(*until_seconds)?],
+                        |row| row.get(0),
+                    )
+                    .storage()?;
+                first.map(i64_to_u64).transpose()
+            })
+            .collect()
+    }
+
     /// Settle one admission batch in one transaction: a failure removes none
     /// of its rows. An admitted row leaves once its event is in the seen
     /// index, and stays otherwise. A refused row leaves whatever the index

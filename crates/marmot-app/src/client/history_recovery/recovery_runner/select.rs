@@ -279,11 +279,12 @@ pub(super) fn survey(
     let mut admission = Admission::new(turn);
     let fenced = admission.fenced_routes()?;
     let mut current_windows = BackgroundWindows::new();
-    let mut candidates = Vec::new();
-    let mut catching_up = BTreeSet::new();
+    // Every unit's window first, then one read of all their debts: a turn
+    // otherwise takes the ledger once per unit.
+    let mut units = Vec::new();
     for route in turn.routes {
         for (relay, best_effort) in route.relays() {
-            let unit_key = || UnitKey {
+            let key = UnitKey {
                 route: route.route.clone(),
                 relay: relay.to_owned(),
             };
@@ -299,7 +300,6 @@ pub(super) fn survey(
                 }
                 let group = &route.group_id;
                 let visit = group.as_ref().and_then(|group| visits.get(group));
-                let key = unit_key();
                 let until = previous
                     .get(group)
                     .and_then(|units| units.get(&key))
@@ -310,54 +310,62 @@ pub(super) fn survey(
                 current_windows
                     .entry(group.clone())
                     .or_default()
-                    .insert(key, until);
+                    .insert(key.clone(), until);
                 Some(until)
             });
             let owed_until = turn
                 .checked_until(route)
                 .min(history_end.or(fetch_until).unwrap_or(now));
-            let debt = app.recovery_unit_debt(&route.route, relay, owed_until)?;
-            let Some(first) = debt.first() else {
-                continue;
-            };
-            let owed_seconds = debt
-                .iter()
-                .map(|range| range.until_seconds - range.since_seconds + 1)
-                .fold(0u64, u64::saturating_add);
-            let unit = app.recovery_unit(&route.route, relay)?;
-            let (retry_at, parked, broken) = match (&unit, best_effort) {
-                // A best-effort relay keeps no retry state.
-                (_, true) | (None, false) => (0, false, false),
-                (Some(unit), false) => {
-                    let parked = matches!(unit.state, RecoveryUnitState::Broken(_));
-                    (unit.next_attempt_at_seconds, parked, parked && !unit.probe)
-                }
-            };
-            let cooldown = cooldown_until(app, &mut cooldowns, relay, now)?;
-            let key = unit_key();
-            // Nothing is fetched for a group admission cannot drain, and
-            // staging holds a relay back until the group's laggard advances or
-            // leaves the admission frontier.
-            let held_back =
-                stalled.holds(route) || admission.backpressured(&key, &policy.staging, true)?;
-            // A probe is quiet: one quantum that re-parks or re-arms, never
-            // a catch-up the account's status shows.
-            if !best_effort && !parked && !suspended(route) {
-                catching_up.insert(route.route.clone());
-            }
-            candidates.push(Candidate {
-                key,
-                group_id: route.group_id.clone(),
-                best_effort,
-                fetch_until,
-                owed_seconds,
-                position: first.since_seconds,
-                last_served_at: unit.as_ref().and_then(|unit| unit.last_served_at_seconds),
-                due_at: retry_at.max(cooldown.unwrap_or(0)),
-                blocked: broken || suspended(route) || held_back,
-                recheck: false,
-            });
+            units.push((route, key, best_effort, fetch_until, owed_until));
         }
+    }
+    let debts = app.recovery_unit_debts(
+        &units
+            .iter()
+            .map(|(route, key, _, _, owed_until)| (&route.route, key.relay.as_str(), *owed_until))
+            .collect::<Vec<_>>(),
+    )?;
+    let mut candidates = Vec::new();
+    let mut catching_up = BTreeSet::new();
+    for ((route, key, best_effort, fetch_until, _), (debt, unit)) in units.into_iter().zip(debts) {
+        let Some(first) = debt.first() else {
+            continue;
+        };
+        let owed_seconds = debt
+            .iter()
+            .map(|range| range.until_seconds - range.since_seconds + 1)
+            .fold(0u64, u64::saturating_add);
+        let (retry_at, parked, broken) = match (&unit, best_effort) {
+            // A best-effort relay keeps no retry state.
+            (_, true) | (None, false) => (0, false, false),
+            (Some(unit), false) => {
+                let parked = matches!(unit.state, RecoveryUnitState::Broken(_));
+                (unit.next_attempt_at_seconds, parked, parked && !unit.probe)
+            }
+        };
+        let cooldown = cooldown_until(app, &mut cooldowns, &key.relay, now)?;
+        // Nothing is fetched for a group admission cannot drain, and
+        // staging holds a relay back until the group's laggard advances or
+        // leaves the admission frontier.
+        let held_back =
+            stalled.holds(route) || admission.backpressured(&key, &policy.staging, true)?;
+        // A probe is quiet: one quantum that re-parks or re-arms, never
+        // a catch-up the account's status shows.
+        if !best_effort && !parked && !suspended(route) {
+            catching_up.insert(route.route.clone());
+        }
+        candidates.push(Candidate {
+            key,
+            group_id: route.group_id.clone(),
+            best_effort,
+            fetch_until,
+            owed_seconds,
+            position: first.since_seconds,
+            last_served_at: unit.as_ref().and_then(|unit| unit.last_served_at_seconds),
+            due_at: retry_at.max(cooldown.unwrap_or(0)),
+            blocked: broken || suspended(route) || held_back,
+            recheck: false,
+        });
     }
     if let Some((_, previous)) = &mut windows {
         **previous = current_windows;

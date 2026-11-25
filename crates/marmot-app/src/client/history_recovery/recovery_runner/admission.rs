@@ -338,7 +338,9 @@ impl<'t> Admission<'t> {
         &mut self,
     ) -> StorageResult<BTreeMap<TransportReconciliationRoute, u64>> {
         let mut routes = BTreeMap::new();
-        for key in self.fence_groups()? {
+        let keys = self.fence_groups()?;
+        self.read_groups(&keys)?;
+        for key in keys {
             let group = self.group(&key)?;
             let until = group
                 .members
@@ -356,7 +358,9 @@ impl<'t> Admission<'t> {
 
     fn live_fences(&mut self) -> StorageResult<Vec<LiveFence>> {
         let mut fences = Vec::new();
-        for key in self.fence_groups()? {
+        let keys = self.fence_groups()?;
+        self.read_groups(&keys)?;
+        for key in keys {
             let group = self.group(&key)?;
             if let Some(release_before) = group.release_before() {
                 fences.push(LiveFence {
@@ -373,7 +377,9 @@ impl<'t> Admission<'t> {
     /// relay no longer required keeps.
     fn record_fences(&mut self, per_unit: usize) -> StorageResult<()> {
         let app = self.turn.app;
-        for key in self.fence_groups()? {
+        let keys = self.fence_groups()?;
+        self.read_groups(&keys)?;
+        for key in keys {
             let group = self.group(&key)?;
             let changed = group
                 .members
@@ -511,111 +517,166 @@ impl<'t> Admission<'t> {
 
     /// The group `key` names, read on first use.
     fn group(&mut self, key: &GroupKey) -> StorageResult<&Group> {
-        if !self.read.contains_key(key) {
-            let group = self.read_group(key)?;
-            self.read.insert(key.clone(), group);
-        }
+        self.read_groups(std::iter::once(key))?;
         Ok(&self.read[key])
     }
 
-    fn read_group(&mut self, key: &GroupKey) -> StorageResult<Group> {
+    /// Read each of `keys` not read yet: every unit's debt and state from one
+    /// look at the ledger, and what staging holds in their captures from one
+    /// more. A fenced turn otherwise takes the ledger several times per unit,
+    /// once per look at the account's groups.
+    fn read_groups<'k>(
+        &mut self,
+        keys: impl IntoIterator<Item = &'k GroupKey>,
+    ) -> StorageResult<()> {
         let turn = self.turn;
-        let routes = self.groups.get(key).cloned().unwrap_or_default();
-        let group_routes = routes
-            .iter()
-            .map(|route| route.route.clone())
-            .collect::<Vec<_>>();
-        let mut members = Vec::new();
-        for route in routes.iter().copied() {
-            for relay in route.required.iter().collect::<BTreeSet<_>>() {
-                let owed_until = turn.owed_until(route, relay);
-                let debt = turn
-                    .app
-                    .recovery_unit_debt(&route.route, relay, owed_until)?;
-                let unit = turn.app.recovery_unit(&route.route, relay)?;
-                let position = debt.first().map(|range| range.since_seconds);
-                // Its relay could not prove the first second it still owes,
-                // under the caps it still publishes.
-                let saturated = unit
-                    .as_ref()
-                    .is_some_and(|unit| saturated_at(unit, position));
-                let left = self.relay_left(relay)?
-                    || unit.as_ref().is_some_and(|unit| unit_left(unit, saturated));
-                let state = unit.as_ref().map(|unit| unit.state);
-                let pursued = !saturated
-                    && unit
-                        .as_ref()
-                        .is_none_or(|unit| !matches!(unit.state, RecoveryUnitState::Broken(_)));
-                let key = UnitKey {
-                    route: route.route.clone(),
-                    relay: relay.clone(),
-                };
-                let stored = self.stored_fences()?.get(&key).cloned().unwrap_or_default();
-                let captures = stored
-                    .iter()
-                    .copied()
-                    .chain(
-                        self.captures
-                            .get(&(&route.route, relay.as_str()))
-                            .into_iter()
-                            .flatten()
-                            .copied(),
-                    )
-                    .collect();
-                let captures = merge(captures);
-                let (mut fences, first_owed) = owed(captures.clone(), &debt);
-                let mut first_staged = None;
-                for capture in captures {
-                    let mut pending = None;
-                    for route in &group_routes {
-                        let items = turn.app.staged_recovery_items(
-                            route,
-                            capture.since_seconds,
-                            capture.until_seconds,
-                        )?;
-                        pending = super::sooner(pending, items.first().map(|item| item.created_at));
-                    }
-                    if let Some(at) = pending {
-                        first_staged = super::sooner(first_staged, Some(at));
-                        if !fences.contains(&capture) {
-                            fences.push(capture);
-                        }
-                    }
+        let keys = keys
+            .into_iter()
+            .filter(|key| !self.read.contains_key(*key))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut units: Vec<(&GroupKey, &'t RunnerRoute, &'t String)> = Vec::new();
+        for key in &keys {
+            for route in self.groups.get(key).cloned().unwrap_or_default() {
+                for relay in route.required.iter().collect::<BTreeSet<_>>() {
+                    units.push((key, route, relay));
                 }
-                fences.sort_by_key(|range| range.since_seconds);
-                members.push(Member {
-                    key,
-                    position,
-                    left,
-                    serves: !left
-                        || (position.is_none()
-                            && state.is_none_or(|state| state == RecoveryUnitState::Active)),
-                    pursued,
-                    on_frontier: false,
-                    stored,
-                    fences,
-                    first_owed,
-                    first_staged,
-                });
             }
         }
-        // A failed source stops holding up its peers. With no source left to
-        // serve the group, each one still pursuing its debt holds instead: a
-        // frame opened ahead of history its relay may still return can put
-        // that history past the ratchet's out-of-order window.
-        let stranded = !members.iter().any(|member| member.serves);
-        for member in &mut members {
-            member.on_frontier = member.position.is_some()
-                && if stranded {
-                    member.pursued
-                } else {
-                    !member.left
-                };
+        let debts = turn.app.recovery_unit_debts(
+            &units
+                .iter()
+                .map(|(_, route, relay)| {
+                    (&route.route, relay.as_str(), turn.owed_until(route, relay))
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        let mut members = Vec::with_capacity(units.len());
+        for ((group, route, relay), (debt, unit)) in units.into_iter().zip(debts) {
+            let position = debt.first().map(|range| range.since_seconds);
+            // Its relay could not prove the first second it still owes,
+            // under the caps it still publishes.
+            let saturated = unit
+                .as_ref()
+                .is_some_and(|unit| saturated_at(unit, position));
+            let left = self.relay_left(relay)?
+                || unit.as_ref().is_some_and(|unit| unit_left(unit, saturated));
+            let state = unit.as_ref().map(|unit| unit.state);
+            let pursued = !saturated
+                && unit
+                    .as_ref()
+                    .is_none_or(|unit| !matches!(unit.state, RecoveryUnitState::Broken(_)));
+            let key = UnitKey {
+                route: route.route.clone(),
+                relay: relay.clone(),
+            };
+            let stored = self.stored_fences()?.get(&key).cloned().unwrap_or_default();
+            let captures = stored
+                .iter()
+                .copied()
+                .chain(
+                    self.captures
+                        .get(&(&route.route, relay.as_str()))
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                )
+                .collect();
+            let captures = merge(captures);
+            let (fences, first_owed) = owed(captures.clone(), &debt);
+            let member = Member {
+                key,
+                position,
+                left,
+                serves: !left
+                    || (position.is_none()
+                        && state.is_none_or(|state| state == RecoveryUnitState::Active)),
+                pursued,
+                on_frontier: false,
+                stored,
+                fences,
+                first_owed,
+                first_staged: None,
+            };
+            members.push((group, member, captures));
         }
-        Ok(Group {
-            routes: routes.iter().map(|route| route.route.clone()).collect(),
-            members,
-        })
+        // Fetched input not yet admitted inside a capture keeps it fenced,
+        // on any of its group's routes.
+        let group_routes = |group: &GroupKey| {
+            self.groups
+                .get(group)
+                .into_iter()
+                .flatten()
+                .map(|route| &route.route)
+        };
+        let ranges = members
+            .iter()
+            .flat_map(|(group, _, captures)| {
+                captures.iter().flat_map(move |capture| {
+                    group_routes(group)
+                        .map(move |route| (route, capture.since_seconds, capture.until_seconds))
+                })
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let staged = ranges
+            .iter()
+            .copied()
+            .zip(turn.app.staged_recovery_first_seconds(&ranges)?)
+            .collect::<BTreeMap<_, _>>();
+        for (group, member, captures) in &mut members {
+            for capture in captures.iter() {
+                let pending = group_routes(group)
+                    .filter_map(|route| {
+                        staged
+                            .get(&(route, capture.since_seconds, capture.until_seconds))
+                            .copied()
+                            .flatten()
+                    })
+                    .min();
+                if let Some(at) = pending {
+                    member.first_staged = super::sooner(member.first_staged, Some(at));
+                    if !member.fences.contains(capture) {
+                        member.fences.push(*capture);
+                    }
+                }
+            }
+            member.fences.sort_by_key(|range| range.since_seconds);
+        }
+        let mut members = members.into_iter().peekable();
+        for key in &keys {
+            let mut group_members = Vec::new();
+            while let Some((_, member, _)) = members.next_if(|(group, _, _)| *group == key) {
+                group_members.push(member);
+            }
+            // A failed source stops holding up its peers. With no source left
+            // to serve the group, each one still pursuing its debt holds
+            // instead: a frame opened ahead of history its relay may still
+            // return can put that history past the ratchet's out-of-order
+            // window.
+            let stranded = !group_members.iter().any(|member| member.serves);
+            for member in &mut group_members {
+                member.on_frontier = member.position.is_some()
+                    && if stranded {
+                        member.pursued
+                    } else {
+                        !member.left
+                    };
+            }
+            let routes = group_routes(key).cloned().collect();
+            self.read.insert(
+                key.clone(),
+                Group {
+                    routes,
+                    members: group_members,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// A failed source stops holding up its peers. Its range stays owed;
