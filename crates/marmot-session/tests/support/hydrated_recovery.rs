@@ -177,6 +177,7 @@ async fn hydrated_recovery_fixture(
         drop(alice);
         // A real failed delivery owns a durable retry before the fork. It must
         // not publish later merely because it retained the exact old bytes.
+        // It failed a minute ago, so its relay's backoff has passed.
         let adapter = RecordingAdapter::default();
         adapter.accept_only_endpoints(vec![]);
         let mut runtime = AccountDeviceRuntime::new(
@@ -187,6 +188,11 @@ async fn hydrated_recovery_fixture(
                 vec![TransportEndpoint("wss://recovery-inbox.example".into())],
             ),
             RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            Arc::new(TestWallClock::new(unix_now() - 60)),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
         );
         runtime
             .publish_welcome_messages_with_audit_context(
