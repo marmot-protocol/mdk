@@ -4162,6 +4162,253 @@ fn offers_relay_edits(state: &OnboardingStepState) -> bool {
             .contains(&OnboardingAction::UseRecommendedRelays)
 }
 
+fn assert_inbox_repair_basis_uncertain(
+    snapshot: &OnboardingSnapshot,
+    context: OnboardingFindingContext,
+) {
+    let state = &snapshot.steps[OnboardingStep::InboxRelays.index()];
+    assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+    assert!(state.findings.iter().any(|finding| {
+        finding.issue == OnboardingIssue::RecordChanged
+            && finding.context == context
+            && finding.purpose == OnboardingCheckPurpose::SourceFreshness
+            && finding.outcome == OnboardingCheckOutcome::Unknown
+            && finding
+                .actions
+                .contains(&OnboardingAction::CancelOnboarding)
+    }));
+    assert!(!state.actions.contains(&OnboardingAction::EditRelays));
+    assert!(
+        !state
+            .actions
+            .contains(&OnboardingAction::UseRecommendedRelays)
+    );
+    assert!(snapshot.proposal.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_later_reads_preserve_the_newest_relay_repair_basis() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let step = OnboardingStep::InboxRelays;
+    let tags = vec![
+        vec!["relay".into(), retired_relay_fixture_endpoint()],
+        vec!["client".into(), "opaque original tag".into()],
+    ];
+    inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), "wss://healthy.example".into()]],
+        Some(tags),
+    )
+    .await;
+    let setup = runtime.account_setup();
+    let preview = setup
+        .propose_onboarding_relay_repair(&id, step)
+        .await
+        .unwrap();
+    let checkpoint_record = || {
+        runtime
+            .accounts()
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap()
+            .records[step.index()]
+        .clone()
+        .unwrap()
+    };
+    let original = checkpoint_record();
+    assert_eq!(
+        preview.proposal.unwrap().previous_event_id.as_ref(),
+        Some(&original.id)
+    );
+    let older = signed(&keys, 10050, vec![], "older", original.created_at - 1);
+    network.events.lock().retain(|event| event.kind != 10050);
+    network.events.lock().push(older);
+
+    let refused = crate::client::boxed(|| setup.approve_onboarding_repair(&id, preview.revision))
+        .await
+        .unwrap();
+    assert_eq!(checkpoint_record(), original);
+    assert_inbox_repair_basis_uncertain(&refused, OnboardingFindingContext::RepairApproval);
+
+    for empty in [false, true] {
+        if empty {
+            network.events.lock().retain(|event| event.kind != 10050);
+        }
+        let checked = crate::client::boxed(|| setup.retry_onboarding_step(&id, step))
+            .await
+            .unwrap();
+        assert_eq!(checkpoint_record(), original);
+        assert_inbox_repair_basis_uncertain(&checked, OnboardingFindingContext::RecordDiscovery);
+        assert!(
+            setup
+                .propose_onboarding_relays(&id, step, None)
+                .await
+                .is_err()
+        );
+        assert!(network.attempts.lock().is_empty());
+    }
+
+    network.events.lock().push(original.clone());
+    crate::client::boxed(|| setup.retry_onboarding_step(&id, step))
+        .await
+        .unwrap();
+    let preview = setup
+        .propose_onboarding_relay_repair(&id, step)
+        .await
+        .unwrap();
+    network.events.lock().retain(|event| event.kind != 10050);
+    network.events.lock().push(signed(
+        &keys,
+        10050,
+        vec![],
+        "out of range",
+        unix_now_seconds() + FUTURE_CLOCK_SKEW + 3600,
+    ));
+    let refused = crate::client::boxed(|| setup.approve_onboarding_repair(&id, preview.revision))
+        .await
+        .unwrap();
+    assert_eq!(checkpoint_record(), original);
+    let finding = &refused.steps[step.index()].findings[0];
+    assert_eq!(finding.issue, OnboardingIssue::FutureDated);
+    assert_eq!(finding.context, OnboardingFindingContext::RepairApproval);
+    assert!(refused.proposal.is_none());
+    let retried = crate::client::boxed(|| setup.retry_onboarding_step(&id, step))
+        .await
+        .unwrap();
+    assert_eq!(checkpoint_record(), original);
+    let finding = &retried.steps[step.index()].findings[0];
+    assert_eq!(finding.issue, OnboardingIssue::FutureDated);
+    assert_eq!(
+        finding.context,
+        OnboardingFindingContext::PublishedDeclaration
+    );
+
+    network.events.lock().retain(|event| event.kind != 10050);
+    let newer = signed(
+        &keys,
+        10050,
+        original.tags.clone(),
+        "new signed content",
+        original.created_at + 1,
+    );
+    network.events.lock().push(newer.clone());
+    crate::client::boxed(|| setup.retry_onboarding_step(&id, step))
+        .await
+        .unwrap();
+    let refreshed = setup
+        .propose_onboarding_relay_repair(&id, step)
+        .await
+        .unwrap();
+    let proposal = refreshed.proposal.unwrap();
+    assert_eq!(proposal.previous_event_id, Some(newer.id));
+    let repair = proposal.relay_repair.unwrap();
+    assert_eq!(repair.original_content, "new signed content");
+    assert!(
+        repair
+            .after_tags
+            .iter()
+            .any(|tag| tag.fields == newer.tags[1])
+    );
+    assert!(network.attempts.lock().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_onboarding_rechecks_a_deliberately_deleted_relay_list() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let step = OnboardingStep::InboxRelays;
+    let nip65 = vec![vec!["r".into(), "wss://healthy.example".into()]];
+    inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        nip65.clone(),
+        Some(vec![vec!["relay".into(), retired_relay_fixture_endpoint()]]),
+    )
+    .await;
+    let setup = runtime.account_setup();
+    network.events.lock().retain(|event| event.kind != 10050);
+    let lost = crate::client::boxed(|| setup.retry_onboarding_step(&id, step))
+        .await
+        .unwrap();
+    assert_inbox_repair_basis_uncertain(&lost, OnboardingFindingContext::RecordDiscovery);
+    setup.cancel_onboarding(&id).await.unwrap();
+    let restarted = crate::client::boxed(|| {
+        setup.begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(restarted.revision > lost.revision);
+
+    network
+        .inspection_errors
+        .lock()
+        .insert("index.example".into(), DirectoryInspectionError::TimedOut);
+    let partial = inbox_step(&runtime, &network, &keys, &id, nip65, None).await;
+    let state = &partial.steps[step.index()];
+    assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+    assert!(
+        state
+            .findings
+            .iter()
+            .any(|finding| finding.issue == OnboardingIssue::TimedOut)
+    );
+    assert!(
+        !state
+            .findings
+            .iter()
+            .any(|finding| finding.issue == OnboardingIssue::Missing)
+    );
+
+    network.inspection_errors.lock().clear();
+    network.events.lock().push(signed(
+        &keys,
+        10050,
+        vec![],
+        "out of range",
+        unix_now_seconds() + FUTURE_CLOCK_SKEW + 3600,
+    ));
+    let future_dated = crate::client::boxed(|| setup.retry_onboarding_step(&id, step))
+        .await
+        .unwrap();
+    assert_eq!(
+        future_dated.steps[step.index()].findings[0].issue,
+        OnboardingIssue::FutureDated
+    );
+
+    network.events.lock().retain(|event| event.kind != 10050);
+    let absent = crate::client::boxed(|| setup.retry_onboarding_step(&id, step))
+        .await
+        .unwrap();
+    let state = &absent.steps[step.index()];
+    assert_eq!(state.status, OnboardingStatus::NeedsInput);
+    assert!(
+        state
+            .findings
+            .iter()
+            .any(|finding| finding.issue == OnboardingIssue::Missing)
+    );
+    let proposed = setup
+        .propose_onboarding_relay_repair(&id, step)
+        .await
+        .unwrap()
+        .proposal
+        .unwrap();
+    assert_eq!(proposed.previous_event_id, None);
+    assert!(network.attempts.lock().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_inbox_list_no_declared_route_answers_can_be_extended_with_consent() {
     use transport_nostr::DirectoryInspectionError;

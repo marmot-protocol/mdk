@@ -696,6 +696,13 @@ Imported identities can use the durable preflight API instead of `login`:
    a proposal until approval has been recorded.
 5. `retry_onboarding_step` requires an offered `Retry` action; `set_onboarding_discovery_relays`
    retries with explicitly chosen discovery sources without publishing them.
+   A complete read can return only older copies of a relay list or no copy at all.
+   If the attempt has already seen a newer list, onboarding keeps that signed
+   repair basis and pauses with `RecordChanged`, `SourceFreshness`, and an `Unknown`
+   outcome. Offer retry or a different discovery set. If the user intentionally
+   deleted the list, they can choose `CancelOnboarding` and start sign-in again.
+   Cancellation signs out the identity and retains its keys and local data.
+   The new attempt checks discovery again before reporting the list missing.
    After process restart, read `onboarding_snapshot`, register the external
    signer again if applicable, and run/resume or retry the indicated step.
 6. Enter the normal app only when `snapshot.ready` is true. Normal worker

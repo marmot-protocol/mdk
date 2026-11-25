@@ -918,6 +918,12 @@ impl OnboardingCheckpoint {
                         });
                     }
                 }
+                if findings
+                    .iter()
+                    .any(OnboardingFinding::is_unconfirmed_relay_basis)
+                {
+                    actions.push(OnboardingAction::CancelOnboarding);
+                }
                 // Inconclusive discovery never proposes a replacement by
                 // itself; the user may still edit after one (see below).
                 if step.relay()
@@ -987,6 +993,19 @@ fn finding(issue: OnboardingIssue) -> OnboardingFinding {
 }
 
 impl OnboardingFinding {
+    fn unconfirmed_relay_basis(context: OnboardingFindingContext) -> Self {
+        let mut finding = finding(OnboardingIssue::RecordChanged)
+            .in_context(context, OnboardingCheckPurpose::SourceFreshness);
+        finding.outcome = OnboardingCheckOutcome::Unknown;
+        finding
+    }
+
+    fn is_unconfirmed_relay_basis(&self) -> bool {
+        self.issue == OnboardingIssue::RecordChanged
+            && self.purpose == OnboardingCheckPurpose::SourceFreshness
+            && self.outcome == OnboardingCheckOutcome::Unknown
+    }
+
     fn in_context(
         mut self,
         context: OnboardingFindingContext,
@@ -1008,6 +1027,17 @@ impl OnboardingFinding {
         };
         self
     }
+}
+
+/// NIP-01 orders replaceable events by timestamp and then the lower id.
+fn compare_record_recency(a: &NostrTransportEvent, b: &NostrTransportEvent) -> std::cmp::Ordering {
+    a.created_at
+        .cmp(&b.created_at)
+        .then_with(|| b.id.cmp(&a.id))
+}
+
+fn is_future_dated_record(event: &NostrTransportEvent) -> bool {
+    event.created_at > unix_now_seconds() + FUTURE_CLOCK_SKEW
 }
 
 fn declared_capabilities(
@@ -1091,6 +1121,16 @@ fn refresh_finding_actions(snapshot: &mut OnboardingSnapshot) {
                         OnboardingAction::UseRecommendedRelays,
                         OnboardingAction::ContinueWithout,
                         OnboardingAction::ReconnectSigner,
+                    ]
+                }
+                OnboardingFindingContext::RecordDiscovery
+                | OnboardingFindingContext::RepairApproval
+                    if finding.is_unconfirmed_relay_basis() =>
+                {
+                    &[
+                        OnboardingAction::Retry,
+                        OnboardingAction::EditDiscoveryRelays,
+                        OnboardingAction::CancelOnboarding,
                     ]
                 }
                 OnboardingFindingContext::RecordDiscovery
@@ -2284,7 +2324,11 @@ impl AccountSetup<'_> {
                     )
                     .await?;
                 self.require_live_onboarding_attempt(c)?;
-                c.records[index] = event.clone();
+                // A failed recheck tells us nothing about the prior relay list.
+                if event.is_some() || !step.relay() || status != OnboardingStatus::RetryableFailure
+                {
+                    c.records[index].clone_from(&event);
+                }
                 // Cache even imperfect signed data for settings visibility;
                 // routing still filters it through the relay safety chokepoint.
                 if let Some(event) = event {
@@ -2607,7 +2651,7 @@ impl AccountSetup<'_> {
             }
             valid
         });
-        records.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+        records.sort_by(|a, b| compare_record_recency(b, a));
         records.dedup_by(|a, b| a.id == b.id);
         let failures = failures
             .into_iter()
@@ -2692,7 +2736,7 @@ impl AccountSetup<'_> {
         } else {
             None
         };
-        if let Some(event) = list.filter(|e| e.created_at <= unix_now_seconds() + FUTURE_CLOCK_SKEW)
+        if let Some(event) = list.filter(|event| !is_future_dated_record(event))
             && let Some(state) = crate::relay_list_state_from_event(&event)
         {
             let safe = self.app().relay_plane.retain_safe_discovered_endpoints(
@@ -2741,6 +2785,25 @@ impl AccountSetup<'_> {
         let (records, mut failures, completed) = self
             .inspect_onboarding_relays(&c.snapshot.account_id_hex, step.kind(), sources.clone())
             .await;
+        let basis = c.records[step.index()]
+            .as_ref()
+            .filter(|event| step.relay() && !is_future_dated_record(event));
+        if failures.is_empty()
+            && !completed.is_empty()
+            && basis.is_some_and(|basis| {
+                records
+                    .first()
+                    .is_none_or(|event| compare_record_recency(event, basis).is_lt())
+            })
+        {
+            return (
+                OnboardingStatus::RetryableFailure,
+                vec![OnboardingFinding::unconfirmed_relay_basis(
+                    OnboardingFindingContext::RecordDiscovery,
+                )],
+                None,
+            );
+        }
         let Some(event) = records.into_iter().next() else {
             return if completed.is_empty() || !failures.is_empty() {
                 if !failures.is_empty() && self.authoritative_answered(c, &sources, &completed) {
@@ -2776,14 +2839,16 @@ impl AccountSetup<'_> {
                 )
             };
         };
-        if event.created_at > unix_now_seconds() + FUTURE_CLOCK_SKEW {
+        if is_future_dated_record(&event) {
             return (
                 OnboardingStatus::RetryableFailure,
                 vec![finding(OnboardingIssue::FutureDated).in_context(
                     OnboardingFindingContext::PublishedDeclaration,
                     OnboardingCheckPurpose::DeclarationValidation,
                 )],
-                Some(event),
+                // Keep a previously eligible declaration when the latest
+                // response is a signed event beyond the permitted clock skew.
+                basis.is_none().then_some(event),
             );
         }
         let mut findings: Vec<_> = validate_onboarding_record(&event)
@@ -3309,21 +3374,32 @@ impl AccountSetup<'_> {
             .as_ref()
             .filter(|event| Some(&event.id) == proposal.previous_event_id.as_ref());
         let newer_seen = records.first().is_some_and(|event| {
-            basis.is_none_or(|basis| {
-                event.created_at > basis.created_at
-                    || (event.created_at == basis.created_at && event.id < basis.id)
-            })
+            basis.is_none_or(|basis| compare_record_recency(event, basis).is_gt())
         });
         if !basis_newest && (complete || (accepted_risk && newer_seen)) {
-            c.records[proposal.step.index()] = records.first().cloned();
+            let eligible_relay_basis =
+                proposal.step.relay() && basis.is_some_and(|event| !is_future_dated_record(event));
+            let finding = if eligible_relay_basis
+                && records.first().is_some_and(is_future_dated_record)
+            {
+                finding(OnboardingIssue::FutureDated).in_context(
+                    OnboardingFindingContext::RepairApproval,
+                    OnboardingCheckPurpose::SourceFreshness,
+                )
+            } else if complete && eligible_relay_basis && !newer_seen {
+                OnboardingFinding::unconfirmed_relay_basis(OnboardingFindingContext::RepairApproval)
+            } else {
+                c.records[proposal.step.index()] = records.first().cloned();
+                finding(OnboardingIssue::RecordChanged).in_context(
+                    OnboardingFindingContext::RepairApproval,
+                    OnboardingCheckPurpose::SourceFreshness,
+                )
+            };
             c.snapshot.proposal = None;
             c.set(
                 proposal.step,
                 OnboardingStatus::RetryableFailure,
-                vec![finding(OnboardingIssue::RecordChanged).in_context(
-                    OnboardingFindingContext::RepairApproval,
-                    OnboardingCheckPurpose::SourceFreshness,
-                )],
+                vec![finding],
             );
         } else if !complete && !(accepted_risk && basis_newest) {
             let failures = if failures.is_empty() {
