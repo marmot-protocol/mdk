@@ -14,7 +14,7 @@ use super::device_roster::{
 };
 use super::send_intents::{pending_proposals, queue, store_pending_add};
 use super::*;
-use cgka_engine::engine::OutboundWelcomeStatus;
+use cgka_engine::engine::{OutboundWelcomeStatus, WelcomeWithdrawal};
 use cgka_traits::app_components::{
     DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1, MAX_LEAVES_PER_ACCOUNT,
     RejectedSlotReasonV1, RejectedSlotV1, encode_device_roster_update_v1,
@@ -654,6 +654,44 @@ async fn a_device_group_commit_takes_no_add_from_the_proposal_store() {
         &gid,
     )
     .await;
+}
+
+/// A device group's founding Welcome its session could not seal yet (its
+/// signer failed, or the process stopped first) is found by its
+/// `KeyPackageRef` and withdrawn, so a link cancelled meanwhile leaves no
+/// Welcome for maintenance to seal and send later (mdk#3498).
+#[tokio::test]
+async fn an_unsealed_founding_welcome_is_withdrawn_by_its_key_package_ref() {
+    let mut first = roster_device(b"alice");
+    let laptop_key_package = roster_device(b"alice")
+        .engine
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let founding_ref = key_package_ref(&laptop_key_package);
+    let (founded, created) = create_under(
+        &mut first,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        vec![laptop_key_package],
+        &GroupId::new(vec![0x43; 16]),
+    )
+    .await
+    .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
+        panic!("current-profile founding group")
+    };
+    assert_eq!(first.engine.unsealed_owed_welcomes().unwrap(), welcomes);
+
+    let found = first
+        .engine
+        .sent_welcomes_for_key_package(&founded, &founding_ref)
+        .unwrap();
+    assert_eq!(found, vec![welcomes[0].local_id.clone()]);
+    assert_eq!(
+        first.engine.withdraw_sent_welcome(&found[0]).unwrap(),
+        WelcomeWithdrawal::Withdrawn
+    );
+    assert!(first.engine.unsealed_owed_welcomes().unwrap().is_empty());
 }
 
 /// A link's Welcome keeps the `KeyPackageRef` of the KeyPackage it answers

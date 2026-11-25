@@ -443,7 +443,7 @@ impl StoredMessagePayload {
     }
 
     /// The `KeyPackageRef` of the KeyPackage a retained outbound Welcome
-    /// answers, staged or not, when the Welcome recorded one.
+    /// answers, staged, owed or still unsealed, when the Welcome recorded one.
     pub fn welcome_key_package_ref(&self) -> Option<&[u8]> {
         match self {
             Self::OutboundWelcome {
@@ -451,19 +451,21 @@ impl StoredMessagePayload {
             }
             | Self::StagedInviteWelcome {
                 key_package_ref, ..
+            }
+            | Self::UnsealedWelcome {
+                key_package_ref, ..
             } => key_package_ref.as_deref(),
             Self::RawTransport(_)
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
             | Self::OwnCommitWire { .. }
             | Self::StagedSiblingWelcome { .. }
-            | Self::OutboundSiblingWelcome { .. }
-            | Self::UnsealedWelcome { .. } => None,
+            | Self::OutboundSiblingWelcome { .. } => None,
         }
     }
 
     /// The transport event id of the KeyPackage a retained outbound Welcome
-    /// answers, staged or not, when the Welcome recorded one.
+    /// answers, staged, owed or still unsealed, when the Welcome recorded one.
     pub fn welcome_key_package_event_id(&self) -> Option<&MessageId> {
         match self {
             Self::OutboundWelcome {
@@ -473,31 +475,34 @@ impl StoredMessagePayload {
             | Self::StagedInviteWelcome {
                 key_package_event_id,
                 ..
+            }
+            | Self::UnsealedWelcome {
+                key_package_event_id,
+                ..
             } => key_package_event_id.as_ref(),
             Self::RawTransport(_)
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
             | Self::OwnCommitWire { .. }
             | Self::StagedSiblingWelcome { .. }
-            | Self::OutboundSiblingWelcome { .. }
-            | Self::UnsealedWelcome { .. } => None,
+            | Self::OutboundSiblingWelcome { .. } => None,
         }
     }
 
-    /// When a retained outbound Welcome, staged or not, stops being
-    /// deliverable, if it has a delivery deadline: a device link's Welcome
-    /// does.
+    /// When a retained outbound Welcome, staged, owed or still unsealed, stops
+    /// being deliverable, if it has a delivery deadline: a device link's
+    /// Welcome does.
     pub fn welcome_deliver_until(&self) -> Option<Timestamp> {
         match self {
             Self::OutboundWelcome { deliver_until, .. }
-            | Self::StagedInviteWelcome { deliver_until, .. } => *deliver_until,
+            | Self::StagedInviteWelcome { deliver_until, .. }
+            | Self::UnsealedWelcome { deliver_until, .. } => *deliver_until,
             Self::RawTransport(_)
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
             | Self::OwnCommitWire { .. }
             | Self::StagedSiblingWelcome { .. }
-            | Self::OutboundSiblingWelcome { .. }
-            | Self::UnsealedWelcome { .. } => None,
+            | Self::OutboundSiblingWelcome { .. } => None,
         }
     }
 

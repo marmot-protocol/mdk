@@ -4979,20 +4979,22 @@ impl<S: StorageProvider> Engine<S> {
         let record = self.storage.get_message(id)?;
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
-        let message = match &payload {
+        let is_welcome = match &payload {
             StoredMessagePayload::OutboundWelcome { message, .. }
-            | StoredMessagePayload::StagedInviteWelcome { message, .. } => Some(message),
+            | StoredMessagePayload::StagedInviteWelcome { message, .. } => {
+                matches!(message.envelope, TransportEnvelope::Welcome { .. })
+            }
+            // Withdrawn before it was sealed: maintenance seals only `Sent`
+            // rows, and a row bound anyway keeps its `Failed` state.
+            StoredMessagePayload::UnsealedWelcome { .. } => true,
             StoredMessagePayload::RawTransport(_)
             | StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
             | StoredMessagePayload::OwnCommitWire { .. }
             | StoredMessagePayload::StagedSiblingWelcome { .. }
-            | StoredMessagePayload::OutboundSiblingWelcome { .. }
-            | StoredMessagePayload::UnsealedWelcome { .. } => None,
+            | StoredMessagePayload::OutboundSiblingWelcome { .. } => false,
         };
-        if !message
-            .is_some_and(|message| matches!(message.envelope, TransportEnvelope::Welcome { .. }))
-        {
+        if !is_welcome {
             return Err(EngineError::Backend(
                 "stored message is not a delivery-aware outbound Welcome".into(),
             ));
@@ -5152,7 +5154,9 @@ impl<S: StorageProvider> Engine<S> {
     /// KeyPackage but lost the Welcome's id, say to a crash right after the
     /// commit, finds it here to withdraw it (mdk#2628 item 3.3b, D40). A
     /// KeyPackage added again after its commit rolled back has a Welcome per
-    /// attempt. Only Welcomes that recorded their KeyPackageRef are found.
+    /// attempt. Only Welcomes that recorded their KeyPackageRef are found. A
+    /// Welcome not sealed yet is found under its local id, which withdrawal
+    /// accepts.
     ///
     /// Like withdrawal, it reads only the Welcomes' own rows, so it works for
     /// a group not hydrated yet.
