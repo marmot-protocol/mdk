@@ -371,11 +371,18 @@ struct MemberTarget {
     /// Outboxes of a served relay list that ties the remembered one on its
     /// timestamp but names other relays. KeyPackage reads include them.
     tied_relays: Vec<String>,
+    relay_list_coverage: RelayListCoverage,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelayListCoverage {
+    Unconfirmed,
+    UnqueriedOutbox,
+    Confirmed,
 }
 
 #[derive(Default)]
 struct RelayListResolution {
-    completed: HashSet<usize>,
     errors: Vec<(usize, DirectoryError)>,
     /// Members a cut-off stopped before their discovery finished. Their relay
     /// lists may be a discovery-only snapshot.
@@ -639,6 +646,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 relay_records: Vec::new(),
                 completed_relay_records: Vec::new(),
                 tied_relays: Vec::new(),
+                relay_list_coverage: RelayListCoverage::Unconfirmed,
             });
         }
 
@@ -694,48 +702,43 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .filter(|index| !reused_prewarmed_routes.contains(index))
             .collect::<Vec<_>>();
         // Unfinished relay lists cannot support any KeyPackage verdict.
-        let (relay_lists_completed, relay_lists_unfinished, finished) =
-            match tokio::time::timeout_at(
-                deadline,
-                self.resolve_missing_relay_lists(&mut targets, &relay_list_unresolved, cut_offs),
-            )
-            .await
-            {
-                Ok(resolution) => {
-                    let RelayListResolution {
-                        completed,
-                        errors,
-                        unfinished,
-                    } = resolution?;
-                    for (index, error) in errors {
-                        outcomes[index] = Some(Err(error));
-                    }
-                    let key_package_unresolved = (0..targets.len())
-                        .filter(|index| outcomes[*index].is_none())
-                        .collect::<Vec<_>>();
-                    let finished = match tokio::time::timeout_at(
-                        deadline,
-                        self.resolve_missing_key_packages(
-                            &targets,
-                            &key_package_unresolved,
-                            &mut outcomes,
-                            purpose,
-                            requirements,
-                            cut_offs.map(|cut_offs| cut_offs.key_package_batches),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            result?;
-                            true
-                        }
-                        Err(_) => false,
-                    };
-                    (completed, Some(unfinished), finished)
+        let (relay_lists_unfinished, finished) = match tokio::time::timeout_at(
+            deadline,
+            self.resolve_missing_relay_lists(&mut targets, &relay_list_unresolved, cut_offs),
+        )
+        .await
+        {
+            Ok(resolution) => {
+                let RelayListResolution { errors, unfinished } = resolution?;
+                for (index, error) in errors {
+                    outcomes[index] = Some(Err(error));
                 }
-                Err(_) => (HashSet::new(), None, false),
-            };
+                let key_package_unresolved = (0..targets.len())
+                    .filter(|index| outcomes[*index].is_none())
+                    .collect::<Vec<_>>();
+                let finished = match tokio::time::timeout_at(
+                    deadline,
+                    self.resolve_missing_key_packages(
+                        &targets,
+                        &key_package_unresolved,
+                        &mut outcomes,
+                        purpose,
+                        requirements,
+                        cut_offs.map(|cut_offs| cut_offs.key_package_batches),
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        result?;
+                        true
+                    }
+                    Err(_) => false,
+                };
+                (Some(unfinished), finished)
+            }
+            Err(_) => (None, false),
+        };
         if !finished {
             for (target, outcome) in targets.iter().zip(&mut outcomes) {
                 outcome.get_or_insert_with(|| {
@@ -756,16 +759,15 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 observation.directory_sample(outcome, "network", 1);
             }
         }
-        for (index, (target, outcome)) in targets.iter().zip(&mut outcomes).enumerate() {
+        for (target, outcome) in targets.iter().zip(&mut outcomes) {
             let Some(result) = outcome.take() else {
                 continue;
             };
-            // An incompatibility verdict needs current outbox discovery as
-            // well as complete KeyPackage reads. Absence stands without a
-            // confirmed list, as for an account that publishes none.
+            // An incompatibility verdict needs a confirmed relay list as
+            // well as complete KeyPackage reads.
             let result = match result {
                 Err(DirectoryError::KeyPackageRequirements(error))
-                    if !relay_lists_completed.contains(&index)
+                    if target.relay_list_coverage != RelayListCoverage::Confirmed
                         && key_package_requirements_are_incompatible(&error) =>
                 {
                     Err(DirectoryError::DirectoryLookupIncomplete(
@@ -838,7 +840,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     // Only completed discovery renews the route deadline.
                     // A usable package can arrive after an incomplete metadata
                     // hop retained an older durable inbox/outbox projection.
-                    if relay_lists_completed.contains(&index)
+                    if target.relay_list_coverage == RelayListCoverage::Confirmed
                         && matches!(outcomes[index], Some(Ok(_)))
                     {
                         cache.insert(target.account_id_hex.clone(), target.relay_lists.clone());
@@ -1295,7 +1297,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         // cache cannot tell which tied list is current, so every tied list's
         // outboxes are read too but a tie decides nothing.
         let freshness = self.directory_freshness();
-        let mut confirmed = HashSet::new();
         for &index in &needs_discovery {
             let target = &mut targets[index];
             let listed_at = target.relay_lists.nip65.created_at;
@@ -1323,30 +1324,33 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 .into_iter()
                 .filter(|relays| relay_identities(relays) != listed)
                 .collect::<Vec<_>>();
-            if !conflicting.is_empty() {
+            let tied = !conflicting.is_empty();
+            if tied {
                 target.tied_relays = conflicting.into_iter().flatten().collect();
-            } else if served {
-                confirmed.insert(index);
             }
+
+            // A list found on an outbox can name another outbox after the
+            // relay-list queries have already been sent.
+            let unqueried_outbox = outboxes(index, &target.relay_lists.nip65.relays)
+                .iter()
+                .any(|outbox| {
+                    !read_outboxes
+                        .get(&index)
+                        .zip(RelayUrl::parse(outbox.as_str()).ok())
+                        .is_some_and(|(read, outbox)| read.contains(&outbox))
+                });
+            target.relay_list_coverage = if unqueried_outbox {
+                RelayListCoverage::UnqueriedOutbox
+            } else if served
+                && !tied
+                && completed_discovery.contains(&index)
+                && (!attempted_outbox.contains(&index) || completed_outbox.contains(&index))
+            {
+                RelayListCoverage::Confirmed
+            } else {
+                RelayListCoverage::Unconfirmed
+            };
         }
-        let completed = completed_discovery
-            .iter()
-            .copied()
-            .filter(|index| {
-                (!attempted_outbox.contains(index) || completed_outbox.contains(index))
-                    && confirmed.contains(index)
-                    // A newer list found on an outbox can name outboxes this
-                    // lookup never read.
-                    && outboxes(*index, &targets[*index].relay_lists.nip65.relays)
-                        .iter()
-                        .all(|outbox| {
-                            read_outboxes
-                                .get(index)
-                                .zip(RelayUrl::parse(outbox.as_str()).ok())
-                                .is_some_and(|(read, outbox)| read.contains(&outbox))
-                        })
-            })
-            .collect();
         let errors = needs_discovery
             .into_iter()
             .filter(|index| {
@@ -1379,11 +1383,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 (index, DirectoryError::DirectoryLookupIncomplete(account))
             })
             .collect();
-        Ok(RelayListResolution {
-            completed,
-            errors,
-            unfinished,
-        })
+        Ok(RelayListResolution { errors, unfinished })
     }
 
     async fn resolve_missing_key_packages(
@@ -1626,13 +1626,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 Ok((packages, _)) => packages.is_empty(),
                 Err(_) => false,
             };
-            outcomes[index] = Some(if absent && tie_unread.contains(&index) {
-                Err(DirectoryError::DirectoryLookupIncomplete(
-                    targets[index].account_id_hex.clone(),
-                ))
-            } else {
-                result
-            });
+            outcomes[index] = Some(
+                if absent
+                    && (tie_unread.contains(&index)
+                        || targets[index].relay_list_coverage == RelayListCoverage::UnqueriedOutbox)
+                {
+                    Err(DirectoryError::DirectoryLookupIncomplete(
+                        targets[index].account_id_hex.clone(),
+                    ))
+                } else {
+                    result
+                },
+            );
         }
         Ok(())
     }
