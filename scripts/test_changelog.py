@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-from changelog import VERSION, check, release
+from changelog import VERSION, Tree, check, release
 
 HEADER = "# Changelog\n\n"
 OLDER = "## 0.1.0 - 2026-01-01\n\n### Added\n\n- The first release.\n"
@@ -29,12 +29,18 @@ class ChangelogTests(unittest.TestCase):
         path = self.root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-        # A release folds only fragments git tracks.
-        subprocess.run(["git", "-C", str(self.root), "add", rel], check=True)
+        # A release folds what HEAD holds.
+        self.commit(rel)
         return path
 
+    def commit(self, *paths: str) -> None:
+        git = ["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@example.test",
+               "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]
+        subprocess.run([*git, "add", "--all", "--", *paths], check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "change"], check=True)
+
     def errors(self, none_pending: bool = False) -> str:
-        return "\n".join(check(self.root, none_pending))
+        return "\n".join(check(Tree(self.root), none_pending))
 
     def test_accepts_a_well_formed_fragment(self) -> None:
         self.write("crates/a/changelog.d/fix-x.md", "### Fixed\n\n- X no longer fails.\n")
@@ -48,7 +54,7 @@ class ChangelogTests(unittest.TestCase):
     def test_rejects_any_heading_markdown_renders_as_unreleased(self) -> None:
         for heading in ("## \\[Unreleased\\]", "## unreleased", "### [Unreleased][]", "   # Unreleased changes ##",
                         "## [Unreleased](https://example.test)", "## **Unreleased**", "Unreleased\n----------",
-                        "Unreleased\nchanges\n==="):
+                        "Unreleased\nchanges\n===", "## Unrelea&#115;ed"):
             with self.subTest(heading=heading):
                 self.write("crates/a/CHANGELOG.md", HEADER + heading + "\n\n- New.\n\n" + OLDER)
                 self.assertIn("crates/a/CHANGELOG.md:3: no Unreleased section", self.errors())
@@ -138,35 +144,29 @@ class ChangelogTests(unittest.TestCase):
         self.assertFalse(late.exists())
 
     def test_an_interrupted_release_can_be_run_again(self) -> None:
-        # Killed after writing CHANGELOG.md but before deleting the fragments it folded.
-        self.write("crates/a/changelog.d/x.md", "### Fixed\n\n- X.\n  Only for Y.\n")
+        # Killed after writing CHANGELOG.md, with one fragment deleted and one left.
+        self.write("crates/a/changelog.d/x.md", "### Fixed\n\n- X.\n")
         self.write("crates/a/changelog.d/y.md", "### Changed\n\nA paragraph.\n")
         self.assertEqual(release(self.root, "0.2.0", "2026-02-02"), [])
         once = (self.root / "crates/a/CHANGELOG.md").read_text()
-        subprocess.run(["git", "-C", str(self.root), "checkout", "--", "crates/a/changelog.d"], check=True)
-        # A late fragment that only starts like a folded entry is a new entry.
-        late = self.write("crates/a/changelog.d/late.md", "### Fixed\n\n- X.\n")
-        self.assertEqual(release(self.root, "0.2.0", "2026-02-03"), [])
-        self.assertEqual((self.root / "crates/a/CHANGELOG.md").read_text(),
-                         once.replace("- X.\n  Only for Y.\n", "- X.\n  Only for Y.\n- X.\n"))
-        self.assertFalse(late.exists())
+        subprocess.run(["git", "-C", str(self.root), "checkout", "--", "crates/a/changelog.d/y.md"], check=True)
+        self.assertEqual(release(self.root, "0.2.0", "2026-02-02"), [])
+        self.assertEqual((self.root / "crates/a/CHANGELOG.md").read_text(), once)
         self.assertEqual(self.errors(none_pending=True), "")
 
-    def test_release_refuses_an_untracked_fragment(self) -> None:
-        # Release notes list merged changes, not a file left in this checkout.
-        stray = self.root / "crates/a/changelog.d/stray.md"
-        stray.parent.mkdir(parents=True)
-        stray.write_text("### Added\n\n- Local experiment.\n")
-        self.assertIn("crates/a/changelog.d/stray.md: not tracked by git",
-                      "\n".join(release(self.root, "0.2.0", "2026-02-02")))
-        self.assertTrue(stray.exists())
-        self.assertEqual((self.root / "crates/a/CHANGELOG.md").read_text(), HEADER + OLDER)
+    def test_release_refuses_uncommitted_edits_it_would_lose(self) -> None:
+        changelog = self.write("crates/a/CHANGELOG.md", HEADER + OLDER)
+        fragment = self.write("crates/a/changelog.d/x.md", "### Added\n\n- X.\n")
+        changelog.write_text(HEADER + "A local note.\n\n" + OLDER)
+        fragment.write_text("### Added\n\n- X, reworded.\n")
+        errors = "\n".join(release(self.root, "0.2.0", "2026-02-02"))
+        self.assertIn("crates/a/CHANGELOG.md: differs from HEAD and from this fold", errors)
+        self.assertIn("crates/a/changelog.d/x.md: differs from HEAD", errors)
+        self.assertEqual(changelog.read_text(), HEADER + "A local note.\n\n" + OLDER)
+        self.assertTrue(fragment.exists())
 
     def tag(self, name: str) -> None:
-        git = ["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@example.test",
-               "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]
-        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "release"], check=True)
-        subprocess.run([*git, "tag", name], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "tag.gpgsign=false", "tag", name], check=True)
 
     def test_release_refuses_an_older_version_and_a_bad_fragment(self) -> None:
         released = HEADER + "## 0.2.0 - 2026-02-02\n\n### Fixed\n\n- X.\n\n" + OLDER
@@ -206,12 +206,12 @@ class ChangelogTests(unittest.TestCase):
         a = self.write("crates/a/changelog.d/x.md", "### Added\n\n- X.\n")
         b = self.write("crates/b/changelog.d/y.md", "### Added\n\n- Y.\n")
         only = [self.root / "crates/a/CHANGELOG.md"]
-        self.assertIn("crates/a/changelog.d/x.md: still pending", "\n".join(check(self.root, True, only)))
-        self.assertNotIn("crates/b/", "\n".join(check(self.root, True, only)))
+        self.assertIn("crates/a/changelog.d/x.md: still pending", "\n".join(check(Tree(self.root), True, only)))
+        self.assertNotIn("crates/b/", "\n".join(check(Tree(self.root), True, only)))
         self.assertEqual(release(self.root, "0.2.0", "2026-02-02", only), [])
         self.assertFalse(a.exists())
         self.assertTrue(b.exists())
-        self.assertEqual(check(self.root, True, only), [])
+        self.assertEqual(check(Tree(self.root), True, only), [])
 
 
 if __name__ == "__main__":
