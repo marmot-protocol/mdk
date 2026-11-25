@@ -220,8 +220,8 @@ Before the release commit:
    upgrades. Keep known limitations and unresolved release blockers explicit.
 6. Run `just binding-docs-gate`, verify local Markdown links and source signatures,
    review examples against generated sources, then run the normal release preflight.
-   This gate checks exported names, signatures and source links; it cannot establish semantic prose,
-   DTO compatibility or platform adoption.
+   The gate checks that each export has a guide entry and generates signatures and source links.
+   Review prose, DTO compatibility, and platform adoption separately.
 
 Publish pointers to **both documents** in the MDK, MarmotKit and C GitHub Release bodies
 (and WN Agent when applicable). Existing auto-generated notes/workflow bodies do not
@@ -269,7 +269,8 @@ git status --short --branch
 git fetch origin
 ```
 
-Confirm the version, release notes, companion integration guide and complete method inventory:
+Check release notes and guide coverage before tagging. The source-only preflight checks the
+UniFFI guide. `just binding-docs-gate` also generates the C header and checks the C guide:
 
 ```sh
 release_version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"

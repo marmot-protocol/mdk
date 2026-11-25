@@ -146,15 +146,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--with-c", action="store_true", help="also generate the C reference from the generated header")
-    mode.add_argument("--release-version", help="verify companion release documents instead of generating references")
+    mode.add_argument("--release-version", help="check release documents and UniFFI guide without writing references")
     args = parser.parse_args()
     if args.release_version:
         problems = release_problems(REPO, args.release_version)
-        for problem in problems:
-            print(problem)
-        if not problems:
-            print(f"release documentation preflight passed for {args.release_version}")
-        return bool(problems)
+        if problems:
+            parser.exit(1, "\n".join(problems) + "\n")
 
     catalogs = [(REPO / "crates/marmot-uniffi", "rust", uniffi_catalog())]
     if args.with_c:
@@ -166,9 +163,12 @@ def main() -> int:
             reference = render(guide.read_text(), language, exports)
         except ValueError as error:
             parser.exit(1, f"{guide.relative_to(REPO)}:\n{error}\n")
-        output = crate / "API-REFERENCE.md"
-        output.write_text("<!-- Generated from API-GUIDE.md and declarations. Do not edit. -->\n\n" + reference)
-        print(f"{output.relative_to(REPO)}: {len(exports)} callables")
+        if not args.release_version:
+            output = crate / "API-REFERENCE.md"
+            output.write_text("<!-- Generated from API-GUIDE.md and declarations. Do not edit. -->\n\n" + reference)
+            print(f"{output.relative_to(REPO)}: {len(exports)} callables")
+    if args.release_version:
+        print(f"release documentation preflight passed for {args.release_version}")
     return 0
 
 

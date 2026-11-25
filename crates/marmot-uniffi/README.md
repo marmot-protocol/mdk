@@ -162,7 +162,7 @@ operation. Cancelling keeps committed rows and does not change account scope.
 ### Feature map
 
 All methods, including less common management/diagnostic operations, are listed in the
-[complete reference](API-GUIDE.md). These are the responsibilities of the main API families:
+[method guide](API-GUIDE.md). These are the responsibilities of the main API families:
 
 | Family | Integration boundary |
 | --- | --- |
@@ -261,7 +261,7 @@ completed before the cancel took effect returns its result or error instead; aft
 [Swift adapter signatures](API-GUIDE.md#swift-cancellation-adapters).
 
 ### Localization, privacy and diagnostics
-Native startup investigation can explicitly call `set_startup_diagnostics_enabled(true)` before the first account query, then read `startup_diagnostics_snapshot()` while a call remains unfinished. The snapshot uses independent bounded memory and fixed phases, including key lookup, database-open waiting and migration numbers; it contains no paths, account identifiers or error text. Keep normal builds disabled, bound host serialization separately, and revoke capture with `false` when it is no longer needed. Neither method changes upload consent or database state. See the [API reference](API-GUIDE.md).
+Native startup investigation can explicitly call `set_startup_diagnostics_enabled(true)` before the first account query, then read `startup_diagnostics_snapshot()` while a call remains unfinished. The snapshot uses independent bounded memory and fixed phases, including key lookup, database-open waiting and migration numbers; it contains no paths, account identifiers or error text. Keep normal builds disabled, bound host serialization separately, and revoke capture with `false` when it is no longer needed. Neither method changes upload consent or database state. See the [method guide](API-GUIDE.md).
 
 
 `record_host_performance` accepts 28 shared host stages for runtime/UI initialization,

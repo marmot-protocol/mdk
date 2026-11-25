@@ -38,6 +38,10 @@ class ClassifyCiChangesTests(unittest.TestCase):
         result = classify([".agents/skills/land-change/SKILL.md", ".claude/skills"])
         self.assertFalse(any(result.values()))
 
+    def test_c_api_guide_selects_only_c_lane(self) -> None:
+        result = classify(["crates/marmot-c/API-GUIDE.md", "README.md"])
+        self.assertEqual({lane for lane, enabled in result.items() if enabled}, {"run_c"})
+
     def test_non_markdown_agent_skill_file_fails_open_to_every_lane(self) -> None:
         result = classify([".agents/skills/review-local/scripts/launch.sh"])
         self.assertTrue(all(result.values()))

@@ -204,7 +204,7 @@ jobs:
           Marmot C bindings generated from MDK commit \`$GITHUB_SHA\`.
 
           Assets:
-          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, README.
+          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, C and UniFFI API references, README.
 
           Verify downloads with the accompanying \`.sha256\` files.
           EOF

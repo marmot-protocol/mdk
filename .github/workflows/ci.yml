@@ -403,7 +403,7 @@ jobs:
   c-smoke:
     name: C bindings smoke
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck' && needs.changes.outputs.run_c == 'true'
+    if: needs.changes.outputs.run_c == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -453,9 +453,11 @@ jobs:
           if-no-files-found: error
 
       - name: Alloc-audit tests
+        if: needs.changes.outputs.ci_mode != 'precheck'
         run: cargo test -p marmot-c --features alloc-audit --locked
 
       - name: Compile and run debug C smoke test (gcc)
+        if: needs.changes.outputs.ci_mode != 'precheck'
         run: ./crates/marmot-c/c-smoke.sh --debug gcc
 
       - name: Upload runner diagnostics

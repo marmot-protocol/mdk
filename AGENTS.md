@@ -138,7 +138,8 @@ GitHub CI is the full gate. Local verification proves your change and stays scop
 build on the same machine, so workspace-wide builds and suites run locally only when a rule below calls for one. By
 default, CI runs a pre-check of a few minutes on a PR: fmt, the static gates (including the tracing audit),
 `cargo audit`, clippy (default and `--all-features`), the WASM build, and the workspace tests with the `precheck`
-nextest profile. That profile stops each test after half a second and counts it as passed, so it catches only a test
+nextest profile. PRs affecting C bindings also generate the header and both API references.
+That nextest profile stops each test after half a second and counts it as passed, so it catches only a test
 that fails quickly; unless the PR carries `ci:full`, your local tests are the only signal from the slower tests before
 the merge queue. The merge queue runs the whole matrix (every crate's tests, the simulator,
 and the C, iOS and Windows lanes) and is the merge gate; the `ci:full` label runs that matrix on a PR, `ci:apple`

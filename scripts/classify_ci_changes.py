@@ -179,7 +179,9 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
         return dict.fromkeys(LANES, True)
 
     if all(_is_documentation(path) for path in normalized):
-        return dict.fromkeys(LANES, False)
+        result = dict.fromkeys(LANES, False)
+        result["run_c"] = "crates/marmot-c/API-GUIDE.md" in normalized
+        return result
 
     core_paths = [
         path for path in normalized

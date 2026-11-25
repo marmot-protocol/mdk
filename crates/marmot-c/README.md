@@ -76,16 +76,18 @@ calling thread; keep page and status reads off the UI thread.
 
 - `libmarmot_c.so` / `libmarmot_c.a` (cdylib + staticlib).
 - `include/marmot.h`, generated from the same source as the library.
+- C and UniFFI API references under `references/`.
 - A pkg-config file (`marmot-c.pc`) in the staged `output/` bundle.
 
-Install cbindgen 0.29.4 and build the bundle locally:
+Install cbindgen 0.29.4 and Python 3.11 or later to build the bundle locally:
 
 ```sh
-./crates/marmot-c/c-bindings.sh   # stages output/ (libs, header, pkg-config)
+./crates/marmot-c/c-bindings.sh
 ```
 
 Tagged releases (`marmotc-v*`) publish a Linux x86_64 zip (`marmot-c-linux-x86_64-<version>.zip`) with the same
-contents plus this README.
+contents plus this README. To follow source links, copy the contents of `references/` into `crates/` at
+the matching source revision and copy `include/marmot.h` into `crates/marmot-c/include/`.
 
 ## Binary compatibility
 
