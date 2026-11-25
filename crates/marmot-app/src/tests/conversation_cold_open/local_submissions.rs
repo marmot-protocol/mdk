@@ -1922,8 +1922,9 @@ async fn custom_event_to_members_is_refused_while_a_member_is_unlisted() {
 /// A send the engine took into its queue, which the worker recorded as
 /// accepted pending, is settled as refused in the transaction that retires its
 /// intent for a new member. Its row is retracted when the refusal is announced,
-/// or at the next account open if a crash came first; a refused send takes no
-/// edit. While the engine holds the send, its status names the event.
+/// in one pass per group, or at the next account open if a crash came first;
+/// a refused send takes no edit. While the engine holds the send, its status
+/// names the event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
     use cgka_traits::storage::OutboundIntentStorage;
@@ -2027,7 +2028,9 @@ async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
         "a refused send takes no edit"
     );
 
+    // Two refused in one drain; its first announcement retracts both rows.
     let (announced, announced_id) = refuse("announced");
+    let (_, also_refused) = refuse("also-refused");
     let refusal = cgka_traits::engine::GroupEvent::QueuedIntentRefused {
         group_id: h.group.clone(),
         intent_id: announced.id.clone(),
@@ -2043,5 +2046,6 @@ async fn a_queued_send_refused_for_a_new_member_is_settled_durably() {
             .is_some()
     );
     assert!(retracted(&announced_id));
+    assert!(retracted(&also_refused));
     runtime.shutdown_and_close().await.unwrap();
 }

@@ -9,8 +9,9 @@
 - Account migration 0226 rebuilds `local_message_submissions` to admit state 4, a token send refused because the group
   gained a member account its member list leaves out, and indexes refused sends. It fences older binaries, which
   would send a retained member-limited send without its list. Older binaries refuse schema 226; downgrade is
-  unsupported. `SqliteAppStorage::refuse_local_submission` and `refused_local_submissions_with_live_rows` are new,
-  and retiring a queued application message refused for a new member settles its local send in the same transaction.
+  unsupported. `SqliteAppStorage::refuse_local_submission`, `invalidate_refused_local_sends_for_group` and
+  `groups_with_refused_live_local_sends` are new, and retiring a queued application message refused for a new member
+  settles its local send in the same transaction.
 - Migration 0219 adds `message_timeline.timeline_order_seq`, rebuilds the canonical order index with it before the
   message id, and drops kind-1202 timeline rows. `TimelineMessageRecord` gains `agent_item` and
   `timeline_order_seq`, and `TimelineUpdateTrigger::AgentActivity`/`AgentOperation` become `AgentItem`.
