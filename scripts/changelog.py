@@ -148,14 +148,29 @@ def release_section(heading: str, parts: list[dict[str, list[str]]]) -> list[str
     return out
 
 
+def shipped_tags(root: Path, version: str) -> tuple[list[str], list[str]]:
+    """The version's track tags, here or on origin, where a tag this checkout lacks may already be."""
+    tags = [f"{prefix}{version}" for prefix in TRACK_TAG_PREFIXES]
+    git = ["git", "-C", str(root)]
+    local = subprocess.run([*git, "tag", "--list", *tags], check=True, capture_output=True, text=True)
+    remote = subprocess.run([*git, "ls-remote", "--tags", "origin", *(f"refs/tags/{tag}" for tag in tags)],
+                            capture_output=True, text=True)
+    if remote.returncode != 0:
+        return [], [f"cannot read origin's release tags, so cannot tell whether {version} shipped: "
+                    f"{remote.stderr.strip()}"]
+    on_origin = {line.split("refs/tags/", 1)[1].removesuffix("^{}") for line in remote.stdout.splitlines()}
+    return sorted(set(local.stdout.split()) | on_origin), []
+
+
 def release(root: Path, version: str, date: str, only: list[Path] | None = None) -> list[str]:
     errors = check(root, none_pending=False)
     if errors:
         return errors
     # A shipped version's notes describe its tagged tree: later fragments belong to the next.
-    tags = [f"{prefix}{version}" for prefix in TRACK_TAG_PREFIXES]
-    if tagged := subprocess.run(["git", "-C", str(root), "tag", "--list", *tags],
-                                check=True, capture_output=True, text=True).stdout.split():
+    tagged, errors = shipped_tags(root, version)
+    if errors:
+        return errors
+    if tagged:
         return [f"{version} is tagged ({', '.join(tagged)}); fold these fragments into the next release"]
     grouped, _ = fragments_by_changelog(root)
     released = re.compile(rf"^## \[?{re.escape(version)}\]?(\s|$)")
@@ -212,10 +227,11 @@ def main() -> int:
     release_cmd.add_argument("--date", default=dt.datetime.now(dt.timezone.utc).date().isoformat())
     args = parser.parse_args()
     only = [(Path.cwd() / path).resolve() for path in args.changelogs] or None
-    missing = [str(path) for path in only or [] if not path.is_file()]
+    changelogs = {path.resolve() for path in repo_files(ROOT) if path.name == "CHANGELOG.md"}
+    unknown = [str(path) for path in only or [] if path not in changelogs]
 
-    if missing:
-        errors = [f"no such changelog: {path}" for path in missing]
+    if unknown:
+        errors = [f"not a CHANGELOG.md in this repository: {path}" for path in unknown]
     elif args.command == "check":
         errors = check(ROOT, args.none_pending, only)
     elif not VERSION.match(args.version):

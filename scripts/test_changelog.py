@@ -14,8 +14,12 @@ OLDER = "## 0.1.0 - 2026-01-01\n\n### Added\n\n- The first release.\n"
 class ChangelogTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name) / "repo"
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        # The tag guard asks origin for tags this checkout may lack.
+        self.origin = Path(self.tmp.name) / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(self.origin)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "remote", "add", "origin", str(self.origin)], check=True)
         self.write("crates/a/CHANGELOG.md", HEADER + OLDER)
 
     def tearDown(self) -> None:
@@ -145,6 +149,19 @@ class ChangelogTests(unittest.TestCase):
         self.assertIn("0.2.0 is tagged (wn-agent-v0.2.0)", "\n".join(release(self.root, "0.2.0", "2026-02-03")))
         self.assertTrue(fragment.exists())
         self.assertEqual((self.root / "crates/a/CHANGELOG.md").read_text(), HEADER + OLDER)
+
+    def test_release_sees_a_tag_only_origin_has(self) -> None:
+        fragment = self.write("crates/a/changelog.d/later.md", "### Fixed\n\n- Later fix.\n")
+        self.tag("v0.2.0")
+        subprocess.run(["git", "-C", str(self.root), "push", "-q", "origin", "v0.2.0"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "tag", "-d", "v0.2.0"], check=True, capture_output=True)
+        self.assertIn("0.2.0 is tagged (v0.2.0)", "\n".join(release(self.root, "0.2.0", "2026-02-03")))
+        self.assertTrue(fragment.exists())
+
+    def test_release_refuses_when_origin_cannot_be_read(self) -> None:
+        self.write("crates/a/changelog.d/x.md", "### Added\n\n- X.\n")
+        subprocess.run(["git", "-C", str(self.root), "remote", "remove", "origin"], check=True)
+        self.assertIn("cannot read origin's release tags", "\n".join(release(self.root, "0.2.0", "2026-02-03")))
 
     def test_named_changelogs_limit_the_pending_check_and_the_fold(self) -> None:
         # A standalone WN Agent release folds and checks only the CLI changelog.
