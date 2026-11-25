@@ -83,7 +83,10 @@ where
         }
         if self.key_package_network_maintenance_due()? {
             let endpoints = self.routing.key_package_endpoints().to_vec();
-            if let Err(error) = self.prepare_key_package_replacement(endpoints, false).await {
+            if let Err(error) = self
+                .prepare_key_package_replacement(endpoints, false, None)
+                .await
+            {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     method = "announce_key_package",
@@ -211,7 +214,7 @@ where
             return Ok(AccountDeviceEffects::default());
         }
         let endpoints = self.routing.key_package_endpoints().to_vec();
-        self.prepare_key_package_replacement(endpoints, false)
+        self.prepare_key_package_replacement(endpoints, false, None)
             .await?;
         self.announce_key_package_holding(held).await
     }
