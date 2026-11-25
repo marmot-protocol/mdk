@@ -261,32 +261,32 @@ fn ended_broken_and_unplaced_generations() {
 
 /// Loss that names its routes breaks only those routes of a batched REQ's
 /// generation: the other routes it carries keep their tail and their live
-/// boundary. Loss that names no routes breaks every one.
+/// boundary. A later loss naming another route adds to what is broken, and
+/// loss that names no routes breaks every one.
 #[test]
 fn loss_on_one_route_of_a_batched_request_breaks_only_that_route() {
     let healthy = TransportReconciliationRoute::Group([1; 32]);
     let lost = TransportReconciliationRoute::Group([2; 32]);
-    let facts = [fact(
-        vec![healthy.clone(), lost.clone()],
-        count(1, Some(50)),
-        false,
-    )];
-    let present = std::collections::HashMap::from([(
-        facts[0].key.clone(),
-        vec![healthy.clone(), lost.clone()],
-    )]);
+    let later = TransportReconciliationRoute::Group([3; 32]);
+    let routes = vec![healthy.clone(), lost.clone(), later.clone()];
+    let facts = [fact(routes.clone(), count(1, Some(50)), false)];
+    let present = std::collections::HashMap::from([(facts[0].key.clone(), routes)]);
     let mut live = LiveCoverage::opened_at(None);
+    let tail = |live: &LiveCoverage, route| {
+        live.tails(&facts, |_, since| Some(since))
+            .owed_until(route, &relay(), 5_000)
+    };
     live.break_reached(&present, Some(std::slice::from_ref(&lost)));
-    let tails = live.tails(&facts, |_, since| Some(since));
-    assert_eq!(tails.owed_until(&healthy, &relay(), 5_000), REQUESTED - 1);
-    assert_eq!(tails.owed_until(&lost, &relay(), 5_000), 5_000);
+    live.break_reached(&present, Some(std::slice::from_ref(&later)));
+    assert_eq!(tail(&live, &healthy), REQUESTED - 1);
+    assert_eq!(tail(&live, &lost), 5_000, "an earlier loss still holds");
+    assert_eq!(tail(&live, &later), 5_000);
     let settling = live.durable(&facts);
     assert_eq!(settling.len(), 1);
     assert_eq!(settling[0].2, vec![&healthy]);
 
     live.break_reached(&present, None);
-    let tails = live.tails(&facts, |_, since| Some(since));
-    assert_eq!(tails.owed_until(&healthy, &relay(), 5_000), 5_000);
+    assert_eq!(tail(&live, &healthy), 5_000);
     assert!(live.durable(&facts).is_empty());
 }
 

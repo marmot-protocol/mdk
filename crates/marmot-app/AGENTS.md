@@ -899,9 +899,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   runner fixture that owes history on a quiet group either owes it through a loss (`uncover_recovery_coverage`) after
   its live REQs went out or opts out with `MarmotApp::with_unvouched_relay_replies_for_test`; tests of the wire
   proof itself never opt out. Read the
-  un-cover mark before each look at the adapter and write through `record_recovery_coverage_since`; a generation that
-  loss imported since the last look may have reached never proves again (`LiveCoverage`), and the log is read again
-  after the look so loss imported during it gives no tail; the adapter is looked at again after the write, and a
+  un-cover mark before each look at the adapter and write through `record_recovery_coverage_since`; a route that
+  loss imported since the last look may have reached never proves again on a generation that carries it, and loss
+  that names no routes reaches every route (`LiveCoverage`); the log is read again after the look so loss imported
+  during it gives no tail; the adapter is looked at again after the write, and a
   generation it no longer reports streaming with the same count gives none either. Past the request an open,
   healthy REQ vouches only provisionally: `LiveTails`, held in memory and never written to the ledger, because nothing
   proves when an open REQ stopped delivering. A tail starts at the count's `live_from`, which for a REQ the relay pool

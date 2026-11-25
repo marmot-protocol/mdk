@@ -133,17 +133,19 @@ impl LiveCoverage {
         present: &HashMap<GenerationKey, Vec<TransportReconciliationRoute>>,
         lost: Option<&[TransportReconciliationRoute]>,
     ) {
+        if lost.is_some_and(<[_]>::is_empty) {
+            return;
+        }
         for (key, routes) in present {
             let Some(lost) = lost else {
                 self.broken.insert(key.clone(), Broken::All);
                 continue;
             };
-            let reached = routes
+            let mut reached = routes
                 .iter()
                 .filter(|route| lost.contains(route))
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if reached.is_empty() {
+                .peekable();
+            if reached.peek().is_none() {
                 continue;
             }
             match self
@@ -152,7 +154,7 @@ impl LiveCoverage {
                 .or_insert_with(|| Broken::Routes(BTreeSet::new()))
             {
                 Broken::All => {}
-                Broken::Routes(routes) => routes.extend(reached),
+                Broken::Routes(routes) => routes.extend(reached.cloned()),
             }
         }
     }
@@ -170,7 +172,7 @@ impl LiveCoverage {
     /// The counts `facts` settle now, each with the range it proves, if any,
     /// and the routes its filter carries that it settles on: from
     /// [`live_boundary_since`] through the second before its `requested_at`.
-    /// Generations loss may have reached prove nothing, and a route whose
+    /// A route loss may have reached proves nothing there, and a route whose
     /// group's live frames a fence holds waits until they are released.
     fn durable<'a>(&self, facts: &'a [LiveCountFact]) -> Vec<Settling<'a>> {
         facts
@@ -1162,8 +1164,9 @@ impl AppClient {
     /// provisional tail
     /// ([`LiveTails`]). Healthy means the cursor seal's guards: input placed,
     /// no loss or spill hand-off pending. Loss may have dropped what a
-    /// generation delivered, so a generation it may have reached proves
-    /// nothing again (see [`LiveCoverage`]). Storage keeps released seconds
+    /// generation delivered on the routes it names (every route when it names
+    /// none), so those routes prove nothing again there (see
+    /// [`LiveCoverage`]). Storage keeps released seconds
     /// out of every live boundary.
     pub(crate) async fn record_native_coverage(&self, app: &SqliteAppStorage) {
         self.record_native_coverage_at(app, unix_now_seconds())
