@@ -1383,6 +1383,44 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
     }
 }
 
+/// A device group move's carried rejections keep no tag signature key
+/// (marmot#520): the destination cannot check a key from another group. One
+/// that keeps a key is refused with nothing staged; one without goes in as
+/// it is.
+#[tokio::test]
+async fn a_carried_rejection_keeps_no_key() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let rejected_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let record = |tag_signature_key| RejectedSlotV1 {
+        reason: RejectedSlotReasonV1::Removed,
+        rejected_at,
+        tag_signature_key,
+    };
+    let carried = |tag_signature_key| SendIntent::ImportDeviceGroupRejections {
+        group_id: gid.clone(),
+        roster_update: update(vec![DeviceRosterOperationV1::SetRejectedSlot(
+            slot(3),
+            record(tag_signature_key),
+        )]),
+    };
+    let epoch = phone.engine.epoch(&gid).unwrap();
+    assert_refused(
+        phone.engine.send(carried(Some(vec![0x44; 32]))).await,
+        "carried rejection keeps a tag signature key",
+    );
+    assert_eq!(phone.engine.epoch(&gid).unwrap(), epoch);
+
+    let commit = send_commit(&mut phone, carried(None), &gid).await;
+    assert_accepted(&mut laptop, &commit, &gid).await;
+    assert_eq!(
+        roster_of(&laptop, &gid).rejected_slots[&slot(3)],
+        record(None)
+    );
+}
+
 /// A lone record that loses branch selection is not made again by the
 /// engine, even when the winning branch left the roster as it was: only its
 /// caller decides whether to send it again (mdk#2761).

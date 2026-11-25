@@ -2193,8 +2193,9 @@ async fn a_removal_a_failed_link_undid_is_recorded_alone() {
             "the record is made once"
         );
         // Four later states list newer keys for the slot, then it is unlisted
-        // again. The key the record carried is no longer among the slot's
-        // four newest, and still the record is not made again.
+        // again. The key the keyless record held as removed is no longer
+        // among the slot's four newest, and still the record is not made
+        // again.
         for key in 2..=5 {
             let entry = DeviceEntryV1 {
                 tag_signature_key: Some(vec![key; 32]),

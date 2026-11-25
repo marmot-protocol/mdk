@@ -323,7 +323,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   failed link's undo, with no tag signature key (marmot#520), only through the runtime's `record_removed_slot`, which
   the engine never queues or re-issues, and only while the decision is under 30 days old, the group is settled and
   quiet, this device remembers a key for the slot, and no roster state this device applied has held a `removed` record
-  for the slot, as the engine's remembered keys record (`held_as_removed`, set on every kept key of a slot whose record
+  for the slot, as the engine's remembered keys record (`held_as_removed`, set on a slot's kept keys when its record
   keeps none): a send that went nowhere or failed is made again, a record a sibling's expiry pass or branch selection
   dropped is not, even within one pass or after a restart. A `removed` record carried into a move's destination keeps
   no tag signature key either: the destination cannot check a key from another group.

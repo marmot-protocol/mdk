@@ -187,6 +187,12 @@ impl<S: StorageProvider> Engine<S> {
                         "carried rejection contains another operation".into(),
                     ));
                 };
+                // This group cannot check a key from another (marmot#520).
+                if record.tag_signature_key.is_some() {
+                    return Err(EngineError::Other(
+                        "carried rejection keeps a tag signature key".into(),
+                    ));
+                }
                 if !roster.devices.contains_key(slot)
                     && !roster.rejected_slots.contains_key(slot)
                     && !(record.reason == RejectedSlotReasonV1::Removed

@@ -162,8 +162,9 @@ async fn a_removed_record_dropped_within_one_pass_is_recorded() {
 
 /// A `removed` record that keeps no key (marmot#520) holds the keys a
 /// device keeps for its slot as removed, on the device whose own Commit made
-/// it and on one that applies it and its drop within one pass. Another
-/// slot's key is not held.
+/// it and on one that applies it and its drop within one pass. A key the
+/// slot is listed with after the drop, and another slot's key, are not
+/// held.
 #[tokio::test]
 async fn a_removed_record_without_a_key_holds_the_slots_keys() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
@@ -187,7 +188,10 @@ async fn a_removed_record_without_a_key_holds_the_slots_keys() {
     );
     let second = roster_update(
         &gid,
-        vec![DeviceRosterOperationV1::RemoveRejectedSlot(slot(4))],
+        vec![
+            DeviceRosterOperationV1::RemoveRejectedSlot(slot(4)),
+            set_key_op(4, "Tablet", 0xe4),
+        ],
     );
     let first = send_commit(&mut phone, first, &gid).await;
     let second = send_commit(&mut phone, second, &gid).await;
@@ -206,6 +210,7 @@ async fn a_removed_record_without_a_key_holds_the_slots_keys() {
         let keys = recorded(device, &gid);
         assert!(keys.contains(&removed_key(4, 0xd4)), "{keys:?}");
         assert!(!keys.contains(&tag_key(4, 0xd4)), "{keys:?}");
+        assert!(keys.contains(&tag_key(4, 0xe4)), "{keys:?}");
         assert!(keys.contains(&tag_key(5, 0xd5)), "{keys:?}");
     }
 }

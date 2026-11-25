@@ -354,7 +354,7 @@ impl AppClient {
     /// link, which comes before the decision. Only until a roster state this
     /// device applied has held a `removed` record for the slot, as its
     /// remembered keys say (`held_as_removed`, which a record with no key
-    /// sets on every key kept for the slot): a record a sibling's expiry
+    /// sets on the keys kept for the slot): a record a sibling's expiry
     /// pass or branch selection dropped is not made again, even when one pass
     /// applied it and its drop, or after a restart, while a send that went
     /// nowhere, or whose Commit failed or was rolled back, is made again.

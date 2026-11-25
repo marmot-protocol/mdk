@@ -7,9 +7,9 @@
 //! founding create and a Welcome join record the roster they start from. A
 //! record outlives the branch that listed it, since a device whose key a
 //! dropped branch listed may have tagged leaves in chats under it. A
-//! `removed` record that keeps no key (marmot#520) holds every key this
-//! device keeps for its slot as removed instead, so the slot is still known
-//! to have held its record.
+//! `removed` record that keeps no key (marmot#520) holds the keys this
+//! device keeps for its slot as removed instead, unless one already is, so
+//! the slot is still known to have held its record.
 //!
 //! The engine only writes them. No convergence input, snapshot or replay
 //! fingerprint reads them, so group state and branch selection are what they
@@ -78,9 +78,9 @@ pub(crate) fn roster_tag_keys(group: &MlsGroup) -> BTreeSet<RosterTagSighting> {
 /// applied, as seen in `group_id` at `now`, then drop what is past its
 /// bounds. A key listed again later counts from its last listing, so a
 /// slot's newest key is the one a roster state listed last, even within one
-/// pass. A slot recorded as `removed` with no key then has every key this
-/// device keeps for it held as removed, those the same pass recorded
-/// included. A backend without the store records none.
+/// pass. A slot recorded as `removed` with no key has the keys this device
+/// keeps for it by then held as removed, unless one already is; a key first
+/// listed after that is not. A backend without the store records none.
 pub(crate) fn record_tag_keys<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -93,33 +93,28 @@ pub(crate) fn record_tag_keys<S: StorageProvider>(
     if sightings.is_empty() {
         return Ok(());
     }
-    let mut listed = BTreeSet::new();
-    let mut keys = sightings
-        .iter()
-        .rev()
-        .filter_map(|sighting| match sighting {
-            RosterTagSighting::Key(key) => Some(key),
-            RosterTagSighting::RemovedWithoutKey(_) => None,
-        })
-        .filter(|key| listed.insert(*key))
-        .cloned()
-        .collect::<Vec<_>>();
-    keys.reverse();
-    store.record_roster_tag_keys(group_id, &keys, now.0)?;
-    let held = sightings
-        .iter()
-        .filter_map(|sighting| match sighting {
-            RosterTagSighting::RemovedWithoutKey(slot) => Some(slot),
-            RosterTagSighting::Key(_) => None,
-        })
-        .collect::<BTreeSet<_>>();
-    for slot in held {
-        store.hold_roster_tag_keys_as_removed(group_id, slot)?;
+    let since = now.0.saturating_sub(ROSTER_TAG_KEY_RETENTION_SECS);
+    for run in sightings
+        .split_inclusive(|sighting| matches!(sighting, RosterTagSighting::RemovedWithoutKey(_)))
+    {
+        let mut listed = BTreeSet::new();
+        let mut keys = run
+            .iter()
+            .rev()
+            .filter_map(|sighting| match sighting {
+                RosterTagSighting::Key(key) => Some(key),
+                RosterTagSighting::RemovedWithoutKey(_) => None,
+            })
+            .filter(|key| listed.insert(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.reverse();
+        store.record_roster_tag_keys(group_id, &keys, now.0)?;
+        if let Some(RosterTagSighting::RemovedWithoutKey(slot)) = run.last() {
+            store.hold_roster_tag_keys_as_removed(group_id, slot, since)?;
+        }
     }
-    store.prune_roster_tag_keys(
-        now.0.saturating_sub(ROSTER_TAG_KEY_RETENTION_SECS),
-        ROSTER_TAG_KEYS_PER_SLOT,
-    )
+    store.prune_roster_tag_keys(since, ROSTER_TAG_KEYS_PER_SLOT)
 }
 
 /// Record the tag signature keys `group`'s roster lists now.

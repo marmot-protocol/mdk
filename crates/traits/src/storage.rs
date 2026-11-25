@@ -1324,14 +1324,17 @@ pub trait RosterTagKeyStorage {
         since: u64,
         seen_at: u64,
     ) -> StorageResult<()>;
-    /// Hold every key of `group_id`'s `slot` as removed, keeping their
-    /// sighting times and order: a roster state recorded the slot as
-    /// `removed` with no key (marmot#520), so the keys this device keeps for
-    /// it say the record was held.
+    /// Hold every key of `group_id`'s `slot` last seen at or after `since`
+    /// as removed, keeping their sighting times and order, unless one of
+    /// them already is: a roster state recorded the slot as `removed` with
+    /// no key (marmot#520), so the keys this device keeps for it say the
+    /// record was held. A slot that already holds a key keeps it as its one
+    /// newest held key, the one a prune past `per_slot` keeps.
     fn hold_roster_tag_keys_as_removed(
         &self,
         group_id: &GroupId,
         slot: &[u8; 32],
+        since: u64,
     ) -> StorageResult<()>;
     /// What `group_id`'s rosters listed, last seen at or after `since`: by
     /// slot, and within a slot the most recently seen first.
