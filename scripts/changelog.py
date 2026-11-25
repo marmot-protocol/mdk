@@ -54,10 +54,14 @@ def repo_files(root: Path) -> list[Path]:
 
 def parse_fragment(path: Path) -> tuple[dict[str, list[str]], list[str]]:
     """Return the fragment's entries by section, and its problems."""
+    return parse_sections(path.read_text(encoding="utf-8").splitlines())
+
+
+def parse_sections(text: list[str]) -> tuple[dict[str, list[str]], list[str]]:
     sections: dict[str, list[str]] = {}
     errors: list[str] = []
     current: str | None = None
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for number, line in enumerate(text, 1):
         if line.startswith("### "):
             current = line[4:].strip()
             if current not in SECTIONS:
@@ -121,10 +125,10 @@ def check(root: Path, none_pending: bool) -> list[str]:
     return errors
 
 
-def release_section(heading: str, fragments: list[Path]) -> list[str]:
+def release_section(heading: str, parts: list[dict[str, list[str]]]) -> list[str]:
     merged: dict[str, list[str]] = {}
-    for path in fragments:
-        for name, lines in parse_fragment(path)[0].items():
+    for sections in parts:
+        for name, lines in sections.items():
             merged.setdefault(name, []).extend(lines)
     out = [heading, ""]
     for name in SECTIONS:
@@ -139,29 +143,46 @@ def release(root: Path, version: str, date: str) -> list[str]:
         return errors
     grouped, _ = fragments_by_changelog(root)
     released = re.compile(rf"^## \[?{re.escape(version)}\]?(\s|$)")
-    texts = {changelog: changelog.read_text(encoding="utf-8").splitlines() for changelog in grouped}
-    errors = [f"{changelog.relative_to(root)}: already has a {version} heading"
-              for changelog, lines in texts.items() if any(released.match(line) for line in lines)]
+    tagged = subprocess.run(["git", "-C", str(root), "tag", "--list", f"v{version}"],
+                            check=True, capture_output=True, text=True).stdout.strip()
+    folded: dict[Path, list[str]] = {}
+    for changelog, fragments in sorted(grouped.items()):
+        rel = changelog.relative_to(root)
+        lines = changelog.read_text(encoding="utf-8").splitlines()
+        parts = [parse_fragment(path)[0] for path in fragments]
+        headings = [i for i, line in enumerate(lines) if line.startswith("## ")] + [len(lines)] * 2
+        at, end = headings[0], headings[1]
+        if at < len(lines) and released.match(lines[at]):
+            # A fragment that merged after the release PR joins that version until it is tagged.
+            existing, problems = parse_sections(lines[at + 1:end])
+            if tagged:
+                errors.append(f"{rel}: v{version} is tagged; a fragment added since belongs to the next release")
+            elif problems:
+                errors += [f"{rel} {version} section: {problem}" for problem in problems]
+            else:
+                lines[at:end] = release_section(lines[at], [existing, *parts])
+        elif any(released.match(line) for line in lines):
+            errors.append(f"{rel}: {version} is not the newest version heading")
+        else:
+            bracketed = any(line.startswith("## [") for line in lines)
+            heading = f"## [{version}] - {date}" if bracketed else f"## {version} - {date}"
+            lines[at:at] = release_section(heading, parts)
+            for i, line in enumerate(lines):
+                if link := UNRELEASED_LINK.match(line):
+                    compare, prefix = link["compare"], link["prefix"]
+                    lines[i:i + 1] = [
+                        f"[Unreleased]: {compare}{prefix}{version}...HEAD",
+                        f"[{version}]: {compare}{prefix}{link['previous']}...{prefix}{version}",
+                    ]
+                    break
+        folded[changelog] = lines
     if errors:
         return errors
-    for changelog, fragments in sorted(grouped.items()):
-        lines = texts[changelog]
-        bracketed = any(line.startswith("## [") for line in lines)
-        heading = f"## [{version}] - {date}" if bracketed else f"## {version} - {date}"
-        at = next((i for i, line in enumerate(lines) if line.startswith("## ")), len(lines))
-        lines[at:at] = release_section(heading, fragments)
-        for i, line in enumerate(lines):
-            if link := UNRELEASED_LINK.match(line):
-                compare, prefix = link["compare"], link["prefix"]
-                lines[i:i + 1] = [
-                    f"[Unreleased]: {compare}{prefix}{version}...HEAD",
-                    f"[{version}]: {compare}{prefix}{link['previous']}...{prefix}{version}",
-                ]
-                break
+    for changelog, lines in folded.items():
         changelog.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        for path in fragments:
+        for path in grouped[changelog]:
             path.unlink()
-        print(f"{changelog.relative_to(root)}: {version} from {len(fragments)} fragment(s)")
+        print(f"{changelog.relative_to(root)}: {version} from {len(grouped[changelog])} fragment(s)")
     return []
 
 
