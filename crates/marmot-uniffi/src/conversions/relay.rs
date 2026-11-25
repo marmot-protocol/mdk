@@ -277,9 +277,289 @@ impl From<RelayPlaneHealth> for RelayHealthFfi {
     }
 }
 
+/// Whether MDK holds one of the account's relay lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayListPresenceFfi {
+    /// No copy is held: not loaded yet, or none was published. MDK cannot
+    /// tell which, so it raises no warning for it.
+    Unknown,
+    /// A published list is held, possibly an empty one.
+    Published,
+}
+
+/// A list that names a relay. Later versions may add roles: keep a default
+/// branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayRoleFfi {
+    /// The inbox list (kind 10050), where senders send invitations.
+    Inbox,
+    /// A NIP-65 (kind 10002) write relay, marked write or unmarked.
+    Write,
+    /// A NIP-65 read relay, marked read or unmarked.
+    Read,
+}
+
+/// What MDK knows of a relay. Only `Unchecked` and `NotAllowed` are produced
+/// yet; `Healthy`, `Suspected` and `Failing` are reserved for relay checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayHealthStateFfi {
+    /// Allowed, and not checked.
+    Unchecked,
+    /// Not produced yet.
+    Healthy,
+    /// Not produced yet.
+    Suspected,
+    /// Not produced yet.
+    Failing,
+    /// The relay policy refuses it: this device never dials it.
+    NotAllowed,
+}
+
+/// Why a relay is not allowed. Later versions may add faults: keep a default
+/// branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayHealthFaultFfi {
+    /// On the retired-relay list.
+    Retired,
+    /// Not a relay URL.
+    Invalid,
+    /// A host this device refuses to dial: plaintext, a private address,
+    /// localhost or onion.
+    Unsafe,
+}
+
+/// The problem a relay warning reports. Each needs a published inbox list.
+/// Later versions may add kinds: keep a default branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayWarningKindFfi {
+    /// Critical: the published inbox list names no relay, so an invitation
+    /// sent through it has nowhere to go. A sender on this same install
+    /// (another local account, or this account linking a new device) resolves
+    /// the route through the same fallback to the defaults and may still get
+    /// through. `relays` is empty.
+    InboxListEmpty,
+    /// Critical: the published inbox list names relays but the policy allows
+    /// none, so an invitation sent through the list cannot reach this device.
+    /// A sender on this same install (another local account, or this account
+    /// linking a new device) resolves the route through the same fallback to
+    /// the defaults and may still get through. `relays` are the refused
+    /// entries.
+    NoAllowedInboxRelay,
+    /// Warning: some entries are refused beside at least one allowed; an
+    /// invitation sent only to the refused ones does not reach this device.
+    /// `relays` are the refused entries.
+    InboxRelaysNotAllowed,
+    /// Notice: exactly one entry is allowed, so an invitation sent through the
+    /// list reaches this device only there. `relays` is that relay.
+    SingleInboxRelay,
+}
+
+/// How loudly to present a relay warning, from the least severe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayWarningSeverityFfi {
+    Notice,
+    Warning,
+    Critical,
+}
+
+/// A change to the account's relay lists that would fix a warning; the user
+/// makes it. When a warning lists both actions, make them one list edit: removing every
+/// entry first would save an empty inbox list, which `set_account_inbox_relays`
+/// rejects.
+/// Later versions may add actions: keep a default branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayRepairActionFfi {
+    /// Add an allowed relay to the inbox list.
+    AddInboxRelay,
+    /// Remove the warning's relays from the inbox list.
+    RemoveInboxRelay,
+}
+
+/// One relay the account's inbox and NIP-65 lists name.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RelayHealthRowFfi {
+    /// Canonical URL, matching `account_relay_liveness` rows; an entry that
+    /// does not parse appears as published.
+    pub url: String,
+    /// In the order Inbox, Write, Read.
+    pub roles: Vec<RelayRoleFfi>,
+    pub state: RelayHealthStateFfi,
+    /// Set exactly when `state` is `NotAllowed`.
+    pub fault: Option<RelayHealthFaultFfi>,
+    /// The connection state `account_relay_liveness` reports.
+    pub liveness: RelayStatusFfi,
+}
+
+redact!(RelayHealthRowFfi);
+
+/// A problem with the account's relay setup.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccountRelayWarningFfi {
+    pub kind: RelayWarningKindFfi,
+    pub severity: RelayWarningSeverityFfi,
+    /// The relays it is about, as row URLs.
+    pub relays: Vec<String>,
+    /// What would fix it, in order.
+    pub actions: Vec<RelayRepairActionFfi>,
+}
+
+redact!(AccountRelayWarningFfi);
+
+/// The account's relay health from its held lists and the relay policy.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccountRelayHealthFfi {
+    /// Inbox warnings need a published inbox list; `Unknown` raises none.
+    pub inbox_list: RelayListPresenceFfi,
+    /// One per relay, ordered by URL.
+    pub rows: Vec<RelayHealthRowFfi>,
+    /// Ordered from the most severe.
+    pub warnings: Vec<AccountRelayWarningFfi>,
+    /// `None` without warnings.
+    pub highest_severity: Option<RelayWarningSeverityFfi>,
+    /// The inbox route MDK builds from the held lists is the configured
+    /// defaults, because no inbox relay it holds is allowed. Also true while
+    /// `inbox_list` is `Unknown`, so on its own it says nothing about
+    /// invitations; the warnings do.
+    pub falls_back_to_defaults: bool,
+}
+
+redact!(AccountRelayHealthFfi);
+
+impl From<marmot_app::AccountRelayHealth> for AccountRelayHealthFfi {
+    fn from(value: marmot_app::AccountRelayHealth) -> Self {
+        use marmot_app::{
+            RelayHealthFault as Fault, RelayHealthState as State, RelayListPresence as Presence,
+            RelayRepairAction as Action, RelayRole as Role, RelayWarningKind as Kind,
+            RelayWarningSeverity as Severity,
+        };
+        let severity = |severity| match severity {
+            Severity::Notice => RelayWarningSeverityFfi::Notice,
+            Severity::Warning => RelayWarningSeverityFfi::Warning,
+            Severity::Critical => RelayWarningSeverityFfi::Critical,
+        };
+        Self {
+            inbox_list: match value.inbox_list {
+                Presence::Unknown => RelayListPresenceFfi::Unknown,
+                Presence::Published => RelayListPresenceFfi::Published,
+            },
+            rows: value
+                .rows
+                .into_iter()
+                .map(|row| RelayHealthRowFfi {
+                    url: row.url,
+                    roles: row
+                        .roles
+                        .into_iter()
+                        .map(|role| match role {
+                            Role::Inbox => RelayRoleFfi::Inbox,
+                            Role::Write => RelayRoleFfi::Write,
+                            Role::Read => RelayRoleFfi::Read,
+                        })
+                        .collect(),
+                    state: match row.state {
+                        State::Unchecked => RelayHealthStateFfi::Unchecked,
+                        State::Healthy => RelayHealthStateFfi::Healthy,
+                        State::Suspected => RelayHealthStateFfi::Suspected,
+                        State::Failing => RelayHealthStateFfi::Failing,
+                        State::NotAllowed => RelayHealthStateFfi::NotAllowed,
+                    },
+                    fault: row.fault.map(|fault| match fault {
+                        Fault::Retired => RelayHealthFaultFfi::Retired,
+                        Fault::Invalid => RelayHealthFaultFfi::Invalid,
+                        Fault::Unsafe => RelayHealthFaultFfi::Unsafe,
+                    }),
+                    liveness: row.liveness.into(),
+                })
+                .collect(),
+            warnings: value
+                .warnings
+                .into_iter()
+                .map(|warning| AccountRelayWarningFfi {
+                    kind: match warning.kind {
+                        Kind::InboxListEmpty => RelayWarningKindFfi::InboxListEmpty,
+                        Kind::NoAllowedInboxRelay => RelayWarningKindFfi::NoAllowedInboxRelay,
+                        Kind::InboxRelaysNotAllowed => RelayWarningKindFfi::InboxRelaysNotAllowed,
+                        Kind::SingleInboxRelay => RelayWarningKindFfi::SingleInboxRelay,
+                    },
+                    severity: severity(warning.severity),
+                    relays: warning.relays,
+                    actions: warning
+                        .actions
+                        .into_iter()
+                        .map(|action| match action {
+                            Action::AddInboxRelay => RelayRepairActionFfi::AddInboxRelay,
+                            Action::RemoveInboxRelay => RelayRepairActionFfi::RemoveInboxRelay,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            highest_severity: value.highest_severity.map(severity),
+            falls_back_to_defaults: value.falls_back_to_defaults,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every field of a relay health answer reaches the host as MDK read it,
+    /// and its `Debug` shows no relay URL.
+    #[test]
+    fn relay_health_converts_every_field_and_debug_hides_urls() {
+        use marmot_app::{
+            AccountRelayHealth, AccountRelayWarning, RelayHealthFault, RelayHealthRow,
+            RelayHealthState, RelayListPresence, RelayLivenessStatus, RelayRepairAction, RelayRole,
+            RelayWarningKind, RelayWarningSeverity,
+        };
+        let health = AccountRelayHealthFfi::from(AccountRelayHealth {
+            inbox_list: RelayListPresence::Published,
+            rows: vec![RelayHealthRow {
+                url: "wss://refused.example".into(),
+                roles: vec![RelayRole::Inbox, RelayRole::Read],
+                state: RelayHealthState::NotAllowed,
+                fault: Some(RelayHealthFault::Unsafe),
+                liveness: RelayLivenessStatus::Offline,
+            }],
+            warnings: vec![AccountRelayWarning {
+                kind: RelayWarningKind::NoAllowedInboxRelay,
+                severity: RelayWarningSeverity::Critical,
+                relays: vec!["wss://refused.example".into()],
+                actions: vec![
+                    RelayRepairAction::RemoveInboxRelay,
+                    RelayRepairAction::AddInboxRelay,
+                ],
+            }],
+            highest_severity: Some(RelayWarningSeverity::Critical),
+            falls_back_to_defaults: true,
+        });
+        assert_eq!(
+            health,
+            AccountRelayHealthFfi {
+                inbox_list: RelayListPresenceFfi::Published,
+                rows: vec![RelayHealthRowFfi {
+                    url: "wss://refused.example".into(),
+                    roles: vec![RelayRoleFfi::Inbox, RelayRoleFfi::Read],
+                    state: RelayHealthStateFfi::NotAllowed,
+                    fault: Some(RelayHealthFaultFfi::Unsafe),
+                    liveness: RelayStatusFfi::Offline,
+                }],
+                warnings: vec![AccountRelayWarningFfi {
+                    kind: RelayWarningKindFfi::NoAllowedInboxRelay,
+                    severity: RelayWarningSeverityFfi::Critical,
+                    relays: vec!["wss://refused.example".into()],
+                    actions: vec![
+                        RelayRepairActionFfi::RemoveInboxRelay,
+                        RelayRepairActionFfi::AddInboxRelay,
+                    ],
+                }],
+                highest_severity: Some(RelayWarningSeverityFfi::Critical),
+                falls_back_to_defaults: true,
+            }
+        );
+        let rendered = format!("{health:?} {:?} {:?}", health.rows, health.warnings);
+        assert!(!rendered.contains("refused.example"), "{rendered}");
+    }
 
     #[test]
     fn relay_telemetry_config_debug_redacts_bearer_token() {

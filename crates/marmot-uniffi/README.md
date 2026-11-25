@@ -19,7 +19,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [NIP-46 accounts](#nip-46-accounts),
   [identity references and profiles](#identity-references-and-profiles),
   [KeyPackage inventory](#keypackage-inventory), [KeyPackage selection](#keypackage-selection),
-  [invitation lookup outcomes](#invitation-lookup-outcomes),
+  [invitation lookup outcomes](#invitation-lookup-outcomes), [account relay health](#account-relay-health),
   [direct-follow availability](#direct-follow-availability),
   [public Nostr event verification](#public-nostr-event-verification),
   [public event previews](#public-event-previews)
@@ -1033,6 +1033,70 @@ Direct-chat creation remains atomic. A peer that cannot resolve produces an erro
   `fetch_latest_key_package_for_account_id` and relay-list lookups report the same
   outcome.
 - `MissingMemberInboxRoute { account }`: the recipient has no usable inbox relay.
+
+## Account relay health
+
+`account_relay_health(account_ref)` says what MDK already holds about invitations sent through the account's published
+inbox list: the account's cached inbox (kind 10050) and NIP-65 lists and the relay policy that
+`classify_relay_endpoints` exposes. It never dials, waits on a relay or stores anything. A sender on another install
+sends an invitation (Welcome) to the relays of the published inbox list; an MDK sender finds no route when that list is
+empty or the policy allows none of it, and never falls back to defaults. This device's inbox route is the entries of the
+list the policy allows, or the configured defaults when it allows none. A sender on this same install (another local
+account, or this account linking a new device) resolves the route through the same fallback to the defaults and may
+still get through. The answer describes the route MDK builds from the held lists: a running device takes a changed route
+at its next routing refresh, so a warning that clears says the lists are fixed, not yet that this device listens on
+them. It says nothing about whether an allowed relay is up or accepts invitations; `liveness` is only the connection
+state.
+
+`AccountRelayHealthFfi` holds:
+
+- `inbox_list`: `Published` when MDK holds an inbox list, possibly an empty one, or `Unknown` when it holds none.
+  `Unknown` covers both "not loaded yet" (a fresh start, an empty cache) and "never published": MDK keeps no record that
+  a read found none, so it cannot tell them apart, and raises no warning for it.
+- `rows`: one `RelayHealthRowFfi` per relay the inbox and NIP-65 lists name, ordered by `url`. `url` is the canonical
+  URL that `account_relay_liveness` rows use; an entry that does not parse appears as published. `roles` lists `Inbox`,
+  `Write` (NIP-65 write or unmarked) and `Read` (NIP-65 read or unmarked), in that order. `state` is `Unchecked`
+  (allowed, not checked) or `NotAllowed` (the policy refuses it; this device never dials it), and `fault` says why for
+  `NotAllowed` only: `Retired`, `Invalid` or `Unsafe` (plaintext, a private address, localhost or onion). `liveness` is
+  the row's `account_relay_liveness` status. The states `Healthy`, `Suspected` and `Failing` are defined but not
+  produced yet; they are reserved for relay checks.
+- `warnings`, ordered from the most severe, and `highest_severity`, the first one's (`None` without warnings).
+- `falls_back_to_defaults`: no inbox relay MDK holds is allowed, so the inbox route MDK builds is the configured
+  defaults. It is also true while `inbox_list` is `Unknown`, when the real list may name those same relays, so on its
+  own it says nothing about invitations; the warnings do.
+
+Each warning has a `kind`, a `severity`, the `relays` it is about (row URLs) and the `actions` that would fix it. Every
+kind needs `inbox_list == Published`; "allowed" means the policy allows it, counting each canonical URL once:
+
+| Kind | Severity | Condition | `relays` | `actions` |
+| --- | --- | --- | --- | --- |
+| `InboxListEmpty` | `Critical` | The published inbox list names no relay: an invitation sent through it has nowhere to go | none | `AddInboxRelay` |
+| `NoAllowedInboxRelay` | `Critical` | It names relays and none is allowed: this device never listens on them, so an invitation sent through the list cannot reach it | the entries not allowed | `RemoveInboxRelay`, `AddInboxRelay` |
+| `InboxRelaysNotAllowed` | `Warning` | Some entries are not allowed, beside at least one that is: an invitation sent only to those does not reach this device | the entries not allowed | `RemoveInboxRelay` |
+| `SingleInboxRelay` | `Notice` | Exactly one entry is allowed: an invitation sent through the list reaches this device only there | that relay | `AddInboxRelay` |
+
+A list with one allowed entry and some refused ones raises both `InboxRelaysNotAllowed` and `SingleInboxRelay`. The two
+`Critical` kinds are about senders that use the published list; a sender on this same install (another local account, or
+this account linking a new device) resolves the route through the same fallback to the defaults and may still get
+through. Severity is for presentation: for example a blocking banner for `Critical`, a dismissible one for `Warning` and
+a settings badge for `Notice`. Actions name what the user would change; MDK never edits, removes or republishes a list
+on its own. For `NoAllowedInboxRelay`, make `RemoveInboxRelay` and `AddInboxRelay` one `set_account_inbox_relays` call:
+removing every entry first would save an empty inbox list, which that call rejects. NIP-65 write relays get rows but no
+warning: when none is allowed, this device publishes its KeyPackages to its defaults, and an MDK sender that allows none
+reads them from its own defaults, so what MDK holds cannot say that invitations will not arrive.
+
+`RelayHealthChanged { account_id_hex, account_label }` says to read the query again. It fires when the answer, apart
+from each row's `liveness`, differs from the one last announced, which only a change to the account's held relay lists
+causes, and once each time the account's worker starts. A relay connecting or disconnecting never fires it;
+`subscribe_relay_liveness` reports those. Only a running account worker sends it: a list that changes while none runs
+(an external-signer account whose signer is not registered, say) announces nothing, so read the query when the account
+starts and when the relay screen opens. It carries no relays, and a missed, late or repeated event is harmless because
+the query is the source of truth.
+
+Later versions add kinds, faults, actions and states. Keep a default branch in every `match`/`when`/`switch` over
+`RelayWarningKindFfi`, `RelayHealthFaultFfi`, `RelayRepairActionFfi`, `RelayRoleFfi` and `RelayHealthStateFfi`. Rows
+and warnings name the account's own relays: show them to the account's owner, and keep them out of logs and
+diagnostics. Their `Debug` output omits URLs.
 
 ## Public Nostr event verification
 

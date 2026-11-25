@@ -466,6 +466,20 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
+    /// The account's relay health changed; re-read
+    /// `marmot_account_relay_health`. Fires when its answer, apart from each
+    /// row's liveness, differs from the one last announced, which only a
+    /// change to the account's held relay lists causes, and once each time
+    /// the account's worker starts; never for a relay connecting or
+    /// disconnecting. Carries no relays.
+    /// Only a running account worker sends it: a list that changes while
+    /// none runs (an external-signer account whose signer is not registered,
+    /// say) announces nothing, so read the query when the account starts and
+    /// when the relay screen opens.
+    RelayHealthChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
@@ -592,6 +606,13 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 account_id_hex: owned_c_string(account_id_hex),
                 account_label: owned_c_string(account_label),
             },
+            F::RelayHealthChanged {
+                account_id_hex,
+                account_label,
+            } => Self::RelayHealthChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
             F::UnrecognizedSignInsChanged {
                 account_id_hex,
                 account_label,
@@ -711,6 +732,10 @@ impl CFree for MarmotEvent {
                     account_label,
                 }
                 | Self::DeviceUnlinked {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::RelayHealthChanged {
                     account_id_hex,
                     account_label,
                 } => {
@@ -873,6 +898,35 @@ mod tests {
             assert_eq!(
                 std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
                 "dave"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn relay_health_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(MarmotEventFfi::RelayHealthChanged {
+            account_id_hex: "af".repeat(32),
+            account_label: "erin".to_owned(),
+        }));
+        unsafe {
+            let MarmotEvent::RelayHealthChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "af".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "erin"
             );
             marmot_event_free(event);
         }

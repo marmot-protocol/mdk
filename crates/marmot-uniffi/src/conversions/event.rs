@@ -146,6 +146,20 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's relay health changed: re-read `account_relay_health`.
+    /// Fires when its answer, apart from each row's liveness, differs from
+    /// the one last announced, which only a change to the account's held
+    /// relay lists causes, and once each time the account's worker starts;
+    /// never for a relay connecting or disconnecting (see
+    /// `subscribe_relay_liveness`). Carries no relays.
+    /// Only a running account worker sends it: a list that changes while
+    /// none runs (an external-signer account whose signer is not registered,
+    /// say) announces nothing, so read the query when the account starts and
+    /// when the relay screen opens.
+    RelayHealthChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// The account's unrecognized sign-ins may have changed: re-read
     /// `unrecognized_sign_ins`. Also fires once each time the account's
     /// worker opens or reconnects. Carries no slots, and may fire with no
@@ -605,6 +619,13 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_id_hex,
                 account_label,
             } => Self::KeyPackageRefreshOverdueChanged {
+                account_id_hex,
+                account_label,
+            },
+            MarmotAppEvent::RelayHealthChanged {
+                account_id_hex,
+                account_label,
+            } => Self::RelayHealthChanged {
                 account_id_hex,
                 account_label,
             },
@@ -1196,6 +1217,7 @@ mod tests {
         notice!(RecoveryStatusChanged);
         notice!(LinkedDevicesChanged);
         notice!(KeyPackageRefreshOverdueChanged);
+        notice!(RelayHealthChanged);
         notice!(UnrecognizedSignInsChanged);
         notice!(CompromiseWarningChanged);
         notice!(DeviceLinkChanged);
