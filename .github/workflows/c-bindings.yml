@@ -146,6 +146,33 @@ jobs:
 
           cp -R crates/marmot-c/output/. "$stage/"
           cp crates/marmot-c/README.md "$stage/"
+
+          # Keep links between bundle files relative. Link everything else to the source revision.
+          python3 - "$stage" <<'PY'
+          import os
+          import posixpath
+          import re
+          import sys
+          from pathlib import Path
+
+          stage = Path(sys.argv[1])
+          repo = f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}'
+          sha = os.environ["SOURCE_SHA"]
+          for reference in sorted((stage / "references").glob("*/API-REFERENCE.md")):
+              crate = reference.parent.name
+
+              def rebase(match):
+                  path, anchor = match[1], match[2] or ""
+                  if path.startswith("/") or (reference.parent / path).is_file():
+                      return match[0]
+                  source = posixpath.normpath(f"crates/{crate}/{path}")
+                  kind = "tree" if path.endswith("/") else "blob"
+                  return f"]({repo}/{kind}/{sha}/{source}{anchor})"
+
+              text = reference.read_text()
+              reference.write_text(re.sub(r"\]\(([^)#:\s]+)(#[^)\s]*)?\)", rebase, text))
+          PY
+
           cat > "$stage/manifest.json" <<EOF
           {
             "artifact": "marmot-c",
