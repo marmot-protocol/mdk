@@ -167,7 +167,33 @@ async fn a_cached_relay_list_outside_the_clock_window_cannot_block_an_eligible_l
         1_000
     );
 
+    let follow = Keys::generate().public_key().to_hex();
+    directory
+        .update_directory_entry(&author, |entry| {
+            entry.follows.push(follow);
+            true
+        })
+        .unwrap();
+    clock.store(1_000, Ordering::SeqCst);
+    assert!(
+        directory
+            .cached_relay_list_status(&author)
+            .unwrap()
+            .complete
+    );
+
+    clock.store(100, Ordering::SeqCst);
     ingest(10002, "r", "wss://current.example", 120);
+    assert_eq!(
+        cache
+            .entry(&author)
+            .unwrap()
+            .unwrap()
+            .relay_lists
+            .inbox
+            .created_at,
+        1_000
+    );
     ingest(10050, "relay", "wss://current.example", 121);
     ingest(10002, "r", "wss://older.example", 119);
     ingest(10050, "relay", "wss://same-second.example", 121);

@@ -312,23 +312,11 @@ impl<R: DirectoryResources> Directory<R> {
                 hydrate_directory_record(user_directory_record_from_public(record)?, local_accounts)
             })
             .transpose()?;
-        Ok(self.select_current_directory_entry(cached_entry, shared_entry))
-    }
-
-    fn select_current_directory_entry(
-        &self,
-        cached: Option<UserDirectoryRecord>,
-        shared: Option<UserDirectoryRecord>,
-    ) -> Option<UserDirectoryRecord> {
-        // A clock correction can move an already cached declaration outside the
-        // window. Filter each tier before comparing timestamps so the eligible
-        // copy still wins, including when ingesting a current repair.
-        let max_created_at = self.directory_freshness().max_created_at;
-        let eligible_lists = |mut entry: UserDirectoryRecord| {
-            entry.relay_lists.discard_future_lists(max_created_at);
-            entry
-        };
-        select_newer_directory_entry(cached.map(eligible_lists), shared.map(eligible_lists))
+        Ok(select_current_directory_entry(
+            cached_entry,
+            shared_entry,
+            self.directory_freshness().max_created_at,
+        ))
     }
 
     pub fn remember_directory_relay_lists(
@@ -650,7 +638,24 @@ impl<R: DirectoryResources> Directory<R> {
                     )
                 })
                 .transpose()?;
-            let current = self.select_current_directory_entry(cached_entry, shared_entry);
+            let max_created_at = self.directory_freshness().max_created_at;
+            let relay_lists = [&cached_entry, &shared_entry]
+                .into_iter()
+                .flatten()
+                .map(|entry| &entry.relay_lists);
+            let future_nip65 = relay_lists
+                .clone()
+                .map(|status| &status.nip65)
+                .filter(|list| list.created_at > max_created_at)
+                .max_by_key(|list| list.created_at)
+                .cloned();
+            let future_inbox = relay_lists
+                .map(|status| &status.inbox)
+                .filter(|list| list.created_at > max_created_at)
+                .max_by_key(|list| list.created_at)
+                .cloned();
+            let current =
+                select_current_directory_entry(cached_entry, shared_entry, max_created_at);
             if current.is_none() && !create_missing {
                 return Ok(());
             }
@@ -662,8 +667,27 @@ impl<R: DirectoryResources> Directory<R> {
             // Preserve the existing component-wise recency merge: an explicit
             // local candidate wins equality, but cannot drag older siblings
             // across cache boundaries. Ingest guards above retain cached ties.
-            let entry = select_newer_directory_entry(Some(proposed), current)
+            let mut entry = select_newer_directory_entry(Some(proposed), current)
                 .expect("proposed directory entry should be present");
+            // Keep the stored values available if the clock is corrected again.
+            // An eligible record for that kind can replace them, but a write
+            // to another component should not erase them.
+            let future_nip65 = future_nip65.filter(|_| {
+                entry.relay_lists.nip65.created_at == 0 && entry.relay_lists.nip65.relays.is_empty()
+            });
+            let future_inbox = future_inbox.filter(|_| {
+                entry.relay_lists.inbox.created_at == 0 && entry.relay_lists.inbox.relays.is_empty()
+            });
+            let restored = future_nip65.is_some() || future_inbox.is_some();
+            if let Some(list) = future_nip65 {
+                entry.relay_lists.nip65 = list;
+            }
+            if let Some(list) = future_inbox {
+                entry.relay_lists.inbox = list;
+            }
+            if restored {
+                entry.relay_lists.refresh();
+            }
             let public_entry = public_directory_user_record(&entry)?;
             let shared_matches = shared_record.as_ref() == Some(&public_entry);
             let mut caches_match = true;
@@ -750,6 +774,21 @@ impl<R: DirectoryResources> Directory<R> {
                 local_signing: account.local_signing,
             })
     }
+}
+
+fn select_current_directory_entry(
+    cached: Option<UserDirectoryRecord>,
+    shared: Option<UserDirectoryRecord>,
+    max_created_at: u64,
+) -> Option<UserDirectoryRecord> {
+    // A clock correction can move an already cached declaration outside the
+    // window. Filter each tier before comparing timestamps so the eligible
+    // copy still wins, including when ingesting a current repair.
+    let eligible_lists = |mut entry: UserDirectoryRecord| {
+        entry.relay_lists.discard_future_lists(max_created_at);
+        entry
+    };
+    select_newer_directory_entry(cached.map(eligible_lists), shared.map(eligible_lists))
 }
 
 fn directory_entry_from_caches(
