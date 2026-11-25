@@ -56,6 +56,11 @@
 
 ### Fixed
 
+- An invite's Welcome that no inbox relay stores is no longer retried forever (mdk#3589). It is sent until its delivery
+  deadline, 7 days after the invite or its KeyPackage's expiry if sooner, then reads `Undeliverable` in
+  `invite_deliveries` with its latest attempt's problem, and leaves `pending_welcome_deliveries`. A Welcome owed from
+  before this upgrade is held to 7 days from its gift wrap's timestamp. The startup retry now keeps each relay's
+  backoff. The invitee stays a member.
 - `sign_out`, `sign_in_account`, `remove_account`, `login`, `login_external_signer`,
   `login_recovering_incomplete_setup`, `set_audit_log_settings` and `nip46_remove` keep running when their call is
   cancelled, on Kotlin and Swift (mdk#3670). A cancel between their steps could leave a withdrawn KeyPackage slot on

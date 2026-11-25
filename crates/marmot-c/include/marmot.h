@@ -729,7 +729,7 @@ typedef enum MarmotGroupPendingCommitState {
 /**
  * Which `MarmotInviteDeliveryState` this is. `RelayAccepted` means a relay
  * stored the Welcome, not that the recipient received it or joined.
- * `Undeliverable` is not produced for invites yet.
+ * `Undeliverable`: no relay stored it by its deadline; it is not resent.
  */
 typedef enum MarmotInviteDeliveryStateKind {
   MARMOT_INVITE_DELIVERY_STATE_KIND_WAITING,

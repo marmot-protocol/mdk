@@ -88,9 +88,7 @@ pub struct InviteDeviceDeliveryFfi {
 /// relays it is sent to and `accepted` that stored it; of the rest, by the
 /// latest attempt, `refused` answered and said no for any reason (including
 /// rate-limited and auth-required), `unreachable` gave no answer, `untried`
-/// were not tried. A count of refused relays is not the `RefusedByRelays`
-/// cause of `Undeliverable`, which a later release gives only for permanent
-/// refusals.
+/// were not tried.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct InviteRelayCountsFfi {
     pub total: u32,
@@ -117,8 +115,11 @@ pub enum InviteDeliveryStateFfi {
     /// count (one relay today) and MDK recorded it delivered. This is not
     /// proof that the recipient received it or joined.
     RelayAccepted,
-    /// It will not be sent again. Not yet produced for an invite: invites
-    /// have no delivery deadline yet.
+    /// It will not be sent again: no relay stored it by its delivery
+    /// deadline, 7 days after the invite or its KeyPackage's expiry if
+    /// sooner. `cause` is what the latest attempt found
+    /// (`RelaysUnreachable` when none finished); `RefusedByRelays` here means
+    /// every relay that attempt tried said no, possibly only for now.
     Undeliverable { cause: InviteDeliveryProblemFfi },
     /// No longer owed.
     Cancelled { reason: InviteCancelReasonFfi },

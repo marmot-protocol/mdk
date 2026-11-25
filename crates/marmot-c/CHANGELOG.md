@@ -45,6 +45,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm
   no longer makes them skip discovery.
 
+### Fixed
+
+- `marmot_invite_deliveries` now reports `MARMOT_INVITE_DELIVERY_STATE_KIND_UNDELIVERABLE` for an invite's Welcome
+  that no relay stored by its delivery deadline, 7 days after the invite or its KeyPackage's expiry if sooner
+  (mdk#3589); that Welcome is never sent again and leaves `marmot_pending_welcome_deliveries`.
+
 ## [0.19.0] - 2026-11-22
 
 ### Breaking changes

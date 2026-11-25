@@ -1026,7 +1026,15 @@ impl<S: StorageProvider> Engine<S> {
                                         .as_slice()
                                         .to_vec(),
                                 ),
-                                chosen.as_ref().map(|chosen| chosen.welcome_deliver_until),
+                                Some(chosen.as_ref().map_or_else(
+                                    || {
+                                        crate::welcome_deadline::welcome_deliver_until(
+                                            enrolled_at,
+                                            parsed_kp.life_time().not_after(),
+                                        )
+                                    },
+                                    |chosen| chosen.welcome_deliver_until,
+                                )),
                             )
                             .with_key_package_event_id(
                                 source_kp

@@ -330,7 +330,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         welcome: super::send::WrappedWelcome,
         origin_commit_id: &MessageId,
-        deliver_until: Option<Timestamp>,
+        deliver_until: Timestamp,
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
@@ -343,7 +343,7 @@ impl<S: StorageProvider> Engine<S> {
                 welcome.message,
                 origin_commit_id.clone(),
                 Some(welcome.key_package_ref),
-                deliver_until,
+                Some(deliver_until),
             )
             .with_key_package_event_id(welcome.key_package_event_id),
             None,

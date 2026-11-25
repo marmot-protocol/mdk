@@ -561,6 +561,8 @@ async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
         TransportEndpoint("wss://carol-inbox.example".into()),
     ]);
     let tried = welcome_publishes(&adapter).len();
+    // Past the backoff of the fixture's failed attempt.
+    wall.set(300_030);
     let task = runtime
         .prepare_welcome_retry_task_with_audit_context(vec![welcome.clone()], Default::default())
         .unwrap();

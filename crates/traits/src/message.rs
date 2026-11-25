@@ -99,10 +99,13 @@ pub enum SiblingWelcomeOrigin {
 ///   outbound carries it across. A Welcome stored before the ref was kept has
 ///   none.
 ///
-///   A device link's Welcome also keeps `deliver_until`: the time, in Unix
-///   seconds, at which the new device stops waiting for it. It is never
-///   published from then on (D40). Promotion carries it across too, and any
-///   other Welcome has none.
+///   Both also keep `deliver_until`, in Unix seconds, from which the Welcome
+///   is never published: for a device link's, when the new device stops
+///   waiting for it (D40); for an invite's or a founding create's, a fixed
+///   window after it was staged, or its KeyPackage's end if sooner
+///   (mdk#3589). Promotion carries it across too. A Welcome stored before
+///   Welcomes kept one has none, and the engine reads its deadline from its
+///   transport timestamp.
 ///
 ///   A Welcome built for a KeyPackage fetched from a transport keeps that
 ///   KeyPackage's transport event id (`key_package_event_id`), the one its

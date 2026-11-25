@@ -1369,15 +1369,13 @@ Each invited device gets its own Welcome; the account reads `RelayAccepted` once
 with `accepted_device_count` of `device_count` ("1 of 2 devices").
 
 Only invites sent after the device upgraded to this version are listed. A Welcome that already existed then gets no
-record and never appears in `invite_deliveries` or `InviteDeliveryChanged`; it is delivered and retried as before and
-stays visible through `pending_welcome_deliveries` and `WelcomeDeliveryPending`.
+record and never appears in `invite_deliveries` or `InviteDeliveryChanged`; it is delivered and retried as before, until
+its delivery deadline, and stays visible through `pending_welcome_deliveries` and `WelcomeDeliveryPending` until then.
 `devices` gives each Welcome's attempts and relay counts; relays are never named. `total` is the relays it is sent to
 and `accepted` those that stored it. Of the rest, by the latest attempt, `refused` counts relays that answered and
 said no for any reason (including rate-limited and auth-required), `unreachable` relays that gave no answer, and
 `untried` relays it did not try. `last_problem` says why the latest attempt fell short: `NoInboxRelays`,
-`RefusedByRelays` (every relay tried said no, possibly only for now), `RelaysUnreachable` or `Mixed`. A count of
-refused relays is not the terminal cause `Undeliverable { RefusedByRelays }`, which a later release gives only for
-permanent refusals. `Sending` can briefly show an accepted relay: MDK saves a relay's acceptance before it marks the
+`RefusedByRelays` (every relay tried said no, possibly only for now), `RelaysUnreachable` or `Mixed`. `Sending` can briefly show an accepted relay: MDK saves a relay's acceptance before it marks the
 Welcome delivered, and until that mark lands (in the same pass, or on the next maintenance pass if it failed) MDK may
 still send it; the state then becomes `RelayAccepted` and an `InviteDeliveryChanged` follows.
 
@@ -1385,8 +1383,18 @@ MDK never removes an invitee because of this state: an invitee whose Welcome is 
 `Cancelled { SupersededByGroupChange }` means the change that added them lost to another change, and
 `Cancelled { Withdrawn }` that it was withdrawn or rolled back before reaching anyone; check the roster for who is a
 member. An invite drops out once all its devices' Welcomes have settled and 30 days have passed since its last
-activity; an account's newest invite is chosen first, so an older one never shows in its place. Ordinary invites have no delivery deadline yet, so
-`Undeliverable` and the `TooLarge` and `KeyPackageRetired` problems are not produced for them yet. The account
+activity; an account's newest invite is chosen first, so an older one never shows in its place.
+
+Each Welcome has a delivery deadline: 7 days after the invite was sent, or sooner when the invited device's KeyPackage
+expires first. A Welcome no relay stored by then is never sent again, at startup, by maintenance or by
+`redeliver_welcome`, and reads `Undeliverable { cause }`, announced by `InviteDeliveryChanged`; it leaves
+`pending_welcome_deliveries`. `cause` is what its latest attempt found, in the same terms as `last_problem`
+(`RelaysUnreachable` when no attempt finished): `RefusedByRelays` there means every relay that attempt tried said no,
+possibly only for now, not that the refusal was permanent. A relay that stores it before the deadline still makes it
+`RelayAccepted`, and so does an attempt started before the deadline and acknowledged after it. A Welcome that ends
+while the app is closed is not announced: the host reads it from the query on its next start. The `TooLarge` and
+`KeyPackageRetired` problems are not produced yet. At startup MDK asks again only the relays it never asked and those
+whose retry backoff (30 seconds, doubling to an hour) has passed. The account
 database adds one table (schema 0225); older native builds cannot reopen it. There is no wire change.
 
 ## Members are accounts

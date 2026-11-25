@@ -90,6 +90,7 @@ pub(crate) mod test_crash_hooks;
 pub mod update_group_data;
 pub mod upgrade;
 mod welcome_content;
+mod welcome_deadline;
 pub mod wire_format;
 
 pub use convergence_clock::{

@@ -76,6 +76,8 @@
   leaf: removal and chat cleanup also find a committed leaf by a device tag that names the slot and verifies under that
   leaf's own key. A device that moved to another device group keeps its chat leaves whatever keys its slot had, and a
   removed device's leftover chat leaf is still counted past 30 days (mdk#3679).
+- An invite's Welcome past its delivery deadline (mdk#3589) is no longer sent by the startup retry and leaves
+  `pending_welcome_deliveries`; `invite_deliveries` reads it `Undeliverable`. The startup retry keeps relay backoff.
 - A device removed from the account can no longer change its siblings' small state (mdk#3680). It kept its last
   device-group epoch's keys for the app-message window, so until the device group moved five more epochs it could
   still send updates and broadcast requests, and a decline or read position at the highest version could not be

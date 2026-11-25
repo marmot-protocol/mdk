@@ -1043,25 +1043,22 @@ async fn gift_wrap_counting_app(
 }
 
 #[derive(Clone, Debug)]
-struct RejectThenBlockGiftWraps {
-    rejecting: Arc<AtomicBool>,
+struct BlockGiftWraps {
     blocking: Arc<AtomicBool>,
+    /// The id of each gift wrap held, in order.
+    held: Arc<std::sync::Mutex<Vec<String>>>,
     entered: Arc<Notify>,
     release: Arc<Notify>,
 }
 
-impl RejectThenBlockGiftWraps {
+impl BlockGiftWraps {
     fn new() -> Self {
         Self {
-            rejecting: Arc::new(AtomicBool::new(false)),
             blocking: Arc::new(AtomicBool::new(false)),
+            held: Arc::default(),
             entered: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
         }
-    }
-
-    fn reject(&self, rejecting: bool) {
-        self.rejecting.store(rejecting, Ordering::SeqCst);
     }
 
     fn block(&self) {
@@ -1072,13 +1069,17 @@ impl RejectThenBlockGiftWraps {
         self.entered.notified().await;
     }
 
+    fn held(&self) -> Vec<String> {
+        self.held.lock().unwrap().clone()
+    }
+
     fn release(&self) {
         self.blocking.store(false, Ordering::SeqCst);
         self.release.notify_waiters();
     }
 }
 
-impl WritePolicy for RejectThenBlockGiftWraps {
+impl WritePolicy for BlockGiftWraps {
     fn admit_event<'a>(
         &'a self,
         event: &'a nostr_relay_builder::prelude::Event,
@@ -1088,10 +1089,8 @@ impl WritePolicy for RejectThenBlockGiftWraps {
             if event.kind != OldKind::GiftWrap {
                 return PolicyResult::Accept;
             }
-            if self.rejecting.load(Ordering::SeqCst) {
-                return PolicyResult::Reject("injected gift-wrap rejection".into());
-            }
             if self.blocking.load(Ordering::SeqCst) {
+                self.held.lock().unwrap().push(event.id.to_hex());
                 self.entered.notify_one();
                 self.release.notified().await;
             }
@@ -14909,6 +14908,12 @@ async fn direct_retry_survives_restart() {
 
     rejecting.store(false, Ordering::Relaxed);
     runtime.restart_account(alice_id).await.unwrap();
+    // The restart sends nothing: the relay that refused the Welcome is inside
+    // its backoff (mdk#3589). The host's explicit redelivery skips it.
+    runtime
+        .redeliver_welcome(alice_id, &pending[0].message_id_hex)
+        .await
+        .unwrap();
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -15676,12 +15681,15 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
 
 /// mdk#1451: once an existing-group Add commit is confirmed, its exact
 /// Welcome is engine-authoritative and receives a startup retry after process
-/// death without staging another invite commit.
+/// death without staging another invite commit. The process dies while the
+/// Welcome's first publish is still in flight, so no attempt has failed and
+/// the startup pass sends it at once; a relay that had refused it would be
+/// asked again only after its backoff (mdk#3589).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn confirmed_invite_welcome_resumes_after_restart() {
     storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
-    let welcome_policy = RejectThenBlockGiftWraps::new();
+    let welcome_policy = BlockGiftWraps::new();
     let (_relay, url) = limited_relay::relay_publishing_with(
         RelayBuilder::default().write_policy(welcome_policy.clone()),
         Some(500),
@@ -15727,34 +15735,37 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     })
     .await;
 
-    welcome_policy.reject(true);
+    welcome_policy.block();
     runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await
         .unwrap()
         .operation
         .expect("eligible fixture members");
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if !runtime
-                .pending_welcome_deliveries(&alice_id)
-                .await
-                .unwrap()
-                .is_empty()
-            {
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("rejected confirmed-invite Welcome must remain pending");
+    // Also takes the relay's notice of this first attempt, so the wait after
+    // the restart sees only the startup pass's.
+    timeout(Duration::from_secs(5), welcome_policy.wait_until_blocked())
+        .await
+        .expect("the invite's first Welcome publish reaches the relay");
+    // Owed, with no attempt finished. (The pending list answers only once
+    // every earlier Welcome wave has settled, so it cannot be read here.)
+    let invites = runtime
+        .invite_deliveries(&alice_id, Some(&group_id))
+        .await
+        .unwrap();
+    let carol_invite = invites
+        .iter()
+        .find(|invite| invite.recipient_hex == carol_id)
+        .expect("carol's invite is listed");
+    assert_eq!(
+        carol_invite.state,
+        marmot_app::WelcomeDeliveryState::Sending { last_problem: None },
+        "in-flight confirmed-invite Welcome must remain owed"
+    );
     runtime.shutdown().await;
     drop(runtime);
     drop(app);
 
-    welcome_policy.reject(false);
-    welcome_policy.block();
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
@@ -15763,22 +15774,15 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     let runtime = MarmotAppRuntime::new(app);
     let mut restarted_events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
-    timeout(Duration::from_secs(10), async {
-        loop {
-            match runtime.pending_welcome_deliveries(&alice_id).await {
-                Ok(pending) if !pending.is_empty() => break,
-                Ok(_) | Err(AppError::AccountWorkerBusy) | Err(AppError::TransportClosed) => {
-                    sleep(Duration::from_millis(25)).await;
-                }
-                Err(error) => panic!("pending Welcome query failed: {error}"),
-            }
-        }
-    })
-    .await
-    .expect("confirmed Welcome must remain pending before startup retry");
     timeout(Duration::from_secs(15), welcome_policy.wait_until_blocked())
         .await
         .expect("startup recovery must begin the retained Welcome publish");
+    let held = welcome_policy.held();
+    assert_eq!(held.len(), 2, "{held:?}");
+    assert_eq!(
+        held[0], held[1],
+        "startup recovery resends the exact Welcome"
+    );
 
     runtime
         .send_message(
