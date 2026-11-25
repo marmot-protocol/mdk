@@ -3077,6 +3077,22 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn invite_deliveries(
+        &self,
+        account_ref: &str,
+        group_id: Option<&GroupId>,
+    ) -> Result<Vec<crate::InviteDelivery>, AppError> {
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
+        command
+            .send(AccountWorkerCommand::InviteDeliveries {
+                group_id: group_id.cloned(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn redeliver_welcome(
         &self,
         account_ref: &str,

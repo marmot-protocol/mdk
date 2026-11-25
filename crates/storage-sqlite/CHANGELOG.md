@@ -7,6 +7,8 @@
 - Migration 0219 adds `message_timeline.timeline_order_seq`, rebuilds the canonical order index with it before the
   message id, and drops kind-1202 timeline rows. `TimelineMessageRecord` gains `agent_item` and
   `timeline_order_seq`, and `TimelineUpdateTrigger::AgentActivity`/`AgentOperation` become `AgentItem`.
+- Account migration 0225 adds `cgka_welcome_delivery_ledger`, one record per outbound Welcome's delivery
+  (mdk#1706). Older binaries refuse schema 225; downgrade is unsupported.
 - Migration 0221 adds `agent_item_expired_targets`: the retention sweep records each agent item whose row it removed,
   so an edit of it that arrives later does not show it again. A sweep from before the migration is not recorded, so
   on a nightly build's database a late edit of an item removed then can still show it.
@@ -35,6 +37,10 @@
 - `delete_local_group_data` keeps the deleted row's invitation standing on the group's deletion frontier, and
   `SqliteAppStorage::local_group_deletion_invitation` returns it as `LocalGroupDeletionInvitation` (mdk#3555). A
   frontier written before schema 223, or by a delete that found no row, returns `None`.
+- Account migration 0224 adds `evidence_floor_epoch` to `account_recovery_obligations` and
+  `SqliteAppStorage::active_epoch_gap_evidence_floor` so active epoch-gap handoffs keep their original arrival-epoch
+  floor across multi-step partial advances and restarts while parked gaps retire cleanly (and explicit unparks reset
+  the floor to `stalled_epoch`). Older binaries refuse schema 224; downgrade is unsupported.
 
 ### Fixed
 

@@ -834,6 +834,7 @@ host_reads!(
     MaintenanceStatus,
     QuarantinedGroups,
     PendingWelcomeDeliveries,
+    InviteDeliveries,
     GroupMlsState,
     AccountDevicesActivation,
     GroupAppComponent,

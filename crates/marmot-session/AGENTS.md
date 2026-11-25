@@ -88,6 +88,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     before its finished row; never mark it elsewhere. Start a pass
     (`V5WelcomePass::start`) only where the transport is called, after the last hold check, so a stopped attempt
     records nothing. Every row of a Welcome carries `welcome_audit_operation_id`.
+  - `runtime/welcome_relays.rs` — a Welcome pass's per-relay requests, the result they join into, and the
+    remaining pass of the relays still answering when the pass was done (see `runtime/welcome_delivery.rs`).
   - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
     one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this
@@ -98,8 +100,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     the expiry, and maintenance drops its retry record, only once neither can. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
     maintenance pass) finds staged or owed; a group skipped because it was not live is read again on each pass until it
     is. A Welcome stays watched until its row is settled. Maintenance publishes each watched Welcome that is owed and
-    that no attempt record (stored fanout or detached wave) holds, so one whose publish stored nothing (no
-    route) or whose fanout expired goes out again on the next pass, as the startup pass would send it.
+    that no attempt record (stored fanout or detached wave) holds, so one whose fanout expired goes out again on the
+    next pass, as the startup pass would send it. One whose publish found no route waits for its recipient's paced
+    retry (`runtime/welcome_routes.rs`).
     Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
     fanout included. A host that names Welcomes by id (the app's invite drive) publishes them through
     `deliver_owed_welcomes_with_audit_context`, which sends only those the engine says are owed now.
@@ -111,7 +114,14 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     selection to finish and checks its current hold; already-started I/O continues. The host finishes it in input
     order (`finish_welcome_publish_task`), after dropping the
     results of a group it no longer shows (`CompletedWelcomePublishTask::drop_gone_groups`), or abandons it
-    (`abandon_welcome_publish_task`), which releases only the reservation. Prepare has already stored each
+    (`abandon_welcome_publish_task`), which releases only the reservation. A pass with more inbox relays than its
+    goal asks each relay with its own request (`runtime/welcome_relays.rs`), since the transport may answer one
+    request at its goal and drop the other relays' answers. The pass is done once its answers meet its goal or every
+    relay answered; a detached wave returns then, and the relays still answering go on as a task of their own
+    (`CompletedWelcomePublishTask::take_remaining`), which takes their reservations. Its finish records their answers
+    on the Welcome's fanout without counting another attempt (it counts and dates one only if the first pass's record
+    was never saved), under its own started/finished pair. Left untaken, cancelled or abandoned, it records nothing
+    (its pass has a started row and no finished row) and those relays are retried after their backoff, as before. Prepare has already stored each
     Welcome's exact signed bytes and endpoint snapshot as a transport fanout, with no relay attempt on any endpoint,
     and the Welcome stays owed, so the next maintenance pass retries that fanout. Every other publish path treats a reserved id as held by its wave. A pending
     create's first Welcome and `redeliver_welcome` still publish inline; a redelivery of a Welcome a wave holds
@@ -120,6 +130,26 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     watch and retry fanout, including across reopen and missed events. Only terminal origin loss retires that debt;
     native re-adoption can make it owed again under its original deadline. `tests/runtime/hydrated_welcome.rs` owns
     encrypted recovery continuation, unrelated-group cancellation, parked retry retention and terminal pruning.
+  - `runtime/welcome_outcomes.rs` — the sender's view of each outbound Welcome's delivery (mdk#1706). Never store a
+    Welcome's state: `welcome_delivery_outcomes` derives it on every read from the engine's stored row
+    (`stored_outbound_welcome_status`, which needs no live group). The ledger, `cgka_welcome_delivery_ledger`, keeps only
+    what nothing else holds: the Welcome's invite (group, recipient, origin commit) and its attempt counts, which
+    outlive the 24-hour retry record. A relay pass writes its counts in the same transaction as the retry record, in
+    `put_pass_fanout`, the one place every pass saves it; a route failure, which saves no retry record, writes them
+    alone. A record is made only when this runtime stages or creates an invite's Welcomes (`watch_welcomes`), all of
+    an invite's in one transaction; every other step only updates an existing record, so a Welcome from before the
+    upgrade never gets one, is never listed, and is delivered as before. There is no reconcile, recovery or adoption
+    pass. The newest invite per group and recipient is the one first recorded last, chosen before retention
+    (`INVITE_DELIVERY_RETENTION_SECS`). Each seam that changes
+    a Welcome's delivery queues its `(group, recipient)` for `take_welcome_delivery_changes`, so the app re-reads only
+    those answers after a turn; an unqueued change only delays the host's notice.
+  - `runtime/welcome_routes.rs` — Welcomes whose recipient has no inbox route (mdk#2261). A publish that finds none
+    stores no retry record, so the runtime paces the recipient in memory (10 minutes, doubling, at most 6 hours) and
+    maintenance leaves its owed Welcomes alone until then; explicit publishes are not held, and each retry asks the
+    routing policy again. A held pass writes nothing, the Welcome's delivery record included, so that record counts
+    one route failure per paced attempt. The policy's `MissingInboxRouteCause` maps to the v5 `welcome_publish_not_started` reason
+    (`no_eligible_route` for an empty or unusable list, `route_resolution_failed` for none known); add no reason for
+    it. Route discovery stays with the host.
   - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b), and join a
     chat from a sibling Welcome the app admitted (3.5b); like a confirmed rejoin, that join's events wait for the
     caller's drain. It also lists the sibling Welcomes this device owes and records a carrier's outcome on one

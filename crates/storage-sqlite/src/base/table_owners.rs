@@ -59,6 +59,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("cgka_sibling_adds", Side::Protocol),
     ("cgka_transport_fanout", Side::Protocol),
     ("cgka_transport_group_routes", Side::Protocol),
+    ("cgka_welcome_delivery_ledger", Side::Protocol),
     ("cgka_welcomes", Side::Protocol),
     ("locally_forgotten_groups", Side::Protocol),
     ("openmls_values", Side::Protocol),

@@ -5,6 +5,7 @@
 use super::canonical_membership::{app_at, deliver_new, published_key_package};
 use super::device_group::{Devices, deliver_all, phone_and_laptop};
 use super::*;
+use crate::client::boxed;
 use crate::small_state::{
     BROADCAST_REQUEST, KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE,
 };
@@ -562,7 +563,40 @@ async fn siblings_exchange_small_state_through_the_device_group() {
     };
     assert_eq!(by_event(&read), by_event(&sent));
 
-    // The laptop starts too: it broadcasts what it holds and asks.
+    // The laptop starts too, once its leaf is tagged: siblings read small
+    // state only from a tagged leaf (mdk#3680). Its first pass tags it only
+    // after small state ran, so that pass holds what it owes and the phone
+    // reads nothing; the next broadcasts what it holds and asks.
+    assert!(
+        !devices
+            .laptop
+            .device_group_exchange()
+            .unwrap()
+            .unwrap()
+            .tagged
+    );
+    devices.laptop.run_due_maintenance().await.unwrap();
+    assert!(
+        devices
+            .laptop
+            .device_group_exchange()
+            .unwrap()
+            .unwrap()
+            .tagged
+    );
+    assert_eq!(
+        laptop_storage().unsent_small_state_items().unwrap().len(),
+        401
+    );
+    assert!(
+        laptop_storage()
+            .small_state_schedule()
+            .unwrap()
+            .unwrap()
+            .request_owed
+    );
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert!(!answer_owed(&phone_app));
     devices.laptop.run_due_maintenance().await.unwrap();
     assert!(
         laptop_storage()
@@ -739,4 +773,238 @@ async fn an_update_that_reached_no_one_is_sent_again() {
         .small_state_items()
         .unwrap();
     assert!(held.contains(&owed[0]));
+}
+
+/// Both devices tagged, a chat the phone started with Bob, and no broadcast
+/// answer owed on the phone, so what the phone reads next is the laptop's.
+async fn tagged_pair_with_chat() -> (Devices, GroupId, tempfile::TempDir, GroupId) {
+    let (mut devices, group) = boxed(super::device_group::tagging_devices).await;
+    let (bob_dir, chat) =
+        boxed(|| chat_with_bob(&devices.phone_app, &mut devices.phone, &devices.relay)).await;
+    boxed(|| devices.phone.drive_small_state()).await;
+    assert!(!answer_owed(&devices.phone_app));
+    (devices, group, bob_dir, chat)
+}
+
+fn answer_owed(app: &MarmotApp) -> bool {
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .small_state_schedule()
+        .unwrap()
+        .unwrap()
+        .answer_owed
+}
+
+fn muted(app: &MarmotApp, chat: &GroupId) -> bool {
+    app.chat_notification_settings("alice", &hex::encode(chat.as_slice()))
+        .unwrap()
+        .muted
+}
+
+/// Send each of `messages` from `client` in `group`.
+async fn send_all(client: &mut AppClient, group: &GroupId, messages: Vec<(u64, String)>) {
+    for (kind, content) in messages {
+        assert!(
+            client
+                .send_device_group_message(group, kind, content)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+/// A sibling's update muting `chat`, and a broadcast request.
+fn mute_and_request(chat: &GroupId) -> Vec<(u64, String)> {
+    let mute = sibling_value(
+        &hex::encode(chat.as_slice()),
+        SmallStateValue::Mute(MuteSetting::Muted),
+    );
+    vec![
+        (
+            KIND_SMALL_STATE_UPDATE,
+            crate::small_state::encode_small_state_update(&[mute])
+                .remove(0)
+                .0,
+        ),
+        (
+            KIND_SMALL_STATE_BROADCAST_REQUEST,
+            BROADCAST_REQUEST.to_owned(),
+        ),
+    ]
+}
+
+/// A removed device keeps its last epoch's keys for the app-message window,
+/// so it can still send small state from that epoch. The phone refuses all of
+/// it, as the sending leaf's tag reads as a removed slot (mdk#3680): a mute,
+/// a decline at the highest version, which no later decision could beat, and
+/// a broadcast request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_devices_small_state_is_refused() {
+    let (devices, group, _bob_dir, chat) = boxed(tagged_pair_with_chat).await;
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        mut phone,
+        mut laptop,
+        ..
+    } = devices;
+    let chat_hex = hex::encode(chat.as_slice());
+    let generation = phone_app
+        .account_storage("alice")
+        .unwrap()
+        .invitation_admission(&chat)
+        .unwrap()
+        .unwrap()
+        .generation;
+    let decision = || {
+        phone_app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .invitation_decision(&chat_hex, &generation)
+            .unwrap()
+            .unwrap()
+    };
+    let accepted = decision();
+    assert!(!accepted.declined);
+    let laptop_epoch = laptop.runtime.group_record(&group).unwrap().epoch;
+    let laptop_slot = super::device_group::stable_slot(&laptop_app);
+    boxed(|| phone.remove_linked_device(&laptop_slot))
+        .await
+        .unwrap();
+    assert!(phone.runtime.group_record(&group).unwrap().epoch.0 > laptop_epoch.0);
+
+    let mut cursor = relay.published_events.lock().unwrap().len();
+    let decline = storage_sqlite::InvitationDecision {
+        version: storage_sqlite::MAX_SMALL_STATE_NUMBER,
+        declined: true,
+        ..accepted.clone()
+    };
+    let mut messages = mute_and_request(&chat);
+    messages.push((
+        KIND_SMALL_STATE_UPDATE,
+        crate::small_state::encode_invitation_decision_updates(&[decline])
+            .remove(0)
+            .0,
+    ));
+    send_all(&mut laptop, &group, messages).await;
+    assert_eq!(
+        laptop.runtime.group_record(&group).unwrap().epoch,
+        laptop_epoch
+    );
+    deliver_new(&mut phone, &relay, &mut cursor).await;
+    phone.sync().await.unwrap();
+    boxed(|| phone.run_due_maintenance()).await.unwrap();
+    assert_eq!(
+        (
+            muted(&phone_app, &chat),
+            decision(),
+            answer_owed(&phone_app)
+        ),
+        (false, accepted, false)
+    );
+}
+
+/// An update and a broadcast request a linked sibling sent before the device
+/// group moved on are read at their own epoch, from its retained anchor, and
+/// applied (mdk#3680).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_siblings_delayed_small_state_is_applied() {
+    let (devices, group, _bob_dir, chat) = boxed(tagged_pair_with_chat).await;
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        mut phone,
+        mut laptop,
+        ..
+    } = devices;
+    let laptop_epoch = laptop.runtime.group_record(&group).unwrap().epoch;
+    let mut cursor = relay.published_events.lock().unwrap().len();
+    send_all(&mut laptop, &group, mute_and_request(&chat)).await;
+    phone
+        .rename_linked_device(&super::device_group::stable_slot(&phone_app), "Phone")
+        .await
+        .unwrap();
+    assert!(phone.runtime.group_record(&group).unwrap().epoch.0 > laptop_epoch.0);
+    deliver_new(&mut phone, &relay, &mut cursor).await;
+    phone.sync().await.unwrap();
+    assert_eq!(
+        (muted(&phone_app, &chat), answer_owed(&phone_app)),
+        (true, true)
+    );
+}
+
+/// Small state goes out pinned to the branch the laptop's tag was read on, as
+/// a sibling Welcome does, so it never leaves from a leaf that lost its tag
+/// (mdk#3680). While the laptop's own device-group commit waits on its
+/// publication, the engine refuses it before encrypting anything: the pass
+/// queues nothing and its items stay owed. The pass after that commit fails
+/// sends them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn small_state_waits_out_this_devices_unsettled_device_group_commit() {
+    let (devices, group) = boxed(super::device_group::tagging_devices).await;
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        mut phone,
+        mut laptop,
+        ..
+    } = devices;
+    let notes = boxed(|| laptop.create_group("Notes", &[]))
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let notes_hex = hex::encode(notes.as_slice());
+    laptop_app
+        .set_chat_pinned("alice", &notes_hex, true)
+        .unwrap();
+    let holds_pin = |app: &MarmotApp, unsent: bool| {
+        let storage = app.account_storage("alice").unwrap().app_storage();
+        let items = if unsent {
+            storage.unsent_small_state_items()
+        } else {
+            storage.small_state_items()
+        };
+        items
+            .unwrap()
+            .iter()
+            .any(|item| item.group_id_hex == notes_hex && item.value == SmallStateValue::Pin(true))
+    };
+    let effects = laptop
+        .runtime
+        .session_mut()
+        .send(cgka_traits::engine::SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    let Some(marmot_session::PublishWork::GroupEvolution { pending, .. }) =
+        effects.publish.into_iter().next()
+    else {
+        panic!("expected a group evolution")
+    };
+
+    boxed(|| laptop.drive_small_state()).await;
+    assert!(holds_pin(&laptop_app, true));
+    assert!(!laptop.runtime.has_queued_outbound_intents(&group).unwrap());
+    deliver_all(&mut phone, &relay).await;
+    assert!(!holds_pin(&phone_app, false));
+
+    laptop
+        .runtime
+        .session_mut()
+        .publish_failed(pending)
+        .await
+        .unwrap();
+    boxed(|| laptop.drive_small_state()).await;
+    assert!(!holds_pin(&laptop_app, true));
+    deliver_all(&mut phone, &relay).await;
+    assert!(holds_pin(&phone_app, false));
 }

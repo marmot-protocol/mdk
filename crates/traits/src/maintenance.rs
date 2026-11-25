@@ -326,6 +326,108 @@ impl CommitRefusal {
     }
 }
 
+/// Where one outbound Welcome's delivery stands for the device that sent it
+/// (mdk#1706), as its sender's host shows it. A relay's acknowledgement is
+/// not the recipient's: `RelayAccepted` means a relay stored the Welcome,
+/// not that the recipient received it or joined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WelcomeDeliveryState {
+    /// Its commit is not confirmed yet, so nothing sends it.
+    Waiting,
+    /// Owed and being sent; `last_problem` is why the latest attempt did not
+    /// reach enough relays, `None` before any attempt finished.
+    Sending {
+        last_problem: Option<WelcomeDeliveryProblem>,
+    },
+    /// Enough of the recipient's inbox relays stored it. Not proof that the
+    /// recipient received it or joined.
+    RelayAccepted,
+    /// It will not be sent again.
+    Undeliverable { cause: WelcomeDeliveryProblem },
+    /// It is no longer owed: the group change that added the recipient did
+    /// not happen, or the Welcome was withdrawn.
+    Cancelled { reason: WelcomeCancelReason },
+}
+
+impl WelcomeDeliveryState {
+    /// Whether nothing will send this Welcome again.
+    pub fn is_settled(self) -> bool {
+        matches!(
+            self,
+            Self::RelayAccepted | Self::Undeliverable { .. } | Self::Cancelled { .. }
+        )
+    }
+}
+
+/// Why a Welcome has not reached enough relays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WelcomeDeliveryProblem {
+    /// No usable inbox relay was known for the recipient.
+    NoInboxRelays,
+    /// Every relay that answered refused it.
+    RefusedByRelays,
+    /// No relay tried acknowledged it: unreachable, timed out or no answer.
+    RelaysUnreachable,
+    /// Some relays refused it and the others could not be reached.
+    Mixed,
+    /// It fits none of the recipient's inbox relays' size limits.
+    TooLarge,
+    /// The recipient no longer holds the KeyPackage it answers.
+    KeyPackageRetired,
+}
+
+/// Why a Welcome is no longer owed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WelcomeCancelReason {
+    /// The group change that added the recipient lost to another change.
+    SupersededByGroupChange,
+    /// Withdrawn by this device, or retired with a group change that was
+    /// rolled back before it reached anyone.
+    Withdrawn,
+}
+
+/// How a Welcome's inbox relays answered, as counts: never relay names.
+/// `total` is the relays it is being sent to; `accepted` those that stored
+/// it. Of the rest, by the latest attempt: `refused` answered and said no,
+/// for any reason (including rate-limited and auth-required), `unreachable`
+/// gave no answer, and `untried` were not tried.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WelcomeRelayCounts {
+    pub total: u32,
+    pub accepted: u32,
+    pub refused: u32,
+    pub unreachable: u32,
+    pub untried: u32,
+}
+
+/// What the sender keeps of one outbound Welcome's delivery (mdk#1706) that
+/// nothing else holds: which invite it belongs to, and what its publish
+/// attempts found, which must outlive the Welcome's 24-hour retry record. One
+/// per Welcome, which is one per invited device. It holds no state: a
+/// Welcome's state is derived from the engine's stored row whenever it is
+/// read, so it never disagrees with what the engine will send.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WelcomeDeliveryRecord {
+    pub welcome_id: MessageId,
+    pub group_id: GroupId,
+    pub recipient: crate::types::MemberId,
+    /// The commit the Welcome was staged with; `None` for a group's founding
+    /// Welcome.
+    pub origin_commit_id: Option<MessageId>,
+    pub created_at: Timestamp,
+    /// Publish attempts made: relay passes, and attempts that found no route.
+    pub attempts: u32,
+    pub last_attempt_at: Option<Timestamp>,
+    /// When a pass first found a relay holding it.
+    pub accepted_at: Option<Timestamp>,
+    pub relays: WelcomeRelayCounts,
+    /// Why the latest attempt fell short, if it did.
+    pub last_problem: Option<WelcomeDeliveryProblem>,
+}
+
 /// Transport-neutral exact signed artifact used for account-scoped
 /// replaceable events such as a KeyPackage publication.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

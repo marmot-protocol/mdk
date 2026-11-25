@@ -29,6 +29,9 @@
 ### Added
 
 - `submit_thread_message` and `submit_tagged_sticker` accept a client token and return before relay publication.
+- `MarmotAppRuntime::invite_deliveries` and `MarmotAppEvent::InviteDeliveryChanged` (mdk#1706): one `InviteDelivery`
+  per group and invited account, rolled up from the session's per-Welcome delivery records. `RelayAccepted` means a
+  relay stored the Welcome, not that the recipient received it or joined.
 - A later version of an agent item is a kind-1009 edit carrying the whole item with a higher `v`, sent crash-safely
   with `submit_tagged_edit_for_local_send` on the item's token. The row keeps the highest version, ignores an older
   one that arrives late, applies an edit that arrived before its item, and is not marked edited.
@@ -66,6 +69,28 @@
 
 ### Fixed
 
+- A device removed from the account can no longer change its siblings' small state (mdk#3680). It kept its last
+  device-group epoch's keys for the app-message window, so until the device group moved five more epochs it could
+  still send updates and broadcast requests, and a decline or read position at the highest version could not be
+  undone. A device now takes a small-state update or broadcast request only from a leaf whose device tag reads, at
+  the message's epoch, as a device its roster lists, and sends its own only once its leaf is tagged: a newly linked
+  device's first broadcast waits for its tag commit instead of going out untagged.
+- When the app's account worker publishes a Welcome (an invite's, a new chat's, or a retry of either), the first pass
+  now reaches every inbox relay of its recipient, not only the first relay that acknowledged it. Each relay is asked
+  on its own. The Welcome is still marked delivered at the first acknowledgement, and the host and the account worker
+  do not wait for the other relays. Their answers are recorded once all of them have answered. If the worker stops
+  waiting first (at the shutdown bound, a reconnect, sign-out or unlink), nothing more is recorded: those relays stay
+  owed and are retried after their backoff, and one that already stored the Welcome answers duplicate. A Welcome whose
+  only acknowledgement came from a relay that accepts gift wraps but cannot serve them back no longer depends on a
+  retry 30 seconds later, which a closed app never ran. `redeliver_welcome` and runtimes that publish Welcomes inline
+  still stop at the first acknowledgement.
+- An invite's Welcome whose recipient has no usable inbox relay no longer retries, and records a routing failure, on
+  every maintenance pass while it is owed (mdk#2261, in part). Its recipient is retried 10 minutes later, then at
+  doubling intervals up to 6 hours; the pacing is kept in memory, so each app start still makes one attempt. Each
+  retry uses the recipient's inbox route as the account last loaded it from the local directory cache: MDK does not
+  look the recipient's relay list up again, so such a Welcome still goes out only once a new list reaches the cache
+  and the route table, in practice through a new invite to that person. The audit records why no route was found:
+  `no_eligible_route` for an empty or unusable list, `route_resolution_failed` for no list known.
 - A newly linked device no longer waits up to an hour for its siblings' small state, showing a chat the account already
   accepted as an invitation, with an "invited you" notification, when every sibling broadcast within the last hour
   (mdk#3556). A device whose trusted roster lists a device its last broadcast was not made for broadcasts at once, and

@@ -814,6 +814,10 @@ pub(crate) enum AccountWorkerCommand {
     PendingWelcomeDeliveries {
         respond: ReadReply<Result<Vec<PendingWelcomeDelivery>, AppError>>,
     },
+    InviteDeliveries {
+        group_id: Option<GroupId>,
+        respond: ReadReply<Result<Vec<crate::InviteDelivery>, AppError>>,
+    },
     RedeliverWelcome {
         message_id_hex: String,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
@@ -987,6 +991,7 @@ impl AccountWorkerCommand {
                 | Self::BackupSettings { .. }
                 | Self::GroupCommitDelivery { .. }
                 | Self::PendingWelcomeDeliveries { .. }
+                | Self::InviteDeliveries { .. }
                 | Self::KeyPackageMaintenanceStatus { .. }
                 | Self::DurablyOwnedKeyPackages { .. }
                 | Self::MaintenanceStatus { .. }
@@ -1836,6 +1841,8 @@ async fn run_app_runtime_account_worker(
         // worker has exited (mdk#2628 D67).
         if client.device_unlinked() {
             stop_recovery_runner(&mut recovery_runner, &mut client).await;
+            // Its waves stop before its audit recording closes.
+            welcome_runs.stop(&mut client).await;
             stop_unlinked_worker(&mut client, unlinked).await;
             break 'worker;
         }
@@ -2097,13 +2104,15 @@ async fn run_app_runtime_account_worker(
                 if let Some(deadline) = lifecycle.welcome_wave_deadline() {
                     welcome_runs.settle_until(&mut client, &shared, deadline).await;
                 }
+                // The rest are cancelled and joined before the audit closes.
+                welcome_runs.cancel_and_join(Some(&mut client), false).await;
                 client.finish_audit_recording();
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
             }
             stop = &mut shutdown => {
                 if stop.is_ok() {
-                    welcome_runs.record_returned(&mut client);
+                    welcome_runs.stop(&mut client).await;
                     client.finish_audit_recording();
                 }
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
@@ -7888,6 +7897,11 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
             true
         }),
+        AccountWorkerCommand::InviteDeliveries { group_id, respond } => Box::pin(async move {
+            let result = client.invite_deliveries(group_id.as_ref());
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
+            true
+        }),
         AccountWorkerCommand::RedeliverWelcome {
             message_id_hex,
             respond,
@@ -9775,6 +9789,18 @@ fn publish_pending_welcome_delivery_events(
                 message_id_hex: pending.message_id_hex,
                 recipient_hex: pending.recipient_hex,
                 size_class: pending.size_class,
+            },
+        );
+    }
+    // Invite delivery changes ride the same drains (mdk#1706).
+    for delivery in client.take_invite_delivery_changes() {
+        let _ = emit(
+            Emit::Quiescent(client),
+            events,
+            MarmotAppEvent::InviteDeliveryChanged {
+                account_id_hex: account_id_hex.to_owned(),
+                account_label: account_label.to_owned(),
+                delivery,
             },
         );
     }

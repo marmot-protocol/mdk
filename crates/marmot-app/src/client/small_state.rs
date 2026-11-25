@@ -1,6 +1,9 @@
 //! Small state with this account's other devices (mdk#2628 item 4.3): each
 //! chat's read position, pin, mute and archive state, kept the same on every
-//! device that trusts the account's device group.
+//! device that trusts the account's device group. Only a device that group's
+//! roster lists writes it: a sibling's message counts only when its sending
+//! leaf's device tag reads as a listed device, so this device sends none
+//! until its own leaf is tagged (mdk#3680).
 //!
 //! A pass ([`AppClient::sync_small_state`]) records what this device's user
 //! changed, merges items received from siblings and applies the winners.
@@ -18,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cgka_traits::GroupId;
+use cgka_traits::{EpochId, EpochPin, GroupId};
 use marmot_session::CanonicalizationPolicy;
 use storage_sqlite::{SmallStateItem, SmallStateItemName};
 
@@ -65,13 +68,24 @@ impl AppClient {
     /// out, and only if they still hold the value it carried; an update that
     /// reached no relay stops the pass, and its items stay owed. Sending one
     /// twice does no harm: every device merges it to the same winner.
+    ///
+    /// Nothing goes out until this device's own leaf is tagged: siblings
+    /// refuse small state from any other leaf (mdk#3680). What is owed stays
+    /// owed, and the first pass after the tag commit sends it. Each message
+    /// is pinned to the branch the tag was read on, so the engine refuses one
+    /// whose epoch moved or is about to, encrypting nothing, rather than send
+    /// it from a leaf that lost its tag; what it carried stays owed too.
     pub(super) async fn send_owed_small_state(&mut self) -> Result<(), AppError> {
         if !self.app.device_groups_enabled() {
             return Ok(());
         }
-        let Some(group_id) = self.trusted_device_group()? else {
+        let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
+        if !exchange.tagged {
+            return Ok(());
+        }
+        let (group_id, pin) = (exchange.group_id, exchange.pin);
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let Some(schedule) = storage.small_state_schedule()? else {
             return Ok(());
@@ -79,14 +93,14 @@ impl AppClient {
         let mut sent = 0;
         // Invitation decisions first: a sibling Add waits on them (mdk#3556),
         // and a page of other items no relay takes must not hold them back.
-        // A page the session holds, queued or unacknowledged, counts as sent,
-        // as for other items: while no relay is up the Add can then go ahead
+        // A page the session holds unacknowledged counts as sent, as for
+        // other items: while no relay is up the Add can then go ahead
         // before the decision lands, until the session's retry delivers it.
         for (content, carried) in
             encode_invitation_decision_updates(&storage.unsent_invitation_decisions()?)
         {
             if !self
-                .send_device_group_message(&group_id, KIND_SMALL_STATE_UPDATE, content)
+                .send_small_state_message(&group_id, pin, KIND_SMALL_STATE_UPDATE, content)
                 .await?
             {
                 return Ok(());
@@ -96,7 +110,7 @@ impl AppClient {
         }
         for (content, carried) in encode_small_state_update(&storage.unsent_small_state_items()?) {
             if !self
-                .send_device_group_message(&group_id, KIND_SMALL_STATE_UPDATE, content)
+                .send_small_state_message(&group_id, pin, KIND_SMALL_STATE_UPDATE, content)
                 .await?
             {
                 return Ok(());
@@ -106,8 +120,9 @@ impl AppClient {
         }
         let requested = schedule.request_owed
             && self
-                .send_device_group_message(
+                .send_small_state_message(
                     &group_id,
+                    pin,
                     KIND_SMALL_STATE_BROADCAST_REQUEST,
                     BROADCAST_REQUEST.to_owned(),
                 )
@@ -125,6 +140,20 @@ impl AppClient {
             );
         }
         Ok(())
+    }
+
+    /// Send one small-state message pinned to `pin`, as
+    /// [`Self::send_device_group_event_at`] does.
+    async fn send_small_state_message(
+        &mut self,
+        group_id: &GroupId,
+        pin: EpochPin,
+        kind: u64,
+        content: String,
+    ) -> Result<bool, AppError> {
+        let event = self.device_group_event(kind, content)?;
+        self.send_device_group_event_at(group_id, event, Some(pin))
+            .await
     }
 
     /// Begin a broadcast when [`broadcast_due`] says one is owed at `now`:
@@ -297,9 +326,28 @@ impl AppClient {
         Ok(())
     }
 
-    /// Merge an update's items, sent at `epoch` of the device group, from
-    /// any device of the trusted device group: membership is the
-    /// authentication, so no sender is read.
+    /// Refuse a small-state message unless a device the trusted roster lists
+    /// sent it in the trusted device group: `sender`'s leaf must read, at the
+    /// message's epoch, as that device's (mdk#3680). Membership is not
+    /// enough: a removed device keeps its last epoch's keys for the
+    /// app-message window, and its leaf reads as its removed slot. A linked
+    /// sibling's message read after later commits is read from its epoch's
+    /// retained anchor.
+    pub(crate) fn ensure_small_state_sender(
+        &mut self,
+        group_id: &GroupId,
+        sender: (EpochId, Option<u32>),
+    ) -> Result<(), AppError> {
+        match self.trusted_device_roster()? {
+            Some((trusted, roster)) if trusted == *group_id => {
+                self.sending_device(group_id, &roster, sender).map(drop)
+            }
+            _ => Err(AppError::DeviceGroupRefused("not_trusted_device_group")),
+        }
+    }
+
+    /// Merge an update's items, sent at `epoch` of the device group by a
+    /// sibling [`Self::ensure_small_state_sender`] admitted.
     pub(crate) fn receive_small_state_update(
         &mut self,
         group_id: &GroupId,
@@ -325,7 +373,8 @@ impl AppClient {
         self.sync_small_state(&items)
     }
 
-    /// Take a sibling's broadcast request: owe a broadcast, which
+    /// Take the broadcast request of a sibling
+    /// [`Self::ensure_small_state_sender`] admitted: owe a broadcast, which
     /// [`broadcast_due`] spaces at least an hour after the last.
     pub(crate) fn receive_small_state_broadcast_request(
         &mut self,

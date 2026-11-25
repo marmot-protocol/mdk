@@ -89,7 +89,14 @@ mod sign_in_rejection;
 mod slot_announcement;
 mod welcome_audit;
 mod welcome_delivery;
+mod welcome_outcomes;
+mod welcome_relays;
+mod welcome_routes;
 use welcome_audit::{InviteRefusal, V5WelcomePass};
+pub use welcome_outcomes::{INVITE_DELIVERY_RETENTION_SECS, WelcomeDeliveryOutcome};
+use welcome_relays::{
+    RelayPublish, RemainingPass, RemainingWelcomeSends, join_relay_answers, relay_sends, until_met,
+};
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
@@ -249,6 +256,8 @@ enum LegacyPublishCompletion {
         Box<PreparedLegacyPublishAttempt>,
         Result<TransportPublishReport, TransportAdapterError>,
     ),
+    /// What the relays a settled pass left answering said since.
+    Remaining(Box<RemainingPass>),
 }
 
 struct PreparedLegacyPublishAttempt {
@@ -307,12 +316,22 @@ struct CompletedWelcomePublish {
 #[doc(hidden)]
 #[must_use = "a prepared Welcome publish task must be run and reconciled"]
 pub struct PreparedWelcomePublishTask {
-    adapter: Arc<dyn TransportAdapter>,
-    wall_clock: Arc<dyn WallClock>,
-    prepared: PreparedWelcomePublish,
     message_ids: Vec<cgka_traits::MessageId>,
-    holds: DetachedWelcomeHolds,
-    selection: Arc<futures::lock::Mutex<()>>,
+    run: WelcomeTaskRun,
+}
+
+enum WelcomeTaskRun {
+    /// A wave's passes, each started once its hold allows.
+    Wave {
+        adapter: Arc<dyn TransportAdapter>,
+        wall_clock: Arc<dyn WallClock>,
+        prepared: PreparedWelcomePublish,
+        holds: DetachedWelcomeHolds,
+        selection: Arc<futures::lock::Mutex<()>>,
+    },
+    /// The relays a wave's passes left answering
+    /// ([`CompletedWelcomePublishTask::take_remaining`]).
+    Remaining(RemainingWelcomeSends<'static>),
 }
 
 /// Opaque relay results from [`PreparedWelcomePublishTask::run`].
@@ -320,9 +339,26 @@ pub struct PreparedWelcomePublishTask {
 pub struct CompletedWelcomePublishTask {
     completed: CompletedWelcomePublish,
     message_ids: Vec<cgka_traits::MessageId>,
+    remaining: Option<RemainingWelcomeSends<'static>>,
 }
 
 impl CompletedWelcomePublishTask {
+    /// The relays this task's passes were still waiting on when each pass
+    /// had met its Welcome's policy, as a task of their own that keeps
+    /// asking them. Their Welcomes' reservations go with it, so this task's
+    /// finish settles each pass at once, and the returned task's finish, or
+    /// its abandonment, releases them. Left untaken, they stop when this task
+    /// is finished, and maintenance retries them after their backoff.
+    pub fn take_remaining(&mut self) -> Option<PreparedWelcomePublishTask> {
+        let remaining = self.remaining.take()?;
+        let message_ids = remaining.message_ids();
+        self.message_ids.retain(|id| !message_ids.contains(id));
+        Some(PreparedWelcomePublishTask {
+            message_ids,
+            run: WelcomeTaskRun::Remaining(remaining),
+        })
+    }
+
     /// Drop the results of every Welcome whose group `gone` names, so that
     /// finishing this task changes nothing of a group the host left or
     /// deleted while the task ran. Their records stay as preparation left
@@ -351,30 +387,24 @@ impl CompletedWelcomePublishTask {
         completed.completions = completions;
         before - completed.metadata.len()
     }
-
-    /// Record the finished audit row of each pass of this task that reached
-    /// relays, from the answers it got, with no stored outcome: for a task
-    /// dropped unsettled as its worker stops. Its records stay as preparation
-    /// left them, and its Welcomes stay owed.
-    pub fn record_unsettled_passes(&self) {
-        for completion in self.completed.completions.iter().flatten() {
-            record_dropped_completion(&self.completed.audit, completion);
-        }
-    }
 }
 
 /// The finished row of a pass that reached relays and whose results are
 /// dropped unreconciled.
 fn record_dropped_completion(audit: &SharedRecorder, completion: &LegacyPublishCompletion) {
-    if let LegacyPublishCompletion::Network(attempt, result) = completion
-        && let Some(pass) = &attempt.v5_welcome
-    {
-        pass.record_dropped(
-            audit,
-            result,
-            &attempt.retry_endpoints,
-            attempt.required_acks,
-        );
+    match completion {
+        LegacyPublishCompletion::Network(attempt, result) => {
+            if let Some(pass) = &attempt.v5_welcome {
+                pass.record_dropped(
+                    audit,
+                    result,
+                    &attempt.retry_endpoints,
+                    attempt.required_acks,
+                );
+            }
+        }
+        LegacyPublishCompletion::Remaining(pass) => pass.record_dropped(audit),
+        LegacyPublishCompletion::Complete(_) => {}
     }
 }
 
@@ -386,18 +416,41 @@ impl PreparedWelcomePublishTask {
 
     /// Run only the bounded relay publication phase. This owns no engine or
     /// SQLite state and is therefore safe to poll beside the account worker.
+    /// A wave returns once each of its passes is done; the relays a pass was
+    /// still waiting on are left in the result
+    /// ([`CompletedWelcomePublishTask::take_remaining`]), still asking.
     pub async fn run(self) -> CompletedWelcomePublishTask {
-        CompletedWelcomePublishTask {
-            completed: self
-                .prepared
-                .publish(
-                    self.adapter.as_ref(),
-                    self.wall_clock.as_ref(),
-                    Some(&self.holds),
-                    Some(&self.selection),
-                )
-                .await,
-            message_ids: self.message_ids,
+        match self.run {
+            WelcomeTaskRun::Wave {
+                adapter,
+                wall_clock,
+                prepared,
+                holds,
+                selection,
+            } => {
+                // Each relay request owns the adapter, so a relay still
+                // answering can outlive this wave.
+                let send = move |request| -> RelayPublish<'static> {
+                    let adapter = adapter.clone();
+                    async move { adapter.publish(request).await }.boxed()
+                };
+                let (completed, mut remaining) = prepared
+                    .publish(&send, wall_clock.as_ref(), Some(&holds), Some(&selection))
+                    .await;
+                if let Some(remaining) = remaining.as_mut() {
+                    remaining.start();
+                }
+                CompletedWelcomePublishTask {
+                    completed,
+                    message_ids: self.message_ids,
+                    remaining,
+                }
+            }
+            WelcomeTaskRun::Remaining(remaining) => CompletedWelcomePublishTask {
+                completed: remaining.run().await,
+                message_ids: self.message_ids,
+                remaining: None,
+            },
         }
     }
 }
@@ -412,13 +465,22 @@ impl PreparedWelcomePublish {
 
     /// Check the owner's current hold before starting each queued attempt.
     /// Already-started relay I/O still completes under its original contract.
-    async fn publish(
+    ///
+    /// Each attempt asks its relays through `send`, one request per relay when
+    /// it has more than its goal (`relay_sends`), and is done once their
+    /// answers meet its goal or all have answered. A relay that answers while
+    /// the wave still runs joins its pass. The relays still answering once
+    /// every pass is done are returned, still asking.
+    async fn publish<'a, S>(
         mut self,
-        adapter: &dyn TransportAdapter,
+        send: &S,
         wall_clock: &dyn WallClock,
         holds: Option<&DetachedWelcomeHolds>,
         selection: Option<&Arc<futures::lock::Mutex<()>>>,
-    ) -> CompletedWelcomePublish {
+    ) -> (CompletedWelcomePublish, Option<RemainingWelcomeSends<'a>>)
+    where
+        S: Fn(TransportPublishRequest) -> RelayPublish<'a> + Sync,
+    {
         let audit = &self.audit;
         let publish = |index, mut attempt: Box<PreparedLegacyPublishAttempt>| async move {
             let mut selection = match selection {
@@ -450,7 +512,11 @@ impl PreparedWelcomePublish {
                 if let Some(pass) = attempt.v5_welcome.as_mut() {
                     pass.start(audit);
                 }
-                let mut future = adapter.publish(attempt.request.clone());
+                let mut future = until_met(
+                    relay_sends(send, &attempt.request),
+                    attempt.request.required_acks,
+                )
+                .boxed();
                 let result = future.poll_unpin(cx).map(Ok);
                 publishing = Some(future);
                 drop(selection.take());
@@ -466,31 +532,77 @@ impl PreparedWelcomePublish {
             };
             in_flight.push(publish(index, attempt));
         }
-        while let Some((index, attempt, result)) = in_flight.next().await {
-            self.completions[index] = Some(match result {
-                Ok(result) => LegacyPublishCompletion::Network(attempt, result),
-                Err(WelcomeHold::AwaitsCommit) => {
-                    LegacyPublishCompletion::Complete(PublishStatus {
-                        awaits_commit: true,
-                        ..PublishStatus::default()
-                    })
+        // Each done pass, by index, with its answers so far, and the answers
+        // still to come from the relays a done pass was waiting on.
+        let mut done: Vec<(usize, Box<PreparedLegacyPublishAttempt>, Vec<_>)> = Vec::new();
+        let mut late = FuturesUnordered::new();
+        while !in_flight.is_empty() {
+            let next = futures::future::poll_fn(|cx| {
+                if let std::task::Poll::Ready(Some(answer)) = late.poll_next_unpin(cx) {
+                    return std::task::Poll::Ready(Err(answer));
                 }
-                Err(_) => LegacyPublishCompletion::Complete(PublishStatus {
-                    withdrawn: true,
-                    ..PublishStatus::default()
-                }),
-            });
+                in_flight.poll_next_unpin(cx).map(Ok)
+            })
+            .await;
+            let (index, attempt, result) = match next {
+                Ok(Some(started)) => started,
+                Ok(None) => break,
+                Err((index, answer)) => {
+                    if let Some((_, _, answers)) = done.iter_mut().find(|done| done.0 == index) {
+                        answers.push(answer);
+                    }
+                    continue;
+                }
+            };
+            match result {
+                Ok((answers, sends)) => {
+                    for send in sends {
+                        late.push(async move { (index, send.await) }.boxed());
+                    }
+                    done.push((index, attempt, answers));
+                }
+                Err(WelcomeHold::AwaitsCommit) => {
+                    self.completions[index] =
+                        Some(LegacyPublishCompletion::Complete(PublishStatus {
+                            awaits_commit: true,
+                            ..PublishStatus::default()
+                        }));
+                }
+                Err(_) => {
+                    self.completions[index] =
+                        Some(LegacyPublishCompletion::Complete(PublishStatus {
+                            withdrawn: true,
+                            ..PublishStatus::default()
+                        }));
+                }
+            }
             if let Some((next_index, next_attempt)) = self.pending.pop_front() {
                 in_flight.push(publish(next_index, next_attempt));
             }
         }
 
-        CompletedWelcomePublish {
-            group_id: self.group_id,
-            metadata: self.metadata,
-            completions: self.completions,
-            audit: self.audit.clone(),
+        let mut remaining =
+            RemainingWelcomeSends::new(late, self.group_id.clone(), self.audit.clone());
+        for (index, attempt, answers) in done {
+            remaining.push(
+                index,
+                &attempt,
+                self.metadata[index].group_id.clone(),
+                &answers,
+            );
+            let result = join_relay_answers(&attempt.request, answers);
+            self.completions[index] = Some(LegacyPublishCompletion::Network(attempt, result));
         }
+
+        (
+            CompletedWelcomePublish {
+                group_id: self.group_id,
+                metadata: self.metadata,
+                completions: self.completions,
+                audit: self.audit.clone(),
+            },
+            (!remaining.is_empty()).then_some(remaining),
+        )
     }
 }
 
@@ -665,6 +777,13 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// Welcomes whose withdrawal `withdraw_welcome` recorded, so the
     /// watcher does not record it again.
     v5_withdrawn_welcomes: std::sync::Mutex<HashSet<cgka_traits::MessageId>>,
+    /// The `(group, recipient)` pairs whose Welcome delivery state changed
+    /// and that no host has taken yet (`take_welcome_delivery_changes`).
+    welcome_delivery_changes: std::sync::Mutex<Vec<(GroupId, MemberId)>>,
+    /// Recipients whose last Welcome publish found no inbox route, paced so
+    /// maintenance does not prepare their Welcomes on every pass (see
+    /// `welcome_routes`).
+    welcome_route_retries: std::sync::Mutex<welcome_routes::WelcomeRouteRetries>,
     /// Whether the store has been read for `watched_welcomes`: the startup
     /// pass reads it, or else the first maintenance pass.
     welcome_store_read: bool,
@@ -743,6 +862,8 @@ where
             watched_welcomes: Vec::new(),
             v5_prepared_welcomes: HashSet::new(),
             v5_withdrawn_welcomes: std::sync::Mutex::new(HashSet::new()),
+            welcome_delivery_changes: std::sync::Mutex::new(Vec::new()),
+            welcome_route_retries: std::sync::Mutex::default(),
             welcome_store_read: false,
             unread_welcome_groups: Vec::new(),
             finish_stage_failure: None,
@@ -864,6 +985,19 @@ where
         limit: usize,
     ) -> AccountResult<cgka_traits::DeferredStallEvidence> {
         Ok(self.session.deferred_stall_evidence(group_id, limit)?)
+    }
+
+    /// Undecryptable objects retained since `min_epoch` up to the group's
+    /// current epoch; see `Engine::deferred_stall_evidence_since`.
+    pub fn deferred_stall_evidence_since(
+        &mut self,
+        group_id: &GroupId,
+        min_epoch: EpochId,
+        limit: usize,
+    ) -> AccountResult<cgka_traits::DeferredStallEvidence> {
+        Ok(self
+            .session
+            .deferred_stall_evidence_since(group_id, min_epoch, limit)?)
     }
 
     pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
@@ -6140,9 +6274,15 @@ where
                 accepted_before,
                 audit_v5::RouteSource::RetainedTarget,
             );
-            // The pass's per-endpoint results, joined for its finished row:
-            // each report, and the endpoint failures an adapter error names.
-            // One that names none leaves the row's results incomplete.
+            // The pass's per-endpoint results, joined for its finished row
+            // and a Welcome's delivery record: each report, and the endpoint
+            // failures an adapter error names. One that names none leaves the
+            // row's results incomplete.
+            let collects_pass_report = v5_welcome.is_some()
+                || matches!(
+                    fanout.exact_message.envelope,
+                    TransportEnvelope::Welcome { .. }
+                );
             let mut pass_report = TransportPublishReport {
                 message_id: message_id.clone(),
                 accepted: Vec::new(),
@@ -6221,14 +6361,14 @@ where
                                 reason: "fanout endpoint did not acknowledge".into(),
                             });
                         }
-                        if v5_welcome.is_some() {
+                        if collects_pass_report {
                             pass_report.accepted.extend(report.accepted.iter().cloned());
                             pass_report.failed.extend(report.failed.iter().cloned());
                         }
                         output.reports.push(report);
                     }
                     Err(error) => {
-                        if v5_welcome.is_some() {
+                        if collects_pass_report {
                             pass_report
                                 .failed
                                 .extend(error.publish_endpoint_failures().iter().cloned());
@@ -7273,13 +7413,18 @@ where
         let target = if let Some(fanout) = existing_fanout.as_ref() {
             fanout.target.clone()
         } else {
-            match self.routing.publish_target(&message) {
+            let routed = self.routing.publish_target(&message);
+            self.note_welcome_route(&message, routed.as_ref().map(|_| ()));
+            match routed {
                 Ok(target) => target,
                 Err(e) => {
                     self.record_v5_welcome_not_started(
                         welcome_facts.clone(),
-                        audit_v5::NotStartedReason::RouteResolutionFailed,
+                        welcome_routes::route_not_started_reason(&e),
                     );
+                    if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+                        self.record_welcome_route_failure(&message.id);
+                    }
                     self.record_audit_event(
                         welcome_facts.as_ref().map(|facts| &facts.group_id),
                         Some(publish_context),
@@ -7459,7 +7604,8 @@ where
         )))
     }
 
-    /// Save a publish pass's fanout bookkeeping. When that fails after the
+    /// Save a publish pass's fanout bookkeeping, and a Welcome's delivery
+    /// counts in the same transaction (mdk#1706). When that fails after the
     /// relays answered, the pass's finished row still records their answers,
     /// with no stored total, before the error returns.
     fn put_pass_fanout(
@@ -7469,15 +7615,65 @@ where
         report: Option<&TransportPublishReport>,
         attempted: &[TransportEndpoint],
     ) -> AccountResult<()> {
+        self.put_pass_fanout_counting(
+            fanout,
+            v5_welcome,
+            report,
+            attempted,
+            welcome_outcomes::PassCounts {
+                attempted,
+                report,
+                counts_attempt: true,
+            },
+        )
+    }
+
+    /// [`Self::put_pass_fanout`], counting the pass on the delivery record
+    /// as `counts` says.
+    fn put_pass_fanout_counting(
+        &self,
+        fanout: &DurableTransportFanout,
+        v5_welcome: &Option<V5WelcomePass>,
+        report: Option<&TransportPublishReport>,
+        attempted: &[TransportEndpoint],
+        counts: welcome_outcomes::PassCounts<'_>,
+    ) -> AccountResult<()> {
         // Test-only fault injection (`arm_finish_stage_failure`): the write
         // fails with transient contention.
-        let written = if self.finish_stage_failure.as_ref() == Some(&fanout.exact_message.id) {
-            Err(SessionError::from(StorageError::Busy(
-                "injected finish-stage failure".into(),
-            )))
-        } else {
-            self.session.put_transport_fanout(fanout)
-        };
+        // The counts and the retry record are one write, all or nothing: a
+        // delivery record that cannot be read fails the save like any storage
+        // error in it, never leaving the retry record saved without its
+        // counts. As for any failed save, the pass is retried and a relay
+        // that already stored the Welcome answers duplicate.
+        let written: AccountResult<()> =
+            if self.finish_stage_failure.as_ref() == Some(&fanout.exact_message.id) {
+                Err(
+                    SessionError::from(StorageError::Busy("injected finish-stage failure".into()))
+                        .into(),
+                )
+            } else {
+                let now = self.wall_clock.now();
+                self.welcome_delivery_group(fanout)
+                    .and_then(|group| {
+                        let delivery = group.map(|group| {
+                            (
+                                group,
+                                &fanout.exact_message.id,
+                                |record: &mut cgka_traits::maintenance::WelcomeDeliveryRecord| {
+                                    welcome_outcomes::record_pass(record, fanout, &counts, now)
+                                },
+                            )
+                        });
+                        Ok(self
+                            .session
+                            .put_transport_fanout_with_welcome_delivery(fanout, delivery)?)
+                    })
+                    .map(|saved| {
+                        if let Some(saved) = &saved {
+                            self.queue_welcome_delivery_change(saved);
+                        }
+                    })
+            };
         if written.is_err() {
             self.record_v5_welcome_publish_finished(
                 v5_welcome,
@@ -7487,7 +7683,7 @@ where
                 fanout.required_acks,
             );
         }
-        Ok(written?)
+        written
     }
 
     async fn finish_prepared_legacy_publish(

@@ -106,8 +106,13 @@ impl AppClient {
                         }
                     }
                 }
+                // Only deferred-capacity overflow signals active missing-history
+                // pressure. Retry-budget and residence-budget evictions retire
+                // old rows that already failed to open across their full local
+                // budget and must not arm a fresh epoch gap.
                 cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
                     group_id,
+                    resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
                     ..
                 } => {
                     let Ok(record) = self.runtime.group_record(group_id) else {
@@ -267,7 +272,10 @@ impl AppClient {
                     record.epoch,
                     now_ms,
                 ),
-            IngestOutcome::ResourceRefused { .. } => self
+            IngestOutcome::ResourceRefused {
+                resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+                ..
+            } => self
                 .history_recovery
                 .state
                 .epoch_stall
@@ -322,13 +330,14 @@ impl AppClient {
             .map(GroupId::new)
             .collect::<Vec<_>>();
         for group_id in groups {
-            let _ = self.seed_group_stall_from_rows(&group_id);
+            let _ = self.seed_group_stall_from_rows(&group_id, None);
         }
     }
 
     fn seed_group_stall_from_rows(
         &mut self,
         group_id: &GroupId,
+        min_epoch: Option<cgka_traits::EpochId>,
     ) -> Result<StallAssessment, AppError> {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return Ok(StallAssessment::Complete);
@@ -337,7 +346,12 @@ impl AppClient {
             return Ok(StallAssessment::Complete);
         }
         let limit = self.history_recovery.state.epoch_stall.threshold();
-        let evidence = self.runtime.deferred_stall_evidence(group_id, limit)?;
+        let evidence = match min_epoch {
+            Some(floor) => self
+                .runtime
+                .deferred_stall_evidence_since(group_id, floor, limit)?,
+            None => self.runtime.deferred_stall_evidence(group_id, limit)?,
+        };
         // Retained rows supply the first arm at an epoch, never paced re-arms.
         if evidence.rows.is_empty() {
             return Ok(StallAssessment::Complete);
@@ -900,7 +914,19 @@ impl AppClient {
                 .remove(group);
             return Ok(());
         }
-        if self.seed_group_stall_from_rows(group)? == StallAssessment::Deferred {
+        // An active epoch gap that partially advances (including across
+        // multiple commits or restarts, mdk#3558) preserves its original
+        // `evidence_floor_epoch` so rows deferred when the gap began still hand
+        // off until the missing commits arrive or the gap parks. A parked gap
+        // (`NeedsDeepRepair`) returns `None`, so only brand-new undecryptable
+        // rows at `record.epoch` can re-arm it.
+        let min_epoch = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .active_epoch_gap_evidence_floor(group.as_slice(), stalled_epoch)?
+            .map(cgka_traits::EpochId);
+        if self.seed_group_stall_from_rows(group, min_epoch)? == StallAssessment::Deferred {
             return Ok(());
         }
         if self

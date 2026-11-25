@@ -136,12 +136,14 @@ where
             .unwrap_or_else(|error| error.into_inner())
             .extend(message_ids.iter().cloned().map(|id| (id, None)));
         PreparedWelcomePublishTask {
-            adapter,
-            wall_clock: self.wall_clock.clone(),
-            prepared,
             message_ids,
-            holds: self.session.detached_welcome_holds.clone(),
-            selection: self.session.welcome_selection.clone(),
+            run: WelcomeTaskRun::Wave {
+                adapter,
+                wall_clock: self.wall_clock.clone(),
+                prepared,
+                holds: self.session.detached_welcome_holds.clone(),
+                selection: self.session.welcome_selection.clone(),
+            },
         }
     }
 
@@ -152,9 +154,11 @@ where
         &mut self,
         task: CompletedWelcomePublishTask,
     ) -> AccountResult<AccountDeviceEffects> {
+        // Relays left answering that the host did not take stop here.
         let CompletedWelcomePublishTask {
             completed,
             message_ids,
+            remaining: _,
         } = task;
         let mut output = AccountDeviceEffects::default();
         let result = self.finish_welcome_publish(completed, &mut output).await;
@@ -198,9 +202,18 @@ where
             self.prepared_welcome_tasks.push(task);
             return Ok(());
         }
-        let completed = prepared
-            .publish(&self.adapter, self.wall_clock.as_ref(), None, None)
+        let adapter = &self.adapter;
+        let (completed, remaining) = prepared
+            .publish(
+                &|request| adapter.publish(request),
+                self.wall_clock.as_ref(),
+                None,
+                None,
+            )
             .await;
+        // Inline, nothing waits for the relays a pass left answering: they
+        // stop here, and maintenance retries them after their backoff.
+        drop(remaining);
         self.finish_welcome_publish(completed, output).await
     }
 
@@ -279,6 +292,7 @@ where
                     self.finish_prepared_legacy_publish(*attempt, result, &mut effects)
                         .await
                 }
+                LegacyPublishCompletion::Remaining(pass) => self.finish_remaining_pass(*pass),
             };
             let status = match status {
                 Ok(status) => Some(status),
@@ -449,6 +463,7 @@ where
             None
         };
         let withdrawal = self.session.withdraw_sent_welcome(message_id)?;
+        self.note_welcome_delivery_changed(message_id);
         if withdrawal == WelcomeWithdrawal::AlreadyDelivered {
             return Ok(withdrawal);
         }
@@ -516,6 +531,7 @@ where
                 "acknowledged Welcome remains conservatively retryable"
             );
         }
+        self.note_welcome_delivery_changed(message_id);
     }
 
     /// Build the structured re-delivery record for a welcome that just failed
@@ -596,7 +612,10 @@ where
     /// stages with a commit: the caller
     /// publishes them only if the commit was published, and a commit left
     /// for retry confirms later.
+    /// Each also gets its delivery record ([`Self::record_new_welcomes`]).
     pub(super) fn watch_welcomes(&mut self, ids: impl IntoIterator<Item = cgka_traits::MessageId>) {
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        self.record_new_welcomes(&ids);
         for id in ids {
             if !self.watched_welcomes.contains(&id) {
                 self.watched_welcomes.push(id);
@@ -661,8 +680,9 @@ where
     /// Publish each watched Welcome that is owed and that no attempt record
     /// holds. A Welcome stays watched until its row is settled. While a stored
     /// fanout or a detached wave holds it, that record retries it;
-    /// once none does, as after a publish that found no route or a fanout that
-    /// expired, the next pass publishes it again, as the startup pass would.
+    /// once none does, as after a fanout that expired, the next pass publishes
+    /// it again, as the startup pass would. One whose last publish found no
+    /// route waits for its recipient's paced retry (`welcome_routes`).
     pub(super) async fn deliver_watched_welcomes(
         &mut self,
         output: &mut AccountDeviceEffects,
@@ -670,6 +690,8 @@ where
         self.read_welcome_store()?;
         let mut due: Vec<(GroupId, Vec<TransportMessage>)> = Vec::new();
         let mut watching = Vec::with_capacity(self.watched_welcomes.len());
+        // The recipients of every owed Welcome, unless a status read failed.
+        let mut owed_recipients = Some(HashSet::new());
         for id in std::mem::take(&mut self.watched_welcomes) {
             let status = self
                 .session
@@ -688,13 +710,26 @@ where
                     watching.push(id);
                 }
                 Ok((OutboundWelcomeStatus::Settled(settlement), _)) => {
-                    if !self.record_v5_welcome_settled(&id, settlement) {
+                    // Its watch ends only once a host is told and the
+                    // settlement recorded; the notice goes first, so a retry
+                    // never records the settlement twice.
+                    if !self.note_welcome_delivery_changed(&id)
+                        || !self.record_v5_welcome_settled(&id, settlement)
+                    {
                         watching.push(id);
                     }
                 }
-                Ok((OutboundWelcomeStatus::Waiting, _) | (_, true)) => watching.push(id),
-                Ok((OutboundWelcomeStatus::Owed { group_id, message }, false)) => {
+                Ok((OutboundWelcomeStatus::Waiting, _)) => watching.push(id),
+                Ok((OutboundWelcomeStatus::Owed { group_id, message }, held)) => {
                     watching.push(id);
+                    if let (Some(owed), Some(recipient)) =
+                        (owed_recipients.as_mut(), welcome_recipient(&message))
+                    {
+                        owed.insert(recipient);
+                    }
+                    if held || self.welcome_route_retry_holds(&message) {
+                        continue;
+                    }
                     match due.iter_mut().find(|(group, _)| *group == group_id) {
                         Some((_, welcomes)) => welcomes.push(message),
                         None => due.push((group_id, vec![message])),
@@ -707,11 +742,15 @@ where
                         transient = error.is_transient(),
                         "watched Welcome status unreadable"
                     );
+                    owed_recipients = None;
                     watching.push(id);
                 }
             }
         }
         self.watched_welcomes = watching;
+        if let Some(owed) = owed_recipients {
+            self.retain_welcome_route_retries(&owed);
+        }
         for (group_id, welcomes) in due {
             self.publish_welcome_fanout(welcomes, Some(group_id), output, None, false)
                 .await?;

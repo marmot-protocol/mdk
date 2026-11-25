@@ -17,6 +17,7 @@ pub(crate) fn runtime_message_update_from_event(
         | MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::GroupEvent(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::InviteDeliveryChanged { .. }
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
@@ -42,6 +43,7 @@ pub(crate) fn projection_update_from_event(
         | MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::GroupEvent(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::InviteDeliveryChanged { .. }
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
@@ -103,6 +105,7 @@ pub(crate) fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str,
         MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::InviteDeliveryChanged { .. }
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
@@ -137,6 +140,7 @@ pub(crate) fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &Gr
         MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::InviteDeliveryChanged { .. }
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
@@ -183,6 +187,7 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
         MarmotAppEvent::ProjectionUpdated(update) => update.update.chat_list_trigger,
         MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::InviteDeliveryChanged { .. }
         // A stalled group's escalation reports a repair need, not a state
         // change: the chat list has nothing new to show for it.
         | MarmotAppEvent::EpochStallEscalated { .. }

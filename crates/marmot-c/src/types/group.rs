@@ -110,6 +110,134 @@ c_mirror! {
     }
 }
 
+c_enum! {
+    /// Why an invite has not reached a relay (mdk#1706). `TooLarge` and
+    /// `KeyPackageRetired` are not produced yet.
+    MarmotInviteDeliveryProblem from marmot_uniffi::conversions::InviteDeliveryProblemFfi {
+        NoInboxRelays,
+        RefusedByRelays,
+        RelaysUnreachable,
+        Mixed,
+        TooLarge,
+        KeyPackageRetired,
+    }
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for MarmotInviteDeliveryProblem {
+    fn default() -> Self {
+        Self::NoInboxRelays
+    }
+}
+
+c_enum! {
+    /// Why an invite is no longer owed.
+    MarmotInviteCancelReason from marmot_uniffi::conversions::InviteCancelReasonFfi {
+        SupersededByGroupChange,
+        Withdrawn,
+    }
+}
+
+c_enum! {
+    /// Which `MarmotInviteDeliveryState` this is. `RelayAccepted` means a relay
+    /// stored the Welcome, not that the recipient received it or joined.
+    /// `Undeliverable` is not produced for invites yet.
+    MarmotInviteDeliveryStateKind {
+        Waiting,
+        Sending,
+        RelayAccepted,
+        Undeliverable,
+        Cancelled,
+    }
+}
+
+/// Where an invite's delivery stands. `problem` is read only when
+/// `has_problem` is true: `Sending`'s latest problem, or `Undeliverable`'s
+/// cause, which is always set. `cancel_reason` is read only for `Cancelled`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MarmotInviteDeliveryState {
+    pub kind: MarmotInviteDeliveryStateKind,
+    pub has_problem: bool,
+    pub problem: MarmotInviteDeliveryProblem,
+    pub cancel_reason: MarmotInviteCancelReason,
+}
+
+impl From<marmot_uniffi::conversions::InviteDeliveryStateFfi> for MarmotInviteDeliveryState {
+    fn from(value: marmot_uniffi::conversions::InviteDeliveryStateFfi) -> Self {
+        use marmot_uniffi::conversions::InviteDeliveryStateFfi as State;
+        let (kind, problem, cancel_reason) = match value {
+            State::Waiting => (MarmotInviteDeliveryStateKind::Waiting, None, None),
+            State::Sending { last_problem } => {
+                (MarmotInviteDeliveryStateKind::Sending, last_problem, None)
+            }
+            State::RelayAccepted => (MarmotInviteDeliveryStateKind::RelayAccepted, None, None),
+            State::Undeliverable { cause } => (
+                MarmotInviteDeliveryStateKind::Undeliverable,
+                Some(cause),
+                None,
+            ),
+            State::Cancelled { reason } => {
+                (MarmotInviteDeliveryStateKind::Cancelled, None, Some(reason))
+            }
+        };
+        Self {
+            kind,
+            has_problem: problem.is_some(),
+            problem: problem.map(Into::into).unwrap_or_default(),
+            cancel_reason: cancel_reason
+                .map(Into::into)
+                .unwrap_or(MarmotInviteCancelReason::Withdrawn),
+        }
+    }
+}
+
+c_mirror! {
+    /// How an invite's inbox relays answered, as counts, never names: of the
+    /// relays not `accepted`, by the latest attempt, `refused` answered and
+    /// said no for any reason (including rate-limited and auth-required),
+    /// `unreachable` gave no answer, `untried` were not tried.
+    MarmotInviteRelayCounts from marmot_uniffi::conversions::InviteRelayCountsFfi {
+        copy total: u32,
+        copy accepted: u32,
+        copy refused: u32,
+        copy unreachable: u32,
+        copy untried: u32,
+    }
+}
+
+c_mirror! {
+    /// One invited device's Welcome. Times are Unix seconds.
+    MarmotInviteDeviceDelivery from marmot_uniffi::conversions::InviteDeviceDeliveryFfi {
+        str delivery_id_hex,
+        copy state: MarmotInviteDeliveryState,
+        copy created_at: u64,
+        opt_copy has_deliver_until/deliver_until: u64,
+        copy attempt_count: u32,
+        opt_copy has_last_attempt_at/last_attempt_at: u64,
+        opt_copy has_accepted_at/accepted_at: u64,
+        rec relays: MarmotInviteRelayCounts,
+    }
+}
+
+c_mirror! {
+    /// Whether an invite reached the invited account's inbox relays (mdk#1706),
+    /// one per group and invited account: `RelayAccepted` once a relay stored
+    /// any device's Welcome, read with the device counts. `invite_id_hex` is
+    /// NULL for a group's founding members. Requires the matching library and
+    /// header.
+    MarmotInviteDelivery from marmot_uniffi::conversions::InviteDeliveryFfi,
+    list(MarmotInviteDeliveryList, marmot_invite_delivery_list_free) {
+        str group_id_hex,
+        str recipient_hex,
+        opt_str invite_id_hex,
+        copy state: MarmotInviteDeliveryState,
+        copy device_count: u32,
+        copy accepted_device_count: u32,
+        vec devices/devices_len: MarmotInviteDeviceDelivery,
+    }
+}
+
 c_mirror! {
     /// A group change of yours that was not applied (mdk#2332): its call
     /// answered `CompletionUnknown` (or `AcceptedPending`, queued) and MDK then
@@ -583,6 +711,138 @@ mod tests {
     use super::*;
     use crate::memory::boxed;
     use marmot_uniffi::conversions::SendAcceptDispositionFfi;
+
+    /// Each invite delivery state maps to its own kind, with its problem or
+    /// reason, and an invite delivery list and its change event free deeply.
+    #[test]
+    fn invite_delivery_states_keep_their_kind_and_free_deeply() {
+        use marmot_uniffi::conversions::{
+            InviteCancelReasonFfi as Reason, InviteDeliveryFfi,
+            InviteDeliveryProblemFfi as Problem, InviteDeliveryStateFfi as State,
+            InviteDeviceDeliveryFfi, InviteRelayCountsFfi,
+        };
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        for (state, kind, problem, reason) in [
+            (
+                State::Waiting,
+                MarmotInviteDeliveryStateKind::Waiting,
+                None,
+                None,
+            ),
+            (
+                State::Sending { last_problem: None },
+                MarmotInviteDeliveryStateKind::Sending,
+                None,
+                None,
+            ),
+            (
+                State::Sending {
+                    last_problem: Some(Problem::Mixed),
+                },
+                MarmotInviteDeliveryStateKind::Sending,
+                Some(MarmotInviteDeliveryProblem::Mixed),
+                None,
+            ),
+            (
+                State::RelayAccepted,
+                MarmotInviteDeliveryStateKind::RelayAccepted,
+                None,
+                None,
+            ),
+            (
+                State::Undeliverable {
+                    cause: Problem::RefusedByRelays,
+                },
+                MarmotInviteDeliveryStateKind::Undeliverable,
+                Some(MarmotInviteDeliveryProblem::RefusedByRelays),
+                None,
+            ),
+            (
+                State::Cancelled {
+                    reason: Reason::SupersededByGroupChange,
+                },
+                MarmotInviteDeliveryStateKind::Cancelled,
+                None,
+                Some(MarmotInviteCancelReason::SupersededByGroupChange),
+            ),
+        ] {
+            let mirrored = MarmotInviteDeliveryState::from(state);
+            assert_eq!(mirrored.kind, kind, "{state:?}");
+            assert_eq!(mirrored.has_problem, problem.is_some(), "{state:?}");
+            if let Some(problem) = problem {
+                assert_eq!(mirrored.problem, problem, "{state:?}");
+            }
+            if let Some(reason) = reason {
+                assert_eq!(mirrored.cancel_reason, reason, "{state:?}");
+            }
+        }
+
+        let delivery = InviteDeliveryFfi {
+            group_id_hex: "12".repeat(16),
+            recipient_hex: "56".repeat(32),
+            invite_id_hex: Some("9a".repeat(32)),
+            state: State::RelayAccepted,
+            device_count: 2,
+            accepted_device_count: 1,
+            devices: vec![InviteDeviceDeliveryFfi {
+                delivery_id_hex: "34".repeat(32),
+                state: State::RelayAccepted,
+                created_at: 5,
+                deliver_until: None,
+                attempt_count: 2,
+                last_attempt_at: Some(6),
+                accepted_at: Some(6),
+                relays: InviteRelayCountsFfi {
+                    total: 3,
+                    accepted: 1,
+                    refused: 1,
+                    unreachable: 1,
+                    untried: 0,
+                },
+            }],
+        };
+        let list: MarmotInviteDeliveryList = vec![delivery.clone()].into();
+        unsafe {
+            assert_eq!(list.len, 1);
+            let item = &*list.items;
+            assert_eq!(
+                std::ffi::CStr::from_ptr(item.invite_id_hex)
+                    .to_str()
+                    .unwrap(),
+                "9a".repeat(32)
+            );
+            assert_eq!((item.accepted_device_count, item.device_count), (1, 2));
+            assert_eq!(item.devices_len, 1);
+            let device = &*item.devices;
+            assert!(!device.has_deliver_until);
+            assert!(device.has_accepted_at);
+            assert_eq!(device.accepted_at, 6);
+            assert_eq!(device.relays.refused, 1);
+            marmot_invite_delivery_list_free(boxed(list));
+        }
+        let event = boxed(crate::types::event::MarmotEvent::from(
+            marmot_uniffi::conversions::MarmotEventFfi::InviteDeliveryChanged {
+                account_id_hex: "78".repeat(32),
+                account_label: "alice".into(),
+                delivery,
+            },
+        ));
+        unsafe {
+            let crate::types::event::MarmotEvent::InviteDeliveryChanged { delivery, .. } = &*event
+            else {
+                panic!("an invite delivery change");
+            };
+            assert_eq!(
+                delivery.state.kind,
+                MarmotInviteDeliveryStateKind::RelayAccepted
+            );
+            crate::types::event::marmot_event_free(event);
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
 
     #[test]
     fn pending_welcome_outputs_preserve_diagnosis_and_free_deeply() {

@@ -69,9 +69,9 @@ use crate::types::group::{
     MarmotGroupCreationResult, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
     MarmotGroupInviteResult, MarmotGroupManagementState, MarmotGroupMutationResult,
     MarmotGroupPendingCommit, MarmotGroupRecoveryStatus, MarmotGroupRoster,
-    MarmotInitialGroupImage, MarmotInviteMembersResult, MarmotMemberKeyPackagePrewarmSummary,
-    MarmotMemberRef, MarmotPendingWelcomeDeliveryList, MarmotPreparedGroupImageUpload,
-    MarmotPreparedGroupImageUploadList,
+    MarmotInitialGroupImage, MarmotInviteDeliveryList, MarmotInviteMembersResult,
+    MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef, MarmotPendingWelcomeDeliveryList,
+    MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
 use crate::types::history_import::MarmotChatHistoryImportList;
 use crate::types::history_notice::{MarmotAccountRecoveryStatus, MarmotHistoryNoticeList};
@@ -823,6 +823,14 @@ c_cmd! {
     /// remains once per process/Welcome; query for later causes. Free the list
     /// with marmot_pending_welcome_delivery_list_free. Use matching artifacts.
     async fn marmot_pending_welcome_deliveries(account_ref: str) -> rec(MarmotPendingWelcomeDeliveryList) = pending_welcome_deliveries;
+
+    /// Whether each invite reached the invited account's inbox relays
+    /// (mdk#1706), one per group and invited account, for `group_id_hex` or,
+    /// when NULL, every group. `RelayAccepted` means a relay stored the
+    /// Welcome, not that the recipient received it or joined. Only invites sent
+    /// after this device upgraded are listed. Local read.
+    /// Free the list with marmot_invite_delivery_list_free.
+    async fn marmot_invite_deliveries(account_ref: str, group_id_hex: opt_str) -> rec(MarmotInviteDeliveryList) = invite_deliveries;
 
     /// Query advisory membership health and pending rejoin offers.
     /// Free with `marmot_group_recovery_status_free`.

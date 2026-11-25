@@ -4,7 +4,9 @@ use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{GroupEventKindFfi, MarmotEventFfi};
 
-use super::group::{MarmotAppGroupHydrationQuarantineReason, MarmotEventSizeClass};
+use super::group::{
+    MarmotAppGroupHydrationQuarantineReason, MarmotEventSizeClass, MarmotInviteDelivery,
+};
 use super::message::MarmotRuntimeMessageReceived;
 use super::timeline::MarmotRuntimeProjectionUpdate;
 use crate::memory::{CFree, free_c_string, owned_c_string, owned_opt_c_string};
@@ -355,6 +357,14 @@ pub enum MarmotEvent {
         /// Only meaningful when has_size_class is true.
         size_class: MarmotEventSizeClass,
     },
+    /// An invite's delivery state changed (mdk#1706): `delivery` is the
+    /// invited account's answer now. `RelayAccepted` means a relay stored the
+    /// Welcome, not that the recipient received it or joined.
+    InviteDeliveryChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+        delivery: MarmotInviteDelivery,
+    },
     /// This device armed `arms` epoch-gap backfills with no catch-up in
     /// between: the group cannot catch up; re-syncing is recommended.
     EpochStallEscalated {
@@ -521,6 +531,15 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 recipient_hex: owned_c_string(recipient_hex),
                 has_size_class: size_class.is_some(),
                 size_class: size_class.map(Into::into).unwrap_or_default(),
+            },
+            F::InviteDeliveryChanged {
+                account_id_hex,
+                account_label,
+                delivery,
+            } => Self::InviteDeliveryChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+                delivery: delivery.into(),
             },
             F::EpochStallEscalated {
                 account_id_hex,
@@ -711,6 +730,15 @@ impl CFree for MarmotEvent {
                     free_c_string(*group_id_hex);
                     free_c_string(*message_id_hex);
                     free_c_string(*recipient_hex);
+                }
+                Self::InviteDeliveryChanged {
+                    account_id_hex,
+                    account_label,
+                    delivery,
+                } => {
+                    free_c_string(*account_id_hex);
+                    free_c_string(*account_label);
+                    delivery.free_in_place();
                 }
                 Self::EpochStallEscalated {
                     account_id_hex,

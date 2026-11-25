@@ -662,6 +662,9 @@ pub(crate) fn handle_app_runtime_event(
         // The durable record + `redeliver_welcome` handle the repair; this
         // daemon activity path has no runtime-summary shape to record for it.
         marmot_app::MarmotAppEvent::WelcomeDeliveryPending { .. } => {}
+        // An invite's delivery state changed (mdk#1706). Hosts read it from
+        // `invite_deliveries`; there is no activity summary shape for it.
+        marmot_app::MarmotAppEvent::InviteDeliveryChanged { .. } => {}
         // A group's epoch-gap backfill kept arming without catching up. Like the
         // welcome-repair signal above, this reports a repair need rather than
         // runtime activity, so there is no summary shape to record: it reaches

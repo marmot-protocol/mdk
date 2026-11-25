@@ -29,16 +29,19 @@ pub use key_package::{
     NoopKeyPackagePublisher,
 };
 pub use recovery_key::seal_to_recovery_key;
-pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
+pub use routing::{
+    MissingInboxRouteCause, StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy,
+};
 pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,
     CompletedWelcomePublishTask, DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport,
     FailedApplicationMessage, ForeignSlotOutcome, ForeignSlotPublication, GroupMaintenanceRows,
-    GroupRejoinStatus, MaintenanceActivity, MaintenanceAttemptDuration, MaintenanceDue,
-    MaintenanceTiming, OversizedArtifact, OversizedEvent, PendingCommit, PendingCommitState,
-    PendingResolution, PreparedSessionCommit, PreparedSessionSend, PreparedWelcomePublishTask,
-    PublishFailure, PublishedApplicationMessage, UndeliveredCommit, UnresolvedApplicationMessage,
-    UnresolvedPublish, UnresolvedPublishReason, WallClockWindow, WelcomeDeliveryFailure,
+    GroupRejoinStatus, INVITE_DELIVERY_RETENTION_SECS, MaintenanceActivity,
+    MaintenanceAttemptDuration, MaintenanceDue, MaintenanceTiming, OversizedArtifact,
+    OversizedEvent, PendingCommit, PendingCommitState, PendingResolution, PreparedSessionCommit,
+    PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage,
+    UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
+    WallClockWindow, WelcomeDeliveryFailure, WelcomeDeliveryOutcome,
 };
 pub use session::{
     CreateGroupEffects, GroupAuthorityView, HydrationProgress, PublishWork, QueuedIntentRef,

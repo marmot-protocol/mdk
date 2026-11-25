@@ -16,10 +16,12 @@
 //!   device reads one only in the device group it trusts and ignores it in any
 //!   other group, so no chat projects one and no host sends one as a custom
 //!   event.
-//! - [`AppClient::ensure_sent_by`] reads which slot sent a message from the
-//!   sending leaf's device tag (D33), through 3.1d's one tag reader. A
-//!   message from an earlier epoch is read from that epoch's retained anchor,
-//!   so one older than the retained anchors has no readable sender.
+//! - [`AppClient::sending_device`] reads which slot sent a message from the
+//!   sending leaf's device tag (D33), through 3.1d's one tag reader, and
+//!   [`AppClient::ensure_sent_by`] checks it against the sender a payload
+//!   names. A message from an earlier epoch is read from that epoch's
+//!   retained anchor, so one older than the retained anchors has no readable
+//!   sender.
 //! - [`AppClient::device_group_exchange`] names the device group, its roster,
 //!   this device's slot and whether this device's own leaf is tagged, which
 //!   decides whether siblings will read what it sends.
@@ -267,11 +269,16 @@ impl AppClient {
                 }
             }
             KIND_SMALL_STATE_UPDATE => {
-                self.receive_small_state_update(group_id, epoch.0, &message.content)
+                self.ensure_small_state_sender(group_id, sender)
+                    .and_then(|()| {
+                        self.receive_small_state_update(group_id, epoch.0, &message.content)
+                    })
             }
-            KIND_SMALL_STATE_BROADCAST_REQUEST => {
-                self.receive_small_state_broadcast_request(group_id, &message.content)
-            }
+            KIND_SMALL_STATE_BROADCAST_REQUEST => self
+                .ensure_small_state_sender(group_id, sender)
+                .and_then(|()| {
+                    self.receive_small_state_broadcast_request(group_id, &message.content)
+                }),
             _ => return Ok(()),
         };
         let result = result.and_then(|()| {
@@ -308,19 +315,35 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         roster: &DeviceRosterV1,
-        (epoch, sender_leaf_index): (EpochId, Option<u32>),
+        sender: (EpochId, Option<u32>),
         from: &DeviceSlotId,
     ) -> Result<(), AppError> {
+        if self.sending_device(group_id, roster, sender)? == *from {
+            Ok(())
+        } else {
+            Err(AppError::DeviceGroupRefused("sender_not_tagged"))
+        }
+    }
+
+    /// The slot of the device `roster` lists whose leaf sent a message: the
+    /// one that leaf's device tag reads as at the message's epoch. Refused as
+    /// [`Self::ensure_sent_by`] refuses, for a kind whose payload names no
+    /// sender.
+    pub(crate) fn sending_device(
+        &mut self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+        (epoch, sender_leaf_index): (EpochId, Option<u32>),
+    ) -> Result<DeviceSlotId, AppError> {
         let claim = match sender_leaf_index {
             Some(leaf) => self
                 .runtime
                 .member_device_tag_claim_at(group_id, epoch, leaf, roster)?,
             None => None,
         };
-        if claim == Some(DeviceTagClaim::Device(*from)) {
-            Ok(())
-        } else {
-            Err(AppError::DeviceGroupRefused("sender_not_tagged"))
+        match claim {
+            Some(DeviceTagClaim::Device(slot)) => Ok(slot),
+            _ => Err(AppError::DeviceGroupRefused("sender_not_tagged")),
         }
     }
 

@@ -70,29 +70,31 @@ pub(super) async fn drain(runtime: &crate::MarmotAppRuntime) -> oneshot::Receive
     drained
 }
 
-/// A hold the worker of one account, by id, enters after it settles a wave
-/// and before it answers the waits on it: the notifiers it enters and waits
-/// on.
-type SettleHold = (String, Arc<Notify>, Arc<Notify>);
-static HOLD_AFTER_SETTLE: std::sync::Mutex<Option<SettleHold>> = std::sync::Mutex::new(None);
+/// A hold the worker of one account enters after it settles a wave and
+/// before it answers the waits on it: the notifiers it enters and waits on.
+/// Kept by account id, so tests that share a process do not take each
+/// other's hold.
+type SettleHold = (Arc<Notify>, Arc<Notify>);
+static HOLD_AFTER_SETTLE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, SettleHold>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Hold the worker of the account `account_id_hex` after it next settles a
 /// wave.
 fn hold_after_settle(account_id_hex: &str) -> (Arc<Notify>, Arc<Notify>) {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
-    *HOLD_AFTER_SETTLE.lock().unwrap() =
-        Some((account_id_hex.to_owned(), entered.clone(), release.clone()));
+    HOLD_AFTER_SETTLE.lock().unwrap().insert(
+        account_id_hex.to_owned(),
+        (entered.clone(), release.clone()),
+    );
     (entered, release)
 }
 
 /// The worker's side of [`hold_after_settle`].
 pub(in crate::runtime::account_worker) async fn held_after_settle(account_id_hex: &str) {
-    let held = HOLD_AFTER_SETTLE
-        .lock()
-        .unwrap()
-        .take_if(|(held, ..)| held == account_id_hex);
-    if let Some((_, entered, release)) = held {
+    let held = HOLD_AFTER_SETTLE.lock().unwrap().remove(account_id_hex);
+    if let Some((entered, release)) = held {
         entered.notify_one();
         release.notified().await;
     }
@@ -316,6 +318,420 @@ async fn a_startup_retry_settling_after_its_chat_is_deleted_leaves_it_alone() {
     }
     assert_eq!(pending_of(&runtime, &group).await.len(), 1);
     close(&runtime).await;
+}
+
+/// A founding Welcome to bob, whose two inbox relays answer at different
+/// speeds, settles at the first relay's acceptance: a pending-deliveries
+/// read answers with it delivered while the other relay is held, since a
+/// read waits for no remaining wave. Once that relay answers, the worker
+/// settles the remaining wave, which records its acceptance as a pass of
+/// its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_welcome_settles_at_its_first_relay_and_records_the_slower_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let bob = AccountHome::open(dir.path()).create_account("bob").unwrap();
+    let Alice {
+        account,
+        app,
+        relay,
+        runtime,
+        ..
+    } = alice_with_groups(&dir, []).await;
+    let mut relay_lists = crate::AccountRelayListStatus::empty();
+    relay_lists.inbox.created_at = 1;
+    relay_lists.inbox.relays = vec![
+        "wss://relay.example".to_owned(),
+        "wss://slow.example".to_owned(),
+    ];
+    relay_lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&bob.account_id_hex, &relay_lists)
+        .unwrap();
+    runtime.publish_key_package("bob").await.unwrap();
+    runtime
+        .set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .await
+        .unwrap();
+    let (held, release) =
+        relay.hold_next_publish_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    let group = runtime
+        .create_group(
+            "alice",
+            "two inbox relays",
+            std::slice::from_ref(&bob.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, held.notified())
+        .await
+        .expect("one inbox relay holds the Welcome");
+
+    let listed = timeout(SETTLE, read_pending(&runtime).await)
+        .await
+        .expect("the read does not wait for the held relay")
+        .unwrap()
+        .unwrap();
+    assert!(
+        listed
+            .iter()
+            .all(|pending| pending.group_id_hex != hex::encode(group.as_slice())),
+        "the other relay's acceptance settled the Welcome"
+    );
+
+    let (settled, resume) = hold_after_settle(&account.account_id_hex);
+    release.notify_one();
+    timeout(SETTLE, settled.notified())
+        .await
+        .expect("the worker settles the remaining wave once the relay answers");
+    resume.notify_one();
+    close(&runtime).await;
+    let passes = crate::tests::v5_audit_rows(&app, "alice")
+        .into_iter()
+        .filter(|row| row["event"]["type"] == "welcome_publish_finished")
+        .collect::<Vec<_>>();
+    assert_eq!(passes.len(), 2, "{passes:?}");
+    assert_eq!(passes[0]["event"]["policy"], "met", "{passes:?}");
+    let remaining = &passes[1]["event"];
+    assert_eq!(remaining["results_complete"], true, "{remaining}");
+    assert_eq!(remaining["accepted_this_attempt_count"], 1, "{remaining}");
+    assert_eq!(remaining["accepted_total_count"], 2, "{remaining}");
+    assert_eq!(remaining["retained_state"], "completed", "{remaining}");
+}
+
+/// Remember `relays` as the inbox relays of `account_id_hex`.
+fn remember_inboxes(app: &MarmotApp, account_id_hex: &str, relays: &[&str]) {
+    let mut relay_lists = crate::AccountRelayListStatus::empty();
+    relay_lists.inbox.created_at = 1;
+    relay_lists.inbox.relays = relays.iter().map(|relay| (*relay).to_owned()).collect();
+    relay_lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(account_id_hex, &relay_lists)
+        .unwrap();
+}
+
+/// Alice creates a group with bob, whose inbox relays are
+/// `wss://bob-first.example`, which takes his Welcome at once, and
+/// `wss://index.example`, which holds it for good. Returns once the wave
+/// settled the Welcome delivered and its remaining wave runs, asking the held
+/// relay.
+async fn a_held_remaining_wave(dir: &tempfile::TempDir) -> Alice<0> {
+    let bob = AccountHome::open(dir.path()).create_account("bob").unwrap();
+    let alice = alice_with_groups(dir, []).await;
+    remember_inboxes(
+        &alice.app,
+        &bob.account_id_hex,
+        &["wss://bob-first.example", "wss://index.example"],
+    );
+    alice.runtime.publish_key_package("bob").await.unwrap();
+    alice
+        .runtime
+        .set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .await
+        .unwrap();
+    alice
+        .relay
+        .block_indexer_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let group = alice
+        .runtime
+        .create_group(
+            "alice",
+            "held remaining wave",
+            std::slice::from_ref(&bob.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let listed = timeout(SETTLE, read_pending(&alice.runtime).await)
+        .await
+        .expect("the read does not wait for the held relay")
+        .unwrap()
+        .unwrap();
+    assert!(
+        listed
+            .iter()
+            .all(|pending| pending.group_id_hex != hex::encode(group.as_slice())),
+        "the first relay's acceptance settled the Welcome"
+    );
+    timeout(SETTLE, async {
+        while remaining_pass_rows(&alice.app, "welcome_publish_started").is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the remaining wave starts");
+    alice
+}
+
+/// The rows of type `kind` of the remaining passes, the passes over the
+/// relays a settled pass left answering.
+fn remaining_pass_rows(app: &MarmotApp, kind: &str) -> Vec<serde_json::Value> {
+    let rows = crate::tests::v5_audit_rows(app, "alice");
+    let remaining = rows
+        .iter()
+        .filter(|row| {
+            row["event"]["type"] == "welcome_publish_started"
+                && row["event"]["route_source"] == "retained_target"
+        })
+        .map(|row| row["event"]["attempt_id"].clone())
+        .collect::<Vec<_>>();
+    rows.into_iter()
+        .filter(|row| {
+            row["event"]["type"] == kind && remaining.contains(&row["event"]["attempt_id"])
+        })
+        .collect()
+}
+
+/// A cancelled remaining wave records nothing: its pass has its started row
+/// and no finished row, and its relay stays owed. Each first pass's
+/// finished row stands, its Welcome delivered by its one stored acceptance.
+fn assert_the_cancelled_remaining_wave_recorded_nothing(app: &MarmotApp, first_passes: usize) {
+    assert_eq!(remaining_pass_rows(app, "welcome_publish_started").len(), 1);
+    let finished = remaining_pass_rows(app, "welcome_publish_finished");
+    assert!(finished.is_empty(), "{finished:?}");
+    let first = crate::tests::v5_audit_rows(app, "alice")
+        .into_iter()
+        .filter(|row| row["event"]["type"] == "welcome_publish_finished")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first.len(),
+        first_passes,
+        "each first pass finished: {first:?}"
+    );
+    for first in &first {
+        assert_eq!(first["event"]["accepted_total_count"], 1, "{first}");
+        assert_eq!(first["event"]["retained_state"], "completed", "{first}");
+    }
+}
+
+/// L3 with a remaining wave still held when the shutdown bound passes: the
+/// worker cancels it and waits for it before the audit closes, and it
+/// records nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cancels_a_held_remaining_wave_and_records_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let Alice { app, runtime, .. } = a_held_remaining_wave(&dir).await;
+
+    close(&runtime).await;
+
+    assert_the_cancelled_remaining_wave_recorded_nothing(&app, 1);
+}
+
+/// The same at sign-out (`WelcomeRuns::stop`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sign_out_cancels_a_held_remaining_wave_and_records_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let Alice { app, runtime, .. } = a_held_remaining_wave(&dir).await;
+
+    timeout(
+        SETTLE,
+        runtime.sign_out(
+            "alice",
+            crate::SignOutOptions {
+                delete_key_packages: false,
+            },
+        ),
+    )
+    .await
+    .expect("sign-out ends the remaining wave")
+    .unwrap();
+    runtime.shutdown_and_close().await.unwrap();
+
+    assert_the_cancelled_remaining_wave_recorded_nothing(&app, 1);
+}
+
+/// The same at an unlink, which stops the worker its own way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlinking_cancels_a_held_remaining_wave_and_records_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let Alice { app, runtime, .. } = a_held_remaining_wave(&dir).await;
+
+    timeout(SETTLE, runtime.accounts().unlink_device_for_test("alice"))
+        .await
+        .expect("the worker takes the unlink")
+        .unwrap();
+    close(&runtime).await;
+
+    assert_the_cancelled_remaining_wave_recorded_nothing(&app, 1);
+}
+
+/// A stop that finds a first wave already returned, its pass settled at one
+/// relay's acceptance while another relay is still pending, settles it as
+/// the worker would have: the acceptance reaches the retry record and the
+/// Welcome is delivered, while the pending relay's remaining wave is
+/// cancelled, records nothing, and leaves that relay owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_settles_a_first_wave_that_already_returned() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let bob = home.create_account("bob").unwrap();
+    let carol = home.create_account("carol").unwrap();
+    let Alice {
+        account,
+        app,
+        relay,
+        runtime,
+        ..
+    } = alice_with_groups(&dir, []).await;
+    remember_inboxes(
+        &app,
+        &bob.account_id_hex,
+        &["wss://bob-first.example", "wss://index.example"],
+    );
+    remember_inboxes(&app, &carol.account_id_hex, &["wss://carol-only.example"]);
+    runtime.publish_key_package("bob").await.unwrap();
+    runtime.publish_key_package("carol").await.unwrap();
+    runtime
+        .set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .await
+        .unwrap();
+    relay
+        .block_indexer_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Bob's first relay holds his Welcome, so his wave has not returned yet.
+    let (held, release) =
+        relay.hold_next_publish_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    runtime
+        .create_group(
+            "alice",
+            "bob's chat",
+            std::slice::from_ref(&bob.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, held.notified())
+        .await
+        .expect("bob's first relay holds his Welcome");
+    // The worker holds still once it settled carol's wave, so bob's wave
+    // returns while nothing settles it.
+    let (settled, resume) = hold_after_settle(&account.account_id_hex);
+    runtime
+        .create_group(
+            "alice",
+            "carol's chat",
+            std::slice::from_ref(&carol.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, settled.notified())
+        .await
+        .expect("the worker settles carol's wave");
+    release.notify_one();
+    // The returning wave starts the remaining pass over bob's held relay.
+    timeout(SETTLE, async {
+        while remaining_pass_rows(&app, "welcome_publish_started").is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("bob's wave returns");
+    let worker = runtime
+        .accounts()
+        .workers
+        .lock()
+        .await
+        .remove(&account.account_id_hex)
+        .expect("alice's worker");
+    worker.shutdown.send(()).unwrap();
+    resume.notify_one();
+    timeout(SETTLE, worker.handle)
+        .await
+        .expect("the worker stops")
+        .unwrap();
+
+    assert_the_cancelled_remaining_wave_recorded_nothing(&app, 2);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A stop that finds a remaining wave already returned, but not yet settled,
+/// settles it as the worker would have: its relay's acceptance reaches the
+/// retry record, so the finished row reports the stored total, not an
+/// unknown one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_settles_a_remaining_wave_that_already_returned() {
+    let dir = tempfile::tempdir().unwrap();
+    let bob = AccountHome::open(dir.path()).create_account("bob").unwrap();
+    let Alice {
+        account,
+        app,
+        relay,
+        runtime,
+        ..
+    } = alice_with_groups(&dir, []).await;
+    remember_inboxes(
+        &app,
+        &bob.account_id_hex,
+        &["wss://bob-first.example", "wss://bob-second.example"],
+    );
+    runtime.publish_key_package("bob").await.unwrap();
+    runtime
+        .set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .await
+        .unwrap();
+    let (held, release) =
+        relay.hold_next_publish_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    // The worker holds still once it settled the first wave, before it takes
+    // the remaining wave up.
+    let (settled, resume) = hold_after_settle(&account.account_id_hex);
+    runtime
+        .create_group(
+            "alice",
+            "returned remaining wave",
+            std::slice::from_ref(&bob.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, held.notified())
+        .await
+        .expect("bob's first relay holds his Welcome");
+    timeout(SETTLE, settled.notified())
+        .await
+        .expect("the worker settles the first wave");
+
+    release.notify_one();
+    app.welcome_waves_in_flight
+        .ended_by(tokio::time::Instant::now() + SETTLE)
+        .await;
+    assert_eq!(
+        gift_wraps_published(&relay),
+        2,
+        "both relays took the Welcome"
+    );
+    let worker = runtime
+        .accounts()
+        .workers
+        .lock()
+        .await
+        .remove(&account.account_id_hex)
+        .expect("alice's worker");
+    worker.shutdown.send(()).unwrap();
+    resume.notify_one();
+    timeout(SETTLE, worker.handle)
+        .await
+        .expect("the worker stops")
+        .unwrap();
+
+    let finished = remaining_pass_rows(&app, "welcome_publish_finished");
+    let [remaining] = finished.as_slice() else {
+        panic!("one remaining pass: {finished:?}");
+    };
+    assert_eq!(remaining["event"]["results_complete"], true, "{remaining}");
+    assert_eq!(remaining["event"]["accepted_total_count"], 2, "{remaining}");
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 /// W8: a pending-deliveries read waits only for the waves started before
@@ -759,4 +1175,195 @@ async fn unlinking_ends_a_held_wave() {
         .expect("unlinking ends the held wave")
         .unwrap();
     runtime.shutdown_and_close().await.unwrap();
+}
+
+/// mdk#1706: a host reads each invite's delivery from the public runtime,
+/// and is told when it changes. A founding Welcome no relay takes reads as
+/// still being sent, and its worker announces that; after a restart whose
+/// retry a relay stores, the durable record reads as accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_deliveries_answer_from_durable_records_and_announce_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, bob) = alice_and_bob(&dir).await;
+    let Alice { relay, runtime, .. } = alice;
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    let mut events = runtime.subscribe();
+    let group = runtime
+        .create_group(
+            "alice",
+            "invite delivery",
+            std::slice::from_ref(&bob.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let invites = runtime
+        .invite_deliveries("alice", Some(&group))
+        .await
+        .unwrap();
+    assert_eq!(invites.len(), 1, "{invites:?}");
+    let invite = &invites[0];
+    assert_eq!(invite.recipient_hex, bob.account_id_hex);
+    assert_eq!(invite.invite_id_hex, None, "the create added bob");
+    assert!(
+        matches!(
+            invite.state,
+            crate::WelcomeDeliveryState::Sending {
+                last_problem: Some(_)
+            }
+        ),
+        "{invite:?}"
+    );
+    assert_eq!((invite.accepted_device_count, invite.device_count), (0, 1));
+    let mut announced = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let MarmotAppEvent::InviteDeliveryChanged { delivery, .. } = event {
+            announced.push(delivery);
+        }
+    }
+    assert_eq!(announced.last(), Some(invite), "{announced:?}");
+    close(&runtime).await;
+
+    relay.allow_all_publish_kinds();
+    let runtime = restart(&dir, &relay).await;
+    let invites = runtime
+        .invite_deliveries("alice", Some(&group))
+        .await
+        .unwrap();
+    assert_eq!(invites[0].state, crate::WelcomeDeliveryState::RelayAccepted);
+    assert_eq!(invites[0].accepted_device_count, 1);
+    assert_eq!(
+        runtime.invite_deliveries("alice", None).await.unwrap(),
+        invites
+    );
+    close(&runtime).await;
+}
+
+/// A raw connection to alice's account database, for putting it in a state
+/// no runtime call makes. The runtime must not be running.
+fn alices_database(app: &MarmotApp) -> rusqlite::Connection {
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+        .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+}
+
+/// mdk#1706: an invite whose Welcome existed before the device kept invite
+/// delivery records (an upgrade) is never listed by `invite_deliveries` and
+/// announces nothing, yet is delivered as before and stays a pending
+/// delivery while owed. An invite sent to the same account after the
+/// upgrade is listed and announced as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invite_from_before_the_upgrade_is_delivered_but_not_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, bob) = alice_and_bob(&dir).await;
+    let Alice {
+        app,
+        relay,
+        runtime,
+        ..
+    } = alice;
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    let group = runtime
+        .create_group(
+            "alice",
+            "from before",
+            std::slice::from_ref(&bob.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
+    close(&runtime).await;
+    // As a database from before the ledger: the owed Welcome has no record.
+    alices_database(&app)
+        .execute_batch("DELETE FROM cgka_welcome_delivery_ledger;")
+        .unwrap();
+
+    let runtime = restart(&dir, &relay).await;
+    let mut events = runtime.subscribe();
+    assert!(
+        runtime
+            .invite_deliveries("alice", Some(&group))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let pending = pending_of(&runtime, &group).await;
+    assert_eq!(pending.len(), 1, "still a pending delivery while owed");
+
+    relay.allow_all_publish_kinds();
+    runtime
+        .redeliver_welcome("alice", &pending[0].message_id_hex)
+        .await
+        .unwrap();
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(pending_of(&runtime, &group).await.is_empty(), "delivered");
+    assert!(
+        runtime
+            .invite_deliveries("alice", Some(&group))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, MarmotAppEvent::InviteDeliveryChanged { .. }),
+            "{event:?}"
+        );
+    }
+
+    // Bob is invited again after the upgrade: that invite is listed.
+    runtime
+        .remove_members("alice", &group, std::slice::from_ref(&bob.account_id_hex))
+        .await
+        .unwrap();
+    runtime.publish_key_package("bob").await.unwrap();
+    runtime
+        .invite_members("alice", &group, std::slice::from_ref(&bob.account_id_hex))
+        .await
+        .unwrap();
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
+    let invites = runtime
+        .invite_deliveries("alice", Some(&group))
+        .await
+        .unwrap();
+    assert_eq!(invites.len(), 1, "{invites:?}");
+    assert_eq!(invites[0].recipient_hex, bob.account_id_hex);
+    assert!(invites[0].invite_id_hex.is_some(), "the re-invite's commit");
+    assert_eq!(invites[0].state, crate::WelcomeDeliveryState::RelayAccepted);
+    let mut announced = false;
+    while let Ok(event) = events.try_recv() {
+        announced |= matches!(event, MarmotAppEvent::InviteDeliveryChanged { .. });
+    }
+    assert!(announced, "the re-invite is announced");
+    close(&runtime).await;
 }

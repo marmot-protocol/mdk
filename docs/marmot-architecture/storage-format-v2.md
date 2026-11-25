@@ -64,13 +64,17 @@ engine effects. The empty-journal path remains a bounded existence query, withou
 rebuilding the seen ring/index or loading all backfill intents. Consumption
 again removes both durable receipts (including an intervening stale checkpoint),
 arms the existing durable group backfill intent, and acknowledges the journal
-in one transaction. Migration `0215_released_receipt_stall_evidence` records
-whether each release is stall evidence: the engine releases a row that may
-predate this copy's Welcome through
-`release_message_for_replay_without_stall_evidence`, and consumption retires it
-like any other but arms no backfill from it, unless no recovery inventory row
-placed it: that backfill is then all that re-owes its redelivery. An id released again before
-consumption counts if either release did, at that release's epoch. The caller
+in one transaction. Migration `0215_released_receipt_stall_evidence` added `stall_evidence` for
+`release_message_for_replay_without_stall_evidence` (historically used for
+deferred rows predating this copy's Welcome): consuming such a journal entry
+retires its receipts without arming a backfill unless no recovery inventory row
+placed it. Today, budget-expired deferred-peel evictions (retry-budget and
+residence-budget) simply delete the row from `cgka_messages` without journaling
+a replay release, retiring `seen_events`, deleting reconciliation inventory, or
+uncovering coverage. Leaving coverage and inventory intact closes the immediate
+bounce-back loop, and keeping the `seen_events` entry suppresses ordinary-sweep
+re-staging while the event remains within the bounded 16,384-entry seen ring. An id released again
+before consumption counts if either release did, at that release's epoch. The caller
 then clears its in-memory seen ring/index synchronously, before any await or
 fallible operation. Process death before
 consumption leaves the journal; death after acknowledgment leaves clean disk

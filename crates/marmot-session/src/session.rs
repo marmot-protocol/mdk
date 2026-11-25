@@ -936,6 +936,19 @@ impl AccountDeviceSession {
         Ok(self.engine.deferred_stall_evidence(group_id, limit)?)
     }
 
+    /// Undecryptable objects retained since `min_epoch` up to the group's
+    /// current epoch; see `Engine::deferred_stall_evidence_since`.
+    pub fn deferred_stall_evidence_since(
+        &mut self,
+        group_id: &GroupId,
+        min_epoch: EpochId,
+        limit: usize,
+    ) -> SessionResult<cgka_traits::DeferredStallEvidence> {
+        Ok(self
+            .engine
+            .deferred_stall_evidence_since(group_id, min_epoch, limit)?)
+    }
+
     pub fn new_protocol_profile(&self) -> ProtocolProfile {
         self.engine.new_protocol_profile()
     }
@@ -981,6 +994,15 @@ impl AccountDeviceSession {
         now: Timestamp,
     ) -> SessionResult<OutboundWelcomeStatus> {
         Ok(self.engine.outbound_welcome_status(id, now)?)
+    }
+
+    /// See `Engine::stored_outbound_welcome_status`.
+    pub(crate) fn stored_outbound_welcome_status(
+        &self,
+        id: &MessageId,
+        now: Timestamp,
+    ) -> SessionResult<OutboundWelcomeStatus> {
+        Ok(self.engine.stored_outbound_welcome_status(id, now)?)
     }
 
     /// Native selection may yield or be cancelled after changing stored state.
@@ -2394,6 +2416,68 @@ impl AccountDeviceSession {
     /// list, as [`Self::group_evolutions`] is.
     pub fn commit_refusals(&self) -> SessionResult<Vec<cgka_traits::maintenance::CommitRefusal>> {
         Ok(self.storage.commit_refusals()?)
+    }
+
+    /// The stored Welcome delivery records of the account, or of `group_id`
+    /// (mdk#1706). Ungated, as [`Self::commit_refusals`] is, so a group that
+    /// is not live still shows its invites as they last stood.
+    pub fn welcome_delivery_records(
+        &self,
+        group_id: Option<&GroupId>,
+    ) -> SessionResult<Vec<cgka_traits::maintenance::WelcomeDeliveryRecord>> {
+        Ok(self.storage.welcome_delivery_records(group_id)?)
+    }
+
+    /// One Welcome's delivery record: one row's facts, ungated as
+    /// [`Self::stored_message_state`] is.
+    pub fn welcome_delivery_record(
+        &self,
+        welcome_id: &MessageId,
+    ) -> SessionResult<Option<cgka_traits::maintenance::WelcomeDeliveryRecord>> {
+        Ok(self.storage.welcome_delivery_record(welcome_id)?)
+    }
+
+    /// Write each of `records` that has no record yet, in one transaction
+    /// (see the storage method); all of one live group's.
+    pub fn insert_missing_welcome_delivery_records(
+        &self,
+        group_id: &GroupId,
+        records: &[cgka_traits::maintenance::WelcomeDeliveryRecord],
+    ) -> SessionResult<()> {
+        self.engine.check_group_live(group_id)?;
+        Ok(self
+            .storage
+            .insert_missing_welcome_delivery_records(records)?)
+    }
+
+    pub fn put_welcome_delivery_record(
+        &self,
+        record: &cgka_traits::maintenance::WelcomeDeliveryRecord,
+    ) -> SessionResult<()> {
+        self.engine.check_group_live(&record.group_id)?;
+        Ok(self.storage.put_welcome_delivery_record(record)?)
+    }
+
+    /// Save a Welcome's retry record and, when given and stored, the change
+    /// to its delivery record in one transaction (mdk#1706), so the counts
+    /// never disagree with the retry record a pass left. The retry record is
+    /// saved whatever the group's state; the delivery record only while the
+    /// group (`delivery`'s first part) is live.
+    pub fn put_transport_fanout_with_welcome_delivery(
+        &self,
+        fanout: &DurableTransportFanout,
+        delivery: Option<(
+            GroupId,
+            &MessageId,
+            impl FnOnce(&mut cgka_traits::maintenance::WelcomeDeliveryRecord),
+        )>,
+    ) -> SessionResult<Option<cgka_traits::maintenance::WelcomeDeliveryRecord>> {
+        let delivery = delivery
+            .filter(|(group_id, _, _)| self.engine.check_group_live(group_id).is_ok())
+            .map(|(_, welcome_id, change)| (welcome_id, change));
+        Ok(self
+            .storage
+            .put_transport_fanout_with_welcome_delivery(fanout, delivery)?)
     }
 
     /// Merge a confirmed commit's refused relays into its refusal record,

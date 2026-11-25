@@ -2796,20 +2796,46 @@ impl<S: StorageProvider> Engine<S> {
         }
         let row_limit = execution.row_limit();
 
-        // Residence expiry is independent of peel-context changes. Check it
-        // before the fingerprint gate so a permanently stable group can still
-        // release opaque local resource state.
-        let due = deferred
-            .iter()
-            .filter(|record| {
-                record.deferred_peel.as_ref().is_some_and(|lifecycle| {
-                    lifecycle.clock_instance_id == self.convergence_clock_instance_id
-                        && now.monotonic_ms >= lifecycle.residence_deadline_monotonic_ms
-                })
+        // Residence expiry is independent of peel-context changes. Evict
+        // already-expired rows immediately when they have already failed in the
+        // current peel context (so a permanently stable group still releases
+        // opaque state with zero peel work); if a newer peel context has
+        // arrived, let the main sweep loop give them one bounded peel attempt
+        // first so an unlocking commit landing at the deadline is never
+        // silently discarded.
+        let due_any = deferred.iter().any(|record| {
+            record.deferred_peel.as_ref().is_some_and(|lifecycle| {
+                lifecycle.clock_instance_id == self.convergence_clock_instance_id
+                    && now.monotonic_ms >= lifecycle.residence_deadline_monotonic_ms
             })
-            .take(row_limit)
-            .cloned()
-            .collect::<Vec<_>>();
+        });
+        let cached_context = if due_any {
+            Some(self.deferred_peel_context(group_id)?)
+        } else {
+            None
+        };
+        let current_epoch = self.epoch_manager.epoch(group_id).unwrap_or_default();
+        let due = if let Some(context) = cached_context.as_ref() {
+            deferred
+                .iter()
+                .filter(|record| {
+                    record.deferred_peel.as_ref().is_some_and(|lifecycle| {
+                        let expired = lifecycle.clock_instance_id
+                            == self.convergence_clock_instance_id
+                            && now.monotonic_ms >= lifecycle.residence_deadline_monotonic_ms;
+                        let context_changed = record.epoch != current_epoch
+                            || lifecycle
+                                .last_context_fingerprint
+                                .is_some_and(|fp| fp != context.full);
+                        expired && !context_changed
+                    })
+                })
+                .take(row_limit)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if !due.is_empty() {
             let mut released = 0usize;
             for metadata in &due {
@@ -2887,7 +2913,10 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(DeferredPeelWorkResult::complete());
         }
 
-        let context = self.deferred_peel_context(group_id)?;
+        let context = match cached_context {
+            Some(context) => context,
+            None => self.deferred_peel_context(group_id)?,
+        };
         tracing::debug!(
             target: "cgka_engine::message_processor",
             method = "retry_deferred_peels",
@@ -3132,17 +3161,10 @@ impl<S: StorageProvider> Engine<S> {
                 .deferred_peel
                 .as_ref()
                 .expect("deferred lifecycle normalized before sweep");
-            if lifecycle.live_context_attempts >= retry_budget {
-                execution.consume_row();
-                attempted += 1;
-                self.release_deferred_peel_row(
-                    &record,
-                    InboundResourceLimit::TransportDeferredRetryBudget,
-                    crate::message_disposition::MessageDisposition::RetryBudgetRefused,
-                )?;
-                terminal += 1;
-                continue;
-            }
+            let residence_expired = lifecycle.clock_instance_id
+                == self.convergence_clock_instance_id
+                && now.monotonic_ms >= lifecycle.residence_deadline_monotonic_ms;
+            let over_retry_budget = lifecycle.live_context_attempts >= retry_budget;
             execution.consume_row();
             attempted += 1;
             let remaining = execution.remaining(self.monotonic.elapsed());
@@ -3173,6 +3195,29 @@ impl<S: StorageProvider> Engine<S> {
             };
             if result {
                 progressed += 1;
+                continue;
+            }
+            // Give a newly arrived peel context one bounded attempt before
+            // deleting a row at the residence or retry cutoff so a commit that
+            // unlocks the row on the cutoff sweep is never silently discarded.
+            if residence_expired || over_retry_budget {
+                if let Ok(current) = self.storage.get_message(&record.id)
+                    && current.state == MessageState::PeelDeferred
+                {
+                    let (resource, disposition) = if residence_expired {
+                        (
+                            InboundResourceLimit::TransportDeferredResidenceBudget,
+                            crate::message_disposition::MessageDisposition::ResidenceBudgetRefused,
+                        )
+                    } else {
+                        (
+                            InboundResourceLimit::TransportDeferredRetryBudget,
+                            crate::message_disposition::MessageDisposition::RetryBudgetRefused,
+                        )
+                    };
+                    self.release_deferred_peel_row(&current, resource, disposition)?;
+                    terminal += 1;
+                }
                 continue;
             }
 

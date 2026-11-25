@@ -35,7 +35,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
   [a group change still being sent](#a-group-change-still-being-sent),
   [group changes that were not applied](#group-changes-that-were-not-applied),
-  [discarding a failed send](#discarding-a-failed-send), [undelivered Welcomes](#undelivered-welcomes),
+  [discarding a failed send](#discarding-a-failed-send), [undelivered Welcomes](#undelivered-welcomes), [invite delivery](#invite-delivery),
   [turning on account devices](#turning-on-account-devices),
   [backup recovery and background conditions](#backup-recovery-and-background-conditions),
   [group reporting](#group-reporting),
@@ -1352,14 +1352,53 @@ annotation to each existing repair row;
 older native builds supporting only schema 0176 cannot reopen the migrated database. There is no wire change or
 additional diagnostic network traffic.
 
+## Invite delivery
+
+`invite_deliveries(account_ref, group_id_hex)` answers "did my invite reach them?": one `InviteDeliveryFfi` per
+group and invited account (`group_id_hex: None` lists every group), as that account's newest invite left it.
+`InviteDeliveryChanged` carries the same record when an account's answer differs from the one last announced. The query
+is the source of truth: it derives each state from MDK's own record of the Welcome on every read, answers after a
+restart and for a group that is not loaded yet, and a missed, late or repeated event is harmless because a host can
+always read the query again.
+
+`state` is `Waiting` (the commit is not confirmed yet), `Sending { last_problem }`, `RelayAccepted`,
+`Undeliverable { cause }` or `Cancelled { reason }`. **`RelayAccepted` means a relay stored the Welcome, not that the
+recipient received it or joined.** Precisely, it means the Welcome met its configured acknowledgement count (one relay
+today) and MDK recorded it delivered; it comes only from MDK's own record of the Welcome, never from a relay count.
+Each invited device gets its own Welcome; the account reads `RelayAccepted` once any device's Welcome is, so show it
+with `accepted_device_count` of `device_count` ("1 of 2 devices").
+
+Only invites sent after the device upgraded to this version are listed. A Welcome that already existed then gets no
+record and never appears in `invite_deliveries` or `InviteDeliveryChanged`; it is delivered and retried as before and
+stays visible through `pending_welcome_deliveries` and `WelcomeDeliveryPending`.
+`devices` gives each Welcome's attempts and relay counts; relays are never named. `total` is the relays it is sent to
+and `accepted` those that stored it. Of the rest, by the latest attempt, `refused` counts relays that answered and
+said no for any reason (including rate-limited and auth-required), `unreachable` relays that gave no answer, and
+`untried` relays it did not try. `last_problem` says why the latest attempt fell short: `NoInboxRelays`,
+`RefusedByRelays` (every relay tried said no, possibly only for now), `RelaysUnreachable` or `Mixed`. A count of
+refused relays is not the terminal cause `Undeliverable { RefusedByRelays }`, which a later release gives only for
+permanent refusals. `Sending` can briefly show an accepted relay: MDK saves a relay's acceptance before it marks the
+Welcome delivered, and until that mark lands (in the same pass, or on the next maintenance pass if it failed) MDK may
+still send it; the state then becomes `RelayAccepted` and an `InviteDeliveryChanged` follows.
+
+MDK never removes an invitee because of this state: an invitee whose Welcome is not delivered is still a member.
+`Cancelled { SupersededByGroupChange }` means the change that added them lost to another change, and
+`Cancelled { Withdrawn }` that it was withdrawn or rolled back before reaching anyone; check the roster for who is a
+member. An invite drops out once all its devices' Welcomes have settled and 30 days have passed since its last
+activity; an account's newest invite is chosen first, so an older one never shows in its place. Ordinary invites have no delivery deadline yet, so
+`Undeliverable` and the `TooLarge` and `KeyPackageRetired` problems are not produced for them yet. The account
+database adds one table (schema 0225); older native builds cannot reopen it. There is no wire change.
+
 ## Members are accounts
 
 An account can have several devices in one group, each its own MLS leaf. Member
 rows, rosters, member-id pages and conversation snapshots list each account once,
 and `member_count`, admin counts, last-admin checks and direct-chat detection count
 accounts: a 1:1 chat stays a 1:1 whatever devices either person uses. A member row's
-`device_count` is how many of that account's devices are in the group; nothing else
-about another account's devices reaches the bindings. A group-system row marks only
+`device_count` is how many of that account's devices are in the group. The only other
+information about another account's devices is what [invite delivery](#invite-delivery)
+reports for accounts this account invited: one entry per invited device with its Welcome's
+id, delivery state, attempt times and relay counts, never relay names. A group-system row marks only
 an account's first device joining or its last device leaving.
 
 ## Turning on account devices

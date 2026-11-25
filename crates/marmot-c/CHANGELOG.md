@@ -19,6 +19,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 ### Added
 
 - `MarmotAgentItem` and `MarmotAgentItemState`: the latest version of a kind-1201 agent item on its timeline row.
+- `marmot_invite_deliveries` and `marmot_invite_delivery_list_free`, the `MarmotInviteDelivery` records with a
+  flattened `MarmotInviteDeliveryState`, and the `MARMOT_EVENT_INVITE_DELIVERY_CHANGED` event variant (mdk#1706).
+  `MarmotEvent` gains a variant: rebuild against the matching header and library.
 - `marmot_send_custom_event_with_client_token`: durable token admission of a custom application event, such as an
   answer or a control for an agent (kind 1202).
 - `marmot_submit_tagged_text`, `marmot_submit_tagged_reply`, `marmot_submit_thread_message`, and

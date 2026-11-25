@@ -1107,6 +1107,11 @@ pub struct AppClient {
     /// Welcomes already announced as pending by this process, so a Welcome
     /// that keeps failing on each maintenance pass is announced once.
     pub(crate) announced_welcome_failures: HashSet<MessageId>,
+    /// The invite delivery answer last announced for each group and invited
+    /// account this process announced one for (mdk#1706), so an answer is
+    /// announced only when it differs.
+    pub(crate) announced_invite_deliveries:
+        HashMap<(GroupId, cgka_traits::MemberId), crate::InviteDelivery>,
     /// The 461s this process sent to carry sibling Welcomes, until each
     /// settles. A carrier the engine holds that is not here was in flight
     /// when the app last stopped, so its Welcome is owed again.
@@ -7850,6 +7855,66 @@ impl AppClient {
                 recorded_at: record.recorded_at,
             })
             .collect())
+    }
+
+    /// Whether each invite of this account reached the invited account's
+    /// inbox relays (mdk#1706), one answer per group and invited account, for
+    /// `group_id` or every group the host may see. Read from the durable
+    /// records, so it answers after a restart and for a group that is not
+    /// loaded. `RelayAccepted` means a relay stored the Welcome, not that the
+    /// recipient received it or joined.
+    pub fn invite_deliveries(
+        &self,
+        group_id: Option<&GroupId>,
+    ) -> Result<Vec<crate::InviteDelivery>, AppError> {
+        let deliveries = self
+            .runtime
+            .welcome_delivery_outcomes(group_id, None)?
+            .into_iter()
+            .filter(|invite| {
+                invite
+                    .first()
+                    .is_some_and(|device| self.host_may_see_group(&device.record.group_id))
+            })
+            .collect();
+        Ok(crate::invite_deliveries::invite_deliveries(deliveries))
+    }
+
+    /// The invite answers that differ from the ones last announced, for the
+    /// runtime worker to broadcast as `InviteDeliveryChanged` events. Only the
+    /// accounts whose Welcomes a turn touched are read again, so a turn that
+    /// touched none reads nothing. A read that fails drops the notice; the
+    /// query still answers.
+    pub(crate) fn take_invite_delivery_changes(&mut self) -> Vec<crate::InviteDelivery> {
+        let mut changed = Vec::new();
+        for (group_id, recipient) in self.runtime.take_welcome_delivery_changes() {
+            if !self.host_may_see_group(&group_id) {
+                continue;
+            }
+            let answer = self
+                .runtime
+                .welcome_delivery_outcomes(Some(&group_id), Some(&recipient))
+                .map(crate::invite_deliveries::invite_deliveries);
+            let answer = match answer {
+                Ok(mut invites) => invites.pop(),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "take_invite_delivery_changes",
+                        error_kind = crate::AppError::from(error).privacy_safe_kind(),
+                        "invite delivery notice dropped"
+                    );
+                    continue;
+                }
+            };
+            let Some(answer) = answer else { continue };
+            let key = (group_id, recipient);
+            if self.announced_invite_deliveries.get(&key) != Some(&answer) {
+                self.announced_invite_deliveries.insert(key, answer.clone());
+                changed.push(answer);
+            }
+        }
+        changed
     }
 
     /// Re-publish a welcome that a confirmed create/invite failed to deliver,

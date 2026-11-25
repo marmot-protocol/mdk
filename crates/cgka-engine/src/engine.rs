@@ -4303,13 +4303,36 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         limit: usize,
     ) -> Result<cgka_traits::DeferredStallEvidence, EngineError> {
+        self.deferred_stall_evidence_in_range(group_id, None, limit)
+    }
+
+    /// [`Self::deferred_stall_evidence`] including rows whose arrival epoch
+    /// falls in `min_epoch..=group.epoch`, used when an active epoch-gap
+    /// obligation advances partially and must decide whether to hand off to
+    /// the new tip epoch without carrying ancient pre-stall rows forever.
+    pub fn deferred_stall_evidence_since(
+        &mut self,
+        group_id: &GroupId,
+        min_epoch: EpochId,
+        limit: usize,
+    ) -> Result<cgka_traits::DeferredStallEvidence, EngineError> {
+        self.deferred_stall_evidence_in_range(group_id, Some(min_epoch), limit)
+    }
+
+    fn deferred_stall_evidence_in_range(
+        &mut self,
+        group_id: &GroupId,
+        min_epoch: Option<EpochId>,
+        limit: usize,
+    ) -> Result<cgka_traits::DeferredStallEvidence, EngineError> {
         self.ensure_group_live(group_id)?;
         let group = self.live_group_record(group_id)?;
         let epoch = group.epoch;
+        let lower = min_epoch.unwrap_or(epoch);
         let mut rows = Vec::new();
         if limit > 0 {
             for metadata in self.storage.list_deferred_message_metadata(group_id)? {
-                if metadata.epoch != epoch {
+                if metadata.epoch < lower || metadata.epoch > epoch {
                     continue;
                 }
                 // A retired row may disappear between listing and reading.
@@ -4518,6 +4541,28 @@ impl<S: StorageProvider> Engine<S> {
         id: &MessageId,
         now: Timestamp,
     ) -> Result<OutboundWelcomeStatus, EngineError> {
+        self.outbound_welcome_status_in(id, now, true)
+    }
+
+    /// [`Self::outbound_welcome_status`] read from the stored rows alone, for a
+    /// group that is not live too: a Welcome of an unhydrated or quarantined
+    /// group reads as its rows stand, staged (`Waiting`) or owed, instead of
+    /// `Waiting`. For a host's view of a Welcome's delivery (mdk#1706), never
+    /// for deciding whether to publish it.
+    pub fn stored_outbound_welcome_status(
+        &self,
+        id: &MessageId,
+        now: Timestamp,
+    ) -> Result<OutboundWelcomeStatus, EngineError> {
+        self.outbound_welcome_status_in(id, now, false)
+    }
+
+    fn outbound_welcome_status_in(
+        &self,
+        id: &MessageId,
+        now: Timestamp,
+        live_group_only: bool,
+    ) -> Result<OutboundWelcomeStatus, EngineError> {
         let record = match self.storage.get_message(id) {
             Ok(record) => record,
             Err(StorageError::NotFound) => {
@@ -4550,7 +4595,7 @@ impl<S: StorageProvider> Engine<S> {
             _ => return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Untracked)),
         }
         // A quarantined group may recover, and an unhydrated one hydrates.
-        if self.ensure_group_live(&record.group_id).is_err() {
+        if live_group_only && self.ensure_group_live(&record.group_id).is_err() {
             return Ok(OutboundWelcomeStatus::Waiting);
         }
         // A `Sent` row that cannot be read may still be staged: wait.

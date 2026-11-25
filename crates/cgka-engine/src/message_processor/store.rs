@@ -882,12 +882,25 @@ impl<S: StorageProvider> Engine<S> {
         payload: Vec<u8>,
         processed_transport_id: Option<&MessageId>,
     ) -> Result<(), EngineError> {
-        let epoch = epochs.row;
         let id_hex = hex::encode(id.as_slice());
         let previous = match self.storage.get_message(&id) {
             Ok(record) => Some(record),
             Err(StorageError::NotFound) => None,
             Err(err) => return Err(EngineError::Storage(err)),
+        };
+        // Preserve the original arrival epoch when a deferred-peel row still
+        // cannot peel on a later sweep; restamping it to the new tip epoch
+        // makes permanently unopenable old rows look like fresh stall evidence
+        // on every epoch advance and reopen.
+        let epoch = match previous.as_ref() {
+            Some(record)
+                if state == MessageState::PeelDeferred
+                    && record.state == MessageState::PeelDeferred
+                    && record.group_id == *group_id =>
+            {
+                record.epoch
+            }
+            _ => epochs.row,
         };
         let deferred_peel = if state == MessageState::PeelDeferred {
             previous
@@ -939,8 +952,8 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             self.storage.put_message(&record)?;
         }
-        // A rewrite that keeps the state (e.g. a deferred-peel retry that
-        // still cannot peel, restamped at the new epoch) is no transition.
+        // A rewrite that keeps the state (e.g. a same-state payload upgrade)
+        // is no transition.
         let previous_state = previous.map(|record| record.state);
         if previous_state == Some(state) {
             return Ok(());
@@ -1045,21 +1058,17 @@ impl<S: StorageProvider> Engine<S> {
         resource: InboundResourceLimit,
         disposition: crate::message_disposition::MessageDisposition,
     ) -> Result<(), EngineError> {
-        // The application reads `TransportObjectResourceRefused` as evidence
-        // that this device is missing history it was served, and arms a
-        // full-history backfill from it. Traffic older than this copy's Welcome
-        // is the one shape where that is knowably wasted work: the copy's own
-        // epochs begin at the commit that minted its Welcome, so a re-fetch can
-        // only bring back more of what it already cannot open. The release
-        // itself is unchanged — only the announcement and its durable twin, the
-        // release journal's backfill arm, are dropped, which is why
-        // a timestamp is allowed to decide it at all. It is a compose-time
-        // value for application messages and this seam cannot tell those from
-        // commits, so being wrong here must lose nothing, and it does not: the
-        // row is released either way, the id stays eligible for redelivery,
-        // and the host still re-owes it (through the recovery inventory, or
-        // the journal's arm where none placed it). A wrong guess can only
-        // delay a stall's detection until traffic past the margin arrives.
+        // Traffic older than this copy's Welcome is recorded under
+        // `PredatesLocalCopy` and does not emit `TransportObjectResourceRefused`,
+        // because this copy's epochs begin at the commit that minted its Welcome.
+        // Regardless of timestamp, a budget-expired deferred row is simply
+        // deleted from `cgka_messages` (never marked `Failed` or added to
+        // `cgka_processed_transport_ids`, so engine-level redelivery still
+        // works). Unlike `release_message_for_replay`, this does not journal a
+        // replay release, clear the app's `seen_events`, delete reconciliation
+        // inventory, uncover coverage, or arm an epoch gap — keeping every
+        // automatic recovery path from re-admitting rows that already exhausted
+        // their full local retry or residence budget.
         let predates_this_copy = self.released_row_predates_local_copy(record);
         let released_as = if predates_this_copy {
             crate::message_disposition::MessageDisposition::PredatesLocalCopy
@@ -1086,15 +1095,7 @@ impl<S: StorageProvider> Engine<S> {
                 .max(self.convergence_now().wall_ms)
                 .saturating_sub(lifecycle.first_observed_wall_ms)
         });
-        // The host's durable release journal arms the same backfill when it is
-        // consumed, so it is told the same decision; without it a receipt sync
-        // or reopen would re-raise what the suppressed event withheld.
-        if predates_this_copy {
-            self.storage
-                .release_message_for_replay_without_stall_evidence(record)?;
-        } else {
-            self.storage.release_message_for_replay(record)?;
-        }
+        self.storage.delete_message(&record.id)?;
         let release_reason = released_as.tag();
         tracing::info!(
             target: "cgka_engine::message_processor",
@@ -1102,7 +1103,7 @@ impl<S: StorageProvider> Engine<S> {
             retry_count,
             residence_ms,
             release_reason,
-            "deferred transport row released for replay"
+            "deferred transport row released on budget expiry"
         );
         self.audit_group(
             &record.group_id,
