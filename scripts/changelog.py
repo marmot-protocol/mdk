@@ -55,15 +55,19 @@ UNRELEASED_LINK = re.compile(r"^\[Unreleased\]: (?P<compare>\S+/compare/)(?P<pre
 
 def unreleased_headings(text: list[str]) -> list[int]:
     """Line numbers of the headings Markdown renders as starting with "Unreleased"."""
-    found = []
+    found: list[int] = []
+    paragraph: list[tuple[int, str]] = []  # the lines since the last blank line, which an underline makes a heading
     for number, line in enumerate(text, 1):
-        following = text[number] if number < len(text) else ""
         if heading := ATX_HEADING.match(line):
-            line = heading["text"]
-        elif not SETEXT_UNDERLINE.match(following):
+            start, title = number, heading["text"]
+        elif paragraph and SETEXT_UNDERLINE.match(line):
+            start, title = paragraph[0][0], " ".join(part for _, part in paragraph)
+        else:
+            paragraph = paragraph + [(number, line)] if line.strip() else []
             continue
-        if MARKUP.sub("", line).strip().lower().startswith("unreleased"):
-            found.append(number)
+        paragraph = []
+        if MARKUP.sub("", title).strip().lower().startswith("unreleased"):
+            found.append(start)
     return found
 
 
@@ -80,7 +84,11 @@ def repo_files(root: Path) -> list[Path]:
 
 def parse_fragment(path: Path) -> tuple[dict[str, list[str]], list[str]]:
     """Return the fragment's entries by section, and its problems."""
-    return parse_sections(path.read_text(encoding="utf-8").splitlines())
+    text = path.read_text(encoding="utf-8").splitlines()
+    sections, errors = parse_sections(text)
+    # Folded in, it would fail the changelog's own check, even inside a code block.
+    return sections, errors + [f"line {number}: a heading that renders as Unreleased"
+                               for number in unreleased_headings(text)]
 
 
 def parse_sections(text: list[str]) -> tuple[dict[str, list[str]], list[str]]:
@@ -183,19 +191,25 @@ def shipped_tags(root: Path, version: str) -> tuple[list[str], list[str]]:
 
 def folded_already(existing: dict[str, list[str]], sections: dict[str, list[str]]) -> bool:
     """Whether the version's section holds every entry of a fragment, as an interrupted fold leaves it."""
+    def entry_ends(entries: list[str], at: int) -> bool:
+        return at == len(entries) or not entries[at].strip() or entries[at].startswith("- ")
+
     for name, lines in sections.items():
         entries = existing.get(name, [])
-        if not any(entries[i:i + len(lines)] == lines for i in range(len(entries))):
+        # Whole entries only: a fragment's first line alone is not a longer entry that starts with it.
+        if not any(entries[i:i + len(lines)] == lines and entry_ends(entries, i + len(lines))
+                   and (i == 0 or lines[0].startswith("- ") or not entries[i - 1].strip())
+                   for i in range(len(entries))):
             return False
     return True
 
 
 def replace_text(path: Path, text: str) -> None:
     """Write through a sibling file, so an interrupted write leaves the old content whole."""
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.",
-                                     delete=False) as tmp:
-        tmp.write(text)
+    tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False)
     try:
+        with tmp:
+            tmp.write(text)
         shutil.copymode(path, tmp.name)
         os.replace(tmp.name, path)
     except BaseException:

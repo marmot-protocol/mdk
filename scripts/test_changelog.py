@@ -47,7 +47,8 @@ class ChangelogTests(unittest.TestCase):
 
     def test_rejects_any_heading_markdown_renders_as_unreleased(self) -> None:
         for heading in ("## \\[Unreleased\\]", "## unreleased", "### [Unreleased][]", "   # Unreleased changes ##",
-                        "## [Unreleased](https://example.test)", "## **Unreleased**", "Unreleased\n----------"):
+                        "## [Unreleased](https://example.test)", "## **Unreleased**", "Unreleased\n----------",
+                        "Unreleased\nchanges\n==="):
             with self.subTest(heading=heading):
                 self.write("crates/a/CHANGELOG.md", HEADER + heading + "\n\n- New.\n\n" + OLDER)
                 self.assertIn("crates/a/CHANGELOG.md:3: no Unreleased section", self.errors())
@@ -57,11 +58,13 @@ class ChangelogTests(unittest.TestCase):
         self.write("crates/a/changelog.d/preamble.md", "Some text.\n\n### Added\n\n- Z.\n")
         self.write("crates/a/changelog.d/empty.md", "### Added\n\n")
         self.write("crates/a/changelog.d/version.md", "## 0.2.0\n\n### Added\n\n- W.\n")
+        self.write("crates/a/changelog.d/fenced.md", "### Added\n\n- An example:\n\n  ```md\n  #### Unreleased\n  ```\n")
         errors = self.errors()
         self.assertIn("unknown.md: line 1: unknown section 'Improvements'", errors)
         self.assertIn("preamble.md: line 1: text before the first", errors)
         self.assertIn("empty.md: section 'Added' has no entries", errors)
         self.assertIn("version.md: line 1: only `### <Section>` headings", errors)
+        self.assertIn("fenced.md: line 6: a heading that renders as Unreleased", errors)
 
     def test_rejects_misplaced_or_misnamed_fragments(self) -> None:
         self.write("crates/b/changelog.d/orphan.md", "### Added\n\n- Q.\n")
@@ -136,14 +139,16 @@ class ChangelogTests(unittest.TestCase):
 
     def test_an_interrupted_release_can_be_run_again(self) -> None:
         # Killed after writing CHANGELOG.md but before deleting the fragments it folded.
-        self.write("crates/a/changelog.d/x.md", "### Fixed\n\n- X.\n")
+        self.write("crates/a/changelog.d/x.md", "### Fixed\n\n- X.\n  Only for Y.\n")
         self.write("crates/a/changelog.d/y.md", "### Changed\n\nA paragraph.\n")
         self.assertEqual(release(self.root, "0.2.0", "2026-02-02"), [])
         once = (self.root / "crates/a/CHANGELOG.md").read_text()
         subprocess.run(["git", "-C", str(self.root), "checkout", "--", "crates/a/changelog.d"], check=True)
-        late = self.write("crates/a/changelog.d/late.md", "### Fixed\n\n- Z.\n")
+        # A late fragment that only starts like a folded entry is a new entry.
+        late = self.write("crates/a/changelog.d/late.md", "### Fixed\n\n- X.\n")
         self.assertEqual(release(self.root, "0.2.0", "2026-02-03"), [])
-        self.assertEqual((self.root / "crates/a/CHANGELOG.md").read_text(), once.replace("- X.\n", "- X.\n- Z.\n"))
+        self.assertEqual((self.root / "crates/a/CHANGELOG.md").read_text(),
+                         once.replace("- X.\n  Only for Y.\n", "- X.\n  Only for Y.\n- X.\n"))
         self.assertFalse(late.exists())
         self.assertEqual(self.errors(none_pending=True), "")
 
