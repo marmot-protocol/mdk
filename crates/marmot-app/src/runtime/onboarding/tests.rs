@@ -152,7 +152,7 @@ impl DirectoryRelayFetcher for Network {
                     endpoints: vec![endpoint.clone()],
                     queries: vec![query.clone()],
                 });
-                records.sort_by(|a, b| b.event.created_at.cmp(&a.event.created_at));
+                records.sort_by_key(|record| std::cmp::Reverse(record.event.created_at));
                 records.dedup_by(|a, b| a.event.id == b.event.id);
                 complete &= records.len() < query.limit;
                 outcome
