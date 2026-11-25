@@ -74,6 +74,12 @@ if [ "$workspace_version" != "$version" ]; then
     exit 1
 fi
 
+# A CLI fragment left in changelog.d/ would ship in this binary but be listed under a later release.
+if ! python3 scripts/changelog.py check --none-pending crates/cli/CHANGELOG.md; then
+    echo "error: fold the CLI changelog fragments first: just changelog-release $version crates/cli/CHANGELOG.md" >&2
+    exit 1
+fi
+
 if [ -n "$(git status --porcelain)" ]; then
     if [ "$dry_run" -eq 1 ]; then
         echo "warning: working tree has uncommitted changes; a real release requires a clean tree" >&2

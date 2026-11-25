@@ -16,10 +16,13 @@ entries:
 
 Usage:
 
-    changelog.py check [--none-pending]   validate fragments; with --none-pending
-                                          also fail while any fragment is left
-    changelog.py release <version> [--date YYYY-MM-DD]
-                                          fold every fragment into its CHANGELOG.md
+    changelog.py check [--none-pending [CHANGELOG.md ...]]
+                                          validate fragments; with --none-pending also
+                                          fail while a fragment is left (for the named
+                                          changelogs, or any)
+    changelog.py release <version> [CHANGELOG.md ...] [--date YYYY-MM-DD]
+                                          fold the fragments into their CHANGELOG.md
+                                          (the named ones, or every one)
 """
 from __future__ import annotations
 
@@ -38,6 +41,8 @@ FRAGMENT_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]*\.md$")
 # The release version grammar of scripts/cut-full-release.sh.
 VERSION = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$")
 UNRELEASED = re.compile(r"^##\s+\[?unreleased\]?", re.IGNORECASE)
+# The tag of each artifact track; any of them for a version means it shipped (release.md).
+TRACK_TAG_PREFIXES = ("v", "wn-agent-v", "marmotkit-v", "marmotc-v")
 # Keep a Changelog compare links, e.g. `[Unreleased]: https://.../compare/marmotc-v0.19.0...HEAD`.
 UNRELEASED_LINK = re.compile(r"^\[Unreleased\]: (?P<compare>\S+/compare/)(?P<prefix>[A-Za-z-]*)(?P<previous>\S+)\.\.\.HEAD$")
 
@@ -107,7 +112,7 @@ def fragments_by_changelog(root: Path) -> tuple[dict[Path, list[Path]], list[str
     return grouped, errors
 
 
-def check(root: Path, none_pending: bool) -> list[str]:
+def check(root: Path, none_pending: bool, only: list[Path] | None = None) -> list[str]:
     grouped, errors = fragments_by_changelog(root)
     for changelog in (path for path in repo_files(root) if path.name == "CHANGELOG.md"):
         for number, line in enumerate(changelog.read_text(encoding="utf-8").splitlines(), 1):
@@ -122,7 +127,7 @@ def check(root: Path, none_pending: bool) -> list[str]:
             errors += [f"{path.relative_to(root)}: {e}" for e in parse_fragment(path)[1]]
     if none_pending:
         errors += [f"{p.relative_to(root)}: still pending; run `just changelog-release <version>`"
-                   for paths in grouped.values() for p in paths]
+                   for changelog, paths in grouped.items() if only is None or changelog in only for p in paths]
     return errors
 
 
@@ -143,16 +148,21 @@ def release_section(heading: str, parts: list[dict[str, list[str]]]) -> list[str
     return out
 
 
-def release(root: Path, version: str, date: str) -> list[str]:
+def release(root: Path, version: str, date: str, only: list[Path] | None = None) -> list[str]:
     errors = check(root, none_pending=False)
     if errors:
         return errors
+    # A shipped version's notes describe its tagged tree: later fragments belong to the next.
+    tags = [f"{prefix}{version}" for prefix in TRACK_TAG_PREFIXES]
+    if tagged := subprocess.run(["git", "-C", str(root), "tag", "--list", *tags],
+                                check=True, capture_output=True, text=True).stdout.split():
+        return [f"{version} is tagged ({', '.join(tagged)}); fold these fragments into the next release"]
     grouped, _ = fragments_by_changelog(root)
     released = re.compile(rf"^## \[?{re.escape(version)}\]?(\s|$)")
-    tagged = subprocess.run(["git", "-C", str(root), "tag", "--list", f"v{version}"],
-                            check=True, capture_output=True, text=True).stdout.strip()
     folded: dict[Path, list[str]] = {}
     for changelog, fragments in sorted(grouped.items()):
+        if only is not None and changelog not in only:
+            continue
         rel = changelog.relative_to(root)
         lines = changelog.read_text(encoding="utf-8").splitlines()
         parts = [parse_fragment(path)[0] for path in fragments]
@@ -161,9 +171,7 @@ def release(root: Path, version: str, date: str) -> list[str]:
         if at < len(lines) and released.match(lines[at]):
             # A fragment that merged after the release PR joins that version until it is tagged.
             existing, problems = parse_sections(lines[at + 1:end])
-            if tagged:
-                errors.append(f"{rel}: v{version} is tagged; a fragment added since belongs to the next release")
-            elif problems:
+            if problems:
                 errors += [f"{rel} {version} section: {problem}" for problem in problems]
             else:
                 lines[at:end] = release_section(lines[at], [existing, *parts])
@@ -196,20 +204,26 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     check_cmd = sub.add_parser("check", help="validate fragments and changelogs")
-    check_cmd.add_argument("--none-pending", action="store_true", help="also fail while any fragment is left")
-    release_cmd = sub.add_parser("release", help="fold every fragment into its CHANGELOG.md")
+    check_cmd.add_argument("--none-pending", action="store_true", help="also fail while a fragment is left")
+    check_cmd.add_argument("changelogs", nargs="*", type=Path, help="limit --none-pending to these")
+    release_cmd = sub.add_parser("release", help="fold the fragments into their CHANGELOG.md")
     release_cmd.add_argument("version")
+    release_cmd.add_argument("changelogs", nargs="*", type=Path, help="fold only these")
     release_cmd.add_argument("--date", default=dt.datetime.now(dt.timezone.utc).date().isoformat())
     args = parser.parse_args()
+    only = [(Path.cwd() / path).resolve() for path in args.changelogs] or None
+    missing = [str(path) for path in only or [] if not path.is_file()]
 
-    if args.command == "check":
-        errors = check(ROOT, args.none_pending)
+    if missing:
+        errors = [f"no such changelog: {path}" for path in missing]
+    elif args.command == "check":
+        errors = check(ROOT, args.none_pending, only)
     elif not VERSION.match(args.version):
         errors = [f"{args.version!r} is not a version like 0.20.0 or 0.20.0-rc-1"]
     elif not re.match(r"^\d{4}-\d{2}-\d{2}$", args.date):
         errors = [f"{args.date!r} is not a YYYY-MM-DD date"]
     else:
-        errors = release(ROOT, args.version, args.date)
+        errors = release(ROOT, args.version, args.date, only)
     for error in errors:
         print(f"changelog: {error}", file=sys.stderr)
     if errors:

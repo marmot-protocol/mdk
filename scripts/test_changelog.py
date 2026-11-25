@@ -121,20 +121,43 @@ class ChangelogTests(unittest.TestCase):
         )
         self.assertFalse(late.exists())
 
-    def test_release_refuses_a_tagged_or_older_version_and_a_bad_fragment(self) -> None:
+    def tag(self, name: str) -> None:
+        git = ["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@example.test",
+               "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "release"], check=True)
+        subprocess.run([*git, "tag", name], check=True)
+
+    def test_release_refuses_an_older_version_and_a_bad_fragment(self) -> None:
         released = HEADER + "## 0.2.0 - 2026-02-02\n\n### Fixed\n\n- X.\n\n" + OLDER
         self.write("crates/a/CHANGELOG.md", released)
         fragment = self.write("crates/a/changelog.d/x.md", "### Added\n\n- X.\n")
         self.assertIn("0.1.0 is not the newest", "\n".join(release(self.root, "0.1.0", "2026-02-03")))
-        git = ["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@example.test",
-               "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]
-        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "release"], check=True)
-        subprocess.run([*git, "tag", "v0.2.0"], check=True)
-        self.assertIn("v0.2.0 is tagged", "\n".join(release(self.root, "0.2.0", "2026-02-03")))
         self.write("crates/a/changelog.d/bad.md", "### Misc\n\n- Y.\n")
         self.assertIn("unknown section", "\n".join(release(self.root, "0.3.0", "2026-02-03")))
         self.assertTrue(fragment.exists())
         self.assertEqual((self.root / "crates/a/CHANGELOG.md").read_text(), released)
+
+    def test_release_refuses_a_tagged_version_even_without_its_heading(self) -> None:
+        # A crate with no fragments at release time has no heading for that version; a
+        # later fold must not credit the shipped release with a change it lacks.
+        fragment = self.write("crates/a/changelog.d/later.md", "### Fixed\n\n- Later fix.\n")
+        self.tag("wn-agent-v0.2.0")
+        self.assertIn("0.2.0 is tagged (wn-agent-v0.2.0)", "\n".join(release(self.root, "0.2.0", "2026-02-03")))
+        self.assertTrue(fragment.exists())
+        self.assertEqual((self.root / "crates/a/CHANGELOG.md").read_text(), HEADER + OLDER)
+
+    def test_named_changelogs_limit_the_pending_check_and_the_fold(self) -> None:
+        # A standalone WN Agent release folds and checks only the CLI changelog.
+        self.write("crates/b/CHANGELOG.md", HEADER + OLDER)
+        a = self.write("crates/a/changelog.d/x.md", "### Added\n\n- X.\n")
+        b = self.write("crates/b/changelog.d/y.md", "### Added\n\n- Y.\n")
+        only = [self.root / "crates/a/CHANGELOG.md"]
+        self.assertIn("crates/a/changelog.d/x.md: still pending", "\n".join(check(self.root, True, only)))
+        self.assertNotIn("crates/b/", "\n".join(check(self.root, True, only)))
+        self.assertEqual(release(self.root, "0.2.0", "2026-02-02", only), [])
+        self.assertFalse(a.exists())
+        self.assertTrue(b.exists())
+        self.assertEqual(check(self.root, True, only), [])
 
 
 if __name__ == "__main__":

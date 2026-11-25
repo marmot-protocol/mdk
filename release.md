@@ -243,8 +243,8 @@ Keep the initial release PR limited to version fields, workspace package version
 `conformance_version` values, changelogs, release/integration documentation, README/install version pins, and other
 release metadata. Fold the unreleased changelog fragments in first, then run only the preflight. It and
 `just release-all` both fail while any fragment is left. A fragment that merges after the release PR stops
-`release-all`; open a follow-up PR that runs `just changelog-release <version>` again, which adds it to that version
-until the version is tagged:
+`release-all`; open a follow-up PR that runs `just changelog-release <version>` again, which adds it to that version.
+Once any track's tag for the version exists, the fold refuses it:
 
 ```sh
 just changelog-release <version>
@@ -459,7 +459,13 @@ authorization. Existing OpenCode automation must pass at least one explicit
 `--allow-welcomer`; `WN_OPENCODE_ALLOWED_SENDERS_HEX` configures prompt senders
 only and no longer satisfies the bootstrap welcomer requirement.
 
-Cut the release tag from the current `origin/master` commit:
+Fold the CLI's changelog fragments in a PR first; the helper refuses while `crates/cli/changelog.d/` has any:
+
+```sh
+just changelog-release 0.9.3 crates/cli/CHANGELOG.md
+```
+
+Then cut the release tag from the current `origin/master` commit:
 
 ```sh
 just release-wn-agent 0.9.3

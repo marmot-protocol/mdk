@@ -677,8 +677,8 @@ changelog-gate:
     python3 scripts/test_changelog.py
 
 # Release metadata PR: fold every changelog.d/ fragment into its CHANGELOG.md.
-changelog-release version:
-    python3 scripts/changelog.py release {{version}}
+changelog-release version *changelogs:
+    python3 scripts/changelog.py release {{version}} {{changelogs}}
 
 # Exercise release build phases without compiling Rust or requiring platform SDKs.
 binding-build-gate:
