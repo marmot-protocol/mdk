@@ -29,6 +29,8 @@ class ChangelogTests(unittest.TestCase):
         path = self.root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
+        # A release folds only fragments git tracks.
+        subprocess.run(["git", "-C", str(self.root), "add", rel], check=True)
         return path
 
     def errors(self, none_pending: bool = False) -> str:
@@ -42,6 +44,13 @@ class ChangelogTests(unittest.TestCase):
         # The section every PR used to edit, and so conflict on.
         self.write("crates/a/CHANGELOG.md", HEADER + "## [Unreleased]\n\n- New.\n\n" + OLDER)
         self.assertIn("crates/a/CHANGELOG.md:3: no Unreleased section", self.errors())
+
+    def test_rejects_any_heading_markdown_renders_as_unreleased(self) -> None:
+        for heading in ("## \\[Unreleased\\]", "## unreleased", "### [Unreleased][]", "   # Unreleased changes ##",
+                        "## [Unreleased](https://example.test)", "## **Unreleased**", "Unreleased\n----------"):
+            with self.subTest(heading=heading):
+                self.write("crates/a/CHANGELOG.md", HEADER + heading + "\n\n- New.\n\n" + OLDER)
+                self.assertIn("crates/a/CHANGELOG.md:3: no Unreleased section", self.errors())
 
     def test_rejects_malformed_fragments(self) -> None:
         self.write("crates/a/changelog.d/unknown.md", "### Improvements\n\n- Y.\n")
@@ -124,6 +133,29 @@ class ChangelogTests(unittest.TestCase):
             HEADER + "## 0.2.0 - 2026-02-02\n\n### Added\n\n- Z.\n\n### Fixed\n\n- X.\n- Y.\n\n" + OLDER,
         )
         self.assertFalse(late.exists())
+
+    def test_an_interrupted_release_can_be_run_again(self) -> None:
+        # Killed after writing CHANGELOG.md but before deleting the fragments it folded.
+        self.write("crates/a/changelog.d/x.md", "### Fixed\n\n- X.\n")
+        self.write("crates/a/changelog.d/y.md", "### Changed\n\nA paragraph.\n")
+        self.assertEqual(release(self.root, "0.2.0", "2026-02-02"), [])
+        once = (self.root / "crates/a/CHANGELOG.md").read_text()
+        subprocess.run(["git", "-C", str(self.root), "checkout", "--", "crates/a/changelog.d"], check=True)
+        late = self.write("crates/a/changelog.d/late.md", "### Fixed\n\n- Z.\n")
+        self.assertEqual(release(self.root, "0.2.0", "2026-02-03"), [])
+        self.assertEqual((self.root / "crates/a/CHANGELOG.md").read_text(), once.replace("- X.\n", "- X.\n- Z.\n"))
+        self.assertFalse(late.exists())
+        self.assertEqual(self.errors(none_pending=True), "")
+
+    def test_release_refuses_an_untracked_fragment(self) -> None:
+        # Release notes list merged changes, not a file left in this checkout.
+        stray = self.root / "crates/a/changelog.d/stray.md"
+        stray.parent.mkdir(parents=True)
+        stray.write_text("### Added\n\n- Local experiment.\n")
+        self.assertIn("crates/a/changelog.d/stray.md: not tracked by git",
+                      "\n".join(release(self.root, "0.2.0", "2026-02-02")))
+        self.assertTrue(stray.exists())
+        self.assertEqual((self.root / "crates/a/CHANGELOG.md").read_text(), HEADER + OLDER)
 
     def tag(self, name: str) -> None:
         git = ["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@example.test",

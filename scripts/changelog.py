@@ -28,9 +28,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,11 +43,28 @@ SECTIONS = ("Breaking changes", "Added", "Changed", "Deprecated", "Removed", "Fi
 FRAGMENT_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]*\.md$")
 # The release version grammar of scripts/cut-full-release.sh.
 VERSION = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$")
-UNRELEASED = re.compile(r"^##\s+\[?unreleased\]?", re.IGNORECASE)
+ATX_HEADING = re.compile(r"^ {0,3}#{1,6}[ \t]+(?P<text>.*)$")
+SETEXT_UNDERLINE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
+# What heading text renders as, without escapes, emphasis, code, link brackets or HTML tags.
+MARKUP = re.compile(r"<[^>]*>|[\\*_`~\[\]]")
 # The tag of each artifact track; any of them for a version means it shipped (release.md).
 TRACK_TAG_PREFIXES = ("v", "wn-agent-v", "marmotkit-v", "marmotc-v")
 # Keep a Changelog compare links, e.g. `[Unreleased]: https://.../compare/marmotc-v0.19.0...HEAD`.
 UNRELEASED_LINK = re.compile(r"^\[Unreleased\]: (?P<compare>\S+/compare/)(?P<prefix>[A-Za-z-]*)(?P<previous>\S+)\.\.\.HEAD$")
+
+
+def unreleased_headings(text: list[str]) -> list[int]:
+    """Line numbers of the headings Markdown renders as starting with "Unreleased"."""
+    found = []
+    for number, line in enumerate(text, 1):
+        following = text[number] if number < len(text) else ""
+        if heading := ATX_HEADING.match(line):
+            line = heading["text"]
+        elif not SETEXT_UNDERLINE.match(following):
+            continue
+        if MARKUP.sub("", line).strip().lower().startswith("unreleased"):
+            found.append(number)
+    return found
 
 
 def repo_files(root: Path) -> list[Path]:
@@ -115,13 +135,12 @@ def fragments_by_changelog(root: Path) -> tuple[dict[Path, list[Path]], list[str
 def check(root: Path, none_pending: bool, only: list[Path] | None = None) -> list[str]:
     grouped, errors = fragments_by_changelog(root)
     for changelog in (path for path in repo_files(root) if path.name == "CHANGELOG.md"):
-        for number, line in enumerate(changelog.read_text(encoding="utf-8").splitlines(), 1):
-            if UNRELEASED.match(line):
-                rel = changelog.relative_to(root)
-                errors.append(
-                    f"{rel}:{number}: no Unreleased section; add each entry as a fragment in "
-                    f"{rel.parent / FRAGMENT_DIR}/ instead"
-                )
+        for number in unreleased_headings(changelog.read_text(encoding="utf-8").splitlines()):
+            rel = changelog.relative_to(root)
+            errors.append(
+                f"{rel}:{number}: no Unreleased section; add each entry as a fragment in "
+                f"{rel.parent / FRAGMENT_DIR}/ instead"
+            )
     for paths in grouped.values():
         for path in paths:
             errors += [f"{path.relative_to(root)}: {e}" for e in parse_fragment(path)[1]]
@@ -162,6 +181,28 @@ def shipped_tags(root: Path, version: str) -> tuple[list[str], list[str]]:
     return sorted(set(local.stdout.split()) | on_origin), []
 
 
+def folded_already(existing: dict[str, list[str]], sections: dict[str, list[str]]) -> bool:
+    """Whether the version's section holds every entry of a fragment, as an interrupted fold leaves it."""
+    for name, lines in sections.items():
+        entries = existing.get(name, [])
+        if not any(entries[i:i + len(lines)] == lines for i in range(len(entries))):
+            return False
+    return True
+
+
+def replace_text(path: Path, text: str) -> None:
+    """Write through a sibling file, so an interrupted write leaves the old content whole."""
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.",
+                                     delete=False) as tmp:
+        tmp.write(text)
+    try:
+        shutil.copymode(path, tmp.name)
+        os.replace(tmp.name, path)
+    except BaseException:
+        os.unlink(tmp.name)
+        raise
+
+
 def release(root: Path, version: str, date: str, only: list[Path] | None = None) -> list[str]:
     errors = check(root, none_pending=False)
     if errors:
@@ -173,11 +214,17 @@ def release(root: Path, version: str, date: str, only: list[Path] | None = None)
     if tagged:
         return [f"{version} is tagged ({', '.join(tagged)}); fold these fragments into the next release"]
     grouped, _ = fragments_by_changelog(root)
+    grouped = {changelog: paths for changelog, paths in grouped.items() if only is None or changelog in only}
+    # A release lists merged changes, so it folds only fragments git tracks.
+    untracked = set(subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--others", "--exclude-standard"],
+                                   check=True, capture_output=True, text=True).stdout.split("\0"))
+    errors = [f"{path.relative_to(root)}: not tracked by git; commit it or move it aside"
+              for paths in grouped.values() for path in paths if path.relative_to(root).as_posix() in untracked]
+    if errors:
+        return errors
     released = re.compile(rf"^## \[?{re.escape(version)}\]?(\s|$)")
     folded: dict[Path, list[str]] = {}
     for changelog, fragments in sorted(grouped.items()):
-        if only is not None and changelog not in only:
-            continue
         rel = changelog.relative_to(root)
         lines = changelog.read_text(encoding="utf-8").splitlines()
         parts = [parse_fragment(path)[0] for path in fragments]
@@ -189,6 +236,8 @@ def release(root: Path, version: str, date: str, only: list[Path] | None = None)
             if problems:
                 errors += [f"{rel} {version} section: {problem}" for problem in problems]
             else:
+                # A re-run after an interrupted fold finds some fragments in the section already.
+                parts = [part for part in parts if not folded_already(existing, part)]
                 lines[at:end] = release_section(lines[at], [existing, *parts])
         elif any(released.match(line) for line in lines):
             errors.append(f"{rel}: {version} is not the newest version heading")
@@ -207,8 +256,10 @@ def release(root: Path, version: str, date: str, only: list[Path] | None = None)
         folded[changelog] = lines
     if errors:
         return errors
+    # Every changelog is whole before any fragment goes; a re-run finishes an interrupted fold.
     for changelog, lines in folded.items():
-        changelog.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        replace_text(changelog, "\n".join(lines) + "\n")
+    for changelog in folded:
         for path in grouped[changelog]:
             path.unlink()
         print(f"{changelog.relative_to(root)}: {version} from {len(grouped[changelog])} fragment(s)")
