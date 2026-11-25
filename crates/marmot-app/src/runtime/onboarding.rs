@@ -697,6 +697,10 @@ struct OnboardingCheckpoint {
     // signing resumes later. A later list can supersede it.
     #[serde(default)]
     automatic_inbox_event_time: Option<u64>,
+    // A stopped send may have reached a relay. Once sending starts, the
+    // checkpoint must keep the exact bytes through an inconclusive lookup.
+    #[serde(default)]
+    automatic_inbox_send_started: bool,
 }
 
 struct RepairSourceCheck {
@@ -837,6 +841,7 @@ impl OnboardingCheckpoint {
             reported_pauses: Vec::new(),
             inbox_list_seen: false,
             automatic_inbox_event_time: None,
+            automatic_inbox_send_started: false,
         }
     }
     fn new_attempt(
@@ -2352,6 +2357,7 @@ impl AccountSetup<'_> {
                     crate::client::boxed(|| self.approve_repair_if_current(c)).await?;
                     if c.approved {
                         c.automatic_inbox_event_time = Some(event_time);
+                        c.automatic_inbox_send_started = false;
                         self.save_onboarding(c)?;
                         if !crate::client::boxed(|| self.publish_onboarding_repair(c, true)).await?
                         {
@@ -2687,6 +2693,7 @@ impl AccountSetup<'_> {
     fn authoritative_answered(
         &self,
         c: &OnboardingCheckpoint,
+        step: OnboardingStep,
         sources: &[String],
         completed: &HashMap<String, String>,
     ) -> bool {
@@ -2710,11 +2717,14 @@ impl AccountSetup<'_> {
             .iter()
             .map(|relay| relay_key(relay))
             .collect();
+        let recommendation = automatic_inbox_lookup_endpoint(c, step)
+            .map(relay_key)
+            .filter(|key| !host.contains(key));
         completed.keys().any(|key| {
-            !indexer_searched
-                || indexers.contains(key)
+            indexers.contains(key)
                 || declared.contains(key)
-                || !host.contains(key)
+                || (recommendation.as_ref() != Some(key)
+                    && (!indexer_searched || !host.contains(key)))
         })
     }
     async fn onboarding_sources(
@@ -2728,7 +2738,17 @@ impl AccountSetup<'_> {
         } else {
             self.app().discovery_indexer_relays()
         };
-        self.onboarding_sources_with(c, step, &indexers).await
+        let mut sources = self.onboarding_sources_with(c, step, &indexers).await;
+        // Search the proposed publication endpoint before automatically
+        // creating a list and when verifying the acknowledged event.
+        if let Some(endpoint) = automatic_inbox_lookup_endpoint(c, step)
+            && !sources
+                .iter()
+                .any(|source| relay_key(source) == relay_key(endpoint))
+        {
+            sources.push(endpoint.to_owned());
+        }
+        sources
     }
     async fn onboarding_sources_with(
         &self,
@@ -2762,15 +2782,6 @@ impl AccountSetup<'_> {
                     sources.push(endpoint.0);
                 }
             }
-        }
-        // The relay selected for an automatic list may be outside discovery.
-        // Search it before we write and when verifying its acknowledged event.
-        if step == OnboardingStep::InboxRelays
-            && c.options.create_missing_inbox_list
-            && let Some(endpoint) = c.options.defaults_for(step).first()
-            && !sources.contains(endpoint)
-        {
-            sources.push(endpoint.clone());
         }
         // Indexers come after the host's discovery relays and the account's
         // declared relays, and are dialed outside the inspection cap.
@@ -2810,7 +2821,9 @@ impl AccountSetup<'_> {
             .await;
         let Some(event) = records.into_iter().next() else {
             return if completed.is_empty() || !failures.is_empty() {
-                if !failures.is_empty() && self.authoritative_answered(c, &sources, &completed) {
+                if !failures.is_empty()
+                    && self.authoritative_answered(c, step, &sources, &completed)
+                {
                     // Absent where it answered, unknown where it failed.
                     failures.insert(
                         0,
@@ -3394,7 +3407,7 @@ impl AccountSetup<'_> {
                 .iter()
                 .all(|endpoint| completed.contains_key(&relay_key(endpoint)))
             && !(records.is_empty() && !failures.is_empty());
-        let authoritative = self.authoritative_answered(c, &sources, &completed);
+        let authoritative = self.authoritative_answered(c, step, &sources, &completed);
         Ok(RepairSourceCheck {
             records,
             failures,
@@ -3457,27 +3470,7 @@ impl AccountSetup<'_> {
                 )
             });
             if proposal.step.relay() && authoritative && basis_newest {
-                let step = proposal.step;
-                let state = &c.snapshot.steps[step.index()];
-                let status = state.status;
-                let mut findings = state.findings.clone();
-                findings
-                    .retain(|finding| finding.context != OnboardingFindingContext::RepairApproval);
-                findings.extend(failures);
-                c.set(proposal.step, status, findings);
-                c.snapshot.proposal = Some(OnboardingRepairProposal {
-                    revision: c
-                        .snapshot
-                        .revision
-                        .checked_add(1)
-                        .ok_or_else(onboarding_error)?,
-                    inconclusive: true,
-                    ..proposal
-                });
-                c.snapshot.steps[step.index()].actions = vec![
-                    OnboardingAction::ApproveRepair,
-                    OnboardingAction::CancelRepair,
-                ];
+                renew_relay_approval(c, proposal, failures)?;
             } else {
                 c.set(
                     proposal.step,
@@ -3582,6 +3575,7 @@ impl AccountSetup<'_> {
             c.inbox_list_seen = true;
             c.records[step.index()] = Some(existing);
             c.automatic_inbox_event_time = None;
+            c.automatic_inbox_send_started = false;
             c.approved = false;
             c.signed_repair = None;
             c.snapshot.proposal = None;
@@ -3596,12 +3590,24 @@ impl AccountSetup<'_> {
             .chain(check.failures)
             .map(|finding| {
                 finding.in_context(
-                    OnboardingFindingContext::RepairPublication,
+                    OnboardingFindingContext::RepairApproval,
                     OnboardingCheckPurpose::SourceFreshness,
                 )
-            })
-            .collect();
-        c.set(step, OnboardingStatus::RetryableFailure, findings);
+            });
+        if c.automatic_inbox_send_started {
+            c.set(step, OnboardingStatus::RetryableFailure, findings.collect());
+        } else {
+            c.approved = false;
+            c.signed_repair = None;
+            c.automatic_inbox_event_time = None;
+            let proposal = c.snapshot.proposal.take().ok_or_else(onboarding_error)?;
+            if check.authoritative {
+                c.set(step, OnboardingStatus::NeedsInput, Vec::new());
+                renew_relay_approval(c, proposal, findings)?;
+            } else {
+                c.set(step, OnboardingStatus::RetryableFailure, findings.collect());
+            }
+        }
         self.save_onboarding(c)?;
         Ok(AutomaticInboxFreshness::Deferred)
     }
@@ -3756,6 +3762,11 @@ impl AccountSetup<'_> {
         if self.require_live_under_state_lock(c).is_err() {
             return Ok(false);
         }
+        // Persist the send boundary before handing the event to transport.
+        if c.automatic_inbox_event_time.is_some() && !c.automatic_inbox_send_started {
+            c.automatic_inbox_send_started = true;
+            self.save_onboarding(c)?;
+        }
         let outcome = self
             .await_while_onboarding_live(
                 &c.snapshot.account_id_hex,
@@ -3781,6 +3792,7 @@ impl AccountSetup<'_> {
                         event: event.clone(),
                     })?;
                 if c.automatic_inbox_event_time.take().is_some() {
+                    c.automatic_inbox_send_started = false;
                     c.snapshot.created_inbox_list = Some(OnboardingCreatedInboxList {
                         relays: proposal.read_relays.clone(),
                         event_id: event.id.clone(),
@@ -3823,6 +3835,42 @@ impl AccountSetup<'_> {
             }
         }
     }
+}
+
+fn automatic_inbox_lookup_endpoint(c: &OnboardingCheckpoint, step: OnboardingStep) -> Option<&str> {
+    if step == OnboardingStep::InboxRelays && c.options.create_missing_inbox_list {
+        c.options.defaults_for(step).first().map(String::as_str)
+    } else {
+        None
+    }
+}
+
+fn renew_relay_approval(
+    c: &mut OnboardingCheckpoint,
+    proposal: OnboardingRepairProposal,
+    failures: impl IntoIterator<Item = OnboardingFinding>,
+) -> Result<(), AppError> {
+    let step = proposal.step;
+    let state = &c.snapshot.steps[step.index()];
+    let status = state.status;
+    let mut findings = state.findings.clone();
+    findings.retain(|finding| finding.context != OnboardingFindingContext::RepairApproval);
+    findings.extend(failures);
+    c.set(step, status, findings);
+    c.snapshot.proposal = Some(OnboardingRepairProposal {
+        revision: c
+            .snapshot
+            .revision
+            .checked_add(1)
+            .ok_or_else(onboarding_error)?,
+        inconclusive: true,
+        ..proposal
+    });
+    c.snapshot.steps[step.index()].actions = vec![
+        OnboardingAction::ApproveRepair,
+        OnboardingAction::CancelRepair,
+    ];
+    Ok(())
 }
 
 // A published declaration can retain Tor endpoints even without a Tor transport.

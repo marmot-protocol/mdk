@@ -438,6 +438,7 @@ async fn an_unlinked_account_is_refused_every_way_back_in() {
         keys: keys.clone(),
         block: Arc::new(AtomicBool::new(false)),
         started: Arc::new(Notify::new()),
+        release: None,
     };
 
     assert!(unlinked(
@@ -4360,6 +4361,7 @@ async fn automatic_inbox_creation_resumes_without_superseding_a_later_list() {
                 keys: keys.clone(),
                 block: block.clone(),
                 started: started.clone(),
+                release: None,
             },
             OnboardingOptions {
                 create_missing_inbox_list: true,
@@ -4432,6 +4434,7 @@ async fn automatic_inbox_creation_resumes_without_superseding_a_later_list() {
                 keys,
                 block,
                 started,
+                release: None,
             },
             options(),
         )
@@ -4455,6 +4458,103 @@ async fn automatic_inbox_creation_resumes_without_superseding_a_later_list() {
         Some(manual)
     );
     runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_inbox_rechecks_after_signing_and_requires_real_authority() {
+    use transport_nostr::DirectoryInspectionError::Unreachable;
+
+    for authoritative in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let runtime = runtime(directory.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let setup = runtime.account_setup();
+        setup
+            .begin_external_signer_onboarding(
+                id.clone(),
+                BlockingSigner {
+                    keys: keys.clone(),
+                    block: Arc::new(AtomicBool::new(true)),
+                    started: started.clone(),
+                    release: Some(release.clone()),
+                },
+                OnboardingOptions {
+                    inbox_relays: vec!["wss://recommended.example".into()],
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+        network.events.lock().push(signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), "wss://declared.example".into()]],
+            "",
+            unix_now_seconds() - 60,
+        ));
+        setup.run_onboarding(&id).await.unwrap();
+        setup
+            .continue_onboarding_without(&id, OnboardingStep::Profile)
+            .await
+            .unwrap();
+        let task = tokio::spawn({
+            let manager = runtime.accounts();
+            let id = id.clone();
+            async move {
+                manager
+                    .account_setup()
+                    .continue_onboarding_without(&id, OnboardingStep::Follows)
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        network
+            .inspection_errors
+            .lock()
+            .insert("index.example".into(), Unreachable);
+        if !authoritative {
+            network
+                .inspection_errors
+                .lock()
+                .insert("declared.example".into(), Unreachable);
+            fail_public_indexers(&network);
+        }
+        release.notify_one();
+        let snapshot = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let state = &snapshot.steps[OnboardingStep::InboxRelays.index()];
+        if authoritative {
+            let proposal = snapshot.proposal.as_ref().unwrap();
+            assert!(proposal.inconclusive);
+            assert_eq!(proposal.revision, snapshot.revision);
+            assert_eq!(proposal.read_relays, ["wss://recommended.example"]);
+            assert!(state.actions.contains(&OnboardingAction::ApproveRepair));
+        } else {
+            assert!(snapshot.proposal.is_none());
+            assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+            assert!(!state.actions.contains(&OnboardingAction::ApproveRepair));
+        }
+        let checkpoint = runtime
+            .accounts()
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        assert!(!checkpoint.approved);
+        assert!(checkpoint.signed_repair.is_none());
+        assert!(network.attempts.lock().is_empty());
+        runtime.shutdown_and_close().await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6152,6 +6252,7 @@ struct BlockingSigner {
     keys: nostr::prelude::Keys,
     block: Arc<AtomicBool>,
     started: Arc<Notify>,
+    release: Option<Arc<Notify>>,
 }
 
 impl std::fmt::Debug for BlockingSigner {
@@ -6179,10 +6280,15 @@ impl transport_nostr_peeler::MarmotNostrSigner for BlockingSigner {
         let keys = self.keys.clone();
         let block = self.block.clone();
         let started = self.started.clone();
+        let release = self.release.clone();
         Box::pin(async move {
             started.notify_one();
             if block.load(Ordering::SeqCst) {
-                std::future::pending::<()>().await;
+                if let Some(release) = release {
+                    release.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
             }
             transport_nostr_peeler::MarmotNostrSigner::sign_event(&keys, unsigned).await
         })
@@ -6262,6 +6368,7 @@ async fn signer_diagnostic_recovery() {
                     keys: keys.clone(),
                     block: block.clone(),
                     started: started.clone(),
+                    release: None,
                 },
                 options(),
             )
@@ -6361,6 +6468,7 @@ async fn cancel_during_blocked_signer_allows_fresh_external_begin() {
                 keys: keys.clone(),
                 block: block.clone(),
                 started: started.clone(),
+                release: None,
             },
             options(),
         )
@@ -6398,6 +6506,7 @@ async fn cancel_during_blocked_signer_allows_fresh_external_begin() {
                 keys: keys.clone(),
                 block: Arc::new(AtomicBool::new(false)),
                 started: Arc::new(Notify::new()),
+                release: None,
             },
             options(),
         ),
@@ -8068,6 +8177,7 @@ async fn recovery_retires_blocked_external_signer_and_survives_dropped_caller() 
         keys,
         block: Arc::new(AtomicBool::new(false)),
         started: Arc::new(Notify::new()),
+        release: None,
     };
     let manager = runtime.accounts();
     manager
@@ -10745,6 +10855,7 @@ async fn only_a_policy_refusal_of_the_local_key_nominates_a_route_for_removal() 
                 keys: keys.clone(),
                 block: Arc::new(AtomicBool::new(false)),
                 started: Arc::new(Notify::new()),
+                release: None,
             },
             options(),
         )
