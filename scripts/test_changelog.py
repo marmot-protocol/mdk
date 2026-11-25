@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-from changelog import check, release
+from changelog import VERSION, check, release
 
 HEADER = "# Changelog\n\n"
 OLDER = "## 0.1.0 - 2026-01-01\n\n### Added\n\n- The first release.\n"
@@ -79,6 +79,19 @@ class ChangelogTests(unittest.TestCase):
         )
         self.assertFalse(first.exists() or second.exists())
         self.assertEqual(self.errors(none_pending=True), "")
+
+    def test_release_keeps_prose_fragments_as_separate_paragraphs(self) -> None:
+        self.write("crates/a/changelog.d/a.md", "### Changed\n\nA first paragraph.\n")
+        self.write("crates/a/changelog.d/b.md", "### Changed\n\nA second paragraph.\n")
+        self.assertEqual(release(self.root, "0.2.0", "2026-02-02"), [])
+        self.assertIn("### Changed\n\nA first paragraph.\n\nA second paragraph.\n\n## 0.1.0",
+                      (self.root / "crates/a/CHANGELOG.md").read_text())
+
+    def test_release_accepts_a_prerelease_version(self) -> None:
+        # The grammar `cut-full-release.sh` accepts, so a prerelease can fold its fragments.
+        self.assertRegex("0.20.0-rc-1", VERSION)
+        self.assertRegex("0.20.0-alpha.1+build.5", VERSION)
+        self.assertNotRegex("0.20", VERSION)
 
     def test_release_keeps_bracketed_headings_and_their_compare_links(self) -> None:
         # Keep a Changelog files render `## [0.2.0]` as a link only with a `[0.2.0]:` definition.

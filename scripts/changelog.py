@@ -35,7 +35,8 @@ FRAGMENT_DIR = "changelog.d"
 # Release order of the sections a fragment may use.
 SECTIONS = ("Breaking changes", "Added", "Changed", "Deprecated", "Removed", "Fixed", "Security")
 FRAGMENT_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]*\.md$")
-VERSION = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$")
+# The release version grammar of scripts/cut-full-release.sh.
+VERSION = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$")
 UNRELEASED = re.compile(r"^##\s+\[?unreleased\]?", re.IGNORECASE)
 # Keep a Changelog compare links, e.g. `[Unreleased]: https://.../compare/marmotc-v0.19.0...HEAD`.
 UNRELEASED_LINK = re.compile(r"^\[Unreleased\]: (?P<compare>\S+/compare/)(?P<prefix>[A-Za-z-]*)(?P<previous>\S+)\.\.\.HEAD$")
@@ -129,7 +130,12 @@ def release_section(heading: str, parts: list[dict[str, list[str]]]) -> list[str
     merged: dict[str, list[str]] = {}
     for sections in parts:
         for name, lines in sections.items():
-            merged.setdefault(name, []).extend(lines)
+            entries = merged.setdefault(name, [])
+            # Bullets from separate fragments join one list; anything else
+            # keeps a blank line, or two paragraphs would render as one.
+            if entries and not (entries[0].startswith("- ") and lines[0].startswith("- ")):
+                entries.append("")
+            entries.extend(lines)
     out = [heading, ""]
     for name in SECTIONS:
         if name in merged:
@@ -199,7 +205,7 @@ def main() -> int:
     if args.command == "check":
         errors = check(ROOT, args.none_pending)
     elif not VERSION.match(args.version):
-        errors = [f"{args.version!r} is not a version like 0.20.0"]
+        errors = [f"{args.version!r} is not a version like 0.20.0 or 0.20.0-rc-1"]
     elif not re.match(r"^\d{4}-\d{2}-\d{2}$", args.date):
         errors = [f"{args.date!r} is not a YYYY-MM-DD date"]
     else:
