@@ -219,8 +219,19 @@ fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
         ))
         .unwrap();
 
+    store
+        .record_app_event(&event(
+            "reply",
+            "member",
+            60,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![tag(&["e", ITEM]), tag(&["q", ITEM])],
+            "What happened?",
+        ))
+        .unwrap();
+
     for _ in 0..2 {
-        assert_eq!(rows(&store), [ITEM]);
+        assert_eq!(rows(&store), [ITEM, "reply"]);
         let held = row(&store, ITEM);
         assert!(held.agent_item_first_event_missing);
         assert_eq!(held.sender, "agent");
@@ -232,6 +243,9 @@ fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
         assert_eq!(held.edit, None);
         assert_eq!(held.retention_seconds, Some(3600));
         assert_eq!(held.retention_expires_at, Some(3630));
+        let preview = row(&store, "reply").reply_preview.unwrap();
+        assert_eq!(preview.retention_seconds, Some(3600));
+        assert_eq!(preview.retention_expires_at, Some(3630));
         store.rebuild_message_timeline_for_group(GROUP).unwrap();
     }
 
@@ -242,6 +256,9 @@ fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
     assert!(!first.agent_item_first_event_missing);
     assert_eq!(first.timeline_at, 10);
     assert_eq!(first.plaintext, "v4 waiting");
+    let preview = row(&store, "reply").reply_preview.unwrap();
+    assert_eq!(preview.retention_seconds, None);
+    assert_eq!(preview.retention_expires_at, None);
 }
 
 /// The agent deleting an item it never sent this device removes the row

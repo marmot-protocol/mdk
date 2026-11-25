@@ -6002,6 +6002,16 @@ typedef struct MarmotTimelineReplyPreview {
    * The previewed message's own reply target. Nullable.
    */
   char *reply_to_message_id_hex;
+  bool has_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_seconds;
+  bool has_retention_expires_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_expires_at;
 } MarmotTimelineReplyPreview;
 
 /**
