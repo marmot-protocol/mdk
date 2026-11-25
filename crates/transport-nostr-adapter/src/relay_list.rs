@@ -135,6 +135,7 @@ impl NostrAccountRelayListPublication {
             self.list_kind.event_kind(),
             tags,
             String::new(),
+            &cgka_traits::SystemWallClock,
         ))
     }
 }
@@ -198,6 +199,7 @@ impl NostrNip65RelayListPublication {
             KIND_NIP65_RELAY_LIST,
             tags,
             String::new(),
+            &cgka_traits::SystemWallClock,
         ))
     }
 }
@@ -253,6 +255,7 @@ mod tests {
                 vec!["not-r".into(), "wss://wrong-tag.example".into()],
             ],
             String::new(),
+            &cgka_traits::SystemWallClock,
         );
 
         let relays = parse_nip65_relay_set(&event);
@@ -286,6 +289,7 @@ mod tests {
             KIND_MARMOT_INBOX_RELAY_LIST,
             vec![vec!["r".into(), "wss://relay.example".into()]],
             String::new(),
+            &cgka_traits::SystemWallClock,
         );
 
         assert_eq!(parse_nip65_relay_set(&event), NostrNip65RelaySet::default());

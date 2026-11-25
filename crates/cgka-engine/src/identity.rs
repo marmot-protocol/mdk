@@ -18,6 +18,7 @@ use openmls::prelude::{
     ProcessedMessageContent, Sender, SignatureScheme,
 };
 use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::types::Ciphersuite;
 
 /// Bundle of everything needed to sign + identify the local client.
@@ -39,6 +40,7 @@ impl Identity {
         ciphersuite: Ciphersuite,
         identity_bytes: Vec<u8>,
         storage: &S,
+        crypto: &impl OpenMlsCrypto,
         protocol_profile: ProtocolProfile,
         created_at: Timestamp,
         proof_signer: &dyn crate::account_identity_proof::AccountIdentityProofSigner,
@@ -65,7 +67,10 @@ impl Identity {
                 })?;
                 (signer, binding)
             } else {
-                let signer = SignatureKeyPair::new(scheme).map_err(|e| format!("signer: {e}"))?;
+                let (private, public) = crypto
+                    .signature_key_gen(scheme)
+                    .map_err(|e| format!("signer: {e}"))?;
+                let signer = SignatureKeyPair::from_raw(scheme, private, public);
                 signer
                     .store(storage.mls_storage())
                     .map_err(|e| format!("store signer: {e:?}"))?;

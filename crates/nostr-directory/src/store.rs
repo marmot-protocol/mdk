@@ -780,6 +780,7 @@ mod deletion_barrier_tests {
                 5,
                 vec![vec![], vec!["e".into()], vec!["a".into()]],
                 String::new(),
+                &cgka_traits::SystemWallClock,
             ),
         };
 

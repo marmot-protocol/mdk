@@ -132,7 +132,7 @@ async fn a_route_less_welcome_is_classified_and_paced() {
     alice.runtime = alice.runtime.with_maintenance_sources(
         clock.clone(),
         Arc::new(marmot_session::SystemMonotonicClock::default()),
-        Arc::new(marmot_session::OsMaintenanceRandom),
+        Arc::new(marmot_session::OsEntropy),
     );
     alice
         .create_group("paced", &[&bob_id])

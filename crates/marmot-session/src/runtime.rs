@@ -71,8 +71,7 @@ use crate::session::{
     SessionError, SessionOpenTimings, SessionResult, WelcomeHold, WelcomeWithdrawal,
 };
 use crate::time::{
-    MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
-    WallClock,
+    EntropySource, MonotonicClock, OsEntropy, SystemMonotonicClock, SystemWallClock, WallClock,
 };
 
 mod device_roster;
@@ -730,7 +729,7 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     key_packages: K,
     wall_clock: Arc<dyn WallClock>,
     monotonic_clock: Arc<dyn MonotonicClock>,
-    maintenance_random: Arc<dyn MaintenanceRandom>,
+    entropy: Arc<dyn EntropySource>,
     maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
     /// This runtime was asked to withdraw the device's slot for sign-out, so
@@ -845,7 +844,7 @@ where
             key_packages,
             wall_clock: Arc::new(SystemWallClock),
             monotonic_clock: Arc::new(SystemMonotonicClock::default()),
-            maintenance_random: Arc::new(OsMaintenanceRandom),
+            entropy: Arc::new(OsEntropy),
             maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
             key_package_slot_withdrawn: false,
@@ -884,11 +883,11 @@ where
         mut self,
         wall_clock: Arc<dyn WallClock>,
         monotonic_clock: Arc<dyn MonotonicClock>,
-        maintenance_random: Arc<dyn MaintenanceRandom>,
+        entropy: Arc<dyn EntropySource>,
     ) -> Self {
         self.wall_clock = wall_clock;
         self.monotonic_clock = monotonic_clock;
-        self.maintenance_random = maintenance_random;
+        self.entropy = entropy;
         self
     }
 
@@ -1885,7 +1884,7 @@ where
                 return Err(AccountError::ClockSkewBlocked);
             }
             let refresh_after = self
-                .maintenance_random
+                .entropy
                 .sample_inclusive(KEY_PACKAGE_REFRESH_MIN_SECS, KEY_PACKAGE_REFRESH_MAX_SECS);
             if supersede_pending {
                 // Recorded with the replacement it pays for, so a restart
@@ -2663,7 +2662,7 @@ where
         hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
         hasher.update(group_id.as_slice());
         hasher.update(now.0.to_be_bytes());
-        hasher.update(self.maintenance_random.next_u64().to_be_bytes());
+        hasher.update(self.entropy.next_u64().to_be_bytes());
         let id = cgka_traits::MessageId::new(hasher.finalize().to_vec());
         let obligation = MaintenanceObligation {
             id: id.clone(),
@@ -2678,7 +2677,7 @@ where
             quiet_since: Some(now),
             own_leaf_baseline_hash: Some(self.session.own_leaf_hash(group_id)?),
             sampled_jitter_ms: self
-                .maintenance_random
+                .entropy
                 .sample_inclusive(0, self.maintenance_timing.contention_jitter_max_ms()),
             not_before: None,
             attempt_count: 0,
@@ -3069,7 +3068,7 @@ where
                     grace_until: None,
                     quiet_since: Some(now),
                     own_leaf_baseline_hash: Some(self.session.own_leaf_hash(&group_id)?),
-                    sampled_jitter_ms: self.maintenance_random.sample_inclusive(0, 15 * 60 * 1_000),
+                    sampled_jitter_ms: self.entropy.sample_inclusive(0, 15 * 60 * 1_000),
                     not_before: None,
                     attempt_count: 0,
                     semantic_rearm_count: 0,
@@ -3593,7 +3592,7 @@ where
                     grace_until: None,
                     quiet_since: Some(now),
                     own_leaf_baseline_hash: Some(self.session.own_leaf_hash(group_id)?),
-                    sampled_jitter_ms: self.maintenance_random.sample_inclusive(0, 15 * 60 * 1_000),
+                    sampled_jitter_ms: self.entropy.sample_inclusive(0, 15 * 60 * 1_000),
                     not_before: None,
                     attempt_count: 0,
                     semantic_rearm_count: 0,
@@ -5597,7 +5596,7 @@ where
         let earliest = baseline.0.saturating_add(PERIODIC_MIN_SECS);
         let latest = baseline.0.saturating_add(PERIODIC_MAX_SECS);
         let first = baseline.0.saturating_add(
-            self.maintenance_random
+            self.entropy
                 .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
         );
         let mut deadline = first;

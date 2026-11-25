@@ -1,4 +1,4 @@
-use cgka_traits::{EngineError, MarmotAppEvent, MemberId};
+use cgka_traits::{EngineError, EntropySource, MarmotAppEvent, MemberId};
 use sha2::{Digest, Sha256};
 
 pub(crate) fn source_authority(
@@ -152,6 +152,7 @@ pub(crate) fn historical_source<S: cgka_traits::StorageProvider>(
     storage: &S,
     rewinds: &crate::snapshot_guard::Rewinds,
     crypto: &openmls_rust_crypto::RustCrypto,
+    entropy: &dyn EntropySource,
     request: &cgka_traits::app_event::PendingAppMessageAuthority,
     snapshot: &str,
     wire: &[u8],
@@ -159,12 +160,15 @@ pub(crate) fn historical_source<S: cgka_traits::StorageProvider>(
     use cgka_traits::storage::StorageError;
     use openmls::prelude::{MlsGroup, ProcessedMessageContent};
     use openmls_traits::OpenMlsProvider;
+
+    let mut suffix = [0_u8; 16];
+    entropy.fill_bytes(&mut suffix);
     crate::snapshot_guard::SnapshotRollbackGuard::contained(
         storage,
         rewinds,
         &request.group_id,
         crate::snapshot_guard::RewindSite::ModerationSource,
-        &format!("{:032x}", rand::random::<u128>()),
+        &hex::encode(suffix),
         |storage| {
             match storage.rollback_group_state_keeping_live_records(&request.group_id, snapshot) {
                 Ok(()) => {}
@@ -282,6 +286,7 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
                 &self.storage,
                 &self.rewinds,
                 &self.crypto,
+                self.entropy.as_ref(),
                 &request,
                 &snapshot,
                 &wire.payload,
@@ -369,6 +374,7 @@ mod tests {
                 &storage,
                 &crate::snapshot_guard::Rewinds::default(),
                 &openmls_rust_crypto::RustCrypto::default(),
+                &cgka_traits::OsEntropy,
                 &request,
                 "pruned-after-listing",
                 &[]

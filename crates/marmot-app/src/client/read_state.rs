@@ -2726,7 +2726,7 @@ mod tests {
         client.runtime = client.runtime.with_maintenance_sources(
             Arc::new(BehindClock(system_clock_now().0 - 3_600)),
             Arc::new(marmot_session::SystemMonotonicClock::default()),
-            Arc::new(marmot_session::OsMaintenanceRandom),
+            Arc::new(marmot_session::OsEntropy),
         );
 
         let (sender, _reader) = read_state_channel();

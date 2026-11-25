@@ -2,6 +2,7 @@ use super::*;
 use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
 use cgka_traits::storage::AccountDeviceSignerStorage;
 use nostr::prelude::{FinalizeEvent, Keys};
+use openmls_rust_crypto::RustCrypto;
 use std::sync::Mutex;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
@@ -30,6 +31,7 @@ impl Signer {
             SUITE,
             self.identity(),
             store,
+            &RustCrypto::default(),
             ProtocolProfile::Current,
             OPENED_AT,
             self,
@@ -185,6 +187,7 @@ fn current_and_legacy_proof_domains_remain_separate() {
         SUITE,
         signer.identity(),
         &store,
+        &RustCrypto::default(),
         ProtocolProfile::Legacy,
         OPENED_AT,
         &signer,
@@ -217,6 +220,7 @@ fn invalid_new_signature_is_never_persisted_or_returned() {
             SUITE,
             identity.clone(),
             &store,
+            &RustCrypto::default(),
             ProtocolProfile::Current,
             OPENED_AT,
             &InvalidSigner,
@@ -257,6 +261,7 @@ fn failed_proof_persistence_reopens_with_the_same_key_and_retries_acquisition() 
                 SUITE,
                 signer.identity(),
                 &store,
+                &RustCrypto::default(),
                 ProtocolProfile::Current,
                 OPENED_AT,
                 &ClosingSigner {

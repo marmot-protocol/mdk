@@ -29,13 +29,14 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::group_context::GroupContext;
 use cgka_traits::ingest::IngestOutcome;
-use cgka_traits::maintenance::{MaintenanceRandom, MonotonicClock, WallClock};
+use cgka_traits::maintenance::{EntropySource, MonotonicClock, WallClock};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{LeaveRequest, RosterTagKey, StorageError, StorageProvider};
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
+pub use cgka_traits::{OsEntropy, SystemWallClock};
 use marmot_forensics::{
     AuditEngineContext, AuditEventContext, AuditEventKind, AuditGroupContext, AuditRecord,
     ForensicRecorder, NoopRecorder,
@@ -43,13 +44,12 @@ use marmot_forensics::{
 use openmls::prelude::{ProcessedMessageContent, Proposal};
 use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tls_codec::Serialize as _;
-use web_time::{Instant, SystemTime, UNIX_EPOCH};
+use web_time::Instant;
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
@@ -189,32 +189,6 @@ impl<S: StorageProvider> Drop for OperationAuditScope<'_, S> {
     }
 }
 
-/// Production wall clock: the system's time since the Unix epoch.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemWallClock;
-
-// The system clock itself (see clippy.toml).
-#[allow(clippy::disallowed_methods)]
-impl WallClock for SystemWallClock {
-    fn now(&self) -> cgka_traits::Timestamp {
-        cgka_traits::Timestamp(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        )
-    }
-
-    fn now_ms(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX)
-    }
-}
-
 /// Production monotonic clock: time since this value was made.
 #[derive(Debug)]
 pub struct SystemMonotonicClock {
@@ -234,16 +208,6 @@ impl Default for SystemMonotonicClock {
 impl MonotonicClock for SystemMonotonicClock {
     fn elapsed(&self) -> Duration {
         self.origin.elapsed()
-    }
-}
-
-/// Production maintenance randomness, from the operating system.
-#[derive(Debug, Default)]
-pub struct OsMaintenanceRandom;
-
-impl MaintenanceRandom for OsMaintenanceRandom {
-    fn next_u64(&self) -> u64 {
-        rand::rngs::OsRng.next_u64()
     }
 }
 
@@ -320,7 +284,7 @@ pub struct Engine<S: StorageProvider> {
     /// Times every in-process budget, deadline and duration metric. Its
     /// readings mean nothing after a restart and are never persisted.
     pub(crate) monotonic: Arc<dyn MonotonicClock>,
-    pub(crate) maintenance_random: Arc<dyn MaintenanceRandom>,
+    pub(crate) entropy: Arc<dyn EntropySource>,
 
     /// Per-group state-machine owner. Every transition, pending-ref
     /// allocation, and fork-detection marker flows through this struct.
@@ -558,7 +522,7 @@ pub struct EngineBuilder<S: StorageProvider> {
     max_past_epochs: usize,
     wall_clock: Arc<dyn WallClock>,
     monotonic: Arc<dyn MonotonicClock>,
-    maintenance_random: Arc<dyn MaintenanceRandom>,
+    entropy: Arc<dyn EntropySource>,
     convergence_clock: Arc<dyn ConvergenceClock>,
     #[cfg(feature = "test-policy-overrides")]
     admit_app_witnesses: bool,
@@ -584,7 +548,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
             wall_clock: Arc::new(SystemWallClock),
             monotonic: Arc::new(SystemMonotonicClock::default()),
-            maintenance_random: Arc::new(OsMaintenanceRandom),
+            entropy: Arc::new(OsEntropy),
             convergence_clock: Arc::new(SystemConvergenceClock::default()),
             #[cfg(feature = "test-policy-overrides")]
             admit_app_witnesses: true,
@@ -659,13 +623,18 @@ impl<S: StorageProvider> EngineBuilder<S> {
         self
     }
 
+    /// Set the wall clock and entropy used by the engine.
+    ///
+    /// A test entropy source must give each build on the same database a
+    /// distinct `next_u64` value. Otherwise, after a reopen the engine can
+    /// mistake persisted monotonic deadlines for readings of its new clock.
     pub fn maintenance_sources(
         mut self,
         wall_clock: Arc<dyn WallClock>,
-        maintenance_random: Arc<dyn MaintenanceRandom>,
+        entropy: Arc<dyn EntropySource>,
     ) -> Self {
         self.wall_clock = wall_clock;
-        self.maintenance_random = maintenance_random;
+        self.entropy = entropy;
         self
     }
 
@@ -782,6 +751,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             self.ciphersuite,
             identity_bytes,
             &self.storage,
+            &crypto,
             self.new_protocol_profile,
             self.wall_clock.now(),
             proof_signer.as_ref(),
@@ -835,6 +805,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             crate::message_processor::MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT,
         );
 
+        let convergence_clock_instance_id = self.entropy.next_u64();
         Ok(Engine {
             storage: self.storage,
             crypto,
@@ -848,7 +819,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             max_past_epochs: self.max_past_epochs,
             wall_clock: self.wall_clock,
             monotonic: self.monotonic,
-            maintenance_random: self.maintenance_random,
+            entropy: self.entropy,
             epoch_manager,
             mls_group_cache: crate::mls_group_cache::MlsGroupCache::default(),
             pending_origin_commits: HashMap::new(),
@@ -885,7 +856,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             #[cfg(feature = "test-conformance-snapshot")]
             conformance_replay_probe_count: 0,
             convergence_clock: self.convergence_clock,
-            convergence_clock_instance_id: rand::rngs::OsRng.next_u64(),
+            convergence_clock_instance_id,
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
             recorder: Arc::from(self.recorder.unwrap_or_else(|| Box::new(NoopRecorder))),
             audit_operation_counter: 0,

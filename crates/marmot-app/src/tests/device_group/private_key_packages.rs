@@ -2336,7 +2336,7 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_a_later_heartbeat() 
     devices.laptop.runtime = devices.laptop.runtime.with_maintenance_sources(
         Arc::new(EarlierClock(earlier)),
         Arc::new(marmot_session::SystemMonotonicClock::default()),
-        Arc::new(marmot_session::OsMaintenanceRandom),
+        Arc::new(marmot_session::OsEntropy),
     );
     let event = devices
         .laptop
@@ -2372,7 +2372,7 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_a_later_heartbeat() 
     devices.laptop.runtime = devices.laptop.runtime.with_maintenance_sources(
         Arc::new(marmot_session::SystemWallClock),
         Arc::new(marmot_session::SystemMonotonicClock::default()),
-        Arc::new(marmot_session::OsMaintenanceRandom),
+        Arc::new(marmot_session::OsEntropy),
     );
     assert!(
         devices.phone.state_group_record(&chat).is_none(),

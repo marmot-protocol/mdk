@@ -449,6 +449,7 @@ mod tests {
                     1,
                     Vec::new(),
                     String::new(),
+                    &cgka_traits::SystemWallClock,
                 ),
                 required_acks: 1,
             })

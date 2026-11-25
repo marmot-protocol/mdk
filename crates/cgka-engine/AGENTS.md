@@ -38,7 +38,7 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 
 | Module | Owns |
 | --- | --- |
-| `engine.rs` | `Engine<S>`, `EngineBuilder`, `CgkaEngine` impl, `drain_events` / `drain_auto_publish` / `drain_auto_proposals` queues, and the system clocks and randomness an engine runs on unless the builder is given others (`SystemWallClock`, `SystemMonotonicClock`, `OsMaintenanceRandom`) |
+| `engine.rs` | `Engine<S>`, `EngineBuilder`, `CgkaEngine` impl, `drain_events` / `drain_auto_publish` / `drain_auto_proposals` queues, and `SystemMonotonicClock`. Re-exports `SystemWallClock` and `OsEntropy` from `cgka_traits`. |
 | `identity.rs` | Local signer + credential bundle; `member_id_of_processed_message` / `member_id_of_sender` chokepoints |
 | `provider.rs` | Ad-hoc `OpenMlsProvider` adapter composed from crypto + storage |
 | `feature_registry.rs` | Runtime feature → capability-requirement registry |

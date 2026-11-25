@@ -1147,7 +1147,7 @@ async fn welcomes_ordered(
     let events = account.relay.published_events.lock().unwrap()[*cursor..].to_vec();
     *cursor += events.len();
     let peeler =
-        transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer(account.keys.clone());
+        transport_nostr_peeler::NostrMlsPeeler::default().with_welcome_signer(account.keys.clone());
     let (mut named, mut own_rumors, mut other_rumors) = (Vec::new(), 0, 0);
     for event in events {
         let names_own = match peeler

@@ -1907,6 +1907,7 @@ impl<S: StorageProvider> Engine<S> {
                     &self.storage,
                     &self.rewinds,
                     &self.crypto,
+                    self.entropy.as_ref(),
                     &request,
                     &snapshot,
                     &msg.payload,

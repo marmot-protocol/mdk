@@ -48,9 +48,12 @@ fn not_advertising(
 /// Give the two groups different contention delays.
 struct FiveMinuteRandom(AtomicU64);
 
-impl MaintenanceRandom for FiveMinuteRandom {
-    fn next_u64(&self) -> u64 {
-        self.0.fetch_add(1, Ordering::Relaxed) * 5 * 60 * 1_000
+impl EntropySource for FiveMinuteRandom {
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        for chunk in dest.chunks_mut(8) {
+            let value = self.0.fetch_add(1, Ordering::Relaxed) * 5 * 60 * 1_000;
+            chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+        }
     }
 }
 

@@ -1569,7 +1569,7 @@ impl<S: StorageProvider> Engine<S> {
         // recipient consent bound to its current epoch authenticator.
         let join_config = join_config(self.max_past_epochs);
         let joined_at = self.wall_clock.now();
-        let sampled_jitter_ms = self.maintenance_random.sample_inclusive(
+        let sampled_jitter_ms = self.entropy.sample_inclusive(
             0,
             cgka_traits::maintenance::POST_JOIN_CONTENTION_JITTER_MAX_MS,
         );

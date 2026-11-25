@@ -25,6 +25,7 @@ pub(crate) async fn discovery_fixture(
             KIND_NIP65_RELAY_LIST,
             vec![vec!["r".into(), OUTBOX.into(), "write".into()]],
             String::new(),
+            &cgka_traits::SystemWallClock,
         ));
     }
     let outbox = discovery
