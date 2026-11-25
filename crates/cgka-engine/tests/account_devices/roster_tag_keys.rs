@@ -161,17 +161,17 @@ async fn a_removed_record_dropped_within_one_pass_is_recorded() {
 }
 
 /// A `removed` record that keeps no key (marmot#520) holds the keys a
-/// device keeps for its slot as removed, on the device whose own Commit made
-/// it and on one that applies it and its drop within one pass. A key the
-/// slot is listed with after the drop, and another slot's key, are not
-/// held.
+/// device keeps for its slot as removed, on the device whose own Commits
+/// list the key and make the record, and on one that applies the listing,
+/// the record and its drop within one pass. A key the slot is listed with
+/// after the drop, and another slot's key, are not held.
 #[tokio::test]
 async fn a_removed_record_without_a_key_holds_the_slots_keys() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
-    let commit = send_commit(&mut phone, set_key(&gid, 4, "Tablet", 0xd4), &gid).await;
-    assert_accepted(&mut laptop, &commit, &gid).await;
-    let commit = send_commit(&mut phone, set_key(&gid, 5, "Watch", 0xd5), &gid).await;
-    assert_accepted(&mut laptop, &commit, &gid).await;
+    let listed = roster_update(
+        &gid,
+        vec![set_key_op(4, "Tablet", 0xd4), set_key_op(5, "Watch", 0xd5)],
+    );
     let first = roster_update(
         &gid,
         vec![
@@ -193,9 +193,10 @@ async fn a_removed_record_without_a_key_holds_the_slots_keys() {
             set_key_op(4, "Tablet", 0xe4),
         ],
     );
+    let listed = send_commit(&mut phone, listed, &gid).await;
     let first = send_commit(&mut phone, first, &gid).await;
     let second = send_commit(&mut phone, second, &gid).await;
-    for commit in [&first, &second] {
+    for commit in [&listed, &first, &second] {
         laptop
             .engine
             .buffer_openmls_convergence_message_at(&gid, commit.clone(), 500)
@@ -205,7 +206,7 @@ async fn a_removed_record_without_a_key_holds_the_slots_keys() {
         .engine
         .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .unwrap();
-    assert_eq!(result.accepted_commits.len(), 2, "{result:?}");
+    assert_eq!(result.accepted_commits.len(), 3, "{result:?}");
     for device in [&phone, &laptop] {
         let keys = recorded(device, &gid);
         assert!(keys.contains(&removed_key(4, 0xd4)), "{keys:?}");
