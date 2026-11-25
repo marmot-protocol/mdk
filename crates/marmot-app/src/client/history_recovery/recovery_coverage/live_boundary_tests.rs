@@ -246,7 +246,8 @@ fn ended_broken_and_unplaced_generations() {
     assert_eq!(inbox_owed_until(&live, &ended, 5_000), 5_000);
 
     let current = [fact(vec![INBOX], count(1, Some(50)), false)];
-    live.broken.insert(current[0].key.clone());
+    live.broken
+        .insert(current[0].key.clone(), super::Broken::All);
     assert!(durable(&live, &current).is_empty());
     assert_eq!(inbox_owed_until(&live, &current, 5_000), 5_000);
 
@@ -256,6 +257,37 @@ fn ended_broken_and_unplaced_generations() {
     let fresh = LiveCoverage::opened_at(None);
     assert!(durable(&fresh, &unplaced).is_empty(), "waits for placement");
     assert_eq!(inbox_owed_until(&fresh, &unplaced, 5_000), 5_000);
+}
+
+/// Loss that names its routes breaks only those routes of a batched REQ's
+/// generation: the other routes it carries keep their tail and their live
+/// boundary. Loss that names no routes breaks every one.
+#[test]
+fn loss_on_one_route_of_a_batched_request_breaks_only_that_route() {
+    let healthy = TransportReconciliationRoute::Group([1; 32]);
+    let lost = TransportReconciliationRoute::Group([2; 32]);
+    let facts = [fact(
+        vec![healthy.clone(), lost.clone()],
+        count(1, Some(50)),
+        false,
+    )];
+    let present = std::collections::HashMap::from([(
+        facts[0].key.clone(),
+        vec![healthy.clone(), lost.clone()],
+    )]);
+    let mut live = LiveCoverage::opened_at(None);
+    live.break_reached(&present, Some(std::slice::from_ref(&lost)));
+    let tails = live.tails(&facts, |_, since| Some(since));
+    assert_eq!(tails.owed_until(&healthy, &relay(), 5_000), REQUESTED - 1);
+    assert_eq!(tails.owed_until(&lost, &relay(), 5_000), 5_000);
+    let settling = live.durable(&facts);
+    assert_eq!(settling.len(), 1);
+    assert_eq!(settling[0].2, vec![&healthy]);
+
+    live.break_reached(&present, None);
+    let tails = live.tails(&facts, |_, since| Some(since));
+    assert_eq!(tails.owed_until(&healthy, &relay(), 5_000), 5_000);
+    assert!(live.durable(&facts).is_empty());
 }
 
 /// The REQ will not deliver a released event again, so its tail starts past
