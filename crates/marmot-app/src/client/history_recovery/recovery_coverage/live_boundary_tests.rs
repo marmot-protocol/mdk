@@ -1,6 +1,7 @@
 //! The live boundary and its provisional tail (mdk#2660 phase 4): what a
 //! live REQ's count proves, what its open REQ vouches for while it lasts, and
 //! what ends that.
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use storage_sqlite::{RecoveryCoverageProof, TransportReconciliationRoute};
@@ -77,7 +78,7 @@ fn durable(live: &LiveCoverage, facts: &[LiveCountFact]) -> Vec<Option<(u64, u64
 /// The last second owed on the inbox at `now` after `facts`' tails, with no
 /// released second.
 fn inbox_owed_until(live: &LiveCoverage, facts: &[LiveCountFact], now: u64) -> u64 {
-    live.tails(facts, |_, since| Some(since))
+    live.tails(facts, &BTreeMap::new())
         .owed_until(&INBOX, &relay(), now)
 }
 
@@ -118,7 +119,7 @@ fn a_durable_proof_stops_before_the_request_and_the_tail_runs_from_it() {
     assert_eq!(written.len(), 1);
     assert_eq!(written[0].2, groups.iter().collect::<Vec<_>>());
     assert_eq!(written[0].1, Some((401, REQUESTED - 1)));
-    let tails = live.tails(&facts, |_, since| Some(since));
+    let tails = live.tails(&facts, &BTreeMap::new());
     for route in &groups {
         assert_eq!(tails.owed_until(route, &relay(), 5_000), REQUESTED - 1);
         assert_eq!(
@@ -273,7 +274,7 @@ fn loss_on_one_route_of_a_batched_request_breaks_only_that_route() {
     let present = std::collections::HashMap::from([(facts[0].key.clone(), routes)]);
     let mut live = LiveCoverage::opened_at(None);
     let tail = |live: &LiveCoverage, route| {
-        live.tails(&facts, |_, since| Some(since))
+        live.tails(&facts, &BTreeMap::new())
             .owed_until(route, &relay(), 5_000)
     };
     live.break_reached(&present, Some(std::slice::from_ref(&lost)));
@@ -290,24 +291,25 @@ fn loss_on_one_route_of_a_batched_request_breaks_only_that_route() {
     assert!(live.durable(&facts).is_empty());
 }
 
-/// The REQ will not deliver a released event again, so its tail starts past
-/// the newest second released on that route; a failed read drops the tail.
+/// The REQ will not deliver a released event again, so its tail starts just
+/// past the newest second released on that route at or after the tail's
+/// start. An earlier release, or none, leaves the start where the count put
+/// it.
 #[test]
 fn the_tail_starts_past_released_seconds() {
-    let first = TransportReconciliationRoute::Group([1; 32]);
-    let second = TransportReconciliationRoute::Group([2; 32]);
-    let facts = [fact(
-        vec![first.clone(), second.clone()],
-        count(0, None),
-        false,
-    )];
-    let live = LiveCoverage::opened_at(None);
-    let tails = live.tails(&facts, |route, since| {
-        assert_eq!(since, REQUESTED);
-        (route == &first).then_some(1_501)
-    });
-    assert_eq!(tails.owed_until(&first, &relay(), 5_000), 1_500);
-    assert_eq!(tails.owed_until(&second, &relay(), 5_000), 5_000);
+    let route = |n| TransportReconciliationRoute::Group([n; 32]);
+    let facts = [fact((1..=4).map(route).collect(), count(0, None), false)];
+    let released = BTreeMap::from([
+        (route(2), REQUESTED - 5),
+        (route(3), REQUESTED),
+        (route(4), REQUESTED + 5),
+    ]);
+    let tails = LiveCoverage::opened_at(None).tails(&facts, &released);
+    let owed = |n| tails.owed_until(&route(n), &relay(), 5_000);
+    assert_eq!(owed(1), REQUESTED - 1, "nothing released");
+    assert_eq!(owed(2), REQUESTED - 1, "released before the tail");
+    assert_eq!(owed(3), REQUESTED, "released at its start");
+    assert_eq!(owed(4), REQUESTED + 5, "released inside it");
 }
 
 /// The runner's fence reads a count's emptiness and its oldest event: only a
@@ -387,7 +389,7 @@ fn a_held_route_waits_while_its_counts_other_routes_are_written() {
         .insert(second.clone());
     assert!(durable(&live, &facts).is_empty(), "the held route waits");
     assert_eq!(
-        live.tails(&facts, |_, since| Some(since))
+        live.tails(&facts, &BTreeMap::new())
             .owed_until(&first, &relay(), 5_000),
         REQUESTED - 1,
         "its tail stands, so only capture debt is owed"

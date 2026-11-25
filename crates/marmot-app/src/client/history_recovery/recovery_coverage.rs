@@ -208,12 +208,13 @@ impl LiveCoverage {
     /// stored event older than that, so it may have cut what it stored
     /// after; then just past the oldest it sent. A count whose relay said it
     /// held events back has no tail ([`ReplayLiveCount::withheld`]).
-    /// `released` moves a start on a route past the seconds released for
-    /// replay there, or drops it.
+    /// `released` holds each route's newest second released for replay: the
+    /// REQ will not deliver a released event again, so a start at or before
+    /// it moves just past it.
     fn tails(
         &self,
         facts: &[LiveCountFact],
-        mut released: impl FnMut(&TransportReconciliationRoute, u64) -> Option<u64>,
+        released: &BTreeMap<TransportReconciliationRoute, u64>,
     ) -> LiveTails {
         let mut tails = LiveTails::default();
         for fact in facts
@@ -232,9 +233,11 @@ impl LiveCoverage {
                 .iter()
                 .filter(|route| !self.route_broken(&fact.key, route))
             {
-                if let Some(since) = released(route, since) {
-                    tails.start(route, &fact.key.1, since);
-                }
+                let since = match released.get(route) {
+                    Some(second) if *second >= since => second.saturating_add(1),
+                    _ => since,
+                };
+                tails.start(route, &fact.key.1, since);
             }
         }
         tails
@@ -1229,9 +1232,9 @@ impl AppClient {
             }
             Err(error) => return log_failure("record_native_coverage", &error.into()),
         }
-        // Loss imported while the adapter was read may have reached a
-        // generation this observation saw: the write left its seconds out,
-        // and it gets no tail either.
+        // Loss imported while the adapter was read may have reached routes
+        // of a generation this observation saw: the write left their seconds
+        // out, and they get no tail either.
         match app.recovery_coverage_lost_since(mark) {
             Ok(lost) => live.break_reached(&present, lost.as_deref()),
             Err(error) => return log_failure("record_native_coverage", &error.into()),
@@ -1263,14 +1266,7 @@ impl AppClient {
             Ok(released) => released,
             Err(error) => return log_failure("record_native_coverage", &error.into()),
         };
-        live.tails = live.tails(&facts, |route, since| {
-            Some(
-                released
-                    .get(route)
-                    .filter(|second| **second >= since)
-                    .map_or(since, |second| second.saturating_add(1)),
-            )
-        });
+        live.tails = live.tails(&facts, &released);
     }
 
     /// The live tails now: observes the adapter as
