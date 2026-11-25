@@ -200,7 +200,7 @@ async fn failed_permanent_removal_preserves_live_row_timing_then_committed_remov
         runtime
             .local_send_status(&account.label, &group, "remove-token")
             .unwrap(),
-        Some(crate::LocalSendStatus::Queued)
+        Some(crate::LocalSendStatus::Queued { .. })
     ));
     assert_eq!(queue_snapshot(&runtime).in_flight, 1);
     let obstruction = home.root().join(".wipe-tombstones");
@@ -314,7 +314,7 @@ async fn unhydrated_durable_send_waits_for_safety_and_survives_terminal_close() 
         runtime
             .local_send_status(&account.label, &group, token)
             .unwrap(),
-        Some(crate::LocalSendStatus::Queued)
+        Some(crate::LocalSendStatus::Queued { .. })
     ));
     assert_eq!(
         app.account_storage(&account.label)

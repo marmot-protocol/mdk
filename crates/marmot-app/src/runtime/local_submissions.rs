@@ -239,12 +239,20 @@ impl MarmotAppRuntime {
             .local_submission(&hex::encode(group.as_slice()), token)?;
         submission
             .map(|s| {
-                Ok(if let Some(json) = s.outcome_json {
-                    crate::local_submissions::decode_local_outcome(&json)?
+                Ok(if s.state == 4 {
+                    crate::LocalSendStatus::RefusedNewMembers
+                } else if let Some(json) = s.outcome_json {
+                    crate::LocalSendStatus::Completed(
+                        crate::local_submissions::decode_local_outcome(&json)?,
+                    )
                 } else {
                     match s.state {
-                        0 => crate::LocalSendStatus::Queued,
-                        1 => crate::LocalSendStatus::EngineOwned,
+                        0 => crate::LocalSendStatus::Queued {
+                            message_id_hex: s.message_id_hex,
+                        },
+                        1 => crate::LocalSendStatus::EngineOwned {
+                            message_id_hex: s.message_id_hex,
+                        },
                         _ => crate::LocalSendStatus::Rejected,
                     }
                 })

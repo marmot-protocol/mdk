@@ -1716,12 +1716,15 @@ impl<S: StorageProvider> Engine<S> {
                 SendAcceptance::Prepare => engine.do_send(intent).await,
                 SendAcceptance::QueueAppMessage => {
                     let SendIntent::AppMessage {
-                        group_id, payload, ..
+                        group_id,
+                        payload,
+                        only_to_members,
+                        ..
                     } = intent
                     else {
                         unreachable!("queue app-message acceptance constructs an AppMessage intent")
                     };
-                    engine.do_queue_app_message(group_id, payload)
+                    engine.do_queue_app_message(group_id, payload, only_to_members)
                 }
             }
         };

@@ -727,6 +727,10 @@ impl AppClient {
             }
         }
         self.reconcile_disband_drafts();
+        // A crash between the engine refusing a queued send and the host
+        // seeing the refusal leaves its row to retract here.
+        let refused = self.app.retract_refused_local_sends(&self.state.label)?;
+        self.pending_projection_updates.extend(refused);
         // Live group state is readable from here on either open path, and the
         // durable stall evidence was restored before this seam.
         self.seed_epoch_stall_from_deferred_rows();

@@ -770,6 +770,19 @@ pub trait OutboundIntentStorage {
         group_id: &GroupId,
     ) -> StorageResult<Vec<QueuedOutboundIntent>>;
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()>;
+    /// Delete a queued intent the engine refused on the settled state.
+    /// `error_kind` is the refusal's
+    /// [`EngineError::privacy_safe_kind`](crate::error::EngineError::privacy_safe_kind),
+    /// so a host's storage can record what the refusal means for its own
+    /// state in the same transaction.
+    fn retire_refused_queued_outbound_intent(
+        &self,
+        record: &QueuedOutboundIntent,
+        error_kind: &str,
+    ) -> StorageResult<()> {
+        let _ = error_kind;
+        self.delete_queued_outbound_intent(&record.id)
+    }
 
     /// Record or replace the intent behind a staged own commit.
     fn put_own_commit_intent(&self, record: &OwnCommitIntent) -> StorageResult<()>;

@@ -197,7 +197,8 @@ impl<S: StorageProvider> Engine<S> {
         record: &QueuedOutboundIntent,
         error: &EngineError,
     ) -> Result<(), EngineError> {
-        self.storage.delete_queued_outbound_intent(&record.id)?;
+        self.storage
+            .retire_refused_queued_outbound_intent(record, error.privacy_safe_kind())?;
         self.announce_refused_queued_intent(record, QueuedIntentRetirement::Refused(error));
         Ok(())
     }

@@ -2,7 +2,7 @@
 //! and publication remain with the account worker; admission performs no I/O to relays.
 mod outcome;
 pub(crate) use outcome::decode_local_outcome;
-use outcome::{encode_local_outcome, encode_refused_new_members};
+use outcome::encode_local_outcome;
 
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::storage::{GroupStorage, StorageProvider};
@@ -63,11 +63,17 @@ impl std::fmt::Debug for LocalSendAcceptance {
 }
 
 /// Queryable after restart; transport delivery is also reflected by the ordinary
-/// timeline source identity and invalidation updates.
+/// timeline source identity and invalidation updates. A send MDK still holds
+/// names its event, so a host that lost the acceptance learns it by asking,
+/// without handing the send again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocalSendStatus {
-    Queued,
-    EngineOwned,
+    Queued {
+        message_id_hex: String,
+    },
+    EngineOwned {
+        message_id_hex: String,
+    },
     Completed(crate::SendSummary),
     Rejected,
     /// Not sent: the group gained a member account the send's member list
@@ -247,18 +253,13 @@ impl MarmotApp {
         result: &Result<crate::SendSummary, AppError>,
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let storage = self.account_storage(label)?;
-        let outcome = match result {
-            Ok(summary) => Some(encode_local_outcome(summary)?),
-            Err(error)
-                if matches!(
-                    error.as_engine_error(),
-                    Some(cgka_traits::error::EngineError::AppMessageNewMembers)
-                ) =>
-            {
-                Some(encode_refused_new_members())
-            }
-            Err(_) => None,
-        };
+        let outcome = result.as_ref().ok().map(encode_local_outcome).transpose()?;
+        let refused = result.as_ref().is_err_and(|error| {
+            matches!(
+                error.as_engine_error(),
+                Some(cgka_traits::error::EngineError::AppMessageNewMembers)
+            )
+        });
         StorageProvider::with_transaction(&storage, |storage| {
             let Some(current) = storage
                 .app_storage()
@@ -276,40 +277,43 @@ impl MarmotApp {
             } else {
                 None
             };
-            storage.app_storage().finish_local_submission(
-                &submission.group_id_hex,
-                &submission.client_token,
-                outcome.as_deref(),
-            )?;
+            if refused {
+                storage
+                    .app_storage()
+                    .refuse_local_submission(&submission.group_id_hex, &submission.client_token)?;
+            } else {
+                storage.app_storage().finish_local_submission(
+                    &submission.group_id_hex,
+                    &submission.client_token,
+                    outcome.as_deref(),
+                )?;
+            }
             Ok(update)
         })
     }
 
-    /// A token send the engine queued and then refused at drain because the
-    /// group gained a member it leaves out: settle its token and retract its
-    /// local row, as [`Self::finish_local_message`] does for a direct refusal.
-    pub(crate) fn refuse_queued_local_send_for_new_members(
+    /// Retract the timeline row of every send refused for a new member that
+    /// still shows one. The engine settles a refused queued send in the
+    /// transaction that retires it; its row follows here, live when the
+    /// refusal is announced and at account open after a crash in between.
+    pub(crate) fn retract_refused_local_sends(
         &self,
         label: &str,
-        group_id_hex: &str,
-        message_id_hex: &str,
-    ) -> Result<Option<AppProjectionUpdate>, AppError> {
-        let storage = self.account_storage(label)?;
-        StorageProvider::with_transaction(&storage, |storage| {
-            if !storage.app_storage().finish_local_submission_for_message(
-                group_id_hex,
-                message_id_hex,
-                &encode_refused_new_members(),
-            )? {
-                return Ok(None);
-            }
-            self.invalidate_timeline_app_event(
+    ) -> Result<Vec<AppProjectionUpdate>, AppError> {
+        let refused = self
+            .account_storage(label)?
+            .app_storage()
+            .refused_local_submissions_with_live_rows()?;
+        let mut updates = Vec::new();
+        for (group_id_hex, message_id_hex) in refused {
+            updates.extend(self.invalidate_timeline_app_event(
                 label,
-                group_id_hex,
-                message_id_hex,
+                &group_id_hex,
+                &message_id_hex,
                 crate::LOCAL_PUBLISH_FAILED_REASON,
-            )
-        })
+            )?);
+        }
+        Ok(updates)
     }
 
     #[cfg(test)]

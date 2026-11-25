@@ -2,7 +2,7 @@
 use cgka_traits::{SendAcceptDisposition, SendMaintenanceDisposition};
 use serde::{Deserialize, Serialize};
 
-use crate::{AppError, LocalSendStatus, SendSummary};
+use crate::{AppError, SendSummary};
 
 #[derive(Serialize, Deserialize)]
 struct RetainedLocalOutcome {
@@ -31,26 +31,6 @@ enum AcceptanceV1 {
 enum MaintenanceV1 {
     Ready,
     PostJoinRotationPendingRetryable,
-}
-
-/// A send MDK refused instead of sending, stored where a summary would be.
-#[derive(Serialize, Deserialize)]
-struct RetainedLocalRefusal {
-    version: u8,
-    refused: RefusalV1,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RefusalV1 {
-    NewMembers,
-}
-
-pub(crate) fn encode_refused_new_members() -> String {
-    serde_json::to_string(&RetainedLocalRefusal {
-        version: 1,
-        refused: RefusalV1::NewMembers,
-    })
-    .expect("a unit refusal serializes")
 }
 
 fn invalid_outcome() -> AppError {
@@ -82,17 +62,7 @@ pub(super) fn encode_local_outcome(summary: &SendSummary) -> Result<String, AppE
     .map_err(|_| invalid_outcome())
 }
 
-pub(crate) fn decode_local_outcome(json: &str) -> Result<LocalSendStatus, AppError> {
-    if let Ok(refusal) = serde_json::from_str::<RetainedLocalRefusal>(json) {
-        if refusal.version != 1 {
-            return Err(AppError::InvalidAppMessagePayload(
-                "unsupported local submission outcome version".into(),
-            ));
-        }
-        return Ok(match refusal.refused {
-            RefusalV1::NewMembers => LocalSendStatus::RefusedNewMembers,
-        });
-    }
+pub(crate) fn decode_local_outcome(json: &str) -> Result<SendSummary, AppError> {
     let retained: RetainedLocalOutcome =
         serde_json::from_str(json).map_err(|_| invalid_outcome())?;
     if retained.version != 1 {
@@ -100,7 +70,7 @@ pub(crate) fn decode_local_outcome(json: &str) -> Result<LocalSendStatus, AppErr
             "unsupported local submission outcome version".into(),
         ));
     }
-    Ok(LocalSendStatus::Completed(SendSummary {
+    Ok(SendSummary {
         published: retained
             .summary
             .published
@@ -118,7 +88,7 @@ pub(crate) fn decode_local_outcome(json: &str) -> Result<LocalSendStatus, AppErr
                 SendMaintenanceDisposition::PostJoinRotationPendingRetryable
             }
         },
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -152,10 +122,7 @@ mod tests {
                     accept_disposition,
                     maintenance_disposition,
                 };
-                assert_eq!(
-                    decode_local_outcome(&fixture).unwrap(),
-                    LocalSendStatus::Completed(expected.clone())
-                );
+                assert_eq!(decode_local_outcome(&fixture).unwrap(), expected);
                 assert_eq!(encode_local_outcome(&expected).unwrap(), fixture);
                 assert!(
                     decode_local_outcome(&fixture.replace("\"version\":1", "\"version\":2"))
@@ -164,16 +131,5 @@ mod tests {
                 assert!(decode_local_outcome(&fixture.replace("\"version\":1,", "")).is_err());
             }
         }
-    }
-
-    #[test]
-    fn persisted_new_members_refusal_v1_fixture() {
-        let fixture = r#"{"version":1,"refused":"new_members"}"#;
-        assert_eq!(
-            decode_local_outcome(fixture).unwrap(),
-            LocalSendStatus::RefusedNewMembers
-        );
-        assert_eq!(encode_refused_new_members(), fixture);
-        assert!(decode_local_outcome(&fixture.replace("1", "2")).is_err());
     }
 }

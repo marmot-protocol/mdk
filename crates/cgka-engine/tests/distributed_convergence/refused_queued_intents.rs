@@ -359,16 +359,51 @@ async fn a_queued_retired_stream_start_is_retired_not_published() {
     assert!(!queued_ids.contains(&intent_ids[0]), "{queued_ids:?}");
 }
 
-/// A message limited to its members (`only_to_members`) and queued while an
-/// Add is unsettled is refused at drain once the Add merges, instead of being
-/// encrypted to the new member; one that lists the new member still goes out.
-/// A direct send is refused the same way.
+/// A message limited to its members (`only_to_members`) is refused at drain
+/// once an Add of another account merges, instead of being encrypted to the
+/// new member: one queued in the offline outbox before the Add arrived, and
+/// one sent while the Add was unsettled. One that lists the new member still
+/// goes out, and a direct send is refused the same way.
 #[tokio::test]
 async fn a_queued_message_not_for_a_new_member_is_refused_once_the_add_merges() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut carol, carol_storage) = build_client(b"carol");
     let (mut dave, _dave_storage) = build_client(b"dave");
     let group_id = create_reservation_test_group(&mut alice, &mut carol, "only-to-members").await;
+    let carol_hex = hex::encode(carol.self_id().as_slice());
+    let members = vec![alice.self_id(), carol.self_id()];
+    let payload = |created_at| {
+        let event = MarmotAppEvent::new(
+            carol_hex.clone(),
+            created_at,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![],
+            "x".to_owned(),
+        );
+        (event.id.clone(), event.encode().unwrap())
+    };
+    let message = |payload, only_to_members| SendIntent::AppMessage {
+        group_id: group_id.clone(),
+        payload,
+        expected_epoch: None,
+        only_to_members: Some(only_to_members),
+    };
+    let queued = |result| match result {
+        Ok(SendResult::Queued { intent_id, .. }) => intent_id,
+        other => panic!("the message waits in the queue: {other:?}"),
+    };
+
+    let (outbox_event_id, outbox_payload) = payload(1_700_000_000);
+    let outbox_intent = queued(
+        carol
+            .queue_app_message_with_audit_context(
+                group_id.clone(),
+                outbox_payload,
+                Some(members.clone()),
+                None,
+            )
+            .await,
+    );
     let dave_kp = dave.fresh_key_package().await.unwrap();
     let (add, pending) = evolution(
         alice
@@ -385,39 +420,17 @@ async fn a_queued_message_not_for_a_new_member_is_refused_once_the_add_merges() 
         carol.ingest(route(add, &group_id)).await.unwrap(),
         IngestOutcome::Buffered { .. }
     ));
-
-    let carol_hex = hex::encode(carol.self_id().as_slice());
-    let members = vec![alice.self_id(), carol.self_id()];
-    let message = |created_at, only_to_members| {
-        let event = MarmotAppEvent::new(
-            carol_hex.clone(),
-            created_at,
-            MARMOT_APP_EVENT_KIND_CHAT,
-            vec![],
-            "x".to_owned(),
-        );
-        (
-            event.id.clone(),
-            SendIntent::AppMessage {
-                group_id: group_id.clone(),
-                payload: event.encode().unwrap(),
-                expected_epoch: None,
-                only_to_members: Some(only_to_members),
-            },
-        )
-    };
-    let (refused_event_id, not_for_dave) = message(1_700_000_000, members.clone());
-    let (_, for_dave) = message(
-        1_700_000_001,
-        vec![alice.self_id(), carol.self_id(), dave.self_id()],
+    let (sent_event_id, sent_payload) = payload(1_700_000_001);
+    let sent_intent = queued(carol.send(message(sent_payload, members.clone())).await);
+    let (_, for_dave) = payload(1_700_000_002);
+    queued(
+        carol
+            .send(message(
+                for_dave,
+                vec![alice.self_id(), carol.self_id(), dave.self_id()],
+            ))
+            .await,
     );
-    let mut intent_ids = Vec::new();
-    for intent in [not_for_dave, for_dave] {
-        match carol.send(intent).await {
-            Ok(SendResult::Queued { intent_id, .. }) => intent_ids.push(intent_id),
-            other => panic!("the send waits for the Add to settle: {other:?}"),
-        }
-    }
     carol.drain_events();
 
     let drained = carol
@@ -430,37 +443,45 @@ async fn a_queued_message_not_for_a_new_member_is_refused_once_the_add_merges() 
         matches!(drained.as_slice(), [SendResult::ApplicationMessage { .. }]),
         "only the message that lists dave is published: {drained:?}"
     );
-    let refusals = events
+    let mut refusals = events
         .iter()
-        .filter(|event| matches!(event, GroupEvent::QueuedIntentRefused { .. }))
-        .collect::<Vec<_>>();
-    match refusals.as_slice() {
-        [
+        .filter_map(|event| match event {
             GroupEvent::QueuedIntentRefused {
                 intent_id,
                 reason,
                 app_event_id,
                 ..
-            },
-        ] => {
-            assert_eq!(intent_id, &intent_ids[0]);
-            assert_eq!(reason, "app_message_new_members");
-            assert_eq!(app_event_id.as_deref(), Some(refused_event_id.as_str()));
-        }
-        other => panic!("expected one refusal announcement, got {other:?}"),
-    }
+            } => Some((intent_id.clone(), reason.as_str(), app_event_id.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    refusals.sort_by_key(|refusal| refusal.2.clone());
+    let mut expected = vec![
+        (
+            outbox_intent.clone(),
+            "app_message_new_members",
+            Some(outbox_event_id),
+        ),
+        (
+            sent_intent.clone(),
+            "app_message_new_members",
+            Some(sent_event_id),
+        ),
+    ];
+    expected.sort_by_key(|refusal| refusal.2.clone());
+    assert_eq!(refusals, expected);
     assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
             .unwrap()
             .iter()
-            .all(|record| record.id != intent_ids[0]),
-        "the refused message is no longer queued"
+            .all(|record| record.id != outbox_intent && record.id != sent_intent),
+        "the refused messages are no longer queued"
     );
 
-    let (_, direct) = message(1_700_000_002, members);
+    let (_, direct) = payload(1_700_000_003);
     assert!(matches!(
-        carol.send(direct).await,
+        carol.send(message(direct, members)).await,
         Err(cgka_traits::error::EngineError::AppMessageNewMembers)
     ));
 }

@@ -4,7 +4,8 @@
 
 ### Breaking changes
 
-- `LocalSendStatus` gains `RefusedNewMembers`.
+- `LocalSendStatus` gains `RefusedNewMembers`, and `Queued` and `EngineOwned` carry the send's `message_id_hex`, so a
+  host that lost the acceptance learns the event by asking rather than by handing the send again.
 - Kinds 1201 and 1202 take the shape of marmot-agents D-076, and the old shape is gone (D-051): an agent item
   (kind 1201) and an answer or a control (kind 1202) are sent with `submit_custom_event` or `send_custom_event`, which
   check their shape and refuse one over `AGENT_EVENT_MAX_BYTES` (64 KiB). MDK names a turn's starting message with a
