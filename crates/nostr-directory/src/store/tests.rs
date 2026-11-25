@@ -156,6 +156,8 @@ async fn a_cached_relay_list_outside_the_clock_window_cannot_block_an_eligible_l
     clock.store(100, Ordering::SeqCst);
     let missing = directory.cached_relay_list_status(&author).unwrap();
     assert_eq!(missing, AccountRelayListStatus::empty());
+    let entries = directory.directory_entries().unwrap();
+    assert_eq!(entries[0].relay_lists, missing);
     assert_eq!(
         cache
             .entry(&author)
@@ -209,6 +211,12 @@ async fn a_cached_relay_list_outside_the_clock_window_cannot_block_an_eligible_l
             .relay_lists,
         stored
     );
+    let mut stale_copy = cache.entry(&author).unwrap().unwrap();
+    stale_copy.relay_lists = relay_lists(1_000);
+    cache.put_with_reason(&stale_copy, "fixture").unwrap();
+    assert_eq!(directory.cached_relay_list_status(&author).unwrap(), stored);
+    let entries = directory.directory_entries().unwrap();
+    assert_eq!(entries[0].relay_lists, stored);
     plane.shutdown().await;
 }
 

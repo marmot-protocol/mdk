@@ -1067,9 +1067,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
 
     pub fn directory_entries(&self) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
         let local_accounts = self.local_accounts_by_id()?;
+        let max_created_at = self.directory_freshness().max_created_at;
         let mut entries_by_id = BTreeMap::new();
         for cache in self.resources.current_caches()? {
-            for entry in cache.entries()? {
+            for mut entry in cache.entries()? {
+                entry.relay_lists.discard_future_lists(max_created_at);
                 upsert_newer_directory_entry(
                     &mut entries_by_id,
                     hydrate_directory_record(entry, &local_accounts)?,
@@ -1077,10 +1079,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             }
         }
         for record in self.resources.shared_storage()?.public_directory_users()? {
-            let entry = hydrate_directory_record(
+            let mut entry = hydrate_directory_record(
                 user_directory_record_from_public(record)?,
                 &local_accounts,
             )?;
+            entry.relay_lists.discard_future_lists(max_created_at);
             upsert_newer_directory_entry(&mut entries_by_id, entry);
         }
         Ok(entries_by_id.into_values().collect())

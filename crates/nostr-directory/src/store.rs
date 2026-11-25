@@ -639,7 +639,9 @@ impl<R: DirectoryResources> Directory<R> {
                 })
                 .transpose()?;
             let max_created_at = self.directory_freshness().max_created_at;
-            let relay_lists = [&cached_entry, &shared_entry]
+            // max_by_key keeps the last tie. Prefer the account cache, as
+            // the normal directory merge does.
+            let relay_lists = [&shared_entry, &cached_entry]
                 .into_iter()
                 .flatten()
                 .map(|entry| &entry.relay_lists);
