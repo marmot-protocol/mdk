@@ -13,6 +13,10 @@
   `NotificationTrafficClassFfi::AgentActivity` is removed. An agent item notifies as `Standard` only while it is a
   waiting approval or question, or a failed turn.
 
+- `MarmotKitError` gains `IncompatibleKeyPackage`. Update exhaustive Swift `switch` and Kotlin `when` expressions to
+  handle it, and regenerate bindings with the matching native library. For this error, ask the recipient to update
+  their client and publish a compatible KeyPackage (#3604).
+
 ### Added
 
 - Swift `nextCancellable()` / `nextUpdateCancellable()` adapters for the receives generated without `throws`:
@@ -32,6 +36,23 @@
   control for an agent (kind 1202), so a retry after a restart does not send it twice.
 - `submit_tagged_text`, `submit_tagged_reply`, `submit_thread_message`, and `submit_tagged_sticker` return durable
   local acceptance before relay publication.
+
+### Changed
+
+- A member's `MemberResolutionStatusFfi::IncompatibleKeyPackage` now requires completed relay-list discovery,
+  complete KeyPackage reads and a completed read that finds no deletion request for the refused KeyPackage or its
+  slot. If any is incomplete, the status is `MemberResolutionStatusFfi::Incomplete`.
+- A member with no usable KeyPackage is `MemberResolutionStatusFfi::Incomplete`, not missing or incompatible, while
+  this device's KeyPackage journal keeps a publication of theirs that the lookup did not account for. The API
+  reference for `start_direct_conversation_with_options` states what accounts for one and how long the journal keeps
+  it.
+- A member with no KeyPackage is `MemberResolutionStatusFfi::Incomplete`, not missing, while a relay list tied with
+  theirs named a usable outbox that no KeyPackage read covered.
+- A member lookup treats a relay that the member's relay lists name twice, or with and without a trailing root slash, as
+  one relay: it reads the relay once and counts it once toward a read's limit.
+- Group creation, invites and direct-chat starts always discover the members' current relay routes after
+  `prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm no longer
+  makes them skip discovery.
 
 ### Fixed
 

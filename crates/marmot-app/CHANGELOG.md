@@ -22,6 +22,9 @@
 - `TimelineUpdateTrigger::AgentActivity` becomes `AgentItem`, and `AgentOperation` is removed: a kind 1202 has no
   timeline row.
 - `TimelineMessageRecord::canonical_order_key` gains the agent item `seq` before the message id.
+- `AppError` gains `IncompatibleKeyPackage(Box<EngineError>)`. When a complete lookup finds only KeyPackages incompatible
+  with a new direct chat's founding requirements, the start returns this variant in place of `AppError::Session`.
+  Handle it in exhaustive matches. `as_engine_error` still exposes the cause (#3604).
 
 ### Added
 
@@ -55,6 +58,17 @@
   for each member a create, invite or invite recovery selects, whether its KeyPackage read heard every relay it asked,
   and how many of those relays answered. `MemberKeyPackageResolutionStats::key_package_reads` carries the same counts.
   Selection is unchanged.
+- Group creation, invites and direct-chat starts always discover the members' current relay routes after
+  `prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm no longer
+  makes them skip discovery. An `IncompatibleKeyPackage` verdict needs that discovery to complete, and a completed read
+  that finds no deletion request for the refused KeyPackage or its slot.
+- A member lookup that finds no usable KeyPackage reports `DirectoryLookupIncomplete`, not a missing or incompatible
+  KeyPackage, while this device's KeyPackage journal keeps a publication of that member that the lookup did not account
+  for. The README's direct-chat section states what accounts for one and how long the journal keeps it.
+- A member lookup that finds no KeyPackage reports `DirectoryLookupIncomplete`, not a missing KeyPackage, while a relay
+  list tied with the member's named a usable outbox that no KeyPackage read covered.
+- A member lookup treats a relay that the member's relay lists name twice, or with and without a trailing root slash, as
+  one relay: it reads the relay once and counts it once toward a read's limit.
 
 ### Fixed
 

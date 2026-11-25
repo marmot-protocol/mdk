@@ -735,8 +735,13 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     pub(crate) events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     pub(crate) reject_multi_author: std::sync::atomic::AtomicBool,
-    key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
-    key_packages_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Events a relay returns only to single-author reads.
+    events_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Events a relay returns only to multi-author reads.
+    events_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Every multi-author read stops before its end of stored events, as a
+    /// relay that closes a batch subscription early.
+    pub(crate) closed_multi_author_reads: std::sync::atomic::AtomicBool,
     pub(super) failing_single_author: std::sync::Mutex<Option<String>>,
     pub(crate) stalled_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
@@ -922,20 +927,18 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         {
             return Ok(Vec::new());
         }
-        let single_author_only = self.key_packages_only_in_single_author.lock().unwrap();
-        let multi_author_only = self.key_packages_only_in_multi_author.lock().unwrap();
+        let single_author_only = self.events_only_in_single_author.lock().unwrap();
+        let multi_author_only = self.events_only_in_multi_author.lock().unwrap();
         let matches_query = |event: &NostrTransportEvent| {
             if event.kind == 5 && event.to_verified_nostr_event().is_err() {
                 return false;
             }
-            if event.kind == KIND_MARMOT_KEY_PACKAGE
-                && multi_author_only.contains(&event.id)
+            if multi_author_only.contains(&event.id)
                 && request.queries.iter().all(|query| query.authors.len() == 1)
             {
                 return false;
             }
-            if event.kind == KIND_MARMOT_KEY_PACKAGE
-                && single_author_only.contains(&event.id)
+            if single_author_only.contains(&event.id)
                 && request.queries.iter().any(|query| query.authors.len() > 1)
             {
                 return false;
@@ -994,6 +997,11 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
                         .iter()
                         .any(|endpoint| endpoint.0 == *incomplete)
             });
+        let complete = complete
+            && !(self
+                .closed_multi_author_reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && request.queries.iter().any(|query| query.authors.len() > 1));
         let queries = request.queries.clone();
         let endpoints = request.endpoints.clone();
         let mut records = match self.fetch_directory_events(request).await {
@@ -9513,6 +9521,7 @@ async fn direct_requires_ready_peer() {
         .lock()
         .unwrap()
         .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    key_package_selection::retire_journaled_key_packages(&app, &accounts[0]).await;
     let runtime = app.runtime();
     let result = runtime
         .start_direct_conversation(&creator.label, &accounts[0].account_id_hex)
@@ -9775,10 +9784,10 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
     let requests = fetcher.requests.lock().unwrap();
     assert_eq!(
         requests.len(),
-        1,
-        "prewarmed routes should avoid repeating discovery"
+        3,
+        "a commit discovers routes again after a prewarm, then reads KeyPackages"
     );
-    key_package_read(&requests[0]);
+    key_package_read(&requests[2]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9892,7 +9901,9 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .err()
             .expect("future-only discovery must fail closed");
         assert!(
-            matches!(error, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            // The journal knows the packages the first lookup selected, and
+            // no completed read returned them, so absence is not established.
+            matches!(error, DirectoryError::DirectoryLookupIncomplete(id) if id == members[0])
         );
         assert!(
             fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -9910,7 +9921,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .await
             .unwrap_err();
         assert!(
-            matches!(ordinary, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            matches!(ordinary, DirectoryError::DirectoryLookupIncomplete(id) if id == members[0])
         );
         let prewarm = app
             .directory()
@@ -9918,13 +9929,13 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .await
             .unwrap_err();
         assert!(
-            matches!(prewarm, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            matches!(prewarm, DirectoryError::DirectoryLookupIncomplete(id) if id == members[0])
         );
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes() {
+async fn member_key_package_set_batches_shared_relay_and_rediscovers_after_prewarm() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(8, false).await;
     let members = accounts
         .iter()
@@ -9992,8 +10003,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        12,
-        "create reuses discovery routes but adds a package batch and eight single-author reads"
+        14,
+        "create repeats both discovery hops, then a package batch and eight single-author reads"
     );
 }
 
@@ -10074,8 +10085,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     );
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        5,
-        "create adds the package batch and two single-author reads, without relay discovery"
+        6,
+        "create repeats the single discovery hop, then the package batch and two single-author reads"
     );
 }
 

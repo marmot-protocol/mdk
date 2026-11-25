@@ -358,6 +358,11 @@ enum MarmotStatus
    * while the group's relays stay the same (mdk#3305).
    */
   MARMOT_STATUS_NO_USABLE_RELAY = 133,
+  /**
+   * None of a recipient's available KeyPackages is compatible. No MLS group change was committed.
+   * Ask the recipient to update their client and publish a compatible KeyPackage.
+   */
+  MARMOT_STATUS_INCOMPATIBLE_KEY_PACKAGE = 134,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -11820,9 +11825,9 @@ MarmotStatus marmot_message_draft(const struct MarmotClient *client,
                                   struct MarmotMessageDraft **out);
 
 /**
- * Resolve and cache KeyPackages for prospective members ahead of a
- * group creation, so the create itself does not wait on the
- * network. Free with
+ * Check prospective members' KeyPackage readiness ahead of a group
+ * creation. The create still discovers routes and fetches
+ * KeyPackages from relays. Free with
  * `marmot_member_key_package_prewarm_summary_free`.
  *
  * # Safety

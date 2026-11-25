@@ -621,9 +621,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 account: account_id_hex,
                 searched: &source_relays,
                 observed: outcome.records,
+                hints: Vec::new(),
                 primary_complete: outcome.complete,
                 discovery: &discovery_relays,
                 requirements: None,
+                fence: None,
                 cached_target,
                 wanted: 1,
             })

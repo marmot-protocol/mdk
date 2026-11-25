@@ -604,7 +604,9 @@ async fn resolution_deadline_names_the_member_whose_lookup_did_not_finish() {
             .map(|_| ())
     });
     entered.notified().await;
-    tokio::time::advance(Duration::from_secs(51)).await;
+    // Let the paused clock reach the deadline on its own, so the finished
+    // member's pending journal work completes first.
+    tokio::time::sleep(Duration::from_secs(51)).await;
     let error = task.await.unwrap().unwrap_err();
     assert!(
         matches!(&error, DirectoryError::DirectoryLookupIncomplete(id) if *id == accounts[0].account_id_hex),
@@ -820,13 +822,27 @@ async fn invite_recovery_group_preflight_keeps_failed_roster_unchanged_and_allow
     let after = client.group_mls_state(&group).unwrap();
     assert_eq!(after.member_count, before.member_count);
     assert_eq!(after.epoch, before.epoch);
+    // A known deletion stays a deletion even if a relay stops serving it, so
+    // the retry needs a package the member publishes again.
+    let republished = member_resolution_key_package_event(
+        member,
+        fresh_key_package_for_account(&app, member, false).await,
+    );
+    let mut tags = republished.tags;
+    tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = "republished".into();
     fetcher
         .events_by_endpoint
         .lock()
         .unwrap()
         .get_mut(OUTBOX)
         .unwrap()
-        .retain(|event| event.kind != 5);
+        .push(NostrTransportEvent::new_unsigned_at(
+            republished.pubkey,
+            republished.kind,
+            tags,
+            republished.content,
+            republished.created_at,
+        ));
     client
         .invite_members(&group, &[&member.account_id_hex])
         .await
@@ -1121,7 +1137,7 @@ async fn invite_recovery_candidate_budget_does_not_accept_an_unchecked_survivor(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supplements() {
+async fn invite_recovery_requires_complete_coverage_for_an_incompatibility_verdict() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let account = &accounts[0];
     app.account_home()
@@ -1174,9 +1190,7 @@ async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supp
             .await;
         assert!(matches!(
             result,
-            Err(DirectoryError::KeyPackageRequirements(
-                cgka_traits::EngineError::MissingRequiredCapabilities { .. }
-            ))
+            Err(DirectoryError::DirectoryLookupIncomplete(id)) if id == account.account_id_hex
         ));
     }
     {

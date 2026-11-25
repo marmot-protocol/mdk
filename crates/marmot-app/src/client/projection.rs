@@ -1504,7 +1504,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::Nip46(_) => "read_marker_failed:nip46",
         AppError::Account(_) => "read_marker_failed:account",
         AppError::AccountHome(_) => "read_marker_failed:account_home",
-        AppError::Session(_) => "read_marker_failed:session",
+        AppError::Session(_) | AppError::IncompatibleKeyPackage(_) => "read_marker_failed:session",
         AppError::Storage(_) => "read_marker_failed:storage",
         AppError::Transport(_) => "read_marker_failed:transport",
         AppError::Io(_) => "read_marker_failed:io",

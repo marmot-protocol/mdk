@@ -27,6 +27,10 @@ use transport_nostr_peeler::NostrTransportEvent;
 use super::unix_now_seconds;
 use crate::error::{DirectoryError, MissingKeyPackageReason};
 use crate::{DirectoryKeyPackage, UserDirectoryRecord};
+use storage_sqlite::{
+    PublicKeyPackageBarrierKind, PublicKeyPackageBarrierRecord, PublicKeyPackageEvidenceSnapshot,
+    PublicKeyPackageReplacementRecord, public_key_package_evidence_retained,
+};
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -299,7 +303,7 @@ impl KeyPackageRecoveryEvidence {
 
 /// Slot order: the later `created_at` first and, on a tie, the lower event id,
 /// which NIP-01 keeps as the slot's current publication.
-fn newest_publication_first(
+pub(crate) fn newest_publication_first(
     event: &NostrTransportEvent,
     created_at: u64,
     event_id: &str,
@@ -353,7 +357,10 @@ pub(crate) fn without_revoked_slot_winners(
 }
 
 /// The account's signed kind 5 requests among `records`.
-fn verified_deletions(account: &str, records: &[RelayEventRecord]) -> Vec<NostrTransportEvent> {
+pub(crate) fn verified_deletions(
+    account: &str,
+    records: &[RelayEventRecord],
+) -> Vec<NostrTransportEvent> {
     records
         .iter()
         .filter(|record| {
@@ -575,6 +582,122 @@ struct RankedKeyPackage {
     key_package_ref: Vec<u8>,
 }
 
+/// What the shared KeyPackage journal knows about an account's slot
+/// replacements and deletions. Selection applies it to every candidate, so a
+/// relay that no longer serves a replacement or deletion cannot revive what it
+/// barred. A selection that finds no candidate also checks that the lookup
+/// accounted for every publication the journal still keeps
+/// ([`FencedLookup`]).
+///
+/// Past the journal's size limits an account keeps one eviction marker. While
+/// it names an evicted replacement, or an evicted deletion of a slot's
+/// address, it is that barrier still, for its slot. A marker for an evicted
+/// deletion of one event has lost its target, and the marker with no account
+/// names none: they only say evidence is missing, so they bar nothing.
+pub(crate) struct KeyPackageJournalFence {
+    replacements: Vec<PublicKeyPackageReplacementRecord>,
+    barriers: Vec<PublicKeyPackageBarrierRecord>,
+}
+
+/// A journal fence with everything one lookup observed: the account's
+/// KeyPackages and deletion requests from every read, used or not.
+#[derive(Clone, Copy)]
+pub(crate) struct FencedLookup<'a> {
+    fence: &'a KeyPackageJournalFence,
+    seen: &'a [RelayEventRecord],
+}
+
+impl KeyPackageJournalFence {
+    pub(crate) fn new(snapshot: PublicKeyPackageEvidenceSnapshot) -> Self {
+        let mut barriers = snapshot.barriers;
+        barriers.extend(
+            snapshot
+                .watermark
+                .filter(|marker| marker.kind != PublicKeyPackageBarrierKind::ExactDeletion),
+        );
+        Self {
+            replacements: snapshot.replacements,
+            barriers,
+        }
+    }
+
+    /// This fence beside what a lookup observed.
+    pub(crate) fn over<'a>(&'a self, seen: &'a [RelayEventRecord]) -> FencedLookup<'a> {
+        FencedLookup { fence: self, seen }
+    }
+
+    /// Whether the journal knows neither a replacement nor a deletion of this
+    /// publication.
+    pub(crate) fn allows(&self, event_id: &str, slot: &str, created_at: u64) -> bool {
+        self.barriers.iter().all(|barrier| {
+            (barrier.deleted_event_id.is_none() && barrier.key_package_id != slot)
+                || barrier_allows(event_id, created_at, barrier)
+        }) && self
+            .replacements
+            .iter()
+            .filter(|replacement| replacement.key_package_id == slot)
+            .all(|replacement| replacement_allows(event_id, created_at, replacement))
+    }
+}
+
+impl FencedLookup<'_> {
+    /// Whether the journal keeps a publication the lookup did not account
+    /// for. A publication is accounted for when what the lookup observed
+    /// holds it, a replacement of it or a deletion request covering it, or
+    /// when the journal knows it deleted. A lookup that missed one cannot say
+    /// what the account publishes in that slot.
+    ///
+    /// A package past selection's freshness window can still be the one
+    /// selected, so a row counts for as long as the journal retains it. Only
+    /// a write prunes the journal, so that bound is applied here too.
+    ///
+    /// The journal's memory is bounded. Past its size limits it keeps one
+    /// evicted barrier per account, which the fence still holds: an evicted
+    /// publication counts, and an evicted address deletion still accounts
+    /// for what it covers. Beyond that only markers without a target remain,
+    /// which can do neither. A publication with no `d` slot is never a
+    /// candidate, so it does not count either.
+    fn misses_a_journaled_publication(self, account: &str, freshness: DirectoryFreshness) -> bool {
+        let Self { fence, seen } = self;
+        let replacements = fence.replacements.iter().map(|replacement| {
+            (
+                replacement.key_package_id.as_str(),
+                replacement.event_id_hex.as_str(),
+                replacement.event_created_at,
+            )
+        });
+        // A replacement pruned from the journal's table stays as a barrier.
+        let pruned = fence
+            .barriers
+            .iter()
+            .filter(|barrier| barrier.kind == PublicKeyPackageBarrierKind::Replacement)
+            .map(|barrier| {
+                (
+                    barrier.key_package_id.as_str(),
+                    barrier.event_id_hex.as_str(),
+                    barrier.event_created_at,
+                )
+            });
+        let deletions = verified_deletions(account, seen);
+        replacements.chain(pruned).any(|(slot, event_id, at)| {
+            !slot.is_empty()
+                && public_key_package_evidence_retained(at, freshness.now)
+                && fence.allows(event_id, slot, at)
+                && !package_is_deleted(account, event_id, slot, at, &deletions)
+                && !seen.iter().any(|record| {
+                    let read = &record.event;
+                    read.kind == KIND_MARMOT_KEY_PACKAGE
+                        && read.pubkey == account
+                        && freshness.accepts(record)
+                        && read.tag_value("d").unwrap_or_default() == slot
+                        && (read.id == event_id
+                            || read.created_at > at
+                            || (read.created_at == at && read.id.as_str() < event_id))
+                })
+        })
+    }
+}
+
 /// Select the account's KeyPackages to add (`foundation/key-packages.md`,
 /// "Selection and lifecycle"; `transports/nostr.md`, "KeyPackage
 /// publication" and "Slot deletion").
@@ -602,16 +725,53 @@ pub fn select_key_packages_from_records(
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
 ) -> Result<KeyPackageSelection, DirectoryError> {
+    select_fenced_key_packages(account_id_hex, records, freshness, requirements, None)
+}
+
+/// [`select_key_packages_from_records`], skipping every publication the
+/// journal knows was replaced or deleted. When that leaves no candidate and
+/// the journal keeps a publication the lookup did not account for, the lookup
+/// is incomplete.
+pub(crate) fn select_fenced_key_packages(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    fence: Option<FencedLookup<'_>>,
+) -> Result<KeyPackageSelection, DirectoryError> {
+    select_fenced_or_reject(account_id_hex, records, freshness, requirements, fence)
+        .map_err(|(error, _)| error)
+}
+
+/// [`select_fenced_key_packages`]. An error that is the newest rejection
+/// comes with the publication rejected.
+pub(crate) fn select_fenced_or_reject(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    fence: Option<FencedLookup<'_>>,
+) -> Result<KeyPackageSelection, (DirectoryError, Option<KeyPackageRecoveryTarget>)> {
     let SlotCandidates {
         mut candidates,
-        newest_error,
+        newest_rejection,
         rejected_future,
         legacy_slots,
-    } = slot_candidates(account_id_hex, records, freshness, requirements);
+        unread_publication,
+    } = slot_candidates(account_id_hex, records, freshness, requirements, fence);
+    // Finding no candidate, by rejection or by absence, describes the
+    // account's packages only when the lookup accounted for every
+    // publication the journal keeps.
+    if unread_publication {
+        return Err((
+            DirectoryError::DirectoryLookupIncomplete(account_id_hex.to_owned()),
+            None,
+        ));
+    }
     if candidates.is_empty()
-        && let Some(error) = newest_error
+        && let Some((rejected, error)) = newest_rejection
     {
-        return Err(error);
+        return Err((error, Some(rejected)));
     }
     candidates.sort_by(|a, b| {
         a.last_resort
@@ -647,10 +807,14 @@ pub fn select_key_packages_from_records(
 /// not deleted, valid, current profile and, with `requirements`, compatible.
 struct SlotCandidates {
     candidates: Vec<RankedKeyPackage>,
-    /// The newest publication's rejection, of every slot rejected.
-    newest_error: Option<DirectoryError>,
+    /// The newest rejected publication, of every slot rejected, and its
+    /// rejection.
+    newest_rejection: Option<(KeyPackageRecoveryTarget, DirectoryError)>,
     rejected_future: bool,
     legacy_slots: bool,
+    /// No candidate was found, and the journal keeps a publication the
+    /// lookup did not account for.
+    unread_publication: bool,
 }
 
 fn slot_candidates(
@@ -658,6 +822,7 @@ fn slot_candidates(
     records: &[RelayEventRecord],
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    fence: Option<FencedLookup<'_>>,
 ) -> SlotCandidates {
     let deletions = verified_deletions(account_id_hex, records);
     let mut records = records
@@ -668,7 +833,7 @@ fn slot_candidates(
         .collect::<Vec<_>>();
     records.sort_by(|a, b| newest_publication_first(&a.event, b.event.created_at, &b.event.id));
     let mut rejected_future = false;
-    let mut newest_error = None;
+    let mut newest_rejection = None;
     let mut slots = BTreeSet::new();
     let mut legacy_slots = false;
     let mut candidates = Vec::new();
@@ -687,9 +852,18 @@ fn slot_candidates(
             slot,
             record.event.created_at,
             &deletions,
-        ) {
+        ) || fence.is_some_and(|lookup| {
+            !lookup
+                .fence
+                .allows(&record.event.id, slot, record.event.created_at)
+        }) {
             continue;
         }
+        let rejected = || KeyPackageRecoveryTarget {
+            event_id: record.event.id.clone(),
+            slot: slot.to_owned(),
+            created_at: record.event.created_at,
+        };
         let (fetched, metadata) = match key_package_and_metadata_from_borrowed_record(record) {
             Ok((fetched, metadata))
                 if fetched.key_package.protocol_profile == ProtocolProfile::Current =>
@@ -705,14 +879,15 @@ fn slot_candidates(
                 continue;
             }
             Err(error) => {
-                newest_error.get_or_insert(error);
+                newest_rejection.get_or_insert_with(|| (rejected(), error));
                 continue;
             }
         };
         if let Some(requirements) = requirements
             && let Err(error) = requirements.validate(&fetched.key_package)
         {
-            newest_error.get_or_insert(DirectoryError::KeyPackageRequirements(error));
+            newest_rejection
+                .get_or_insert_with(|| (rejected(), DirectoryError::KeyPackageRequirements(error)));
             continue;
         }
         let Ok(key_package_ref) = hex::decode(&metadata.key_package_ref_hex) else {
@@ -725,11 +900,15 @@ fn slot_candidates(
             key_package_ref,
         });
     }
+    let unread_publication = candidates.is_empty()
+        && fence
+            .is_some_and(|lookup| lookup.misses_a_journaled_publication(account_id_hex, freshness));
     SlotCandidates {
         candidates,
-        newest_error,
+        newest_rejection,
         rejected_future,
         legacy_slots,
+        unread_publication,
     }
 }
 
@@ -828,7 +1007,7 @@ pub fn account_key_package_slots_from_records(
     });
     let complete = complete && !key_package_read_page_full(account, records);
     let reached = complete || records.iter().any(|record| record.event.pubkey == account);
-    let candidates = slot_candidates(account, records, freshness, None).candidates;
+    let candidates = slot_candidates(account, records, freshness, None, None).candidates;
     let current_slots = candidates
         .iter()
         .map(|candidate| candidate.fetched.key_package_id.clone())
@@ -1241,4 +1420,231 @@ pub fn require_multi_value_key_package_tag_matches(
 
 pub(crate) fn is_zero_u64(value: &u64) -> bool {
     *value == 0
+}
+
+pub(crate) fn replacement_allows(
+    event_id: &str,
+    created_at: u64,
+    replacement: &PublicKeyPackageReplacementRecord,
+) -> bool {
+    event_id == replacement.event_id_hex
+        || created_at > replacement.event_created_at
+        || (created_at == replacement.event_created_at
+            && event_id < replacement.event_id_hex.as_str())
+}
+
+pub(crate) fn barrier_allows(
+    event_id: &str,
+    created_at: u64,
+    barrier: &PublicKeyPackageBarrierRecord,
+) -> bool {
+    match barrier.kind {
+        PublicKeyPackageBarrierKind::Replacement => {
+            event_id == barrier.event_id_hex
+                || created_at > barrier.event_created_at
+                || (created_at == barrier.event_created_at
+                    && event_id < barrier.event_id_hex.as_str())
+        }
+        PublicKeyPackageBarrierKind::Deletion => {
+            if barrier
+                .deleted_event_id
+                .as_deref()
+                .is_some_and(|deleted| deleted.eq_ignore_ascii_case(event_id))
+            {
+                return false;
+            }
+            if barrier.deleted_event_id.is_some() {
+                return true;
+            }
+            created_at > barrier.event_created_at
+        }
+        PublicKeyPackageBarrierKind::ExactDeletion => created_at > barrier.observed_at,
+    }
+}
+
+pub(crate) fn watermark_allows(
+    event_id: &str,
+    created_at: u64,
+    now: u64,
+    future_skew_secs: u64,
+    barrier: &PublicKeyPackageBarrierRecord,
+) -> bool {
+    if barrier
+        .observed_at
+        .saturating_add(KEY_PACKAGE_FRESHNESS.as_secs())
+        .saturating_add(future_skew_secs)
+        <= now
+    {
+        return true;
+    }
+    if barrier.kind == PublicKeyPackageBarrierKind::ExactDeletion {
+        return created_at > barrier.observed_at.saturating_add(future_skew_secs);
+    }
+    barrier_allows(event_id, created_at, barrier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+
+    fn package(account: &str, slot: &str, id: &str, created_at: u64) -> RelayEventRecord {
+        let mut event = NostrTransportEvent::new_unsigned_at(
+            account.to_owned(),
+            KIND_MARMOT_KEY_PACKAGE,
+            vec![vec!["d".into(), slot.into()]],
+            String::new(),
+            created_at,
+        );
+        event.id = id.to_owned();
+        RelayEventRecord {
+            endpoints: Vec::new(),
+            event,
+        }
+    }
+
+    /// The journal's publication counts against a lookup until the lookup
+    /// reads it or a replacement of it, observes its deletion request, the
+    /// journal knows it deleted, or the journal's retention bound passes. It
+    /// still counts past selection's freshness window.
+    #[test]
+    fn a_journaled_publication_counts_until_the_lookup_accounts_for_it() {
+        let keys = Keys::generate();
+        let account = keys.public_key().to_hex();
+        let (older, newer) = ("11".repeat(32), "22".repeat(32));
+        let barrier = |kind, deleted_event_id| PublicKeyPackageBarrierRecord {
+            account_id_hex: account.clone(),
+            key_package_id: "slot".into(),
+            event_id_hex: newer.clone(),
+            deleted_event_id,
+            event_created_at: 20,
+            observed_at: 30,
+            kind,
+        };
+        let fence = |replaced: bool, barriers| KeyPackageJournalFence {
+            replacements: replaced
+                .then(|| PublicKeyPackageReplacementRecord {
+                    account_id_hex: account.clone(),
+                    key_package_id: "slot".into(),
+                    event_id_hex: newer.clone(),
+                    event_created_at: 20,
+                    observed_at: 30,
+                })
+                .into_iter()
+                .collect(),
+            barriers,
+        };
+        let pruned = barrier(PublicKeyPackageBarrierKind::Replacement, None);
+        let deletion = PublicKeyPackageBarrierRecord {
+            event_id_hex: "33".repeat(32),
+            ..barrier(PublicKeyPackageBarrierKind::Deletion, Some(newer.clone()))
+        };
+        let observed_deletion = RelayEventRecord {
+            endpoints: Vec::new(),
+            event: NostrTransportEvent::from_nostr_event(
+                &EventBuilder::new(Kind::from(5), "")
+                    .tags([Tag::custom("e", [newer.clone()])])
+                    .finalize(&keys)
+                    .unwrap(),
+            )
+            .unwrap(),
+        };
+        let at = |now| DirectoryFreshness::at(now, Duration::ZERO);
+        let fresh = at(40);
+        // Past selection's freshness window, inside the journal's retention.
+        let stale = at(20 + KEY_PACKAGE_FRESHNESS.as_secs() + 60);
+        let expired = at(20 + KEY_PACKAGE_FRESHNESS.as_secs() + 5 * 60);
+        // Evicted past the journal's size limits, a barrier survives as the
+        // account's marker: a publication, or a deletion of the slot's
+        // address at that time. A deletion of one event loses its target.
+        let evicted = |replaced: bool, kind| {
+            KeyPackageJournalFence::new(PublicKeyPackageEvidenceSnapshot {
+                replacements: fence(replaced, Vec::new()).replacements,
+                global_eviction: None,
+                barriers: Vec::new(),
+                watermark: Some(barrier(kind, None)),
+                revision: 0,
+            })
+        };
+        let marker = |kind| evicted(false, kind);
+        // A publication with no slot is never a candidate.
+        let slotless = KeyPackageJournalFence {
+            replacements: vec![PublicKeyPackageReplacementRecord {
+                account_id_hex: account.clone(),
+                key_package_id: String::new(),
+                event_id_hex: newer.clone(),
+                event_created_at: 20,
+                observed_at: 30,
+            }],
+            barriers: Vec::new(),
+        };
+        // An evicted replacement still bars an older copy of its slot, as
+        // its barrier did, and nothing else. An evicted address deletion
+        // still bars what it covered, the publication at its time included.
+        let replacement = marker(PublicKeyPackageBarrierKind::Replacement);
+        assert!(!replacement.allows(&older, "slot", 10));
+        assert!(replacement.allows(&newer, "slot", 20));
+        assert!(replacement.allows(&older, "other", 10));
+        let address_deletion = marker(PublicKeyPackageBarrierKind::Deletion);
+        assert!(!address_deletion.allows(&newer, "slot", 20));
+        assert!(address_deletion.allows(&older, "slot", 21));
+        assert!(address_deletion.allows(&newer, "other", 20));
+        assert!(marker(PublicKeyPackageBarrierKind::ExactDeletion).allows(&older, "slot", 10));
+        for (fence, journaled) in [
+            (fence(true, vec![]), true),
+            (fence(false, vec![pruned.clone()]), true),
+            (marker(PublicKeyPackageBarrierKind::Replacement), true),
+            (fence(true, vec![deletion]), false),
+            (marker(PublicKeyPackageBarrierKind::Deletion), false),
+            (marker(PublicKeyPackageBarrierKind::ExactDeletion), false),
+            // The journal's row is covered by the evicted address deletion,
+            // but not by a marker that lost its target.
+            (evicted(true, PublicKeyPackageBarrierKind::Deletion), false),
+            (
+                evicted(true, PublicKeyPackageBarrierKind::ExactDeletion),
+                true,
+            ),
+            (slotless, false),
+            (fence(false, vec![]), false),
+        ] {
+            let misses = |seen: &[RelayEventRecord], freshness| {
+                fence
+                    .over(seen)
+                    .misses_a_journaled_publication(&account, freshness)
+            };
+            // Missing the slot or holding only an older copy leaves it unread.
+            assert_eq!(misses(&[], fresh), journaled);
+            assert_eq!(
+                misses(
+                    &[
+                        package(&account, "slot", &older, 10),
+                        package(&account, "other", &newer, 30),
+                    ],
+                    fresh
+                ),
+                journaled
+            );
+            assert!(!misses(&[package(&account, "slot", &newer, 20)], fresh));
+            assert!(!misses(&[package(&account, "slot", &older, 21)], fresh));
+            assert!(!misses(std::slice::from_ref(&observed_deletion), fresh));
+            assert_eq!(misses(&[], stale), journaled);
+            assert!(!misses(&[], expired));
+            // An empty selection is then incomplete, or the account having
+            // no package.
+            let empty = |freshness| {
+                select_fenced_key_packages(&account, &[], freshness, None, Some(fence.over(&[])))
+                    .map(|selection| selection.value.len())
+            };
+            for freshness in [fresh, stale] {
+                assert_eq!(
+                    matches!(
+                        empty(freshness),
+                        Err(DirectoryError::DirectoryLookupIncomplete(_))
+                    ),
+                    journaled
+                );
+            }
+            assert!(matches!(empty(expired), Ok(0)));
+        }
+    }
 }

@@ -1488,9 +1488,9 @@ c_cmd! {
     /// `marmot_message_draft_free`.
     sync fn marmot_message_draft(account_ref: str, group_id_hex: str) -> opt_rec(MarmotMessageDraft) = message_draft;
 
-    /// Resolve and cache KeyPackages for prospective members ahead of a
-    /// group creation, so the create itself does not wait on the
-    /// network. Free with
+    /// Check prospective members' KeyPackage readiness ahead of a group
+    /// creation. The create still discovers routes and fetches
+    /// KeyPackages from relays. Free with
     /// `marmot_member_key_package_prewarm_summary_free`.
     async fn marmot_prewarm_group_member_key_packages(account_ref: str, member_refs/member_refs_len: str_arr) -> rec(MarmotMemberKeyPackagePrewarmSummary) = prewarm_group_member_key_packages;
 

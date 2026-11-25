@@ -244,6 +244,9 @@ pub enum MarmotStatus {
     /// Nothing was sent; a commit rolled back. Retrying fails the same way
     /// while the group's relays stay the same (mdk#3305).
     NoUsableRelay = 133,
+    /// None of a recipient's available KeyPackages is compatible. No MLS group change was committed.
+    /// Ask the recipient to update their client and publish a compatible KeyPackage.
+    IncompatibleKeyPackage = 134,
 }
 
 thread_local! {
@@ -433,6 +436,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
             MarmotStatus::AccountWorkerResponseTimedOut
         }
         MarmotKitError::ReactionNotFound => MarmotStatus::ReactionNotFound,
+        MarmotKitError::IncompatibleKeyPackage => MarmotStatus::IncompatibleKeyPackage,
     }
 }
 
@@ -643,6 +647,7 @@ mod tests {
             },
             MarmotKitError::ReactionNotFound,
             MarmotKitError::NoUsableRelay,
+            MarmotKitError::IncompatibleKeyPackage,
             MarmotKitError::MemberNotInGroup {
                 group_id_hex: "aa".into(),
                 member_id_hex: "bb".into(),
@@ -833,6 +838,10 @@ mod tests {
             133
         );
         assert_eq!(take_last_error().as_deref(), Some("no usable relay"));
+        assert_eq!(
+            status_from_error(&MarmotKitError::IncompatibleKeyPackage) as i32,
+            134
+        );
         assert_eq!(
             status_from_error(&MarmotKitError::GroupRecoverySourceMismatch {
                 group_id_hex: "aa".into(),

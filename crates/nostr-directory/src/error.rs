@@ -54,9 +54,9 @@ pub enum DirectoryError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Hex(#[from] hex::FromHexError),
-    /// A KeyPackage failed the engine's requirements check. The app reports it
-    /// through its session error, as it did before the directory had its own
-    /// type.
+    /// A KeyPackage failed the engine's requirements check. The app reports
+    /// compatibility refusals as `AppError::IncompatibleKeyPackage` and other
+    /// requirements failures through its session error.
     #[error(transparent)]
     KeyPackageRequirements(EngineError),
     /// A failure from the app, carried unchanged; see [`ResourceError`].

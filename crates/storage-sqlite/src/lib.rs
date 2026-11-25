@@ -207,7 +207,7 @@ pub use shared::{
     PublicDirectoryUserRecord, PublicKeyPackageBarrierKind, PublicKeyPackageBarrierRecord,
     PublicKeyPackageEvidenceSnapshot, PublicKeyPackageReplacementRecord, SqliteSharedStorage,
     StoredAuditLogRetention, StoredAuditLogSettings, StoredRelayTelemetrySettings,
-    StoredUsageDiagnosticsSettings,
+    StoredUsageDiagnosticsSettings, public_key_package_evidence_retained,
 };
 
 pub(crate) use base::codec::{

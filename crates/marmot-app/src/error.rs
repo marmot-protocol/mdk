@@ -125,6 +125,9 @@ pub enum AppError {
         account: String,
         reason: MissingKeyPackageReason,
     },
+    /// The recipient's available KeyPackages do not meet the group's requirements.
+    #[error(transparent)]
+    IncompatibleKeyPackage(Box<cgka_traits::error::EngineError>),
     /// The canonical invite target has no Marmot inbox endpoint that survives
     /// this device's relay-safety policy. Kept per-recipient for typed host
     /// presentation, while Display remains identity-free for safe diagnostics.
@@ -486,9 +489,8 @@ pub enum AppError {
     TransportClosed,
 }
 
-/// The directory's errors convert back to the `AppError` they replaced: the
-/// same variant, message and `privacy_safe_kind` as before the directory had its
-/// own type.
+/// Directory errors retain their display and privacy-safe labels. Incompatible
+/// KeyPackage failures keep their engine cause and expose a specific app error.
 impl From<DirectoryError> for AppError {
     fn from(error: DirectoryError) -> Self {
         match error {
@@ -518,6 +520,11 @@ impl From<DirectoryError> for AppError {
             DirectoryError::TransportClosed => Self::TransportClosed,
             DirectoryError::MissingKeyPackage { account, reason } => {
                 Self::MissingKeyPackage { account, reason }
+            }
+            DirectoryError::KeyPackageRequirements(error)
+                if nostr_directory::key_package_requirements_are_incompatible(&error) =>
+            {
+                Self::IncompatibleKeyPackage(Box::new(error))
             }
             DirectoryError::KeyPackageRequirements(error) => {
                 Self::from(marmot_session::SessionError::from(error))
@@ -714,6 +721,7 @@ impl AppError {
             Self::Sqlite(error) => sqlite_error_kind(error),
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage { .. } => "missing_key_package",
+            Self::IncompatibleKeyPackage(error) => engine_error_kind(error),
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
             Self::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
             Self::GroupCreateIncludesCreator => "group_create_includes_creator",
@@ -855,6 +863,7 @@ impl AppError {
             },
             Self::Io(_) => SyncErrorClass::Storage,
             Self::Session(error) => engine_error_class(error.as_engine_error()),
+            Self::IncompatibleKeyPackage(error) => engine_error_class(error),
             Self::Account(error) => account_sync_error_class(error),
             Self::Transport(error) => transport_error_class(error),
             Self::RelayDirectory(_) | Self::DirectoryLookupIncomplete(_) => {
@@ -888,6 +897,7 @@ impl AppError {
         match self {
             Self::Account(error) => error.as_engine_error(),
             Self::Session(error) => Some(error.as_engine_error()),
+            Self::IncompatibleKeyPackage(error) => Some(error),
             _ => None,
         }
     }

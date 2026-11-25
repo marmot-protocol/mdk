@@ -1,6 +1,8 @@
 //! Bounded discovery recovery; a relay copy is not proof of private-key possession.
 
 use crate::error::DirectoryError;
+use crate::member_key_packages::key_package_requirements_are_incompatible;
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use cgka_engine::key_package::KeyPackageRequirements;
@@ -9,12 +11,15 @@ use nostr_sdk::prelude::RelayUrl;
 
 use super::Directory;
 use super::resources::DirectoryResources;
-use crate::DirectoryFreshness;
 use crate::published_records::{
-    KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, key_package_queries,
-    key_package_read_page_full, select_key_packages_from_records, without_revoked_slot_winners,
+    KeyPackageJournalFence, KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget,
+    key_package_queries, key_package_read_page_full, newest_publication_first, package_is_deleted,
+    select_fenced_key_packages, select_fenced_or_reject, verified_deletions,
+    without_revoked_slot_winners,
 };
+use crate::{DirectoryFreshness, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome, DirectoryRelayEventRecord};
+use transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
 
 const RECOVERY_ENDPOINT_LIMIT: usize = 8;
 /// How many revoked candidates recovery replaces before it reports the lookup
@@ -26,16 +31,64 @@ pub(super) struct RecoveredKeyPackageRecords {
     /// deletion lookup must never admit a different, unchecked candidate.
     pub(super) freshness: DirectoryFreshness,
     pub(super) records: Vec<DirectoryRelayEventRecord>,
+    /// Everything the lookup observed, when `records` is only part of it.
+    /// Final selection checks the journal against this.
+    seen: Option<Vec<DirectoryRelayEventRecord>>,
     pub(super) cache_evidence: Option<KeyPackageRecoveryEvidence>,
+    /// Every KeyPackage read behind `records` completed.
+    pub(super) complete: bool,
+}
+
+impl RecoveredKeyPackageRecords {
+    /// The final selection, which revalidates each package on the wall clock.
+    /// A non-empty selection may still leave out a device (D12). After a
+    /// complete read, an empty one or a refusal is the verdict, unless
+    /// `fence` keeps a publication the lookup did not account for.
+    pub(super) fn select(
+        &self,
+        account: &str,
+        requirements: Option<&KeyPackageRequirements>,
+        fence: Option<&KeyPackageJournalFence>,
+    ) -> Result<Vec<FetchedKeyPackage>, DirectoryError> {
+        let seen = self.seen.as_deref().unwrap_or(&self.records);
+        match select_fenced_key_packages(
+            account,
+            &self.records,
+            self.freshness,
+            requirements,
+            fence.map(|fence| fence.over(seen)),
+        ) {
+            Ok(selection) if !selection.value.is_empty() => Ok(selection.value),
+            // Losing an incomplete read's package to revalidation says
+            // nothing about what the recipient published.
+            _ if !self.complete => Err(recovery_incomplete(account)),
+            // Recovery reports an incompatibility itself, once the refused
+            // slot is proven undeleted. One that first appears here refuses a
+            // slot no deletion read covered.
+            Err(DirectoryError::KeyPackageRequirements(error))
+                if key_package_requirements_are_incompatible(&error) =>
+            {
+                Err(recovery_incomplete(account))
+            }
+            selection => selection?.into_value_or_missing(account),
+        }
+    }
 }
 
 pub(super) struct KeyPackageRecoveryRequest<'a> {
     pub(super) account: &'a str,
     pub(super) searched: &'a [TransportEndpoint],
     pub(super) observed: Vec<DirectoryRelayEventRecord>,
+    /// What an earlier read in this lookup returned. Its packages can be used
+    /// and its replacements and deletions count, but a relay may since have
+    /// withdrawn a package, so one no completed read served again decides
+    /// nothing.
+    pub(super) hints: Vec<DirectoryRelayEventRecord>,
     pub(super) primary_complete: bool,
     pub(super) discovery: &'a [TransportEndpoint],
     pub(super) requirements: Option<&'a KeyPackageRequirements>,
+    /// Replacements and deletions the journal already knows.
+    pub(super) fence: Option<&'a KeyPackageJournalFence>,
     /// Public metadata only. Membership callers must never nominate a cache.
     pub(super) cached_target: Option<KeyPackageRecoveryTarget>,
     /// How many of the best-ranked selected candidates to prove undeleted.
@@ -53,52 +106,57 @@ impl<R: DirectoryResources> Directory<R> {
             account,
             searched,
             mut observed,
+            hints,
             primary_complete,
             discovery,
             requirements,
+            fence,
             cached_target,
             wanted,
         } = request;
+        // What completed reads served, which only hints need.
+        let mut served = if primary_complete && !hints.is_empty() {
+            observed.clone()
+        } else {
+            Vec::new()
+        };
+        observed.extend(hints.iter().cloned());
         // A full page of KeyPackages or deletion requests hides what lies
         // past it; recovery's targeted reads cannot show that either.
         if key_package_read_page_full(account, &observed) {
             return Err(recovery_incomplete(account));
         }
+        let (searched, supplementary) = self.key_package_recovery_routes(searched, discovery);
         let freshness = self.directory_freshness();
         // What the read found is used even when the read was incomplete:
         // every device is sought, not guaranteed (mdk#2628, D12).
-        if select_key_packages_from_records(account, &observed, freshness, requirements)
-            .is_ok_and(|selection| !selection.value.is_empty())
+        if select_fenced_key_packages(
+            account,
+            &observed,
+            freshness,
+            requirements,
+            fence.map(|fence| fence.over(&observed)),
+        )
+        .is_ok_and(|selection| !selection.value.is_empty())
         {
+            // Losing this package decides nothing if a supplementary read was
+            // skipped or an earlier read's package went unserved.
+            let complete = primary_complete
+                && supplementary.is_empty()
+                && !unserved_hint(account, &hints, &served, &observed, fence, freshness);
             return Ok(RecoveredKeyPackageRecords {
                 freshness,
                 records: observed,
+                seen: None,
                 cache_evidence: None,
+                complete,
             });
         }
-        // Primary routes already crossed the maintained 16-endpoint admission
-        // gate. Recovery only adds eight distinct safe configured routes.
-        let searched = self.relay_plane.retain_safe_discovered_endpoints(
-            searched.to_vec(),
-            "KeyPackage recovery searched routes",
-        );
-        // RelayUrl equality ignores an optional root slash, while its display
-        // spelling (and TransportEndpoint equality) preserves it. Count relay
-        // identities, not spellings, against the supplementary route budget.
-        let mut seen = searched
-            .iter()
-            .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
-            .collect::<BTreeSet<_>>();
-        let supplementary = self
-            .relay_plane
-            .retain_safe_discovered_endpoints(discovery.to_vec(), "KeyPackage discovery recovery")
-            .into_iter()
-            .filter(|endpoint| {
-                RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| seen.insert(relay))
-            })
-            .take(RECOVERY_ENDPOINT_LIMIT)
-            .collect::<Vec<_>>();
         let mut package_coverage = primary_complete;
+        // The caller's fence predates every read below. Each selection after
+        // a read uses a journal snapshot taken after it, so a replacement or
+        // deletion another lookup recorded meanwhile still counts.
+        let mut refreshed = None;
         if !supplementary.is_empty() {
             let outcome = self
                 .relay_plane
@@ -108,10 +166,23 @@ impl<R: DirectoryResources> Directory<R> {
                 )
                 .await
                 .map_err(DirectoryError::RelayDirectory)?;
+            // Callers journal the primary read; journal only this reply.
+            refreshed = self
+                .journal_and_refresh_fence(account, &outcome.records, fence)
+                .await?;
+            if outcome.complete && !hints.is_empty() {
+                served.extend(outcome.records.iter().cloned());
+            }
             observed.extend(outcome.records);
-            self.journal_key_package_records(account, &observed).await?;
             package_coverage &= outcome.complete;
         }
+        // Evaluated at each verdict: a deletion request a later read returns
+        // accounts for an earlier read's package too.
+        let verdict_coverage =
+            |deletions: &[DirectoryRelayEventRecord], fence: Option<&KeyPackageJournalFence>| {
+                package_coverage
+                    && !unserved_hint(account, &hints, &served, deletions, fence, freshness)
+            };
         let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));
         // Deletion requests read with the KeyPackages count from the start; a
         // later scoped read that misses one never revives what it covers.
@@ -126,9 +197,12 @@ impl<R: DirectoryResources> Directory<R> {
         // time passing during a deletion read must never swap in a different
         // candidate.
         let mut targets = None;
+        // Whether the selection being proven is the package an
+        // incompatibility refuses.
+        let mut refusal = false;
         let mut revocations = 0;
-        // Every pass proves a candidate not proven before or revokes one, so
-        // the selection's size and the revocation limit bound the loop.
+        // Every pass proves a publication not proven before or revokes one,
+        // so what the lookup observed and the revocation limit bound the loop.
         loop {
             let current = match &mut targets {
                 Some(current) => current,
@@ -141,39 +215,67 @@ impl<R: DirectoryResources> Directory<R> {
                         &deletions,
                         freshness,
                     );
-                    // A known validation error precedes an incomplete negative
-                    // lookup; it never authorizes returning an unproven
-                    // usable package.
-                    let selection = select_key_packages_from_records(
+                    let journal = refreshed.as_ref().or(fence);
+                    let selected = match select_fenced_or_reject(
                         account,
                         &records,
                         freshness,
                         requirements,
-                    )?;
-                    let mut selected = selection
-                        .value
-                        .iter()
-                        .take(wanted)
-                        .map(KeyPackageRecoveryTarget::from_fetched)
-                        .collect::<Vec<_>>();
-                    if selected.is_empty()
-                        && selection.rejected_future
-                        && let Some(cached) = cached_target
-                            .as_ref()
-                            .filter(|target| evidence.allows_target(target))
-                    {
-                        selected.push(cached.clone());
-                    }
-                    if selected.is_empty() {
-                        if !package_coverage {
-                            return Err(recovery_incomplete(account));
+                        journal.map(|fence| fence.over(&observed)),
+                    ) {
+                        Err((DirectoryError::KeyPackageRequirements(error), Some(refused)))
+                            if key_package_requirements_are_incompatible(&error) =>
+                        {
+                            // A compatibility refusal describes the recipient's
+                            // available packages and requires complete coverage.
+                            if !verdict_coverage(&deletions, journal) {
+                                return Err(recovery_incomplete(account));
+                            }
+                            // It also says the recipient still publishes the
+                            // refused package. The KeyPackage reads ask only
+                            // for deletion requests tagged with the kind, so
+                            // the refused slot is proven undeleted like a
+                            // selected one. A deleted slot drops out and the
+                            // rest are drawn again.
+                            if proven.contains(&refused.event_id) {
+                                return Err(DirectoryError::KeyPackageRequirements(error));
+                            }
+                            refusal = true;
+                            vec![refused]
                         }
-                        return Ok(RecoveredKeyPackageRecords {
-                            freshness,
-                            records,
-                            cache_evidence: Some(evidence),
-                        });
-                    }
+                        Err((error, _)) => return Err(error),
+                        Ok(selection) => {
+                            let mut selected = selection
+                                .value
+                                .iter()
+                                .take(wanted)
+                                .map(KeyPackageRecoveryTarget::from_fetched)
+                                .collect::<Vec<_>>();
+                            if selected.is_empty()
+                                && selection.rejected_future
+                                && let Some(cached) = cached_target
+                                    .as_ref()
+                                    .filter(|target| evidence.allows_target(target))
+                            {
+                                selected.push(cached.clone());
+                            }
+                            if selected.is_empty() {
+                                // Absence is a verdict too, with the same coverage.
+                                if !verdict_coverage(&deletions, journal) {
+                                    return Err(recovery_incomplete(account));
+                                }
+                                return Ok(RecoveredKeyPackageRecords {
+                                    freshness,
+                                    records,
+                                    seen: Some(observed),
+                                    cache_evidence: Some(evidence),
+                                    complete: true,
+                                });
+                            }
+                            refusal = false;
+                            selected
+                        }
+                    };
                     targets.insert(selected)
                 }
             };
@@ -182,8 +284,9 @@ impl<R: DirectoryResources> Directory<R> {
                 .find(|target| !proven.contains(&target.event_id))
                 .cloned()
             else {
+                let complete = verdict_coverage(&deletions, refreshed.as_ref().or(fence));
                 return Ok(proven_records(
-                    account, observed, &deletions, freshness, &proven,
+                    account, observed, &deletions, freshness, &proven, complete,
                 ));
             };
             if !package_coverage || routes.is_empty() || revocations == RECOVERY_CANDIDATE_LIMIT {
@@ -213,9 +316,13 @@ impl<R: DirectoryResources> Directory<R> {
                     .fetch_directory_events_with_completion(endpoints.to_vec(), queries.clone())
                     .await
                     .map_err(DirectoryError::RelayDirectory)?;
+                let scoped = deletions.len();
                 deletion_coverage &= self
                     .record_recovery_deletion_outcome(account, outcome, &mut deletions)
                     .await?;
+                // A request this read returns can cover more than its target,
+                // so it joins what the journal check sees.
+                observed.extend(deletions[scoped..].iter().cloned());
                 let (_, gathered) =
                     without_revoked_slot_winners(account, observed.clone(), &deletions, freshness);
                 // A verified positive is sufficient to reject a candidate,
@@ -228,13 +335,71 @@ impl<R: DirectoryResources> Directory<R> {
             if revoked {
                 revocations += 1;
                 targets = None;
+                // The deletion read already journaled what it found.
+                refreshed = self.journal_and_refresh_fence(account, &[], fence).await?;
                 continue;
             }
             if !deletion_coverage {
                 return Err(recovery_incomplete(account));
             }
             proven.insert(target.event_id);
+            if refusal {
+                // The refusal is drawn again from the journal as it is after
+                // the proof read, and returned once its slot is proven.
+                targets = None;
+                refreshed = self.journal_and_refresh_fence(account, &[], fence).await?;
+            }
         }
+    }
+
+    /// The safe routes among `searched`, and the supplementary routes
+    /// recovery reads from `discovery` when those find no usable package.
+    pub(super) fn key_package_recovery_routes(
+        &self,
+        searched: &[TransportEndpoint],
+        discovery: &[TransportEndpoint],
+    ) -> (Vec<TransportEndpoint>, Vec<TransportEndpoint>) {
+        // Primary routes already crossed the maintained 16-endpoint admission
+        // gate. Recovery only adds eight distinct safe configured routes.
+        let searched = self.relay_plane.retain_safe_discovered_endpoints(
+            searched.to_vec(),
+            "KeyPackage recovery searched routes",
+        );
+        // RelayUrl equality ignores an optional root slash, while its display
+        // spelling (and TransportEndpoint equality) preserves it. Count relay
+        // identities, not spellings, against the supplementary route budget.
+        let mut seen = searched
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
+            .collect::<BTreeSet<_>>();
+        let supplementary = self
+            .relay_plane
+            .retain_safe_discovered_endpoints(discovery.to_vec(), "KeyPackage discovery recovery")
+            .into_iter()
+            .filter(|endpoint| {
+                RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| seen.insert(relay))
+            })
+            .take(RECOVERY_ENDPOINT_LIMIT)
+            .collect();
+        (searched, supplementary)
+    }
+
+    /// Journals `records`, then rereads the account's fence when the caller
+    /// supplied one.
+    async fn journal_and_refresh_fence(
+        &self,
+        account: &str,
+        records: &[DirectoryRelayEventRecord],
+        fence: Option<&KeyPackageJournalFence>,
+    ) -> Result<Option<KeyPackageJournalFence>, DirectoryError> {
+        if fence.is_none() {
+            self.journal_key_package_records(account, records).await?;
+            return Ok(None);
+        }
+        Ok(Some(KeyPackageJournalFence::new(
+            self.journal_and_read_key_package_evidence(account, records)
+                .await?,
+        )))
     }
 
     async fn record_recovery_deletion_outcome(
@@ -257,22 +422,73 @@ impl<R: DirectoryResources> Directory<R> {
 /// revalidates MLS lifetime on the real wall clock. It may reject a proven
 /// identity after a slow deletion read, but must never select a different
 /// fresh slot whose deletion was not read. Rejected-future metadata stays for
-/// the diagnostic cache fallback, whose exact target was checked.
+/// the diagnostic cache fallback, whose exact target was checked. Losing the
+/// proven candidates is a verdict only with `complete` coverage and no other
+/// fresh package left unproven here.
 fn proven_records(
     account: &str,
     observed: Vec<DirectoryRelayEventRecord>,
     deletions: &[DirectoryRelayEventRecord],
     freshness: DirectoryFreshness,
     proven: &BTreeSet<String>,
+    complete: bool,
 ) -> RecoveredKeyPackageRecords {
     let (mut records, evidence) =
-        without_revoked_slot_winners(account, observed, deletions, freshness);
-    records.retain(|record| !freshness.accepts(record) || proven.contains(&record.event.id));
+        without_revoked_slot_winners(account, observed.clone(), deletions, freshness);
+    let unproven = |record: &DirectoryRelayEventRecord| {
+        freshness.accepts(record) && !proven.contains(&record.event.id)
+    };
+    // Every record left is one of the account's KeyPackages.
+    let alternate = records.iter().any(unproven);
+    records.retain(|record| !unproven(record));
     RecoveredKeyPackageRecords {
         freshness,
         records,
+        seen: Some(observed),
         cache_evidence: Some(evidence),
+        complete: complete && !alternate,
     }
+}
+
+/// Whether some package in `hints` that is still a candidate has no
+/// completed read serving it or a publication that replaces it in its slot.
+/// Confirmation uses selection's freshness boundary and slot order. A hint
+/// that a verified deletion request among `observed` covers, or that the
+/// journal bars, is no candidate and needs no confirmation.
+fn unserved_hint(
+    account: &str,
+    hints: &[DirectoryRelayEventRecord],
+    served: &[DirectoryRelayEventRecord],
+    observed: &[DirectoryRelayEventRecord],
+    fence: Option<&KeyPackageJournalFence>,
+    freshness: DirectoryFreshness,
+) -> bool {
+    if hints.is_empty() {
+        return false;
+    }
+    let package = |record: &&DirectoryRelayEventRecord| {
+        record.event.kind == KIND_MARMOT_KEY_PACKAGE
+            && record.event.pubkey == account
+            && freshness.accepts(record)
+    };
+    let deletions = verified_deletions(account, observed);
+    hints.iter().filter(package).any(|hint| {
+        let slot = hint.event.tag_value("d").unwrap_or_default();
+        let (id, created_at) = (hint.event.id.as_str(), hint.event.created_at);
+        if package_is_deleted(account, id, slot, created_at, &deletions)
+            || fence.is_some_and(|fence| !fence.allows(id, slot, created_at))
+        {
+            return false;
+        }
+        !served.iter().filter(package).any(|record| {
+            // A package without a slot is replaced by nothing else.
+            if slot.is_empty() {
+                return record.event.id == id;
+            }
+            record.event.tag_value("d") == Some(slot)
+                && newest_publication_first(&record.event, created_at, id) != Ordering::Greater
+        })
+    })
 }
 
 fn distinct_recovery_routes<'a>(
@@ -385,6 +601,7 @@ mod tests {
             &deletions,
             directory.directory_freshness(),
             &BTreeSet::new(),
+            true,
         );
         assert!(recovered.records.is_empty());
         let barriers = shared.public_key_package_barriers(&account).unwrap();

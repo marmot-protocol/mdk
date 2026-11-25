@@ -589,6 +589,9 @@ pub enum MarmotKitError {
     /// This result does not establish that other devices have caught up.
     #[error("no matching reaction to remove")]
     ReactionNotFound,
+    /// Ask the recipient to update their client and publish a compatible KeyPackage.
+    #[error("incompatible KeyPackage")]
+    IncompatibleKeyPackage,
 }
 
 impl From<AppError> for MarmotKitError {
@@ -612,6 +615,9 @@ impl From<&AppError> for MarmotKitError {
                 artifact: cause.artifact.into(),
                 size_class: cause.size_class.into(),
             };
+        }
+        if matches!(value, AppError::IncompatibleKeyPackage(_)) {
+            return Self::IncompatibleKeyPackage;
         }
         if let Some(err) = value.as_engine_error() {
             return Self::from_engine_error(err);
@@ -1035,6 +1041,39 @@ mod tests {
     use cgka_traits::storage::StorageError;
     use marmot_account::AccountHomeError;
     use marmot_app::{AccountError, AppError};
+
+    #[test]
+    fn incompatible_recipient_key_package_stays_typed() {
+        use marmot_app::DirectoryError;
+
+        let required = Box::new(cgka_traits::GroupCapabilities::default());
+        let had = required.clone();
+        for failure in [
+            EngineError::MissingRequiredCapabilities { required, had },
+            EngineError::InvalidKeyPackageCapabilities {
+                member: cgka_traits::MemberId::new(vec![1; 32]),
+            },
+            EngineError::Other(
+                "KeyPackage does not match target group profile or ciphersuite".into(),
+            ),
+        ] {
+            let app_error = AppError::from(DirectoryError::KeyPackageRequirements(failure));
+            assert!(app_error.as_engine_error().is_some());
+            let ffi = MarmotKitError::from(app_error);
+            assert!(
+                matches!(ffi, MarmotKitError::IncompatibleKeyPackage),
+                "{ffi:?}"
+            );
+        }
+        // A capability check outside recipient resolution does not identify an incompatible KeyPackage.
+        let unrelated = MarmotKitError::from(AppError::from(marmot_app::SessionError::from(
+            EngineError::MissingRequiredCapabilities {
+                required: Box::default(),
+                had: Box::default(),
+            },
+        )));
+        assert!(matches!(unrelated, MarmotKitError::Runtime { .. }));
+    }
 
     #[test]
     fn block_and_follow_refusals_keep_distinct_host_choices() {

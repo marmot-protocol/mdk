@@ -147,13 +147,23 @@ async fn partial_members_stay_fresh() {
         absent.key_packages.is_empty(),
         "cached selections cannot authorize another invitation"
     );
+    // The journal still knows the packages the earlier lookup read, and no
+    // deletion request covers them, so their absence decides nothing. The
+    // members it never read a valid package for have none.
     assert_eq!(
         absent.member_outcomes,
         ordered
             .into_iter()
-            .map(|index| MemberResolutionOutcome {
+            .zip([
+                MemberResolutionStatus::MissingKeyPackage,
+                MemberResolutionStatus::Incomplete,
+                MemberResolutionStatus::MissingKeyPackage,
+                MemberResolutionStatus::Incomplete,
+                MemberResolutionStatus::Incomplete,
+            ])
+            .map(|(index, status)| MemberResolutionOutcome {
                 account_id_hex: accounts[index].account_id_hex.clone(),
-                status: MemberResolutionStatus::MissingKeyPackage,
+                status,
                 selected_device_count: 0,
             })
             .collect::<Vec<_>>()
@@ -310,10 +320,15 @@ async fn member_recovery_journals_malformed_replacement() {
         .retain(|event| event.id != replacement.id);
     app.drop_account_caches(&owner.label);
 
-    app.directory()
-        .prewarm_group_member_key_packages(&[accounts[0].account_id_hex.as_str()])
-        .await
-        .unwrap();
+    // The journal remembers the newer malformed publication, so the older
+    // package it superseded is no longer offered either. No read returned
+    // that publication again, so the lookup is incomplete.
+    assert!(matches!(
+        app.directory()
+            .prewarm_group_member_key_packages(&[accounts[0].account_id_hex.as_str()])
+            .await,
+        Err(nostr_directory::error::DirectoryError::DirectoryLookupIncomplete(_))
+    ));
     let page = app
         .directory()
         .follow_availability_page(

@@ -134,6 +134,8 @@ To found the chat with a disappearing-message duration, such as the user's defau
 `startDirectConversationWithOptions` with `DirectConversationOptionsFfi(disappearingMessageSecs:)`. The duration is part
 of the founding state and Welcome; a reused or retried start keeps the existing chat's duration and roles. Do not follow
 the start with `updateMessageRetention`, which would overwrite a reused chat's policy.
+If the start returns `IncompatibleKeyPackage`, ask the recipient to update their client and publish a compatible
+KeyPackage. An unusable recipient inbox route has its own `MissingMemberInboxRoute` result.
 See the [exact Rust signature and contract](API-REFERENCE.md#marmotstart_direct_conversation) and the
 [options variant](API-REFERENCE.md#marmotstart_direct_conversation_with_options).
 

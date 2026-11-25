@@ -7,15 +7,17 @@ use std::sync::{Arc, Mutex};
 
 use cgka_traits::TransportEndpoint;
 use rusqlite::OptionalExtension;
-use transport_nostr::{DirectorySyncPlan, MarmotRelayPlane};
+use transport_nostr::{DirectoryRelayEventRecord, DirectorySyncPlan, MarmotRelayPlane};
 
+use crate::FetchedKeyPackage;
 use crate::cache::{DirectoryCache, DirectorySearchGraphRecord};
 use crate::error::DirectoryError;
+use crate::key_package_recovery::KeyPackageRecoveryRequest;
 use crate::member_key_packages::{
     MemberKeyPackagePrewarmCache, MemberResolutionPurpose, ResolvedMemberKeyPackages,
 };
 use crate::observer::DirectoryObserver;
-use crate::published_records::DirectoryFreshness;
+use crate::published_records::{DirectoryFreshness, MAX_KEY_PACKAGES_PER_ACCOUNT};
 use crate::records::{
     FetchedFollowList, LocalAccountNames, UserDirectoryLocalAccount, UserDirectoryRecord,
     UserProfileMetadata,
@@ -233,5 +235,42 @@ impl<R: DirectoryResources> Directory<R> {
 
     pub fn empty_directory_record_for_test(&self, account_id_hex: &str) -> UserDirectoryRecord {
         self.empty_directory_record(account_id_hex)
+    }
+
+    /// Runs recovery over `observed` and an earlier read's `hints`, with
+    /// `discovery` as its supplementary relays, then final selection after
+    /// losing the packages recovery selected, as wall-clock revalidation can.
+    pub async fn recover_then_lose_selection_for_test(
+        &self,
+        account_id_hex: &str,
+        observed: Vec<DirectoryRelayEventRecord>,
+        hints: Vec<DirectoryRelayEventRecord>,
+        primary_complete: bool,
+        discovery: Vec<TransportEndpoint>,
+        requirements: &cgka_engine::key_package::KeyPackageRequirements,
+    ) -> Result<Vec<FetchedKeyPackage>, DirectoryError> {
+        let mut recovered = self
+            .recover_key_package_records(KeyPackageRecoveryRequest {
+                account: account_id_hex,
+                searched: &[],
+                observed,
+                hints,
+                primary_complete,
+                discovery: &discovery,
+                requirements: Some(requirements),
+                fence: None,
+                cached_target: None,
+                wanted: MAX_KEY_PACKAGES_PER_ACCOUNT,
+            })
+            .await?;
+        let lost = recovered
+            .select(account_id_hex, Some(requirements), None)?
+            .into_iter()
+            .map(|fetched| fetched.key_package_event_id)
+            .collect::<Vec<_>>();
+        recovered
+            .records
+            .retain(|record| !lost.contains(&record.event.id));
+        recovered.select(account_id_hex, Some(requirements), None)
     }
 }

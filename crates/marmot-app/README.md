@@ -352,7 +352,29 @@ with both accounts as founding admins.
 `AppCreateGroupOptions` does for generic creation, so the recipient joins with that duration and no retention commit
 follows. Options apply only when the call creates the group: reuse, retry, and same-account concurrent starts return the
 existing group with its founding duration and roles, whatever duration they propose. A nonzero duration requires the
-peer's KeyPackages to support message retention; without it the start fails and nothing is created.
+peer's KeyPackages to support message retention. When a lookup finds only KeyPackages incompatible with the chat's
+founding requirements, the start returns `AppError::IncompatibleKeyPackage` if relay-list discovery, the KeyPackage
+reads and one more read all completed. KeyPackage reads return only the deletion requests tagged with the KeyPackage
+kind, so on every relay they covered the lookup also asks for a deletion request naming the newest refused KeyPackage or
+its `d` slot. If it finds one, that KeyPackage is dropped and the peer's remaining KeyPackages decide the result. If any
+of the three did not complete, the start returns `AppError::DirectoryLookupIncomplete`. Either refusal creates no chat.
+The lookup is bounded: complete discovery requires reading relay lists on the configured directory relays and on every
+eligible outbox the newest list names. KeyPackage reads cover those outboxes, a tied list's outboxes when one read admits
+them, and at most eight more configured directory relays. A relay that a list names twice, or with and without a
+trailing root slash, is one relay: it is read once and counts once toward a read's limit. A compatible KeyPackage
+published only elsewhere is not seen.
+
+If the newest list names an eligible outbox not queried for relay lists, finding no usable KeyPackage returns
+`AppError::DirectoryLookupIncomplete`, even after a deletion removes the last known slot. Finding no usable KeyPackage
+also returns this error while the journal keeps a publication of the peer in a `d` slot that the lookup did not account
+for: the reads returned neither that publication nor a newer one in the same slot (not counting one dated past the
+clock-skew allowance), the journal knows no newer one there either, and no deletion request covers it. The journal keeps
+a publication for 30 days and five minutes from its creation and holds a bounded number of publications and deletion
+requests. A publication it has dropped no longer blocks a verdict, and a deletion request it has dropped no longer
+accounts for one. A relay list published in the same second as the peer's and naming other relays never supports an
+incompatibility. If a tied list names an eligible outbox that no KeyPackage read covered, the start reports an
+incomplete lookup rather than a missing KeyPackage. This can happen when the two lists together name more outboxes
+than one read admits.
 `start_direct_conversation` is the same call with default options, which leave disappearing messages disabled.
 
 There is no immutable cross-client DM provenance, so MDK cannot prove legacy groups eligible for automatic admin repair.
@@ -411,7 +433,8 @@ Simulator app/process membership actions also use atomic resolution before mutat
   shortcut, and its published package must be reachable on relays. Relay freshness is not proof that the recipient still
   owns private material; it avoids authorizing from a stale local copy.
 - Hosts may prewarm the same bounded composition lookup without reserving packages or durably admitting strangers; the
-  final action reuses discovery routes but fetches packages again before the mutation validates them. Each prewarm call
+  final action still discovers routes, reads unexpired prewarmed outboxes only as hints, and fetches packages again
+  before the mutation validates them; only a later prewarm skips discovery. Each prewarm call
   requests a fresh readiness signal, so debounce roster changes. The process-local prewarm cache keeps only bounded
   relay metadata; only completed discovery and advertised-outbox metadata hops renew its freshness deadline, and a
   usable package returned after an incomplete metadata hop does not make previously cached routes fresh.
@@ -422,7 +445,7 @@ When advertised outboxes have no usable invitation package, lookup makes one sup
 safe configured discovery endpoints that were not already searched. Explicit bootstrap endpoints supply this set for
 direct directory lookups. Successful advertised lookups skip the supplementary pass. Recovery keeps observed
 replacement barriers and requires complete package coverage and completed deletion queries for each usable candidate
-across the searched routes. Separate exact-event and timestamp-scoped coordinate filters ask for one signed deletion;
+across the searched routes, and for the newest refused candidate before it reports an incompatibility. Separate exact-event and timestamp-scoped coordinate filters ask for one signed deletion;
 unrelated deleted posts cannot fill their limits. Any verified matching deletion rejects the candidate, even when
 another route is incomplete. Accepting a candidate requires complete empty queries on every required route; unknown
 coverage and the twelve-candidate budget remain retryable. Signed deletions cannot revive an older slot version.
