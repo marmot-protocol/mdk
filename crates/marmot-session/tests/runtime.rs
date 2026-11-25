@@ -5739,11 +5739,17 @@ async fn current_founding_create_keeps_group_when_every_welcome_delivery_fails()
                 carol_id,
                 vec![TransportEndpoint("wss://carol-inbox.example".into())],
             );
+    // An hour on, past the backoff of the failed attempts.
     let mut runtime = AccountDeviceRuntime::new(
         current_session(&alice_path, &key, b"alice-current"),
         restarted_adapter.clone(),
         restarted_policy,
         RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(unix_now() + 60 * 60)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
     );
     let retried = runtime
         .redeliver_welcome(&effects.welcome_failures[0].message_id)
