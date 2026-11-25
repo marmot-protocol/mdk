@@ -1394,13 +1394,22 @@ async fn a_link_welcome_withdrawn_past_its_deadline_while_a_wave_holds_it_ends_e
             .unwrap(),
         Some(cgka_traits::message::WelcomeExpiry::Recorded)
     );
+    // With the clock set back before the deadline, only the wave's hold,
+    // which the mark updated, keeps it from asking a relay.
+    wall.set(300_000);
     let finished = runtime
         .finish_welcome_publish_task(task.run().await)
         .await
         .unwrap();
     assert!(finished.welcome_failures.is_empty());
     runtime.run_due_maintenance().await.unwrap();
-    let rows = v5_audit_rows(&audit_path)
+    let rows = v5_audit_rows(&audit_path);
+    assert!(
+        rows.iter()
+            .all(|row| row["event"]["type"] != "welcome_publish_started"),
+        "the wave asks no relay: {rows:?}"
+    );
+    let rows = rows
         .into_iter()
         .filter(|row| row["event"]["type"] == "welcome_withdrawn")
         .collect::<Vec<_>>();
