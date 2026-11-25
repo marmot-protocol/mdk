@@ -9,13 +9,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::provider::EngineOpenMlsProvider;
+use crate::roster_tag_keys::RosterTagSighting;
 use crate::snapshot_guard::{RewindSite, Rewinds};
 use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Member, ProtocolProfile};
 use cgka_traits::message::{MessageState, OwnApplicationConvergenceStamp, StoredMessagePayload};
-use cgka_traits::storage::{RosterTagKey, StorageError, StorageProvider};
+use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::{
@@ -350,10 +351,11 @@ struct OpenMlsReplayOutput {
     /// candidate probe.
     disband_former_members: Option<Vec<Member>>,
     epoch_authenticators: BTreeMap<u64, String>,
-    /// The tag signature keys each roster state a canonical apply reached
-    /// listed, in the order it reached them, for the caller to record in the
-    /// apply's transaction (mdk#2761). Empty for a candidate probe.
-    roster_tag_keys: Vec<RosterTagKey>,
+    /// What each roster state a canonical apply reached listed of its slots'
+    /// tag signature keys, in the order it reached them, for the caller to
+    /// record in the apply's transaction (mdk#2761). Empty for a candidate
+    /// probe.
+    roster_tag_keys: Vec<RosterTagSighting>,
 }
 
 /// Presentation output stays private; public replay observations retain their API.
@@ -367,7 +369,7 @@ pub(crate) struct AppliedGroupChanges {
 pub(crate) struct OpenMlsApplyOutput {
     pub(crate) observations: Vec<OpenMlsReplayObservation>,
     pub(crate) group_changes: Vec<AppliedGroupChanges>,
-    pub(crate) roster_tag_keys: Vec<RosterTagKey>,
+    pub(crate) roster_tag_keys: Vec<RosterTagSighting>,
 }
 
 #[derive(Debug)]

@@ -287,6 +287,8 @@ impl AppClient {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let mut operations = Vec::new();
         for fact in facts.iter().filter(|fact| fact.outcome.is_none()) {
+            // A carried record keeps no tag signature key: this group cannot
+            // check a key from another group (marmot#520).
             let original = RejectedSlotV1 {
                 reason: if fact.removed {
                     RejectedSlotReasonV1::Removed
@@ -294,7 +296,7 @@ impl AppClient {
                     RejectedSlotReasonV1::NotMe
                 },
                 rejected_at: fact.rejected_at,
-                tag_signature_key: fact.tag_signature_key.clone(),
+                tag_signature_key: None,
             };
             let outcome = if roster.devices.contains_key(&fact.slot) {
                 Some(MoveCarryOutcome::DeviceCollision)

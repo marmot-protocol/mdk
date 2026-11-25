@@ -59,7 +59,7 @@ impl SqliteAccountStorage {
             let destination = hex::encode(movement.destination_id.as_slice());
             let rejected = original_roster.rejected_slots.iter().map(|(slot, entry)| MoveRejectedSlot {
                 slot: *slot, removed: entry.reason == RejectedSlotReasonV1::Removed,
-                rejected_at: entry.rejected_at, tag_signature_key: entry.tag_signature_key.clone(), outcome: None,
+                rejected_at: entry.rejected_at, outcome: None,
             }).collect::<Vec<_>>();
             let siblings = original_roster.devices.iter().filter(|(slot, _)| **slot != movement.own_slot)
                 .map(|(slot, entry)| MoveSibling { slot: *slot, label: entry.label.clone(), ended: false }).collect::<Vec<_>>();
