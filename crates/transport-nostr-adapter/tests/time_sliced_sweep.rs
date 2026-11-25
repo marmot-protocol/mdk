@@ -22,6 +22,7 @@ use nostr_relay_builder::prelude::{
     MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RateLimit,
 };
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
+use nostr_sdk::authenticator::SignerAuthenticator;
 use nostr_sdk::prelude::{
     Client, ClientMessage, Event, EventBuilder, FinalizeEvent, Keys, Kind, RelayUrl,
     SubscriptionId, Tag, Timestamp,
@@ -600,6 +601,147 @@ async fn an_auth_hint_leaves_the_slice_owed() {
             .is_none_or(|cursor| cursor.next_since == T0),
         "the cursor stays at the slice"
     );
+}
+
+/// A relay that answers one REQ before NIP-42 finishes, ends it with
+/// NIP-67 `auth` and the AUTH challenge, and once the client authenticates
+/// answers each REQ with the newest `cap` of `events` its `since`/`until`
+/// match: a cap it publishes nowhere. A REQ before authentication is
+/// refused.
+async fn auth_gated_clamping_relay(
+    events: Vec<Event>,
+    cap: usize,
+) -> (RelayUrl, tokio::task::JoinHandle<()>) {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as Ws;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let (mut reqs, mut authenticated) = (0, false);
+        while let Some(Ok(message)) = socket.next().await {
+            let Ws::Text(text) = message else {
+                continue;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let replies = match (frame[0].as_str(), frame[1].as_str()) {
+                (Some("REQ"), Some(id)) => {
+                    reqs += 1;
+                    let filter = &frame[2];
+                    let since = filter["since"].as_u64().unwrap_or(0);
+                    let until = filter["until"].as_u64().unwrap_or(u64::MAX);
+                    let mut matched = events
+                        .iter()
+                        .filter(|event| (since..=until).contains(&event.created_at.as_secs()))
+                        .collect::<Vec<_>>();
+                    matched.sort_by_key(|event| std::cmp::Reverse(event.created_at));
+                    if reqs == 1 {
+                        // The oldest match only, as a relay hiding the rest
+                        // until the client authenticates.
+                        let mut frames = matched
+                            .last()
+                            .map(|event| serde_json::json!(["EVENT", id, event]))
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        frames.push(serde_json::json!(["AUTH", "challenge"]));
+                        frames.push(serde_json::json!(["EOSE", id, ["auth"]]));
+                        frames
+                    } else if !authenticated {
+                        vec![serde_json::json!([
+                            "CLOSED",
+                            id,
+                            "auth-required: too early"
+                        ])]
+                    } else {
+                        let mut frames = matched
+                            .into_iter()
+                            .take(cap)
+                            .map(|event| serde_json::json!(["EVENT", id, event]))
+                            .collect::<Vec<_>>();
+                        frames.push(serde_json::json!(["EOSE", id]));
+                        frames
+                    }
+                }
+                (Some("AUTH"), _) => {
+                    authenticated = true;
+                    vec![serde_json::json!(["OK", frame[1]["id"], true, ""])]
+                }
+                _ => Vec::new(),
+            };
+            for reply in replies {
+                if socket
+                    .send(Ws::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+    (url, server)
+}
+
+/// A slice retried after authentication carries two pages: the one the
+/// relay answered while holding events back, and the authenticated one
+/// (mdk#3689). Counting them as one would teach a relay with no published
+/// cap one larger than it is, and the next clamped page would then pass as
+/// complete. A retried reply proves nothing, so no slice is covered without
+/// every event in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slice_retried_after_authentication_proves_nothing() {
+    let keys = Keys::generate();
+    let older = group_event(&keys, GROUP, T0 + 10, 0);
+    let newer = group_event(&keys, GROUP, T0 + 20, 1);
+    let (url, server) = auth_gated_clamping_relay(vec![older.clone(), newer.clone()], 1).await;
+    let sdk = NostrSdkRelayClient::from_builder(
+        Client::builder().authenticator(SignerAuthenticator::new(Keys::generate())),
+    );
+    sdk.client().add_relay(&url).await.unwrap();
+    sdk.client().connect().await;
+    let relay = SdkSweepRelay::new(
+        &sdk,
+        url,
+        RelayCaps {
+            max_limit: None,
+            negentropy: false,
+        },
+        Duration::from_secs(5),
+    );
+    let mut sink = Sink::default();
+    let report = run_sweep(
+        request(SweepRange {
+            since: T0,
+            until: T0 + 99,
+        }),
+        &relay,
+        &mut sink,
+        &MemoryStore::default(),
+        &CancellationToken::new(),
+    )
+    .await;
+    let admitted = sink
+        .events
+        .iter()
+        .map(|event| event.id)
+        .collect::<HashSet<_>>();
+    for event in [&older, &newer] {
+        let second = event.created_at.as_secs();
+        if report
+            .covered
+            .iter()
+            .any(|slice| (slice.since..=slice.until).contains(&second))
+        {
+            assert!(
+                admitted.contains(&event.id),
+                "second {second} covered without its event: {report:?}"
+            );
+        }
+    }
+    sdk.shutdown().await;
+    server.abort();
 }
 
 /// wok's marmot preset: cap 5,000, default page 500. A saturated second over

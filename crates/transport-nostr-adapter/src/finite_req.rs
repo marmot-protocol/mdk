@@ -121,10 +121,10 @@ pub struct FiniteReply {
     /// EVENT frames read for the request, valid or not, duplicates and the
     /// first one over the item budget included.
     pub raw_items: usize,
-    /// The part of `raw_items` the attempt that ended the request read: a
-    /// retry after authentication is one page of its own, and only its count
-    /// can prove that page against a relay's cap.
-    pub page_items: usize,
+    /// The relay asked for authentication and the request was asked again
+    /// after it: the reply joins two attempts' pages, so no count of it is
+    /// one page's.
+    pub retried: bool,
     /// Valid copies read, duplicates and the first one over a budget
     /// included.
     pub received_items: usize,
@@ -166,7 +166,7 @@ impl FiniteReply {
         }
         Self {
             raw_items: self.raw_items + retry.raw_items,
-            page_items: retry.page_items,
+            retried: true,
             received_items: self.received_items + retry.received_items,
             duplicates: self.duplicates + retry.duplicates,
             event_bytes: self.event_bytes + retry.event_bytes,
@@ -182,7 +182,7 @@ impl FiniteReply {
         Self {
             events: Vec::new(),
             raw_items: 0,
-            page_items: 0,
+            retried: false,
             received_items: 0,
             duplicates: 0,
             event_bytes: 0,
@@ -849,7 +849,7 @@ impl<'a> Collector<'a> {
         FiniteReply {
             events: self.events,
             raw_items: self.raw_items,
-            page_items: self.raw_items,
+            retried: false,
             received_items: self.received_items,
             duplicates: self.duplicates,
             event_bytes: self.event_bytes,
@@ -1095,7 +1095,7 @@ impl Drop for Diverted {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::time::Duration;
 
     use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
@@ -1971,7 +1971,7 @@ pub(crate) mod tests {
             assert_eq!(reply.end, end, "{case}");
             assert_eq!(reply.events, kept, "{case}");
             assert_eq!(reply.raw_items, 2, "{case}");
-            assert_eq!(reply.page_items, 1, "{case}: the retry's page is its own");
+            assert!(reply.retried, "{case}");
             assert!(!reply.auth, "{case}: the retry's reply holds nothing back");
             client.shutdown().await;
             server.abort();
@@ -1980,7 +1980,7 @@ pub(crate) mod tests {
 
     /// How a relay asks the client to authenticate.
     #[derive(Clone, Copy, Debug)]
-    pub(crate) enum AuthAsk {
+    enum AuthAsk {
         /// `CLOSED` with an `auth-required:` reason.
         Refusal,
         /// EOSE with NIP-67 `auth`.
@@ -1991,7 +1991,7 @@ pub(crate) mod tests {
     /// authentication as `asks` says, authenticates the client, and answers
     /// the next REQ with `second` and EOSE. A REQ sent again before the
     /// client authenticated is refused again.
-    pub(crate) async fn refusing_relay(
+    async fn refusing_relay(
         asks: AuthAsk,
         first: Event,
         second: Event,

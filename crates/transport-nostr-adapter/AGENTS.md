@@ -37,7 +37,7 @@ for reconnect/backoff and relay status mechanics.
 | `tests/acquisition_contract.rs` | Request validation and optional-boundary shape tests. |
 | `tests/publish_accounting.rs` | Direct-adapter publish admission, classification, and cancellation tests, with or without `sdk`. |
 | `tests/selective_history_acquisition_tests.rs` | `sdk`-gated bounded history acquisition and reconciliation-cursor tests. |
-| `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp including raw500/validated499 with1,200valid events (#2885), NIP-77 saturated second, an inconclusive second (a listed id withheld, a malformed NEG-MSG, or repeated id-fetch events that cut a one-id reply; retried and never saturated), resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing, `auth` leaves the slice owed; replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
+| `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp including raw500/validated499 with1,200valid events (#2885), NIP-77 saturated second, an inconclusive second (a listed id withheld, a malformed NEG-MSG, or repeated id-fetch events that cut a one-id reply; retried and never saturated), resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing, `auth` leaves the slice owed, and a slice retried after authentication proves nothing (a scripted auth-gated relay with an unpublished cap); replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
 | `tests/relay_limit_subscriptions.rs` | `sdk`-gated subscription behavior against `tests/support/limit_relay.rs`, a proxy enforcing strfry 1.1.3's per-connection limits (REQ and NEG caps, filter shape, 500 limit clamp). |
 
 ## Invariants
@@ -245,7 +245,8 @@ for reconnect/backoff and relay status mechanics.
   A relay without NIP-77 or a refused comparison proves nothing and ends the call; never read it as an empty set.
 - No NIP-67 hint proves a slice; only counting does. `more` splits, `auth` asks for authentication as an
   `auth-required:` refusal does (the finite request retries once after it; a slice still hinted stays owed), and
-  `finish` is never read: a misread `finish`
+  `finish` is never read. A reply retried after authentication (`FiniteReply::retried`) joins two pages, so it proves
+  nothing and its slice splits, never teaching an observed cap: a misread `finish`
   would skip history while a misread `more` only costs requests. The collector takes hints from nostr-sdk's typed
   EOSE (`RelayMessage::EndOfStoredEvents { hints }`). Do not add a hint-based `SliceProof`.
 - Every `SdkSweepRelay` REQ and every `acquire_history` request is a finite request (`src/finite_req.rs`), which
