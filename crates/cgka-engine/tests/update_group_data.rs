@@ -2188,6 +2188,7 @@ async fn delayed_app_messages_pin_retention_from_their_source_epoch() {
             group_id: gid.clone(),
             payload: before_enable_payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -2257,6 +2258,7 @@ async fn delayed_app_messages_pin_retention_from_their_source_epoch() {
             group_id: gid.clone(),
             payload: before_disable_payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -3832,6 +3834,7 @@ async fn moderation_uses_authenticated_source_policy_after_admin_demotion() {
             group_id: gid.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -3888,7 +3891,8 @@ async fn moderation_uses_authenticated_source_policy_after_admin_demotion() {
         bob.send(SendIntent::AppMessage {
             group_id: gid,
             payload,
-            expected_epoch: None
+            expected_epoch: None,
+            only_to_members: None
         })
         .await
         , Err(EngineError::InvalidAppMessagePayload(reason)) if reason == "group admin authority required"
@@ -3918,6 +3922,7 @@ async fn unavailable_moderation_authority_survives_restart_and_resolves_later() 
             group_id: gid.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -4064,6 +4069,7 @@ async fn unresolved_moderation_proof_preserves_source_epoch_retention() {
             group_id: gid.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -4190,6 +4196,7 @@ async fn later_admin_promotion_does_not_authorize_an_earlier_removal() {
             group_id: gid.clone(),
             payload: payload.clone(),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await,
         Err(EngineError::InvalidAppMessagePayload(_))
@@ -4280,6 +4287,7 @@ async fn ordinary_messages_and_author_deletion_omit_moderation_authority() {
                 group_id: gid.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();
@@ -4341,7 +4349,8 @@ async fn engine_allows_moderation_in_unnamed_two_account_groups() {
                 .send(SendIntent::AppMessage {
                     group_id: gid.clone(),
                     payload,
-                    expected_epoch: None
+                    expected_epoch: None,
+                    only_to_members: None
                 })
                 .await,
             Ok(SendResult::ApplicationMessage { .. })
@@ -4383,6 +4392,7 @@ async fn moderation_authority_distinguishes_same_epoch_sibling_branches() {
                 group_id: gid.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap()

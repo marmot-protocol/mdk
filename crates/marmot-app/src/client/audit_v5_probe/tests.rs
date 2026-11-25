@@ -2537,6 +2537,7 @@ async fn ignored_relay_replays_add_only_their_outcome_row() {
                     group_id: group.clone(),
                     payload,
                     expected_epoch: None,
+                    only_to_members: None,
                 })
                 .await
                 .unwrap();

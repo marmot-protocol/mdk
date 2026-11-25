@@ -772,6 +772,7 @@ async fn publish_app_events(
                 group_id: group_id.clone(),
                 payload: app_payload_for(sender, payload_label(seed, message_index).as_bytes()),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();

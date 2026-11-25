@@ -2567,6 +2567,7 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         // to caller input (the pinned epoch), not a protocol failure.
         | EngineError::AppMessageEpochMismatch { .. }
         | EngineError::AppMessageEpochUnsettled { .. }
+        | EngineError::AppMessageNewMembers
         | EngineError::LinkDeviceUnsettled { .. }
         | EngineError::SiblingAddUnsettled { .. }
         | EngineError::DeviceEntryChanged { .. }
@@ -2649,6 +2650,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::LeaveNotBlocked { .. } => "leave_not_blocked",
         EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
         EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
+        EngineError::AppMessageNewMembers => "app_message_new_members",
         EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
         EngineError::SiblingAddUnsettled { .. } => "sibling_add_unsettled",
         EngineError::DeviceEntryChanged { .. } => "device_entry_changed",

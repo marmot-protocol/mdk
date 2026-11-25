@@ -819,6 +819,7 @@ mod tagged_siblings {
                 group_id: device_group.clone(),
                 payload: event.encode().unwrap(),
                 expected_epoch: Some(pin),
+                only_to_members: None,
             })
             .await
             .unwrap();

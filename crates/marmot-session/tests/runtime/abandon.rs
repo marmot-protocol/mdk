@@ -197,8 +197,8 @@ async fn a_queued_change_given_up_after_a_restart_is_retired() {
         .queue_app_message_with_audit_context(
             fixture.group_id.clone(),
             app_payload_for(&sender, b"queued first"),
-            Default::default(),
-        )
+            None,
+            Default::default())
         .await
         .unwrap();
     // A change sent behind a queued send waits in the queue too (mdk#2842).

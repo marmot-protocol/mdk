@@ -1641,6 +1641,7 @@ impl AccountDeviceSession {
         &mut self,
         group_id: GroupId,
         payload: Vec<u8>,
+        only_to_members: Option<Vec<MemberId>>,
         context: AuditEventContext,
     ) -> SessionResult<SessionEffects> {
         tracing::debug!(
@@ -1651,7 +1652,7 @@ impl AccountDeviceSession {
         let _selection = self.pause_welcome_publishes().await;
         let result = self
             .engine
-            .queue_app_message_with_audit_context(group_id, payload, Some(context))
+            .queue_app_message_with_audit_context(group_id, payload, only_to_members, Some(context))
             .await;
         self.refresh_welcome_holds();
         let result = result?;

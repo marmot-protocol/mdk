@@ -779,6 +779,7 @@ async fn run_child_case(database: &Path) {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, b"queued across crash"),
                 expected_epoch: None,
+                only_to_members: None,
             },
             created_at_ms: 2_100,
             reissue_attempts: 0,
@@ -1202,6 +1203,7 @@ async fn run_probe_child(database: &Path) {
             group_id: group.clone(),
             intent: SendIntent::AppMessage {
                 expected_epoch: None,
+                only_to_members: None,
                 group_id: group.clone(),
                 payload: app_payload_for(&carol, b"retained work"),
             },
@@ -1467,6 +1469,7 @@ async fn run_application_child(database: &Path) {
     let sent = alice
         .send(SendIntent::AppMessage {
             expected_epoch: None,
+            only_to_members: None,
             group_id: group.clone(),
             payload,
         })
@@ -1834,6 +1837,7 @@ async fn run_stale_ordinary_recovery(phase: GroupEvolutionPhase) {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             expected_epoch: None,
+            only_to_members: None,
             payload: app_payload_for(&coordinator, b"recovery past ordinary orphan delivers"),
         })
         .await
@@ -2252,6 +2256,7 @@ fn run_recovery_parent(point: &str) {
                 .send(SendIntent::AppMessage {
                     group_id: group_id.clone(),
                     expected_epoch: None,
+                    only_to_members: None,
                     payload: app_payload_for(&restarted, b"resumed recovery delivers"),
                 })
                 .await

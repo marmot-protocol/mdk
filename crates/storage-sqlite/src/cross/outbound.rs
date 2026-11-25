@@ -23,6 +23,22 @@ pub(crate) fn accept_confirmed_payload(
     accept_submission_tx(conn, group_hex, DraftAcceptance::Payload(payload))
 }
 
+/// Refuses the submission of a queued app message, identified by its payload,
+/// that the engine retired because the group gained a member it is not for.
+pub(crate) fn refuse_queued_payload(
+    conn: &rusqlite::Connection,
+    group_hex: &str,
+    payload: &[u8],
+) -> StorageResult<()> {
+    use sha2::{Digest, Sha256};
+    SqliteAppStorage::refuse_local_submission_tx(
+        conn,
+        group_hex,
+        "payload_hash",
+        &Sha256::digest(payload).to_vec(),
+    )
+}
+
 /// Accepts the submission and draft of a fanned-out app message, identified by
 /// its app event id. Returns whether a draft changed.
 pub(crate) fn accept_confirmed_event(

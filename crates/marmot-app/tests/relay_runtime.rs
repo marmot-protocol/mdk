@@ -4159,7 +4159,9 @@ async fn tagged_poll_sticker_peer() {
     assert_eq!(sent.client_token, token);
     assert_eq!(
         runtime.local_send_status(a, &group, token).unwrap(),
-        Some(marmot_app::LocalSendStatus::Queued)
+        Some(marmot_app::LocalSendStatus::Queued {
+            message_id_hex: sent.message_id_hex.clone()
+        })
     );
     let sticker_id = &sent.message_id_hex;
     assert!(
@@ -4176,7 +4178,9 @@ async fn tagged_poll_sticker_peer() {
     let mut events = runtime.subscribe();
     assert_eq!(
         runtime.local_send_status(a, &group, token).unwrap(),
-        Some(marmot_app::LocalSendStatus::Queued)
+        Some(marmot_app::LocalSendStatus::Queued {
+            message_id_hex: sent.message_id_hex.clone()
+        })
     );
     runtime.start().await.unwrap();
     let replay = runtime

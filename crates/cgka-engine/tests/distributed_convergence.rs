@@ -2215,6 +2215,7 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -2502,6 +2503,7 @@ async fn convergence_apply_clears_removed_marker_without_canonical_evidence() {
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -2664,6 +2666,7 @@ async fn convergence_apply_heals_fully_evicted_shaped_record() {
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -3722,6 +3725,7 @@ async fn pass_opens_while_app_message_intents_are_queued() {
             group_id: group_id.clone(),
             payload: b"queued-chat".to_vec(),
             expected_epoch: None,
+            only_to_members: None,
         },
         1_000_001,
     );
@@ -3780,6 +3784,7 @@ async fn queued_app_regeneration_converges_authenticated_input_before_fairness_s
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, "queued after authenticated input"),
             expected_epoch: None,
+            only_to_members: None,
         },
         1_000_001,
     );
@@ -4141,6 +4146,7 @@ async fn restart_with_only_app_messages_opens_pass_without_delay() {
             group_id: group_id.clone(),
             payload: b"queued-chat".to_vec(),
             expected_epoch: None,
+            only_to_members: None,
         },
         1_000_001,
     );
@@ -4930,6 +4936,7 @@ async fn durable_unrecoverable_halt_blocks_queued_drain_without_rehydration() {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&alice, b"must remain queued"),
                 expected_epoch: None,
+                only_to_members: None,
             },
             created_at_ms: 1,
             reissue_attempts: 0,
@@ -5150,6 +5157,7 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
             group_id: group_id.clone(),
             payload: app_payload_for(&restarted, b"must not send while halted"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect_err("send must refuse Unrecoverable after restart");
@@ -5247,6 +5255,7 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
             group_id,
             payload: app_payload_for(&restarted, b"send resumes after verified repair"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect("verified repair returns the group to Stable");
@@ -5655,6 +5664,7 @@ async fn a_settled_convergence_pass_leaves_no_unscheduled_retained_intent() {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"typed inside the pass window"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -5854,6 +5864,7 @@ async fn a_completed_pass_rearms_the_drain_for_intents_queued_inside_the_window(
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"typed inside the fork window"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -6447,6 +6458,7 @@ async fn future_app_without_reachable_commit_is_retained_without_gating_sends() 
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"current branch remains usable"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -9136,6 +9148,7 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"queued until stable"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -9298,6 +9311,7 @@ async fn far_future_convergence_input_beyond_ceiling_does_not_gate_sends() {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"still able to send"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -9394,6 +9408,7 @@ async fn never_validating_commit_is_terminal_and_does_not_gate_sends() {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"send after invalid commit"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -9458,6 +9473,7 @@ async fn undecodable_convergence_row_does_not_gate_sends() {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"send despite garbage row"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -9556,6 +9572,7 @@ async fn non_wire_and_unprojectable_convergence_rows_do_not_gate_sends() {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"send despite fail-open rows"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -9653,6 +9670,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"send after full catch-up"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -9862,6 +9880,7 @@ async fn send_preflight_terminally_retires_deferred_app_message_outside_past_epo
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"send after terminal stale"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -10037,6 +10056,7 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"queued through trait lifecycle"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -10184,6 +10204,7 @@ async fn restart_schedules_groups_with_durable_queued_intents() {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&alice, b"send after restart"),
                 expected_epoch: None,
+                only_to_members: None,
             },
             created_at_ms: 1,
             reissue_attempts: 0,
@@ -10250,6 +10271,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
                 group_id: group_id.clone(),
                 payload: app_payload_for(&alice, b"after invite publish resolves"),
                 expected_epoch: None,
+                only_to_members: None,
             },
             created_at_ms: 1,
             reissue_attempts: 0,
@@ -10378,6 +10400,7 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"queued across restart"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -10470,6 +10493,7 @@ async fn send_app(
             group_id: group_id.clone(),
             payload: app_payload_for(engine, payload),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect("send app");
@@ -11828,6 +11852,7 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
             group_id: group_id.clone(),
             payload: old_payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -12053,6 +12078,7 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
                 group_id: group_id.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();
@@ -12743,6 +12769,7 @@ async fn canonical_application_backlog_resumes_after_restart_in_bounded_turns_wi
         b"send-during-application-drain",
         SendIntent::AppMessage {
             expected_epoch: None,
+            only_to_members: None,
             group_id: group.clone(),
             payload: app_payload_for(&carol, b"queued with backlog"),
         },

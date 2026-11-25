@@ -641,6 +641,7 @@ fn snapshot_send_intents() {
             group_id: gid(),
             payload: b"hello".to_vec(),
             expected_epoch: None,
+            only_to_members: None,
         }
     );
     insta::assert_json_snapshot!(
@@ -652,6 +653,16 @@ fn snapshot_send_intents() {
                 epoch: EpochId(7),
                 identity: [0xAB; 32],
             }),
+            only_to_members: None,
+        }
+    );
+    insta::assert_json_snapshot!(
+        "intent_app_message_only_to_members",
+        SendIntent::AppMessage {
+            group_id: gid(),
+            payload: b"hello".to_vec(),
+            expected_epoch: None,
+            only_to_members: Some(vec![MemberId::new(vec![0xCD; 32])]),
         }
     );
     insta::assert_json_snapshot!(

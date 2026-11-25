@@ -684,6 +684,7 @@ async fn ignored_replays_record_only_their_outcome() {
                 group_id: group_id.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap()
@@ -863,6 +864,7 @@ async fn queued_application_audit_correlates_preparation_after_restart() {
             group_id: group_id.clone(),
             payload: third.encode().unwrap(),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -872,6 +874,7 @@ async fn queued_application_audit_correlates_preparation_after_restart() {
                 group_id: group_id.clone(),
                 payload: b"malformed-private-fixture".to_vec(),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await,
         Err(cgka_traits::EngineError::InvalidAppMessagePayload(_))
@@ -997,6 +1000,7 @@ async fn dropping_a_suspended_send_leaves_no_operation_context_behind() {
             group_id,
             payload,
             expected_epoch: None,
+            only_to_members: None,
         },
         Some(human_action_context("send_message")),
     ));

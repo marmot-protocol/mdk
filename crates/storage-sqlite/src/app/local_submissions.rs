@@ -16,8 +16,10 @@ pub struct LocalSubmission {
     pub payload_hash: Vec<u8>,
     pub payload: Option<Vec<u8>>,
     pub request_json: Option<String>,
-    /// 0: app-owned queue; 1: engine-owned; 3: rejected before engine acceptance.
-    /// Value 2 is reserved for the API's completed outcome (stored in outcome_json).
+    /// 0: app-owned queue; 1: engine-owned; 3: rejected before engine acceptance;
+    /// 4: refused, never sent, because the group gained a member account the
+    /// send's member list leaves out. Value 2 is reserved for the API's
+    /// completed outcome (stored in outcome_json).
     pub state: u8,
     pub outcome_json: Option<String>,
 }
@@ -118,6 +120,43 @@ impl SqliteAppStorage {
             params![group, token, outcome],
         ).storage()?;
         Ok(())
+    }
+
+    /// The engine refused the send because the group gained a member account
+    /// its member list leaves out: nothing was sent, and nothing will be.
+    pub fn refuse_local_submission(&self, group: &str, token: &str) -> StorageResult<()> {
+        let conn = self.lock()?;
+        Self::refuse_local_submission_tx(&conn, group, "client_token", &token)
+    }
+
+    /// [`Self::refuse_local_submission`] for a send the engine names by its
+    /// payload, in the transaction that retires the engine's queued intent.
+    pub(crate) fn refuse_local_submission_tx(
+        conn: &rusqlite::Connection,
+        group: &str,
+        field: &str,
+        value: &dyn rusqlite::ToSql,
+    ) -> StorageResult<()> {
+        let column = match field {
+            "client_token" => "client_token",
+            "payload_hash" => "payload_hash",
+            _ => return Err(StorageError::Backend("invalid refusal field".to_owned())),
+        };
+        conn.execute_cached(&format!("UPDATE local_message_submissions SET state=4, payload=NULL, request_json=NULL, outcome_json=NULL WHERE group_id_hex=?1 AND {column}=?2 AND state IN (0, 1)"), params![group, value]).storage()?;
+        Ok(())
+    }
+
+    /// The groups holding a refused send whose timeline row is still live.
+    pub fn groups_with_refused_live_local_sends(&self) -> StorageResult<Vec<String>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare_cached(
+            "SELECT DISTINCT local.group_id_hex FROM local_message_submissions local JOIN app_events event ON event.group_id_hex=local.group_id_hex AND event.message_id_hex=local.message_id_hex WHERE local.state=4 AND event.invalidated=0",
+        ).storage()?;
+        statement
+            .query_map([], |row| row.get(0))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
     }
 }
 

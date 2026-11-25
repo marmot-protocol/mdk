@@ -117,6 +117,7 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::NoDataAppComponent { .. }
         | EngineError::AppMessageEpochMismatch { .. }
         | EngineError::AppMessageEpochUnsettled { .. }
+        | EngineError::AppMessageNewMembers
         | EngineError::LinkDeviceUnsettled { .. }
         | EngineError::SiblingAddUnsettled { .. }
         | EngineError::DeviceEntryChanged { .. }
@@ -189,14 +190,16 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Retire a queued intent the settled state refused and tell the host.
-    /// Nothing was staged for it, so the durable delete is the only write; the
-    /// announcement follows it.
+    /// Nothing was staged for it, so the storage retirement is the whole
+    /// durable step (a host's storage may settle its own state for the refusal
+    /// in that transaction); the announcement follows it.
     pub(crate) fn retire_refused_queued_intent(
         &mut self,
         record: &QueuedOutboundIntent,
         error: &EngineError,
     ) -> Result<(), EngineError> {
-        self.storage.delete_queued_outbound_intent(&record.id)?;
+        self.storage
+            .retire_refused_queued_outbound_intent(record, error.privacy_safe_kind())?;
         self.announce_refused_queued_intent(record, QueuedIntentRetirement::Refused(error));
         Ok(())
     }

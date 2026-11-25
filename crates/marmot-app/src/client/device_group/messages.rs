@@ -412,6 +412,7 @@ impl AppClient {
                 group_id: group_id.clone(),
                 payload,
                 expected_epoch,
+                only_to_members: None,
             })
             .await?;
         let reached = !effects

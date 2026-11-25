@@ -23,25 +23,35 @@ c_mirror! {
 struct StatusFields {
     state: u32,
     summary: Option<marmot_uniffi::conversions::SendSummaryFfi>,
+    message_id_hex: Option<String>,
 }
 c_mirror! {
-    /// Local submission status: 0 queued, 1 engine-owned, 2 completed, 3 rejected.
+    /// Local submission status: 0 queued, 1 engine-owned, 2 completed, 3 rejected, 4 refused.
     /// Summary is present only for completed attempts; inspect its disposition.
+    /// `message_id_hex` names the send's event while MDK holds it (states 0 and
+    /// 1), and is NULL otherwise.
     MarmotLocalSendStatus from StatusFields,
     free marmot_local_send_status_free {
         copy state: u32,
         opt_rec summary: MarmotSendSummary,
+        opt_str message_id_hex,
     }
 }
 impl From<LocalSendStatusFfi> for MarmotLocalSendStatus {
     fn from(value: LocalSendStatusFfi) -> Self {
-        let (state, summary) = match value {
-            LocalSendStatusFfi::Queued => (0, None),
-            LocalSendStatusFfi::EngineOwned => (1, None),
-            LocalSendStatusFfi::Completed { summary } => (2, Some(summary)),
-            LocalSendStatusFfi::Rejected => (3, None),
+        let (state, summary, message_id_hex) = match value {
+            LocalSendStatusFfi::Queued { message_id_hex } => (0, None, Some(message_id_hex)),
+            LocalSendStatusFfi::EngineOwned { message_id_hex } => (1, None, Some(message_id_hex)),
+            LocalSendStatusFfi::Completed { summary } => (2, Some(summary), None),
+            LocalSendStatusFfi::Rejected => (3, None, None),
+            LocalSendStatusFfi::RefusedNewMembers => (4, None, None),
         };
-        StatusFields { state, summary }.into()
+        StatusFields {
+            state,
+            summary,
+            message_id_hex,
+        }
+        .into()
     }
 }
 
@@ -79,8 +89,8 @@ mod tests {
         );
         unsafe { result.free_in_place() };
         for (expected, status) in [
-            LocalSendStatusFfi::Queued,
-            LocalSendStatusFfi::EngineOwned,
+            LocalSendStatusFfi::Queued { message_id_hex: "cc".repeat(32) },
+            LocalSendStatusFfi::EngineOwned { message_id_hex: "cc".repeat(32) },
             LocalSendStatusFfi::Completed { summary: marmot_uniffi::conversions::SendSummaryFfi {
                 published: 2,
                 message_ids: vec!["bb".repeat(32)],
@@ -88,9 +98,15 @@ mod tests {
                 maintenance_disposition: marmot_uniffi::conversions::SendMaintenanceDispositionFfi::PostJoinRotationPendingRetryable,
             } },
             LocalSendStatusFfi::Rejected,
+            LocalSendStatusFfi::RefusedNewMembers,
         ].into_iter().enumerate() {
             let mut mirror = MarmotLocalSendStatus::from(status);
             assert_eq!(mirror.state, expected as u32);
+            if expected < 2 {
+                assert_eq!(unsafe { std::ffi::CStr::from_ptr(mirror.message_id_hex) }.to_str().unwrap(), "cc".repeat(32));
+            } else {
+                assert!(mirror.message_id_hex.is_null());
+            }
             if expected == 2 {
                 assert!(!mirror.summary.is_null());
                 let summary = unsafe { &*mirror.summary };

@@ -1538,6 +1538,7 @@ async fn chat_list_draft_acceptance_rollback_and_lag_use_authoritative_store() {
             group_id,
             payload: b"payload".to_vec(),
             expected_epoch: None,
+            only_to_members: None,
         },
         created_at_ms: 1,
         reissue_attempts: 0,

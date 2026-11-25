@@ -2410,6 +2410,7 @@ async fn send_chat<S: StorageProvider + 'static>(
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -3505,6 +3506,7 @@ async fn queued_output_preserves_background_recovery_allowance() {
                 group_id: group_id.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();

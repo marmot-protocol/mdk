@@ -476,6 +476,7 @@ fn seed_probe_work_rows(
             group_id: group_id.clone(),
             payload: vec![0x73, suffix],
             expected_epoch: None,
+            only_to_members: None,
         },
         created_at_ms: u64::from(suffix),
         reissue_attempts: 0,
@@ -2571,6 +2572,7 @@ async fn quarantined_group_blocks_convergence_and_send() {
                 group_id: group_id.clone(),
                 payload: b"blocked".to_vec(),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await,
         Err(EngineError::UnknownGroup(id)) if id == group_id

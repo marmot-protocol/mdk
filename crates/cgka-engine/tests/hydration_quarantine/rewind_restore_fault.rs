@@ -395,6 +395,7 @@ async fn alice_app_message(fork: &mut Fork) -> TransportMessage {
             group_id: fork.group.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect("alice sends")
@@ -505,6 +506,7 @@ async fn fail_then_use_the_session(window: Window, exit: Exit) -> (Fork, Image, 
                 group_id: fork.group.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await,
         "send",

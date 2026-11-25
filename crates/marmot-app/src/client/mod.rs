@@ -4835,7 +4835,7 @@ impl AppClient {
     where
         F: FnMut(crate::AppProjectionUpdate),
     {
-        self.send_app_event_with_context(group_id, intent, on_local_projection, draft, None)
+        self.send_app_event_with_context(group_id, intent, on_local_projection, draft, None, None)
             .await
     }
 
@@ -4884,6 +4884,7 @@ impl AppClient {
         } else {
             request.intent()
         };
+        let only_to_members = request.only_to_members()?;
         let (event, payload) = crate::local_submissions::retained_event(submission)?;
         if !request.attachments.is_empty() {
             self.sync_runtime_groups_for_send("publish_local_submission")
@@ -4896,6 +4897,7 @@ impl AppClient {
             on_projection,
             None,
             Some((event, payload)),
+            only_to_members,
         )
         .await
         .map(|(_, summary)| summary)
@@ -4940,6 +4942,7 @@ impl AppClient {
         mut on_local_projection: F,
         draft: Option<(crate::MessageDraftRevision, Option<String>)>,
         prepared: Option<(MarmotInnerEvent, Vec<u8>)>,
+        only_to_members: Option<Vec<cgka_traits::MemberId>>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
     where
         F: FnMut(crate::AppProjectionUpdate),
@@ -5237,6 +5240,7 @@ impl AppClient {
                         group_id: group_id.clone(),
                         payload,
                         expected_epoch,
+                        only_to_members,
                     };
                     // Thread the human-action context through the engine so the
                     // send's audit rows carry `human_action`, matching
@@ -5257,7 +5261,12 @@ impl AppClient {
                 Err(error) if error.is_account_not_active() && expected_epoch.is_none() => {
                     let context = audit_context.clone().unwrap_or_default();
                     self.runtime
-                        .queue_app_message_with_audit_context(group_id.clone(), payload, context)
+                        .queue_app_message_with_audit_context(
+                            group_id.clone(),
+                            payload,
+                            only_to_members,
+                            context,
+                        )
                         .await
                         .map_err(AppError::from)
                 }

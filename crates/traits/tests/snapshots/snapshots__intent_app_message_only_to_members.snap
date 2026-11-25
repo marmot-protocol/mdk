@@ -1,0 +1,57 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendIntent::AppMessage\n{\n    group_id: gid(), payload: b\"hello\".to_vec(), expected_epoch: None,\n    only_to_members: Some(vec![MemberId::new(vec![0xCD; 32])]),\n}"
+---
+{
+  "AppMessage": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "payload": [
+      104,
+      101,
+      108,
+      108,
+      111
+    ],
+    "only_to_members": [
+      [
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205,
+        205
+      ]
+    ]
+  }
+}

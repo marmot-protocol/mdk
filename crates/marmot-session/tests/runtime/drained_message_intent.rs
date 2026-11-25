@@ -21,8 +21,8 @@ async fn queue_message(runtime: &mut FloorRuntime, fixture: &FloorFixture) {
         .queue_app_message_with_audit_context(
             fixture.group_id.clone(),
             app_payload_for(&sender, b"queued"),
-            Default::default(),
-        )
+            None,
+            Default::default())
         .await
         .unwrap();
 }

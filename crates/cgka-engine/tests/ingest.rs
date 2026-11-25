@@ -636,6 +636,7 @@ async fn send_app_message_passes_retention_metadata_to_peeler() {
             group_id,
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -875,6 +876,7 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"retry after peel"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -976,6 +978,7 @@ async fn malformed_group_message_is_rejected_and_does_not_wedge_ingest() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"after the garbage"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -1354,6 +1357,7 @@ async fn post_peel_invalid_mls_inputs_are_terminal_and_restart_deduplicated() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"after post-peel garbage"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -1589,6 +1593,7 @@ async fn malformed_via_snapshot_fallback_is_rejected_and_does_not_wedge_ingest()
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"after the snapshot garbage"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -1643,6 +1648,7 @@ async fn ingest_own_created_message_returns_own_echo() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"hi"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -1706,6 +1712,7 @@ async fn buffered_legacy_own_echo_retires_raw_retry_row() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"legacy own echo"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -1830,6 +1837,7 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&alice, b"durable own echo"),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap()
@@ -2024,6 +2032,7 @@ async fn send_app_message_round_trips_to_another_client() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"hello bob"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -2093,6 +2102,7 @@ async fn pending_application_delivery_replays_after_restart_until_acknowledged()
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"survive the projection crash"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -2230,6 +2240,7 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"arrived while alice was pending"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -2330,6 +2341,7 @@ async fn buffered_retryable_peer_message_is_retired_terminal_after_replay() {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"arrived while alice was pending"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -2472,6 +2484,7 @@ async fn rewrapped_mls_message_with_new_transport_id_is_a_duplicate() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"only once"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -2546,6 +2559,7 @@ async fn distinct_mls_messages_are_not_collapsed_by_content_dedup() {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&alice, body),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap()

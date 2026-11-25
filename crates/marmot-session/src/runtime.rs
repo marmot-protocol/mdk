@@ -4241,12 +4241,18 @@ where
         &mut self,
         group_id: GroupId,
         payload: Vec<u8>,
+        only_to_members: Option<Vec<MemberId>>,
         context: AuditEventContext,
     ) -> AccountResult<AccountDeviceEffects> {
         let accept_started = Instant::now();
         let effects = self
             .session
-            .queue_app_message_with_audit_context(group_id.clone(), payload, context.clone())
+            .queue_app_message_with_audit_context(
+                group_id.clone(),
+                payload,
+                only_to_members,
+                context.clone(),
+            )
             .await?;
         let local_accept_duration = accept_started.elapsed();
         let publish_started = Instant::now();
@@ -9786,6 +9792,7 @@ mod tests {
             group_id: group_id.clone(),
             payload: Vec::new(),
             expected_epoch: None,
+            only_to_members: None,
         }));
         assert!(!supports_deferred_commit_publish(&SendIntent::Leave {
             group_id: group_id.clone(),

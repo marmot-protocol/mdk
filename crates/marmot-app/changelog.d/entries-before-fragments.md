@@ -1,5 +1,7 @@
 ### Breaking changes
 
+- `LocalSendStatus` gains `RefusedNewMembers`, and `Queued` and `EngineOwned` carry the send's `message_id_hex`, so a
+  host that lost the acceptance learns the event by asking rather than by handing the send again.
 - Kinds 1201 and 1202 take the shape of marmot-agents D-076, and the old shape is gone (D-051): an agent item
   (kind 1201) and an answer or a control (kind 1202) are sent with `submit_custom_event` or `send_custom_event`, which
   check their shape and refuse one over `AGENT_EVENT_MAX_BYTES` (64 KiB). MDK names a turn's starting message with a
@@ -24,6 +26,9 @@
 
 ### Added
 
+- `submit_custom_event_to_members` and `submit_tagged_edit_for_local_send_to_members` send only to the listed member
+  accounts: if the group has another member account when MDK encrypts the send, including one that joined while the
+  send was queued, it is not sent, its local row is retracted, and `local_send_status` reports `RefusedNewMembers`.
 - `submit_thread_message` and `submit_tagged_sticker` accept a client token and return before relay publication.
 - `MarmotAppRuntime::invite_deliveries` and `MarmotAppEvent::InviteDeliveryChanged` (mdk#1706): one `InviteDelivery`
   per group and invited account, rolled up from the session's per-Welcome delivery records. `RelayAccepted` means a

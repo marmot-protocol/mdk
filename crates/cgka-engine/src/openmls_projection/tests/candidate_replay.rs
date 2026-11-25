@@ -969,6 +969,7 @@ async fn resumable_selection_and_peeling_restore_historical_state_and_match_comp
             group_id: group_id.clone(),
             intent: SendIntent::AppMessage {
                 expected_epoch: None,
+                only_to_members: None,
                 group_id: group_id.clone(),
                 payload: b"retained".to_vec(),
             },
@@ -1123,6 +1124,7 @@ async fn resumable_public_background_advance_retains_progress_until_complete() {
                 group_id: group_id.clone(),
                 intent: SendIntent::AppMessage {
                     expected_epoch: None,
+                    only_to_members: None,
                     group_id: group_id.clone(),
                     payload: vec![0],
                 },
@@ -1473,6 +1475,7 @@ async fn replay_transaction_preserves_results_and_restores_after_error_and_panic
         group_id: group_id.clone(),
         intent: SendIntent::AppMessage {
             expected_epoch: None,
+            only_to_members: None,
             group_id: group_id.clone(),
             payload: b"retained".to_vec(),
         },
@@ -1768,6 +1771,7 @@ async fn own_checkpoint_apply_parity() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             expected_epoch: None,
+            only_to_members: None,
             payload,
         })
         .await
@@ -1939,6 +1943,7 @@ async fn check_restored_tip(
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 expected_epoch: None,
+                only_to_members: None,
                 payload: app_payload(content),
             })
             .await
@@ -2031,6 +2036,7 @@ async fn check_restored_tip(
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 expected_epoch: Some(pin),
+                only_to_members: None,
                 payload: payload.clone(),
             })
             .await;
@@ -2061,6 +2067,7 @@ async fn check_restored_tip(
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             expected_epoch: None,
+            only_to_members: None,
             payload: payload.clone(),
         })
         .await;
@@ -2187,6 +2194,7 @@ async fn check_restored_tip(
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             expected_epoch: None,
+            only_to_members: None,
             payload: peer_payload,
         })
         .await
@@ -2227,6 +2235,7 @@ async fn check_restored_tip(
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             expected_epoch: None,
+            only_to_members: None,
             payload: app_payload("after ordinary peer traffic"),
         })
         .await

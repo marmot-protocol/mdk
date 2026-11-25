@@ -180,6 +180,14 @@ pub enum EngineError {
     )]
     AppMessageEpochUnsettled { expected: EpochId },
 
+    /// An application message limited to some member accounts (see
+    /// [`SendIntent::AppMessage::only_to_members`](crate::engine::SendIntent))
+    /// reached encryption in an epoch whose members include an account it
+    /// does not list. Nothing was prepared or published; sending it again
+    /// gives the same answer while that account is a member.
+    #[error("application message refused: the group has members it is not for")]
+    AppMessageNewMembers,
+
     /// A [`SendIntent::LinkDevice`](crate::engine::SendIntent::LinkDevice),
     /// [`SendIntent::UnlinkDevice`](crate::engine::SendIntent::UnlinkDevice)
     /// or [`SendIntent::RecordRemovedSlot`](crate::engine::SendIntent::RecordRemovedSlot)
@@ -406,6 +414,7 @@ impl EngineError {
             EngineError::NoDataAppComponent { .. } => "no_data_app_component",
             EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
             EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
+            EngineError::AppMessageNewMembers => "app_message_new_members",
             EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
             EngineError::SiblingAddUnsettled { .. } => "sibling_add_unsettled",
             EngineError::DeviceEntryChanged { .. } => "device_entry_changed",

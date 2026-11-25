@@ -1127,11 +1127,13 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         payload: Vec<u8>,
+        only_to_members: Option<Vec<MemberId>>,
     ) -> Result<SendResult, EngineError> {
         let intent = SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members,
         };
         self.validate_send_acceptance(&intent)?;
         // Same retention boundary as `send`: a publication this client staged
@@ -5201,6 +5203,7 @@ mod deferred_peel_accounting_tests {
                 let SendResult::ApplicationMessage { mut msg, .. } = engine
                     .send(SendIntent::AppMessage {
                         expected_epoch: None,
+                        only_to_members: None,
                         group_id: group_id.clone(),
                         payload,
                     })
