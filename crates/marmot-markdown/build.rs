@@ -60,8 +60,6 @@ fn main() {
     if archive.exists() {
         fs::remove_file(&archive).expect("remove previous Odin archive");
     }
-    println!("cargo:rerun-if-env-changed=ODIN_WINDOWS_SDK_ROOT");
-    let windows_sdk = env::var_os("ODIN_WINDOWS_SDK_ROOT").filter(|_| os == "windows");
     let object_output = matches!(os.as_str(), "android" | "ios" | "windows");
     let parallel_codegen =
         target == "x86_64-unknown-linux-gnu" && env::var("OPT_LEVEL").as_deref() != Ok("0");
@@ -113,8 +111,11 @@ fn main() {
     if os == "windows" {
         command.arg("-linker:msvc");
     }
-    if let Some(root) = &windows_sdk {
-        command.arg(format!("-windows-sdk-root:{}", Path::new(root).display()));
+    if !cfg!(windows) && os == "windows" {
+        println!("cargo:rerun-if-env-changed=ODIN_WINDOWS_SDK_ROOT");
+        if let Some(root) = env::var_os("ODIN_WINDOWS_SDK_ROOT") {
+            command.arg(format!("-windows-sdk-root:{}", Path::new(&root).display()));
+        }
     }
     if os == "windows" && target_env.as_deref() == Ok("gnu") {
         command.arg("-define:MARMOT_MARKDOWN_MINGW=true");
