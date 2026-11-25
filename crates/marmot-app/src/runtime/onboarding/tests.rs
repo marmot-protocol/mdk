@@ -4342,17 +4342,17 @@ async fn inbox_repair_requires_fresh_consent_when_a_source_stops_answering() {
 /// For an external signer, creating the missing inbox list is a signing
 /// request, not a relay question. Its approval is checkpointed before the
 /// signature. A list the user publishes while signing is paused wins over
-/// the automatic event when onboarding resumes.
+/// automatic creation when onboarding resumes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_inbox_creation_resumes_without_superseding_a_later_list() {
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
-    let runtime = runtime(directory.path(), network.clone());
+    let first = runtime(directory.path(), network.clone());
     let keys = nostr::prelude::Keys::generate();
     let id = keys.public_key().to_hex();
     let block = Arc::new(AtomicBool::new(true));
     let started = Arc::new(Notify::new());
-    runtime
+    first
         .account_setup()
         .begin_external_signer_onboarding(
             id.clone(),
@@ -4375,14 +4375,14 @@ async fn automatic_inbox_creation_resumes_without_superseding_a_later_list() {
         "",
         unix_now_seconds() - 10,
     )];
-    let setup = runtime.account_setup();
+    let setup = first.account_setup();
     setup.run_onboarding(&id).await.unwrap();
     setup
         .continue_onboarding_without(&id, OnboardingStep::Profile)
         .await
         .unwrap();
     let task = tokio::spawn({
-        let manager = runtime.accounts();
+        let manager = first.accounts();
         let id = id.clone();
         async move {
             manager
@@ -4396,7 +4396,7 @@ async fn automatic_inbox_creation_resumes_without_superseding_a_later_list() {
         .expect("onboarding never asked the signer to sign the inbox list");
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    let checkpoint = runtime
+    let checkpoint = first
         .accounts()
         .setup_records()
         .onboarding_checkpoint(&id)
@@ -4418,19 +4418,32 @@ async fn automatic_inbox_creation_resumes_without_superseding_a_later_list() {
         10050,
         vec![vec!["relay".into(), "wss://chosen.example".into()]],
         "",
-        unix_now_seconds(),
+        unix_now_seconds() - 60,
     );
+    first.shutdown_and_close().await.unwrap();
     network.events.lock().push(manual.clone());
     block.store(false, Ordering::SeqCst);
-    let snapshot = setup.run_onboarding(&id).await.unwrap();
+    let runtime = runtime(directory.path(), network.clone());
+    runtime
+        .account_setup()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            BlockingSigner {
+                keys,
+                block,
+                started,
+            },
+            options(),
+        )
+        .await
+        .unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(
         snapshot.steps[OnboardingStep::InboxRelays.index()].status,
         OnboardingStatus::Passed
     );
-    let attempts = network.attempts.lock().clone();
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].kind, 10050);
-    assert!(attempts[0].created_at < manual.created_at);
+    assert!(network.attempts.lock().is_empty());
+    assert!(snapshot.created_inbox_list.is_none());
     let checkpoint = runtime
         .accounts()
         .setup_records()
@@ -4441,14 +4454,41 @@ async fn automatic_inbox_creation_resumes_without_superseding_a_later_list() {
         checkpoint.records[OnboardingStep::InboxRelays.index()],
         Some(manual)
     );
-    assert_eq!(
-        attempts[0].tags,
-        vec![vec!["relay".to_owned(), "wss://default.example".to_owned()]]
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_inbox_creation_searches_a_distinct_recommended_relay() {
+    let (_dir, runtime, network, keys, id) = fixture_with_options(OnboardingOptions {
+        discovery_relays: vec!["wss://discovery.example".into()],
+        inbox_relays: vec!["wss://index.example".into()],
+        create_missing_inbox_list: true,
+        ..options()
+    })
+    .await;
+    let existing = signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://chosen.example".into()]],
+        "",
+        unix_now_seconds() - 60,
     );
+    network.index_events.lock().push(existing);
+    let snapshot = inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), "wss://healthy.example".into()]],
+        None,
+    )
+    .await;
     assert_eq!(
-        snapshot.created_inbox_list.map(|created| created.relays),
-        Some(vec!["wss://default.example".to_owned()])
+        snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::Passed
     );
+    assert!(network.attempts.lock().is_empty());
+    assert!(snapshot.created_inbox_list.is_none());
     runtime.shutdown_and_close().await.unwrap();
 }
 

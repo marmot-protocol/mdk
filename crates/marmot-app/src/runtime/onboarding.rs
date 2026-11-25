@@ -699,6 +699,19 @@ struct OnboardingCheckpoint {
     automatic_inbox_event_time: Option<u64>,
 }
 
+struct RepairSourceCheck {
+    records: Vec<NostrTransportEvent>,
+    failures: Vec<OnboardingFinding>,
+    complete: bool,
+    authoritative: bool,
+}
+
+enum AutomaticInboxFreshness {
+    Confirmed,
+    Deferred,
+    FoundExistingList,
+}
+
 /// A device notice the user acknowledged, with the findings shown beside it.
 #[derive(Clone, Serialize, Deserialize)]
 struct AcknowledgedDeviceNotice {
@@ -2197,7 +2210,7 @@ impl AccountSetup<'_> {
         }
         if c.approved {
             self.require_live_onboarding_attempt(c)?;
-            if !self.publish_onboarding_repair(c).await? {
+            if !crate::client::boxed(|| self.publish_onboarding_repair(c, false)).await? {
                 return Ok(());
             }
         } else if c.snapshot.proposal.is_some() {
@@ -2336,11 +2349,12 @@ impl AccountSetup<'_> {
                 c.set(step, status, findings);
                 if step == OnboardingStep::InboxRelays && self.prepare_missing_inbox_list(c)? {
                     let event_time = unix_now_seconds().saturating_sub(1);
-                    self.approve_repair_if_current(c).await?;
+                    crate::client::boxed(|| self.approve_repair_if_current(c)).await?;
                     if c.approved {
                         c.automatic_inbox_event_time = Some(event_time);
                         self.save_onboarding(c)?;
-                        if !self.publish_onboarding_repair(c).await? {
+                        if !crate::client::boxed(|| self.publish_onboarding_repair(c, true)).await?
+                        {
                             return Ok(());
                         }
                         continue;
@@ -2748,6 +2762,15 @@ impl AccountSetup<'_> {
                     sources.push(endpoint.0);
                 }
             }
+        }
+        // The relay selected for an automatic list may be outside discovery.
+        // Search it before we write and when verifying its acknowledged event.
+        if step == OnboardingStep::InboxRelays
+            && c.options.create_missing_inbox_list
+            && let Some(endpoint) = c.options.defaults_for(step).first()
+            && !sources.contains(endpoint)
+        {
+            sources.push(endpoint.clone());
         }
         // Indexers come after the host's discovery relays and the account's
         // declared relays, and are dialed outside the inspection cap.
@@ -3341,20 +3364,15 @@ impl AccountSetup<'_> {
         Ok(c.snapshot)
     }
 
-    async fn approve_repair_if_current(
+    async fn inspect_repair_sources(
         &self,
-        c: &mut OnboardingCheckpoint,
-    ) -> Result<(), AppError> {
-        let proposal = c.snapshot.proposal.clone().ok_or_else(onboarding_error)?;
-        self.validate_typed_onboarding_repair(c, &proposal)?;
+        c: &OnboardingCheckpoint,
+        step: OnboardingStep,
+    ) -> Result<RepairSourceCheck, AppError> {
         let account_id = c.snapshot.account_id_hex.clone();
         let attempt = c.attempt();
         let sources = self
-            .await_while_onboarding_live(
-                &account_id,
-                attempt,
-                self.onboarding_sources(c, proposal.step),
-            )
+            .await_while_onboarding_live(&account_id, attempt, self.onboarding_sources(c, step))
             .await?;
         self.require_live_onboarding_attempt(c)?;
         let (records, failures, completed) = self
@@ -3363,7 +3381,7 @@ impl AccountSetup<'_> {
                 attempt,
                 self.inspect_onboarding_relays(
                     &c.snapshot.account_id_hex,
-                    proposal.step.kind(),
+                    step.kind(),
                     sources.clone(),
                 ),
             )
@@ -3376,12 +3394,30 @@ impl AccountSetup<'_> {
                 .iter()
                 .all(|endpoint| completed.contains_key(&relay_key(endpoint)))
             && !(records.is_empty() && !failures.is_empty());
-        // Unless the user approves a proposal displayed as inconclusive. Then a
-        // source that vouches for the account's records must answer, and the
-        // proposal's record must still be the newest that any answering source
-        // holds; a record only an unanswered source holds is the accepted risk.
-        let authoritative = !complete && self.authoritative_answered(c, &sources, &completed);
-        let accepted_risk = authoritative && proposal.inconclusive;
+        let authoritative = self.authoritative_answered(c, &sources, &completed);
+        Ok(RepairSourceCheck {
+            records,
+            failures,
+            complete,
+            authoritative,
+        })
+    }
+
+    async fn approve_repair_if_current(
+        &self,
+        c: &mut OnboardingCheckpoint,
+    ) -> Result<(), AppError> {
+        let proposal = c.snapshot.proposal.clone().ok_or_else(onboarding_error)?;
+        self.validate_typed_onboarding_repair(c, &proposal)?;
+        let RepairSourceCheck {
+            records,
+            failures,
+            complete,
+            authoritative,
+        } = self.inspect_repair_sources(c, proposal.step).await?;
+        // An inconclusive preview must show this risk before the user approves.
+        // At least one authoritative answer must still support the preview.
+        let accepted_risk = !complete && authoritative && proposal.inconclusive;
         let basis_newest = records.first().map(|e| &e.id) == proposal.previous_event_id.as_ref();
         // Past a failed source, only a record that replaces the proposal's own
         // counts as a change; an older copy must not displace it.
@@ -3531,9 +3567,49 @@ impl AccountSetup<'_> {
         }
         Ok(())
     }
+    async fn recheck_automatic_inbox(
+        &self,
+        c: &mut OnboardingCheckpoint,
+    ) -> Result<AutomaticInboxFreshness, AppError> {
+        let step = OnboardingStep::InboxRelays;
+        let check = self.inspect_repair_sources(c, step).await?;
+        let pending_id = c.signed_repair.as_ref().map(|event| &event.id);
+        if let Some(existing) = check
+            .records
+            .into_iter()
+            .find(|event| Some(&event.id) != pending_id)
+        {
+            c.inbox_list_seen = true;
+            c.records[step.index()] = Some(existing);
+            c.automatic_inbox_event_time = None;
+            c.approved = false;
+            c.signed_repair = None;
+            c.snapshot.proposal = None;
+            c.reset_step(step);
+            self.save_onboarding(c)?;
+            return Ok(AutomaticInboxFreshness::FoundExistingList);
+        }
+        if check.complete {
+            return Ok(AutomaticInboxFreshness::Confirmed);
+        }
+        let findings = std::iter::once(finding(OnboardingIssue::DiscoveryIncomplete))
+            .chain(check.failures)
+            .map(|finding| {
+                finding.in_context(
+                    OnboardingFindingContext::RepairPublication,
+                    OnboardingCheckPurpose::SourceFreshness,
+                )
+            })
+            .collect();
+        c.set(step, OnboardingStatus::RetryableFailure, findings);
+        self.save_onboarding(c)?;
+        Ok(AutomaticInboxFreshness::Deferred)
+    }
+
     async fn publish_onboarding_repair(
         &self,
         c: &mut OnboardingCheckpoint,
+        just_approved_inbox: bool,
     ) -> Result<bool, AppError> {
         let proposal = c.snapshot.proposal.clone().ok_or_else(onboarding_error)?;
         // Unsigned manual previews must reach validation below so a stale or
@@ -3555,7 +3631,15 @@ impl AccountSetup<'_> {
                 return Ok(false);
             }
         };
-        if c.signed_repair.is_none() {
+        let requires_signature = c.signed_repair.is_none();
+        if c.automatic_inbox_event_time.is_some() && !just_approved_inbox && requires_signature {
+            match crate::client::boxed(|| self.recheck_automatic_inbox(c)).await? {
+                AutomaticInboxFreshness::Confirmed => {}
+                AutomaticInboxFreshness::Deferred => return Ok(false),
+                AutomaticInboxFreshness::FoundExistingList => return Ok(true),
+            }
+        }
+        if requires_signature {
             if let Err(error) = self.validate_typed_onboarding_repair(c, &proposal) {
                 // Policy or persisted preview changes invalidate approval. Keep
                 // the error fail-closed, but allow a new inspection/preview.
@@ -3628,6 +3712,17 @@ impl AccountSetup<'_> {
             );
             c.set(proposal.step, OnboardingStatus::Checking, Vec::new());
             self.save_onboarding(c)?;
+        }
+        // An external signature can take an arbitrarily long time. A retry
+        // of saved bytes can also be separated from approval by a restart.
+        if c.automatic_inbox_event_time.is_some()
+            && (account.external_signing || !requires_signature)
+        {
+            match crate::client::boxed(|| self.recheck_automatic_inbox(c)).await? {
+                AutomaticInboxFreshness::Confirmed => {}
+                AutomaticInboxFreshness::Deferred => return Ok(false),
+                AutomaticInboxFreshness::FoundExistingList => return Ok(true),
+            }
         }
         let event = c.signed_repair.clone().ok_or_else(onboarding_error)?;
         if self.require_live_onboarding_attempt(c).is_err() {
