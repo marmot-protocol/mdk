@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use cgka_traits::{MemberId, TransportAdapterError};
 use nostr::prelude::{FinalizeEvent, ToBech32};
 use parking_lot::Mutex as FixtureMutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use transport_nostr::{DirectoryFetchRequest, DirectoryRelayFetcher};
 use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscription};
 
@@ -19,7 +19,7 @@ struct Network {
     fail_index_only: AtomicBool,
     inspection_errors: FixtureMutex<HashMap<String, transport_nostr::DirectoryInspectionError>>,
     inspected_endpoints: FixtureMutex<Vec<String>>,
-    inspect_after: FixtureMutex<Option<std::time::SystemTime>>,
+    inspect_clock: FixtureMutex<Option<(Arc<AtomicU64>, u64)>>,
     zero_acks: AtomicBool,
     block_publish: AtomicBool,
     publishing: Notify,
@@ -105,15 +105,14 @@ impl DirectoryRelayFetcher for Network {
         }) {
             return Err(error);
         }
-        let inspect_after = *self.inspect_after.lock();
-        if let Some(at) = inspect_after
-            && let Ok(delay) = at.duration_since(std::time::SystemTime::now())
-        {
-            tokio::time::sleep(delay).await;
-        }
-        self.fetch_directory_events(request)
+        let events = self
+            .fetch_directory_events(request)
             .await
-            .map_err(|_| transport_nostr::DirectoryInspectionError::TimedOut)
+            .map_err(|_| transport_nostr::DirectoryInspectionError::TimedOut);
+        if let Some((clock, time)) = self.inspect_clock.lock().as_ref() {
+            clock.store(*time, Ordering::SeqCst);
+        }
+        events
     }
 }
 
@@ -4982,10 +4981,9 @@ async fn future_dated_records_are_set_aside_with_an_advisory() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_can_enter_the_clock_window_during_lookup() {
-    use std::time::UNIX_EPOCH;
-
     let (_dir, runtime, network, keys, id) = fixture().await;
-    let eligible_at = unix_now_seconds() + 2;
+    let eligible_at = unix_now_seconds();
+    let clock = Arc::new(AtomicU64::new(eligible_at - 1));
     let list = signed(
         &keys,
         10002,
@@ -4994,12 +4992,11 @@ async fn a_record_can_enter_the_clock_window_during_lookup() {
         eligible_at + FUTURE_CLOCK_SKEW,
     );
     *network.events.lock() = vec![list.clone()];
-    *network.inspect_after.lock() =
-        Some(UNIX_EPOCH + Duration::from_secs(eligible_at) + Duration::from_millis(50));
-    assert!(list.created_at > unix_now_seconds() + FUTURE_CLOCK_SKEW);
+    *network.inspect_clock.lock() = Some((clock.clone(), eligible_at));
 
-    let (records, findings, _) = runtime
-        .account_setup()
+    let mut setup = runtime.account_setup();
+    setup.lookup_clock = Some(clock.as_ref());
+    let (records, findings, _) = setup
         .inspect_onboarding_relays(&id, 10002, options().discovery_relays)
         .await;
     assert_eq!(records, vec![list]);

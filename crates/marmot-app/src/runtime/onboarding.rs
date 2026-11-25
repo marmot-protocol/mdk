@@ -53,6 +53,8 @@ pub(super) struct GeneratedTeardownFence {
 pub struct AccountSetup<'a> {
     state: &'a SetupState,
     manager: &'a AccountManager,
+    #[cfg(test)]
+    lookup_clock: Option<&'a std::sync::atomic::AtomicU64>,
 }
 
 /// Setup's durable records: the onboarding checkpoint, the onboarding recovery
@@ -204,7 +206,12 @@ impl SetupState {
 
 impl<'a> AccountSetup<'a> {
     pub(super) fn new(state: &'a SetupState, manager: &'a AccountManager) -> Self {
-        Self { state, manager }
+        Self {
+            state,
+            manager,
+            #[cfg(test)]
+            lookup_clock: None,
+        }
     }
 
     fn app(&self) -> &'a MarmotApp {
@@ -2632,7 +2639,13 @@ impl AccountSetup<'_> {
                 Err(_) => failures.push(finding(OnboardingIssue::Interrupted)),
             }
         }
-        let latest_allowed_timestamp = unix_now_seconds() + FUTURE_CLOCK_SKEW;
+        #[cfg(test)]
+        let now = self.lookup_clock.map_or_else(unix_now_seconds, |clock| {
+            clock.load(std::sync::atomic::Ordering::SeqCst)
+        });
+        #[cfg(not(test))]
+        let now = unix_now_seconds();
+        let latest_allowed_timestamp = now + FUTURE_CLOCK_SKEW;
         if replaceable {
             records.retain(|event| event.created_at <= latest_allowed_timestamp);
         }
