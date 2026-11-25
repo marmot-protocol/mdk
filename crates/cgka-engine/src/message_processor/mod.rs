@@ -1132,6 +1132,7 @@ impl<S: StorageProvider> Engine<S> {
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         };
         self.validate_send_acceptance(&intent)?;
         // Same retention boundary as `send`: a publication this client staged
@@ -5201,6 +5202,7 @@ mod deferred_peel_accounting_tests {
                 let SendResult::ApplicationMessage { mut msg, .. } = engine
                     .send(SendIntent::AppMessage {
                         expected_epoch: None,
+                        only_to_members: None,
                         group_id: group_id.clone(),
                         payload,
                     })

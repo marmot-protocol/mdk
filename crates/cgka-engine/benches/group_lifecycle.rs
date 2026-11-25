@@ -677,6 +677,7 @@ fn bench_app_message_send(c: &mut Criterion) {
                         group_id,
                         payload,
                         expected_epoch: None,
+                        only_to_members: None,
                     }))
                     .expect("app send succeeds");
                 assert!(matches!(result, SendResult::ApplicationMessage { .. }));
@@ -907,6 +908,7 @@ fn assert_deferred_preflight_contract(
             group_id: fixture.group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         }))
         .expect("matrix probe send");
     if case.expects_queue() {
@@ -965,6 +967,7 @@ fn bench_deferred_outbound_preflight_matrix(c: &mut Criterion) {
                                 group_id: fixture.group_id,
                                 payload,
                                 expected_epoch: None,
+                                only_to_members: None,
                             }))
                             .expect("matrix send")
                         },
@@ -998,6 +1001,7 @@ fn prepare_app_ingest(
             group_id,
             payload: app_payload_for(&alice),
             expected_epoch: None,
+            only_to_members: None,
         }))
         .expect("app send succeeds");
     let SendResult::ApplicationMessage { msg, .. } = result else {

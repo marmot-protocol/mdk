@@ -12,6 +12,31 @@ fn validate_client_token(client_token: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// A send's member list: account pubkeys, stored lowercase, sorted and once
+/// each, so the same accounts make the same request.
+fn member_accounts(members: Vec<String>) -> Result<Vec<String>, AppError> {
+    let mut accounts = members
+        .iter()
+        .map(|member| {
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(member, &mut bytes).map_err(|_| {
+                AppError::InvalidAppMessagePayload(
+                    "member accounts must be exactly 32 bytes of hexadecimal".into(),
+                )
+            })?;
+            Ok(hex::encode(bytes))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    accounts.sort();
+    accounts.dedup();
+    if accounts.is_empty() {
+        return Err(AppError::InvalidAppMessagePayload(
+            "member list must name at least one account".into(),
+        ));
+    }
+    Ok(accounts)
+}
+
 fn validate_media_reply_target(target: &str) -> Result<(), AppError> {
     let mut bytes = [0u8; 32];
     hex::decode_to_slice(target, &mut bytes).map_err(|_| {
@@ -215,9 +240,7 @@ impl MarmotAppRuntime {
         submission
             .map(|s| {
                 Ok(if let Some(json) = s.outcome_json {
-                    crate::LocalSendStatus::Completed(
-                        crate::local_submissions::decode_local_outcome(&json)?,
-                    )
+                    crate::local_submissions::decode_local_outcome(&json)?
                 } else {
                     match s.state {
                         0 => crate::LocalSendStatus::Queued,
@@ -459,6 +482,42 @@ impl MarmotAppRuntime {
         .await
     }
 
+    /// [`Self::submit_custom_event`] for an event only `members` may receive:
+    /// account pubkeys in hex, the sending account's included. The engine
+    /// checks the group's member accounts when it encrypts the event, so an
+    /// event still queued when an unlisted account joins is not sent, and
+    /// [`Self::local_send_status`] reports
+    /// [`crate::LocalSendStatus::RefusedNewMembers`]. A listed account's
+    /// devices, including ones it links later, receive it. The list is part
+    /// of the request.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_custom_event_to_members(
+        &self,
+        account: &str,
+        group: &GroupId,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: String,
+        members: Vec<String>,
+        client_token: String,
+    ) -> Result<crate::LocalSendAcceptance, AppError> {
+        self.submit_local_message(
+            account,
+            group,
+            client_token,
+            LocalMessageRequest {
+                content,
+                tags,
+                custom_kind: Some(kind),
+                only_to_members: Some(member_accounts(members)?),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
     pub async fn submit_message_draft(
         &self,
         account: &str,
@@ -524,6 +583,35 @@ impl MarmotAppRuntime {
             LocalMessageRequest {
                 content,
                 tags,
+                ..Default::default()
+            },
+            None,
+            Some(original_client_token),
+        )
+        .await
+    }
+
+    /// [`Self::submit_tagged_edit_for_local_send`] for an edit only `members`
+    /// may receive, under [`Self::submit_custom_event_to_members`]'s rules.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_tagged_edit_for_local_send_to_members(
+        &self,
+        account: &str,
+        group: &GroupId,
+        original_client_token: String,
+        content: String,
+        tags: Vec<Vec<String>>,
+        members: Vec<String>,
+        edit_client_token: String,
+    ) -> Result<crate::LocalSendAcceptance, AppError> {
+        self.submit_local_message(
+            account,
+            group,
+            edit_client_token,
+            LocalMessageRequest {
+                content,
+                tags,
+                only_to_members: Some(member_accounts(members)?),
                 ..Default::default()
             },
             None,

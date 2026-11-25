@@ -20,8 +20,13 @@ impl From<marmot_app::LocalSendAcceptance> for LocalSendAcceptanceFfi {
 pub enum LocalSendStatusFfi {
     Queued,
     EngineOwned,
-    Completed { summary: SendSummaryFfi },
+    Completed {
+        summary: SendSummaryFfi,
+    },
     Rejected,
+    /// Not sent: the group gained a member account the send's member list
+    /// leaves out. Final.
+    RefusedNewMembers,
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -347,6 +352,7 @@ fn local_send_status_ffi(status: marmot_app::LocalSendStatus) -> LocalSendStatus
             summary: summary.into(),
         },
         marmot_app::LocalSendStatus::Rejected => LocalSendStatusFfi::Rejected,
+        marmot_app::LocalSendStatus::RefusedNewMembers => LocalSendStatusFfi::RefusedNewMembers,
     }
 }
 
@@ -367,6 +373,10 @@ mod tests {
         assert!(matches!(
             local_send_status_ffi(marmot_app::LocalSendStatus::Rejected),
             LocalSendStatusFfi::Rejected
+        ));
+        assert!(matches!(
+            local_send_status_ffi(marmot_app::LocalSendStatus::RefusedNewMembers),
+            LocalSendStatusFfi::RefusedNewMembers
         ));
         let completed = local_send_status_ffi(marmot_app::LocalSendStatus::Completed(
             marmot_app::SendSummary {

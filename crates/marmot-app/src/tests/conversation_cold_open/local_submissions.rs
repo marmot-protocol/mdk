@@ -57,6 +57,7 @@ async fn retained_submission_preserves_noncanonical_json_bytes_for_engine_handof
                 group_id: h.group.clone(),
                 payload: retained,
                 expected_epoch: None,
+                only_to_members: None,
             },
             created_at_ms: 1,
             reissue_attempts: 0,
@@ -1854,5 +1855,144 @@ async fn agent_events_are_crash_safe_by_token() {
         .collect::<Vec<_>>();
     assert!(actions.contains(&"send_custom_event".into()), "{actions:?}");
     assert!(!actions.contains(&"edit_message".into()), "{actions:?}");
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+async fn local_send_settled(
+    runtime: &MarmotAppRuntime,
+    group: &GroupId,
+    token: &str,
+) -> crate::LocalSendStatus {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match runtime.local_send_status("alice", group, token).unwrap() {
+                Some(crate::LocalSendStatus::Queued | crate::LocalSendStatus::EngineOwned)
+                | None => tokio::time::sleep(Duration::from_millis(10)).await,
+                Some(settled) => break settled,
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+/// A custom event limited to member accounts is sent while every member is
+/// listed, and refused, not sent, while one is not: the engine checks the
+/// list when it encrypts. The refusal settles the token and retracts the
+/// local row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_event_to_members_is_refused_while_a_member_is_unlisted() {
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    let runtime = MarmotAppRuntime::new(h.app.clone());
+    let submit = |members: Vec<String>, token: &str| {
+        runtime.submit_custom_event_to_members(
+            "alice",
+            &h.group,
+            41201,
+            vec![],
+            format!("{{\"token\":\"{token}\"}}"),
+            members,
+            token.into(),
+        )
+    };
+    submit(vec![h.account.clone()], "listed").await.unwrap();
+    assert!(matches!(
+        local_send_settled(&runtime, &h.group, "listed").await,
+        crate::LocalSendStatus::Completed(_)
+    ));
+
+    let refused = submit(vec!["cc".repeat(32)], "unlisted").await.unwrap();
+    assert_eq!(
+        local_send_settled(&runtime, &h.group, "unlisted").await,
+        crate::LocalSendStatus::RefusedNewMembers
+    );
+    let row = h
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .timeline_message(&group_hex, &refused.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.invalidation_status.as_deref(),
+        Some(crate::LOCAL_PUBLISH_FAILED_REASON)
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A send the engine queued and then refused at drain, because the group
+/// gained a member the send leaves out, settles its token from the engine's
+/// announcement and retracts its local row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_send_refused_for_a_new_member_settles_its_token() {
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    let (accepted, _) = h
+        .app
+        .admit_local_message(
+            "alice",
+            &h.group,
+            "queued".into(),
+            LocalMessageRequest {
+                content: "{}".into(),
+                custom_kind: Some(41201),
+                only_to_members: Some(vec![h.account.clone()]),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+    let storage = h.app.account_storage("alice").unwrap();
+    let payload = storage
+        .app_storage()
+        .local_submission(&group_hex, "queued")
+        .unwrap()
+        .unwrap()
+        .payload
+        .unwrap();
+    // The engine takes the send into its queue, as it takes a send that has
+    // to wait for convergence.
+    cgka_traits::storage::OutboundIntentStorage::put_queued_outbound_intent(
+        &storage,
+        &cgka_traits::storage::QueuedOutboundIntent {
+            id: cgka_traits::MessageId::new(vec![7; 32]),
+            group_id: h.group.clone(),
+            intent: cgka_traits::SendIntent::AppMessage {
+                group_id: h.group.clone(),
+                payload,
+                expected_epoch: None,
+                only_to_members: None,
+            },
+            created_at_ms: 0,
+            reissue_attempts: 0,
+        },
+    )
+    .unwrap();
+    let refusal = cgka_traits::engine::GroupEvent::QueuedIntentRefused {
+        group_id: h.group.clone(),
+        intent_id: cgka_traits::MessageId::new(vec![7; 32]),
+        intent_kind: "app_message".into(),
+        reason: "app_message_new_members".into(),
+        artifact: None,
+        size_class: None,
+        app_event_id: Some(accepted.message_id_hex.clone()),
+    };
+    assert!(
+        h.app
+            .projection_update_for_invalidation_event("alice", &refusal)
+            .unwrap()
+            .is_some(),
+        "the local row is retracted"
+    );
+
+    let runtime = MarmotAppRuntime::new(h.app.clone());
+    assert_eq!(
+        runtime
+            .local_send_status("alice", &h.group, "queued")
+            .unwrap(),
+        Some(crate::LocalSendStatus::RefusedNewMembers)
+    );
     runtime.shutdown_and_close().await.unwrap();
 }

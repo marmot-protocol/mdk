@@ -1668,6 +1668,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         payload: Vec<u8>,
+        only_to_members: Option<Vec<MemberId>>,
         context: Option<AuditEventContext>,
     ) -> Result<SendResult, EngineError> {
         self.accept_send_with_audit_context(
@@ -1675,6 +1676,7 @@ impl<S: StorageProvider> Engine<S> {
                 group_id,
                 payload,
                 expected_epoch: None,
+                only_to_members,
             },
             context,
             SendAcceptance::QueueAppMessage,
@@ -5371,7 +5373,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         group_id: GroupId,
         payload: Vec<u8>,
     ) -> Result<SendResult, EngineError> {
-        self.queue_app_message_with_audit_context(group_id, payload, None)
+        self.queue_app_message_with_audit_context(group_id, payload, None, None)
             .await
     }
 

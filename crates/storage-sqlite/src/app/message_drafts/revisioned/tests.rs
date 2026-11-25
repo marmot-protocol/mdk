@@ -99,6 +99,7 @@ fn queued(payload: &[u8]) -> QueuedOutboundIntent {
             group_id,
             payload: payload.to_vec(),
             expected_epoch: None,
+            only_to_members: None,
         },
         created_at_ms: 1,
         reissue_attempts: 0,

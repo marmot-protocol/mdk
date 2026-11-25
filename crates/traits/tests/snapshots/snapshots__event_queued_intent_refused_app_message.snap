@@ -1,0 +1,23 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::QueuedIntentRefused\n{\n    group_id: gid(), intent_id: mid(), intent_kind: \"app_message\".into(),\n    reason: \"app_message_new_members\".into(), artifact: None, size_class:\n    None, app_event_id: Some(\"ab\".repeat(32)),\n}"
+---
+{
+  "QueuedIntentRefused": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "intent_id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "intent_kind": "app_message",
+    "reason": "app_message_new_members",
+    "app_event_id": "abababababababababababababababababababababababababababababababab"
+  }
+}

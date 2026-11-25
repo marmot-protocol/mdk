@@ -6,6 +6,10 @@
 
 - `RosterTagKeyStorage` gains `renew_roster_tag_keys`, which moves the sighting time of a slot's unexpired keys in one
   step and keeps their order (mdk#3679).
+- `SendIntent::AppMessage` gains `only_to_members`: the member accounts the payload may reach. The engine checks the
+  group's member accounts when it encrypts, so a send queued while an Add merged is refused
+  (`EngineError::AppMessageNewMembers`, new) rather than sent to the new member. `None` keeps today's behavior.
+- `GroupEvent::QueuedIntentRefused` gains `app_event_id`, the inner event id of a refused application message.
 - `MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY` and `MARMOT_APP_EVENT_KIND_AGENT_OPERATION` become
   `MARMOT_APP_EVENT_KIND_AGENT_ITEM` and `MARMOT_APP_EVENT_KIND_AGENT_REQUEST`, and the old shape's tag constants
   (`AGENT_ACTIVITY_STATUS_TAG`, `AGENT_OPERATION_*_TAG`) are removed.

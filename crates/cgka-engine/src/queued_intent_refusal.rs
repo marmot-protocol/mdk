@@ -117,6 +117,7 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::NoDataAppComponent { .. }
         | EngineError::AppMessageEpochMismatch { .. }
         | EngineError::AppMessageEpochUnsettled { .. }
+        | EngineError::AppMessageNewMembers
         | EngineError::LinkDeviceUnsettled { .. }
         | EngineError::SiblingAddUnsettled { .. }
         | EngineError::DeviceEntryChanged { .. }
@@ -237,6 +238,14 @@ impl<S: StorageProvider> Engine<S> {
             }) => (Some(*artifact), Some(*size_class)),
             _ => (None, None),
         };
+        let app_event_id = match &record.intent {
+            SendIntent::AppMessage { payload, .. } => {
+                cgka_traits::app_event::MarmotAppEvent::decode(payload)
+                    .ok()
+                    .map(|event| event.id)
+            }
+            _ => None,
+        };
         self.events_buf.push_back(GroupEvent::QueuedIntentRefused {
             group_id: record.group_id.clone(),
             intent_id: record.id.clone(),
@@ -244,6 +253,7 @@ impl<S: StorageProvider> Engine<S> {
             reason: reason.to_string(),
             artifact,
             size_class,
+            app_event_id,
         });
     }
 }

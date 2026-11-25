@@ -9,6 +9,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `MarmotLocalSendStatus::state` gains `4`: refused because the group gained a member account the send leaves out.
 - `MarmotTimelineMessageRecord` gains a nullable `agent_item: MarmotAgentItem *` after `group_system`, and
   `agent_item_first_event_missing: bool` after it: true for an agent item whose first event this device does not
   hold, such as one that began before the member joined.

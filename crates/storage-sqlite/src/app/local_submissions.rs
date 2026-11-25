@@ -119,6 +119,22 @@ impl SqliteAppStorage {
         ).storage()?;
         Ok(())
     }
+
+    /// Record how a send ended when only its message id names it, as a queued
+    /// send the engine refused at drain is named. Returns whether a send that
+    /// had no outcome yet took this one.
+    pub fn finish_local_submission_for_message(
+        &self,
+        group: &str,
+        message: &str,
+        outcome: &str,
+    ) -> StorageResult<bool> {
+        let changed = self.lock()?.execute_cached(
+            "UPDATE local_message_submissions SET payload=NULL, request_json=NULL, outcome_json=?3 WHERE group_id_hex=?1 AND message_id_hex=?2 AND outcome_json IS NULL",
+            params![group, message, outcome],
+        ).storage()?;
+        Ok(changed > 0)
+    }
 }
 
 #[cfg(test)]

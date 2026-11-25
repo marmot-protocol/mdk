@@ -1315,6 +1315,7 @@ async fn welcome_scan_filters_rows() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, "retained application history"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -1884,6 +1885,7 @@ async fn late_founding_welcome_write_failure_restores_state_and_allows_retry() {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&bob, b"routing after late creation failure"),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();
@@ -2174,6 +2176,7 @@ async fn current_solo_group_is_canonical_at_epoch_zero_without_confirmation() {
             group_id,
             payload: app_payload_for(&alice, "usable immediately"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect("canonical solo group accepts work without confirm_published");
@@ -2230,6 +2233,7 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, "must be gated"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -2418,6 +2422,7 @@ async fn own_sends_survive_the_pass_that_settles_their_senders_disband() {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&alice, body),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap()
@@ -2701,6 +2706,7 @@ async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
             group_id: group_id.clone(),
             payload: app_payload_for(&current, "still usable"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect("legacy group remains usable by current-configured engine");
@@ -2865,6 +2871,7 @@ async fn nostr_routing_component_drives_group_message_route() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"hello"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -4408,6 +4415,7 @@ async fn audit_log_records_welcome_recipient_expectation() {
                 group_id: gid.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             },
             None,
         )
@@ -4521,6 +4529,7 @@ async fn audit_log_recipient_expectation_counts_each_account_once() {
                 group_id: gid.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             },
             None,
         )
@@ -5284,6 +5293,7 @@ async fn failed_legacy_founding_preserves_an_existing_live_route() {
             group_id: existing_group.clone(),
             payload: app_payload_for(&bob, b"live route after failed creation"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -5319,6 +5329,7 @@ async fn failed_legacy_founding_preserves_an_existing_live_route() {
             group_id: existing_group,
             payload: app_payload_for(&bob, b"live route after encrypted reopen"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();

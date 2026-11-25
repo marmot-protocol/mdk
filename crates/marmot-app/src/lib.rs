@@ -7918,6 +7918,8 @@ impl MarmotApp {
     ///   pairs this event with the commit-rollback seam (`CommitRolledBack`),
     ///   so that commit-level event intentionally does NOT dispatch here: one
     ///   rollback must tombstone once, with one reason.
+    /// - [`GroupEvent::QueuedIntentRefused`] for a token send that the group
+    ///   gained a member it leaves out settles the token and retracts its row.
     /// - [`GroupEvent::GroupStateRevalidated`] takes that withdrawal back when
     ///   a later convergence pass re-adopts the commit. Storage-side
     ///   invalidation is terminal by default (#1608), so this explicitly
@@ -7954,6 +7956,20 @@ impl MarmotApp {
                 label,
                 &hex::encode(revalidated_commit_id.as_slice()),
             ),
+            cgka_traits::engine::GroupEvent::QueuedIntentRefused {
+                group_id,
+                reason,
+                app_event_id: Some(app_event_id),
+                ..
+            } if reason
+                == cgka_traits::error::EngineError::AppMessageNewMembers.privacy_safe_kind() =>
+            {
+                self.refuse_queued_local_send_for_new_members(
+                    label,
+                    &hex::encode(group_id.as_slice()),
+                    app_event_id,
+                )
+            }
             _ => Ok(None),
         }
     }

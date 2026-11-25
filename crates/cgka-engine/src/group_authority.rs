@@ -261,6 +261,7 @@ mod tests {
                 group_id: group.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();

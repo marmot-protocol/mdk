@@ -19145,6 +19145,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
             group_id: group_id.clone(),
             payload: fresh_payload.clone(),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -19239,6 +19240,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
                 group_id: group_id.clone(),
                 payload: historical_payload.clone(),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();
@@ -19266,6 +19268,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
                 group_id: group_id.clone(),
                 payload: fresh_payload.clone(),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();
@@ -19365,6 +19368,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
             group_id: group_id.clone(),
             payload: fresh_payload.clone(),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -19479,6 +19483,7 @@ async fn recreate_after_local_delete(
             group_id: group_id.clone(),
             payload: fresh_payload.clone(),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -19652,6 +19657,7 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
             group_id: group_id.clone(),
             payload: fresh_payload.clone(),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -20965,6 +20971,7 @@ async fn discarding_a_failed_send_waits_for_the_groups_sends_then_drops_it() {
                 group_id: group_id.clone(),
                 payload: b"held".to_vec(),
                 expected_epoch: None,
+                only_to_members: None,
             },
             created_at_ms: 1,
             reissue_attempts: 0,
@@ -24024,6 +24031,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
                 group_id: group_id.clone(),
                 payload: event.encode().unwrap(),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();

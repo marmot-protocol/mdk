@@ -200,6 +200,7 @@ async fn a_commit_one_relay_refuses_for_size_confirms_on_the_other() {
             group_id: fixture.group_id.clone(),
             payload: app_payload_for(&alice_hex, b"not a commit"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();

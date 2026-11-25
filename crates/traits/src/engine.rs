@@ -192,6 +192,16 @@ pub enum SendIntent {
         /// number. Nothing is persisted or published in either case.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_epoch: Option<EpochPin>,
+        /// The member accounts this payload may reach. `Some` makes the
+        /// engine encrypt it only into an epoch whose every member account is
+        /// listed; one that lists another account refuses it with
+        /// [`EngineError::AppMessageNewMembers`], checked at encryption, so a
+        /// send retained while an Add merged is refused rather than shown to
+        /// the new member. Account, not device: the listed accounts' new
+        /// devices still receive it. `None` (the default) sends to whoever
+        /// the group holds when it is encrypted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        only_to_members: Option<Vec<MemberId>>,
     },
     /// Invite new members via their KeyPackages.
     ///
@@ -865,6 +875,10 @@ pub enum GroupEvent {
         /// other reason.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size_class: Option<crate::EventSizeClass>,
+        /// For an application message, the id of its inner app event, which
+        /// names the message to its sender. `None` for every other intent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_event_id: Option<String>,
     },
     /// A change the host asked for directly was not applied (mdk#2332): the
     /// call that staged its commit returned with the commit unresolved, and a

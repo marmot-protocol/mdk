@@ -58,6 +58,7 @@ async fn kill_between_a_disbands_apply_and_its_settle_keeps_the_disbands_roster(
         let SendResult::ApplicationMessage { msg: late, .. } = alice
             .send(SendIntent::AppMessage {
                 expected_epoch: None,
+                only_to_members: None,
                 group_id: group.clone(),
                 payload,
             })

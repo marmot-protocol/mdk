@@ -407,6 +407,7 @@ async fn session_facade_promotes_one_bounded_legacy_row_without_semantic_change(
             group_id,
             payload: post_promotion_payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect("promotion preserves public session behavior");
@@ -464,6 +465,7 @@ async fn current_founding_creation_is_immediately_stable_and_survives_restart() 
             group_id: created.group_id.clone(),
             payload: app_payload_for(&bob, b"invitee first message"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -558,6 +560,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&alice, b"hello through session"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -662,6 +665,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&alice, b"hello after restart"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -892,6 +896,7 @@ async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&bob, b"still leaving"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -985,6 +990,7 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
             group_id: created.group_id.clone(),
             payload: queued_payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -1172,6 +1178,7 @@ async fn session_advance_convergence_announces_a_refused_queued_intent() {
                 reason,
                 artifact: None,
                 size_class: None,
+                app_event_id: None,
             } => Some((group_id, intent_id, intent_kind.as_str(), reason.as_str())),
             _ => None,
         })
@@ -2002,6 +2009,7 @@ async fn configured_recorder_preserves_delivery_source_and_open_health() {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&alice, b"audited message"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();

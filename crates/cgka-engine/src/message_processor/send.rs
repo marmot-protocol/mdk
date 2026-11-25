@@ -125,8 +125,9 @@ impl<S: StorageProvider> Engine<S> {
                 group_id,
                 payload,
                 expected_epoch,
+                only_to_members,
             } => {
-                self.do_send_app_message(group_id, payload, expected_epoch)
+                self.do_send_app_message(group_id, payload, expected_epoch, only_to_members)
                     .await
             }
             SendIntent::Invite {
@@ -1434,6 +1435,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         payload: Vec<u8>,
         expected_epoch: Option<EpochPin>,
+        only_to_members: Option<Vec<MemberId>>,
     ) -> Result<SendResult, EngineError> {
         // Direct sending still requires Stable after convergence gating.
         if let Some(state) = self.epoch_manager.state(&group_id)
@@ -1469,6 +1471,16 @@ impl<S: StorageProvider> Engine<S> {
                 expected: expected.epoch,
                 current: source_epoch,
             });
+        }
+        // Checked on the epoch it is about to be encrypted under, so a send
+        // retained while an Add merged reaches no member it was not for.
+        if let Some(allowed) = &only_to_members
+            && crate::app_components::member_account_pubkeys(&mls_group)
+                .iter()
+                .any(|member| !allowed.iter().any(|allowed| allowed.as_slice() == member))
+        {
+            self.return_unmodified_mls_group(&group_id, mls_group);
+            return Err(EngineError::AppMessageNewMembers);
         }
         // Queued preparation bypasses the public send gate. Never encrypt
         // under an installed checkpoint's possibly reused sender generation,

@@ -814,6 +814,7 @@ async fn demoted_disband_request_fails_durably_and_is_acknowledged_once() {
             group_id: gid.clone(),
             payload: app_payload_for(&alice, "still a member"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap()
@@ -860,7 +861,8 @@ async fn disband_request_preserves_a_held_publish_and_retires_queued_plaintext()
                 .send(SendIntent::AppMessage {
                     group_id: gid.clone(),
                     payload: app_payload_for(&alice, "retire me"),
-                    expected_epoch: None
+                    expected_epoch: None,
+                    only_to_members: None
                 })
                 .await
                 .unwrap(),
@@ -909,7 +911,7 @@ async fn disband_request_preserves_a_held_publish_and_retires_queued_plaintext()
         assert!(alice.advance_convergence(&gid).await.unwrap().is_empty());
         assert!(storage.list_disband_candidates(&gid).unwrap().is_empty());
         assert!(
-            matches!(alice.send(SendIntent::AppMessage { group_id: gid.clone(), payload: app_payload_for(&alice, "gated"), expected_epoch: None }).await, Err(EngineError::InvalidTransition(ref transition)) if transition.from == "Disbanding")
+            matches!(alice.send(SendIntent::AppMessage { group_id: gid.clone(), payload: app_payload_for(&alice, "gated"), expected_epoch: None, only_to_members: None }).await, Err(EngineError::InvalidTransition(ref transition)) if transition.from == "Disbanding")
         );
         if confirm {
             alice.confirm_published(pending).await.unwrap();
@@ -3457,6 +3459,7 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
                 group_id: group_id.clone(),
                 payload: app_payload_for(&bob, "retained across confirmation"),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap()
@@ -3483,6 +3486,7 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
                         payload
                     },
                     expected_epoch: None,
+                    only_to_members: None,
                 })
                 .await
                 .unwrap()
@@ -3876,6 +3880,7 @@ async fn rejoin_retries_failed_replay() {
                 group_id: group_id.clone(),
                 payload: payload.clone(),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap()
@@ -4038,6 +4043,7 @@ async fn epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publis
             group_id: group_id.clone(),
             payload,
             expected_epoch: Some(pin),
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -4072,6 +4078,7 @@ async fn epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publis
             group_id: group_id.clone(),
             payload,
             expected_epoch: Some(settled),
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -4125,6 +4132,7 @@ async fn epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_comm
             group_id: group_id.clone(),
             payload,
             expected_epoch: Some(pin),
+            only_to_members: None,
         })
         .await;
     let folded_epoch = bob.epoch(&group_id).unwrap();
@@ -4150,6 +4158,7 @@ async fn epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_comm
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -4245,6 +4254,7 @@ async fn epoch_pinned_app_message_is_refused_when_the_send_selects_a_rival_at_th
             group_id: group_id.clone(),
             payload,
             expected_epoch: Some(pin),
+            only_to_members: None,
         })
         .await;
     let selected = loser.epoch_pin(&group_id).unwrap();
@@ -4271,6 +4281,7 @@ async fn epoch_pinned_app_message_is_refused_when_the_send_selects_a_rival_at_th
             group_id: group_id.clone(),
             payload,
             expected_epoch: Some(selected),
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -4318,6 +4329,7 @@ async fn retained_app_message_encrypts_under_the_drain_time_epoch() {
                 group_id: group_id.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap(),
@@ -4420,6 +4432,7 @@ async fn resolving_a_publish_schedules_the_drain_for_retained_app_messages() {
                     group_id: group_id.clone(),
                     payload,
                     expected_epoch: None,
+                    only_to_members: None,
                 })
                 .await
                 .unwrap(),
@@ -4493,6 +4506,7 @@ async fn an_unreadable_intent_queue_still_schedules_the_drain() {
                     group_id: group_id.clone(),
                     payload,
                     expected_epoch: None,
+                    only_to_members: None,
                 })
                 .await
                 .unwrap(),
@@ -4573,6 +4587,7 @@ async fn an_unreadable_intent_queue_at_pass_close_still_rearms_and_drains() {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, "retained across a locked pass-close read"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -4647,6 +4662,7 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
                 group_id: group_id.clone(),
                 payload,
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap_or_else(|error| panic!("send {i} below the cap must be retained: {error:?}"));
@@ -4688,6 +4704,7 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
             group_id: other_group.clone(),
             payload: app_payload_for(&alice, "independent retained event"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -4718,6 +4735,7 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect_err("a send past the retention cap must be refused, not silently retained");
@@ -4794,6 +4812,7 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
             group_id: group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect("a recovered group must accept sends again");
@@ -4830,6 +4849,7 @@ async fn a_queued_message_is_in_flight_while_its_drain_or_stored_fanout_holds_it
                 group_id: group_id.clone(),
                 payload: app_payload_for(&alice, body),
                 expected_epoch: None,
+                only_to_members: None,
             })
             .await
             .unwrap();

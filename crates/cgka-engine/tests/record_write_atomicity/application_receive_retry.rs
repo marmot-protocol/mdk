@@ -103,6 +103,7 @@ async fn application(
             group_id: group_id.clone(),
             payload: payload.clone(),
             expected_epoch: Some(sender.epoch_pin(group_id).unwrap()),
+            only_to_members: None,
         })
         .await
         .unwrap();
@@ -533,6 +534,7 @@ async fn sent_message_audit_waits_for_both_durable_rows() {
             group_id: group.clone(),
             payload,
             expected_epoch: Some(alice.epoch_pin(&group).unwrap()),
+            only_to_members: None,
         })
         .await;
     assert!(
@@ -603,6 +605,7 @@ async fn sent_message_audit_waits_for_both_durable_rows() {
                     group_id: group.clone(),
                     payload,
                     expected_epoch: Some(alice.epoch_pin(&group).unwrap()),
+                    only_to_members: None,
                 },
                 Some(marmot_forensics::AuditEventContext {
                     human_action: Some(marmot_forensics::AuditHumanActionContext {

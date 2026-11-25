@@ -462,6 +462,7 @@ async fn a_failing_convergence_pass_backs_off_then_parks_after_its_budget() {
                     group_id: case.group_id.clone(),
                     payload,
                     expected_epoch: None,
+                    only_to_members: None,
                 })
                 .await
                 .expect("a send during backoff queues");
@@ -903,6 +904,7 @@ async fn structural_progress_waits_out_a_failed_pass_and_idles_a_parked_one() {
             group_id: case.group_id.clone(),
             payload,
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .expect("a send during backoff queues");

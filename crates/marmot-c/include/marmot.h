@@ -3985,7 +3985,8 @@ typedef struct MarmotLocalSendAcceptance {
 } MarmotLocalSendAcceptance;
 
 /**
- * Local submission status: 0 queued, 1 engine-owned, 2 completed, 3 rejected.
+ * Local submission status: 0 queued, 1 engine-owned, 2 completed, 3 rejected,
+ * 4 refused because the group gained a member account the send leaves out.
  * Summary is present only for completed attempts; inspect its disposition.
  */
 typedef struct MarmotLocalSendStatus {

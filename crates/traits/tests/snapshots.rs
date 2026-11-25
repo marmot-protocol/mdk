@@ -641,6 +641,7 @@ fn snapshot_send_intents() {
             group_id: gid(),
             payload: b"hello".to_vec(),
             expected_epoch: None,
+            only_to_members: None,
         }
     );
     insta::assert_json_snapshot!(
@@ -652,6 +653,16 @@ fn snapshot_send_intents() {
                 epoch: EpochId(7),
                 identity: [0xAB; 32],
             }),
+            only_to_members: None,
+        }
+    );
+    insta::assert_json_snapshot!(
+        "intent_app_message_only_to_members",
+        SendIntent::AppMessage {
+            group_id: gid(),
+            payload: b"hello".to_vec(),
+            expected_epoch: None,
+            only_to_members: Some(vec![MemberId::new(vec![0xCD; 32])]),
         }
     );
     insta::assert_json_snapshot!(
@@ -784,6 +795,19 @@ fn snapshot_group_events() {
             reason: "not_group_admin".into(),
             artifact: None,
             size_class: None,
+            app_event_id: None,
+        }
+    );
+    insta::assert_json_snapshot!(
+        "event_queued_intent_refused_app_message",
+        GroupEvent::QueuedIntentRefused {
+            group_id: gid(),
+            intent_id: mid(),
+            intent_kind: "app_message".into(),
+            reason: "app_message_new_members".into(),
+            artifact: None,
+            size_class: None,
+            app_event_id: Some("ab".repeat(32)),
         }
     );
     insta::assert_json_snapshot!(
@@ -795,6 +819,7 @@ fn snapshot_group_events() {
             reason: "event_too_large".into(),
             artifact: Some(cgka_traits::OversizedArtifact::Welcome),
             size_class: Some(cgka_traits::EventSizeClass::From64To128Kib),
+            app_event_id: None,
         }
     );
     insta::assert_json_snapshot!(

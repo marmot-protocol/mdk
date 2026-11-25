@@ -25,7 +25,8 @@ struct StatusFields {
     summary: Option<marmot_uniffi::conversions::SendSummaryFfi>,
 }
 c_mirror! {
-    /// Local submission status: 0 queued, 1 engine-owned, 2 completed, 3 rejected.
+    /// Local submission status: 0 queued, 1 engine-owned, 2 completed, 3 rejected,
+    /// 4 refused because the group gained a member account the send leaves out.
     /// Summary is present only for completed attempts; inspect its disposition.
     MarmotLocalSendStatus from StatusFields,
     free marmot_local_send_status_free {
@@ -40,6 +41,7 @@ impl From<LocalSendStatusFfi> for MarmotLocalSendStatus {
             LocalSendStatusFfi::EngineOwned => (1, None),
             LocalSendStatusFfi::Completed { summary } => (2, Some(summary)),
             LocalSendStatusFfi::Rejected => (3, None),
+            LocalSendStatusFfi::RefusedNewMembers => (4, None),
         };
         StatusFields { state, summary }.into()
     }
@@ -88,6 +90,7 @@ mod tests {
                 maintenance_disposition: marmot_uniffi::conversions::SendMaintenanceDispositionFfi::PostJoinRotationPendingRetryable,
             } },
             LocalSendStatusFfi::Rejected,
+            LocalSendStatusFfi::RefusedNewMembers,
         ].into_iter().enumerate() {
             let mut mirror = MarmotLocalSendStatus::from(status);
             assert_eq!(mirror.state, expected as u32);

@@ -51,6 +51,7 @@ async fn an_own_echo_from_a_target_relay_confirms_a_pending_commit() {
             group_id: fixture.group_id.clone(),
             payload: app_payload_for(&alice_hex, b"before the rename"),
             expected_epoch: None,
+            only_to_members: None,
         })
         .await
         .unwrap();

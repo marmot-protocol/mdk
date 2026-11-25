@@ -29,6 +29,7 @@ async fn queued_messages(app: &MarmotApp) -> (AppClient, cgka_traits::GroupId, V
             .queue_app_message_with_audit_context(
                 group.clone(),
                 event.encode().unwrap(),
+                None,
                 Default::default(),
             )
             .await

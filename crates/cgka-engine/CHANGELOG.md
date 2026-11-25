@@ -5,11 +5,15 @@
 ### Breaking changes
 
 - `Engine::own_account_leaves_tagged_by` returns each leaf's signature key with the slot its tag read as.
+- `Engine::queue_app_message_with_audit_context` takes the intent's `only_to_members`.
 
 ### Added
 
 - `Engine::own_account_self_signed_tags` reads, for this account's other leaves, a device tag that verifies under
   that leaf's own signature key, with the slot it names (mdk#3679).
+- An application message sent with `only_to_members` is encrypted only into an epoch whose member accounts it all
+  lists, checked at encryption for direct sends and queued ones alike; otherwise it fails with
+  `AppMessageNewMembers`, or, queued, is retired and announced as `QueuedIntentRefused` with its `app_event_id`.
 - `Engine::deferred_stall_evidence_since` returns deferred stall evidence for rows whose arrival epoch falls in
   `min_epoch..=group.epoch`, for active epoch-gap handoffs across partial advances.
 - `Engine::stored_outbound_welcome_status`, an outbound Welcome's status read from its stored rows without the

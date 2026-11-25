@@ -2,7 +2,7 @@
 //! and publication remain with the account worker; admission performs no I/O to relays.
 mod outcome;
 pub(crate) use outcome::decode_local_outcome;
-use outcome::encode_local_outcome;
+use outcome::{encode_local_outcome, encode_refused_new_members};
 
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::storage::{GroupStorage, StorageProvider};
@@ -70,6 +70,10 @@ pub enum LocalSendStatus {
     EngineOwned,
     Completed(crate::SendSummary),
     Rejected,
+    /// Not sent: the group gained a member account the send's member list
+    /// (`submit_custom_event_to_members`) leaves out. Final; nothing reached
+    /// the group.
+    RefusedNewMembers,
 }
 
 /// Decode for validation/projection, but preserve the bytes that bind engine
@@ -112,6 +116,10 @@ pub(crate) struct LocalMessageRequest {
     pub custom_kind: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typed: Option<LocalTypedSend>,
+    /// The member accounts (lowercase hex) the send may reach, enforced by
+    /// the engine when it encrypts (`SendIntent::AppMessage::only_to_members`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only_to_members: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -143,6 +151,26 @@ impl LocalMessageRequest {
         })
         .map_err(|_| AppError::InvalidAppMessagePayload("invalid local submission request".into()))
     }
+    pub(crate) fn only_to_members(&self) -> Result<Option<Vec<cgka_traits::MemberId>>, AppError> {
+        self.only_to_members
+            .as_ref()
+            .map(|members| {
+                members
+                    .iter()
+                    .map(|member| {
+                        hex::decode(member)
+                            .map(cgka_traits::MemberId::new)
+                            .map_err(|_| {
+                                AppError::InvalidAppMessagePayload(
+                                    "invalid local submission member".into(),
+                                )
+                            })
+                    })
+                    .collect()
+            })
+            .transpose()
+    }
+
     pub(crate) fn intent(&self) -> AppMessageIntent {
         if let Some(typed) = &self.typed {
             match typed {
@@ -219,7 +247,18 @@ impl MarmotApp {
         result: &Result<crate::SendSummary, AppError>,
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let storage = self.account_storage(label)?;
-        let outcome = result.as_ref().ok().map(encode_local_outcome).transpose()?;
+        let outcome = match result {
+            Ok(summary) => Some(encode_local_outcome(summary)?),
+            Err(error)
+                if matches!(
+                    error.as_engine_error(),
+                    Some(cgka_traits::error::EngineError::AppMessageNewMembers)
+                ) =>
+            {
+                Some(encode_refused_new_members())
+            }
+            Err(_) => None,
+        };
         StorageProvider::with_transaction(&storage, |storage| {
             let Some(current) = storage
                 .app_storage()
@@ -243,6 +282,33 @@ impl MarmotApp {
                 outcome.as_deref(),
             )?;
             Ok(update)
+        })
+    }
+
+    /// A token send the engine queued and then refused at drain because the
+    /// group gained a member it leaves out: settle its token and retract its
+    /// local row, as [`Self::finish_local_message`] does for a direct refusal.
+    pub(crate) fn refuse_queued_local_send_for_new_members(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let storage = self.account_storage(label)?;
+        StorageProvider::with_transaction(&storage, |storage| {
+            if !storage.app_storage().finish_local_submission_for_message(
+                group_id_hex,
+                message_id_hex,
+                &encode_refused_new_members(),
+            )? {
+                return Ok(None);
+            }
+            self.invalidate_timeline_app_event(
+                label,
+                group_id_hex,
+                message_id_hex,
+                crate::LOCAL_PUBLISH_FAILED_REASON,
+            )
         })
     }
 
