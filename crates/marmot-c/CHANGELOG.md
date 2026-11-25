@@ -27,6 +27,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - `marmot_submit_tagged_text`, `marmot_submit_tagged_reply`, `marmot_submit_thread_message`, and
   `marmot_submit_tagged_sticker` return durable local acceptance before relay publication.
 
+### Fixed
+
+- `marmot_invite_deliveries` now reports `MARMOT_INVITE_DELIVERY_STATE_KIND_UNDELIVERABLE` for an invite's Welcome
+  that no relay stored by its delivery deadline, 7 days after the invite or its KeyPackage's expiry if sooner
+  (mdk#3589); that Welcome is never sent again and leaves `marmot_pending_welcome_deliveries`.
+
 ## [0.19.0] - 2026-11-22
 
 ### Breaking changes

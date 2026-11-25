@@ -92,8 +92,10 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     remaining pass of the relays still answering when the pass was done (see `runtime/welcome_delivery.rs`).
   - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
-    one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this
-    runtime's wall clock (mdk#2628 D40). A batch checks that deadline again before it starts each relay attempt, so a
+    one waits for its commit, and no Welcome goes out from its `deliver_until` on, by this runtime's wall clock: a
+    device link's (mdk#2628 D40), or an invite's or founding create's, the engine's window from its staging
+    (mdk#3589). A Welcome past its deadline is not owed: the startup pass, `outstanding_welcome_deliveries` and the
+    pending list (`welcome_delivery_index`) leave it out. A batch checks that deadline again before it starts each relay attempt, so a
     detached wave prepared earlier does not send it late. An expired Welcome is never sent again, but it may still close
     as delivered: a detached pass started before the deadline may be acknowledged, and a saved relay acceptance that
     meets its policy is marked (`expired_welcome_may_still_close`, `welcome_still_owes_met_policy`). Its watch records
@@ -101,7 +103,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     maintenance pass) finds staged or owed; a group skipped because it was not live is read again on each pass until it
     is. A Welcome stays watched until its row is settled. Maintenance publishes each watched Welcome that is owed and
     that no attempt record (stored fanout or detached wave) holds, so one whose fanout expired goes out again on the
-    next pass, as the startup pass would send it. One whose publish found no route waits for its recipient's paced
+    next pass, as the startup pass would send it. The startup pass keeps each relay's backoff: it asks again only a
+    relay never asked or one whose backoff has passed; only `redeliver_welcome` skips it. One whose publish found no route waits for its recipient's paced
     retry (`runtime/welcome_routes.rs`).
     Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
     fanout included. A host that names Welcomes by id (the app's invite drive) publishes them through

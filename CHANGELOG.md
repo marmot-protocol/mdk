@@ -19,6 +19,13 @@
 
 ### Fixed
 
+- An invite's or new chat's Welcome that no inbox relay stores is no longer retried for weeks (mdk#3589). It has a
+  delivery deadline, 7 days after it was made or its KeyPackage's expiry if sooner; after that nothing sends it, not
+  the startup retry, maintenance or `redeliver_welcome`, it leaves `pending_welcome_deliveries`, and
+  `invite_deliveries` reads it `Undeliverable` with what its latest attempt found. When the deadline passes while the app runs, the v5
+  audit records the end as `welcome_withdrawn` with reason `expired`. A Welcome owed from before this upgrade is held to 7 days from its gift
+  wrap's timestamp, so the oldest end on the first start. The startup retry no longer skips relay backoff: it asks
+  only relays never asked and those whose backoff has passed. The invitee stays a member.
 - Cancelling a Swift task now cancels the throwing MarmotKit call it awaits, commands and subscription receives
   alike, and releases the native references that call holds without `shutdownAndClose()` (mdk#3670). Calls whose
   work must finish, such as `shutdownAndClose()`, `removeAccount()`, `signOut()`, `signOutAndWipe()` and the `login*`

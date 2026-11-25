@@ -4532,8 +4532,9 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Where the retained outbound Welcome `id` stands for delivery at `now`.
     /// A missing row is settled: there is nothing this engine owes under it.
-    /// So is one whose delivery deadline is not after `now`: it is never
-    /// published again (mdk#2628 D40). A Welcome whose commit lost reads as
+    /// So is one whose delivery deadline ([`Self::sent_welcome_deliver_until`])
+    /// is not after `now`: it is never published again (mdk#2628 D40,
+    /// mdk#3589). A Welcome whose commit lost reads as
     /// superseded, before and after convergence retires its row, and ahead
     /// of its deadline.
     pub fn outbound_welcome_status(

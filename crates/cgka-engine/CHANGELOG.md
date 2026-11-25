@@ -20,6 +20,10 @@
 - `SendIntent::UnlinkDevice` may keep the removed leaf's signature key in the slot's `removed` record once that leaf
   has committed since its Add, and refuses any `removed` record while the removed leaf is still its link's KeyPackage
   leaf (mdk#3679). Receivers are unchanged.
+- An invite's and a founding create's Welcome record `deliver_until`: `WELCOME_DELIVERY_WINDOW_SECS` (7 days) after
+  staging, or the KeyPackage's `not_after` if sooner, and `outbound_welcome_status` reports them
+  `Settled(Expired)` from then on (mdk#3589). A device link's deadline is unchanged. `sent_welcome_deliver_until` and
+  the status hold a Welcome stored without a deadline to its transport timestamp plus the window.
 - Budget-expired deferred-peel evictions delete the deferred row from `cgka_messages` directly instead of calling
   `release_message_for_replay`, so storage hosts are no longer notified via the release journal for budget-expired
   rows, avoiding false epoch-gap arms, `seen_events` retirement, and relay bounce-backs.

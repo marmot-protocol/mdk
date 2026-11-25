@@ -265,7 +265,8 @@ pub enum SendIntent {
     /// `key_package`'s `KeyPackageRef`. The group must require the roster.
     /// The added device gets its Welcome as an [`Self::Invite`]'s devices do,
     /// except that it is never published from `deliver_until` on, in Unix
-    /// seconds: the end of the new device's wait for it (D40).
+    /// seconds: the end of the new device's wait for it (D40), instead of
+    /// an invite's own delivery deadline.
     LinkDevice {
         group_id: GroupId,
         key_package: KeyPackage,

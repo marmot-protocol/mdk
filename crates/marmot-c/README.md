@@ -507,7 +507,7 @@ rebuild against the matching header and library. Each list owns its strings; do 
 
 Use `marmot_invite_deliveries` for the [shared invite delivery contract](../marmot-uniffi/README.md#invite-delivery);
 pass NULL `group_id_hex` for every group. Only invites sent after the device upgraded are listed; an older Welcome
-stays visible through `marmot_pending_welcome_deliveries`. It returns an owned `MarmotInviteDeliveryList`; release the whole result
+stays visible through `marmot_pending_welcome_deliveries` until its delivery deadline. It returns an owned `MarmotInviteDeliveryList`; release the whole result
 with `marmot_invite_delivery_list_free`. `MARMOT_EVENT_INVITE_DELIVERY_CHANGED` embeds the same
 `MarmotInviteDelivery`, released with the event. `MarmotInviteDeliveryState` is flattened: read `problem` only when
 `has_problem` is true (`Sending`'s latest problem, or `Undeliverable`'s cause), and `cancel_reason` only when `kind`
