@@ -1089,6 +1089,7 @@ async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     let set_back_audit = dir.path().join("set-back-audit-v5.jsonl");
     let mut set_back = start(300_000, &set_back_audit);
     set_back.run_due_maintenance().await.unwrap();
+    assert_eq!(welcome_publishes(&adapter).len(), tried);
     let redelivered = set_back.redeliver_welcome(&welcome.id).await.unwrap();
     assert!(redelivered.welcome_failures.is_empty());
     assert_eq!(welcome_publishes(&adapter).len(), tried);

@@ -1,12 +1,14 @@
 //! Outbound Welcome delivery (mdk#2628 item 3.5a).
 //!
 //! The engine's Welcome row is the obligation: staged with its commit, owed
-//! once the commit confirms (or at a founding create), delivered, or
-//! withdrawn. Every publish reads that row first (`welcome_hold`), so a
-//! withdrawn Welcome never goes out again, a staged one waits for its
-//! commit, and no Welcome goes out once its delivery deadline passes
+//! once the commit confirms (or at a founding create), delivered, withdrawn,
+//! or marked expired. Every publish reads that row first (`welcome_hold`), so
+//! a withdrawn or expired Welcome never goes out again, a staged one waits
+//! for its commit, and no Welcome goes out once its delivery deadline passes
 //! (a device link's at the end of the new device's wait, any other seven
-//! days after it was staged, mdk#3589). Per-endpoint
+//! days after it was staged, mdk#3589). The watcher marks a Welcome past its
+//! deadline expired once nothing it has received can still deliver it, and
+//! records that once (`expire_welcome`). Per-endpoint
 //! attempts and backoff live on the Welcome's `DurableTransportFanout`,
 //! which maintenance retries; only `redeliver_welcome` skips that backoff.
 

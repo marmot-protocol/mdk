@@ -1449,14 +1449,16 @@ MDK never removes an invitee because of this state: an invitee whose Welcome is 
 member. An invite drops out once all its devices' Welcomes have settled and 30 days have passed since its last
 activity; an account's newest invite is chosen first, so an older one never shows in its place.
 
-Each Welcome has a delivery deadline: 7 days after the invite was sent, or sooner when the invited device's KeyPackage
-expires first. A Welcome no relay stored by then is never sent again, at startup, by maintenance or by
-`redeliver_welcome`, and reads `Undeliverable { cause }`, announced by `InviteDeliveryChanged`; it leaves
+Each Welcome has a delivery deadline: 7 days after it was staged with the invite (before the invite's commit is
+published), or sooner when the invited device's KeyPackage expires first. A Welcome no relay acknowledged by then is
+never sent again, at startup, by maintenance or by `redeliver_welcome`, and reads `Undeliverable { cause }`, announced
+once by `InviteDeliveryChanged`; it leaves
 `pending_welcome_deliveries`. `cause` is what its latest attempt found, in the same terms as `last_problem`
 (`RelaysUnreachable` when no attempt finished): `RefusedByRelays` there means every relay that attempt tried said no,
 possibly only for now, not that the refusal was permanent. A relay that stores it before the deadline still makes it
-`RelayAccepted`, and so does an attempt started before the deadline and acknowledged after it. A Welcome that ends
-while the app is closed is not announced: the host reads it from the query on its next start. The `TooLarge` and
+`RelayAccepted`, and so does an attempt started before the deadline and acknowledged after it. MDK records the end
+durably the first time it sees the deadline passed, so a device clock set back afterwards does not reopen it. A Welcome
+whose deadline passes while the app is closed is announced on the next start. The `TooLarge` and
 `KeyPackageRetired` problems are not produced yet. At startup MDK asks again only the relays it never asked and those
 whose retry backoff (30 seconds, doubling to an hour) has passed. The account
 database adds one table (schema 0225); older native builds cannot reopen it. There is no wire change.
