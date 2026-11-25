@@ -784,6 +784,10 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// retry of it, could not read: each later pass reads them again.
     welcome_expiries_read: bool,
     unread_expiry_groups: Vec<GroupId>,
+    /// Welcomes a withdrawal or a redelivery marked expired whose record
+    /// could not be written then; the next pass watches them, so the record
+    /// is retried before the next start.
+    expiries_to_record: std::sync::Mutex<Vec<cgka_traits::MessageId>>,
     /// The `(group, recipient)` pairs whose Welcome delivery state changed
     /// and that no host has taken yet (`take_welcome_delivery_changes`).
     welcome_delivery_changes: std::sync::Mutex<Vec<(GroupId, MemberId)>>,
@@ -872,6 +876,7 @@ where
             v5_expired_welcomes: std::sync::Mutex::new(HashSet::new()),
             welcome_expiries_read: false,
             unread_expiry_groups: Vec::new(),
+            expiries_to_record: std::sync::Mutex::new(Vec::new()),
             welcome_delivery_changes: std::sync::Mutex::new(Vec::new()),
             welcome_route_retries: std::sync::Mutex::default(),
             welcome_store_read: false,

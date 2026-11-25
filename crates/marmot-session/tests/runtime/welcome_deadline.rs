@@ -821,6 +821,10 @@ async fn an_unrecorded_expiry_in_a_group_that_reads_again_is_recorded_then() {
     );
     restarted.run_due_maintenance().await.unwrap();
     assert!(expired_rows(&audit).is_empty(), "its group cannot be read");
+    assert!(
+        restarted.maintenance_due(&[]).unwrap().retry_while_owed,
+        "the unread group keeps maintenance owed"
+    );
 
     owed_invite_database(dir.path())
         .execute("DELETE FROM cgka_messages WHERE id = ?1", [unreadable])

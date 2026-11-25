@@ -430,7 +430,7 @@ where
                 if !self.expired_welcome_may_still_close(message_id)
                     && self.session.expire_sent_welcome(message_id, now)?.is_some()
                 {
-                    self.record_welcome_expiry(message_id);
+                    self.record_welcome_expiry_or_retry(message_id);
                 }
                 return Ok(output);
             }
@@ -522,7 +522,7 @@ where
             && !may_deliver
             && self.session.expire_sent_welcome(message_id, now)?.is_some()
         {
-            self.record_welcome_expiry(message_id);
+            self.record_welcome_expiry_or_retry(message_id);
             if !self.session.detached_welcome_publishes.contains(message_id) {
                 self.session.delete_transport_fanout(message_id)?;
             }
@@ -749,12 +749,44 @@ where
         }
     }
 
+    /// [`Self::record_welcome_expiry`] for a Welcome this call just marked,
+    /// leaving it for the next pass to record if that cannot be done now.
+    fn record_welcome_expiry_or_retry(&self, message_id: &cgka_traits::MessageId) {
+        if !self.record_welcome_expiry(message_id) {
+            self.expiries_to_record
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(message_id.clone());
+        }
+    }
+
+    /// Whether the search for unrecorded Welcome expiries still has work: it
+    /// ran and could not read the group list, a group could not be read, or
+    /// a mark is left to record. A search not yet run is not owed: the
+    /// startup pass or the first maintenance pass runs it.
+    pub(super) fn welcome_expiries_unfinished(&self) -> bool {
+        (self.welcome_store_read && !self.welcome_expiries_read)
+            || !self.unread_expiry_groups.is_empty()
+            || !self
+                .expiries_to_record
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+    }
+
     /// Watch every Welcome marked expired whose expiry a stop left
     /// unrecorded, so it is recorded: every group's on the first call, then,
     /// on each later call, each group whose rows could not be read before,
     /// until they read. A read that fails is logged and stops nothing else:
     /// owed Welcomes are read and published as usual.
     fn adopt_unrecorded_expiries(&mut self) {
+        let to_record = std::mem::take(
+            &mut *self
+                .expiries_to_record
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        self.adopt_stored_welcomes(to_record);
         for group_id in std::mem::take(&mut self.unread_expiry_groups) {
             match self.session.unrecorded_welcome_expiries_in(&group_id) {
                 Ok(ids) => self.adopt_stored_welcomes(ids),
