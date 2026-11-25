@@ -97,19 +97,18 @@ impl RejectedFrame {
 
     /// Explain why the typed decode refused `frame` with `err`. This never
     /// admits a request: it only chooses the error the client gets.
-    fn explain(frame: &[u8], err: &AgentControlError) -> Self {
-        let frame: serde_json::Value = match agent_control::decode_frame(frame) {
+    fn explain(raw: &[u8], err: &AgentControlError) -> Self {
+        let frame: serde_json::Value = match agent_control::decode_frame(raw) {
             Ok(frame) => frame,
             Err(err) => return Self::unreadable(&err),
         };
         let duplicate = schema_field(err, "duplicate field");
-        // With a repeated `id` no single value is the client's id.
-        let id = frame
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .filter(|id| {
-                id.len() <= MAX_ECHOED_REQUEST_ID_BYTES && duplicate.as_deref() != Some("id")
-            })
+        // With a repeated `id` no single value is the client's id, whichever
+        // duplicate the typed decode happened to report.
+        let id = (top_level_key_count(raw, "id") == 1)
+            .then(|| frame.get("id").and_then(serde_json::Value::as_str))
+            .flatten()
+            .filter(|id| id.len() <= MAX_ECHOED_REQUEST_ID_BYTES)
             .map(str::to_owned);
         let Some(fields) = frame.as_object() else {
             return Self::invalid(id, "control frame is not a JSON object");
@@ -148,6 +147,44 @@ impl RejectedFrame {
             None => Self::invalid(id, "a field has a value its request type does not accept"),
         }
     }
+}
+
+/// How many times `key` appears among the top-level keys of the JSON object in
+/// `raw`. A `serde_json::Value` keeps only the last of repeated keys, so the
+/// keys are counted as the object is read.
+fn top_level_key_count(raw: &[u8], key: &str) -> usize {
+    struct Count<'a>(&'a str);
+
+    impl<'de> serde::de::DeserializeSeed<'de> for Count<'_> {
+        type Value = usize;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<usize, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for Count<'_> {
+        type Value = usize;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<usize, A::Error> {
+            let mut count = 0;
+            while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                count += usize::from(name == self.0);
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(count)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(raw);
+    serde::de::DeserializeSeed::deserialize(Count(key), &mut deserializer).unwrap_or(0)
 }
 
 /// The field named in a serde error such as "missing field `account_id_hex`",

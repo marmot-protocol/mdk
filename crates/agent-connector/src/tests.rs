@@ -300,6 +300,16 @@ async fn rejected_control_frames_get_an_error_response() {
             "invalid_request",
             "duplicate field `id`",
         ),
+        // The typed decode reports the first duplicate it meets, here
+        // `auth_token`; a repeated `id` is still not echoed.
+        (
+            format!(
+                r#"{{"marmot_agent_control":"{v2}","auth_token":"t","auth_token":"u","id":"j","id":"k","type":"diagnostic_status"}}"#
+            ),
+            None,
+            "invalid_request",
+            "duplicate field `auth_token`",
+        ),
         ("hello".to_owned(), None, "invalid_request", "JSON"),
         ("[1,2]".to_owned(), None, "invalid_request", "JSON object"),
         (
