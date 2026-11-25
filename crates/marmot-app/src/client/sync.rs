@@ -1117,12 +1117,16 @@ impl AppClient {
                 .any(|state| *state == PendingMessageNotification::Ready);
         if pending {
             self.pending_runtime_group_subscription_refresh = true;
+            self.pending_failed_receive_projection = true;
         }
         pending
     }
 
     pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
         self.pending_runtime_group_subscription_refresh
+            // A route sync between the failure and the retry clears the flag
+            // above; the one-shot activity still waits for the retry's save.
+            || self.pending_failed_receive_projection
             || !self.pending_applied_effects.is_empty()
             || !self.pending_push_leaf_reconciliations.is_empty()
             || self
@@ -1145,6 +1149,7 @@ impl AppClient {
         self.retry_applied_effect_projections_buffered().await?;
         let push_cleanup_result = self.retry_pending_push_leaf_reconciliations();
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.pending_failed_receive_projection = false;
         let mut checkpointed = std::mem::take(&mut self.pending_failed_sync_summary);
         checkpointed.merge(std::mem::take(&mut self.pending_applied_sync_summary));
         self.pending_applied_sync_summary = checkpointed;

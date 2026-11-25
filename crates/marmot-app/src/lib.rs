@@ -2471,6 +2471,7 @@ impl MarmotApp {
             received_private_key_package_generation: 0,
             acceptances_recorded: false,
             invitation_decisions_changed: false,
+            invitation_answers_await_epoch: false,
             invitation_work_held: false,
             invitations_settled: Vec::new(),
             device_group_work_changed: true,
@@ -2542,6 +2543,7 @@ impl MarmotApp {
                 .config
                 .dev_fail_published_app_message_acknowledgement,
             pending_runtime_group_subscription_refresh: false,
+            pending_failed_receive_projection: false,
             #[cfg(test)]
             fail_next_runner_preparation: self
                 .test_fail_runner_preparation

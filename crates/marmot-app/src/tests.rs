@@ -26967,6 +26967,23 @@ async fn a_refused_an_owed_and_a_pending_commit_each_answer_their_own_read() {
         .await
         .unwrap();
     let commit_a = last_commit_id(&relay);
+    // A's first pass ends at its first acceptance and cancels a send still
+    // in flight, which stays owed for a later pass. Run that pass while
+    // relay B is up, so B holds A before it goes down.
+    assert!(client.note_connectivity_restored().unwrap() > 0);
+    client
+        .advance_convergence_after_runtime_sync(&group_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .group_commit_delivery(&group_id)
+            .unwrap()
+            .expect("A is owed to C")
+            .owed_relay_urls,
+        vec!["wss://relay-c.example".to_owned()],
+        "A is owed to C alone"
+    );
     relay.make_endpoints_unavailable(&["wss://relay-b.example", "wss://relay-c.example"]);
     client
         .update_group_profile(&group_id, Some("b"), None)

@@ -652,11 +652,46 @@ async fn siblings_exchange_small_state_through_the_device_group() {
     );
     assert_eq!(
         laptop_storage().unsent_invitation_decisions().unwrap(),
-        [decision]
+        std::slice::from_ref(&decision)
     );
     // The answer it carried goes out again on the worker's next turn, as the
-    // answer first did, not at the next maintenance pass (mdk#3566).
+    // answer first did, not at the next maintenance pass (mdk#3566). While
+    // the device group's epoch is still settling, as when the fork that
+    // withdrew it resolves, the engine refuses that send; it goes out on
+    // the turn after the epoch settles (mdk#3573).
+    devices.relay.fail_publishes_as_possibly_exposed();
+    devices
+        .phone
+        .runtime
+        .send(cgka_traits::engine::SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        devices.phone.runtime.epoch_state(&group),
+        Some(cgka_traits::EpochState::PendingPublish(_))
+    ));
     assert!(devices.phone.drive_changed_invitation_decisions().await);
+    // A maintenance pass in between clears the turn's flag and is refused
+    // the same way; it must leave the send owed to the next turn too.
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        phone_storage().unsent_invitation_decisions().unwrap(),
+        std::slice::from_ref(&decision),
+        "refused while the epoch settles"
+    );
+    devices.relay.allow_publishes();
+    assert!(devices.phone.note_connectivity_restored().unwrap() > 0);
+    devices
+        .phone
+        .advance_convergence_after_runtime_sync(&group)
+        .await
+        .unwrap();
+    assert!(
+        devices.phone.drive_changed_invitation_decisions().await,
+        "the turn after the epoch settles sends it"
+    );
     assert!(
         phone_storage()
             .unsent_invitation_decisions()

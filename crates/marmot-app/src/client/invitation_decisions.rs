@@ -431,9 +431,33 @@ impl AppClient {
         if !std::mem::take(&mut self.acceptances_recorded) {
             return;
         }
-        if let Err(error) = self.send_owed_small_state().await {
+        if let Err(error) = self.send_owed_small_state().await
+            && !self.answers_await_epoch(&error)
+        {
             tracing::warn!(target: "marmot_app::client::invitation_decisions", method = "send_recorded_acceptances", error_kind = error.privacy_safe_kind(), "recorded acceptances wait for ordinary small-state sending");
         }
+    }
+
+    /// Note a small-state send the engine refused, before anything was
+    /// encrypted, because the device group's epoch moves or is about to, as
+    /// while a fork between linked devices resolves, with invitation answers
+    /// left unsent. The worker's invitation turn after the epoch settles
+    /// sends them ([`Self::drive_changed_invitation_decisions`]), not the
+    /// next maintenance pass (mdk#3573). Returns whether it noted one.
+    pub(super) fn answers_await_epoch(&mut self, error: &AppError) -> bool {
+        let waiting = matches!(
+            error.as_engine_error(),
+            Some(
+                EngineError::AppMessageEpochUnsettled { .. }
+                    | EngineError::AppMessageEpochMismatch { .. }
+            )
+        ) && self
+            .app
+            .account_storage(&self.state.label)
+            .and_then(|account| Ok(account.app_storage().unsent_invitation_decisions()?))
+            .is_ok_and(|unsent| !unsent.is_empty());
+        self.invitation_answers_await_epoch |= waiting;
+        waiting
     }
 
     /// Native founding can be recovered by the ordinary projection reconcile
@@ -558,8 +582,11 @@ impl AppClient {
         {
             return false;
         }
+        self.acceptances_recorded |= std::mem::take(&mut self.invitation_answers_await_epoch);
         self.send_recorded_acceptances().await;
         self.drive_invitation_decisions().await;
+        // The epoch settles in a worker unit: try again on the turn after.
+        self.invitation_decisions_changed |= self.invitation_answers_await_epoch;
         true
     }
 

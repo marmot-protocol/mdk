@@ -818,6 +818,10 @@ pub struct AppClient {
     /// since the worker last sent and applied them: it does so on its next
     /// turn, not at the next maintenance pass (mdk#3566).
     pub(crate) invitation_decisions_changed: bool,
+    /// A send of invitation answers was refused while the device group's
+    /// epoch settled ([`Self::answers_await_epoch`]); the worker's next
+    /// invitation turn sends them again.
+    pub(crate) invitation_answers_await_epoch: bool,
     /// The last invitation pass left work it retries once the reason passes
     /// on its own: a chat's projection still saving, a chat not quiet or a
     /// failure. Work that waits for an event, such as a blocked inviter, is
@@ -1032,6 +1036,11 @@ pub struct AppClient {
     /// background retry instead of turning the already-applied ingest into an
     /// apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
+    /// A live receive failed while this client held output or writes its
+    /// state checkpoint had not saved ([`Self::arm_failed_receive_projection_retry`]).
+    /// Kept apart from the subscription-refresh flag, which a route sync
+    /// clears: only the retry's state save ends it.
+    pub(crate) pending_failed_receive_projection: bool,
     /// One-shot failure of the recovery runner's ownership preparation.
     #[cfg(test)]
     pub(crate) fail_next_runner_preparation: bool,
@@ -1701,6 +1710,10 @@ impl AppClient {
             )
         })
         .await;
+        // This pass cleared the worker's invitation flag above. An answer a
+        // settling epoch held back here goes out on a worker turn after it
+        // settles, not at the next pass (mdk#3573).
+        self.invitation_decisions_changed |= self.invitation_answers_await_epoch;
         boxed(|| self.sibling_key_package_upkeep(&held)).await;
         // One second for both, so a heartbeat sent on the pass that restarts
         // the inactivity clock counts as sent since the restart.

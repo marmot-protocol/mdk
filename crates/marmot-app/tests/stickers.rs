@@ -114,21 +114,26 @@ async fn publish_installed_list(relay_url: &str, keys: &Keys, packs: &[&str], cr
     publish_signed(relay_url, keys, USER_STICKER_PACKS_KIND, tags, created_at).await;
 }
 
-/// The NIP-01 winner of the account's installed list as the relay serves it:
-/// newest `created_at`, lowest id on ties.
-async fn remote_installed_list(relay_url: &str, author: PublicKey) -> (u64, Vec<String>) {
+/// The NIP-01 winner of the account's installed list as these relays serve
+/// it together: newest `created_at`, lowest id on ties. The app publishes the
+/// list with a one-acknowledgement quorum and abandons the other relays once
+/// one accepts, so with several account relays only one is sure to hold it.
+async fn remote_installed_list(relay_urls: &[String], author: PublicKey) -> (u64, Vec<String>) {
     let client = NostrSdkClient::builder().build();
-    client.add_relay(relay_url).await.unwrap();
+    for relay_url in relay_urls {
+        client.add_relay(relay_url).await.unwrap();
+    }
     client.connect().await;
+    let filter = Filter::new()
+        .author(author)
+        .kind(Kind::Custom(USER_STICKER_PACKS_KIND));
     let events = client
-        .fetch_events(ReqTarget::manual(vec![(
-            RelayUrl::parse(relay_url).unwrap(),
-            vec![
-                Filter::new()
-                    .author(author)
-                    .kind(Kind::Custom(USER_STICKER_PACKS_KIND)),
-            ],
-        )]))
+        .fetch_events(ReqTarget::manual(
+            relay_urls
+                .iter()
+                .map(|relay_url| (RelayUrl::parse(relay_url).unwrap(), vec![filter.clone()]))
+                .collect::<Vec<_>>(),
+        ))
         .timeout(Duration::from_secs(5))
         .await
         .unwrap();
@@ -233,7 +238,8 @@ async fn failed_installed_list_refresh_blocks_stale_publication_until_rebase() {
     // Reads recover. Nothing below the app has run yet, so the relay still
     // shows exactly what the failed-refresh path left behind.
     policy.armed.store(false, Ordering::SeqCst);
-    let (created_at, packs) = remote_installed_list(&url, keys.public_key()).await;
+    let (created_at, packs) =
+        remote_installed_list(std::slice::from_ref(&url), keys.public_key()).await;
     assert_eq!(
         packs,
         vec![pack_a.clone(), pack_b.clone()],
@@ -258,7 +264,8 @@ async fn failed_installed_list_refresh_blocks_stale_publication_until_rebase() {
         "the rebased operation was published"
     );
     assert_eq!(synced.installed, 1);
-    let (created_at, packs) = remote_installed_list(&url, keys.public_key()).await;
+    let (created_at, packs) =
+        remote_installed_list(std::slice::from_ref(&url), keys.public_key()).await;
     assert_eq!(
         packs,
         vec![pack_b],
@@ -573,7 +580,8 @@ async fn sync_refreshes_installed_packs() {
     assert_eq!(refreshed.stickers[0].shortcode, "dance");
 
     policy.armed.store(false, Ordering::SeqCst);
-    let (created_at, packs) = remote_installed_list(&url, keys.public_key()).await;
+    let (created_at, packs) =
+        remote_installed_list(std::slice::from_ref(&url), keys.public_key()).await;
     assert_eq!(created_at, now - 300);
     assert_eq!(packs, vec![coordinate]);
 
@@ -696,7 +704,6 @@ async fn configured_relays_serve_pack_reads_but_not_the_installed_list() {
         account_urls.push(relay.url().await.to_string());
         account_relays.push(relay);
     }
-    let account_url = account_urls[0].clone();
     let configured_relay = LocalRelay::new(RelayBuilder::default());
     configured_relay.run().await.unwrap();
     let configured_url = configured_relay.url().await.to_string();
@@ -760,7 +767,8 @@ async fn configured_relays_serve_pack_reads_but_not_the_installed_list() {
         vec![spelled(&account_urls[7])]
     );
 
-    let (_, packs) = remote_installed_list(&account_url, keys.public_key()).await;
+    // The list reaches the account's relays: whichever accepted it first.
+    let (_, packs) = remote_installed_list(&account_urls, keys.public_key()).await;
     assert_eq!(packs, vec![default_pack]);
     assert_eq!(
         installed_list_count(&configured_url, keys.public_key()).await,

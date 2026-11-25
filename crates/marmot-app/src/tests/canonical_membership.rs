@@ -1815,6 +1815,20 @@ async fn assert_managed_worker_retains_activity(late_checkpoint: bool) {
     app.relay_plane
         .route_account_delivery_for_test(later_delivery);
     tokio::time::sleep(Duration::from_millis(300)).await;
+    // A maintenance pass also reaches the activity, by replaying the
+    // delivery; count it so a delivery that waited for one fails.
+    let ticks = || {
+        runtime
+            .app_performance_snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.operation == crate::RuntimePerformanceOperation::WorkerMaintenanceDue
+            })
+            .expect("every runtime operation is exported")
+            .completed
+    };
+    let ticks_before = ticks();
     connection
         .execute_batch("DROP TRIGGER fail_live_activity")
         .unwrap();
@@ -1835,6 +1849,11 @@ async fn assert_managed_worker_retains_activity(late_checkpoint: bool) {
     })
     .await
     .expect("quiet worker retry must deliver the one-shot activity");
+    assert_eq!(
+        ticks(),
+        ticks_before,
+        "the bounded projection retry delivers it, not the next maintenance pass"
+    );
     assert_eq!(timeline.take_snapshot().messages.len(), baseline + 2);
     runtime.shutdown().await;
 }
