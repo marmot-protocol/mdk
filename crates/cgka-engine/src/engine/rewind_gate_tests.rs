@@ -26,7 +26,7 @@ fn carried(payload: &[u8], envelope: TransportEnvelope) -> TransportMessage {
     shared_carried("rewind-gate-test", payload, envelope)
 }
 
-fn client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+pub(super) fn client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let key = signing_key(seed);
     let engine = EngineBuilder::new(storage.clone())
