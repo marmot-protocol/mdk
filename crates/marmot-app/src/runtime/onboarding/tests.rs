@@ -1725,20 +1725,22 @@ async fn minimal_relay_repair_adds_only_missing_role_and_preserves_unmarked_dupl
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
-    let malformed = signed(
+    // A record dated beyond the clock skew cannot be the basis of a repair:
+    // a replacement would have to be dated after it.
+    let future_dated = signed(
         &keys,
         10002,
         vec![vec![
             "r".into(),
             "wss://custom.example".into(),
-            "unsupported".into(),
+            "read".into(),
         ]],
         "opaque",
-        unix_now_seconds() - 1,
+        unix_now_seconds() + 3600,
     );
     let (repair, _, _) = runtime.accounts().account_setup().minimal_relay_repair(
         OnboardingStep::Relays,
-        Some(&malformed),
+        Some(&future_dated),
         &["wss://default.example".into()],
         &BTreeMap::new(),
         false,
@@ -1758,7 +1760,7 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
         .unwrap()
         .unwrap();
     checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
-    checkpoint.records[OnboardingStep::Relays.index()] = Some(malformed);
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(future_dated);
     checkpoint.append_relays = true;
     runtime
         .accounts()
@@ -1810,6 +1812,140 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
             .unwrap()
             .unwrap()
             .append_relays
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// mdk#3727: entries the repair cannot use (an unknown marker, no URL, an
+/// invalid URL) stay exactly as signed, and a NIP-65 list longer than the
+/// dial cap still gets its missing role. An inbox route over the cap is
+/// rejected as a whole (mdk#3710), so such a list stays manual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn minimal_relay_repair_keeps_unusable_entries_and_adds_the_missing_role() {
+    let (_dir, runtime, _network, keys, _id) = fixture().await;
+    let setup = runtime.accounts().account_setup();
+    let default = "wss://default.example".to_owned();
+    let tags = |entries: &[&[&str]]| -> Vec<Vec<String>> {
+        entries
+            .iter()
+            .map(|tag| tag.iter().map(|field| (*field).to_owned()).collect())
+            .collect()
+    };
+    let relays = |count: usize, tag: &[&str]| -> Vec<Vec<String>> {
+        (0..count)
+            .map(|index| {
+                let mut fields = vec![tag[0].to_owned(), format!("wss://relay{index}.example")];
+                fields.extend(tag[1..].iter().map(|field| (*field).to_owned()));
+                fields
+            })
+            .collect()
+    };
+    for (step, before, added) in [
+        (
+            OnboardingStep::Relays,
+            tags(&[
+                &["r", "wss://ok.example", "unsupported"],
+                &["r"],
+                &["r", "wss://write.example", "write"],
+            ]),
+            Some(vec!["r".into(), default.clone(), "read".into()]),
+        ),
+        (
+            OnboardingStep::InboxRelays,
+            tags(&[&["relay", "not a url"]]),
+            Some(vec!["relay".into(), default.clone()]),
+        ),
+        (
+            OnboardingStep::Relays,
+            relays(20, &["r", "read"]),
+            Some(vec!["r".into(), default.clone(), "write".into()]),
+        ),
+        (OnboardingStep::InboxRelays, relays(17, &["relay"]), None),
+    ] {
+        let event = signed(
+            &keys,
+            step.kind() as u16,
+            before.clone(),
+            "opaque",
+            unix_now_seconds() - 1,
+        );
+        let (repair, _, _) = setup.minimal_relay_repair(
+            step,
+            Some(&event),
+            std::slice::from_ref(&default),
+            &BTreeMap::new(),
+            false,
+        );
+        let after: Vec<_> = repair.after_tags.iter().map(|t| t.fields.clone()).collect();
+        let Some(added) = added else {
+            assert_eq!(repair.mode, OnboardingRelayRepairMode::ManualReview);
+            assert_eq!(after, before);
+            continue;
+        };
+        assert_eq!(
+            repair.mode,
+            OnboardingRelayRepairMode::Additive,
+            "{before:?}"
+        );
+        let mut expected = before.clone();
+        expected.push(added);
+        assert_eq!(after, expected);
+        let (last, kept) = repair.changes.split_last().unwrap();
+        assert_eq!(last.disposition, OnboardingRelayTagDisposition::Added);
+        assert!(
+            kept.iter()
+                .all(|change| change.disposition == OnboardingRelayTagDisposition::Retained)
+        );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Discovering many outboxes can add sources that exceed the approval lookup's
+/// dial budget. The preview makes the incomplete lookup explicit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_outbox_list_can_gain_a_read_route_with_inconclusive_consent() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let mut tags: Vec<_> = (0..=MAX_RELAYS)
+        .map(|index| {
+            vec![
+                "r".into(),
+                format!("wss://outbox{index}.example"),
+                "write".into(),
+            ]
+        })
+        .collect();
+    network.events.lock().push(signed(
+        &keys,
+        10002,
+        tags.clone(),
+        "",
+        unix_now_seconds() - 10,
+    ));
+    missing_relays(&runtime, &id).await;
+    let setup = runtime.account_setup();
+    let preview = setup
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    assert!(preview.proposal.as_ref().unwrap().inconclusive);
+    assert!(
+        preview.steps[OnboardingStep::Relays.index()]
+            .actions
+            .contains(&OnboardingAction::ApproveRepair)
+    );
+    let approved = setup
+        .approve_onboarding_repair(&id, preview.revision)
+        .await
+        .unwrap();
+    tags.push(vec![
+        "r".into(),
+        "wss://default.example".into(),
+        "read".into(),
+    ]);
+    assert_eq!(network.attempts.lock()[0].tags, tags);
+    assert_eq!(
+        approved.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::Passed
     );
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -4272,6 +4408,70 @@ async fn an_inbox_list_no_declared_route_answers_can_be_extended_with_consent() 
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// mdk#3726: senders read only `relay` tags, so a newest inbox list written
+/// with `r` tags stops the step. The suggested fix declares the relays the
+/// user named as `relay` tags, keeping the original tags, and adds no default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_r_tagged_inbox_list_is_repaired_with_its_own_relays() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let inbox = vec![
+        vec!["r".into(), "wss://healthy.example".into()],
+        vec!["r".into(), "wss://other.example".into(), "write".into()],
+    ];
+    let snapshot = inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), "wss://healthy.example".into()]],
+        Some(inbox.clone()),
+    )
+    .await;
+    assert_eq!(
+        snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    let setup = runtime.account_setup();
+    let preview = setup
+        .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    let repair = preview
+        .proposal
+        .as_ref()
+        .unwrap()
+        .relay_repair
+        .as_ref()
+        .unwrap();
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::Additive);
+    let mut expected = inbox;
+    expected.push(vec!["relay".into(), "wss://healthy.example".into()]);
+    expected.push(vec!["relay".into(), "wss://other.example".into()]);
+    assert_eq!(
+        repair
+            .after_tags
+            .iter()
+            .map(|tag| tag.fields.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(
+        preview.steps[OnboardingStep::InboxRelays.index()]
+            .actions
+            .contains(&OnboardingAction::ApproveRepair)
+    );
+    let approved = setup
+        .approve_onboarding_repair(&id, preview.revision)
+        .await
+        .unwrap();
+    assert_eq!(network.attempts.lock()[0].tags, expected);
+    assert_eq!(
+        approved.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::Passed
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_inconclusive_inbox_lookup_offers_an_edit_whose_approval_tolerates_the_failed_source() {
     use transport_nostr::DirectoryInspectionError;
@@ -4712,26 +4912,133 @@ async fn newest_malformed_profile_is_not_hidden_by_older_valid_metadata() {
     assert_eq!(result.steps[0].status, OnboardingStatus::NeedsInput);
     runtime.shutdown_and_close().await.unwrap();
 }
+/// mdk#3726: a record dated beyond the clock skew never decides a step. The
+/// step judges the newest record that is not, or finds none, and names the
+/// relay that holds the future one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn future_dated_record_is_inconclusive_and_cannot_be_repaired_automatically() {
+async fn future_dated_records_are_set_aside_with_an_advisory() {
     let (_dir, runtime, network, keys, id) = fixture().await;
-    network
-        .events
-        .lock()
-        .push(signed(&keys, 0, vec![], "{}", unix_now_seconds() + 3600));
-    let result = runtime.account_setup().run_onboarding(&id).await.unwrap();
-    assert_eq!(
-        result.steps[0].findings[0].issue,
-        OnboardingIssue::FutureDated
-    );
-    assert_eq!(result.steps[0].status, OnboardingStatus::RetryableFailure);
-    assert!(
-        !result.steps[0]
-            .actions
-            .contains(&OnboardingAction::EditProfile)
-    );
+    let manager = runtime.accounts();
+    let setup = manager.account_setup();
+    let c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    for (step, tags) in [
+        (OnboardingStep::Profile, vec![]),
+        (OnboardingStep::Follows, vec![]),
+        (
+            OnboardingStep::Relays,
+            vec![vec!["r".into(), "wss://healthy.example".into()]],
+        ),
+        (
+            OnboardingStep::InboxRelays,
+            vec![vec!["relay".into(), "wss://healthy.example".into()]],
+        ),
+    ] {
+        let kind = step.kind() as u16;
+        // Only the discovery relay holds the record dated a year ahead.
+        *network.index_events.lock() = vec![signed(
+            &keys,
+            kind,
+            tags.clone(),
+            "{}",
+            unix_now_seconds() + 365 * 24 * 60 * 60,
+        )];
+        let older = signed(&keys, kind, tags, "{}", unix_now_seconds() - 10);
+        for fallback in [None, Some(older)] {
+            *network.events.lock() = fallback.iter().cloned().collect();
+            let (status, findings, record) = setup.check_onboarding_step(&c, step).await;
+            assert_eq!(record, fallback, "{step:?}");
+            if fallback.is_some() {
+                assert_eq!(status, OnboardingStatus::Passed, "{step:?} {findings:?}");
+            } else {
+                assert_eq!(status, OnboardingStatus::NeedsInput, "{step:?}");
+                assert_eq!(findings[0].issue, OnboardingIssue::Missing, "{step:?}");
+            }
+            let advisory = findings
+                .iter()
+                .find(|finding| finding.issue == OnboardingIssue::FutureDated)
+                .unwrap();
+            assert_eq!(advisory.outcome, OnboardingCheckOutcome::Success);
+            assert_eq!(
+                advisory.endpoint.as_deref(),
+                Some("wss://index.example"),
+                "{step:?}"
+            );
+        }
+    }
     runtime.shutdown_and_close().await.unwrap();
 }
+
+/// A repair checks the newest eligible record again after consent, even if
+/// the relay that serves the new record also serves a far-future copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repair_past_a_future_dated_relay_list_builds_on_the_selected_record() {
+    for changed in [false, true] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        *network.index_events.lock() = vec![signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), "wss://future.example".into()]],
+            "",
+            unix_now_seconds() + 365 * 24 * 60 * 60,
+        )];
+        let read_only = vec![vec![
+            "r".into(),
+            "wss://healthy.example".into(),
+            "read".into(),
+        ]];
+        *network.events.lock() = vec![signed(
+            &keys,
+            10002,
+            read_only.clone(),
+            "",
+            unix_now_seconds() - 10,
+        )];
+        missing_relays(&runtime, &id).await;
+        let setup = runtime.account_setup();
+        let preview = setup
+            .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+            .await
+            .unwrap();
+        assert!(!preview.proposal.as_ref().unwrap().inconclusive);
+        if changed {
+            network.index_events.lock().push(signed(
+                &keys,
+                10002,
+                vec![vec!["r".into(), "wss://newer.example".into()]],
+                "",
+                unix_now_seconds(),
+            ));
+        }
+        let approved = setup
+            .approve_onboarding_repair(&id, preview.revision)
+            .await
+            .unwrap();
+        let relays = &approved.steps[OnboardingStep::Relays.index()];
+        if changed {
+            assert!(network.attempts.lock().is_empty());
+            assert!(approved.proposal.is_none());
+            assert_eq!(relays.status, OnboardingStatus::RetryableFailure);
+            assert_eq!(relays.findings[0].issue, OnboardingIssue::RecordChanged);
+        } else {
+            let published = network.attempts.lock()[0].clone();
+            let mut expected = read_only;
+            expected.push(vec![
+                "r".into(),
+                "wss://default.example".into(),
+                "write".into(),
+            ]);
+            assert_eq!(published.tags, expected);
+            assert!(published.created_at <= unix_now_seconds());
+            assert_eq!(relays.status, OnboardingStatus::Passed);
+        }
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_ack_repair_survives_restart_and_retries_exact_signed_bytes() {
     let (dir, first, network, _keys, id) = fixture().await;

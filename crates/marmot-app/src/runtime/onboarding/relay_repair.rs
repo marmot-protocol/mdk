@@ -239,13 +239,9 @@ impl AccountSetup<'_> {
         let mut has_inbox = false;
         let mut removed = 0;
         for (index, tag) in before.iter().enumerate() {
-            if relevant(tag) {
-                if tag.role == OnboardingRelayTagRole::Other {
-                    return manual();
-                }
-                let Some(endpoint) = tag.endpoint.as_ref() else {
-                    return manual();
-                };
+            if tag.role != OnboardingRelayTagRole::Other
+                && let Some(endpoint) = tag.endpoint.as_ref()
+            {
                 if let Some(reason) = unusable_reason(endpoint)
                     && !kept.contains(&relay_key(endpoint))
                 {
@@ -259,9 +255,6 @@ impl AccountSetup<'_> {
                         removed += 1;
                         continue;
                     }
-                    // A route the direct dialer cannot use may still be useful
-                    // to a Tor or LAN client. Do not erase its declaration.
-                    Some(RelayEndpointPolicy::Unsafe) => {}
                     Some(RelayEndpointPolicy::Allowed) => {
                         safe_endpoints
                             .entry(relay_key(endpoint))
@@ -277,7 +270,9 @@ impl AccountSetup<'_> {
                             OnboardingRelayTagRole::Other => unreachable!(),
                         }
                     }
-                    _ => return manual(),
+                    // Keep entries the direct dialer cannot use, including Tor or LAN
+                    // routes and invalid URLs. Only allowed entries cover a role.
+                    _ => {}
                 }
             }
             changes.push(tag_change(
@@ -289,15 +284,38 @@ impl AccountSetup<'_> {
             ));
             after.push(tag.clone());
         }
-        if safe_endpoints.len() > MAX_RELAYS {
+        if step == OnboardingStep::InboxRelays && safe_endpoints.len() > MAX_RELAYS {
             return manual();
         }
 
         let missing_read = step == OnboardingStep::Relays && !has_read;
         let missing_write = step == OnboardingStep::Relays && !has_write;
         let missing_inbox = step == OnboardingStep::InboxRelays && !has_inbox;
-        let mut added = false;
-        if missing_read || missing_write || missing_inbox {
+        let mut additions = Vec::new();
+        if missing_inbox && !before.iter().any(relevant) {
+            let endpoints = before
+                .iter()
+                .filter(|tag| tag.fields.first().is_some_and(|name| name == "r"))
+                .filter_map(|tag| tag.fields.get(1).cloned())
+                .collect();
+            let mut seen = HashSet::new();
+            for candidate in self.app().relay_plane.classify_relay_endpoints(endpoints) {
+                let key = relay_key(&candidate.endpoint);
+                if candidate.policy == RelayEndpointPolicy::Allowed
+                    && !unusable.contains_key(&key)
+                    && seen.insert(key)
+                {
+                    additions.push((
+                        vec!["relay".into(), candidate.endpoint.trim().to_owned()],
+                        OnboardingRelayCapability::Inbox,
+                    ));
+                }
+            }
+            if additions.len() > MAX_RELAYS {
+                return manual();
+            }
+        }
+        if additions.is_empty() && (missing_read || missing_write || missing_inbox) {
             let allowed_defaults = self
                 .app()
                 .relay_plane
@@ -312,14 +330,14 @@ impl AccountSetup<'_> {
                 .iter()
                 .find_map(|endpoint| safe_endpoints.get(&relay_key(endpoint)))
                 .or_else(|| {
-                    (safe_endpoints.len() < MAX_RELAYS)
+                    (!missing_inbox || safe_endpoints.len() < MAX_RELAYS)
                         .then(|| allowed_defaults.first())
                         .flatten()
                 });
             let Some(endpoint) = candidate else {
                 return manual();
             };
-            let (fields, restores) = if missing_inbox {
+            additions.push(if missing_inbox {
                 (
                     vec!["relay".into(), endpoint.clone()],
                     OnboardingRelayCapability::Inbox,
@@ -339,7 +357,10 @@ impl AccountSetup<'_> {
                     vec!["r".into(), endpoint.clone(), "write".into()],
                     OnboardingRelayCapability::Write,
                 )
-            };
+            });
+        }
+        let added = !additions.is_empty();
+        for (fields, restores) in additions {
             let tag = relay_tag(step, fields);
             changes.push(tag_change(
                 &tag,
@@ -349,7 +370,6 @@ impl AccountSetup<'_> {
                 restores,
             ));
             after.push(tag);
-            added = true;
         }
         if removed == 0 && !added {
             return manual();
@@ -453,6 +473,28 @@ impl AccountSetup<'_> {
         })
     }
 
+    // The first lookup can discover more outboxes than the approval lookup will
+    // dial. Show that gap in the preview so approval still requires consent.
+    async fn relay_repair_lookup_is_capped(&self, c: &OnboardingCheckpoint) -> bool {
+        let sources = self.onboarding_sources(c, OnboardingStep::Relays).await;
+        let indexers: HashSet<_> = self
+            .app()
+            .discovery_indexer_relays()
+            .iter()
+            .map(|endpoint| relay_key(&endpoint.0))
+            .collect();
+        self.app()
+            .relay_plane
+            .retain_safe_discovered_endpoints(
+                sources.into_iter().map(TransportEndpoint).collect(),
+                "onboarding discovery",
+            )
+            .iter()
+            .filter(|endpoint| !indexers.contains(&relay_key(&endpoint.0)))
+            .count()
+            > MAX_RELAYS
+    }
+
     /// Whether `step` should offer `RemoveUnusableRelays`: its preview is
     /// approvable and removes at least one declared entry.
     pub(super) fn relay_cleanup_available(
@@ -496,7 +538,8 @@ impl AccountSetup<'_> {
             unusable,
         } = self.relay_repair_preview(&c, step)?;
         let manual = repair.mode == OnboardingRelayRepairMode::ManualReview;
-        let inconclusive = check_inconclusive(&c.snapshot.steps[step.index()].findings);
+        let inconclusive = check_inconclusive(&c.snapshot.steps[step.index()].findings)
+            || (step == OnboardingStep::Relays && self.relay_repair_lookup_is_capped(&c).await);
         // A typed preview replaces any earlier append-only editor proposal.
         c.append_relays = false;
         c.manual_relay_edit = false;

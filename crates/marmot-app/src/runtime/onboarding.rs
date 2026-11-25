@@ -3,7 +3,7 @@
 //! bytes are checkpointed before they can reach a relay.
 use super::*;
 use nostr::prelude::{EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord, RelayEndpointPolicy};
 use transport_nostr_peeler::NostrTransportEvent;
@@ -745,6 +745,12 @@ impl OnboardingStep {
     }
 }
 impl OnboardingCheckpoint {
+    fn relay_source_record(&self) -> Option<&NostrTransportEvent> {
+        self.records[OnboardingStep::Relays.index()]
+            .as_ref()
+            .filter(|event| event.created_at <= unix_now_seconds() + FUTURE_CLOCK_SKEW)
+    }
+
     fn reset_step(&mut self, step: OnboardingStep) {
         if step.optional() && self.snapshot.steps[step.index()].status == OnboardingStatus::Skipped
         {
@@ -2555,10 +2561,11 @@ impl AccountSetup<'_> {
         }
         let mut records = Vec::new();
         let mut completed = HashMap::new();
+        let mut future_sources = BTreeSet::new();
+        let latest_allowed_timestamp = unix_now_seconds() + FUTURE_CLOCK_SKEW;
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok((endpoint, Ok(events))) => {
-                    completed.insert(relay_key(&endpoint), endpoint);
                     // A full bounded page may omit another installation's slot.
                     if kind == 30443
                         && events
@@ -2569,7 +2576,27 @@ impl AccountSetup<'_> {
                     {
                         failures.push(finding(OnboardingIssue::DiscoveryIncomplete));
                     }
-                    records.extend(events.into_iter().map(|r| r.event));
+                    for event in events.into_iter().map(|record| record.event) {
+                        // Enforce the event boundary even for injected fetchers. Keep signed
+                        // declarations with malformed contents so they can still be repaired.
+                        if event.kind != kind || event.pubkey != account_id {
+                            continue;
+                        }
+                        if event.to_verified_nostr_event().is_err() {
+                            if kind == 30443 {
+                                failures.push(finding(OnboardingIssue::Malformed));
+                            }
+                            continue;
+                        }
+                        // Slot discovery reports a signed foreign slot even if its timestamp
+                        // makes its package unusable. Replaceable records are selected by age.
+                        if kind != 30443 && event.created_at > latest_allowed_timestamp {
+                            future_sources.insert(endpoint.clone());
+                        } else {
+                            records.push(event);
+                        }
+                    }
+                    completed.insert(relay_key(&endpoint), endpoint);
                 }
                 Ok((endpoint, Err(error))) => {
                     use transport_nostr::DirectoryInspectionError::*;
@@ -2596,20 +2623,9 @@ impl AccountSetup<'_> {
                 Err(_) => failures.push(finding(OnboardingIssue::Interrupted)),
             }
         }
-        // Enforce the event boundary even for injected fetchers. Never let an
-        // older valid event hide a newer signed but malformed declaration.
-        records.retain(|event| {
-            let valid = event.kind == kind
-                && event.pubkey == account_id
-                && event.to_verified_nostr_event().is_ok();
-            if kind == 30443 && event.kind == kind && event.pubkey == account_id && !valid {
-                failures.push(finding(OnboardingIssue::Malformed));
-            }
-            valid
-        });
         records.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
         records.dedup_by(|a, b| a.id == b.id);
-        let failures = failures
+        let mut findings: Vec<_> = failures
             .into_iter()
             .map(|finding| {
                 finding.in_context(
@@ -2618,7 +2634,19 @@ impl AccountSetup<'_> {
                 )
             })
             .collect();
-        (records, failures, completed)
+        // The relay answered the lookup even though this record is ineligible.
+        findings.extend(
+            future_sources
+                .into_iter()
+                .map(|endpoint| OnboardingFinding {
+                    endpoint: Some(endpoint),
+                    context: OnboardingFindingContext::RecordDiscovery,
+                    purpose: OnboardingCheckPurpose::RecordLookup,
+                    outcome: OnboardingCheckOutcome::Success,
+                    ..finding(OnboardingIssue::FutureDated)
+                }),
+        );
+        (records, findings, completed)
     }
     /// Whether a lookup source that answered vouches for the account's own
     /// records: a public indexer or a relay the account declares. The host's
@@ -2641,8 +2669,8 @@ impl AccountSetup<'_> {
         let indexer_searched = sources
             .iter()
             .any(|source| indexers.contains(&relay_key(source)));
-        let declared: HashSet<String> = c.records[OnboardingStep::Relays.index()]
-            .as_ref()
+        let declared: HashSet<String> = c
+            .relay_source_record()
             .and_then(crate::relay_list_state_from_event)
             .map(|state| state.relays.iter().map(|relay| relay_key(relay)).collect())
             .unwrap_or_default();
@@ -2679,7 +2707,7 @@ impl AccountSetup<'_> {
         indexers: &[TransportEndpoint],
     ) -> Vec<String> {
         let mut sources = c.options.discovery_relays.clone();
-        let list = if let Some(event) = &c.records[OnboardingStep::Relays.index()] {
+        let list = if let Some(event) = c.relay_source_record() {
             Some(event.clone())
         } else if step.optional() {
             let mut lookup = sources.clone();
@@ -2692,7 +2720,7 @@ impl AccountSetup<'_> {
         } else {
             None
         };
-        if let Some(event) = list.filter(|e| e.created_at <= unix_now_seconds() + FUTURE_CLOCK_SKEW)
+        if let Some(event) = list
             && let Some(state) = crate::relay_list_state_from_event(&event)
         {
             let safe = self.app().relay_plane.retain_safe_discovered_endpoints(
@@ -2738,12 +2766,20 @@ impl AccountSetup<'_> {
             );
         }
         let sources = self.onboarding_sources(c, step).await;
-        let (records, mut failures, completed) = self
+        let (records, findings, completed) = self
             .inspect_onboarding_relays(&c.snapshot.account_id_hex, step.kind(), sources.clone())
             .await;
+        let (advisories, mut failures): (Vec<_>, Vec<_>) = findings
+            .into_iter()
+            .partition(|finding| finding.issue == OnboardingIssue::FutureDated);
         let Some(event) = records.into_iter().next() else {
-            return if completed.is_empty() || !failures.is_empty() {
-                if !failures.is_empty() && self.authoritative_answered(c, &sources, &completed) {
+            let status = if completed.is_empty() || !failures.is_empty() {
+                if failures.is_empty() {
+                    failures.push(finding(OnboardingIssue::Unreachable).in_context(
+                        OnboardingFindingContext::RecordDiscovery,
+                        OnboardingCheckPurpose::RecordLookup,
+                    ));
+                } else if self.authoritative_answered(c, &sources, &completed) {
                     // Absent where it answered, unknown where it failed.
                     failures.insert(
                         0,
@@ -2753,39 +2789,17 @@ impl AccountSetup<'_> {
                         ),
                     );
                 }
-                (
-                    OnboardingStatus::RetryableFailure,
-                    if failures.is_empty() {
-                        vec![finding(OnboardingIssue::Unreachable).in_context(
-                            OnboardingFindingContext::RecordDiscovery,
-                            OnboardingCheckPurpose::RecordLookup,
-                        )]
-                    } else {
-                        failures
-                    },
-                    None,
-                )
+                OnboardingStatus::RetryableFailure
             } else {
-                (
-                    OnboardingStatus::NeedsInput,
-                    vec![finding(OnboardingIssue::Missing).in_context(
-                        OnboardingFindingContext::RecordDiscovery,
-                        OnboardingCheckPurpose::RecordLookup,
-                    )],
-                    None,
-                )
+                failures.push(finding(OnboardingIssue::Missing).in_context(
+                    OnboardingFindingContext::RecordDiscovery,
+                    OnboardingCheckPurpose::RecordLookup,
+                ));
+                OnboardingStatus::NeedsInput
             };
+            failures.extend(advisories);
+            return (status, failures, None);
         };
-        if event.created_at > unix_now_seconds() + FUTURE_CLOCK_SKEW {
-            return (
-                OnboardingStatus::RetryableFailure,
-                vec![finding(OnboardingIssue::FutureDated).in_context(
-                    OnboardingFindingContext::PublishedDeclaration,
-                    OnboardingCheckPurpose::DeclarationValidation,
-                )],
-                Some(event),
-            );
-        }
         let mut findings: Vec<_> = validate_onboarding_record(&event)
             .into_iter()
             .map(|finding| {
@@ -2902,19 +2916,24 @@ impl AccountSetup<'_> {
                             endpoints,
                         )
                         .await;
-                    findings.extend(failures.into_iter().map(|failure| {
-                        let mut failure = failure.in_context(
-                            OnboardingFindingContext::DeclaredRoute,
-                            OnboardingCheckPurpose::DirectoryQuery,
-                        );
-                        failure.declared_capability = failure
-                            .endpoint
-                            .as_deref()
-                            .and_then(|endpoint| capabilities.get(&relay_key(endpoint)))
-                            .copied()
-                            .unwrap_or_default();
-                        failure
-                    }));
+                    findings.extend(
+                        failures
+                            .into_iter()
+                            .filter(|failure| failure.issue != OnboardingIssue::FutureDated)
+                            .map(|failure| {
+                                let mut failure = failure.in_context(
+                                    OnboardingFindingContext::DeclaredRoute,
+                                    OnboardingCheckPurpose::DirectoryQuery,
+                                );
+                                failure.declared_capability = failure
+                                    .endpoint
+                                    .as_deref()
+                                    .and_then(|endpoint| capabilities.get(&relay_key(endpoint)))
+                                    .copied()
+                                    .unwrap_or_default();
+                                failure
+                            }),
+                    );
                     // Inspection only dials allowed routes from this declaration.
                     if completed.is_empty() {
                         let mut failure = finding(OnboardingIssue::NoUsableRoute).in_context(
@@ -2961,6 +2980,7 @@ impl AccountSetup<'_> {
             ));
             findings.extend(failures);
         }
+        findings.extend(advisories);
         (status, findings, Some(event))
     }
     /// Prepare a relay replacement without signing or publishing it. Passing
@@ -3276,7 +3296,7 @@ impl AccountSetup<'_> {
             )
             .await?;
         self.require_live_onboarding_attempt(&c)?;
-        let (records, failures, completed) = self
+        let (records, mut failures, completed) = self
             .await_while_onboarding_live(
                 &account_id,
                 attempt,
@@ -3288,6 +3308,7 @@ impl AccountSetup<'_> {
             )
             .await?;
         self.require_live_onboarding_attempt(&c)?;
+        failures.retain(|finding| finding.issue != OnboardingIssue::FutureDated);
         // Every source, including declared relays and public indexers, must
         // finish: a timeout may hide a newer record even if another source answers.
         let complete = !completed.is_empty()
