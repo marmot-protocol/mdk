@@ -225,8 +225,10 @@ impl SweepRelay for SdkSweepRelay {
             Ok(()) if reply.auth => SliceReply::Closed(ClosedReason(Some(
                 TransportEndpointRejectionCategory::AuthRequired,
             ))),
+            // A retry after authentication is its own page; only its count
+            // proves the slice against the cap.
             Ok(()) => SliceReply::Answered {
-                received: reply.raw_items,
+                received: reply.page_items,
                 events: reply.events,
                 more: reply.more,
             },
@@ -502,6 +504,71 @@ mod tests {
             };
             assert_eq!(actual, expected);
         }
+    }
+
+    /// A slice retried after authentication is one page of its own
+    /// (mdk#3689): only its count can prove the slice, so the attempt the
+    /// relay held back cannot teach a relay with no published cap one the
+    /// size of both pages.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slice_retried_after_authentication_counts_only_its_page() {
+        use nostr_sdk::authenticator::SignerAuthenticator;
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+
+        use crate::finite_req::tests::{AuthAsk, refusing_relay};
+
+        let group = [7; 32];
+        let keys = Keys::generate();
+        let [first, second] = [10, 20].map(|created_at| {
+            EventBuilder::new(Kind::MlsGroupMessage, "stored")
+                .tags([Tag::custom("h", [hex::encode(group)])])
+                .custom_created_at(Timestamp::from_secs(created_at))
+                .finalize(&keys)
+                .unwrap()
+        });
+        let (url, server) = refusing_relay(AuthAsk::Hint, first, second).await;
+        let sdk = NostrSdkRelayClient::from_builder(
+            crate::network_proxy::nostr_builder(Ok(None))
+                .authenticator(SignerAuthenticator::new(Keys::generate())),
+        );
+        sdk.client().add_relay(&url).await.unwrap();
+        sdk.client()
+            .try_connect_relay(&url)
+            .timeout(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let relay = SdkSweepRelay::new(
+            &sdk,
+            url,
+            RelayCaps {
+                max_limit: None,
+                negentropy: true,
+            },
+            Duration::from_secs(5),
+        );
+        let reply = relay
+            .fetch_slice(SliceQuery {
+                route: SweepRoute::Group {
+                    nostr_group_id: group,
+                },
+                since: 1,
+                until: 100,
+                limit: None,
+            })
+            .await;
+        let SliceReply::Answered {
+            events,
+            received,
+            more,
+        } = reply
+        else {
+            panic!("an answered slice, got {reply:?}");
+        };
+        assert_eq!(events.len(), 2, "both attempts' events are kept");
+        assert_eq!(received, 1, "only the retry's page counts");
+        assert!(!more);
+        sdk.shutdown().await;
+        server.abort();
     }
 
     #[tokio::test]

@@ -121,6 +121,10 @@ pub struct FiniteReply {
     /// EVENT frames read for the request, valid or not, duplicates and the
     /// first one over the item budget included.
     pub raw_items: usize,
+    /// The part of `raw_items` the attempt that ended the request read: a
+    /// retry after authentication is one page of its own, and only its count
+    /// can prove that page against a relay's cap.
+    pub page_items: usize,
     /// Valid copies read, duplicates and the first one over a budget
     /// included.
     pub received_items: usize,
@@ -162,6 +166,7 @@ impl FiniteReply {
         }
         Self {
             raw_items: self.raw_items + retry.raw_items,
+            page_items: retry.page_items,
             received_items: self.received_items + retry.received_items,
             duplicates: self.duplicates + retry.duplicates,
             event_bytes: self.event_bytes + retry.event_bytes,
@@ -177,6 +182,7 @@ impl FiniteReply {
         Self {
             events: Vec::new(),
             raw_items: 0,
+            page_items: 0,
             received_items: 0,
             duplicates: 0,
             event_bytes: 0,
@@ -843,6 +849,7 @@ impl<'a> Collector<'a> {
         FiniteReply {
             events: self.events,
             raw_items: self.raw_items,
+            page_items: self.raw_items,
             received_items: self.received_items,
             duplicates: self.duplicates,
             event_bytes: self.event_bytes,
@@ -1088,7 +1095,7 @@ impl Drop for Diverted {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Duration;
 
     use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
@@ -1964,6 +1971,7 @@ mod tests {
             assert_eq!(reply.end, end, "{case}");
             assert_eq!(reply.events, kept, "{case}");
             assert_eq!(reply.raw_items, 2, "{case}");
+            assert_eq!(reply.page_items, 1, "{case}: the retry's page is its own");
             assert!(!reply.auth, "{case}: the retry's reply holds nothing back");
             client.shutdown().await;
             server.abort();
@@ -1972,7 +1980,7 @@ mod tests {
 
     /// How a relay asks the client to authenticate.
     #[derive(Clone, Copy, Debug)]
-    enum AuthAsk {
+    pub(crate) enum AuthAsk {
         /// `CLOSED` with an `auth-required:` reason.
         Refusal,
         /// EOSE with NIP-67 `auth`.
@@ -1981,8 +1989,9 @@ mod tests {
 
     /// A relay that answers its first REQ with `first` and asks for
     /// authentication as `asks` says, authenticates the client, and answers
-    /// the next REQ with `second` and EOSE.
-    async fn refusing_relay(
+    /// the next REQ with `second` and EOSE. A REQ sent again before the
+    /// client authenticated is refused again.
+    pub(crate) async fn refusing_relay(
         asks: AuthAsk,
         first: Event,
         second: Event,
@@ -1995,6 +2004,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut reqs = 0;
+            let mut authenticated = false;
             while let Some(Ok(message)) = socket.next().await {
                 let Ws::Text(text) = message else {
                     continue;
@@ -2004,16 +2014,23 @@ mod tests {
                     (Some("REQ"), Some(id)) => {
                         reqs += 1;
                         if reqs == 1 {
+                            // NIP-67: the challenge comes before the hint.
                             vec![
                                 serde_json::json!(["EVENT", id, first]),
+                                serde_json::json!(["AUTH", "challenge"]),
                                 match asks {
                                     AuthAsk::Refusal => {
                                         serde_json::json!(["CLOSED", id, "auth-required: sign in"])
                                     }
                                     AuthAsk::Hint => serde_json::json!(["EOSE", id, ["auth"]]),
                                 },
-                                serde_json::json!(["AUTH", "challenge"]),
                             ]
+                        } else if !authenticated {
+                            vec![serde_json::json!([
+                                "CLOSED",
+                                id,
+                                "auth-required: too early"
+                            ])]
                         } else {
                             vec![
                                 serde_json::json!(["EVENT", id, second]),
@@ -2022,6 +2039,7 @@ mod tests {
                         }
                     }
                     (Some("AUTH"), _) => {
+                        authenticated = true;
                         vec![serde_json::json!(["OK", frame[1]["id"], true, ""])]
                     }
                     _ => Vec::new(),
