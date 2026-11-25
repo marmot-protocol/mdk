@@ -6319,6 +6319,14 @@ where
                     transport: Some(wire.clone()),
                 },
             );
+            // The audit writes above may have waited past the deadline.
+            if matches!(
+                fanout.exact_message.envelope,
+                TransportEnvelope::Welcome { .. }
+            ) && self.welcome_past_deadline(message_id)?
+            {
+                return Ok(());
+            }
             let mut pass_accepted = Vec::new();
             let mut pass_failed = Vec::new();
             // Concurrent single-endpoint publishes with `required_acks: 1`,
@@ -7343,6 +7351,16 @@ where
         match self.prepare_legacy_publish(message, output, context, retry_immediately)? {
             PreparedLegacyPublish::Complete(status) => Ok(status),
             PreparedLegacyPublish::Network(mut attempt) => {
+                // Preparation's writes may have waited past the deadline.
+                if attempt
+                    .deliver_until
+                    .is_some_and(|deliver_until| self.wall_clock.now() >= deliver_until)
+                {
+                    return Ok(PublishStatus {
+                        withdrawn: true,
+                        ..PublishStatus::default()
+                    });
+                }
                 if let Some(pass) = attempt.v5_welcome.as_mut() {
                     pass.start(&self.audit);
                 }
@@ -7475,19 +7493,6 @@ where
         let audit_group_id = target_group_id
             .clone()
             .or_else(|| welcome_facts.as_ref().map(|facts| facts.group_id.clone()));
-        self.record_audit_event(
-            audit_group_id.as_ref(),
-            Some(publish_context.clone()),
-            AuditEventKind::PublishAttempt {
-                msg_id: msg_id_hex.clone(),
-                artifact_kind,
-                target_kind: target_kind.clone(),
-                relay_url: None,
-                relay_urls: relay_urls.clone(),
-                required_acks: required_acks as u64,
-                transport: Some(wire.clone()),
-            },
-        );
         let fanout = if let Some(fanout) = existing_fanout {
             fanout
         } else {
@@ -7576,6 +7581,21 @@ where
                 awaits_commit: false,
             }));
         }
+        // Recorded only for a pass that asks a relay: one whose every relay is
+        // still inside its backoff asks none.
+        self.record_audit_event(
+            audit_group_id.as_ref(),
+            Some(publish_context.clone()),
+            AuditEventKind::PublishAttempt {
+                msg_id: msg_id_hex.clone(),
+                artifact_kind,
+                target_kind: target_kind.clone(),
+                relay_url: None,
+                relay_urls: relay_urls.clone(),
+                required_acks: required_acks as u64,
+                transport: Some(wire.clone()),
+            },
+        );
         let attempt_target = publish_target_with_endpoints(&target, retry_endpoints.clone());
         let attempt_required_acks = required_acks
             .max(1)

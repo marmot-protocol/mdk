@@ -282,7 +282,14 @@ where
                 group_id: _,
                 mut effects,
             } = metadata;
-            let status = match completion.expect("every Welcome publish completed") {
+            let completion = completion.expect("every Welcome publish completed");
+            // A Welcome no relay was asked for, every relay inside its backoff
+            // or a wave holding it, has not failed again.
+            let deferred_unasked = matches!(
+                &completion,
+                LegacyPublishCompletion::Complete(status) if status.retry_deferred
+            );
+            let status = match completion {
                 LegacyPublishCompletion::Complete(status) => Ok(status),
                 LegacyPublishCompletion::Network(attempt, result) => {
                     self.finish_prepared_legacy_publish(*attempt, result, &mut effects)
@@ -304,6 +311,7 @@ where
                 && !status.withdrawn
                 && !status.awaits_commit
                 && !status.met_required_acks
+                && !deferred_unasked
                 && let Some(recipient) = recipient
             {
                 effects.welcome_failures.push(self.welcome_delivery_failure(
@@ -351,7 +359,10 @@ where
     /// Whether the retained Welcome `message_id` is past its delivery
     /// deadline (`Engine::sent_welcome_deliver_until`) by this runtime's
     /// wall clock, so that nothing publishes it again (mdk#3589).
-    fn welcome_past_deadline(&self, message_id: &cgka_traits::MessageId) -> AccountResult<bool> {
+    pub(super) fn welcome_past_deadline(
+        &self,
+        message_id: &cgka_traits::MessageId,
+    ) -> AccountResult<bool> {
         Ok(self
             .session
             .sent_welcome_deliver_until(message_id)?
@@ -648,18 +659,16 @@ where
 
     /// Watch Welcomes read from the store, except one already settled: it
     /// settled before this process watched it, and a later start reads it
-    /// again, so its settlement is not this process's to audit.
-    /// Without a v5 recorder no settlement is audited, so none is read.
+    /// again, so its settlement is neither this process's to audit nor to
+    /// announce. A host reads it from the delivery query (mdk#3589).
     fn adopt_stored_welcomes(&mut self, ids: impl IntoIterator<Item = cgka_traits::MessageId>) {
         let now = self.wall_clock.now();
-        let audited = self.audit.records_v5();
         for id in ids {
             if self.watched_welcomes.contains(&id)
-                || (audited
-                    && matches!(
-                        self.session.outbound_welcome_status(&id, now),
-                        Ok(OutboundWelcomeStatus::Settled(_))
-                    ))
+                || matches!(
+                    self.session.outbound_welcome_status(&id, now),
+                    Ok(OutboundWelcomeStatus::Settled(_))
+                )
             {
                 continue;
             }

@@ -15,6 +15,19 @@ fn reopened_owed_invite(
     at: u64,
     audit: &std::path::Path,
 ) -> WithdrawalRuntime {
+    let runtime = reopened_owed_invite_unaudited(dir, group_id, welcome, adapter, at);
+    runtime.audit_recorder().swap(v5_audit_recorder(audit));
+    runtime
+}
+
+/// [`reopened_owed_invite`] recording no v5 audit.
+fn reopened_owed_invite_unaudited(
+    dir: &std::path::Path,
+    group_id: &GroupId,
+    welcome: &TransportMessage,
+    adapter: RecordingAdapter,
+    at: u64,
+) -> WithdrawalRuntime {
     let TransportEnvelope::Welcome { recipient } = welcome.envelope.clone() else {
         unreachable!("the fixture's Welcome")
     };
@@ -30,7 +43,7 @@ fn reopened_owed_invite(
                 recipient,
                 vec![TransportEndpoint("wss://carol-inbox.example".into())],
             );
-    let runtime = AccountDeviceRuntime::new(
+    AccountDeviceRuntime::new(
         nostr_welcome_session(dir.join("alice.sqlite"), &key, b"alice-withdrawal"),
         adapter,
         policy,
@@ -40,9 +53,7 @@ fn reopened_owed_invite(
         Arc::new(TestWallClock::new(at)),
         Arc::new(TestMonotonicClock::default()),
         Arc::new(TestRandom::new(0)),
-    );
-    runtime.audit_recorder().swap(v5_audit_recorder(audit));
-    runtime
+    )
 }
 
 fn expired_rows(audit: &std::path::Path) -> Vec<serde_json::Value> {
@@ -74,7 +85,8 @@ async fn ask_every_publisher(runtime: &mut WithdrawalRuntime, welcome: &Transpor
 /// after. It then settles as expired: audited once as `welcome_withdrawn`
 /// (`expired`), out of the owed list, and read by the host as `Undeliverable`
 /// with what its last attempt found, announced once. A restart publishes
-/// nothing for it and changes none of that.
+/// nothing for it and changes none of that, and announces nothing again,
+/// with or without a v5 audit.
 #[tokio::test]
 async fn an_invite_welcome_no_relay_acknowledges_ends_at_its_deadline() {
     let dir = relaxed_storage_dir().unwrap();
@@ -168,6 +180,14 @@ async fn an_invite_welcome_no_relay_acknowledges_ends_at_its_deadline() {
         }
     );
     assert!(expired_rows(&restart_audit).is_empty(), "recorded once");
+    assert!(restarted.take_welcome_delivery_changes().is_empty());
+    drop(restarted);
+
+    let mut unaudited =
+        reopened_owed_invite_unaudited(dir.path(), &group_id, &welcome, adapter.clone(), deadline.0 + 120);
+    ask_every_publisher(&mut unaudited, &welcome).await;
+    assert!(welcome_publishes(&adapter).is_empty());
+    assert!(unaudited.take_welcome_delivery_changes().is_empty());
 }
 
 /// A relay that acknowledges the Welcome a second before its deadline
@@ -305,11 +325,15 @@ async fn the_startup_pass_respects_a_relays_backoff() {
         .expect("the Welcome is owed");
     assert_eq!(owed, vec![welcome.id.clone()]);
     assert!(task.message_ids().is_empty(), "inside the relay's backoff");
-    restarted
+    let finished = restarted
         .finish_welcome_publish_task(task.run().await)
         .await
         .unwrap();
     assert!(welcome_publishes(&adapter).is_empty());
+    assert!(
+        finished.welcome_failures.is_empty(),
+        "no relay was asked, so nothing failed again"
+    );
 
     // With no attempt on record, the startup pass sends it at once.
     restarted
