@@ -4558,6 +4558,82 @@ async fn automatic_inbox_rechecks_after_signing_and_requires_real_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_inbox_retry_keeps_signed_bytes_until_absence_is_rechecked() {
+    use transport_nostr::DirectoryInspectionError::Unreachable;
+
+    let (dir, first, network, keys, id) = fixture_with_options(OnboardingOptions {
+        create_missing_inbox_list: true,
+        ..options()
+    })
+    .await;
+    let step = OnboardingStep::InboxRelays;
+    network.zero_acks.store(true, Ordering::SeqCst);
+    let snapshot = inbox_step(
+        &first,
+        &network,
+        &keys,
+        &id,
+        vec![
+            vec!["r".into(), "wss://healthy.example".into()],
+            vec!["r".into(), "wss://declared.example".into()],
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(
+        snapshot.steps[step.index()].status,
+        OnboardingStatus::RetryableFailure
+    );
+    let pending = network.attempts.lock()[0].clone();
+    first.shutdown_and_close().await.unwrap();
+    let reopened = runtime(dir.path(), network.clone());
+    let setup = reopened.account_setup();
+
+    network
+        .inspection_errors
+        .lock()
+        .insert("declared.example".into(), Unreachable);
+    let snapshot = setup.retry_onboarding_step(&id, step).await.unwrap();
+    assert_eq!(
+        snapshot.steps[step.index()].status,
+        OnboardingStatus::RetryableFailure
+    );
+    let checkpoint = reopened
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.signed_repair, Some(pending));
+    assert_eq!(network.attempts.lock().len(), 1);
+
+    let existing = signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://healthy.example".into()]],
+        "",
+        unix_now_seconds() - 60,
+    );
+    network.events.lock().push(existing.clone());
+    let snapshot = setup.retry_onboarding_step(&id, step).await.unwrap();
+    assert_eq!(
+        snapshot.steps[step.index()].status,
+        OnboardingStatus::Passed
+    );
+    assert!(snapshot.created_inbox_list.is_none());
+    assert_eq!(network.attempts.lock().len(), 1);
+    let checkpoint = reopened
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.records[step.index()], Some(existing));
+    assert!(checkpoint.signed_repair.is_none());
+    reopened.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_inbox_creation_searches_a_distinct_recommended_relay() {
     let (_dir, runtime, network, keys, id) = fixture_with_options(OnboardingOptions {
         discovery_relays: vec!["wss://discovery.example".into()],
