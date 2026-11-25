@@ -119,7 +119,8 @@ user asks, and then own the queue result until the change merges.
   version, workspace package versions in `Cargo.lock`, or vector `conformance_version` values during feature, fix,
   binding, or review-feedback work unless the user explicitly requests that version bump. The post-release move of
   master to the next `X.Y.0-dev` is one of those release operations; see `release.md#development-versions`.
-- Keep binding READMEs and complete method references current with API changes; run `just binding-docs-gate`.
+- Keep binding READMEs and authored `API-GUIDE.md` files current with API changes. Run `just binding-docs-gate`;
+  do not commit the generated references or header.
   Starting with 0.10.2, every release requires concise `docs/release/<version>.md` notes and a detailed
   `docs/integration/<version>.md` companion, indexed and linked both ways. Follow `release.md#release-documentation`:
   distinguish required changes, new defaults, optional adoption and automatic fixes; preserve supported lower-level

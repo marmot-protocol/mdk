@@ -188,8 +188,8 @@ Starting with **0.10.2**, each release has two companion documents:
   update the [integration index](docs/integration/README.md).
 
 The binding [README](crates/marmot-uniffi/README.md) is the current conceptual integration
-reference; its [method inventory](crates/marmot-uniffi/API-REFERENCE.md) and the
-[C symbol inventory](crates/marmot-c/API-REFERENCE.md) must match the release source.
+reference; its [method inventory](crates/marmot-uniffi/API-GUIDE.md) and the
+[C symbol inventory](crates/marmot-c/API-GUIDE.md) must match the release source.
 These current references and versioned guides serve different purposes: avoid copying
 an entire current reference into every release note.
 

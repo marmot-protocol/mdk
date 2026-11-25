@@ -186,7 +186,7 @@ jobs:
       - name: C binding command-surface parity gate
         run: python3 scripts/check_c_binding_parity.py
 
-      - name: Complete binding documentation inventory
+      - name: Generate UniFFI method reference and test the generator
         run: |
           python3 scripts/check_binding_docs.py
           python3 scripts/test_check_binding_docs.py
@@ -437,16 +437,20 @@ jobs:
         with:
           tool: cbindgen@0.29.4
 
-      - name: Header diff gate
+      - name: Generate C header and both API references
         run: |
-          set -euo pipefail
-          # Pin the exact version so a newer cbindgen can't reformat the
-          # checked-in header and fail the diff gate on unrelated PRs.
-          # RUSTC_BOOTSTRAP=1 lets cbindgen expand the mirror-generating
-          # macros on stable; it only affects header generation.
-          RUSTC_BOOTSTRAP=1 cbindgen --config crates/marmot-c/cbindgen.toml --crate marmot-c \
-            --output crates/marmot-c/include/marmot.h crates/marmot-c
-          git diff --exit-code crates/marmot-c/include/marmot.h
+          bash crates/marmot-c/c-header.sh
+          python3 scripts/check_binding_docs.py --with-c
+
+      - name: Upload binding references and C header
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: binding-references-${{ github.run_attempt }}
+          path: |
+            crates/marmot-c/API-REFERENCE.md
+            crates/marmot-c/include/marmot.h
+            crates/marmot-uniffi/API-REFERENCE.md
+          if-no-files-found: error
 
       - name: Alloc-audit tests
         run: cargo test -p marmot-c --features alloc-audit --locked

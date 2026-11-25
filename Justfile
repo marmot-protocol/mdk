@@ -645,14 +645,12 @@ naming-gate:
         exit 1
     fi
 
-# Regenerate the checked-in C header from crates/marmot-c (CI diff-gates it).
-# RUSTC_BOOTSTRAP=1 lets cbindgen expand the mirror-generating macros on
-# the stable toolchain; it only affects header generation, not builds.
+# Generate the C header from crates/marmot-c.
 c-header:
-    RUSTC_BOOTSTRAP=1 cbindgen --config crates/marmot-c/cbindgen.toml --crate marmot-c --output crates/marmot-c/include/marmot.h crates/marmot-c
+    bash crates/marmot-c/c-header.sh
 
 # Build marmot-c and compile+run the C smoke test (valgrind when available).
-c-smoke:
+c-smoke: c-header
     ./crates/marmot-c/c-smoke.sh
 
 # Generate host bindings and run chat-screen DTO round trips (swift or kotlin).
@@ -665,9 +663,9 @@ uniffi-projections-smoke language="swift":
 c-parity-gate:
     python3 scripts/check_c_binding_parity.py
 
-# Keep the complete client method inventories aligned with source/header signatures.
-binding-docs-gate:
-    python3 scripts/check_binding_docs.py
+# Generate both complete API references and test the generator.
+binding-docs-gate: c-header
+    python3 scripts/check_binding_docs.py --with-c
     python3 scripts/test_check_binding_docs.py
 
 # Unreleased entries live as fragments in each changelog.d/ (see AGENTS.md).
@@ -684,11 +682,6 @@ changelog-release version *changelogs:
 binding-build-gate:
     python3 crates/marmot-uniffi/test-build-phases.py
     python3 crates/marmot-uniffi/test-android-artifact.py
-
-# Refresh mechanical signatures/source links while preserving integration prose.
-# New exports are scaffolded and remain failing until an author completes their guidance.
-binding-docs-update:
-    python3 scripts/check_binding_docs.py --write
 
 # Keep convergence policy, resource, scheduler, and history-recovery constants
 # attached to reviewed convergence-constant ledger entries.

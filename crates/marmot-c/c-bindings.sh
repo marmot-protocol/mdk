@@ -4,7 +4,7 @@
 # Outputs (under <crate>/output/):
 #   lib/libmarmot_c.so       (cdylib, host target)
 #   lib/libmarmot_c.a        (staticlib, host target)
-#   include/marmot.h         (checked-in cbindgen header, copied)
+#   include/marmot.h         (generated from the same checkout)
 #   lib/pkgconfig/marmot-c.pc
 
 set -euo pipefail
@@ -42,6 +42,9 @@ CRATE_NAME="marmot-c"
 LIB_BASENAME="marmot_c"
 
 cd "$WORKSPACE_DIR"
+
+echo "==> Generating C header"
+bash "$CRATE_DIR/c-header.sh"
 
 echo "==> Cleaning previous output"
 rm -rf "$OUT_DIR"

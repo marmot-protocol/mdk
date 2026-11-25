@@ -108,6 +108,11 @@ jobs:
       # published to a public GitHub Release, so they are built from a clean
       # target directory rather than from a restorable (poisonable) cache.
 
+      - name: Install cbindgen
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: cbindgen@0.29.4
+
       - name: Build C bindings
         shell: bash
         run: ./crates/marmot-c/c-bindings.sh

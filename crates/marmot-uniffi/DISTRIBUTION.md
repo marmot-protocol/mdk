@@ -7,7 +7,7 @@ Android consumers unpack the Kotlin and JNI bundle into their app build.
 The shared Apple Swift asset forwards Swift task cancellation from throwing async calls to their native futures,
 except calls whose work must finish, such as `shutdownAndClose()`, which still run to completion
 ([threading model](README.md#threading-model)). It includes MDK's
-[`nextCancellable()` subscription adapters](API-REFERENCE.md#swift-cancellation-adapters).
+[`nextCancellable()` subscription adapters](API-GUIDE.md#swift-cancellation-adapters).
 Remove any host-owned copy of `CancellablePresentedChatList.swift` when adopting this asset, or Swift
 will reject the duplicate methods. The existing Swift asset hash covers the generated bindings and adapters together;
 there is no extra support-file download.
