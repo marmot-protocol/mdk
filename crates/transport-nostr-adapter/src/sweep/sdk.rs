@@ -218,9 +218,10 @@ impl SweepRelay for SdkSweepRelay {
             return SliceReply::Unreachable(UnreachableKind::Disconnected);
         };
         match failed_end(reply.end) {
-            // NIP-67 `auth`: the relay may hold events back until the client
-            // authenticates. That asks for authentication, as an
-            // `auth-required:` refusal does; splitting the slice cannot help.
+            // NIP-67 `auth` after the finite request's retry: the relay may
+            // still hold events back until the client authenticates, so it
+            // stands as an `auth-required:` refusal would; splitting the
+            // slice cannot help.
             Ok(()) if reply.auth => SliceReply::Closed(ClosedReason(Some(
                 TransportEndpointRejectionCategory::AuthRequired,
             ))),

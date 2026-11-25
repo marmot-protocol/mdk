@@ -37,8 +37,8 @@ use crate::finite_req::{FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests, is
 use crate::network_proxy as process_proxy;
 use crate::sweep::hint_tap::{EoseHints, HintTransport};
 use crate::{
-    DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, NostrAcquisitionCancellation, NostrAcquisitionEnd,
-    NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionLimits,
+    DeliveryRoute, EoseReply, MAX_DELIVERY_LOSS_ROUTES, NostrAcquisitionCancellation,
+    NostrAcquisitionEnd, NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionLimits,
     NostrAcquisitionRequest, NostrAcquisitionResult, NostrAcquisitionScope, NostrAcquisitionStats,
     NostrEventPublishRequest, NostrNotificationLoss, NostrNotificationLossBounds,
     NostrNotificationLossFloor, NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome,
@@ -2230,8 +2230,11 @@ async fn dispatch_sdk_notification(
                         .handle_relay_eose_reply(
                             endpoint,
                             subscription_id.to_string(),
-                            sent_nothing && !hints.contains(&EoseHint::More),
-                            hints.contains(&EoseHint::Auth),
+                            EoseReply {
+                                sent_nothing,
+                                more: hints.contains(&EoseHint::More),
+                                auth: hints.contains(&EoseHint::Auth),
+                            },
                         )
                         .await;
                 }
@@ -9630,10 +9633,10 @@ mod tests {
         root.shutdown().await;
     }
 
-    /// A live REQ's EOSE hints are part of its count (mdk#3689). NIP-67
-    /// `more` says the relay cut its reply, so even an empty one is not a
-    /// reply whose relay sent nothing; `auth` says it may hold events back
-    /// until the client authenticates, whatever it sent.
+    /// A live REQ's EOSE hints reach its count (mdk#3689): NIP-67 `auth`
+    /// says the relay may hold events back until the client authenticates,
+    /// whatever it sent, and `more` on an empty reply says it cut everything
+    /// it sent. Either count is withheld.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_live_count_keeps_its_eose_hints() {
         let mut wire = ReplayWire::new().await;
@@ -9695,8 +9698,7 @@ mod tests {
         .expect("both REQs count their EOSE");
         for (group, count) in counts {
             assert_eq!(count.events, usize::from(group), "group: {group}");
-            assert!(!count.sent_nothing, "group: {group}");
-            assert_eq!(count.auth, group, "only the group's EOSE said auth");
+            assert!(count.withheld, "group: {group}");
         }
         forwarder.abort();
         let _ = forwarder.await;

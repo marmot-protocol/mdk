@@ -399,8 +399,9 @@ impl FiniteRequests {
     }
 
     /// Ask `relay` for `filter`'s events until its EOSE, within `limits`. A
-    /// relay that requires NIP-42 authentication is asked once more under a
-    /// new id after the client authenticates, within what the refused attempt
+    /// relay that requires NIP-42 authentication (an `auth-required:`
+    /// refusal, or an EOSE carrying NIP-67 `auth`) is asked once more under a
+    /// new id after the client authenticates, within what the first attempt
     /// left of `limits`; the reply carries both attempts' events and counts.
     pub async fn fetch(
         &self,
@@ -432,8 +433,11 @@ impl FiniteRequests {
         let first = self
             .request(relay, &filters, limits, deadline, cancel)
             .await;
-        let auth_required =
-            matches!(&first.end, FiniteEnd::Closed(reason) if is_auth_required(reason));
+        let auth_required = match &first.end {
+            FiniteEnd::Closed(reason) => is_auth_required(reason),
+            FiniteEnd::Eose => first.auth,
+            _ => false,
+        };
         let Some(mut watch) = auth.take_if(|_| auth_required && self.0.can_authenticate) else {
             return first;
         };
@@ -1923,16 +1927,29 @@ mod tests {
     }
 
     /// A refusal partway through a page keeps that page: the retry's reply
-    /// continues the refused attempt's, within what it left of the budget.
+    /// continues the refused attempt's, within what it left of the budget. An
+    /// EOSE carrying NIP-67 `auth` asks for authentication as the refusal
+    /// does (mdk#3689).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_retry_after_authentication_continues_the_refused_page() {
         let keys = Keys::generate();
         let [a, b] = ["a", "b"].map(|content| note(&keys, content));
-        for (max_items, end, kept) in [
-            (10, FiniteEnd::Eose, vec![a.clone(), b.clone()]),
-            (1, FiniteEnd::ItemLimit, vec![a.clone()]),
+        for (asks, max_items, end, kept) in [
+            (
+                AuthAsk::Refusal,
+                10,
+                FiniteEnd::Eose,
+                vec![a.clone(), b.clone()],
+            ),
+            (AuthAsk::Refusal, 1, FiniteEnd::ItemLimit, vec![a.clone()]),
+            (
+                AuthAsk::Hint,
+                10,
+                FiniteEnd::Eose,
+                vec![a.clone(), b.clone()],
+            ),
         ] {
-            let (url, server) = refusing_relay(a.clone(), b.clone()).await;
+            let (url, server) = refusing_relay(asks, a.clone(), b.clone()).await;
             let (finite, client) = client_on(Some(Keys::generate()), &url).await;
             let relay = client.relay(&url).await.unwrap().unwrap();
             let reply = finite
@@ -1943,18 +1960,30 @@ mod tests {
                     &CancellationToken::new(),
                 )
                 .await;
-            assert_eq!(reply.end, end, "budget {max_items}");
-            assert_eq!(reply.events, kept, "budget {max_items}");
-            assert_eq!(reply.raw_items, 2, "budget {max_items}");
+            let case = format!("{asks:?}, budget {max_items}");
+            assert_eq!(reply.end, end, "{case}");
+            assert_eq!(reply.events, kept, "{case}");
+            assert_eq!(reply.raw_items, 2, "{case}");
+            assert!(!reply.auth, "{case}: the retry's reply holds nothing back");
             client.shutdown().await;
             server.abort();
         }
     }
 
-    /// A relay that answers its first REQ with `first` and an
-    /// `auth-required` refusal, authenticates the client, and answers the
-    /// next REQ with `second` and EOSE.
+    /// How a relay asks the client to authenticate.
+    #[derive(Clone, Copy, Debug)]
+    enum AuthAsk {
+        /// `CLOSED` with an `auth-required:` reason.
+        Refusal,
+        /// EOSE with NIP-67 `auth`.
+        Hint,
+    }
+
+    /// A relay that answers its first REQ with `first` and asks for
+    /// authentication as `asks` says, authenticates the client, and answers
+    /// the next REQ with `second` and EOSE.
     async fn refusing_relay(
+        asks: AuthAsk,
         first: Event,
         second: Event,
     ) -> (RelayUrl, tokio::task::JoinHandle<()>) {
@@ -1977,7 +2006,12 @@ mod tests {
                         if reqs == 1 {
                             vec![
                                 serde_json::json!(["EVENT", id, first]),
-                                serde_json::json!(["CLOSED", id, "auth-required: sign in"]),
+                                match asks {
+                                    AuthAsk::Refusal => {
+                                        serde_json::json!(["CLOSED", id, "auth-required: sign in"])
+                                    }
+                                    AuthAsk::Hint => serde_json::json!(["EOSE", id, ["auth"]]),
+                                },
                                 serde_json::json!(["AUTH", "challenge"]),
                             ]
                         } else {

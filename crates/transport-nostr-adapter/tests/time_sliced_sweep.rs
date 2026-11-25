@@ -558,9 +558,10 @@ async fn rate_limited_closed_is_waited_out() {
 }
 
 /// A relay that ends a slice with NIP-67 `auth` may hold events back until
-/// the client authenticates (mdk#3689): the reply is the relay asking for
-/// authentication, as an `auth-required:` refusal is, and never a covered
-/// slice. Nothing is admitted and the cursor stays, so the slice stays owed.
+/// the client authenticates (mdk#3689). A client that cannot authenticate
+/// gets no retry, so the reply stands as an `auth-required:` refusal would,
+/// never a covered slice: nothing is admitted and the cursor stays, so the
+/// slice stays owed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_auth_hint_leaves_the_slice_owed() {
     let fixture = Fixture::new().await;

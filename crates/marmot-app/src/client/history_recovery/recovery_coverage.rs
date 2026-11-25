@@ -171,10 +171,10 @@ impl LiveCoverage {
     /// filter carries: at its count's `live_from` (its `requested_at`, or its
     /// EOSE for a REQ the relay pool sent again), unless the relay sent no
     /// stored event older than that, so it may have cut what it stored
-    /// after; then just past the oldest it sent. A count whose EOSE carried
-    /// NIP-67 `auth` has no tail: its relay may hold events back until the
-    /// client authenticates. `released` moves a start on a route past the
-    /// seconds released for replay there, or drops it.
+    /// after; then just past the oldest it sent. A count whose relay said it
+    /// held events back has no tail ([`ReplayLiveCount::withheld`]).
+    /// `released` moves a start on a route past the seconds released for
+    /// replay there, or drops it.
     fn tails(
         &self,
         facts: &[LiveCountFact],
@@ -182,7 +182,7 @@ impl LiveCoverage {
     ) -> LiveTails {
         let mut tails = LiveTails::default();
         for fact in facts.iter().filter(|fact| {
-            !fact.ended && fact.placed && !fact.count.auth && !self.broken.contains(&fact.key)
+            !fact.ended && fact.placed && !fact.count.withheld && !self.broken.contains(&fact.key)
         }) {
             let count = &fact.count;
             let since = match count.oldest {
@@ -380,9 +380,9 @@ impl AppClient {
 /// unless the wire showed the relay sent no EVENT frame at all
 /// ([`ReplayLiveCount::sent_nothing`]): a relay that sent nothing cut
 /// nothing, so the count proves its whole window from `since`. A count whose
-/// EOSE carried NIP-67 `auth` proves nothing ([`ReplayLiveCount::auth`]).
+/// relay said it held events back proves nothing ([`ReplayLiveCount::withheld`]).
 fn live_boundary_since(since: u64, count: &ReplayLiveCount) -> Option<u64> {
-    if count.auth {
+    if count.withheld {
         return None;
     }
     if count.events == 0 {
