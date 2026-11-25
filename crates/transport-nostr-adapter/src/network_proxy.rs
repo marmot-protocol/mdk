@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 
 // Match nostr-sdk's private default transport header. The socket regression
 // compares both transports so an SDK upgrade cannot silently diverge.
-const SDK_USER_AGENT: &str = "nostr-sdk/0.45.4";
+const SDK_USER_AGENT: &str = "nostr-sdk/0.45.6";
 
 /// Privacy-safe error for invalid process proxy configuration.
 pub const CONFIG_ERROR: &str = "invalid SOCKS5 configuration: WN_SOCKS5_PROXY requires a numeric IP and nonzero port; WN_SOCKS5_USERNAME and WN_SOCKS5_PASSWORD must both be empty or both be 1..255 UTF-8 bytes without NUL, with a proxy endpoint";
