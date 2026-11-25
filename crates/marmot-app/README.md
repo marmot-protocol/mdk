@@ -199,13 +199,14 @@ version.
 kind `0` profile, and an initial last-resort Marmot kind `30443` KeyPackage from a default relay set. Account setup
 requires acknowledgements from its operational relays.
 
-Interactive sign-in keeps a notice before initial KeyPackage publication: signing
-in alone does not restore existing chats or messages. The historical `SingleDevice`
-step and acknowledgment APIs retain their names and consent rules, but current
-findings no longer declare all multi-device use unsupported. See the shared
+Before publishing an initial KeyPackage, interactive sign-in checks for evidence
+of other installations. Its `SingleDevice` notice explains that signing in
+alone does not restore existing chats or messages. The notice requires
+acknowledgment by default. A host can set
+`OnboardingOptions.pass_device_notice_when_none_found` to continue immediately
+after complete discovery with no other installations found. The snapshot still
+includes the notice for display. See the shared
 [notice copy and advisory discovery limits](../marmot-uniffi/README.md#single-device-notice).
-Hosts adopt that presentation through localization; MDK owns the pause, discovery
-and publication gate.
 
 - KeyPackages are published to (and fetched from) the account's NIP-65 relays; there is no dedicated KeyPackage relay
   list.

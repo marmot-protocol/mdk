@@ -3562,7 +3562,7 @@ Record Continue anyway for the displayed notice, then resume setup.
 pub async fn begin_onboarding( &self, nsec: String, options: OnboardingOptionsFfi, ) -> Result<OnboardingSnapshotFfi, MarmotKitError>
 ```
 
-Persist the identity and return before any network preflight or publication.
+Persist the identity and return before any network preflight or publication. Set `pass_device_notice_when_none_found` in the options to pass the device notice after complete discovery with no other installation found.
 
 [Source](src/commands/onboarding.rs#L114)
 
@@ -3574,7 +3574,7 @@ Persist the identity and return before any network preflight or publication.
 pub async fn begin_external_signer_onboarding( &self, public_key: String, signer: Arc<dyn ExternalAccountSignerFfi>, options: OnboardingOptionsFfi, ) -> Result<OnboardingSnapshotFfi, MarmotKitError>
 ```
 
-Begin interactive identity-only onboarding with a host signer; signer remains host-owned and must be registered after reconstruction.
+Begin interactive identity-only onboarding with a host signer; signer remains host-owned and must be registered after reconstruction. The device-notice option has the same behavior as in `begin_onboarding`.
 
 [Source](src/commands/onboarding.rs#L126)
 

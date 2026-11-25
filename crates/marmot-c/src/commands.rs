@@ -3620,6 +3620,7 @@ pub unsafe extern "C" fn marmot_begin_onboarding(
             default_relays,
             discovery_relays,
             inbox_relays,
+            pass_device_notice_when_none_found: false,
         };
         unsafe {
             deliver(

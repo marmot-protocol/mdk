@@ -537,6 +537,9 @@ pub struct OnboardingOptionsFfi {
     /// Recommended kind-10050 inbox relays. Empty uses `default_relays`.
     #[uniffi(default = [])]
     pub inbox_relays: Vec<String>,
+    /// Let complete discovery with no other installation pass the device notice.
+    #[uniffi(default = false)]
+    pub pass_device_notice_when_none_found: bool,
 }
 impl From<marmot_app::OnboardingOptions> for OnboardingOptionsFfi {
     fn from(value: marmot_app::OnboardingOptions) -> Self {
@@ -544,6 +547,7 @@ impl From<marmot_app::OnboardingOptions> for OnboardingOptionsFfi {
             default_relays: value.default_relays,
             discovery_relays: value.discovery_relays,
             inbox_relays: value.inbox_relays,
+            pass_device_notice_when_none_found: value.pass_device_notice_when_none_found,
         }
     }
 }
@@ -553,6 +557,7 @@ impl From<OnboardingOptionsFfi> for marmot_app::OnboardingOptions {
             default_relays: value.default_relays,
             discovery_relays: value.discovery_relays,
             inbox_relays: value.inbox_relays,
+            pass_device_notice_when_none_found: value.pass_device_notice_when_none_found,
         }
     }
 }

@@ -632,6 +632,10 @@ pub struct OnboardingOptions {
     /// `default_relays`, which otherwise serve both relay-list steps.
     #[serde(default)]
     pub inbox_relays: Vec<String>,
+    /// Let complete discovery with no other installation pass the device notice.
+    /// The notice remains available in the snapshot.
+    #[serde(default)]
+    pub pass_device_notice_when_none_found: bool,
 }
 impl OnboardingOptions {
     /// The recommended relays for a relay-list step.
@@ -2382,9 +2386,8 @@ impl AccountSetup<'_> {
             return Err(onboarding_error());
         }
         let options = OnboardingOptions {
-            default_relays: c.options.default_relays.clone(),
             discovery_relays,
-            inbox_relays: c.options.inbox_relays.clone(),
+            ..c.options.clone()
         };
         self.validate_onboarding_options(&options)?;
         c.options = options;

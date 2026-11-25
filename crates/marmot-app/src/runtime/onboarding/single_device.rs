@@ -117,6 +117,11 @@ impl AccountSetup<'_> {
                 checkpoint.single_device_acknowledged = true;
                 OnboardingStatus::Passed
             }
+            None if checkpoint.options.pass_device_notice_when_none_found
+                && discovery == OnboardingDeviceDiscovery::NoneFound =>
+            {
+                OnboardingStatus::Passed
+            }
             None => OnboardingStatus::NeedsInput,
         };
         checkpoint.snapshot.single_device_notice = Some(notice);

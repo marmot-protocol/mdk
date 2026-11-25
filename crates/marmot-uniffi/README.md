@@ -632,7 +632,7 @@ Imported identities can use the durable preflight API instead of `login`:
    not enum discriminants, as positions. Subscribe with `subscribe_onboarding`, read its initial
    `snapshot`, and drive `next` concurrently with `run_onboarding`.
 3. Localize the typed status, findings, and actions. A healthy account advances
-   automatically until the notice acknowledgment. `NeedsInput` offers a repair or, for profile/follows, an
+   automatically until the notice acknowledgment by default. `NeedsInput` offers a repair or, for profile/follows, an
    explicit `continue_onboarding_without`. Empty follow lists are valid.
 4. `propose_onboarding_relay_repair` previews the smallest safe change to a
    general or inbox relay declaration, preserving the original ordered tags,
@@ -768,9 +768,15 @@ unsupported evidence with this API.
 
 ### Single-device notice
 
-The historical `SingleDevice` step still pauses before initial KeyPackage publication.
-It explains what signing in alone restores, rather than declaring all multi-device
-use unsupported. Suggested localized copy:
+The historical `SingleDevice` step explains what signing in alone restores. It
+pauses before initial KeyPackage publication by default. Set
+`OnboardingOptionsFfi.pass_device_notice_when_none_found` to let the step pass
+when every discovery source answered and no other installation was found. The
+snapshot keeps the notice for display, and onboarding proceeds to the KeyPackage
+step in the same call. Incomplete discovery or evidence of another installation
+still requires acknowledgment.
+
+Suggested localized copy:
 
 **Chats on this device**
 

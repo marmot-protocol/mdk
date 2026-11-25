@@ -1466,7 +1466,7 @@ fn options() -> OnboardingOptions {
     OnboardingOptions {
         default_relays: vec!["wss://default.example".into()],
         discovery_relays: vec!["wss://index.example".into()],
-        inbox_relays: Vec::new(),
+        ..Default::default()
     }
 }
 fn runtime(path: &std::path::Path, network: Arc<Network>) -> MarmotAppRuntime {
@@ -4628,7 +4628,7 @@ fn public_indexers_join_discovery_except_on_loopback_routes() {
         let local = OnboardingOptions {
             default_relays: vec![loopback.into()],
             discovery_relays: vec![loopback.into()],
-            inbox_relays: Vec::new(),
+            ..Default::default()
         };
         let mut sources = local.discovery_relays.clone();
         append_public_indexers(&mut sources, &local, &indexers);
@@ -5125,6 +5125,21 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
             .actions
             .contains(&OnboardingAction::CancelOnboarding)
     );
+    c.options.pass_device_notice_when_none_found = true;
+    manager
+        .account_setup()
+        .check_onboarding_single_device(&mut c)
+        .await
+        .unwrap();
+    let notice = c.snapshot.single_device_notice.as_ref().unwrap();
+    assert_eq!(notice.discovery, OnboardingDeviceDiscovery::NoneFound);
+    assert!(notice.discovery_complete);
+    assert_eq!(notice.acknowledged_at, None);
+    assert_eq!(
+        c.snapshot.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::Passed
+    );
+
     network.fail_reads.store(true, Ordering::SeqCst);
     manager
         .account_setup()
@@ -5134,6 +5149,10 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
     let notice = c.snapshot.single_device_notice.as_ref().unwrap();
     assert_eq!(notice.discovery, OnboardingDeviceDiscovery::Unknown);
     assert!(!notice.discovery_complete);
+    assert_eq!(
+        c.snapshot.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::NeedsInput
+    );
     assert_no_capability_claim(&c);
     network.fail_reads.store(false, Ordering::SeqCst);
     network.events.lock().push(signed(
@@ -5157,6 +5176,10 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
             .findings
             .iter()
             .any(|f| f.issue == OnboardingIssue::Malformed)
+    );
+    assert_eq!(
+        c.snapshot.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::NeedsInput
     );
     assert_no_capability_claim(&c);
     manager.account_setup().save_onboarding(&mut c).unwrap();
