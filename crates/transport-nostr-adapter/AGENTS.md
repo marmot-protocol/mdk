@@ -37,7 +37,7 @@ for reconnect/backoff and relay status mechanics.
 | `tests/acquisition_contract.rs` | Request validation and optional-boundary shape tests. |
 | `tests/publish_accounting.rs` | Direct-adapter publish admission, classification, and cancellation tests, with or without `sdk`. |
 | `tests/selective_history_acquisition_tests.rs` | `sdk`-gated bounded history acquisition and reconciliation-cursor tests. |
-| `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp including raw500/validated499 with1,200valid events (#2885), NIP-77 saturated second, an inconclusive second (a listed id withheld, a malformed NEG-MSG, or repeated id-fetch events that cut a one-id reply; retried and never saturated), resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing; replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
+| `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp including raw500/validated499 with1,200valid events (#2885), NIP-77 saturated second, an inconclusive second (a listed id withheld, a malformed NEG-MSG, or repeated id-fetch events that cut a one-id reply; retried and never saturated), resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing, `auth` leaves the slice owed, and a slice retried after authentication proves nothing (a scripted auth-gated relay with an unpublished cap); replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
 | `tests/relay_limit_subscriptions.rs` | `sdk`-gated subscription behavior against `tests/support/limit_relay.rs`, a proxy enforcing strfry 1.1.3's per-connection limits (REQ and NEG caps, filter shape, 500 limit clamp). |
 
 ## Invariants
@@ -243,7 +243,11 @@ for reconnect/backoff and relay status mechanics.
   withheld id, a filled set or a cut leaves its window unproven, and a window that cannot shrink below one second
   ends `SaturatedWindow`. Certify oldest first, so a cut proves the prefix below the oldest unfetched difference.
   A relay without NIP-77 or a refused comparison proves nothing and ends the call; never read it as an empty set.
-- No NIP-67 hint proves a slice; only counting does. `more` splits, and `finish` is never read: a misread `finish`
+- No NIP-67 hint proves a slice; only counting does. `more` splits, `auth` asks for authentication as an
+  `auth-required:` refusal does (the finite request retries once after it; a slice still hinted stays owed), and
+  `finish` is never read. A reply retried after authentication (`FiniteReply::retried`) joins two pages, so it proves
+  nothing: the slice is asked once more, authenticated, and only that page counts (a relay that asks to
+  authenticate again stands as the `auth-required` refusal): a misread `finish`
   would skip history while a misread `more` only costs requests. The collector takes hints from nostr-sdk's typed
   EOSE (`RelayMessage::EndOfStoredEvents { hints }`). Do not add a hint-based `SliceProof`.
 - Every `SdkSweepRelay` REQ and every `acquire_history` request is a finite request (`src/finite_req.rs`), which
@@ -265,8 +269,8 @@ for reconnect/backoff and relay status mechanics.
   signature check. It honours cancellation and its deadline between frames, mid-page included. A request the
   collector ends (EOSE, CLOSED, a budget) charges nothing past that frame; one something else ends (cancellation,
   deadline, connection) charges every EVENT frame it was sent and did not read. An
-  `auth-required:` refusal is retried once under a new id after the client authenticates; the retry spends what the
-  refused attempt left of the budget, and the reply keeps both attempts' events and counts. Authentication still
+  `auth-required:` refusal, or an EOSE carrying NIP-67 `auth`, is retried once under a new id after the client
+  authenticates; the retry spends what the first attempt left of the budget, and the reply keeps both attempts' events and counts. Authentication still
   under way at the deadline ends the request `TimedOut` (undecided), never as the refusal. The relay plane's own
   one-shot clients get finite requests through `FiniteRequests::install`; keep that surface to `install`, `fetch`,
   `fetch_watching` with `watch_auth` (an authentication watch started before the dial), `sharing` (one byte budget
@@ -277,7 +281,9 @@ for reconnect/backoff and relay status mechanics.
   for the id not yet asked about, true only if that is also the newest (the SDK may have re-sent the id and had it
   answered before the dispatch); every EOSE frame is counted, even with no count open. The live count keeps the answer as
   `ReplayLiveCount::sent_nothing` only when the SDK counted nothing either; `marmot-app` lets only that empty count
-  prove its window. Err toward unknown: a frame the tap cannot tie to one REQ while counts are open (an unreadable EVENT
+  prove its window. An EOSE carrying NIP-67 `more` or `auth` still settles replay admission, but its reply ends
+  `Delegated`, never complete original-query coverage; `auth`, or `more` on an empty reply, sets
+  `ReplayLiveCount::withheld`, and that count proves nothing. Err toward unknown: a frame the tap cannot tie to one REQ while counts are open (an unreadable EVENT
   id, an oversized EOSE, a binary frame) spoils every open count on its connection; a REQ re-sent on the same
   connection while the relay may still answer the earlier one (open, spoiled, or closed by the client) starts unknown;
   past 1,024 REQs per relay the oldest count goes. Wrappers of a tapped client delegate `reply_sent_nothing`.

@@ -8,8 +8,11 @@
 //!
 //! Every REQ is a finite request ([`crate::finite_req`]): its replies never
 //! reach the SDK's reader, so a large page delays no live message, and its
-//! EOSE keeps the NIP-67 `more` hint the SDK's parser drops. A relay that
-//! sends no hint is proven by counting against the NIP-11 cap. A client built
+//! EOSE keeps its NIP-67 hints: `more` splits the slice, and `auth` reads as
+//! the relay asking for authentication. A reply retried after authentication
+//! joins two pages, so the slice is asked once more and only that page
+//! counts. A relay that sends no hint is proven by counting against the
+//! NIP-11 cap. A client built
 //! without finite requests ([`NostrSdkRelayClient::new`]) reads as
 //! unreachable.
 //!
@@ -213,10 +216,39 @@ impl SweepRelay for SdkSweepRelay {
     async fn fetch_slice(&self, query: SliceQuery) -> SliceReply {
         let limit = query.limit.map_or(usize::MAX, |limit| limit as usize);
         // One over the limit, so a relay that ignores `limit` reads as a cut.
-        let Some(reply) = self.acquire(query.filter(), limit.saturating_add(1)).await else {
+        let Some(mut reply) = self.acquire(query.filter(), limit.saturating_add(1)).await else {
             return SliceReply::Unreachable(UnreachableKind::Disconnected);
         };
+        // A reply retried after authentication joins two attempts' pages,
+        // which no count proves as one, and its retry ran on what the first
+        // attempt left of the budget, so a cut proves nothing either: ask the
+        // slice once more, now authenticated, and answer with that page alone.
+        if reply.retried
+            && !reply.auth
+            && matches!(
+                reply.end,
+                FiniteEnd::Eose | FiniteEnd::ItemLimit | FiniteEnd::ByteLimit
+            )
+        {
+            let Some(fresh) = self.acquire(query.filter(), limit.saturating_add(1)).await else {
+                return SliceReply::Unreachable(UnreachableKind::Disconnected);
+            };
+            // A relay that asked to authenticate again may still hold events
+            // back, however the retry ended: no further ask.
+            if fresh.retried {
+                return SliceReply::Closed(ClosedReason(Some(
+                    TransportEndpointRejectionCategory::AuthRequired,
+                )));
+            }
+            reply = fresh;
+        }
         match failed_end(reply.end) {
+            // NIP-67 `auth` after the finite request's retry: the relay may
+            // still hold events back, so it stands as an `auth-required:`
+            // refusal would; splitting the slice cannot help.
+            Ok(()) if reply.auth => SliceReply::Closed(ClosedReason(Some(
+                TransportEndpointRejectionCategory::AuthRequired,
+            ))),
             Ok(()) => SliceReply::Answered {
                 received: reply.raw_items,
                 events: reply.events,

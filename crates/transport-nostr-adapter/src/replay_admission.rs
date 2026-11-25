@@ -57,6 +57,11 @@ pub struct ReplayLiveCount {
     /// nostr-sdk drops some frames without a word, so `events` alone may be
     /// short: a count with no events proves its window only when this holds.
     pub sent_nothing: bool,
+    /// The EOSE said the relay held back events this count cannot place:
+    /// NIP-67 `auth` (it may until the client authenticates), or `more` on a
+    /// reply that sent none. Such a count proves no window and vouches for no
+    /// live tail.
+    pub withheld: bool,
 }
 
 impl ReplayLiveCount {

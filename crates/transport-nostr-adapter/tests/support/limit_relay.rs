@@ -212,6 +212,8 @@ pub struct LimitStats {
     /// NIP-67 hints sent on EOSE.
     pub finish_hints: usize,
     pub more_hints: usize,
+    /// EOSE frames rewritten to carry `auth` by `auth_hint_next_eoses`.
+    pub auth_hints: usize,
     pub neg_opens: usize,
     pub neg_rejections: BTreeMap<&'static str, usize>,
     pub neg_closes: usize,
@@ -387,6 +389,8 @@ struct Shared {
     withhold_id_events: usize,
     /// Copies of each exact-id REQ's EVENT frames to send; 0 or 1 sends one.
     id_event_copies: usize,
+    /// Upstream EOSE frames still to rewrite with a NIP-67 `auth` hint.
+    auth_hint_eoses: usize,
 }
 
 impl Shared {
@@ -625,6 +629,15 @@ impl LimitRelay {
         let mut shared = self.shared.lock().unwrap();
         shared.withhold_id_events = events;
         shared.stats.withheld_id_events = 0;
+    }
+
+    /// End the next `count` upstream EOSE frames, across connections, with a
+    /// NIP-67 `auth` hint, events forwarded unchanged: a relay that may hold
+    /// events back until the client authenticates.
+    pub fn auth_hint_next_eoses(&self, count: usize) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.auth_hint_eoses = count;
+        shared.stats.auth_hints = 0;
     }
 
     /// Send each EVENT frame of an exact-id REQ `copies` times (1 restores
@@ -1076,6 +1089,14 @@ fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) ->
         }
         // EOSE does not end a live subscription; only CLOSED does.
         "EOSE" => {
+            if shared.auth_hint_eoses > 0 {
+                shared.auth_hint_eoses -= 1;
+                shared.stats.auth_hints += 1;
+                shared.states[connection].hinted.remove(id);
+                return RelayVerdict::Rewrite(
+                    serde_json::json!(["EOSE", id, ["auth"]]).to_string(),
+                );
+            }
             if let Some(req) = shared.states[connection].hinted.remove(id) {
                 let hint = if req.limit.is_some_and(|limit| req.sent > limit) {
                     shared.stats.more_hints += 1;

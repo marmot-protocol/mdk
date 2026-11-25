@@ -892,7 +892,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. The one
   exception is `ReplayLiveCount::sent_nothing`: the account pool's wire tap saw no EVENT frame for the REQ before its
   EOSE, so the empty count proves from the REQ's `since` (`live_boundary_since`). Never derive it from anything but
-  the wire. It keeps a join from owing each quiet route a sliver
+  the wire. A count whose relay said it held events back (`ReplayLiveCount::withheld`: NIP-67 `auth`, or `more` on
+  an empty reply) proves nothing and keeps no live tail. It keeps a join from owing each quiet route a sliver
   (`a_burst_of_quiet_joins_costs_recovery_linear_in_the_joins`). It also proves a quiet group's whole history, so a
   runner fixture that owes history on a quiet group either owes it through a loss (`uncover_recovery_coverage`) after
   its live REQs went out or opts out with `MarmotApp::with_unvouched_relay_replies_for_test`; tests of the wire

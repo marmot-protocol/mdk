@@ -2639,25 +2639,24 @@ impl NostrTransportAdapter {
     /// but the recovery runner owes the older history and the reply never
     /// counts as complete coverage.
     pub async fn handle_relay_eose(&self, endpoint: TransportEndpoint, subscription_id: String) {
-        self.handle_relay_eose_reply(endpoint, subscription_id, false)
+        self.handle_relay_eose_reply(endpoint, subscription_id, EoseReply::default())
             .await;
     }
 
-    /// [`Self::handle_relay_eose`], when the wire showed whether the relay
-    /// sent any EVENT frame for the REQ before this EOSE
-    /// ([`NostrRelayClient::reply_sent_nothing`]).
+    /// [`Self::handle_relay_eose`], with what the wire and the EOSE frame
+    /// showed of the reply.
     pub(crate) async fn handle_relay_eose_reply(
         &self,
         endpoint: TransportEndpoint,
         subscription_id: String,
-        sent_nothing: bool,
+        reply: EoseReply,
     ) {
         let now_ms = self.now_ms();
         self.state.write().await.record_subscription_eose(
             &subscription_id,
             &endpoint,
             now_ms,
-            sent_nothing,
+            reply,
         );
 
         tracing::debug!(
@@ -2666,6 +2665,20 @@ impl NostrTransportAdapter {
             "handled relay eose"
         );
     }
+}
+
+/// What one relay's EOSE for a live REQ showed of its reply, besides the
+/// events the SDK delivered before it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct EoseReply {
+    /// The wire showed no EVENT frame for the REQ before it
+    /// ([`NostrRelayClient::reply_sent_nothing`]).
+    pub(crate) sent_nothing: bool,
+    /// It carried NIP-67 `more`: the relay cut its reply.
+    pub(crate) more: bool,
+    /// It carried NIP-67 `auth`: the relay may hold events back until the
+    /// client authenticates.
+    pub(crate) auth: bool,
 }
 
 /// Owns work across frontend replacement without retaining the delivery receiver.
@@ -3612,11 +3625,12 @@ impl ReplayEndpoint {
         }
     }
 
-    /// What this serial's EOSE counted in `stored`, as a live count;
-    /// `sent_nothing` when the wire showed no EVENT frame before it.
-    fn eose_count(&self, stored: StoredReplay, sent_nothing: bool) -> ReplayLiveCount {
+    /// What this serial's EOSE counted in `stored`, as a live count, with
+    /// what the wire and the EOSE frame showed of the reply.
+    fn eose_count(&self, stored: StoredReplay, reply: EoseReply) -> ReplayLiveCount {
         ReplayLiveCount {
-            sent_nothing: sent_nothing && stored.events == 0,
+            sent_nothing: reply.sent_nothing && stored.events == 0,
+            withheld: reply.auth || (reply.more && stored.events == 0),
             events: stored.events,
             oldest: stored.oldest,
             requested_at: self.requested_at,
@@ -3796,8 +3810,8 @@ enum RelayReplay {
     /// The relay reported end-of-stored-events. Final: a later `CLOSED` ends
     /// the live REQ but cannot take back history already served.
     Eose,
-    /// A full live reply ended, and the account's ledger-driven owner owes
-    /// the rest. Its received input may be admitted, but this is not complete
+    /// A full live reply ended, or one whose EOSE carried NIP-67 `more` or
+    /// `auth`, and the account's ledger-driven owner owes the rest. Its received input may be admitted, but this is not complete
     /// original-query coverage and never upgrades the EOSE coverage gate.
     Delegated,
     /// The relay ended the REQ with a dropped refusal before EOSE.
@@ -5104,12 +5118,12 @@ impl AccountReplayCoverage {
 
     #[cfg(test)]
     fn record_eose(&mut self, id: &str, relay: RelayIndex) {
-        self.record_eose_reply(id, relay, false);
+        self.record_eose_reply(id, relay, EoseReply::default());
     }
 
-    /// Record `relay`'s EOSE for `id`; `sent_nothing` when the wire showed
-    /// it sent no EVENT frame for the REQ before it.
-    fn record_eose_reply(&mut self, id: &str, relay: RelayIndex, sent_nothing: bool) {
+    /// Record `relay`'s EOSE for `id`, with what the wire and the EOSE frame
+    /// showed of the reply.
+    fn record_eose_reply(&mut self, id: &str, relay: RelayIndex, reply: EoseReply) {
         if !self
             .subscriptions
             .get(id)
@@ -5158,7 +5172,7 @@ impl AccountReplayCoverage {
                 .and_then(|relays| relays.get_mut(&relay))
                 && let Some(recount) = endpoint.recount.take()
             {
-                endpoint.install_live_count(endpoint.eose_count(recount, sent_nothing));
+                endpoint.install_live_count(endpoint.eose_count(recount, reply));
                 self.arm_fence(id, relay);
             }
             return;
@@ -5169,13 +5183,14 @@ impl AccountReplayCoverage {
             .and_then(|relays| relays.get_mut(&relay))
             .filter(|endpoint| !endpoint.stopped)
         {
-            endpoint.install_live_count(endpoint.eose_count(stored, sent_nothing));
+            endpoint.install_live_count(endpoint.eose_count(stored, reply));
             self.arm_fence(id, relay);
         }
         let Some(replay) = self.replay_mut(id, relay) else {
             return;
         };
-        *replay = if stored.events >= RELAY_REPLAY_PAGE_LIMIT {
+        // A relay that said it held events back did not answer the query.
+        *replay = if stored.events >= RELAY_REPLAY_PAGE_LIMIT || reply.more || reply.auth {
             RelayReplay::Delegated
         } else {
             RelayReplay::Eose
@@ -6102,12 +6117,12 @@ impl AdapterState {
         subscription_id: &str,
         endpoint: &TransportEndpoint,
         now_ms: u64,
-        sent_nothing: bool,
+        reply: EoseReply,
     ) {
         let relay = self.relay_index.index_for(endpoint);
         self.sync.record_eose(subscription_id, relay, now_ms);
         for coverage in self.account_replay_coverage.values_mut() {
-            coverage.record_eose_reply(subscription_id, relay, sent_nothing);
+            coverage.record_eose_reply(subscription_id, relay, reply);
         }
     }
 
@@ -7115,6 +7130,7 @@ mod batch_tests {
             requested_at,
             live_from: requested_at,
             sent_nothing: false,
+            withheld: false,
         };
         let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
         assert!(endpoint.boundary_admitted);
@@ -7400,20 +7416,64 @@ mod batch_tests {
                 .live_count
                 .map(|count| count.sent_nothing)
         };
-        coverage.record_eose_reply(&id, RelayIndex(1), true);
+        let wire = |sent_nothing| EoseReply {
+            sent_nothing,
+            ..EoseReply::default()
+        };
+        coverage.record_eose_reply(&id, RelayIndex(1), wire(true));
         assert_eq!(sent_nothing(&coverage, 1), Some(true));
         coverage.record_stored_event(&id, RelayIndex(2), 150);
-        coverage.record_eose_reply(&id, RelayIndex(2), true);
+        coverage.record_eose_reply(&id, RelayIndex(2), wire(true));
         assert_eq!(
             sent_nothing(&coverage, 2),
             Some(false),
             "the SDK counted an event"
         );
 
-        for wire in [false, true] {
+        for shown in [false, true] {
             coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
-            coverage.record_eose_reply(&id, RelayIndex(1), wire);
-            assert_eq!(sent_nothing(&coverage, 1), Some(wire), "restored");
+            coverage.record_eose_reply(&id, RelayIndex(1), wire(shown));
+            assert_eq!(sent_nothing(&coverage, 1), Some(shown), "restored");
+        }
+    }
+
+    /// A relay whose EOSE carried NIP-67 `more` or `auth` said it held events
+    /// back (mdk#3689): its input settles, but its reply is delegated, never
+    /// complete original-query coverage. `auth` withholds the count's proof
+    /// whatever it sent; `more` only when it sent nothing, since a cut
+    /// reply's events still prove what is newer than the oldest of them.
+    #[tokio::test]
+    async fn a_hinted_eose_delegates_its_reply() {
+        for (more, auth, events, replay, withheld) in [
+            (false, false, 0, RelayReplay::Eose, false),
+            (true, false, 0, RelayReplay::Delegated, true),
+            (true, false, 1, RelayReplay::Delegated, false),
+            (false, true, 0, RelayReplay::Delegated, true),
+            (false, true, 1, RelayReplay::Delegated, true),
+        ] {
+            let case = format!("more {more}, auth {auth}, events {events}");
+            let (mut coverage, id, _) = replay_coverage(1);
+            if events > 0 {
+                coverage.record_stored_event(&id, RelayIndex(1), 150);
+            }
+            coverage.record_eose_reply(
+                &id,
+                RelayIndex(1),
+                EoseReply {
+                    sent_nothing: events == 0,
+                    more,
+                    auth,
+                },
+            );
+            assert_eq!(
+                coverage.subscriptions[&id][&RelayIndex(1)],
+                replay,
+                "{case}"
+            );
+            let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
+            assert!(endpoint.boundary_admitted, "{case}: its input settles");
+            let count = endpoint.live_count.expect("counted");
+            assert_eq!(count.withheld, withheld, "{case}");
         }
     }
 
@@ -7534,6 +7594,7 @@ mod batch_tests {
                 requested_at: endpoint.requested_at,
                 live_from: endpoint.requested_at,
                 sent_nothing: false,
+                withheld: false,
             })
         );
     }

@@ -16,6 +16,7 @@ use cgka_traits::{
     collapse_publish_failure_summaries,
 };
 use futures::{Stream, StreamExt};
+use nostr::nips::nip67::EoseHint;
 use nostr_gossip::NostrGossip;
 use nostr_sdk::prelude::{
     Client, ClientBuilder, ClientNotification, ErrorKind as SdkErrorKind, Event, EventBuilder,
@@ -36,8 +37,8 @@ use crate::finite_req::{FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests, is
 use crate::network_proxy as process_proxy;
 use crate::sweep::hint_tap::{EoseHints, HintTransport};
 use crate::{
-    DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, NostrAcquisitionCancellation, NostrAcquisitionEnd,
-    NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionLimits,
+    DeliveryRoute, EoseReply, MAX_DELIVERY_LOSS_ROUTES, NostrAcquisitionCancellation,
+    NostrAcquisitionEnd, NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionLimits,
     NostrAcquisitionRequest, NostrAcquisitionResult, NostrAcquisitionScope, NostrAcquisitionStats,
     NostrEventPublishRequest, NostrNotificationLoss, NostrNotificationLossBounds,
     NostrNotificationLossFloor, NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome,
@@ -2215,18 +2216,25 @@ async fn dispatch_sdk_notification(
                     }
                 }
                 RelayMessage::EndOfStoredEvents {
-                    subscription_id, ..
+                    subscription_id,
+                    hints,
                 } => {
                     let endpoint = TransportEndpoint(relay_url.to_string());
+                    // Asked about every EOSE, so each ask stays with its own.
                     let sent_nothing = adapter
                         .relay_client
                         .reply_sent_nothing(account_id, &endpoint, subscription_id.as_str())
                         .await;
+                    let hints = hints.as_deref().unwrap_or_default();
                     adapter
                         .handle_relay_eose_reply(
                             endpoint,
                             subscription_id.to_string(),
-                            sent_nothing,
+                            EoseReply {
+                                sent_nothing,
+                                more: hints.contains(&EoseHint::More),
+                                auth: hints.contains(&EoseHint::Auth),
+                            },
                         )
                         .await;
                 }
@@ -9554,6 +9562,63 @@ mod tests {
     /// its own wire.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_live_count_knows_whether_its_relay_sent_anything() {
+        // The group REQ's relay sends one stored event whose content no
+        // longer matches its id; the inbox REQ's relay sends none.
+        let counts = live_counts_after(|route, group, id| {
+            let mut frames = Vec::new();
+            if group {
+                let mut tampered = serde_json::to_value(stored_group_event(route, 500)).unwrap();
+                tampered["content"] = "tampered".into();
+                frames.push(serde_json::json!(["EVENT", id, tampered]));
+            }
+            frames.push(serde_json::json!(["EOSE", id]));
+            frames
+        })
+        .await;
+        for (group, count) in counts {
+            assert_eq!(
+                count.events, 0,
+                "the SDK delivered nothing (group: {group})"
+            );
+            assert_eq!(
+                count.sent_nothing, !group,
+                "only the wire shows the group's relay sent a frame"
+            );
+        }
+    }
+
+    /// A live REQ's EOSE hints reach its count (mdk#3689): NIP-67 `auth`
+    /// says the relay may hold events back until the client authenticates,
+    /// whatever it sent, and `more` on an empty reply says it cut everything
+    /// it sent. Either count is withheld.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_count_keeps_its_eose_hints() {
+        // The group REQ's relay sends one stored event, then `auth`; the
+        // inbox REQ's relay sends nothing, then `more`.
+        let counts = live_counts_after(|route, group, id| {
+            if group {
+                let stored = serde_json::to_value(stored_group_event(route, 500)).unwrap();
+                vec![
+                    serde_json::json!(["EVENT", id, stored]),
+                    serde_json::json!(["EOSE", id, ["auth"]]),
+                ]
+            } else {
+                vec![serde_json::json!(["EOSE", id, ["more"]])]
+            }
+        })
+        .await;
+        for (group, count) in counts {
+            assert_eq!(count.events, usize::from(group), "group: {group}");
+            assert!(count.withheld, "group: {group}");
+        }
+    }
+
+    /// The live counts of one account's inbox REQ and group REQ on a scripted
+    /// wire, after `answer(route, group, id)` gives each REQ's frames, as
+    /// `(group, count)`.
+    async fn live_counts_after(
+        answer: impl Fn(&[u8], bool, &str) -> Vec<serde_json::Value>,
+    ) -> Vec<(bool, crate::ReplayLiveCount)> {
         let mut wire = ReplayWire::new().await;
         let root = NostrSdkRelayClient::multi_account();
         let keys = Keys::generate();
@@ -9579,17 +9644,12 @@ mod tests {
             })
             .await
             .unwrap();
-        // The group REQ's relay sends one stored event whose content no
-        // longer matches its id; the inbox REQ's relay sends none.
-        let mut tampered = serde_json::to_value(stored_group_event(&route, 500)).unwrap();
-        tampered["content"] = "tampered".into();
         for _ in 0..2 {
             let request = wire.recv_kind("REQ").await;
             let id = request[1].as_str().unwrap();
-            if request[2]["#h"].is_array() {
-                wire.send(serde_json::json!(["EVENT", id, tampered])).await;
+            for frame in answer(&route, request[2]["#h"].is_array(), id) {
+                wire.send(frame).await;
             }
-            wire.send(serde_json::json!(["EOSE", id])).await;
         }
         let counts = timeout(Duration::from_secs(5), async {
             loop {
@@ -9610,19 +9670,10 @@ mod tests {
         })
         .await
         .expect("both REQs count their EOSE");
-        for (group, count) in counts {
-            assert_eq!(
-                count.events, 0,
-                "the SDK delivered nothing (group: {group})"
-            );
-            assert_eq!(
-                count.sent_nothing, !group,
-                "only the wire shows the group's relay sent a frame"
-            );
-        }
         forwarder.abort();
         let _ = forwarder.await;
         root.shutdown().await;
+        counts
     }
 
     /// Live counts whose REQ the relay client still reports streaming.
