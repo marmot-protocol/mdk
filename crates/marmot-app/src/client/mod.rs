@@ -1032,6 +1032,11 @@ pub struct AppClient {
     /// background retry instead of turning the already-applied ingest into an
     /// apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
+    /// A live receive failed while this client held output or writes its
+    /// state checkpoint had not saved ([`Self::arm_failed_receive_projection_retry`]).
+    /// Kept apart from the subscription-refresh flag, which a route sync
+    /// clears: only the retry's state save ends it.
+    pub(crate) pending_failed_receive_projection: bool,
     /// One-shot failure of the recovery runner's ownership preparation.
     #[cfg(test)]
     pub(crate) fail_next_runner_preparation: bool,

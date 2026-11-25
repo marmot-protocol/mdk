@@ -426,14 +426,32 @@ impl AppClient {
 
     /// Send, once a sibling-Add scan has ended, the acceptances it recorded,
     /// with any other owed small state. Other owed state alone waits for
-    /// ordinary maintenance.
-    pub(super) async fn send_recorded_acceptances(&mut self) {
+    /// ordinary maintenance. Returns whether an answer is left unsent because
+    /// the device group's epoch is still settling.
+    pub(super) async fn send_recorded_acceptances(&mut self) -> bool {
         if !std::mem::take(&mut self.acceptances_recorded) {
-            return;
+            return false;
         }
-        if let Err(error) = self.send_owed_small_state().await {
+        let Err(error) = self.send_owed_small_state().await else {
+            return false;
+        };
+        // Refused before anything was encrypted: the epoch moves or is about
+        // to, as while a fork between linked devices resolves.
+        let settling = matches!(
+            error.as_engine_error(),
+            Some(
+                EngineError::AppMessageEpochUnsettled { .. }
+                    | EngineError::AppMessageEpochMismatch { .. }
+            )
+        ) && self
+            .app
+            .account_storage(&self.state.label)
+            .and_then(|account| Ok(account.app_storage().unsent_invitation_decisions()?))
+            .is_ok_and(|unsent| !unsent.is_empty());
+        if !settling {
             tracing::warn!(target: "marmot_app::client::invitation_decisions", method = "send_recorded_acceptances", error_kind = error.privacy_safe_kind(), "recorded acceptances wait for ordinary small-state sending");
         }
+        settling
     }
 
     /// Native founding can be recovered by the ordinary projection reconcile
@@ -558,8 +576,13 @@ impl AppClient {
         {
             return false;
         }
-        self.send_recorded_acceptances().await;
+        let settling = self.send_recorded_acceptances().await;
         self.drive_invitation_decisions().await;
+        // The epoch settles in a worker unit, so an answer it held back goes
+        // out on the turn after, not at the next maintenance pass (mdk#3573).
+        if settling {
+            self.send_invitation_decisions_next_turn();
+        }
         true
     }
 

@@ -652,7 +652,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   on (`exchange.pin`), so the engine refuses one whose epoch moved or is about to, and its page stays owed, rather
   than encrypt it on a branch where that leaf is untagged. A withdrawn update owes every held item again, whoever sent
   it, and a withdrawn broadcast request owes a new one; a withdrawn message with no record in the trusted device group owes both. Invitation
-  decisions it owes again go out on the worker's next turn, as a local answer does, not at the next pass (mdk#3573).
+  decisions it owes again go out on the worker's next turn, as a local answer does, not at the next pass (mdk#3573);
+  when the engine refuses that send because the device group's epoch is still settling, they go out on the turn after.
   A winning pin for an archived chat waits, unobserved, until the chat is unarchived.
 - Invitation decisions (`client/invitation_decisions.rs`, mdk#2628 4.3b/D96) are explicit per-admission intent, never
   inferred from archive/leave/delete snapshots. Explicit UserLeave (D99) records the current identified admission's
