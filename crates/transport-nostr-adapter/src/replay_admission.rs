@@ -56,7 +56,11 @@ pub struct ReplayLiveCount {
     /// as read off the wire ([`crate::NostrRelayClient::reply_sent_nothing`]).
     /// nostr-sdk drops some frames without a word, so `events` alone may be
     /// short: a count with no events proves its window only when this holds.
+    /// Never set when the EOSE carried NIP-67 `more`: that relay cut its reply.
     pub sent_nothing: bool,
+    /// The EOSE carried NIP-67 `auth`: the relay may hold events back until
+    /// the client authenticates, so the count proves no window.
+    pub auth: bool,
 }
 
 impl ReplayLiveCount {

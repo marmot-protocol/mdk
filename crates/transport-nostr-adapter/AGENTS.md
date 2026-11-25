@@ -37,7 +37,7 @@ for reconnect/backoff and relay status mechanics.
 | `tests/acquisition_contract.rs` | Request validation and optional-boundary shape tests. |
 | `tests/publish_accounting.rs` | Direct-adapter publish admission, classification, and cancellation tests, with or without `sdk`. |
 | `tests/selective_history_acquisition_tests.rs` | `sdk`-gated bounded history acquisition and reconciliation-cursor tests. |
-| `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp including raw500/validated499 with1,200valid events (#2885), NIP-77 saturated second, an inconclusive second (a listed id withheld, a malformed NEG-MSG, or repeated id-fetch events that cut a one-id reply; retried and never saturated), resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing; replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
+| `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp including raw500/validated499 with1,200valid events (#2885), NIP-77 saturated second, an inconclusive second (a listed id withheld, a malformed NEG-MSG, or repeated id-fetch events that cut a one-id reply; retried and never saturated), resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing, `auth` leaves the slice owed; replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
 | `tests/relay_limit_subscriptions.rs` | `sdk`-gated subscription behavior against `tests/support/limit_relay.rs`, a proxy enforcing strfry 1.1.3's per-connection limits (REQ and NEG caps, filter shape, 500 limit clamp). |
 
 ## Invariants
@@ -243,7 +243,8 @@ for reconnect/backoff and relay status mechanics.
   withheld id, a filled set or a cut leaves its window unproven, and a window that cannot shrink below one second
   ends `SaturatedWindow`. Certify oldest first, so a cut proves the prefix below the oldest unfetched difference.
   A relay without NIP-77 or a refused comparison proves nothing and ends the call; never read it as an empty set.
-- No NIP-67 hint proves a slice; only counting does. `more` splits, and `finish` is never read: a misread `finish`
+- No NIP-67 hint proves a slice; only counting does. `more` splits, `auth` ends the slice as an `auth-required`
+  refusal (the slice stays owed), and `finish` is never read: a misread `finish`
   would skip history while a misread `more` only costs requests. The collector takes hints from nostr-sdk's typed
   EOSE (`RelayMessage::EndOfStoredEvents { hints }`). Do not add a hint-based `SliceProof`.
 - Every `SdkSweepRelay` REQ and every `acquire_history` request is a finite request (`src/finite_req.rs`), which
@@ -276,8 +277,9 @@ for reconnect/backoff and relay status mechanics.
   `NostrRelayClient::reply_sent_nothing` once as it dispatches each EOSE, and each ask answers only the oldest EOSE
   for the id not yet asked about, true only if that is also the newest (the SDK may have re-sent the id and had it
   answered before the dispatch); every EOSE frame is counted, even with no count open. The live count keeps the answer as
-  `ReplayLiveCount::sent_nothing` only when the SDK counted nothing either; `marmot-app` lets only that empty count
-  prove its window. Err toward unknown: a frame the tap cannot tie to one REQ while counts are open (an unreadable EVENT
+  `ReplayLiveCount::sent_nothing` only when the SDK counted nothing either and the EOSE carried no NIP-67 `more`;
+  `marmot-app` lets only that empty count prove its window. An EOSE carrying `auth` sets `ReplayLiveCount::auth`,
+  and that count proves nothing. Both still settle replay admission. Err toward unknown: a frame the tap cannot tie to one REQ while counts are open (an unreadable EVENT
   id, an oversized EOSE, a binary frame) spoils every open count on its connection; a REQ re-sent on the same
   connection while the relay may still answer the earlier one (open, spoiled, or closed by the client) starts unknown;
   past 1,024 REQs per relay the oldest count goes. Wrappers of a tapped client delegate `reply_sent_nothing`.

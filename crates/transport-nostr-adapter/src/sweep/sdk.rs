@@ -8,8 +8,9 @@
 //!
 //! Every REQ is a finite request ([`crate::finite_req`]): its replies never
 //! reach the SDK's reader, so a large page delays no live message, and its
-//! EOSE keeps the NIP-67 `more` hint the SDK's parser drops. A relay that
-//! sends no hint is proven by counting against the NIP-11 cap. A client built
+//! EOSE keeps its NIP-67 hints: `more` splits the slice, and `auth` reads as
+//! the relay asking for authentication. A relay that sends no hint is proven
+//! by counting against the NIP-11 cap. A client built
 //! without finite requests ([`NostrSdkRelayClient::new`]) reads as
 //! unreachable.
 //!
@@ -217,6 +218,12 @@ impl SweepRelay for SdkSweepRelay {
             return SliceReply::Unreachable(UnreachableKind::Disconnected);
         };
         match failed_end(reply.end) {
+            // NIP-67 `auth`: the relay may hold events back until the client
+            // authenticates. That asks for authentication, as an
+            // `auth-required:` refusal does; splitting the slice cannot help.
+            Ok(()) if reply.auth => SliceReply::Closed(ClosedReason(Some(
+                TransportEndpointRejectionCategory::AuthRequired,
+            ))),
             Ok(()) => SliceReply::Answered {
                 received: reply.raw_items,
                 events: reply.events,

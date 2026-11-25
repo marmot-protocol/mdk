@@ -2639,18 +2639,20 @@ impl NostrTransportAdapter {
     /// but the recovery runner owes the older history and the reply never
     /// counts as complete coverage.
     pub async fn handle_relay_eose(&self, endpoint: TransportEndpoint, subscription_id: String) {
-        self.handle_relay_eose_reply(endpoint, subscription_id, false)
+        self.handle_relay_eose_reply(endpoint, subscription_id, false, false)
             .await;
     }
 
     /// [`Self::handle_relay_eose`], when the wire showed whether the relay
     /// sent any EVENT frame for the REQ before this EOSE
-    /// ([`NostrRelayClient::reply_sent_nothing`]).
+    /// ([`NostrRelayClient::reply_sent_nothing`]) and whether the EOSE
+    /// carried NIP-67 `auth` ([`ReplayLiveCount::auth`]).
     pub(crate) async fn handle_relay_eose_reply(
         &self,
         endpoint: TransportEndpoint,
         subscription_id: String,
         sent_nothing: bool,
+        auth: bool,
     ) {
         let now_ms = self.now_ms();
         self.state.write().await.record_subscription_eose(
@@ -2658,6 +2660,7 @@ impl NostrTransportAdapter {
             &endpoint,
             now_ms,
             sent_nothing,
+            auth,
         );
 
         tracing::debug!(
@@ -3613,10 +3616,12 @@ impl ReplayEndpoint {
     }
 
     /// What this serial's EOSE counted in `stored`, as a live count;
-    /// `sent_nothing` when the wire showed no EVENT frame before it.
-    fn eose_count(&self, stored: StoredReplay, sent_nothing: bool) -> ReplayLiveCount {
+    /// `sent_nothing` when the wire showed no EVENT frame before it, `auth`
+    /// when it carried NIP-67 `auth`.
+    fn eose_count(&self, stored: StoredReplay, sent_nothing: bool, auth: bool) -> ReplayLiveCount {
         ReplayLiveCount {
             sent_nothing: sent_nothing && stored.events == 0,
+            auth,
             events: stored.events,
             oldest: stored.oldest,
             requested_at: self.requested_at,
@@ -5104,12 +5109,13 @@ impl AccountReplayCoverage {
 
     #[cfg(test)]
     fn record_eose(&mut self, id: &str, relay: RelayIndex) {
-        self.record_eose_reply(id, relay, false);
+        self.record_eose_reply(id, relay, false, false);
     }
 
     /// Record `relay`'s EOSE for `id`; `sent_nothing` when the wire showed
-    /// it sent no EVENT frame for the REQ before it.
-    fn record_eose_reply(&mut self, id: &str, relay: RelayIndex, sent_nothing: bool) {
+    /// it sent no EVENT frame for the REQ before it, `auth` when the EOSE
+    /// carried NIP-67 `auth`.
+    fn record_eose_reply(&mut self, id: &str, relay: RelayIndex, sent_nothing: bool, auth: bool) {
         if !self
             .subscriptions
             .get(id)
@@ -5158,7 +5164,7 @@ impl AccountReplayCoverage {
                 .and_then(|relays| relays.get_mut(&relay))
                 && let Some(recount) = endpoint.recount.take()
             {
-                endpoint.install_live_count(endpoint.eose_count(recount, sent_nothing));
+                endpoint.install_live_count(endpoint.eose_count(recount, sent_nothing, auth));
                 self.arm_fence(id, relay);
             }
             return;
@@ -5169,7 +5175,7 @@ impl AccountReplayCoverage {
             .and_then(|relays| relays.get_mut(&relay))
             .filter(|endpoint| !endpoint.stopped)
         {
-            endpoint.install_live_count(endpoint.eose_count(stored, sent_nothing));
+            endpoint.install_live_count(endpoint.eose_count(stored, sent_nothing, auth));
             self.arm_fence(id, relay);
         }
         let Some(replay) = self.replay_mut(id, relay) else {
@@ -6103,11 +6109,12 @@ impl AdapterState {
         endpoint: &TransportEndpoint,
         now_ms: u64,
         sent_nothing: bool,
+        auth: bool,
     ) {
         let relay = self.relay_index.index_for(endpoint);
         self.sync.record_eose(subscription_id, relay, now_ms);
         for coverage in self.account_replay_coverage.values_mut() {
-            coverage.record_eose_reply(subscription_id, relay, sent_nothing);
+            coverage.record_eose_reply(subscription_id, relay, sent_nothing, auth);
         }
     }
 
@@ -7115,6 +7122,7 @@ mod batch_tests {
             requested_at,
             live_from: requested_at,
             sent_nothing: false,
+            auth: false,
         };
         let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
         assert!(endpoint.boundary_admitted);
@@ -7400,10 +7408,10 @@ mod batch_tests {
                 .live_count
                 .map(|count| count.sent_nothing)
         };
-        coverage.record_eose_reply(&id, RelayIndex(1), true);
+        coverage.record_eose_reply(&id, RelayIndex(1), true, false);
         assert_eq!(sent_nothing(&coverage, 1), Some(true));
         coverage.record_stored_event(&id, RelayIndex(2), 150);
-        coverage.record_eose_reply(&id, RelayIndex(2), true);
+        coverage.record_eose_reply(&id, RelayIndex(2), true, false);
         assert_eq!(
             sent_nothing(&coverage, 2),
             Some(false),
@@ -7412,7 +7420,7 @@ mod batch_tests {
 
         for wire in [false, true] {
             coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
-            coverage.record_eose_reply(&id, RelayIndex(1), wire);
+            coverage.record_eose_reply(&id, RelayIndex(1), wire, false);
             assert_eq!(sent_nothing(&coverage, 1), Some(wire), "restored");
         }
     }
@@ -7534,6 +7542,7 @@ mod batch_tests {
                 requested_at: endpoint.requested_at,
                 live_from: endpoint.requested_at,
                 sent_nothing: false,
+                auth: false,
             })
         );
     }

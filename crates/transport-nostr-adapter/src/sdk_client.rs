@@ -16,6 +16,7 @@ use cgka_traits::{
     collapse_publish_failure_summaries,
 };
 use futures::{Stream, StreamExt};
+use nostr::nips::nip67::EoseHint;
 use nostr_gossip::NostrGossip;
 use nostr_sdk::prelude::{
     Client, ClientBuilder, ClientNotification, ErrorKind as SdkErrorKind, Event, EventBuilder,
@@ -2215,18 +2216,22 @@ async fn dispatch_sdk_notification(
                     }
                 }
                 RelayMessage::EndOfStoredEvents {
-                    subscription_id, ..
+                    subscription_id,
+                    hints,
                 } => {
                     let endpoint = TransportEndpoint(relay_url.to_string());
+                    // Asked about every EOSE, so each ask stays with its own.
                     let sent_nothing = adapter
                         .relay_client
                         .reply_sent_nothing(account_id, &endpoint, subscription_id.as_str())
                         .await;
+                    let hints = hints.as_deref().unwrap_or_default();
                     adapter
                         .handle_relay_eose_reply(
                             endpoint,
                             subscription_id.to_string(),
-                            sent_nothing,
+                            sent_nothing && !hints.contains(&EoseHint::More),
+                            hints.contains(&EoseHint::Auth),
                         )
                         .await;
                 }
@@ -9619,6 +9624,79 @@ mod tests {
                 count.sent_nothing, !group,
                 "only the wire shows the group's relay sent a frame"
             );
+        }
+        forwarder.abort();
+        let _ = forwarder.await;
+        root.shutdown().await;
+    }
+
+    /// A live REQ's EOSE hints are part of its count (mdk#3689). NIP-67
+    /// `more` says the relay cut its reply, so even an empty one is not a
+    /// reply whose relay sent nothing; `auth` says it may hold events back
+    /// until the client authenticates, whatever it sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_count_keeps_its_eose_hints() {
+        let mut wire = ReplayWire::new().await;
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let adapter = NostrTransportAdapter::new(Arc::new(root.clone()));
+        let forwarder = account.spawn_notification_forwarder(adapter.clone());
+        let route = vec![0xC5; 32];
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account_id.clone(),
+                inbox_endpoints: vec![wire.endpoint.clone()],
+                group_subscriptions: vec![crate::TransportGroupSubscription {
+                    group_id: cgka_traits::GroupId::new(vec![0xC5; 16]),
+                    transport_group_id: route.clone(),
+                    endpoints: vec![wire.endpoint.clone()],
+                    retained_since: None,
+                }],
+                since: Some(Timestamp(100)),
+            })
+            .await
+            .unwrap();
+        // The group REQ's relay sends one stored event, then `auth`; the
+        // inbox REQ's relay sends nothing, then `more`.
+        let stored = serde_json::to_value(stored_group_event(&route, 500)).unwrap();
+        for _ in 0..2 {
+            let request = wire.recv_kind("REQ").await;
+            let id = request[1].as_str().unwrap();
+            if request[2]["#h"].is_array() {
+                wire.send(serde_json::json!(["EVENT", id, stored])).await;
+                wire.send(serde_json::json!(["EOSE", id, ["auth"]])).await;
+            } else {
+                wire.send(serde_json::json!(["EOSE", id, ["more"]])).await;
+            }
+        }
+        let counts = timeout(Duration::from_secs(5), async {
+            loop {
+                let status = adapter.take_replay_status(&account_id).await;
+                let counts = status
+                    .sources()
+                    .filter_map(|source| {
+                        let group = source.group_routes().next().is_some();
+                        let count = source.endpoints().next()?.live_count()?;
+                        Some((group, count))
+                    })
+                    .collect::<Vec<_>>();
+                if counts.len() == 2 {
+                    break counts;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both REQs count their EOSE");
+        for (group, count) in counts {
+            assert_eq!(count.events, usize::from(group), "group: {group}");
+            assert!(!count.sent_nothing, "group: {group}");
+            assert_eq!(count.auth, group, "only the group's EOSE said auth");
         }
         forwarder.abort();
         let _ = forwarder.await;

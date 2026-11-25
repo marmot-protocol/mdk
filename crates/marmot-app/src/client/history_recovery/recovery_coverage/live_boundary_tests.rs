@@ -33,6 +33,7 @@ fn count(events: usize, oldest: Option<u64>) -> ReplayLiveCount {
         requested_at: REQUESTED,
         live_from: REQUESTED,
         sent_nothing: false,
+        auth: false,
     }
 }
 
@@ -166,6 +167,24 @@ fn a_count_whose_relay_sent_nothing_proves_its_whole_window() {
     let facts = [fact(vec![INBOX], resent, false)];
     assert_eq!(durable(&live, &facts), [Some((100, REQUESTED - 1))]);
     assert_eq!(inbox_owed_until(&live, &facts, 5_000), REQUESTED + 399);
+}
+
+/// A relay whose EOSE carried NIP-67 `auth` may hold events back until the
+/// client authenticates (mdk#3689), so neither what it sent nor its silence
+/// covers a second: the count proves nothing, and its open REQ vouches for
+/// nothing.
+#[test]
+fn an_auth_count_proves_nothing_and_keeps_no_tail() {
+    let live = LiveCoverage::opened_at(None);
+    for count in [count(3, Some(400)), sent_nothing()] {
+        let count = ReplayLiveCount {
+            auth: true,
+            ..count
+        };
+        let facts = [fact(vec![INBOX], count, false)];
+        assert_eq!(durable(&live, &facts), [None], "{count:?}");
+        assert_eq!(inbox_owed_until(&live, &facts, 5_000), 5_000, "{count:?}");
+    }
 }
 
 /// With every event it returned from the request on, the relay may have cut

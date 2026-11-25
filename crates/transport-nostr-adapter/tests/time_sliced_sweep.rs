@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cgka_traits::TransportEndpointRejectionCategory;
 use limit_relay::{LimitConfig, LimitRelay, NegFault};
 use nostr_relay_builder::prelude::{
     MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RateLimit,
@@ -31,10 +32,10 @@ use transport_nostr_adapter::compare::{
     CompareEnd, ComparePolicy, CompareReply, CompareRequest, CompareSink, run_comparison,
 };
 use transport_nostr_adapter::sweep::{
-    CoveredSlice, INTERRUPT_GRACE, RelayCaps, SdkSweepRelay, SecondReply, SliceProof, SliceQuery,
-    SliceReply, SweepCursor, SweepCursorStore, SweepEnd, SweepPolicy, SweepRange, SweepRelay,
-    SweepRequest, SweepRoute, SweepSink, SweepSinkError, SweepStoreError, UnreachableKind,
-    run_sweep,
+    ClosedReason, CoveredSlice, INTERRUPT_GRACE, RelayCaps, SdkSweepRelay, SecondReply, SliceProof,
+    SliceQuery, SliceReply, SweepCursor, SweepCursorStore, SweepEnd, SweepPolicy, SweepRange,
+    SweepRelay, SweepRequest, SweepRoute, SweepSink, SweepSinkError, SweepStoreError,
+    UnreachableKind, run_sweep,
 };
 
 const GROUP: [u8; 32] = [3; 32];
@@ -554,6 +555,50 @@ async fn rate_limited_closed_is_waited_out() {
     assert_eq!(report.end, SweepEnd::Finished, "{report:?}");
     assert_eq!(report.stats.rate_limited_waits, 3);
     assert_once_in_order(&sink, &wanted);
+}
+
+/// A relay that ends a slice with NIP-67 `auth` may hold events back until
+/// the client authenticates (mdk#3689): the reply is the relay asking for
+/// authentication, as an `auth-required:` refusal is, and never a covered
+/// slice. Nothing is admitted and the cursor stays, so the slice stays owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_auth_hint_leaves_the_slice_owed() {
+    let fixture = Fixture::new().await;
+    let keys = Keys::generate();
+    // Far below the cap: without the hint, one reply would prove the day.
+    let events = (0..10)
+        .map(|n| group_event(&keys, GROUP, T0 + (n as u64) * 3_600, n))
+        .collect::<Vec<_>>();
+    fixture.store(&events).await;
+    fixture.limit.auth_hint_next_eoses(1);
+    let store = MemoryStore::default();
+    let mut sink = Sink::default();
+    let report = run_sweep(
+        request(range()),
+        &fixture.relay(),
+        &mut sink,
+        &store,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        report.end,
+        SweepEnd::Refused(ClosedReason(Some(
+            TransportEndpointRejectionCategory::AuthRequired
+        ))),
+        "{report:?}"
+    );
+    assert_eq!(fixture.limit.stats().auth_hints, 1);
+    assert!(report.covered.is_empty(), "{:?}", report.covered);
+    assert!(sink.slices.is_empty() && sink.events.is_empty());
+    assert!(
+        store
+            .0
+            .lock()
+            .unwrap()
+            .is_none_or(|cursor| cursor.next_since == T0),
+        "the cursor stays at the slice"
+    );
 }
 
 /// wok's marmot preset: cap 5,000, default page 500. A saturated second over
