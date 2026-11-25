@@ -105,7 +105,7 @@ async fn a_links_welcome_keeps_its_delivery_deadline() {
     ));
     assert_eq!(
         phone.engine.outbound_welcome_status(id, deadline).unwrap(),
-        OutboundWelcomeStatus::Settled(cgka_engine::engine::WelcomeSettlement::Expired)
+        OutboundWelcomeStatus::PastDeadline
     );
 }
 

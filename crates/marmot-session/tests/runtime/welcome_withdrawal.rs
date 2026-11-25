@@ -981,8 +981,9 @@ async fn a_link_welcome_is_never_published_from_its_deadline_on() {
 
 /// A device link's Welcome that expires while this process watches it is
 /// audited once, as `expired`. A later start that reads it from the store,
-/// already expired, adds no row: it settled before that process watched it.
-/// Nor does the link's cleanup withdrawing it after its expiry was recorded.
+/// already expired, adds no row, nor does the link's cleanup withdrawing it
+/// after its expiry was recorded. The expiry is durable: a start with its
+/// clock set back before the deadline does not send it.
 #[tokio::test]
 async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     let dir = relaxed_storage_dir().unwrap();
@@ -1034,12 +1035,12 @@ async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     };
 
     // Owed and watched, unreachable until its deadline passes.
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_endpoints(Vec::new());
     let start = |at: u64, audit: &std::path::Path| {
-        let adapter = RecordingAdapter::default();
-        adapter.accept_only_endpoints(Vec::new());
         let runtime = AccountDeviceRuntime::new(
             current_nostr_welcome_session(&alice_path, &key, b"alice-expired-link"),
-            adapter,
+            adapter.clone(),
             policy.clone(),
             RecordingKeyPackages::default(),
         )
@@ -1080,6 +1081,18 @@ async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     let mut second = start(300_300, &second_audit);
     second.run_due_maintenance().await.unwrap();
     assert!(withdrawn(&second_audit).is_empty(), "already settled at start");
+    drop(second);
+
+    // Its expiry is durable: a clock set back before the deadline sends it
+    // no more and records nothing.
+    let tried = welcome_publishes(&adapter).len();
+    let set_back_audit = dir.path().join("set-back-audit-v5.jsonl");
+    let mut set_back = start(300_000, &set_back_audit);
+    set_back.run_due_maintenance().await.unwrap();
+    let redelivered = set_back.redeliver_welcome(&welcome.id).await.unwrap();
+    assert!(redelivered.welcome_failures.is_empty());
+    assert_eq!(welcome_publishes(&adapter).len(), tried);
+    assert!(withdrawn(&set_back_audit).is_empty());
 }
 
 /// A device link's Welcome, owed to bob until its deadline at 300_100, and
@@ -1174,7 +1187,8 @@ async fn a_pass_that_fails_after_the_link_deadline_does_not_report_the_welcome_p
     wall.set(300_050);
     let completed = task.run().await;
     wall.set(300_200);
-    runtime.finish_welcome_publish_task(completed).await.unwrap();
+    let finished = runtime.finish_welcome_publish_task(completed).await.unwrap();
+    assert!(finished.welcome_failures.is_empty(), "never pending");
 
     let finished = v5_audit_rows(&audit_path)
         .into_iter()

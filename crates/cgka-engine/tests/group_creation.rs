@@ -5502,7 +5502,7 @@ async fn founding_and_invite_welcomes(
 async fn invite_and_founding_welcomes_are_deliverable_for_the_window_or_their_key_packages_life() {
     // Stated here, not read from the engine, so a changed policy fails it.
     const WINDOW: u64 = 7 * 24 * 60 * 60;
-    use cgka_engine::engine::{OutboundWelcomeStatus, WelcomeSettlement};
+    use cgka_engine::engine::OutboundWelcomeStatus;
     let unix_now = || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5536,7 +5536,7 @@ async fn invite_and_founding_welcomes_are_deliverable_for_the_window_or_their_ke
     ));
     assert_eq!(
         alice.outbound_welcome_status(founding, deadline).unwrap(),
-        OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired)
+        OutboundWelcomeStatus::PastDeadline
     );
 
     // Staged a day before each KeyPackage ends, inside the window.
@@ -5559,4 +5559,90 @@ async fn invite_and_founding_welcomes_are_deliverable_for_the_window_or_their_ke
             ))
         );
     }
+}
+
+/// Marking a Welcome expired settles it for good (mdk#3589): from the mark
+/// on it reads expired at any clock, nothing can mark it delivered, and an
+/// invite's Welcome marked while its commit is pending is never re-owed when
+/// that commit confirms. Only a Welcome past its deadline is marked, and
+/// recording its expiry is the mark's only later change.
+#[tokio::test]
+async fn an_expired_welcome_stays_expired_whatever_the_clock_or_its_commit() {
+    use cgka_engine::engine::{OutboundWelcomeStatus, WelcomeSettlement};
+    use cgka_traits::message::WelcomeExpiry;
+    let bob = build_current_client(b"bob-expiry")
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let carol = build_current_client(b"carol-expiry")
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let mut alice = build_current_client(b"alice-expiry");
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "welcome expiry".into(),
+            description: String::new(),
+            members: vec![bob],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes: founding } = created else {
+        panic!("a current-profile founding create")
+    };
+    let SendResult::GroupEvolution {
+        welcomes: invited,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::Invite {
+            group_id,
+            key_packages: vec![carol],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("an invite commit")
+    };
+    let expired = Some(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired));
+    for id in [&founding[0].id, &invited[0].id] {
+        let deadline = alice.sent_welcome_deliver_until(id).unwrap().unwrap();
+        let before = Timestamp(deadline.0 - 1);
+        assert_eq!(alice.expire_sent_welcome(id, before).unwrap(), None);
+        assert_eq!(
+            alice.expire_sent_welcome(id, deadline).unwrap(),
+            Some(WelcomeExpiry::Unrecorded)
+        );
+        assert_eq!(
+            alice.unrecorded_welcome_expiries().unwrap(),
+            vec![id.clone()]
+        );
+        // A clock set back reads it expired still, and it stays marked.
+        assert_eq!(alice.outbound_welcome_status(id, before).ok(), expired);
+        assert_eq!(
+            alice.expire_sent_welcome(id, before).unwrap(),
+            Some(WelcomeExpiry::Unrecorded)
+        );
+        assert!(alice.sent_welcome_withdrawn(id).unwrap());
+        assert!(alice.mark_sent_welcome_delivered(id).is_err());
+        alice.record_sent_welcome_expiry(id).unwrap();
+        assert_eq!(
+            alice.expire_sent_welcome(id, before).unwrap(),
+            Some(WelcomeExpiry::Recorded)
+        );
+        assert!(alice.unrecorded_welcome_expiries().unwrap().is_empty());
+        assert_eq!(alice.outbound_welcome_status(id, before).ok(), expired);
+    }
+    alice.confirm_published(pending).await.unwrap();
+    let invite = &invited[0].id;
+    assert_eq!(
+        alice.outbound_welcome_status(invite, Timestamp(0)).ok(),
+        expired,
+        "its commit confirming does not re-owe it"
+    );
+    assert!(alice.outstanding_sent_welcomes().unwrap().is_empty());
 }

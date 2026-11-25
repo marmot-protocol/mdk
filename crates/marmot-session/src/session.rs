@@ -54,7 +54,7 @@ use cgka_traits::maintenance::{
     KeyPackageLifecycleState, MaintenanceObligation, PeriodicMaintenancePolicy,
     TransportFanoutTarget, WallClock,
 };
-pub use cgka_traits::message::WelcomeExpiry;
+pub(crate) use cgka_traits::message::WelcomeExpiry;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     DeviceGroupWelcomeExpectation, MaintenanceStorage, MessageStorage, OutboundFanoutStorage,
@@ -1145,7 +1145,7 @@ impl AccountDeviceSession {
     }
 
     /// See `Engine::record_sent_welcome_expiry`.
-    pub fn record_sent_welcome_expiry(&self, id: &MessageId) -> SessionResult<()> {
+    pub(crate) fn record_sent_welcome_expiry(&self, id: &MessageId) -> SessionResult<()> {
         Ok(self.engine.record_sent_welcome_expiry(id)?)
     }
 
