@@ -164,6 +164,8 @@ impl Account {
     }
 
     async fn shutdown(self) {
+        // Setup may have queued worker startup by the time it returns ready.
+        self.runtime.shutdown().await;
         self.runtime.shutdown_and_close().await.unwrap();
     }
 }
