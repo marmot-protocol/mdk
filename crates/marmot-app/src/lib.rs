@@ -136,6 +136,7 @@ mod profile_publication;
 mod projection;
 mod relay_caps;
 mod relay_event_limits;
+mod relay_health;
 mod root_closers;
 mod root_runtime_lease;
 mod runtime;
@@ -385,6 +386,10 @@ pub use notifications::{
     parse_provider_token, push_token_fingerprint,
 };
 pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym};
+pub use relay_health::{
+    AccountRelayHealth, AccountRelayWarning, RelayHealthFault, RelayHealthRow, RelayHealthState,
+    RelayListPresence, RelayRepairAction, RelayRole, RelayWarningKind, RelayWarningSeverity,
+};
 pub use storage_sqlite::{
     BackupHistorySource, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
     ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow,

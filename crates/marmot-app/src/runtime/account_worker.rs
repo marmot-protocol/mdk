@@ -1791,6 +1791,8 @@ async fn run_app_runtime_account_worker(
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
     let mut relay_config_work = RelayConfigWork::Ready;
+    // The relay health hosts last heard of; `None` until the first answer.
+    let mut announced_relay_health = None;
     let mut account_wakeups = app
         .presentation_signals
         .subscribe_account_work(&account_label);
@@ -2119,8 +2121,17 @@ async fn run_app_runtime_account_worker(
                 break 'worker;
             }
             () = std::future::ready(()), if relay_config_work == RelayConfigWork::Ready => {
+                let health_read = publish_relay_health_change(
+                    &client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    &mut announced_relay_health,
+                );
                 relay_config_work = match client.sync_relay_liveness().await {
-                    Ok(_) => RelayConfigWork::Idle,
+                    // A failed health read still owes hosts its answer.
+                    Ok(_) if health_read => RelayConfigWork::Idle,
+                    Ok(_) => RelayConfigWork::Retry,
                     Err(error) if error.is_account_not_active() => RelayConfigWork::Retry,
                     Err(error) => {
                         publish_app_runtime_account_error(
@@ -9714,6 +9725,54 @@ pub(crate) fn publish_device_group_changes(
             },
         );
     }
+}
+
+/// One `RelayHealthChanged` when the account's relay health differs from the
+/// answer hosts last heard of, or on the first answer. The relay lists and the
+/// relay policy alone decide that answer, so a relay connecting or
+/// disconnecting never announces one. Runs wherever the worker reconciles its
+/// relay configuration: at start, on each change to the account's directory
+/// entry and on each activation. False when the answer could not be read, so
+/// the caller retries the reconciliation rather than lose the announcement.
+fn publish_relay_health_change(
+    client: &AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    announced: &mut Option<crate::AccountRelayHealth>,
+) -> bool {
+    let health = match client.app.account_relay_health(account_label) {
+        Ok(health) => health,
+        Err(error) => {
+            tracing::debug!(
+                target: "marmot_app::relay_health",
+                method = "publish_relay_health_change",
+                error_kind = error.privacy_safe_kind(),
+                "relay health read failed; keeping the last announced answer"
+            );
+            return false;
+        }
+    };
+    if announced.as_ref() == Some(&health) {
+        return true;
+    }
+    tracing::debug!(
+        target: "marmot_app::relay_health",
+        method = "publish_relay_health_change",
+        rows = health.rows.len(),
+        warnings = health.warnings.len(),
+        "relay health changed"
+    );
+    *announced = Some(health);
+    let _ = emit(
+        Emit::Quiescent(client),
+        events,
+        MarmotAppEvent::RelayHealthChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        },
+    );
+    true
 }
 
 /// One `UnrecognizedSignInsChanged` for a check or answer that changed the

@@ -689,6 +689,8 @@ pub(crate) fn handle_app_runtime_event(
         // Whether this device's KeyPackage refresh is overdue may have
         // changed; the answer is read from the runtime.
         marmot_app::MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. } => {}
+        // The account's relay health changed; it is read from the runtime.
+        marmot_app::MarmotAppEvent::RelayHealthChanged { .. } => {}
         // The account's unrecognized sign-ins may have changed; they are read
         // from the runtime.
         marmot_app::MarmotAppEvent::UnrecognizedSignInsChanged { .. } => {}

@@ -80,6 +80,28 @@ impl MarmotAppRuntime {
         Ok(rows)
     }
 
+    /// The account's relay health from its held lists and the relay policy:
+    /// one row per relay its inbox and NIP-65 lists name, and warnings about
+    /// invitations sent through its published inbox list. Reads only held
+    /// lists, the relay policy and the account's pool state; never dials.
+    /// [`super::MarmotAppEvent::RelayHealthChanged`] reports changes other
+    /// than liveness.
+    pub async fn account_relay_health(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::AccountRelayHealth, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(account_ref)?;
+        let mut health = self.accounts.app.account_relay_health(&account.label)?;
+        let liveness = self.account_relay_liveness(&account.label).await?;
+        for row in &mut health.rows {
+            if let Ok(index) = liveness.binary_search_by(|current| current.url.cmp(&row.url)) {
+                row.liveness = liveness[index].status;
+            }
+        }
+        Ok(health)
+    }
+
     /// Subscribe before reading, so a concurrent transport or list change is retained.
     pub async fn subscribe_relay_liveness(
         &self,

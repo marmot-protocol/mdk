@@ -1071,3 +1071,151 @@ async fn relay_liveness_account_watch() {
     runtime.shutdown().await;
     assert!(subscription.recv().await.unwrap().is_none());
 }
+
+/// `RelayHealthChanged` follows the account's relay health, not its relays'
+/// connections: it fires once when the worker starts and once for a list
+/// change that changes a warning, and never for a relay that fails to connect
+/// or reconnects, nor for a directory change that leaves the answer as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_health_changed_follows_lists_not_liveness() {
+    async fn next_health_change(
+        events: &mut tokio::sync::broadcast::Receiver<crate::MarmotAppEvent>,
+        account_id_hex: &str,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let crate::MarmotAppEvent::RelayHealthChanged {
+                    account_id_hex: id, ..
+                } = events.recv().await.unwrap()
+                    && id == account_id_hex
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("a RelayHealthChanged for the account");
+    }
+    /// Every event the worker owed is already sent once a command sent after
+    /// the change has answered.
+    fn no_health_change_pending(
+        events: &mut tokio::sync::broadcast::Receiver<crate::MarmotAppEvent>,
+        why: &str,
+    ) {
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, crate::MarmotAppEvent::RelayHealthChanged { .. }),
+                "{why}"
+            );
+        }
+    }
+
+    let receive = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let receive_url = receive.url().await.to_string();
+    // A port nothing listens on: this relay's socket only ever fails.
+    let dead_url = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("ws://{}", listener.local_addr().unwrap())
+    };
+    let retired_url = format!(
+        "wss://{}",
+        crate::retired_relay_hosts()
+            .first()
+            .expect("a configured retired host")
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let account = marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        receive_url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let mut lists = crate::AccountRelayListStatus::empty();
+    lists.nip65.created_at = crate::unix_now_seconds();
+    lists.nip65.relays = vec![receive_url.clone()];
+    lists.inbox.created_at = lists.nip65.created_at;
+    lists.inbox.relays = vec![receive_url.clone(), dead_url.clone()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&account.account_id_hex, &lists)
+        .unwrap();
+    let mut liveness = app.relay_plane.relay_liveness_changes().unwrap();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    next_health_change(&mut events, &account.account_id_hex).await;
+    crate::worker_fences::worker_startup_finished(&runtime, &account.label)
+        .await
+        .unwrap();
+
+    let dead_liveness = || async {
+        runtime
+            .account_relay_health(&account.label)
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .find(|row| row.url == dead_url)
+            .expect("a row for the inbox relay")
+            .liveness
+    };
+    timeout(Duration::from_secs(5), async {
+        loop {
+            liveness.borrow_and_update();
+            if dead_liveness().await != crate::RelayLivenessStatus::Unknown {
+                break;
+            }
+            liveness.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the unreachable inbox relay's connection state passes through");
+
+    // The worker takes a directory change, and then reconciles its relays,
+    // before it takes a command sent after it: a reconnect's answer means
+    // every event that change owed was sent.
+    let write_lists_then_settle = async |lists: &crate::AccountRelayListStatus| {
+        app.directory()
+            .remember_directory_relay_lists(&account.account_id_hex, lists)
+            .unwrap();
+        runtime
+            .reconnect_relay(&account.label, &dead_url)
+            .await
+            .unwrap();
+    };
+    lists.inbox.created_at += 1;
+    lists.refresh();
+    write_lists_then_settle(&lists).await;
+    no_health_change_pending(
+        &mut events,
+        "a reconnect and an unchanged answer owe no relay health change",
+    );
+
+    lists.inbox.created_at += 1;
+    lists.inbox.relays.push(retired_url.clone());
+    lists.refresh();
+    write_lists_then_settle(&lists).await;
+    next_health_change(&mut events, &account.account_id_hex).await;
+    no_health_change_pending(&mut events, "one list change owes one relay health change");
+    let health = runtime.account_relay_health(&account.label).await.unwrap();
+    assert_eq!(
+        health
+            .warnings
+            .iter()
+            .map(|warning| (warning.kind, warning.relays.clone()))
+            .collect::<Vec<_>>(),
+        vec![(
+            crate::RelayWarningKind::InboxRelaysNotAllowed,
+            vec![retired_url]
+        )]
+    );
+    assert_eq!(
+        health.highest_severity,
+        Some(crate::RelayWarningSeverity::Warning)
+    );
+    assert!(!health.falls_back_to_defaults);
+    runtime.shutdown().await;
+    receive.shutdown();
+}

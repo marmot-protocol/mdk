@@ -1436,7 +1436,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   encoding and address, and retention; tests in `backup_archive/tests.rs`), `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
-  `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `profile_pseudonyms.rs` (cosmetic display names; not a
+  `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `relay_health.rs`
+  (the account's relay rows and inbox warnings from its held lists and the dial policy, never dialing; the worker's
+  relay-configuration seam announces `RelayHealthChanged` when that answer differs, so liveness never moves it), `profile_pseudonyms.rs` (cosmetic display names; not a
   security primitive), `root_runtime_lease.rs` (cross-process exclusive root lease), `usage_diagnostics.rs`
   (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
   product collector only through `marmot_observability::wiring`, consent lock before state lock), `projection.rs` (legacy account

@@ -1012,6 +1012,106 @@ typedef enum MarmotRelayStatus {
 } MarmotRelayStatus;
 
 /**
+ * Whether MDK holds one of the account's relay lists. `Unknown`: not
+ * loaded yet, or none was published; it raises no warning.
+ */
+typedef enum MarmotRelayListPresence {
+  MARMOT_RELAY_LIST_PRESENCE_UNKNOWN,
+  MARMOT_RELAY_LIST_PRESENCE_PUBLISHED,
+} MarmotRelayListPresence;
+
+/**
+ * A list that names a relay. Later versions may append roles: keep a
+ * default case.
+ */
+typedef enum MarmotRelayRole {
+  /**
+   * The inbox list (kind 10050), where senders send invitations.
+   */
+  MARMOT_RELAY_ROLE_INBOX,
+  /**
+   * A NIP-65 write relay, marked write or unmarked.
+   */
+  MARMOT_RELAY_ROLE_WRITE,
+  /**
+   * A NIP-65 read relay, marked read or unmarked.
+   */
+  MARMOT_RELAY_ROLE_READ,
+} MarmotRelayRole;
+
+/**
+ * What MDK knows of a relay. Only `Unchecked` and `NotAllowed` are
+ * produced yet.
+ */
+typedef enum MarmotRelayHealthState {
+  MARMOT_RELAY_HEALTH_STATE_UNCHECKED,
+  MARMOT_RELAY_HEALTH_STATE_HEALTHY,
+  MARMOT_RELAY_HEALTH_STATE_SUSPECTED,
+  MARMOT_RELAY_HEALTH_STATE_FAILING,
+  /**
+   * The relay policy refuses it: this device never dials it.
+   */
+  MARMOT_RELAY_HEALTH_STATE_NOT_ALLOWED,
+} MarmotRelayHealthState;
+
+/**
+ * Why a relay is not allowed. Later versions may append faults: keep a
+ * default case.
+ */
+typedef enum MarmotRelayHealthFault {
+  MARMOT_RELAY_HEALTH_FAULT_RETIRED,
+  MARMOT_RELAY_HEALTH_FAULT_INVALID,
+  MARMOT_RELAY_HEALTH_FAULT_UNSAFE,
+} MarmotRelayHealthFault;
+
+/**
+ * The problem a relay warning reports. Later versions may append kinds:
+ * keep a default case.
+ */
+typedef enum MarmotRelayWarningKind {
+  /**
+   * Critical: the published inbox list names no relay, so an invitation
+   * sent through it has nowhere to go (see the shared contract for a
+   * sender on this same install).
+   */
+  MARMOT_RELAY_WARNING_KIND_INBOX_LIST_EMPTY,
+  /**
+   * Critical: the published inbox list allows no relay, so an
+   * invitation sent through it cannot reach this device (see the
+   * shared contract for a sender on this same install).
+   */
+  MARMOT_RELAY_WARNING_KIND_NO_ALLOWED_INBOX_RELAY,
+  /**
+   * Warning: some entries are refused beside at least one allowed.
+   */
+  MARMOT_RELAY_WARNING_KIND_INBOX_RELAYS_NOT_ALLOWED,
+  /**
+   * Notice: exactly one entry is allowed.
+   */
+  MARMOT_RELAY_WARNING_KIND_SINGLE_INBOX_RELAY,
+} MarmotRelayWarningKind;
+
+/**
+ * How loudly to present a relay warning, from the least severe.
+ */
+typedef enum MarmotRelayWarningSeverity {
+  MARMOT_RELAY_WARNING_SEVERITY_NOTICE,
+  MARMOT_RELAY_WARNING_SEVERITY_WARNING,
+  MARMOT_RELAY_WARNING_SEVERITY_CRITICAL,
+} MarmotRelayWarningSeverity;
+
+/**
+ * A change to the account's relay lists that would fix a warning. When a
+ * warning lists both, make them one `marmot_set_account_inbox_relays`
+ * call: an empty inbox list is rejected. Later versions may append
+ * actions: keep a default case.
+ */
+typedef enum MarmotRelayRepairAction {
+  MARMOT_RELAY_REPAIR_ACTION_ADD_INBOX_RELAY,
+  MARMOT_RELAY_REPAIR_ACTION_REMOVE_INBOX_RELAY,
+} MarmotRelayRepairAction;
+
+/**
  * Why the most recent v5 delivery attempt for an account failed.
  */
 typedef enum MarmotAuditDeliveryFailureKindV5 {
@@ -4135,6 +4235,78 @@ typedef struct MarmotRelayLivenessList {
   struct MarmotRelayLiveness *items;
   uintptr_t len;
 } MarmotRelayLivenessList;
+
+/**
+ * One relay the account's inbox and NIP-65 lists name.
+ */
+typedef struct MarmotRelayHealthRow {
+  /**
+   * Canonical URL, matching `marmot_account_relay_liveness` rows.
+   */
+  char *url;
+  /**
+   * In the order Inbox, Write, Read.
+   */
+  enum MarmotRelayRole *roles;
+  uintptr_t roles_len;
+  enum MarmotRelayHealthState state;
+  /**
+   * Set exactly when `state` is `NotAllowed`.
+   */
+  bool has_fault;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  enum MarmotRelayHealthFault fault;
+  enum MarmotRelayStatus liveness;
+} MarmotRelayHealthRow;
+
+/**
+ * A problem with the account's relay setup.
+ */
+typedef struct MarmotAccountRelayWarning {
+  enum MarmotRelayWarningKind kind;
+  enum MarmotRelayWarningSeverity severity;
+  /**
+   * The relays it is about, as row URLs.
+   */
+  char **relays;
+  uintptr_t relays_len;
+  /**
+   * What would fix it, in order.
+   */
+  enum MarmotRelayRepairAction *actions;
+  uintptr_t actions_len;
+} MarmotAccountRelayWarning;
+
+/**
+ * The account's relay health from its held lists and the relay policy.
+ * Free with `marmot_account_relay_health_free`.
+ */
+typedef struct MarmotAccountRelayHealth {
+  enum MarmotRelayListPresence inbox_list;
+  /**
+   * One per relay, ordered by URL.
+   */
+  struct MarmotRelayHealthRow *rows;
+  uintptr_t rows_len;
+  /**
+   * Ordered from the most severe.
+   */
+  struct MarmotAccountRelayWarning *warnings;
+  uintptr_t warnings_len;
+  bool has_highest_severity;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  enum MarmotRelayWarningSeverity highest_severity;
+  /**
+   * The inbox route MDK builds from the held lists is the configured
+   * defaults. Also true while `inbox_list` is `Unknown`, so on its own
+   * it says nothing about invitations; the warnings do.
+   */
+  bool falls_back_to_defaults;
+} MarmotAccountRelayHealth;
 
 /**
  * Relay-telemetry export settings. Also a borrowed input to
@@ -7278,6 +7450,19 @@ typedef enum MarmotEvent_Tag {
    * device identities.
    */
   MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED,
+  /**
+   * The account's relay health changed; re-read
+   * `marmot_account_relay_health`. Fires when its answer, apart from each
+   * row's liveness, differs from the one last announced, which only a
+   * change to the account's held relay lists causes, and once each time
+   * the account's worker starts; never for a relay connecting or
+   * disconnecting. Carries no relays.
+   * Only a running account worker sends it: a list that changes while
+   * none runs (an external-signer account whose signer is not registered,
+   * say) announces nothing, so read the query when the account starts and
+   * when the relay screen opens.
+   */
+  MARMOT_EVENT_RELAY_HEALTH_CHANGED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -7400,6 +7585,11 @@ typedef struct MarmotEvent_ChatHistoryImportsChanged_Body {
   char *account_label;
 } MarmotEvent_ChatHistoryImportsChanged_Body;
 
+typedef struct MarmotEvent_RelayHealthChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_RelayHealthChanged_Body;
+
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
   union {
@@ -7422,6 +7612,7 @@ typedef struct MarmotEvent {
     MarmotEvent_RecoveryStatusChanged_Body RECOVERY_STATUS_CHANGED;
     MarmotEvent_DeviceUnlinked_Body DEVICE_UNLINKED;
     MarmotEvent_ChatHistoryImportsChanged_Body CHAT_HISTORY_IMPORTS_CHANGED;
+    MarmotEvent_RelayHealthChanged_Body RELAY_HEALTH_CHANGED;
   };
 } MarmotEvent;
 
@@ -10835,6 +11026,23 @@ MarmotStatus marmot_account_relay_lists(const struct MarmotClient *client,
 MarmotStatus marmot_account_relay_liveness(const struct MarmotClient *client,
                                            const char *account_ref,
                                            struct MarmotRelayLivenessList **out);
+
+/**
+ * The account's relay health from its held lists and the relay policy:
+ * rows, warnings about invitations sent through its published inbox list,
+ * and the highest severity. Local read; never dials.
+ * Re-read on `MARMOT_EVENT_RELAY_HEALTH_CHANGED`.
+ * Free with `marmot_account_relay_health_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_account_relay_health(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         struct MarmotAccountRelayHealth **out);
 
 /**
  * Reconnect one configured relay and return its next observed state.
@@ -16672,6 +16880,16 @@ void marmot_relay_liveness_free(struct MarmotRelayLiveness *ptr);
  * library.
  */
 void marmot_relay_liveness_list_free(struct MarmotRelayLivenessList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_account_relay_health_free(struct MarmotAccountRelayHealth *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL
