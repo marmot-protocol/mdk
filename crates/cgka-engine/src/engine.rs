@@ -63,6 +63,12 @@ const TRACKED_WELCOME_STATES: &[MessageState] = &[
     MessageState::Failed,
 ];
 
+/// Event-buffer capacity the engine keeps between drains. A background replay
+/// slice processes at most one sweep of rows, and each row can emit a received
+/// message plus an invalidation, so this bound covers a routine slice. A larger
+/// backlog is handed to the caller instead of being retained (mdk#3585).
+const RETAINED_EVENT_CAPACITY: usize = 2 * crate::message_processor::MAX_DEFERRED_ROWS_PER_SWEEP;
+
 /// Retained Welcome obligations and the IDs needed to reconcile their projections.
 #[derive(Debug, Default)]
 pub struct WelcomeDeliveryIndex {
@@ -5467,7 +5473,17 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         // past-epoch peel window fails its ingest call) does so here, so the
         // host reads its event with the operation that caused it (mdk#3272).
         self.quarantine_failed_rewinds();
-        self.events_buf.drain(..).collect()
+        if self.events_buf.capacity() > RETAINED_EVENT_CAPACITY {
+            // Hand the oversized allocation to the caller, which frees it
+            // with the events, and keep a bounded buffer for the next routine
+            // batch (mdk#3585). Routine batches drain in place so a replay
+            // pass reuses the buffer instead of regrowing it every time.
+            let events = std::mem::take(&mut self.events_buf);
+            self.events_buf = VecDeque::with_capacity(RETAINED_EVENT_CAPACITY);
+            events.into()
+        } else {
+            self.events_buf.drain(..).collect()
+        }
     }
 
     fn drain_auto_publish(&mut self) -> Vec<AutoPublish> {
@@ -5806,3 +5822,50 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
 #[cfg(test)]
 #[path = "engine/rewind_gate_tests.rs"]
 mod rewind_gate_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_event(tag: u8) -> GroupEvent {
+        GroupEvent::LocalGroupCopyRestored {
+            group_id: GroupId::new(vec![tag]),
+        }
+    }
+
+    #[test]
+    fn drain_events_keeps_routine_capacity_and_bounds_oversized_capacity() {
+        let (mut engine, _) = super::rewind_gate_tests::client(b"drain-events-capacity");
+
+        // Routine batch (<= RETAINED_EVENT_CAPACITY): drains in place and keeps capacity.
+        for i in 0..64u8 {
+            engine.events_buf.push_back(dummy_event(i));
+        }
+        let routine_cap = engine.events_buf.capacity();
+        assert!(routine_cap <= RETAINED_EVENT_CAPACITY);
+        let drained = engine.drain_events();
+        assert_eq!(drained.len(), 64);
+        assert!(engine.events_buf.is_empty());
+        assert_eq!(engine.events_buf.capacity(), routine_cap);
+
+        // Oversized backlog (> RETAINED_EVENT_CAPACITY): hands off the buffer
+        // and leaves at most RETAINED_EVENT_CAPACITY slots.
+        let oversized = RETAINED_EVENT_CAPACITY * 2;
+        for i in 0..oversized {
+            engine.events_buf.push_back(dummy_event((i & 0xff) as u8));
+        }
+        assert!(engine.events_buf.capacity() > RETAINED_EVENT_CAPACITY);
+        let drained = engine.drain_events();
+        assert_eq!(drained.len(), oversized);
+        assert!(engine.events_buf.is_empty());
+        let bounded_cap = engine.events_buf.capacity();
+        assert!(
+            bounded_cap <= RETAINED_EVENT_CAPACITY,
+            "oversized drain left capacity {bounded_cap} > {RETAINED_EVENT_CAPACITY}"
+        );
+
+        // A subsequent empty drain does not replace or grow the bounded buffer.
+        assert!(engine.drain_events().is_empty());
+        assert_eq!(engine.events_buf.capacity(), bounded_cap);
+    }
+}
