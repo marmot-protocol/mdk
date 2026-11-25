@@ -1150,8 +1150,18 @@ impl AccountDeviceSession {
     }
 
     /// See `Engine::unrecorded_welcome_expiries`.
-    pub(crate) fn unrecorded_welcome_expiries(&self) -> SessionResult<Vec<MessageId>> {
+    pub(crate) fn unrecorded_welcome_expiries(
+        &self,
+    ) -> SessionResult<cgka_engine::engine::UnrecordedWelcomeExpiries> {
         Ok(self.engine.unrecorded_welcome_expiries()?)
+    }
+
+    /// See `Engine::unrecorded_welcome_expiries_in`.
+    pub(crate) fn unrecorded_welcome_expiries_in(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<MessageId>> {
+        Ok(self.engine.unrecorded_welcome_expiries_in(group_id)?)
     }
 
     /// See `Engine::sent_welcomes_for_key_package`.

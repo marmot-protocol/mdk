@@ -32,7 +32,9 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::{EntropySource, MonotonicClock, WallClock};
 use cgka_traits::message::{MessageState, StoredMessagePayload, WelcomeExpiry};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{LeaveRequest, RosterTagKey, StorageError, StorageProvider};
+use cgka_traits::storage::{
+    LeaveRequest, OpenMlsContentFilter, RosterTagKey, StorageError, StorageProvider,
+};
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
@@ -68,6 +70,14 @@ pub struct WelcomeDeliveryIndex {
     pub outstanding: Vec<(GroupId, TransportMessage)>,
     /// Delivery-aware and staged Welcome IDs, including completed and canceled ones.
     pub tracked_ids: Vec<MessageId>,
+}
+
+/// The Welcomes [`Engine::unrecorded_welcome_expiries`] found, and the groups
+/// it could not read now.
+#[derive(Debug, Default)]
+pub struct UnrecordedWelcomeExpiries {
+    pub ids: Vec<MessageId>,
+    pub unread_groups: Vec<GroupId>,
 }
 
 /// Owed Welcomes and staged Welcome ids from one pass over the message store.
@@ -4858,22 +4868,46 @@ impl<S: StorageProvider> Engine<S> {
 
     /// The Welcomes marked expired whose expiry is not recorded yet
     /// ([`WelcomeExpiry::Unrecorded`]): a stop came between the mark and its
-    /// record. Read from every group's rows, live or not.
-    pub fn unrecorded_welcome_expiries(&self) -> Result<Vec<MessageId>, EngineError> {
-        let mut ids = Vec::new();
+    /// record. Read from every group's rows, live or not, with
+    /// [`Self::unrecorded_welcome_expiries_in`]. A group whose rows cannot be
+    /// read now is left out and named in `unread_groups`, so one unreadable
+    /// row never hides another group's.
+    pub fn unrecorded_welcome_expiries(&self) -> Result<UnrecordedWelcomeExpiries, EngineError> {
+        let mut found = UnrecordedWelcomeExpiries::default();
         for group_id in self.storage.list_groups()? {
-            self.visit_group_welcome_records(
-                &group_id,
-                &[MessageState::Failed],
-                |id, _, payload| {
-                    if payload.welcome_expiry() == Some(WelcomeExpiry::Unrecorded) {
-                        ids.push(id);
-                    }
-                    Ok(())
-                },
-            )?;
+            match self.unrecorded_welcome_expiries_in(&group_id) {
+                Ok(ids) => found.ids.extend(ids),
+                Err(_) => found.unread_groups.push(group_id),
+            }
         }
-        Ok(ids)
+        Ok(found)
+    }
+
+    /// [`Self::unrecorded_welcome_expiries`] for one group. Only its `Failed`
+    /// rows that carry no OpenMLS message are read
+    /// ([`OpenMlsContentFilter::NoOpenMlsMessage`]): the mark is only ever
+    /// written on an outbound Welcome's row, never on a failed commit,
+    /// proposal or application.
+    pub fn unrecorded_welcome_expiries_in(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<MessageId>, EngineError> {
+        Ok(self
+            .storage
+            .list_openmls_messages_in_states(
+                group_id,
+                &[MessageState::Failed],
+                EpochId(0),
+                OpenMlsContentFilter::NoOpenMlsMessage,
+            )?
+            .into_iter()
+            .filter(|record| {
+                StoredMessagePayload::decode(&record.payload).is_ok_and(|payload| {
+                    payload.welcome_expiry() == Some(WelcomeExpiry::Unrecorded)
+                })
+            })
+            .map(|record| record.id)
+            .collect())
     }
 
     /// The retained outbound Welcomes of `group_id` that answer the

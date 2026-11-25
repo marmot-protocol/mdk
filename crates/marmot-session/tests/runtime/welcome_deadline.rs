@@ -711,3 +711,121 @@ async fn a_redelivery_past_the_deadline_marks_the_welcome_expired() {
     ));
     assert_eq!(expired_rows(&audit).len(), 1);
 }
+
+/// Put a `Failed` row the store cannot read (its deferred-peel record is not
+/// a record) into `group_id`'s messages in the owed-invite fixture's
+/// database, and return its id.
+fn plant_unreadable_failed_row(dir: &std::path::Path, group_id: &GroupId) -> Vec<u8> {
+    let id = vec![0xbd; 32];
+    owed_invite_database(dir)
+        .execute(
+            "INSERT INTO cgka_messages
+                 (id, group_id, epoch, state, storage_format, payload, deferred_peel, openmls_content)
+             VALUES (?1, ?2, 0, 3, 2, x'00', x'ff', 0)",
+            rusqlite::params![id, group_id.as_slice()],
+        )
+        .unwrap();
+    id
+}
+
+/// One row the store cannot read stops the search for unrecorded expiries in
+/// its own group only: another group's owed Welcome is still sent by the
+/// startup pass, and maintenance runs on (mdk#3589).
+#[tokio::test]
+async fn an_unreadable_row_in_one_group_stops_no_other_groups_welcome() {
+    let dir = relaxed_storage_dir().unwrap();
+    let OwedInviteWelcome {
+        mut runtime,
+        group_id,
+        welcome,
+        ..
+    } = owed_invite_welcome(dir.path()).await;
+    let (other, _) = runtime
+        .create_group(CreateGroupRequest {
+            name: "other".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_ne!(other, group_id);
+    drop(runtime);
+    plant_unreadable_failed_row(dir.path(), &other);
+
+    let adapter = RecordingAdapter::default();
+    let mut restarted = reopened_owed_invite(
+        dir.path(),
+        &group_id,
+        &welcome,
+        adapter.clone(),
+        300_100,
+        &dir.path().join("restart-audit-v5.jsonl"),
+    );
+    let (_, task) = restarted
+        .prepare_owed_welcome_retry_task_with_audit_context(Default::default())
+        .unwrap()
+        .expect("the healthy group's Welcome is owed");
+    assert_eq!(task.message_ids(), std::slice::from_ref(&welcome.id));
+    restarted
+        .finish_welcome_publish_task(task.run().await)
+        .await
+        .unwrap();
+    restarted.run_due_maintenance().await.unwrap();
+    assert_eq!(welcome_publishes(&adapter), vec![welcome]);
+}
+
+/// A group whose rows could not be read when the startup pass searched it is
+/// searched again on each maintenance pass, so the expiry a stop left
+/// unrecorded there is recorded, once, as soon as the group reads again.
+#[tokio::test]
+async fn an_unrecorded_expiry_in_a_group_that_reads_again_is_recorded_then() {
+    let dir = relaxed_storage_dir().unwrap();
+    let OwedInviteWelcome {
+        runtime,
+        group_id,
+        welcome,
+        ..
+    } = owed_invite_tried_now(dir.path()).await;
+    let deadline = runtime
+        .session()
+        .sent_welcome_deliver_until(&welcome.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime
+            .session()
+            .expire_sent_welcome(&welcome.id, deadline)
+            .unwrap(),
+        Some(WelcomeExpiry::Unrecorded)
+    );
+    drop(runtime);
+    let unreadable = plant_unreadable_failed_row(dir.path(), &group_id);
+
+    let audit = dir.path().join("unreadable-audit-v5.jsonl");
+    let mut restarted = reopened_owed_invite(
+        dir.path(),
+        &group_id,
+        &welcome,
+        RecordingAdapter::default(),
+        deadline.0 + 60,
+        &audit,
+    );
+    assert!(
+        restarted
+            .prepare_owed_welcome_retry_task_with_audit_context(Default::default())
+            .unwrap()
+            .is_none()
+    );
+    restarted.run_due_maintenance().await.unwrap();
+    assert!(expired_rows(&audit).is_empty(), "its group cannot be read");
+
+    owed_invite_database(dir.path())
+        .execute("DELETE FROM cgka_messages WHERE id = ?1", [unreadable])
+        .unwrap();
+    restarted.run_due_maintenance().await.unwrap();
+    restarted.run_due_maintenance().await.unwrap();
+    assert_eq!(expired_rows(&audit).len(), 1);
+}

@@ -367,8 +367,9 @@ pub struct TransportGroupRoute {
 ///
 /// A row is classified by its payload: the content type and epoch of the
 /// OpenMLS message that [`crate::message::StoredMessagePayload::as_openmls_wire`]
-/// carries. Every variant leaves out rows whose payload carries no OpenMLS
-/// wire message. A row the backend cannot classify (an undecodable payload,
+/// carries. Every variant but [`Self::NoOpenMlsMessage`] leaves out rows
+/// whose payload carries no OpenMLS wire message. A row the backend cannot
+/// classify (an undecodable payload,
 /// MLS bytes that are not a framed public or private message, an epoch the
 /// backend cannot index) is never left out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -385,6 +386,10 @@ pub enum OpenMlsContentFilter {
     /// Only commits and proposals whose epoch is from `from` through
     /// `through`, the selection input inside a convergence pass's horizon.
     CommitsAndProposalsBetween { from: EpochId, through: EpochId },
+    /// Only rows whose payload carries no OpenMLS wire message, such as the
+    /// retained outbound Welcomes, leaving out every commit, proposal and
+    /// application.
+    NoOpenMlsMessage,
 }
 
 /// Messages + epoch-scoped snapshot/rollback hooks.

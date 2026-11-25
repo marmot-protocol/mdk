@@ -682,7 +682,7 @@ where
         A: Clone + 'static,
     {
         let work = self.session.outbound_welcome_work()?;
-        self.adopt_unrecorded_expiries()?;
+        self.adopt_unrecorded_expiries();
         self.welcome_store_read = true;
         self.unread_welcome_groups = work.unread_groups;
         self.adopt_stored_welcomes(work.staged);
@@ -750,19 +750,42 @@ where
     }
 
     /// Watch every Welcome marked expired whose expiry a stop left
-    /// unrecorded, so the watcher records it.
-    fn adopt_unrecorded_expiries(&mut self) -> AccountResult<()> {
-        let ids = self.session.unrecorded_welcome_expiries()?;
-        self.adopt_stored_welcomes(ids);
-        Ok(())
+    /// unrecorded, so it is recorded: every group's on the first call, then,
+    /// on each later call, each group whose rows could not be read before,
+    /// until they read. A read that fails is logged and stops nothing else:
+    /// owed Welcomes are read and published as usual.
+    fn adopt_unrecorded_expiries(&mut self) {
+        for group_id in std::mem::take(&mut self.unread_expiry_groups) {
+            match self.session.unrecorded_welcome_expiries_in(&group_id) {
+                Ok(ids) => self.adopt_stored_welcomes(ids),
+                Err(error) => {
+                    log_unread_welcome_expiries(1, Some(&error));
+                    self.unread_expiry_groups.push(group_id);
+                }
+            }
+        }
+        if self.welcome_expiries_read {
+            return;
+        }
+        match self.session.unrecorded_welcome_expiries() {
+            Ok(found) => {
+                self.welcome_expiries_read = true;
+                if !found.unread_groups.is_empty() {
+                    log_unread_welcome_expiries(found.unread_groups.len(), None);
+                }
+                self.unread_expiry_groups = found.unread_groups;
+                self.adopt_stored_welcomes(found.ids);
+            }
+            Err(error) => log_unread_welcome_expiries(0, Some(&error)),
+        }
     }
 
     /// Read the store for Welcomes to watch: all of it the first time, unless
     /// the startup pass did, then each group a read skipped, once it is live.
     fn read_welcome_store(&mut self) -> AccountResult<()> {
+        self.adopt_unrecorded_expiries();
         if !self.welcome_store_read {
             let work = self.session.outbound_welcome_work()?;
-            self.adopt_unrecorded_expiries()?;
             self.welcome_store_read = true;
             self.unread_welcome_groups = work.unread_groups;
             self.adopt_stored_welcomes(work.staged);
@@ -881,4 +904,16 @@ where
         }
         Ok(())
     }
+}
+
+/// A search for unrecorded Welcome expiries that could not read `groups`
+/// groups (0: the group list itself), retried on the next maintenance pass.
+fn log_unread_welcome_expiries(groups: usize, error: Option<&crate::session::SessionError>) {
+    tracing::warn!(
+        target: TRACE_TARGET,
+        method = "adopt_unrecorded_expiries",
+        groups,
+        transient = error.map(crate::session::SessionError::is_transient),
+        "unrecorded Welcome expiries not read; retried on a later pass"
+    );
 }

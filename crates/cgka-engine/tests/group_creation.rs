@@ -5618,7 +5618,7 @@ async fn an_expired_welcome_stays_expired_whatever_the_clock_or_its_commit() {
             Some(WelcomeExpiry::Unrecorded)
         );
         assert_eq!(
-            alice.unrecorded_welcome_expiries().unwrap(),
+            alice.unrecorded_welcome_expiries().unwrap().ids,
             vec![id.clone()]
         );
         // A clock set back reads it expired still, and it stays marked.
@@ -5634,7 +5634,7 @@ async fn an_expired_welcome_stays_expired_whatever_the_clock_or_its_commit() {
             alice.expire_sent_welcome(id, before).unwrap(),
             Some(WelcomeExpiry::Recorded)
         );
-        assert!(alice.unrecorded_welcome_expiries().unwrap().is_empty());
+        assert!(alice.unrecorded_welcome_expiries().unwrap().ids.is_empty());
         assert_eq!(alice.outbound_welcome_status(id, before).ok(), expired);
     }
     alice.confirm_published(pending).await.unwrap();
