@@ -44,6 +44,8 @@ before changing this crate.
 - `src/repo_picker.rs` - `/<path>` workdir selection under `$HOME`.
 - `src/store.rs` - private per-group session/workdir/goal/recovery state.
 - `src/process.rs` - JSONL child-process runner and process-group cleanup.
+- `src/reply.rs` - reply context checked against the timeline and rendered
+  into the prompt by the process runner, just before the backend can read it.
 - `src/chunking.rs` - UTF-8-safe reply chunking.
 - `src/error.rs` - `HarnessError` and privacy-safe error text.
 - `src/artifacts.rs` - opt-in artifact export grants, staging, and manifests.

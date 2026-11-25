@@ -4727,6 +4727,118 @@ mod tests {
         server.abort();
     }
 
+    /// Runs a real child process through `run_jsonl_process`, as the backends
+    /// do, so a test sees what the process reads on stdin.
+    struct ScriptProcessBackend {
+        script: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl Backend for ScriptProcessBackend {
+        async fn run(
+            &self,
+            invocation: Invocation,
+            tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            crate::process::run_jsonl_process(
+                crate::process::ProcessSpec {
+                    executable: self.script.to_string_lossy().into_owned(),
+                    args: Vec::new(),
+                    cwd: invocation.cwd,
+                    environment: Vec::new(),
+                    prompt: crate::process::PromptTransport::Stdin(invocation.prompt),
+                    trace_method: "test_backend_run",
+                    backend_name: "test",
+                    total_timeout: invocation.timeout,
+                    idle_timeout: invocation.idle_timeout,
+                    reply: invocation.reply,
+                },
+                tx,
+                |line| {
+                    let value: serde_json::Value = serde_json::from_str(line)?;
+                    Ok::<_, serde_json::Error>(match value["text"].as_str() {
+                        Some(text) => crate::process::ParsedEvent::Text(text.to_owned()),
+                        None => crate::process::ParsedEvent::Ignored,
+                    })
+                },
+            )
+            .await
+        }
+    }
+
+    /// `/retry-last` goes through the same process boundary as a first
+    /// attempt: a quote deleted after the failed first attempt reaches the
+    /// retried process with its ID and attribution only.
+    #[tokio::test]
+    async fn retry_checks_the_reply_at_the_process_boundary() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let stdin_log = root.path().join("stdin");
+        let script = root.path().join("backend");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat > \"{}\"\nprintf '%s\\n' '{{\"text\":\"done\"}}'\n",
+                stdin_log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let config = test_config(root.path());
+        let targets = ReplyTargets::default();
+        let server = spawn_final_server_with_reply_targets(&config.socket, targets.clone());
+        let reply = test_reply("the secret plan");
+
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config.clone(),
+            Arc::new(RecoverableFailureBackend { failure_mode: 1 }),
+        );
+        ctx.sessions
+            .set_workdir("group", repo.canonicalize().unwrap())
+            .await
+            .unwrap();
+        dispatch_test_inbound(
+            ctx.clone(),
+            "failure",
+            "ordinary task",
+            Vec::new(),
+            Some(reply.clone()),
+        )
+        .await;
+        assert_eq!(
+            ctx.recovery.get("group").await.unwrap().reply_to,
+            Some(reply.clone())
+        );
+        drop(ctx);
+        targets
+            .lock()
+            .unwrap()
+            .insert(reply.message_id_hex.clone(), ReplyTargetNow::Deleted);
+
+        let restarted = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            Arc::new(ScriptProcessBackend { script }),
+        );
+        dispatch_test_message(restarted, "retry", "/retry-last").await;
+        let stdin = fs::read_to_string(&stdin_log).unwrap();
+        let mut expected = reply;
+        expected.availability = AgentControlReferencedMessageAvailability::Deleted;
+        expected.text_excerpt = None;
+        assert_eq!(stdin, expected_reply_prompt(&expected, "ordinary task"));
+        assert!(!stdin.contains("the secret plan"));
+        server.abort();
+    }
+
     fn test_reply(excerpt: &str) -> AgentControlReferencedMessage {
         AgentControlReferencedMessage {
             message_id_hex: "ab".repeat(32),
