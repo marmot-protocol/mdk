@@ -1826,6 +1826,12 @@ async fn run_app_runtime_account_worker(
     // first wave.
     client.detach_welcome_waves();
     client.start_startup_welcome_retry();
+    // The startup pass records each expiry that passed while the app was
+    // closed and queues its notice; announce those now, wave or not, since
+    // a later start reads them recorded and queues none (mdk#3589).
+    publish_pending_welcome_delivery_events(&events, &account_id_hex, &account_label, &mut client);
+    #[cfg(test)]
+    tests::welcome_wave_tests::held_after_startup_pass(&account_id_hex).await;
     let mut welcome_runs = welcome_runs::WelcomeRuns::default();
 
     let mut yield_to_convergence = false;
