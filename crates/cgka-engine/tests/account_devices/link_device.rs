@@ -961,6 +961,27 @@ fn removed_slot(n: u8, tag_signature_key: Option<Vec<u8>>) -> DeviceRosterOperat
     )
 }
 
+/// Commit `tablet`'s self-update in the device group, so its leaf is no
+/// longer the one its link's Add built from its KeyPackage, and have the
+/// phone and laptop apply it.
+async fn commit_tablet_update(
+    tablet: &mut Device,
+    phone: &mut Device,
+    laptop: &mut Device,
+    gid: &GroupId,
+) {
+    let update = send_commit(
+        tablet,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        gid,
+    )
+    .await;
+    assert_accepted(phone, &update, gid).await;
+    assert_accepted(laptop, &update, gid).await;
+}
+
 /// Removing a linked device (3.6b) is the unlink's Commit, whose update also
 /// records the slot as `removed` with the tag signature key its entry had.
 /// Every member accepts it, and the removed device sees itself removed.
@@ -968,6 +989,7 @@ fn removed_slot(n: u8, tag_signature_key: Option<Vec<u8>>) -> DeviceRosterOperat
 async fn a_removal_records_the_slot_as_removed_in_the_same_commit() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
     let mut tablet = link_tablet(&mut phone, &mut laptop, &gid).await;
+    commit_tablet_update(&mut tablet, &mut phone, &mut laptop, &gid).await;
     let tag_key = vec![0x44; 32];
     let tagged = DeviceEntryV1 {
         tag_signature_key: Some(tag_key.clone()),
@@ -1018,9 +1040,122 @@ async fn a_removal_records_the_slot_as_removed_in_the_same_commit() {
     }
 }
 
+/// A removed device can leave its entry without the key its leaf signs with
+/// (mdk#3679): here the tablet has committed and its entry carries no tag
+/// signature key. The removal then records the slot as `removed` with the
+/// signature key of the leaf it removes. Every member accepts it, as every
+/// member accepts any well-formed roster update.
+#[tokio::test]
+async fn a_removal_can_record_the_removed_leafs_key() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let mut tablet = link_tablet(&mut phone, &mut laptop, &gid).await;
+    commit_tablet_update(&mut tablet, &mut phone, &mut laptop, &gid).await;
+    let tablet_key = signature_key(&tablet, &gid);
+    assert_eq!(
+        roster_of(&phone, &gid).devices[&slot(3)].tag_signature_key,
+        None
+    );
+    let mut expected = roster_of(&phone, &gid);
+
+    let commit = send_commit(
+        &mut phone,
+        unlink(
+            &gid,
+            tablet_key.clone(),
+            vec![
+                DeviceRosterOperationV1::RemoveDevice(slot(3)),
+                removed_slot(3, Some(tablet_key.clone())),
+            ],
+        ),
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut laptop, &commit, &gid).await;
+    assert_accepted(&mut tablet, &commit, &gid).await;
+    assert!(tablet.engine.group_record(&gid).unwrap().removed);
+
+    expected.devices.remove(&slot(3));
+    expected.rejected_slots.insert(
+        slot(3),
+        RejectedSlotV1 {
+            reason: RejectedSlotReasonV1::Removed,
+            rejected_at: 7,
+            tag_signature_key: Some(tablet_key),
+        },
+    );
+    for device in [&phone, &laptop] {
+        assert_eq!(roster_of(device, &gid), expected);
+        assert_eq!(load_group(device, &gid).members().count(), 2);
+    }
+}
+
+/// A link whose device has not committed is never recorded as `removed`,
+/// even when its entry names a key, as any device can write one there
+/// (mdk#3679): its leaf is still the one its Add built from its KeyPackage.
+/// The unlink is refused with nothing staged, and undoing the link, which
+/// removes the entry alone, still goes ahead.
+#[tokio::test]
+async fn a_pending_links_leaf_is_never_recorded_as_removed() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let mut tablet = link_tablet(&mut phone, &mut laptop, &gid).await;
+    let tablet_key = signature_key(&tablet, &gid);
+    let entry_key = vec![0x44; 32];
+    let named = DeviceEntryV1 {
+        tag_signature_key: Some(entry_key.clone()),
+        ..roster_of(&phone, &gid).devices[&slot(3)].clone()
+    };
+    let set_key = send_commit(
+        &mut phone,
+        roster_update(
+            &gid,
+            vec![DeviceRosterOperationV1::SetDevice(slot(3), named)],
+        ),
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut laptop, &set_key, &gid).await;
+    assert_accepted(&mut tablet, &set_key, &gid).await;
+    let before = super::send_intents::Untouched::of(&phone, &gid);
+
+    assert_refused(
+        phone
+            .engine
+            .send(unlink(
+                &gid,
+                tablet_key.clone(),
+                vec![
+                    DeviceRosterOperationV1::RemoveDevice(slot(3)),
+                    removed_slot(3, Some(entry_key)),
+                ],
+            ))
+            .await,
+        "the removed leaf is still its link's KeyPackage leaf",
+    );
+    assert_eq!(super::send_intents::Untouched::of(&phone, &gid), before);
+
+    let undo = send_commit(
+        &mut phone,
+        unlink(
+            &gid,
+            tablet_key,
+            vec![DeviceRosterOperationV1::RemoveDevice(slot(3))],
+        ),
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut laptop, &undo, &gid).await;
+    for device in [&phone, &laptop] {
+        let roster = roster_of(device, &gid);
+        assert!(!roster.devices.contains_key(&slot(3)));
+        assert!(!roster.rejected_slots.contains_key(&slot(3)));
+        assert_eq!(load_group(device, &gid).members().count(), 2);
+    }
+}
+
 /// An unlink names one other leaf of the account and removes exactly one
 /// listed device entry, optionally recording that slot as `removed` with the
-/// entry's tag signature key; anything else is refused with nothing staged.
+/// entry's tag signature key or the signature key of a removed leaf that has
+/// committed; anything else is refused with nothing staged.
 #[tokio::test]
 async fn a_refused_unlink_leaves_the_group_as_it_was() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
@@ -1077,13 +1212,22 @@ async fn a_refused_unlink_leaves_the_group_as_it_was() {
             ),
             "has reason removed and keeps the entry's tag signature key",
         ),
-        // The tablet's entry has no tag signature key: its link is not made,
-        // so it is undone with `remove_device` alone, never removed.
+        // A record always keeps a key. The tablet's entry has none, and its
+        // leaf is still its link's KeyPackage leaf, so it set no key a
+        // removal could keep (mdk#3679).
         (
             unlink(
                 &gid,
                 tablet_key.clone(),
                 vec![remove(3), removed_slot(3, None)],
+            ),
+            "has reason removed and keeps the entry's tag signature key",
+        ),
+        (
+            unlink(
+                &gid,
+                tablet_key.clone(),
+                vec![remove(3), removed_slot(3, Some(tablet_key.clone()))],
             ),
             "has reason removed and keeps the entry's tag signature key",
         ),

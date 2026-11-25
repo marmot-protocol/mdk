@@ -18,6 +18,8 @@
 
 ### Added
 
+- `renew_roster_tag_keys` updates `last_seen_at` for a slot's unexpired roster tag keys in one statement and leaves
+  `seen_seq` alone (mdk#3679).
 - Kind-1009 edits apply to kind-1201 agent items: the highest `v` replaces the row's content and tags, an older
   version is ignored, and the row is not marked edited. Agent items have no edit history.
 - A kind-1201 agent item with an `E` tag is placed in that thread, under the parent its `e` names or else the root,

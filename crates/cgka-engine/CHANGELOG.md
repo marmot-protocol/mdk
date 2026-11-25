@@ -2,8 +2,14 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `Engine::own_account_leaves_tagged_by` returns each leaf's signature key with the slot its tag read as.
+
 ### Added
 
+- `Engine::own_account_self_signed_tags` reads, for this account's other leaves, a device tag that verifies under
+  that leaf's own signature key, with the slot it names (mdk#3679).
 - `Engine::deferred_stall_evidence_since` returns deferred stall evidence for rows whose arrival epoch falls in
   `min_epoch..=group.epoch`, for active epoch-gap handoffs across partial advances.
 - `Engine::stored_outbound_welcome_status`, an outbound Welcome's status read from its stored rows without the
@@ -11,6 +17,9 @@
 
 ### Changed
 
+- `SendIntent::UnlinkDevice` may keep the removed leaf's signature key in the slot's `removed` record once that leaf
+  has committed since its Add, and refuses any `removed` record while the removed leaf is still its link's KeyPackage
+  leaf (mdk#3679). Receivers are unchanged.
 - Budget-expired deferred-peel evictions delete the deferred row from `cgka_messages` directly instead of calling
   `release_message_for_replay`, so storage hosts are no longer notified via the release journal for budget-expired
   rows, avoiding false epoch-gap arms, `seen_events` retirement, and relay bounce-backs.

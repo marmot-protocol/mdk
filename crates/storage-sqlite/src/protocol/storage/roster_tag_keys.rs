@@ -68,6 +68,28 @@ impl RosterTagKeyStorage for SqliteAccountStorage {
         Ok(())
     }
 
+    fn renew_roster_tag_keys(
+        &self,
+        group_id: &GroupId,
+        slot: &[u8; 32],
+        since: u64,
+        seen_at: u64,
+    ) -> StorageResult<()> {
+        let conn = self.lock()?;
+        conn.execute_cached(
+            "UPDATE cgka_roster_tag_keys SET last_seen_at = max(last_seen_at, ?4)
+             WHERE group_id = ?1 AND slot = ?2 AND last_seen_at >= ?3",
+            params![
+                group_id.as_slice(),
+                slot.as_slice(),
+                u64_to_i64(since)?,
+                u64_to_i64(seen_at)?
+            ],
+        )
+        .storage()?;
+        Ok(())
+    }
+
     fn roster_tag_keys(&self, group_id: &GroupId, since: u64) -> StorageResult<Vec<RosterTagKey>> {
         let conn = self.lock()?;
         let mut stmt = conn
@@ -106,7 +128,9 @@ mod tests {
     use super::*;
     use crate::SqliteAccountStorage;
     use crate::base::test_support::{gid, sample_group};
-    use cgka_traits::storage::{GroupStorage as _, MessageStorage as _, StorageProvider as _};
+    use cgka_traits::storage::{
+        GroupStorage as _, MessageStorage as _, ROSTER_TAG_KEYS_PER_SLOT, StorageProvider as _,
+    };
 
     fn key(slot: u8, key: u8) -> RosterTagKey {
         RosterTagKey {
@@ -232,6 +256,56 @@ mod tests {
         );
         store.prune_roster_tag_keys(600, 2).unwrap();
         assert!(store.roster_tag_keys(&gid(1), 0).unwrap().is_empty());
+    }
+
+    /// Renewing a slot moves its keys' sighting time and nothing else, in one
+    /// step (mdk#3679): its kept keys stay in the order they were seen, so a
+    /// prune after their old time keeps every one of them, the held key
+    /// included, while it would drop a key a renewal had moved past (here
+    /// key 2, the oldest of the four newest). Another slot's keys, and keys
+    /// already last seen before `since`, are not renewed.
+    #[test]
+    fn renewing_a_slot_keeps_its_keys_in_their_order() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 1)).unwrap();
+        store.put_group(&sample_group(gid(2), 0, 1)).unwrap();
+        let held = RosterTagKey {
+            held_as_removed: true,
+            ..key(1, 1)
+        };
+        store
+            .record_roster_tag_keys(
+                &gid(1),
+                &[held.clone(), key(1, 2), key(1, 3), key(1, 4), key(1, 5)],
+                100,
+            )
+            .unwrap();
+        store
+            .record_roster_tag_keys(&gid(1), &[key(2, 1)], 100)
+            .unwrap();
+        store
+            .record_roster_tag_keys(&gid(2), &[key(1, 6)], 10)
+            .unwrap();
+        store
+            .record_roster_tag_keys(&gid(2), &[key(1, 7)], 100)
+            .unwrap();
+        let slot_1 = vec![key(1, 5), key(1, 4), key(1, 3), key(1, 2), held];
+
+        store
+            .renew_roster_tag_keys(&gid(1), &[1; 32], 50, 1000)
+            .unwrap();
+        store
+            .renew_roster_tag_keys(&gid(2), &[1; 32], 50, 1000)
+            .unwrap();
+
+        let mut both = slot_1.clone();
+        both.push(key(2, 1));
+        assert_eq!(store.roster_tag_keys(&gid(1), 0).unwrap(), both);
+        store
+            .prune_roster_tag_keys(500, ROSTER_TAG_KEYS_PER_SLOT)
+            .unwrap();
+        assert_eq!(store.roster_tag_keys(&gid(1), 0).unwrap(), slot_1);
+        assert_eq!(store.roster_tag_keys(&gid(2), 0).unwrap(), vec![key(1, 7)]);
     }
 
     /// A branch-selection rewind keeps the keys the dropped branch listed; a

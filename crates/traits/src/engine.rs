@@ -286,7 +286,10 @@ pub enum SendIntent {
     /// still removed. `roster_update` is a `marmot.account.device-roster.v1`
     /// update that removes the device entry of a slot the roster lists. A
     /// removal also sets that slot's rejected-slot record with reason
-    /// `removed` and the `tag_signature_key` the entry had; a failed link
+    /// `removed` and the `tag_signature_key` the entry had, or the signature
+    /// key of the leaf the Commit removes once that leaf has committed
+    /// (mdk#3679). A leaf still built from its Add's KeyPackage is never
+    /// recorded as `removed`, whatever key the record keeps; a failed link
     /// removes the entry alone. Like a link, it is never queued.
     UnlinkDevice {
         group_id: GroupId,

@@ -273,7 +273,7 @@ pub(crate) fn hydration_quarantine_group_digest(group_id: &GroupId) -> String {
 /// Update=2, Commit=3, and only a KeyPackage source carries a `Lifetime`.
 /// This fork exposes the source accessor but not its enum path, so the
 /// source is read from its TLS encoding rather than from Debug text.
-fn add_leaf_lifetime(
+pub(crate) fn add_leaf_lifetime(
     leaf: &openmls::prelude::LeafNode,
 ) -> Result<Option<openmls::prelude::Lifetime>, EngineError> {
     use tls_codec::Deserialize as _;
@@ -5122,23 +5122,36 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Every other leaf of this device's account in `group_id`'s current
     /// tree whose device tag reads, under `leaf_tag_key`, as the slot of one
-    /// of `keys` and verifies under that pair's key, as its signature key.
-    /// `keys` are tag signature keys this device remembers a roster listing
-    /// (mdk#2761), so the leaves of a device the roster no longer lists are
-    /// still found. This device's own leaf is left out.
+    /// of `keys` and verifies under that pair's key, as its signature key
+    /// with that slot. `keys` are tag signature keys this device remembers a
+    /// roster listing (mdk#2761), so the leaves of a device the roster no
+    /// longer lists are still found. This device's own leaf is left out.
     pub fn own_account_leaves_tagged_by(
         &self,
         group_id: &GroupId,
         leaf_tag_key: &[u8; 32],
         keys: &[RosterTagKey],
-    ) -> Result<Vec<Vec<u8>>, EngineError> {
-        Ok(self
-            .read_other_own_account_leaves(group_id, |leaf| {
-                crate::device_tag::device_tag_reads_as_one_of(leaf, leaf_tag_key, keys)
-            })?
-            .into_iter()
-            .map(|(signature_key, _)| signature_key)
-            .collect())
+    ) -> Result<Vec<(Vec<u8>, cgka_traits::app_components::DeviceSlotId)>, EngineError> {
+        self.read_other_own_account_leaves(group_id, |leaf| {
+            crate::device_tag::device_tag_reads_as_one_of(leaf, leaf_tag_key, keys)
+        })
+    }
+
+    /// Every other leaf of this device's account in `group_id`'s current
+    /// tree whose device tag, opened under `leaf_tag_key`, verifies under
+    /// that leaf's own signature key, as its signature key with the slot the
+    /// tag names (mdk#3679). Only the holder of a leaf's key can make such a
+    /// tag, so it says which slot the leaf's device claims, whatever any
+    /// roster lists. This device's own leaf is left out. The read is advisory
+    /// and authorizes no commit.
+    pub fn own_account_self_signed_tags(
+        &self,
+        group_id: &GroupId,
+        leaf_tag_key: &[u8; 32],
+    ) -> Result<Vec<(Vec<u8>, cgka_traits::app_components::DeviceSlotId)>, EngineError> {
+        self.read_other_own_account_leaves(group_id, |leaf| {
+            crate::device_tag::self_signed_device_tag_slot(leaf, leaf_tag_key)
+        })
     }
 
     /// `read` of each leaf of this device's account in `group_id` other than

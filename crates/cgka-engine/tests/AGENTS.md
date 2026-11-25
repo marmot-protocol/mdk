@@ -348,8 +348,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     `LinkDeviceUnsettled` instead of a queued link while convergence is unsettled, an own Commit is in flight, or an
     intent waits in the queue. Its undo, `UnlinkDevice` (D40): one privileged Commit removing the linked leaf and its
     entry, which the removed device sees as its removal; refused for another leaf than one other leaf of the account,
-    an update that doesn't remove exactly one listed entry, or while an own Commit is in flight or an intent waits in
-    the queue. A device it removed that forgot its copy joins again through the next link's Welcome, which no forget
+    an update that doesn't remove exactly one listed entry, a `removed` record that keeps neither the entry's tag
+    signature key nor the signature key of a removed leaf that has committed, any `removed` record while the removed
+    leaf is still its link's KeyPackage leaf, so a pending link is never recorded as `removed` (sender rules only;
+    receivers accept either, mdk#3679), or
+    while an own Commit is in flight or an intent waits in the queue. A device it removed that forgot its copy joins again through the next link's Welcome, which no forget
     cutoff dates. A link whose Welcome cannot be wrapped writes nothing.
 
   `account_devices/staging_atomicity.rs` owns late LinkDevice, AddOwnAccountDevices and UnlinkDevice projection

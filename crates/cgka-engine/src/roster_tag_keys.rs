@@ -14,7 +14,9 @@
 //! roster no longer lists, whether a removal's record was dropped before this
 //! device acted on it, a link failed, or a branch dropped a made link; and,
 //! adding a newly linked device to its chats (mdk#2628 3.5c), to skip a slot
-//! a state it applied held as removed.
+//! a state it applied held as removed. The app also renews a removed slot's
+//! keys while a chat still holds that device's leaf (mdk#3679), which moves
+//! only their sighting time and never their order.
 
 use std::collections::BTreeSet;
 

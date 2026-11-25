@@ -498,6 +498,39 @@ fn entry_reads_as_one_of(
         .then_some(content.slot)
 }
 
+/// The slot `leaf`'s device tag names, opened under `leaf_tag_key`, when
+/// the tag's signature verifies under the leaf's own signature key and no
+/// other (mdk#3679). Only the holder of that key can make such a tag, so it
+/// says which slot the leaf's device claims, whatever any roster lists. Like
+/// [`device_tag_claim`], only for leaves of the reader's own account.
+pub(crate) fn self_signed_device_tag_slot(
+    leaf: &LeafNode,
+    leaf_tag_key: &[u8; 32],
+) -> Option<DeviceSlotId> {
+    let entry = leaf
+        .extensions()
+        .app_data_dictionary()
+        .and_then(|dictionary| dictionary.dictionary().get(&DEVICE_TAG_COMPONENT_ID))?;
+    entry_reads_as_self_signed(entry, leaf.signature_key().as_slice(), leaf_tag_key)
+}
+
+fn entry_reads_as_self_signed(
+    entry: &[u8],
+    leaf_signature_key: &[u8],
+    leaf_tag_key: &[u8; 32],
+) -> Option<DeviceSlotId> {
+    let content = open_entry(entry, leaf_signature_key, leaf_tag_key)?;
+    VERIFY_CRYPTO
+        .verify_signature(
+            SignatureScheme::ED25519,
+            &sign_content(&content.slot, leaf_signature_key),
+            leaf_signature_key,
+            &content.signature,
+        )
+        .is_ok()
+        .then_some(content.slot)
+}
+
 fn open_entry(
     entry: &[u8],
     leaf_signature_key: &[u8],
@@ -634,6 +667,29 @@ mod tests {
             read_entry(&rekeyed, &LEAF_SIGNATURE_KEY, &roster),
             DeviceTagClaim::Unclaimed,
             "the tag proof cannot be detached from the leaf key it attests"
+        );
+    }
+
+    /// A self-signed tag is one the leaf's own key signed; a tag another key
+    /// signed reads as no slot that way, whichever key that was (mdk#3679).
+    #[test]
+    fn only_the_leafs_own_key_makes_a_self_signed_tag() {
+        let own = seal_device_tag(
+            &RustCrypto::default(),
+            &LEAF_TAG_KEY,
+            &SLOT,
+            &tag_signer(),
+            &tag_public_key(),
+        )
+        .unwrap();
+        assert_eq!(
+            entry_reads_as_self_signed(&own, &tag_public_key(), &LEAF_TAG_KEY),
+            Some(SLOT)
+        );
+        assert_eq!(
+            entry_reads_as_self_signed(&spec_tag(), &LEAF_SIGNATURE_KEY, &LEAF_TAG_KEY),
+            None,
+            "the tag verifies only under another key"
         );
     }
 
