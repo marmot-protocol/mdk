@@ -36,7 +36,7 @@ use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt, TransportReconciliationRoute};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// How long the un-cover log keeps a range. A coverage write whose fetch
 /// started before the oldest pruned range records nothing, so this outlasts
@@ -1200,9 +1200,10 @@ impl SqliteAppStorage {
         routes: impl IntoIterator<Item = &'r TransportReconciliationRoute>,
     ) -> StorageResult<BTreeMap<TransportReconciliationRoute, u64>> {
         let conn = self.lock()?;
+        let mut read = BTreeSet::new();
         let mut newest = BTreeMap::new();
         for route in routes {
-            if newest.contains_key(route) {
+            if !read.insert(route) {
                 continue;
             }
             let (kind, id) = route.storage_key();

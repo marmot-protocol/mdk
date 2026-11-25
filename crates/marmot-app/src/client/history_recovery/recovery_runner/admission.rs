@@ -554,7 +554,8 @@ impl<'t> Admission<'t> {
                 })
                 .collect::<Vec<_>>(),
         )?;
-        let mut members = Vec::with_capacity(units.len());
+        let mut pending: BTreeMap<&GroupKey, Vec<(Member, Vec<RecoveryCoverageRange>)>> =
+            keys.iter().map(|key| (key, Vec::new())).collect();
         for ((group, route, relay), (debt, unit)) in units.into_iter().zip(debts) {
             let position = debt.first().map(|range| range.since_seconds);
             // Its relay could not prove the first second it still owes,
@@ -601,7 +602,7 @@ impl<'t> Admission<'t> {
                 first_owed,
                 first_staged: None,
             };
-            members.push((group, member, captures));
+            pending.entry(group).or_default().push((member, captures));
         }
         // Fetched input not yet admitted inside a capture keeps it fenced,
         // on any of its group's routes.
@@ -612,12 +613,14 @@ impl<'t> Admission<'t> {
                 .flatten()
                 .map(|route| &route.route)
         };
-        let ranges = members
+        let ranges = pending
             .iter()
-            .flat_map(|(group, _, captures)| {
-                captures.iter().flat_map(move |capture| {
-                    group_routes(group)
-                        .map(move |route| (route, capture.since_seconds, capture.until_seconds))
+            .flat_map(|(group, members)| {
+                members.iter().flat_map(move |(_, captures)| {
+                    captures.iter().flat_map(move |capture| {
+                        group_routes(group)
+                            .map(move |route| (route, capture.since_seconds, capture.until_seconds))
+                    })
                 })
             })
             .collect::<BTreeSet<_>>()
@@ -628,31 +631,32 @@ impl<'t> Admission<'t> {
             .copied()
             .zip(turn.app.staged_recovery_first_seconds(&ranges)?)
             .collect::<BTreeMap<_, _>>();
-        for (group, member, captures) in &mut members {
-            for capture in captures.iter() {
-                let pending = group_routes(group)
-                    .filter_map(|route| {
-                        staged
-                            .get(&(route, capture.since_seconds, capture.until_seconds))
-                            .copied()
-                            .flatten()
-                    })
-                    .min();
-                if let Some(at) = pending {
-                    member.first_staged = super::sooner(member.first_staged, Some(at));
-                    if !member.fences.contains(capture) {
-                        member.fences.push(*capture);
+        for (group, members) in &mut pending {
+            for (member, captures) in members {
+                for capture in captures.iter() {
+                    let first = group_routes(group)
+                        .filter_map(|route| {
+                            staged
+                                .get(&(route, capture.since_seconds, capture.until_seconds))
+                                .copied()
+                                .flatten()
+                        })
+                        .min();
+                    if let Some(at) = first {
+                        member.first_staged = super::sooner(member.first_staged, Some(at));
+                        if !member.fences.contains(capture) {
+                            member.fences.push(*capture);
+                        }
                     }
                 }
+                member.fences.sort_by_key(|range| range.since_seconds);
             }
-            member.fences.sort_by_key(|range| range.since_seconds);
         }
-        let mut members = members.into_iter().peekable();
-        for key in &keys {
-            let mut group_members = Vec::new();
-            while let Some((_, member, _)) = members.next_if(|(group, _, _)| *group == key) {
-                group_members.push(member);
-            }
+        for (key, members) in pending {
+            let mut group_members = members
+                .into_iter()
+                .map(|(member, _)| member)
+                .collect::<Vec<_>>();
             // A failed source stops holding up its peers. With no source left
             // to serve the group, each one still pursuing its debt holds
             // instead: a frame opened ahead of history its relay may still
