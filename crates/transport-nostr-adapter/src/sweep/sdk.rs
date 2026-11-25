@@ -220,9 +220,16 @@ impl SweepRelay for SdkSweepRelay {
             return SliceReply::Unreachable(UnreachableKind::Disconnected);
         };
         // A reply retried after authentication joins two attempts' pages,
-        // which no count proves as one: ask the slice once more, now
-        // authenticated, and answer with that page alone.
-        if reply.retried && reply.end == FiniteEnd::Eose && !reply.auth {
+        // which no count proves as one, and its retry ran on what the first
+        // attempt left of the budget, so a cut proves nothing either: ask the
+        // slice once more, now authenticated, and answer with that page alone.
+        if reply.retried
+            && !reply.auth
+            && matches!(
+                reply.end,
+                FiniteEnd::Eose | FiniteEnd::ItemLimit | FiniteEnd::ByteLimit
+            )
+        {
             let Some(fresh) = self.acquire(query.filter(), limit.saturating_add(1)).await else {
                 return SliceReply::Unreachable(UnreachableKind::Disconnected);
             };

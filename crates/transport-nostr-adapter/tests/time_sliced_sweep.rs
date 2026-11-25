@@ -603,13 +603,14 @@ async fn an_auth_hint_leaves_the_slice_owed() {
     );
 }
 
-/// A relay that answers one REQ before NIP-42 finishes, ends it with
-/// NIP-67 `auth` and the AUTH challenge, and once the client authenticates
-/// answers each REQ with the newest `cap` of `events` its `since`/`until`
-/// match: a cap it publishes nowhere. A REQ before authentication is
-/// refused.
+/// A relay that answers one REQ before NIP-42 finishes with the oldest
+/// `before_auth` of the events its `since`/`until` match, ends it with the
+/// AUTH challenge and NIP-67 `auth`, and once the client authenticates
+/// answers each REQ with the newest `cap` of them: a cap it publishes
+/// nowhere. A REQ before authentication is refused.
 async fn auth_gated_clamping_relay(
     events: Vec<Event>,
+    before_auth: usize,
     cap: usize,
 ) -> (RelayUrl, tokio::task::JoinHandle<()>) {
     use futures::{SinkExt, StreamExt};
@@ -638,12 +639,11 @@ async fn auth_gated_clamping_relay(
                         .collect::<Vec<_>>();
                     matched.sort_by_key(|event| std::cmp::Reverse(event.created_at));
                     if reqs == 1 {
-                        // The oldest match only, as a relay hiding the rest
-                        // until the client authenticates.
                         let mut frames = matched
-                            .last()
+                            .iter()
+                            .rev()
+                            .take(before_auth)
                             .map(|event| serde_json::json!(["EVENT", id, event]))
-                            .into_iter()
                             .collect::<Vec<_>>();
                         frames.push(serde_json::json!(["AUTH", "challenge"]));
                         frames.push(serde_json::json!(["EOSE", id, ["auth"]]));
@@ -710,7 +710,7 @@ async fn a_slice_retried_after_authentication_proves_nothing() {
     let keys = Keys::generate();
     let older = group_event(&keys, GROUP, T0 + 10, 0);
     let newer = group_event(&keys, GROUP, T0 + 20, 1);
-    let (url, server) = auth_gated_clamping_relay(vec![older.clone(), newer.clone()], 1).await;
+    let (url, server) = auth_gated_clamping_relay(vec![older.clone(), newer.clone()], 1, 1).await;
     let (sdk, relay) = authenticating_sweep(
         url,
         RelayCaps {
@@ -768,45 +768,57 @@ async fn a_slice_retried_after_authentication_proves_nothing() {
 /// A one-second slice cannot split, so a reply retried after authentication
 /// there must not fall through to NIP-77 (mdk#3689): on a relay without it,
 /// that records a second the relay cannot prove while the authenticated
-/// relay would answer it. A fresh authenticated page proves it by count.
+/// relay would answer it. A fresh authenticated page proves it by count,
+/// also when the retry ran out of what the first attempt left of the budget:
+/// a relay that sent the whole second before asking to authenticate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_one_second_slice_retried_after_authentication_is_proven() {
-    let event = group_event(&Keys::generate(), GROUP, T0 + 10, 0);
-    let (url, server) = auth_gated_clamping_relay(vec![event.clone()], 500).await;
-    let (sdk, relay) = authenticating_sweep(
-        url,
-        RelayCaps {
-            max_limit: Some(500),
-            negentropy: false,
-        },
-    )
-    .await;
-    let mut sink = Sink::default();
-    let report = run_sweep(
-        request(SweepRange {
-            since: T0 + 10,
-            until: T0 + 10,
-        }),
-        &relay,
-        &mut sink,
-        &MemoryStore::default(),
-        &CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(report.end, SweepEnd::Finished, "{report:?}");
-    assert!(
-        matches!(
-            report.covered.as_slice(),
-            [slice] if matches!(slice.proof, SliceProof::BelowCap { received: 1, cap: 500 })
-        ),
-        "{report:?}"
-    );
-    assert_eq!(
-        sink.events.iter().map(|event| event.id).collect::<Vec<_>>(),
-        [event.id]
-    );
-    sdk.shutdown().await;
-    server.abort();
+    let keys = Keys::generate();
+    for (events, before_auth) in [(1, 1), (6, 6)] {
+        let case = format!("{events} events, {before_auth} before auth");
+        let stored = (0..events)
+            .map(|n| group_event(&keys, GROUP, T0 + 10, n))
+            .collect::<Vec<_>>();
+        let (url, server) = auth_gated_clamping_relay(stored.clone(), before_auth, 500).await;
+        let (sdk, relay) = authenticating_sweep(
+            url,
+            RelayCaps {
+                max_limit: Some(10),
+                negentropy: false,
+            },
+        )
+        .await;
+        let mut sink = Sink::default();
+        let report = run_sweep(
+            request(SweepRange {
+                since: T0 + 10,
+                until: T0 + 10,
+            }),
+            &relay,
+            &mut sink,
+            &MemoryStore::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(report.end, SweepEnd::Finished, "{case}: {report:?}");
+        assert!(
+            matches!(
+                report.covered.as_slice(),
+                [slice] if matches!(slice.proof, SliceProof::BelowCap { cap: 10, .. })
+            ),
+            "{case}: {report:?}"
+        );
+        assert_eq!(
+            sink.events
+                .iter()
+                .map(|event| event.id)
+                .collect::<HashSet<_>>(),
+            stored.iter().map(|event| event.id).collect::<HashSet<_>>(),
+            "{case}"
+        );
+        sdk.shutdown().await;
+        server.abort();
+    }
 }
 
 /// wok's marmot preset: cap 5,000, default page 500. A saturated second over
