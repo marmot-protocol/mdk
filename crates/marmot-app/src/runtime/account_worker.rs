@@ -2121,7 +2121,7 @@ async fn run_app_runtime_account_worker(
                 break 'worker;
             }
             () = std::future::ready(()), if relay_config_work == RelayConfigWork::Ready => {
-                publish_relay_health_change(
+                let health_read = publish_relay_health_change(
                     &client,
                     &events,
                     &account_id_hex,
@@ -2129,7 +2129,9 @@ async fn run_app_runtime_account_worker(
                     &mut announced_relay_health,
                 );
                 relay_config_work = match client.sync_relay_liveness().await {
-                    Ok(_) => RelayConfigWork::Idle,
+                    // A failed health read still owes hosts its answer.
+                    Ok(_) if health_read => RelayConfigWork::Idle,
+                    Ok(_) => RelayConfigWork::Retry,
                     Err(error) if error.is_account_not_active() => RelayConfigWork::Retry,
                     Err(error) => {
                         publish_app_runtime_account_error(
@@ -9730,14 +9732,15 @@ pub(crate) fn publish_device_group_changes(
 /// relay policy alone decide that answer, so a relay connecting or
 /// disconnecting never announces one. Runs wherever the worker reconciles its
 /// relay configuration: at start, on each change to the account's directory
-/// entry and on each activation.
+/// entry and on each activation. False when the answer could not be read, so
+/// the caller retries the reconciliation rather than lose the announcement.
 fn publish_relay_health_change(
     client: &AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
     announced: &mut Option<crate::AccountRelayHealth>,
-) {
+) -> bool {
     let health = match client.app.account_relay_health(account_label) {
         Ok(health) => health,
         Err(error) => {
@@ -9747,11 +9750,11 @@ fn publish_relay_health_change(
                 error_kind = error.privacy_safe_kind(),
                 "relay health read failed; keeping the last announced answer"
             );
-            return;
+            return false;
         }
     };
     if announced.as_ref() == Some(&health) {
-        return;
+        return true;
     }
     tracing::debug!(
         target: "marmot_app::relay_health",
@@ -9769,6 +9772,7 @@ fn publish_relay_health_change(
             account_label: account_label.to_owned(),
         },
     );
+    true
 }
 
 /// One `UnrecognizedSignInsChanged` for a check or answer that changed the
