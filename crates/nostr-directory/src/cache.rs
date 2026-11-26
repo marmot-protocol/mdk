@@ -409,7 +409,7 @@ impl DirectoryCache {
     }
 
     /// Frozen v1-schema insert used only during migration 1 (`migrate_legacy_json_records`),
-    /// before migration 4 adds `follows_created_at`.
+    /// before migration 4 adds `follows_created_at`. Do not modify its v1 column list.
     fn put_v1_record_locked(
         conn: &Connection,
         entry: &UserDirectoryRecord,
@@ -694,19 +694,15 @@ impl DirectoryCache {
         follows: &[String],
         created_at: u64,
         require_strictly_newer: bool,
-    ) -> Result<bool, DirectoryError> {
+    ) -> Result<(), DirectoryError> {
         let now = unix_now_seconds() as i64;
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let existing_created_at = Self::search_graph_follows_created_at(&tx, account_id_hex)?;
         if !follow_recency_accepts(existing_created_at, created_at, require_strictly_newer) {
-            return Ok(false);
+            return Ok(());
         }
-        let next_created_at = if created_at > 0 {
-            created_at
-        } else {
-            existing_created_at
-        };
+        let next_created_at = created_at.max(existing_created_at);
         let next_created_at_i64 = i64::try_from(next_created_at).unwrap_or(i64::MAX);
         tx.execute(
             "INSERT INTO directory_search_graph_users (
@@ -735,7 +731,15 @@ impl DirectoryCache {
             now,
         )?;
         tx.commit()?;
-        Ok(true)
+        Ok(())
+    }
+
+    pub(crate) fn search_graph_follows_created_at_for(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<u64, DirectoryError> {
+        let conn = self.lock()?;
+        Self::search_graph_follows_created_at(&conn, account_id_hex)
     }
 
     fn search_graph_follows_created_at(
@@ -1051,7 +1055,7 @@ pub(crate) fn follow_recency_accepts(
         return true;
     }
     if incoming_created_at == 0 {
-        return !require_strictly_newer;
+        return false;
     }
     if require_strictly_newer {
         incoming_created_at > cached_created_at

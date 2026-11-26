@@ -315,13 +315,16 @@ impl<R: DirectoryResources> Directory<R> {
             })
             .transpose()?;
         let mut entry = select_newer_directory_entry(cached_entry, shared_entry);
+        // A closed account cache reopened after a live kind-5 deletion or newer
+        // replacement can still hold a fenced KeyPackage that `select_newer_directory_entry`
+        // would preserve over the cleared shared row. Re-check the shared journal on read.
         if let Some(record) = entry.as_mut()
             && let Some(cached) = record.key_package.as_ref()
         {
             let evidence = shared_storage.key_package_evidence_snapshot(account_id_hex)?;
             if !evidence_allows_key_package(
                 &evidence,
-                &cached.key_package_id,
+                Some(cached.key_package_id.as_str()),
                 &cached.key_package_event_id,
                 cached.created_at,
                 self.directory_freshness(),
@@ -365,7 +368,10 @@ impl<R: DirectoryResources> Directory<R> {
             "directory",
             true,
             true,
-            |entry, shared| {
+            |entry, shared, _caches| {
+                let Some(entry) = entry else {
+                    return Ok(false);
+                };
                 let evidence = shared.key_package_evidence_snapshot(&entry.account_id_hex)?;
                 let merged_relays =
                     merge_relay_list_status(entry.relay_lists.clone(), fetched.relay_lists.clone());
@@ -377,7 +383,7 @@ impl<R: DirectoryResources> Directory<R> {
                 if let Some(cached) = entry.key_package.as_ref()
                     && !evidence_allows_key_package(
                         &evidence,
-                        &cached.key_package_id,
+                        Some(cached.key_package_id.as_str()),
                         &cached.key_package_event_id,
                         cached.created_at,
                         freshness,
@@ -387,10 +393,11 @@ impl<R: DirectoryResources> Directory<R> {
                     mutated = true;
                 }
 
-                // Never admit a KeyPackage that the journal already fences.
+                // Never admit a KeyPackage that the journal already fences
+                // (including older same-slot replays and higher-id same-second ties).
                 if !evidence_allows_key_package(
                     &evidence,
-                    &fetched.key_package_id,
+                    Some(fetched.key_package_id.as_str()),
                     &fetched.key_package_event_id,
                     fetched.created_at,
                     freshness,
@@ -410,13 +417,6 @@ impl<R: DirectoryResources> Directory<R> {
                         );
                         mutated |= cached.source_relays.len() != before;
                     }
-                    Some(cached)
-                        if cached.created_at > fetched.created_at
-                            || (cached.created_at == fetched.created_at
-                                && !cached.key_package_event_id.is_empty()
-                                && (fetched.key_package_event_id.is_empty()
-                                    || cached.key_package_event_id
-                                        < fetched.key_package_event_id)) => {}
                     _ => {
                         entry.key_package = Some(DirectoryKeyPackage {
                             key_package_id: fetched.key_package_id.clone(),
@@ -444,14 +444,17 @@ impl<R: DirectoryResources> Directory<R> {
             "directory",
             false,
             true,
-            |entry, shared| {
+            |entry, shared, _caches| {
+                let Some(entry) = entry else {
+                    return Ok(false);
+                };
                 let Some(cached) = entry.key_package.as_ref() else {
                     return Ok(false);
                 };
                 let evidence = shared.key_package_evidence_snapshot(&entry.account_id_hex)?;
                 if !evidence_allows_key_package(
                     &evidence,
-                    &cached.key_package_id,
+                    Some(cached.key_package_id.as_str()),
                     &cached.key_package_event_id,
                     cached.created_at,
                     freshness,
@@ -492,18 +495,34 @@ impl<R: DirectoryResources> Directory<R> {
         follow_list: &FetchedFollowList,
     ) -> Result<(), DirectoryError> {
         let mut accepted = false;
-        self.update_directory_entry(account_id_hex, |entry| {
-            if !follow_recency_accepts(entry.follows_created_at, follow_list.created_at, false) {
-                return false;
-            }
-            entry.follows = follow_list.follows.clone();
-            entry.follow_source_relays = follow_list.source_relays.clone();
-            if follow_list.created_at > 0 {
-                entry.follows_created_at = follow_list.created_at;
-            }
-            accepted = true;
-            true
-        })?;
+        self.update_directory_entry_with_options(
+            account_id_hex,
+            "directory",
+            true,
+            false,
+            |entry, _shared, caches| {
+                let Some(entry) = entry else {
+                    return Ok(false);
+                };
+                let known_created_at =
+                    entry
+                        .follows_created_at
+                        .max(max_search_graph_follows_created_at(
+                            caches,
+                            &entry.account_id_hex,
+                        )?);
+                if !follow_recency_accepts(known_created_at, follow_list.created_at, false) {
+                    return Ok(false);
+                }
+                entry.follows = follow_list.follows.clone();
+                entry.follow_source_relays = follow_list.source_relays.clone();
+                if follow_list.created_at > 0 {
+                    entry.follows_created_at = follow_list.created_at;
+                }
+                accepted = true;
+                Ok(true)
+            },
+        )?;
         if !accepted {
             return Ok(());
         }
@@ -554,92 +573,44 @@ impl<R: DirectoryResources> Directory<R> {
     ) -> Result<(), DirectoryError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
         let npub = npub_for_account_id(&account_id_hex)?;
-        // Acquire host handles before the record lane to preserve lock ordering.
-        let local_accounts = self.local_accounts_by_id()?;
-        let shared_storage = self.resources.shared_storage()?;
-        let caches = self.resources.current_caches()?;
-        let mut changed = false;
-        let result: Result<(), DirectoryError> = (|| {
-            let _lane = self
-                .state
-                .entry_updates
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let cached_entry = directory_entry_from_caches(&caches, &account_id_hex)?
-                .map(|entry| hydrate_directory_record(entry, &local_accounts))
-                .transpose()?;
-            let shared_record = shared_storage.public_directory_user(&account_id_hex)?;
-            let shared_entry = shared_record
-                .clone()
-                .map(|record| {
-                    hydrate_directory_record(
-                        user_directory_record_from_public(record)?,
-                        &local_accounts,
-                    )
-                })
-                .transpose()?;
-            let current = select_newer_directory_entry(cached_entry, shared_entry);
-            let known_follows_created_at =
-                current.as_ref().map_or(0, |entry| entry.follows_created_at);
-            if !follow_recency_accepts(
-                known_follows_created_at,
-                follow_list.created_at,
-                require_strictly_newer,
-            ) {
-                return Ok(());
-            }
-            for cache in &caches {
-                cache.remember_search_graph_follows(
-                    &account_id_hex,
-                    &npub,
-                    &follow_list.follows,
+        self.update_directory_entry_with_options(
+            &account_id_hex,
+            "directory",
+            false,
+            false,
+            |entry, _shared, caches| {
+                let entry_created_at = entry.as_ref().map_or(0, |record| record.follows_created_at);
+                let graph_created_at =
+                    max_search_graph_follows_created_at(caches, &account_id_hex)?;
+                let known_created_at = entry_created_at.max(graph_created_at);
+                if !follow_recency_accepts(
+                    known_created_at,
                     follow_list.created_at,
                     require_strictly_newer,
-                )?;
-            }
-            // Graph-only ingestion must not promote an unknown author.
-            let Some(current) = current else {
-                return Ok(());
-            };
-            let mut proposed = current.clone();
-            proposed.follows = follow_list.follows.clone();
-            proposed.follow_source_relays = follow_list.source_relays.clone();
-            if follow_list.created_at > 0 {
-                proposed.follows_created_at = follow_list.created_at;
-            }
-            let proposed = hydrate_directory_record(proposed, &local_accounts)?;
-            let entry = select_newer_directory_entry(Some(proposed), Some(current))
-                .expect("proposed directory entry should be present");
-            let public_entry = public_directory_user_record(&entry)?;
-            let shared_matches = shared_record.as_ref() == Some(&public_entry);
-            let mut caches_match = true;
-            for cache in &caches {
-                let cached = cache
-                    .entry(&account_id_hex)?
-                    .map(|record| hydrate_directory_record(record, &local_accounts))
-                    .transpose()?;
-                if cached.as_ref() != Some(&entry) {
-                    caches_match = false;
-                    break;
+                ) {
+                    return Ok(false);
                 }
-            }
-            if shared_matches && caches_match {
-                return Ok(());
-            }
-            shared_storage.put_public_directory_user(&public_entry)?;
-            changed = true;
-            for cache in &caches {
-                cache.put_with_reason(&entry, "directory")?;
-            }
-            Ok(())
-        })();
-        if changed {
-            self.resources.directory_entry_changed(&account_id_hex);
-            if result.is_ok() {
-                self.request_directory_sync_rebuild();
-            }
-        }
-        result
+                for cache in caches {
+                    cache.remember_search_graph_follows(
+                        &account_id_hex,
+                        &npub,
+                        &follow_list.follows,
+                        follow_list.created_at,
+                        require_strictly_newer,
+                    )?;
+                }
+                // Graph-only ingestion must not promote an unknown author.
+                let Some(entry) = entry else {
+                    return Ok(false);
+                };
+                entry.follows = follow_list.follows.clone();
+                entry.follow_source_relays = follow_list.source_relays.clone();
+                if follow_list.created_at > 0 {
+                    entry.follows_created_at = follow_list.created_at;
+                }
+                Ok(true)
+            },
+        )
     }
 
     pub fn remember_directory_profile(
@@ -758,7 +729,16 @@ impl<R: DirectoryResources> Directory<R> {
                 let mut fetched = match key_package_from_record(record) {
                     Ok(fetched) => fetched,
                     Err(error) => {
-                        let _ = self.reconcile_cached_key_package_against_evidence(&account_id_hex);
+                        if let Err(reconcile_error) =
+                            self.reconcile_cached_key_package_against_evidence(&account_id_hex)
+                        {
+                            tracing::warn!(
+                                target: "nostr_directory::store",
+                                method = "ingest_directory_relay_event",
+                                error_kind = reconcile_error.privacy_safe_kind(),
+                                "failed to reconcile cached key package after malformed replacement"
+                            );
+                        }
                         return Err(error);
                     }
                 };
@@ -824,7 +804,7 @@ impl<R: DirectoryResources> Directory<R> {
             reason,
             create_missing,
             false,
-            |entry, _| Ok(update(entry)),
+            |entry, _, _| Ok(entry.is_some_and(update)),
         )
     }
 
@@ -833,10 +813,11 @@ impl<R: DirectoryResources> Directory<R> {
         account_id_hex: &str,
         reason: &str,
         create_missing: bool,
-        allow_clear_key_package: bool,
+        replace_key_package: bool,
         update: impl FnOnce(
-            &mut UserDirectoryRecord,
+            Option<&mut UserDirectoryRecord>,
             &SqliteSharedStorage,
+            &[DirectoryCache],
         ) -> Result<bool, DirectoryError>,
     ) -> Result<(), DirectoryError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
@@ -879,19 +860,17 @@ impl<R: DirectoryResources> Directory<R> {
                 })
                 .transpose()?;
             let mut current = select_newer_directory_entry(cached_entry, shared_entry);
-            if current.is_none() && !create_missing {
+            let mut proposed = current.clone().or_else(|| create_missing.then_some(empty));
+            if !update(proposed.as_mut(), &shared_storage, &caches)? {
                 return Ok(());
             }
-            let mut proposed = current.clone().unwrap_or(empty);
-            if !update(&mut proposed, &shared_storage)? {
+            let Some(proposed) = proposed else {
                 return Ok(());
-            }
-            // When the update deliberately cleared a deleted or superseded
-            // KeyPackage, prevent the sibling recency merge from resurrecting it.
-            if allow_clear_key_package
-                && proposed.key_package.is_none()
-                && let Some(existing) = current.as_mut()
-            {
+            };
+            // When the update explicitly owns `key_package` (clearing a deleted/superseded
+            // package or storing a selector-chosen slot), prevent the sibling recency merge
+            // from reverting `proposed.key_package` back to `current.key_package`.
+            if replace_key_package && let Some(existing) = current.as_mut() {
                 existing.key_package = None;
             }
             let proposed = hydrate_directory_record(proposed, &local_accounts)?;
@@ -999,6 +978,17 @@ fn directory_entry_from_caches(
         }
     }
     Ok(None)
+}
+
+fn max_search_graph_follows_created_at(
+    caches: &[DirectoryCache],
+    account_id_hex: &str,
+) -> Result<u64, DirectoryError> {
+    let mut latest = 0;
+    for cache in caches {
+        latest = latest.max(cache.search_graph_follows_created_at_for(account_id_hex)?);
+    }
+    Ok(latest)
 }
 
 pub fn hydrate_directory_record(

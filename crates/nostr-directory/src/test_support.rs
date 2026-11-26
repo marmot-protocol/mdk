@@ -73,7 +73,7 @@ impl DirectoryCache {
         npub: &str,
         follows: &[String],
     ) -> Result<(), DirectoryError> {
-        let _ = self.remember_search_graph_follows(account_id_hex, npub, follows, 0, false)?;
+        self.remember_search_graph_follows(account_id_hex, npub, follows, 0, false)?;
         Ok(())
     }
 }

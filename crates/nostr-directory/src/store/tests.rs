@@ -613,7 +613,48 @@ async fn live_kind_3_recency_guards_search_graph_and_survives_reopen() {
         Some(vec![dave.clone()])
     );
 
-    // Reopen cache: durable follows_created_at still blocks older replays.
+    // Promote the graph-only author (creates directory/shared rows with follows_created_at = 0):
+    // stale replays via both live kind-3 and explicit follow-list ingestion must still be
+    // rejected against the search graph's newer timestamp (200), keeping both tiers in sync.
+    directory
+        .remember_directory_message_sender(&unknown_author)
+        .unwrap();
+    directory
+        .ingest_directory_relay_event(kind3(&unknown_keys, 100, &carol))
+        .unwrap();
+    directory
+        .remember_directory_follow_list(
+            &unknown_author,
+            &FetchedFollowList {
+                follows: vec![carol.clone()],
+                source_relays: vec!["wss://relay.example".into()],
+                created_at: 100,
+            },
+        )
+        .unwrap();
+    assert!(
+        cache
+            .entry(&unknown_author)
+            .unwrap()
+            .unwrap()
+            .follows
+            .is_empty()
+    );
+    assert!(
+        shared
+            .public_directory_user(&unknown_author)
+            .unwrap()
+            .unwrap()
+            .follows
+            .is_empty()
+    );
+    assert_eq!(
+        cache.search_graph_follows(&unknown_author).unwrap(),
+        Some(vec![bob.clone()])
+    );
+
+    // Reopen cache: durable follows_created_at still blocks older replays for both
+    // known and promoted graph-only authors.
     cache.close().unwrap();
     let reopened = DirectoryCache::open(path, &key).unwrap();
     let reopened_directory = Directory::new(
@@ -639,6 +680,16 @@ async fn live_kind_3_recency_guards_search_graph_and_survives_reopen() {
     reopened_directory
         .ingest_directory_relay_event(kind3(&unknown_keys, 180, &carol))
         .unwrap();
+    reopened_directory
+        .remember_directory_follow_list(
+            &unknown_author,
+            &FetchedFollowList {
+                follows: vec![carol.clone()],
+                source_relays: vec!["wss://relay.example".into()],
+                created_at: 180,
+            },
+        )
+        .unwrap();
     assert_eq!(
         reopened.entry(&local_author).unwrap().unwrap().follows,
         vec![dave]
@@ -650,6 +701,14 @@ async fn live_kind_3_recency_guards_search_graph_and_survives_reopen() {
             .unwrap()
             .follows_created_at,
         200
+    );
+    assert!(
+        reopened
+            .entry(&unknown_author)
+            .unwrap()
+            .unwrap()
+            .follows
+            .is_empty()
     );
     assert_eq!(
         reopened.search_graph_follows(&unknown_author).unwrap(),
@@ -727,7 +786,9 @@ async fn key_package_recency_barriers_and_live_kind_5_deletion_invalidation() {
 
     let now = crate::unix_now_seconds();
     let kp_newer = make_fetched("slot-1", &"bb".repeat(32), now - 300, 0x22);
-    let kp_older = make_fetched("slot-2", &"aa".repeat(32), now - 400, 0x11);
+    let kp_older_same_slot = make_fetched("slot-1", &"aa".repeat(32), now - 400, 0x11);
+    let kp_tie_higher_id = make_fetched("slot-1", &"cc".repeat(32), now - 300, 0x12);
+    let kp_other_slot = make_fetched("slot-2", &"dd".repeat(32), now - 400, 0x13);
     directory.remember_directory_key_package(&kp_newer).unwrap();
     // Seed a stale second cache before the deletion arrives.
     cache_b
@@ -735,8 +796,43 @@ async fn key_package_recency_barriers_and_live_kind_5_deletion_invalidation() {
         .unwrap();
     cache_b.close().unwrap();
 
-    // Older KeyPackage must not overwrite a newer cached KeyPackage.
-    directory.remember_directory_key_package(&kp_older).unwrap();
+    // Older same-slot replay and same-second higher-id tie must not overwrite the cached slot.
+    directory
+        .remember_directory_key_package(&kp_older_same_slot)
+        .unwrap();
+    directory
+        .remember_directory_key_package(&kp_tie_higher_id)
+        .unwrap();
+    assert_eq!(
+        cache_a
+            .entry(&author)
+            .unwrap()
+            .unwrap()
+            .key_package
+            .as_ref()
+            .unwrap()
+            .key_package_event_id,
+        kp_newer.key_package_event_id
+    );
+
+    // Explicitly remembering a different valid slot (e.g. selector choosing a non-last-resort
+    // slot created earlier than a last-resort slot) must not be blocked by cross-slot created_at.
+    directory
+        .remember_directory_key_package(&kp_other_slot)
+        .unwrap();
+    assert_eq!(
+        cache_a
+            .entry(&author)
+            .unwrap()
+            .unwrap()
+            .key_package
+            .as_ref()
+            .unwrap()
+            .key_package_event_id,
+        kp_other_slot.key_package_event_id
+    );
+    // Restore `slot-1` as the cached KeyPackage before exercising live kind-5 deletion.
+    directory.remember_directory_key_package(&kp_newer).unwrap();
     assert_eq!(
         cache_a
             .entry(&author)
