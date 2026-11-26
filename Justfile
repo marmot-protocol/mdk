@@ -97,7 +97,7 @@ test-otlp:
 test-message-journeys:
     cargo nextest run -p marmot-app -p marmot-uniffi --features marmot-app/test-policy-overrides -E 'test(message_journey) | test(unavailable_send_retries_the_exact_event_after_transport_recovers) | test(connectivity_restored_wakes_a_retained_send_before_the_retry_timer) | test(connectivity_restored_during_reconnect_wakes_the_retained_send)'
 
-# Rank the tests that failed an attempt in recent merge-queue runs, from the
+# Rank the tests that failed an attempt in recent Canary runs, from the
 # JUnit reports CI keeps for seven days. Needs an authenticated `gh`; caches
 # each run, so a rerun fetches only new ones. See `--help` for options.
 flake-report *args:

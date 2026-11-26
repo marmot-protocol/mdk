@@ -1719,8 +1719,8 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
         script = workflow_step("canary.yml", "Resolve Canary target and packaging trigger")
         fake_gh = textwrap.dedent("""\
             gh() {
-              if [[ "$FAKE_LAST_GREEN" == "error" ]]; then return 1; fi
-              printf '%s\\n' "$FAKE_LAST_GREEN"
+              if [[ "$FAKE_RUNS_JSON" == "error" ]]; then return 1; fi
+              printf '%s\\n' "$FAKE_RUNS_JSON"
             }
         """)
         with tempfile.TemporaryDirectory() as tmp:
@@ -1758,13 +1758,20 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
             git("commit", "-m", "c3")
             c3 = git("rev-parse", "HEAD")
 
+            (repo / ".cargo").mkdir(parents=True)
+            (repo / ".cargo/config.toml").write_text("[build]\n")
+            git("add", ".")
+            git("commit", "-m", "c4")
+            c4 = git("rev-parse", "HEAD")
+
             # Simulate bare-metal Canary already sitting at c2.
             git("update-ref", "refs/remotes/origin/canary", c2)
 
-            def run_plan(checkout_sha, last_green, force="false", force_bp="false"):
+            def run_plan(checkout_sha, runs, force="false", force_bp="false"):
                 git("checkout", "-q", checkout_sha)
                 out = repo / "gh_out"
                 out.unlink(missing_ok=True)
+                runs_json = "error" if runs == "error" else json.dumps({"workflow_runs": runs})
                 subprocess.run(
                     ["bash", "-c", fake_gh + script],
                     cwd=repo,
@@ -1775,7 +1782,7 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
                         **os.environ,
                         "REPO": "marmot-protocol/mdk",
                         "RUN_ID": "999",
-                        "FAKE_LAST_GREEN": last_green,
+                        "FAKE_RUNS_JSON": runs_json,
                         "FORCE": force,
                         "FORCE_BINDINGS_PROFILE": force_bp,
                         "GITHUB_OUTPUT": str(out),
@@ -1783,28 +1790,44 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
                 )
                 return dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
 
-            # Unchanged master skips quickly.
-            self.assertEqual(run_plan(c1, c1)["should_run"], "false")
+            def green(sha, run_id=100):
+                return {"id": run_id, "head_sha": sha, "conclusion": "success"}
+
+            def failed(sha, run_id=101):
+                return {"id": run_id, "head_sha": sha, "conclusion": "failure"}
+
+            # Unchanged master whose latest completed run succeeded skips quickly.
+            self.assertEqual(run_plan(c1, [green(c1)])["should_run"], "false")
             # Force overrides skip.
-            forced = run_plan(c1, c1, force="true")
+            forced = run_plan(c1, [green(c1)], force="true")
             self.assertEqual((forced["should_run"], forced["run_bindings_profile"]), ("true", "false"))
             # Manual run_bindings_profile=true also bypasses early skip on an already-green SHA.
-            forced_bp = run_plan(c1, c1, force="false", force_bp="true")
+            forced_bp = run_plan(c1, [green(c1)], force="false", force_bp="true")
             self.assertEqual((forced_bp["should_run"], forced_bp["run_bindings_profile"]), ("true", "true"))
+            # An older green run followed by a newer failed run on the same SHA must NOT skip
+            # and must retry packaging rather than letting the older green run bury the failure.
+            failed_after_green = run_plan(c1, [failed(c1, 102), green(c1, 100)])
+            self.assertEqual(
+                (failed_after_green["should_run"], failed_after_green["run_bindings_profile"]),
+                ("true", "true"),
+            )
             # Core-only diff runs CI without heavy macOS bindings-profile packaging.
-            core = run_plan(c1, c0)
+            core = run_plan(c1, [green(c0)])
             self.assertEqual((core["should_run"], core["run_bindings_profile"]), ("true", "false"))
             # Binding diff triggers bindings-profile packaging.
-            binding = run_plan(c2, c1)
+            binding = run_plan(c2, [green(c1)])
             self.assertEqual((binding["should_run"], binding["run_bindings_profile"]), ("true", "true"))
             # Tooling-only diff (setup-odin) also triggers bindings-profile packaging.
-            odin_tooling = run_plan(c3, c2)
+            odin_tooling = run_plan(c3, [green(c2)])
             self.assertEqual((odin_tooling["should_run"], odin_tooling["run_bindings_profile"]), ("true", "true"))
+            # Cargo config diff (.cargo/config.toml) also triggers bindings-profile packaging.
+            cargo_cfg = run_plan(c4, [green(c3)])
+            self.assertEqual((cargo_cfg["should_run"], cargo_cfg["run_bindings_profile"]), ("true", "true"))
             # API failure or missing hosted baseline fails safe to running packaging
             # even if bare-metal `origin/canary` already sits at `source_sha`.
             api_err = run_plan(c2, "error")
             self.assertEqual((api_err["should_run"], api_err["run_bindings_profile"]), ("true", "true"))
-            first_run = run_plan(c2, "")
+            first_run = run_plan(c2, [])
             self.assertEqual((first_run["should_run"], first_run["run_bindings_profile"]), ("true", "true"))
 
     def test_canary_summary_records_json_and_enforces_gate(self):

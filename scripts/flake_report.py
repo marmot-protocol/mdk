@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Rank flaky tests from the JUnit reports that merge-queue CI runs upload.
+"""Rank flaky tests from the JUnit reports that hosted Canary CI runs upload.
 
 Every test job wraps nextest in scripts/ci_runner.py, which writes a JUnit
 report into the job's `ci-runner-<job>-<index>-<attempt>` artifact. GitHub
-keeps those artifacts for seven days. This script lists recent `ci.yml`
-merge-group runs, downloads only the test jobs' artifacts, and keeps a compact
-per-run summary in a local cache, so a rerun fetches only runs it has not seen.
-Cached summaries outlive the artifacts, so a longer window works from the cache.
+keeps those artifacts for seven days. This script lists recent `canary.yml`
+scheduled runs by default (override `--workflow` and `--event` for historical
+`ci.yml` `merge_group` runs), downloads only the test jobs' artifacts, and
+keeps a compact per-run summary in a local cache, so a rerun fetches only runs
+it has not seen. Cached summaries outlive the artifacts, so a longer window
+works from the cache.
 
 Before each run it re-reads the GitHub API rate limit and stops fetching once
 fewer than `--reserve` calls remain, then reports the leaderboard from what it
@@ -481,7 +483,7 @@ def render_markdown(report: dict, top: int, samples: int) -> str:
     lines = [
         "# Flaky test leaderboard",
         "",
-        f"Generated {report['generated_at']} from {runs['with_reports']} merge-queue "
+        f"Generated {report['generated_at']} from {runs['with_reports']} `{report.get('event', 'schedule')}` "
         f"`{report['workflow']}` runs with test reports, created since {report['since']}. "
         f"{len(rows)} tests failed at least one attempt: {flaky} failed attempts of tests that then "
         f"passed on retry (flaky), and {failed} of tests that failed every attempt (failed).",
@@ -557,8 +559,8 @@ def default_cache_dir() -> Path:
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--repo", default=DEFAULT_REPO)
-    parser.add_argument("--workflow", default="ci.yml")
-    parser.add_argument("--event", default="merge_group")
+    parser.add_argument("--workflow", default="canary.yml")
+    parser.add_argument("--event", default="schedule")
     parser.add_argument("--days", type=float, default=7.0,
                         help="window of runs to report; CI keeps the artifacts for 7 days (default: 7)")
     parser.add_argument("--jobs", type=lambda value: [job for job in value.split(",") if job],

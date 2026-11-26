@@ -58,9 +58,24 @@ jobs:
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse 'HEAD^{commit}')"
-          last_green_sha="$(gh api "repos/$REPO/actions/workflows/canary.yml/runs?branch=master&status=success&per_page=20" \
-            --jq "[.workflow_runs[] | select(.id != ($RUN_ID | tonumber))][0].head_sha // \"\"" 2>/dev/null || true)"
-          if [[ "$last_green_sha" == "$source_sha" && "$FORCE" != "true" && "$FORCE_BINDINGS_PROFILE" != "true" ]]; then
+          runs_json="$(gh api "repos/$REPO/actions/workflows/canary.yml/runs?branch=master&status=completed&per_page=20" 2>/dev/null || true)"
+          latest_sha=""
+          latest_conclusion=""
+          last_green_sha=""
+          if [[ -n "$runs_json" ]]; then
+            IFS=$'\t' read -r latest_sha latest_conclusion last_green_sha < <(
+              jq -r --argjson run_id "$RUN_ID" '
+                [.workflow_runs[] | select(.id != $run_id)] as $runs |
+                [
+                  ($runs[0].head_sha // ""),
+                  ($runs[0].conclusion // ""),
+                  ([$runs[] | select(.conclusion == "success")][0].head_sha // "")
+                ] | @tsv
+              ' <<<"$runs_json"
+            )
+          fi
+
+          if [[ "$latest_sha" == "$source_sha" && "$latest_conclusion" == "success" && "$FORCE" != "true" && "$FORCE_BINDINGS_PROFILE" != "true" ]]; then
             echo "Canary already verified $source_sha; skipping."
             {
               echo "should_run=false"
@@ -78,6 +93,11 @@ jobs:
           run_bindings_profile=false
           if [[ "$FORCE_BINDINGS_PROFILE" == "true" ]]; then
             run_bindings_profile=true
+          elif [[ "$latest_sha" == "$source_sha" && -n "$latest_conclusion" && "$latest_conclusion" != "success" ]]; then
+            # A newer attempt on this same SHA failed (for example a forced
+            # packaging run after an earlier green run without packaging);
+            # retry packaging rather than letting the older green run mask it.
+            run_bindings_profile=true
           elif [[ -z "$previous_sha" || ! "$previous_sha" =~ ^[0-9a-f]{40}$ ]] \
             || ! git cat-file -e "${previous_sha}^{commit}" 2>/dev/null; then
             # Fail safe when no prior hosted Canary baseline is available so a
@@ -85,13 +105,14 @@ jobs:
             # verification.
             run_bindings_profile=true
           elif [[ "$previous_sha" != "$source_sha" ]]; then
-            # Trigger heavy macOS/Android candidate packaging when binding or
-            # packaging-toolchain inputs change. Upstream core crates are still
-            # cross-checked every Canary via rust-android-check, ios-account-clippy,
-            # and marmotkit-native-host, and packaged daily by nightly-releases.yml.
+            # Trigger heavy macOS/Android candidate packaging when binding,
+            # Cargo config, or packaging-toolchain inputs change. Upstream core
+            # crates are still cross-checked every Canary via
+            # rust-android-check, ios-account-clippy, and marmotkit-native-host,
+            # and packaged daily by nightly-releases.yml.
             while IFS= read -r -d '' changed; do
               case "$changed" in
-                crates/marmot-uniffi/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/bindings.yaml|.github/workflows/bindings-profile.yml|.github/actions/setup-odin/*|scripts/install-odin.sh)
+                crates/marmot-uniffi/*|Cargo.toml|Cargo.lock|.cargo/config.toml|.cargo/config|rust-toolchain.toml|.github/workflows/bindings.yaml|.github/workflows/bindings-profile.yml|.github/actions/setup-odin/*|scripts/install-odin.sh)
                   run_bindings_profile=true
                   break
                   ;;
