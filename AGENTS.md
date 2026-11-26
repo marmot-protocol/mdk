@@ -56,17 +56,25 @@ before adding behavior or bindings.
 | Restate the last response in plain language | `.agents/skills/bro/SKILL.md` |
 | Releases | `release.md` |
 | Writing, reviewing, or pruning tests | `.agents/skills/test-audit/SKILL.md` |
-| Landing a change (verify, review, PR, merge queue) | `.agents/skills/land-change/SKILL.md` |
+| Landing a change (verify, review, PR, squash-merge) | `.agents/skills/land-change/SKILL.md` |
 | Writing a PR description | `.agents/skills/gh-create-pr/SKILL.md` |
 
 ## Landing changes
 
-Every change reaches master through the merge queue; nobody pushes to master or bypasses the queue. Verification and
-review happen locally, the PR carries the change, and the queue runs the full CI matrix on the exact commit that
-lands. Follow `.agents/skills/land-change`: targeted tests plus the end-to-end smoke, two independent cross-model
-reviews of the local diff (`.agents/skills/review-local`) until both recommend merge, a short PR
-(`.agents/skills/gh-create-pr`) brought to a green pre-check with no conflicts, then a report. Enqueue only when the
-user asks, and then own the queue result until the change merges.
+Every change reaches master through a reviewed, signed squash PR; nobody pushes directly to master. Verification and
+cross-model review happen locally, the team PR gate checks signatures, formatting, static contracts, `cargo-audit`,
+and advisory commit trailers (~1 minute, zero Rust compile), and post-merge `Canary` runs continuously verify `master`.
+Follow `.agents/skills/land-change`: targeted tests plus the end-to-end smoke, two independent cross-model reviews of
+the local diff (`.agents/skills/review-local`) until both recommend merge, a short PR (`.agents/skills/gh-create-pr`)
+brought to green `Required CI` with no conflicts, then a report. Merge (`gh pr merge --squash --match-head-commit <sha>`)
+only when the user asks.
+
+Record three commit trailers on the final signed commit (which GitHub preserves in squash commits under
+`COMMIT_MESSAGES`), and verify them locally with `just pr-trailers-check`:
+
+- `Local-Checks: <commands run locally>`
+- `Local-Review: <seat-a> + <seat-b> merge @ <short-sha>` (or `human` / `exempt (<reason>)`)
+- `Release-Impact: none | patch | minor` — cross-checked against any `changelog.d/<slug>.md` fragments (`### Breaking changes` requires `minor`; non-breaking user-facing fragments forbid `none`).
 
 ## Documentation
 
@@ -133,16 +141,13 @@ user asks, and then own the queue result until the change merges.
 
 ## Verification
 
-GitHub CI is the full gate. Local verification proves your change and stays scoped to it: several agents usually
-build on the same machine, so workspace-wide builds and suites run locally only when a rule below calls for one. By
-default, CI runs a pre-check of a few minutes on a PR: fmt, the static gates (including the tracing audit),
-`cargo audit`, clippy (default and `--all-features`), the WASM build, and the workspace tests with the `precheck`
-nextest profile. That profile stops each test after half a second and counts it as passed, so it catches only a test
-that fails quickly; unless the PR carries `ci:full`, your local tests are the only signal from the slower tests before
-the merge queue. The merge queue runs the whole matrix (every crate's tests, the simulator,
-and the C, iOS and Windows lanes) and is the merge gate; the `ci:full` label runs that matrix on a PR, `ci:apple`
-adds only the iOS lane. Master pushes only refresh CI's Rust caches, and only when a dependency or toolchain input
-changes.
+Local verification proves your change before merge, and post-merge `Canary` runs continuously verify `master` across
+the full suite. Keep local runs scoped to your change: several agents usually build on the same machine, so
+workspace-wide builds and suites run locally only when a rule below calls for one. On team pull requests, `Required CI`
+runs a ~1-minute static gate (verified commit signatures, `cargo fmt --check`, static/contract gates, `cargo audit`,
+and advisory commit-trailer checks) with zero Rust compile. External/fork pull requests and PRs labelled `ci:full` run
+the full `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs on a team PR regardless of changed
+paths. Master pushes only refresh CI's Rust caches, and only when a dependency or toolchain input changes.
 
 While iterating, run only the test you are working on. Before each push, run once:
 
@@ -169,21 +174,22 @@ Widen only for these changes:
   dependents whose behavior you changed.
 - Shared build inputs (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `Justfile`, `vendor/`) or
   `.github/workflows/`: `just fast-ci` once.
-- Convergence, delivery, branch-selection, or multi-client behavior: `just simulator-smoke` (the merge-queue lane
+- Convergence, delivery, branch-selection, or multi-client behavior: `just simulator-smoke` (the Canary smoke
   selection).
 - Formal model: `just tamarin`.
 
 Do not run `just ci`, `just test`, `cargo test --workspace`, `--features conformance-slow`, benchmarks, or the
-convergence lanes locally unless the user asks; they duplicate CI. `just fast-ci` is fmt, the static gates, and CI's
-two workspace clippy passes, so it is not a per-push default.
+convergence lanes locally unless the user asks; post-merge `Canary` and daily `RC` cover the full matrix. `just fast-ci`
+is fmt, the static gates, and CI's two workspace clippy passes, so it is not a per-push default.
 
 Exception: for an initial cohort-release PR limited to version fields, workspace package versions in `Cargo.lock`,
 vector `conformance_version` values, changelogs, release/integration documentation, README/install version pins, and
-other release metadata, run only `just release-pr-preflight <version>`, then open the PR and let GitHub CI provide the
-compile/test signal. Do not run `just fast-ci`, `just test`, `just ci`, Tamarin, benchmarks, binding bundle builds, or
-artifact builds before opening that PR. If preparing the release exposes an implementation or workflow defect, fix it
-in a separate PR with the normal targeted verification instead of expanding the metadata PR. After the metadata PR is
-merged and required CI succeeds, run `just release-all <version>` to build and publish the cohort.
+other release metadata, run only `just release-pr-preflight <version>`, open the PR with the `ci:full` label
+(re-running all jobs if CI started before the label was applied), and confirm the full GitHub CI matrix passes on the
+current head before merging. Do not run `just fast-ci`, `just test`, `just ci`, Tamarin, benchmarks, binding bundle
+builds, or artifact builds before opening that PR. If preparing the release exposes an implementation or workflow
+defect, fix it in a separate PR with the normal targeted verification instead of expanding the metadata PR. After the
+metadata PR is merged and required CI succeeds, run `just release-all <version>` to build and publish the cohort.
 
 The install-example gate renders all six installer `--help` surfaces and checks
 release guidance plus workflow-generated notes for download, sibling `.sha256`

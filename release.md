@@ -121,7 +121,8 @@ cutting the first point release from a release branch.
 ### Nightly builds
 
 Every day `.github/workflows/nightly-releases.yml` builds MarmotKit (iOS, macOS, Android), Marmot C and WN Agent from
-the newest `master` commit whose merge-queue `Required CI` passed. It is scheduled for 00:17 UTC, but GitHub can start
+the newest `master` commit verified at the `canary` branch tip (or whose merge-queue `Required CI` passed). It is
+scheduled for 00:17 UTC, but GitHub can start
 scheduled runs hours late; nothing depends on the start time except the date in the name. If that commit is the
 previous nightly's source, the night is skipped.
 
@@ -255,8 +256,10 @@ just release-pr-preflight <version>
 
 This deliberately checks the release version, companion-document linkage, installer guidance, diff whitespace, tag
 availability, and coordinator inputs without compiling, testing, benchmarking, generating binding bundles, or building
-artifacts. Open the PR immediately after it passes and use required GitHub CI as the compile/test signal. Do not run
-`just fast-ci`, `just test`, `just ci`, Tamarin, benchmarks, binding bundle builds, or artifact builds first.
+artifacts. Open the PR immediately after it passes, add the `ci:full` label (since default team PR CI is a static gate
+with no Rust compilation), re-run all jobs if the initial run already started before the label was added, and confirm
+the full CI matrix passed on the current head before merging. Do not run `just fast-ci`, `just test`, `just ci`,
+Tamarin, benchmarks, binding bundle builds, or artifact builds first.
 
 If release preparation exposes an implementation or workflow defect, stop and fix it in a separate PR with the normal
 targeted verification; do not turn the release-metadata PR into a code/test repair branch. After the metadata PR merges

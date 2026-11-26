@@ -276,48 +276,161 @@ class PackagingPolicyTests(unittest.TestCase):
 
 
 class MergeGatePolicyTests(unittest.TestCase):
-    def test_only_the_merge_queue_and_opt_ins_select_the_full_matrix(self):
-        script = workflow_step("ci.yml", "Select CI mode")
-        for event, full_label, expected in [
-            ("pull_request", "false", "precheck"),
-            ("pull_request", "true", "full"),
-            ("merge_group", "false", "full"),
-            ("workflow_dispatch", "false", "full"),
-            ("push", "false", "warm"),
-        ]:
-            with self.subTest(event=event, full_label=full_label), tempfile.TemporaryDirectory() as tmp:
+    def test_pr_trust_only_marks_same_repo_collaborator_prs_as_team(self):
+        script = workflow_step("ci.yml", "Classify PR trust")
+        fake_gh = textwrap.dedent("""\
+            gh() {
+              if [[ "$FAKE_PERM" == "error" ]]; then return 1; fi
+              printf '%s\\n' "$FAKE_PERM"
+            }
+        """)
+        cases = [
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "admin", "true"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "maintain", "true"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "write", "true"),
+            # Organization member without write access must fail closed into full CI.
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "org-reader", "read", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "outsider", "none", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "error", "false"),
+            ("pull_request", "marmot-protocol/mdk", "external/mdk", "true", "alice", "admin", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "true", "alice", "admin", "false"),
+            ("pull_request", "marmot-protocol/mdk", "", "false", "alice", "admin", "false"),
+            ("push", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "admin", "false"),
+        ]
+        for event, repo, head_repo, head_fork, author, perm, expected in cases:
+            with self.subTest(event=event, head_repo=head_repo, head_fork=head_fork, perm=perm), tempfile.TemporaryDirectory() as tmp:
                 output = Path(tmp) / "output"
-                subprocess.run(["bash", "-c", script], check=True, capture_output=True, timeout=10,
-                               env={**os.environ, "EVENT_NAME": event, "FULL_CI": full_label,
-                                    "GITHUB_OUTPUT": str(output)})
+                subprocess.run(
+                    ["bash", "-c", fake_gh + script],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": event,
+                        "REPO": repo,
+                        "HEAD_REPO": head_repo,
+                        "HEAD_FORK": head_fork,
+                        "PR_AUTHOR": author,
+                        "FAKE_PERM": perm,
+                        "GITHUB_OUTPUT": str(output),
+                    },
+                )
+                self.assertEqual(output.read_text(), f"is_team_pr={expected}\n")
+
+    def test_team_prs_select_fast_mode_while_external_prs_and_opt_ins_select_full(self):
+        script = workflow_step("ci.yml", "Select CI mode")
+        for event, full_label, is_team, expected in [
+            ("pull_request", "false", "true", "fast"),
+            ("pull_request", "true", "true", "full"),
+            ("pull_request", "false", "false", "full"),
+            ("pull_request", "false", "", "full"),
+            ("merge_group", "false", "false", "full"),
+            ("workflow_dispatch", "false", "false", "full"),
+            ("push", "false", "false", "warm"),
+        ]:
+            with self.subTest(event=event, full_label=full_label, is_team=is_team), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "output"
+                subprocess.run(
+                    ["bash", "-c", script],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": event,
+                        "FULL_CI": full_label,
+                        "IS_TEAM_PR": is_team,
+                        "GITHUB_OUTPUT": str(output),
+                    },
+                )
                 self.assertEqual(output.read_text(), f"ci_mode={expected}\n")
 
-    def test_required_ci_rejects_skipped_jobs_in_full_runs(self):
+    def test_required_ci_enforces_fast_team_gate_and_full_external_gate(self):
         script = workflow_step("ci.yml", "Require every selected core CI job to succeed")
-        passed = {"signatures": {"result": "success"}, "changes": {"result": "success"},
-                  "rust-test": {"result": "success"}}
-        skipped = {**passed, "rust-test": {"result": "skipped"}}
+        passed = {
+            "signatures": {"result": "success"},
+            "changes": {"result": "success"},
+            "rust-format": {"result": "success"},
+            "rust-audit": {"result": "success"},
+            "ios-account-clippy": {"result": "success"},
+            "marmotkit-native-host": {"result": "success"},
+            "rust-test": {"result": "success"},
+        }
+        skipped = {
+            **passed,
+            "ios-account-clippy": {"result": "skipped"},
+            "marmotkit-native-host": {"result": "skipped"},
+            "rust-test": {"result": "skipped"},
+        }
+        apple_passed = {
+            **skipped,
+            "ios-account-clippy": {"result": "success"},
+            "marmotkit-native-host": {"result": "success"},
+        }
         failed = {**passed, "rust-test": {"result": "failure"}}
         cancelled = {**passed, "rust-test": {"result": "cancelled"}}
-        for event, mode, needs, expected in [
-            ("pull_request", "precheck", skipped, True),
-            ("pull_request", "precheck", failed, False),
-            ("pull_request", "precheck", {**passed, "signatures": {"result": "skipped"}}, False),
-            ("pull_request", "precheck", {**passed, "signatures": {"result": "failure"}}, False),
-            ("pull_request", "precheck", cancelled, False),
-            ("pull_request", "full", skipped, False),
-            ("merge_group", "full", passed, True),
-            ("merge_group", "full", skipped, False),
-            ("merge_group", "full", cancelled, False),
-            ("merge_group", "precheck", skipped, False),
-            ("merge_group", "", skipped, False),
-            ("push", "warm", skipped, True),
+        for event, mode, is_team, apple_opt_in, needs, expected in [
+            ("pull_request", "fast", "true", "false", skipped, True),
+            ("pull_request", "fast", "true", "true", apple_passed, True),
+            ("pull_request", "fast", "true", "true", skipped, False),
+            ("pull_request", "fast", "true", "true", {**apple_passed, "ios-account-clippy": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "true", {**apple_passed, "marmotkit-native-host": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", failed, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "signatures": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "changes": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-format": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-audit": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-audit": {"result": "failure"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-format": {"result": "failure"}}, False),
+            ("pull_request", "fast", "true", "false", cancelled, False),
+            ("pull_request", "fast", "false", "false", skipped, False),
+            ("pull_request", "full", "false", "false", passed, True),
+            ("pull_request", "full", "false", "false", skipped, False),
+            ("pull_request", "full", "true", "true", skipped, False),
+            ("pull_request", "", "true", "false", skipped, False),
+            ("merge_group", "full", "false", "false", passed, True),
+            ("merge_group", "full", "false", "false", skipped, False),
+            ("merge_group", "full", "false", "false", cancelled, False),
+            ("merge_group", "fast", "true", "false", skipped, False),
+            ("merge_group", "", "false", "false", skipped, False),
+            ("push", "warm", "false", "false", skipped, True),
         ]:
-            with self.subTest(event=event, mode=mode, needs=needs):
-                result = subprocess.run(["bash", "-c", script], capture_output=True, timeout=10,
-                                        env={**os.environ, "EVENT_NAME": event, "CI_MODE": mode,
-                                             "NEEDS": json.dumps(needs)})
+            with self.subTest(event=event, mode=mode, is_team=is_team, apple=apple_opt_in, needs=needs):
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": event,
+                        "CI_MODE": mode,
+                        "IS_TEAM_PR": is_team,
+                        "APPLE_OPT_IN": apple_opt_in,
+                        "NEEDS": json.dumps(needs),
+                    },
+                )
                 self.assertEqual(result.returncode == 0, expected)
+
+    def test_fast_team_gate_skips_heavy_compile_jobs_and_honors_ci_apple(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        blocks = {
+            block.split(":\n", 1)[0]: block
+            for block in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs)
+            if ":\n" in block
+        }
+        for job_name in ("rust-wasm-check", "rust-clippy", "rust-test-build"):
+            with self.subTest(job=job_name):
+                self.assertIn("needs.changes.outputs.ci_mode != 'fast'", blocks[job_name])
+        # `ci:apple` must trigger both macOS jobs even when changed paths leave run_ios=false.
+        for job_name in ("ios-account-clippy", "marmotkit-native-host"):
+            with self.subTest(job=job_name):
+                self.assertIn(
+                    "needs.changes.outputs.apple_opt_in == 'true'\n"
+                    "      || (needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_ios == 'true')",
+                    blocks[job_name],
+                )
 
     def test_required_ci_needs_every_gating_job(self):
         # Required CI is the only required check, so a job missing from its
@@ -331,12 +444,10 @@ class MergeGatePolicyTests(unittest.TestCase):
                          sorted(jobs - {"archive-layout-experiment", "merge-group-fail-fast", "required-ci"}))
 
     def test_full_runs_use_nextest_profiles_without_a_default_filter(self):
-        # The merge queue is the only gate that runs every test to the end, so a
-        # profile filter would silently drop coverage from master.
         profiles = tomllib.loads((ROOT / ".config/nextest.toml").read_text())["profile"]
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         used = set(re.findall(r"--profile (\S+)", workflow)) - {"minimal"}
-        self.assertEqual(used, {"ci", "default", "precheck"})
+        self.assertEqual(used, {"ci", "default"})
         for profile in used:
             with self.subTest(profile=profile):
                 config = profiles.get(profile, {})
@@ -345,25 +456,16 @@ class MergeGatePolicyTests(unittest.TestCase):
                 for override in config.get("overrides", []):
                     self.assertNotIn("default-filter", override)
 
-    def test_only_the_pre_check_counts_a_stopped_test_as_passed(self):
-        # A test that passes on timeout never finishes, so only the pull-request
-        # pre-check may select a profile that allows it.
+    def test_no_nextest_profile_counts_a_stopped_test_as_passed(self):
         profiles = tomllib.loads((ROOT / ".config/nextest.toml").read_text())["profile"]
         for name, config in profiles.items():
             timeouts = [config.get("slow-timeout")]
             timeouts += [override.get("slow-timeout") for override in config.get("overrides", [])]
             passes = any(isinstance(t, dict) and t.get("on-timeout") == "pass" for t in timeouts)
             with self.subTest(profile=name):
-                self.assertEqual(passes, name == "precheck")
+                self.assertFalse(passes)
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        steps = [step for step in workflow.split("\n      - name: ")[1:] if "--profile precheck" in step]
-        self.assertEqual(len(steps), 1)
-        self.assertIn("\n        if: needs.changes.outputs.ci_mode == 'precheck'\n", steps[0])
-        # The job holding that step must still start for a pre-check, or the
-        # pre-check silently loses its tests: it accepts skipped jobs.
-        jobs = workflow.split("\njobs:\n", 1)[1]
-        job = next(block for block in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs) if "--profile precheck" in block)
-        self.assertRegex(job, r"(?m)^    if: needs\.changes\.outputs\.run_full == 'true'$")
+        self.assertNotIn("--profile precheck", workflow)
 
     def test_only_the_merge_group_watcher_can_cancel_and_it_cannot_fail_the_run(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
@@ -721,6 +823,97 @@ class NightlyReleasePolicyTests(unittest.TestCase):
             with self.subTest(jobs=wrong_jobs), unittest.mock.patch.object(gh, "get", return_value=runs), \
                     unittest.mock.patch.object(gh, "paginate", return_value=wrong_jobs):
                 self.assertFalse(gh.required_ci_passed(master))
+
+    def test_nightly_planner_accepts_canary_verified_commits_without_merge_group(self):
+        script = workflow_step("nightly-releases.yml", "Select source commit and version")
+        self.assertIn("git fetch --no-tags origin canary || true", script)
+        self.assertIn("--canary-ref origin/canary", script)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "-b", "master")
+            git("config", "user.name", "Test")
+            git("config", "user.email", "test@example.com")
+            git("config", "commit.gpgsign", "false")
+            (repo / "Cargo.toml").write_text('[workspace.package]\nversion = "0.20.0-dev"\n')
+            git("add", "Cargo.toml")
+            git("commit", "-m", "c0")
+            c0 = git("rev-parse", "HEAD")
+
+            # Create a side branch to test diverged canary rejection.
+            git("checkout", "-b", "diverged")
+            (repo / "side.txt").write_text("side\n")
+            git("add", "side.txt")
+            git("commit", "-m", "diverged commit")
+            git("checkout", "master")
+
+            # Advance master by 52 first-parent commits; place canary 51 commits behind master.
+            shas = [c0]
+            for i in range(1, 53):
+                (repo / "a.txt").write_text(f"{i}\n")
+                git("add", "a.txt")
+                git("commit", "-m", f"c{i}")
+                shas.append(git("rev-parse", "HEAD"))
+            older_canary = shas[1]  # 51 commits behind master tip (shas[52])
+            git("branch", "canary-old", older_canary)
+            recent_canary = shas[50]
+            git("branch", "canary-recent", recent_canary)
+
+            class FakeGH:
+                def __init__(self, previous_sha):
+                    self.previous_sha = previous_sha
+                def read_latest(self):
+                    return {"source_sha": self.previous_sha, "version": "0.20.0-nightly.20261125"} if self.previous_sha else None
+                def required_ci_passed(self, _sha):
+                    return False
+                def tag_names(self, _prefix):
+                    return []
+
+            def run_plan(canary_ref, previous_sha=None):
+                import argparse
+                out_file = repo / "gh_output"
+                out_file.unlink(missing_ok=True)
+                args = argparse.Namespace(
+                    master_ref="master",
+                    canary_ref=canary_ref,
+                    depth=50,
+                    force=False,
+                    today="2026-11-26",
+                )
+                cwd = os.getcwd()
+                try:
+                    os.chdir(repo)
+                    with unittest.mock.patch.object(nightly_release, "github_from_env", return_value=FakeGH(previous_sha)), \
+                            unittest.mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(out_file)}, clear=False):
+                        nightly_release.command_plan(args)
+                finally:
+                    os.chdir(cwd)
+                return dict(line.split("=", 1) for line in out_file.read_text().splitlines() if "=" in line)
+
+            # Recent first-parent canary tip inside 50-commit window is selected.
+            recent_out = run_plan("canary-recent", previous_sha=c0)
+            self.assertEqual(recent_out["source_sha"], recent_canary)
+            self.assertEqual(recent_out["skip"], "false")
+
+            # Valid first-parent canary tip 51 commits behind master (outside depth=50) is still selected.
+            old_out = run_plan("canary-old", previous_sha=c0)
+            self.assertEqual(old_out["source_sha"], older_canary)
+            self.assertEqual(old_out["skip"], "false")
+
+            # Stale canary tip older than previous_sha never moves backwards.
+            no_rewind = run_plan("canary-old", previous_sha=recent_canary)
+            self.assertEqual(no_rewind["source_sha"], recent_canary)
+            self.assertEqual(no_rewind["skip"], "true")
+
+            # Diverged canary tip not on master's first-parent history is rejected.
+            with self.assertRaises(nightly_release.NightlyError):
+                run_plan("diverged", previous_sha=None)
 
     def test_nightly_jobs_require_their_dependencies_and_own_concurrency(self):
         workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
@@ -1343,6 +1536,73 @@ sha256sum() { shasum -a 256 "$@"; }
             self.assertIn(b"checksum", result.stderr)
             self.assertFalse((Path(tmp) / "cargo-nextest-0.9.132").exists())
             self.assertFalse((Path(tmp) / "path").exists())
+
+    def test_pr_trailer_contract_and_advisory_step_resolve_pr_refs(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        changes = workflow.split("\n  changes:\n", 1)[1].split("\n  rust-format:\n", 1)[0]
+        rust_format = workflow.split("\n  rust-format:\n", 1)[1].split("\n  rust-audit:\n", 1)[0]
+        self.assertIn("fetch-depth: 0", changes)
+        self.assertIn("run: python3 scripts/test_check_pr_trailers.py", rust_format)
+
+        script = workflow_step("ci.yml", "PR commit trailers (advisory)")
+        self.assertIn("python3 scripts/check_pr_trailers.py --advisory", script)
+        self.assertIn('|| echo "::warning title=PR trailers::', script)
+        self.assertNotIn("${{", script)
+
+        # Execute the exact workflow step in a synthetic PR merge-ref checkout
+        # (matching `actions/checkout` with `fetch-depth: 0` on pull_request).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "-b", "master")
+            git("config", "user.name", "Test")
+            git("config", "user.email", "test@example.com")
+            git("config", "commit.gpgsign", "false")
+            scripts_dir = repo / "scripts"
+            scripts_dir.mkdir()
+            for name in ("check_pr_trailers.py", "changelog.py"):
+                (scripts_dir / name).write_text((ROOT / "scripts" / name).read_text())
+            git("add", "scripts")
+            git("commit", "-m", "Base commit")
+            git("checkout", "-b", "pr-branch")
+            (repo / "feature.txt").write_text("ok\n")
+            git("add", "feature.txt")
+            git(
+                "commit", "-m",
+                "Add feature\n\n"
+                "Local-Checks: cargo fmt\n"
+                "Local-Review: claude + codex merge @ 1234567\n"
+                "Release-Impact: patch\n",
+            )
+            head_sha = git("rev-parse", "HEAD")
+
+            git("checkout", "master")
+            (repo / "master.txt").write_text("advanced\n")
+            git("add", "master.txt")
+            git("commit", "-m", "Advance master")
+            base_sha = git("rev-parse", "HEAD")
+            git("merge", "--no-ff", "pr-branch", "-m", "Synthetic refs/pull/1/merge")
+
+            result = subprocess.run(
+                ["bash", "-c", script],
+                cwd=repo,
+                env={
+                    **os.environ,
+                    "EVENT_NAME": "pull_request",
+                    "BASE_SHA": base_sha,
+                    "HEAD_SHA": head_sha,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("pr-trailers: OK (Release-Impact: patch)", result.stdout)
+            self.assertNotIn("::warning", result.stdout)
 
 
 if __name__ == "__main__":

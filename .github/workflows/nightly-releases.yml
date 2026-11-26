@@ -1,7 +1,8 @@
 name: Nightly Releases
 
 # Dated MarmotKit, Marmot C and WN Agent pre-releases from the newest master
-# commit whose merge-queue Required CI passed. See release.md#nightly-builds.
+# commit verified by `canary` (or merge-queue Required CI). See
+# release.md#nightly-builds.
 
 on:
   schedule:
@@ -70,7 +71,8 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin master
-          args=(plan --master-ref origin/master)
+          git fetch --no-tags origin canary || true
+          args=(plan --master-ref origin/master --canary-ref origin/canary)
           if [[ "$FORCE" == "true" ]]; then
             args+=(--force)
           fi

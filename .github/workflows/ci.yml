@@ -1,13 +1,13 @@
 name: CI
 
-# The merge queue is the merge gate and runs the full matrix, stopping at the
-# first failed job so the queue ejects that PR at once. Pull requests run a
-# fast pre-check (format, static gates, audit, clippy, WASM build, and the
-# workspace tests that finish quickly) unless labelled `ci:full`. The queue
-# fast-forwards master to the commit it tested, so
-# master pushes only refresh the Rust caches pull requests and merge groups
-# restore: GitHub scopes a cache saved by a merge-group run to its temporary
-# branch. Those pushes run only when an input of the rust-cache key changes.
+# Team pull requests run a fast static gate (~1 minute, zero Rust compile):
+# verified commit signatures, formatting, static/contract gates, cargo-audit,
+# and advisory commit-trailer checks. External/fork pull requests, `ci:full`
+# pull requests, `workflow_dispatch`, and `merge_group` runs execute the full
+# CI matrix (`.github/CODEOWNERS` protects `.github/` so fork PRs cannot edit
+# this workflow without owner review). Post-merge verification runs
+# continuously on `master` (advancing `canary`). Master pushes refresh Rust
+# caches only when a rust-cache input changes.
 #
 # GitHub evicts the least recently used caches once a repository passes 10 GB,
 # so that budget holds only the caches saved here and the wn-agent darwin
@@ -77,6 +77,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       ci_mode: ${{ steps.mode.outputs.ci_mode }}
+      is_team_pr: ${{ steps.trust.outputs.is_team_pr }}
       run_full: ${{ steps.classify.outputs.run_full }}
       run_c: ${{ steps.classify.outputs.run_c }}
       run_conformance: ${{ steps.classify.outputs.run_conformance }}
@@ -97,7 +98,7 @@ jobs:
           persist-credentials: false
 
       # Read labels live so adding ci:full or ci:apple followed by "Re-run all
-      # jobs" selects the requested coverage without a new source commit.
+      # jobs" takes effect without a new source commit.
       - name: Check CI opt-in labels
         id: labels
         env:
@@ -113,19 +114,54 @@ jobs:
           echo "full_ci=$(jq 'index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
           echo "apple_opt_in=$(jq 'index("ci:apple") != null or index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
 
-      # precheck: pull requests without `ci:full` run the fast gates and the
-      # quick workspace tests.
-      # full: merge groups, manual runs and `ci:full` run every job.
+      # Only branches pushed directly to this repository (non-fork) by an author
+      # with authoritative write, maintain, or admin repository permission
+      # qualify for the fast static PR gate. External/fork PRs, read-only org
+      # members, and unavailable permission checks all fail closed into full CI.
+      # `.github/CODEOWNERS` requires owner review for any change to `.github/`.
+      - name: Classify PR trust
+        id: trust
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          is_team_pr=false
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$HEAD_REPO" && "$HEAD_REPO" == "$REPO" && "$HEAD_FORK" != "true" && -n "$PR_AUTHOR" ]]; then
+            permission="$(gh api "repos/$REPO/collaborators/$PR_AUTHOR/permission" --jq '.permission // ""' 2>/dev/null || true)"
+            case "$permission" in
+              write|maintain|admin) is_team_pr=true ;;
+            esac
+          fi
+          echo "is_team_pr=$is_team_pr" >> "$GITHUB_OUTPUT"
+
+      # fast: team pull requests without `ci:full` run signatures, formatting,
+      # static gates, cargo-audit, and advisory trailer checks (zero compile).
+      # full: external/fork PRs, `ci:full` PRs, merge groups, and manual runs
+      # execute every CI job.
       # warm: master pushes run only the jobs that save a Rust cache.
       - name: Select CI mode
         id: mode
         env:
           EVENT_NAME: ${{ github.event_name }}
           FULL_CI: ${{ steps.labels.outputs.full_ci }}
+          IS_TEAM_PR: ${{ steps.trust.outputs.is_team_pr }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
-            pull_request) if [[ "$FULL_CI" == true ]]; then mode=full; else mode=precheck; fi ;;
+            pull_request)
+              if [[ "$FULL_CI" == true ]]; then
+                mode=full
+              elif [[ "$IS_TEAM_PR" == true ]]; then
+                mode=fast
+              else
+                mode=full
+              fi
+              ;;
             push) mode=warm ;;
             *) mode=full ;;
           esac
@@ -142,7 +178,7 @@ jobs:
           paths="$RUNNER_TEMP/ci-changes"
           : > "$paths"
           flags=()
-          if [[ "$CI_MODE" != precheck || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] \
+          if [[ "$CI_MODE" != fast || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] \
             || ! git cat-file -e "${BASE_SHA}^{commit}"; then
             flags=(--all)
           else
@@ -150,6 +186,20 @@ jobs:
             git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" > "$paths"
           fi
           python3 scripts/classify_ci_changes.py "${flags[@]}" --github-output "$GITHUB_OUTPUT" < "$paths"
+
+      - name: PR commit trailers (advisory)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_SHA" && -n "$HEAD_SHA" ]]; then
+            python3 scripts/check_pr_trailers.py --advisory \
+              --base "$BASE_SHA" \
+              --head "$HEAD_SHA" \
+              || echo "::warning title=PR trailers::advisory check failed unexpectedly"
+          fi
 
   rust-format:
     name: Rust format
@@ -195,6 +245,9 @@ jobs:
         run: |
           python3 scripts/changelog.py check
           python3 scripts/test_changelog.py
+
+      - name: PR commit trailers contract
+        run: python3 scripts/test_check_pr_trailers.py
 
       - name: Binding build phase contracts
         run: |
@@ -295,7 +348,7 @@ jobs:
   rust-wasm-check:
     name: Rust WASM check
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -354,7 +407,7 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -403,7 +456,7 @@ jobs:
   c-smoke:
     name: C bindings smoke
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck' && needs.changes.outputs.run_c == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_c == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -469,8 +522,8 @@ jobs:
     name: iOS keychain and Swift cancellation
     needs: changes
     if: >-
-      needs.changes.outputs.run_ios == 'true'
-      && (needs.changes.outputs.ci_mode != 'precheck' || needs.changes.outputs.apple_opt_in == 'true')
+      needs.changes.outputs.apple_opt_in == 'true'
+      || (needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_ios == 'true')
     runs-on: macos-latest
     # The cancellation smoke builds the shipped release profile (thin LTO, one
     # codegen unit), which grows with marmot-app. Queue runs took 16-27
@@ -520,8 +573,8 @@ jobs:
     name: MarmotKit native host lifecycle
     needs: changes
     if: >-
-      needs.changes.outputs.run_ios == 'true'
-      && (needs.changes.outputs.ci_mode != 'precheck' || needs.changes.outputs.apple_opt_in == 'true')
+      needs.changes.outputs.apple_opt_in == 'true'
+      || (needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_ios == 'true')
     runs-on: macos-latest
     # The smoke took 6-9 minutes as a step of ios-account-clippy.
     timeout-minutes: 20
@@ -554,7 +607,7 @@ jobs:
   convergence-policy-pin:
     name: Convergence policy pin (release assertions)
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck' && needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -596,13 +649,13 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-  # Pre-checks build the workspace tests here and run the quick ones in place.
-  # Full runs archive them for the test shards. Master pushes build them only
-  # to save the Rust caches; the jobs that run them need the full mode.
+  # Full runs archive the workspace tests for the test shards. Master pushes
+  # build them only to save the Rust caches; the jobs that run them need the
+  # full mode.
   rust-test-build:
     name: Build workspace tests
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -639,20 +692,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           shared-key: rust-test
 
-      # Every test runs, but the `precheck` profile stops each one after half
-      # a second and counts it as passed (TIMEOUT-PASS): this catches a test
-      # that fails quickly, and the merge queue still runs every test to the
-      # end. About two thirds of the workspace tests finish inside that window.
-      - name: Run quick workspace tests
-        if: needs.changes.outputs.ci_mode == 'precheck'
-        run: python3 scripts/ci_runner.py run rust-test-build -- cargo nextest run --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile precheck -E "$WORKSPACE_FILTER"
-
       - name: Verify workspace shard coverage
-        if: needs.changes.outputs.ci_mode != 'precheck'
         run: python3 scripts/ci_runner.py run workspace-build -- bash scripts/check_ci_partitions.sh slice:14 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile ci -E "$WORKSPACE_FILTER"
 
       - name: Upload workspace compiler timings
-        if: always() && needs.changes.outputs.ci_mode != 'precheck'
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: workspace-compiler-timings
@@ -661,11 +705,9 @@ jobs:
           retention-days: 7
 
       - name: Archive workspace tests
-        if: needs.changes.outputs.ci_mode != 'precheck'
         run: python3 scripts/ci_runner.py run rust-test-build -- cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile ci -E "$WORKSPACE_FILTER" --archive-file tests.tar.zst
 
       - name: Verify and describe test archive
-        if: needs.changes.outputs.ci_mode != 'precheck'
         run: python3 scripts/ci_runner.py manifest tests.tar.zst
 
       - name: Upload test archive
@@ -776,7 +818,7 @@ jobs:
   rust-test-extras:
     name: Doctests and diagnostic exporters
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck' && needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -842,7 +884,7 @@ jobs:
   cli-e2e-build:
     name: Build CLI tests
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck'
+    if: needs.changes.outputs.ci_mode != 'fast'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -891,7 +933,6 @@ jobs:
         run: python3 scripts/ci_runner.py run cli-e2e-build -- cargo nextest archive -p wn-cli --test cli --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
 
       - name: Verify and describe test archive
-        if: needs.changes.outputs.ci_mode != 'precheck'
         run: python3 scripts/ci_runner.py manifest tests.tar.zst
 
       - name: Upload test archive
@@ -989,7 +1030,7 @@ jobs:
   relay-runtime-build:
     name: Build relay runtime tests
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck'
+    if: needs.changes.outputs.ci_mode != 'fast'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -1033,7 +1074,6 @@ jobs:
         run: python3 scripts/ci_runner.py run relay-runtime-build -- cargo nextest archive -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
 
       - name: Verify and describe test archive
-        if: needs.changes.outputs.ci_mode != 'precheck'
         run: python3 scripts/ci_runner.py manifest tests.tar.zst
 
       - name: Upload test archive
@@ -1217,7 +1257,7 @@ jobs:
   conformance-build:
     name: Build simulator tests
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck'
+    if: needs.changes.outputs.ci_mode != 'fast'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -1266,7 +1306,6 @@ jobs:
         run: python3 scripts/ci_runner.py run conformance-build -- cargo nextest archive -p cgka-conformance-simulator --locked --profile ci --archive-file simulator.tar.zst
 
       - name: Verify and describe test archive
-        if: needs.changes.outputs.ci_mode != 'precheck'
         run: python3 scripts/ci_runner.py manifest simulator.tar.zst
 
       - name: Upload simulator test archive
@@ -1415,7 +1454,7 @@ jobs:
   conformance-extras:
     name: Convergence gates and simulator doctests
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck'
+    if: needs.changes.outputs.ci_mode != 'fast'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -1658,7 +1697,7 @@ jobs:
   windows-filesystem:
     name: Windows filesystem contracts
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck'
+    if: needs.changes.outputs.ci_mode != 'fast'
     runs-on: windows-latest
     timeout-minutes: 60
 
@@ -1846,13 +1885,16 @@ jobs:
 
     steps:
       # A full run selects every job, so a skip there means a broken condition
-      # rather than an unaffected lane. Merge groups must be full runs, and a
-      # job cancelled by merge-group-fail-fast fails them like a failure.
+      # rather than an unaffected lane. Merge groups and external/fork PRs must
+      # be full runs; team PRs in fast mode must still pass signatures, changes,
+      # rust-format, and rust-audit.
       - name: Require every selected core CI job to succeed
         env:
           NEEDS: ${{ toJSON(needs) }}
           EVENT_NAME: ${{ github.event_name }}
           CI_MODE: ${{ needs.changes.outputs.ci_mode }}
+          IS_TEAM_PR: ${{ needs.changes.outputs.is_team_pr }}
+          APPLE_OPT_IN: ${{ needs.changes.outputs.apple_opt_in }}
         run: |
           set -euo pipefail
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
@@ -1860,6 +1902,33 @@ jobs:
             echo "error: merge group selected CI mode '$CI_MODE', not full" >&2
             exit 1
           fi
-          accepted='["success", "skipped"]'
-          if [[ "$CI_MODE" == full ]]; then accepted='["success"]'; fi
-          jq --exit-status --argjson accepted "$accepted" '.signatures.result == "success" and all(.[]; .result | IN($accepted[]))' <<<"$NEEDS"
+          if [[ "$EVENT_NAME" == pull_request && "$IS_TEAM_PR" != true && "$CI_MODE" != full ]]; then
+            echo "error: non-team pull request selected CI mode '$CI_MODE', not full" >&2
+            exit 1
+          fi
+          case "$CI_MODE" in
+            full)
+              jq --exit-status 'all(.[]; .result == "success")' <<<"$NEEDS"
+              ;;
+            fast)
+              jq --exit-status --arg apple "$APPLE_OPT_IN" '
+                .signatures.result == "success"
+                and .changes.result == "success"
+                and .["rust-format"].result == "success"
+                and .["rust-audit"].result == "success"
+                and ($apple != "true" or (.["ios-account-clippy"].result == "success" and .["marmotkit-native-host"].result == "success"))
+                and all(.[]; .result | IN("success", "skipped"))
+              ' <<<"$NEEDS"
+              ;;
+            warm)
+              jq --exit-status '
+                .signatures.result == "success"
+                and .changes.result == "success"
+                and all(.[]; .result | IN("success", "skipped"))
+              ' <<<"$NEEDS"
+              ;;
+            *)
+              echo "error: unrecognized or missing CI mode '$CI_MODE'" >&2
+              exit 1
+              ;;
+          esac

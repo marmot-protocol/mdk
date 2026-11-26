@@ -112,7 +112,7 @@ def select_source(
     previous_sha: str | None,
     required_ci_passed: Callable[[str], bool],
 ) -> str | None:
-    """Return the newest master commit whose merge-queue Required CI passed.
+    """Return the newest verified master commit (exact canary tip or merge-queue Required CI).
 
     Walking stops at the previous nightly's source, which already passed, so selection never moves
     backwards and an unchanged master resolves to the previous SHA.
@@ -379,18 +379,51 @@ def workspace_version_at(sha: str) -> str:
     return manifest["workspace"]["package"]["version"]
 
 
+def canary_tip_commit(canary_ref: str | None) -> str | None:
+    """Return the exact verified commit SHA at `canary_ref`, if present."""
+    if not canary_ref:
+        return None
+    probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{canary_ref}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        return None
+    return probe.stdout.strip() or None
+
+
 def command_plan(args: argparse.Namespace) -> int:
     gh = github_from_env()
     day = today_utc(args.today)
-    shas = git("rev-list", "--first-parent", f"--max-count={args.depth}", args.master_ref).split()
+    all_master = git("rev-list", "--first-parent", args.master_ref).split()
+    shas = all_master[: args.depth]
+    canary_tip = canary_tip_commit(args.canary_ref)
+    valid_canary_tip = canary_tip if (canary_tip is not None and canary_tip in all_master) else None
     latest = gh.read_latest()
     previous_sha = latest["source_sha"] if latest else None
     previous_version = latest["version"] if latest else "none"
 
-    source_sha = select_source(shas, previous_sha, gh.required_ci_passed)
+    source_sha = select_source(
+        shas,
+        previous_sha,
+        lambda sha: (valid_canary_tip is not None and sha == valid_canary_tip) or gh.required_ci_passed(sha),
+    )
+    if source_sha is None and valid_canary_tip is not None:
+        # A valid first-parent Canary tip more than `depth` commits behind master
+        # still counts as verified, without ever moving backwards past previous_sha.
+        if (
+            previous_sha is not None
+            and previous_sha in all_master
+            and all_master.index(previous_sha) < all_master.index(valid_canary_tip)
+        ):
+            source_sha = previous_sha
+        else:
+            source_sha = valid_canary_tip
     if source_sha is None:
         raise NightlyError(
-            f"none of the newest {len(shas)} master commits has a successful merge-queue Required CI run"
+            f"none of the newest {len(shas)} master commits has a successful merge-queue Required CI run "
+            "and no valid first-parent canary tip was found"
         )
 
     outputs = {
@@ -427,7 +460,7 @@ def command_plan(args: argparse.Namespace) -> int:
         "## Nightly plan",
         "",
         f"- Master head: `{shas[0] if shas else 'unknown'}`",
-        f"- Newest commit with merge-queue Required CI: `{source_sha}` ({walked} commit(s) walked)",
+        f"- Newest verified commit (canary or merge-queue Required CI): `{source_sha}` ({walked} commit(s) walked)",
         f"- Previous nightly: `{previous_version}` from `{previous_sha or 'none'}`",
         f"- Source workspace version: `{workspace_version}`",
         f"- Nightly version: `{outputs['version'] or 'n/a'}` (date {day.isoformat()})",
@@ -684,6 +717,7 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = commands.add_parser("plan", help="select the source commit and nightly version")
     plan.add_argument("--master-ref", default="origin/master")
+    plan.add_argument("--canary-ref", default=None, help="optional protected canary branch ref whose commits are already verified")
     plan.add_argument("--depth", type=int, default=50)
     plan.add_argument("--force", action="store_true", help="plan a build even if the source is unchanged")
     plan.add_argument("--today", help="override the UTC date (YYYY-MM-DD) for testing")
