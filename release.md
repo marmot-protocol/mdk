@@ -255,7 +255,8 @@ just release-pr-preflight <version>
 
 This deliberately checks the release version, companion-document linkage, installer guidance, diff whitespace, tag
 availability, and coordinator inputs without compiling, testing, benchmarking, generating binding bundles, or building
-artifacts. Open the PR immediately after it passes and use required GitHub CI as the compile/test signal. Do not run
+artifacts. Open the PR immediately after it passes, add the `ci:full` label (since default team PR CI is a static gate
+with no Rust compilation), and use the resulting full GitHub CI run as the compile/test signal. Do not run
 `just fast-ci`, `just test`, `just ci`, Tamarin, benchmarks, binding bundle builds, or artifact builds first.
 
 If release preparation exposes an implementation or workflow defect, stop and fix it in a separate PR with the normal

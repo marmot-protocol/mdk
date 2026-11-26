@@ -63,13 +63,11 @@ before adding behavior or bindings.
 
 Every change reaches master through a reviewed, signed squash PR; nobody pushes directly to master. Verification and
 cross-model review happen locally, the team PR gate checks signatures, formatting, static contracts, `cargo-audit`,
-and advisory commit trailers (~1 minute, zero Rust compile), the trusted `tree-state` status check blocks merges while
-`master` is red, and post-merge `Canary` runs continuously verify `master`. Follow `.agents/skills/land-change`:
-targeted tests plus the end-to-end smoke, two independent cross-model reviews of the local diff
-(`.agents/skills/review-local`) until both recommend merge, a short PR (`.agents/skills/gh-create-pr`) brought to green
-`Required CI` and `tree-state` with no conflicts, then a report. Merge (`gh pr merge --auto --squash`) only when the
-user asks. If `tree-state` is `red` (Meltdown Mode), `.github/workflows/tree-state-gate.yml` marks `tree-state` failing
-on open PRs so only team PRs labeled `tree-fix` or `revert` may merge until `Canary` turns green.
+and advisory commit trailers (~1 minute, zero Rust compile), and post-merge `Canary` runs continuously verify `master`.
+Follow `.agents/skills/land-change`: targeted tests plus the end-to-end smoke, two independent cross-model reviews of
+the local diff (`.agents/skills/review-local`) until both recommend merge, a short PR (`.agents/skills/gh-create-pr`)
+brought to green `Required CI` with no conflicts, then a report. Merge (`gh pr merge --auto --squash`) only when the
+user asks.
 
 Record three commit trailers on the final signed commit (which GitHub preserves in squash commits under
 `COMMIT_MESSAGES`), and verify them locally with `just pr-trailers-check`:
@@ -147,10 +145,9 @@ Local verification proves your change before merge, and post-merge `Canary` runs
 the full suite. Keep local runs scoped to your change: several agents usually build on the same machine, so
 workspace-wide builds and suites run locally only when a rule below calls for one. On team pull requests, `Required CI`
 runs a ~1-minute static gate (verified commit signatures, `cargo fmt --check`, static/contract gates, `cargo audit`,
-and advisory commit-trailer checks) with zero Rust compile, alongside the trusted `tree-state` status check
-(`.github/workflows/tree-state-gate.yml`). External/fork pull requests and PRs labelled `ci:full` run the full `ci.yml`
-matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs on a team PR regardless of changed paths. Master
-pushes only refresh CI's Rust caches, and only when a dependency or toolchain input changes.
+and advisory commit-trailer checks) with zero Rust compile. External/fork pull requests and PRs labelled `ci:full` run
+the full `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs on a team PR regardless of changed
+paths. Master pushes only refresh CI's Rust caches, and only when a dependency or toolchain input changes.
 
 While iterating, run only the test you are working on. Before each push, run once:
 

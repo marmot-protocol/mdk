@@ -13,7 +13,7 @@ description: >-
 # Land a change
 
 Verification and cross-model review happen on your machine, the team PR gate
-checks commit signatures, `tree-state`, formatting, and static contracts (~1
+checks commit signatures, formatting, static contracts, and `cargo-audit` (~1
 minute), and post-merge `Canary` runs verify `master` continuously. Nothing
 reaches `master` by direct push or unsigned commit.
 
@@ -191,10 +191,9 @@ gh pr view <pr> --json headRefOid,mergeable,mergeStateStatus,reviewDecision
 | `BLOCKED` | Required checks pending or failing, or a required human review | Wait for checks (below). If only a human approval is missing (`reviewDecision: REVIEW_REQUIRED`), it is ready: step 6 |
 | `UNKNOWN` | GitHub is still computing | Check again shortly |
 
-Team PR CI is the ~1-minute static gate (commit signatures, `tree-state`,
-formatting, and static contracts); external/fork PRs and `ci:full` PRs run the
-full matrix. To wait for it, use your host's PR watching if it has it, instead
-of a polling loop. The only required check, `Required CI`, does not exist until
+Team PR CI is the ~1-minute static gate (commit signatures, formatting, static
+contracts, and `cargo-audit`); external/fork PRs and `ci:full` PRs run the full
+matrix. To wait for it, use your host's PR watching if it has it, instead of a polling loop. The only required check, `Required CI`, does not exist until
 the other CI jobs finish, so `gh pr checks <pr> --required` reports "no
 required checks reported" straight away, even with `--watch`. Wait for the
 head's `ci.yml` run instead (`gh run list --workflow ci.yml --event
@@ -247,10 +246,6 @@ Nothing else: no finding lists, no round-by-round history, no diff tour.
 Merge only when the user asks, and only the head that was verified and
 reviewed: confirm `headRefOid` is still the reviewed head and `Required CI` is
 green.
-
-If the `tree-state` status check is failing because the signed `tree-state`
-branch is `red` (Meltdown Mode), do not bypass it on unrelated changes; only
-team PRs labeled `tree-fix` or `revert` pass `tree-state` while `master` is red.
 
 Squash-merge the reviewed head (with `--match-head-commit` so the merge fails
 if the branch moved):

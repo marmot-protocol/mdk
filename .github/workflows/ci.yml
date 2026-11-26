@@ -5,10 +5,9 @@ name: CI
 # and advisory commit-trailer checks. External/fork pull requests, `ci:full`
 # pull requests, `workflow_dispatch`, and `merge_group` runs execute the full
 # CI matrix (`.github/CODEOWNERS` protects `.github/` so fork PRs cannot edit
-# this workflow without owner review). Live `tree-state` enforcement runs in
-# `.github/workflows/tree-state-gate.yml` from the trusted default branch.
-# Post-merge verification runs continuously on `master` (advancing `canary`).
-# Master pushes refresh Rust caches only when a rust-cache input changes.
+# this workflow without owner review). Post-merge verification runs
+# continuously on `master` (advancing `canary`). Master pushes refresh Rust
+# caches only when a rust-cache input changes.
 #
 # GitHub evicts the least recently used caches once a repository passes 10 GB,
 # so that budget holds only the caches saved here and the wn-agent darwin
@@ -1884,8 +1883,8 @@ jobs:
     steps:
       # A full run selects every job, so a skip there means a broken condition
       # rather than an unaffected lane. Merge groups and external/fork PRs must
-      # be full runs; team PRs in fast mode must still pass signatures, changes
-      # (including tree-state), and rust-format.
+      # be full runs; team PRs in fast mode must still pass signatures, changes,
+      # rust-format, and rust-audit.
       - name: Require every selected core CI job to succeed
         env:
           NEEDS: ${{ toJSON(needs) }}
