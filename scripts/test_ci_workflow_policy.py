@@ -798,6 +798,51 @@ class NightlyReleasePolicyTests(unittest.TestCase):
                     unittest.mock.patch.object(gh, "paginate", return_value=wrong_jobs):
                 self.assertFalse(gh.required_ci_passed(master))
 
+    def test_nightly_planner_accepts_canary_verified_commits_without_merge_group(self):
+        script = workflow_step("nightly-releases.yml", "Select source commit and version")
+        self.assertIn("git fetch --no-tags origin canary || true", script)
+        self.assertIn("--canary-ref origin/canary", script)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "-b", "master")
+            git("config", "user.name", "Test")
+            git("config", "user.email", "test@example.com")
+            git("config", "commit.gpgsign", "false")
+            (repo / "a.txt").write_text("1\n")
+            git("add", "a.txt")
+            git("commit", "-m", "c1")
+            c1 = git("rev-parse", "HEAD")
+            (repo / "a.txt").write_text("2\n")
+            git("add", "a.txt")
+            git("commit", "-m", "c2")
+            c2 = git("rev-parse", "HEAD")
+            git("branch", "canary", c2)
+            (repo / "a.txt").write_text("3\n")
+            git("add", "a.txt")
+            git("commit", "-m", "c3 unverified")
+            c3 = git("rev-parse", "HEAD")
+
+            cwd = os.getcwd()
+            try:
+                os.chdir(repo)
+                canary_shas = nightly_release.canary_verified_commits("canary", 50)
+                missing_shas = nightly_release.canary_verified_commits("nonexistent", 50)
+            finally:
+                os.chdir(cwd)
+
+            self.assertEqual(canary_shas, {c1, c2})
+            self.assertEqual(missing_shas, set())
+            # Newer unverified master commit c3 is skipped; canary-verified c2 is selected.
+            selected = nightly_release.select_source([c3, c2, c1], c1, lambda sha: sha in canary_shas)
+            self.assertEqual(selected, c2)
+
     def test_nightly_jobs_require_their_dependencies_and_own_concurrency(self):
         workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
         self.assertIn("    if: success() && !inputs.build_only && !inputs.dry_run\n", workflow)

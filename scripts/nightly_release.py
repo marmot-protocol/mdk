@@ -379,18 +379,38 @@ def workspace_version_at(sha: str) -> str:
     return manifest["workspace"]["package"]["version"]
 
 
+def canary_verified_commits(canary_ref: str | None, depth: int) -> set[str]:
+    """Return the first-parent commit set reachable from `canary_ref`, if present."""
+    if not canary_ref:
+        return set()
+    probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{canary_ref}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        return set()
+    return set(git("rev-list", "--first-parent", f"--max-count={depth}", canary_ref).split())
+
+
 def command_plan(args: argparse.Namespace) -> int:
     gh = github_from_env()
     day = today_utc(args.today)
     shas = git("rev-list", "--first-parent", f"--max-count={args.depth}", args.master_ref).split()
+    canary_shas = canary_verified_commits(args.canary_ref, args.depth)
     latest = gh.read_latest()
     previous_sha = latest["source_sha"] if latest else None
     previous_version = latest["version"] if latest else "none"
 
-    source_sha = select_source(shas, previous_sha, gh.required_ci_passed)
+    source_sha = select_source(
+        shas,
+        previous_sha,
+        lambda sha: sha in canary_shas or gh.required_ci_passed(sha),
+    )
     if source_sha is None:
         raise NightlyError(
-            f"none of the newest {len(shas)} master commits has a successful merge-queue Required CI run"
+            f"none of the newest {len(shas)} master commits is verified by canary "
+            "or has a successful merge-queue Required CI run"
         )
 
     outputs = {
@@ -427,7 +447,7 @@ def command_plan(args: argparse.Namespace) -> int:
         "## Nightly plan",
         "",
         f"- Master head: `{shas[0] if shas else 'unknown'}`",
-        f"- Newest commit with merge-queue Required CI: `{source_sha}` ({walked} commit(s) walked)",
+        f"- Newest verified commit (canary or merge-queue Required CI): `{source_sha}` ({walked} commit(s) walked)",
         f"- Previous nightly: `{previous_version}` from `{previous_sha or 'none'}`",
         f"- Source workspace version: `{workspace_version}`",
         f"- Nightly version: `{outputs['version'] or 'n/a'}` (date {day.isoformat()})",
@@ -684,6 +704,7 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = commands.add_parser("plan", help="select the source commit and nightly version")
     plan.add_argument("--master-ref", default="origin/master")
+    plan.add_argument("--canary-ref", default=None, help="optional protected canary branch ref whose commits are already verified")
     plan.add_argument("--depth", type=int, default=50)
     plan.add_argument("--force", action="store_true", help="plan a build even if the source is unchanged")
     plan.add_argument("--today", help="override the UTC date (YYYY-MM-DD) for testing")

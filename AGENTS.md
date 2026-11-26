@@ -184,12 +184,12 @@ is fmt, the static gates, and CI's two workspace clippy passes, so it is not a p
 
 Exception: for an initial cohort-release PR limited to version fields, workspace package versions in `Cargo.lock`,
 vector `conformance_version` values, changelogs, release/integration documentation, README/install version pins, and
-other release metadata, run only `just release-pr-preflight <version>`, open the PR with the `ci:full` label, and let
-GitHub CI provide the compile/test signal. Do not run `just fast-ci`, `just test`, `just ci`, Tamarin, benchmarks,
-binding bundle builds, or artifact builds before opening that PR. If preparing the release exposes an implementation or
-workflow defect, fix it in a separate PR with the normal targeted verification instead of expanding the metadata PR.
-After the metadata PR is merged and required CI succeeds, run `just release-all <version>` to build and publish the
-cohort.
+other release metadata, run only `just release-pr-preflight <version>`, open the PR with the `ci:full` label
+(re-running all jobs if CI started before the label was applied), and confirm the full GitHub CI matrix passes on the
+current head before merging. Do not run `just fast-ci`, `just test`, `just ci`, Tamarin, benchmarks, binding bundle
+builds, or artifact builds before opening that PR. If preparing the release exposes an implementation or workflow
+defect, fix it in a separate PR with the normal targeted verification instead of expanding the metadata PR. After the
+metadata PR is merged and required CI succeeds, run `just release-all <version>` to build and publish the cohort.
 
 The install-example gate renders all six installer `--help` surfaces and checks
 release guidance plus workflow-generated notes for download, sibling `.sha256`
