@@ -695,6 +695,7 @@ class BisectController:
         if would_clear_tree:
             self.state.tree_state = "green"
             self.state.open_revert_prs.clear()
+            self.state.open_revert_commands.clear()
         # Persist recovered state BEFORE best-effort issue comments / alerts.
         self._persist()
 
@@ -739,6 +740,14 @@ class BisectController:
             escalated = True
         return escalated
 
+    def _record_open_revert_command(self, culprit_sha: str, command: tuple[str, ...]) -> None:
+        if not command:
+            return
+        cmd_list = list(command)
+        recorded = self.state.open_revert_commands.setdefault(culprit_sha, [])
+        if cmd_list not in recorded:
+            recorded.append(cmd_list)
+
     def _find_open_revert_pr(self, culprit_sha: str, branch: str) -> str | None:
         """Return open PR URL, `""` when confirmed absent, or `None` when lookup failed."""
         cached = self.state.open_revert_prs.get(culprit_sha, "")
@@ -750,8 +759,66 @@ class BisectController:
             return live
         if cached and not self.dry_run:
             self.state.open_revert_prs.pop(culprit_sha, None)
+            self.state.open_revert_commands.pop(culprit_sha, None)
             return ""
         return cached
+
+    def _check_covered_by_open_revert_pr(
+        self,
+        signal: FailureSignal,
+        seen_key: str,
+    ) -> tuple[ClassificationResult, BisectOutcome] | None:
+        """Short-circuit before classification/bisect when an open revert PR already covers this failure.
+
+        Checks `state.open_revert_prs` / `state.open_revert_commands` when `signal.tip_sha`
+        descends from the culprit and the failing command matches, avoiding repeated full
+        repro+bisect cycles while a revert PR waits for a human to merge it.
+        """
+        if not signal.command or not self.state.open_revert_prs:
+            return None
+        target_cmd = list(signal.command)
+        for culprit_sha in list(self.state.open_revert_prs):
+            recorded_cmds = self.state.open_revert_commands.get(culprit_sha, [])
+            if target_cmd not in recorded_cmds:
+                continue
+            if not is_ancestor_or_equal(self.repo, culprit_sha, signal.tip_sha):
+                continue
+            branch_name = f"revert/{culprit_sha[:9]}"
+            existing = self._find_open_revert_pr(culprit_sha, branch_name)
+            if existing is None:
+                return (
+                    ClassificationResult(
+                        bucket=Bucket.DETERMINISTIC_REGRESSION,
+                        reason=f"deferred duplicate check for open revert PR covering {culprit_sha[:9]}",
+                    ),
+                    BisectOutcome(
+                        culprit_sha=culprit_sha,
+                        revert_branch=branch_name,
+                        pr_creation_failed=True,
+                        meltdown_triggered=False,
+                        reason=f"failed to confirm open revert PR status for {culprit_sha[:9]}; will retry",
+                    ),
+                )
+            if existing:
+                self.state.mark_seen(seen_key)
+                self._persist()
+                return (
+                    ClassificationResult(
+                        bucket=Bucket.DETERMINISTIC_REGRESSION,
+                        reason=f"skipped duplicate bisect: open revert PR {existing} already covers {culprit_sha[:9]}",
+                    ),
+                    BisectOutcome(
+                        culprit_sha=culprit_sha,
+                        clean_revert=True,
+                        revert_verified=True,
+                        revert_branch=branch_name,
+                        revert_pr_url=existing,
+                        duplicate_pr=True,
+                        meltdown_triggered=False,
+                        reason=f"revert PR already open for {culprit_sha[:9]}: {existing}",
+                    ),
+                )
+        return None
 
     def _trigger_meltdown(
         self,
@@ -830,6 +897,9 @@ class BisectController:
     ) -> tuple[ClassificationResult, BisectOutcome | None]:
         """Classify and respond to a single Canary failure signal."""
         seen_key = f"fail:{signal.source}:{signal.run_id}"
+        covered = self._check_covered_by_open_revert_pr(signal, seen_key)
+        if covered is not None:
+            return covered
         eff_attempt = attempt_key or self._attempt_key_from_run_id(signal.run_id)
         open_issues = self.github.open_flake_issues()
         effective_deadline = poll_deadline if poll_deadline is not None else (self.now_fn() + self.bisect_budget_secs)
@@ -1017,6 +1087,7 @@ class BisectController:
                 reason=f"failed to query existing revert PRs for {culprit_sha[:9]}; will retry",
             )
         if existing_pr:
+            self._record_open_revert_command(culprit_sha, signal.command)
             self.state.mark_seen(seen_key)
             self._persist()
             return classification, BisectOutcome(
@@ -1069,6 +1140,7 @@ class BisectController:
             self.state.mark_seen(seen_key)
             if outcome.revert_pr_url:
                 self.state.open_revert_prs[culprit_sha] = outcome.revert_pr_url
+                self._record_open_revert_command(culprit_sha, signal.command)
             self._persist()
             run_line = f"\n- Canary run: {signal.run_url}" if signal.run_url else ""
             self.github.open_or_comment_issue(
@@ -1080,7 +1152,6 @@ class BisectController:
                     f"- Command: `{checks_summary}`{run_line}"
                 ),
             )
-            self.github.dispatch_canary()
             self.alerter.notify_authors(
                 [author] if author else [],
                 f"MDK Bisect Agent reverted {culprit_sha[:9]} ({outcome.culprit_subject}) "
@@ -1158,6 +1229,9 @@ class BisectController:
         cleanup_stale_worktrees(self.repo, self.worktree_root)
         refresh_errors = self.refresh_repo() if fetch_remote else []
         _remote_status, unknown_remote_freeze = self._hydrate_remote_incidents()
+        # Check overdue 30-minute escalations BEFORE running any long classification/bisect
+        # so an already-overdue incident is never delayed by another source's bisect budget.
+        escalated_early = self.check_escalation()
 
         # 1. Inspect local bare-metal Canary status if present.
         if bare_metal_status_path and bare_metal_status_path.is_file():
@@ -1357,7 +1431,7 @@ class BisectController:
                     }
                 )
 
-        escalated = self.check_escalation()
+        escalated = escalated_early or self.check_escalation()
         result: dict[str, Any] = {
             "dry_run": self.dry_run,
             "actions": actions,

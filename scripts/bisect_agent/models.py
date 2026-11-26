@@ -104,6 +104,7 @@ class AgentState:
     consecutive_flake_blocks: dict[str, int] = field(default_factory=dict)
     intermittent_hits: dict[str, int] = field(default_factory=dict)
     open_revert_prs: dict[str, str] = field(default_factory=dict)
+    open_revert_commands: dict[str, list[list[str]]] = field(default_factory=dict)
     tree_state: str = "green"
     active_incidents: dict[str, IncidentRecord] = field(default_factory=dict)
 
@@ -167,6 +168,15 @@ class AgentState:
             },
             open_revert_prs={
                 str(k): str(v) for k, v in dict(data.get("open_revert_prs", {})).items()
+            },
+            open_revert_commands={
+                str(k): [
+                    [str(arg) for arg in cmd]
+                    for cmd in cmds
+                    if isinstance(cmd, list)
+                ]
+                for k, cmds in dict(data.get("open_revert_commands", {})).items()
+                if isinstance(cmds, list)
             },
             tree_state=str(data.get("tree_state", "green")),
             active_incidents=incidents,

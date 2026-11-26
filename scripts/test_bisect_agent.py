@@ -1445,6 +1445,107 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
                 errs = esc_ctrl.refresh_repo()
                 self.assertEqual(len(errs), 3)
 
+            # 6. Early escalation runs BEFORE failure classification/bisect, and open revert PRs
+            # short-circuit subsequent failures on descendants without running predicates or dispatching Canary.
+            gh_open = StubGitHub(author="dev")
+            state_open = AgentState(
+                tree_state="red",
+                active_incidents={
+                    "hosted_canary": IncidentRecord(
+                        started_at=100.0,
+                        reason="existing tangled meltdown",
+                        run_url="https://example.com/old",
+                        tip_sha=c1,
+                        source="hosted_canary",
+                    )
+                },
+            )
+            pred_calls: list[tuple[str, bool]] = []
+            bm_status = tmp / "bm-status.json"
+            bm_status.write_text(
+                json.dumps(
+                    {
+                        "state": "red",
+                        "sha": c1,
+                        "canary_sha": c0,
+                        "failed_step": "cargo-audit",
+                        "updated_at": "2026-11-26T17:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # Push a clean-revertable commit c_rev onto master so revert succeeds.
+            c_clean_base = _commit_file(repo, "rev.txt", "ok\n", "rev base")
+            c_rev = _commit_file(repo, "rev.txt", "broken\n", "rev break")
+            _git(repo, "push", "origin", "master")
+            bm_status.write_text(
+                json.dumps(
+                    {
+                        "state": "red",
+                        "sha": c_rev,
+                        "canary_sha": c_clean_base,
+                        "failed_step": "cargo-audit",
+                        "updated_at": "2026-11-26T17:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def track_pred(wt: Path, _cmd: tuple[str, ...]) -> tuple[RunVerdict, str]:
+                # Assert overdue incident was ALREADY escalated before predicate ran!
+                already_esc = state_open.active_incidents["hosted_canary"].escalated_at is not None
+                pred_calls.append((str(wt), already_esc))
+                ok = (wt / "rev.txt").read_text(encoding="utf-8").strip() == "ok"
+                return (RunVerdict.PASS if ok else RunVerdict.FAIL), ""
+
+            ctrl_open = BisectController(
+                repo=repo,
+                state=state_open,
+                github=gh_open,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=TreeStateController(repo, dry_run=True, sign_commits=False),
+                dry_run=False,
+                sign_commits=False,
+                now_fn=lambda: 5000.0,
+                worktree_root=tmp / "wts-open",
+                run_in_wt=track_pred,
+            )
+            poll_res = ctrl_open.poll_once(
+                bare_metal_status_path=bm_status,
+                hosted_workflows=(),
+                master_ref="origin/master",
+                fetch_remote=False,
+            )
+            self.assertTrue(poll_res["escalated"])
+            self.assertTrue(pred_calls)
+            self.assertTrue(all(was_esc for _, was_esc in pred_calls))
+            self.assertEqual(len(gh_open.prs), 1)
+            # No premature hosted Canary dispatch before a human merges the revert PR!
+            self.assertEqual(gh_open.dispatches, 0)
+
+            # A subsequent failure on a descendant commit with the same command while the revert PR
+            # is still open MUST short-circuit with ZERO predicate calls!
+            c_desc = _commit_file(repo, "unrelated.txt", "note\n", "unrelated commit")
+            _git(repo, "push", "origin", "master")
+            calls_before = len(pred_calls)
+            _cls_dup, out_dup = ctrl_open.handle_failure(
+                FailureSignal(
+                    source="hosted_canary",
+                    run_id="901:1",
+                    run_url="https://example.com/901",
+                    tip_sha=c_desc,
+                    baseline_sha=c_clean_base,
+                    failed_job="Rust audit",
+                    failed_step="Audit Rust dependencies",
+                    command=("cargo", "--locked", "audit"),
+                ),
+                master_ref="origin/master",
+            )
+            assert out_dup is not None
+            self.assertTrue(out_dup.duplicate_pr)
+            self.assertEqual(len(pred_calls), calls_before)
+            self.assertIn("fail:hosted_canary:901:1", state_open.seen_runs)
+
 
 if __name__ == "__main__":
     unittest.main()
