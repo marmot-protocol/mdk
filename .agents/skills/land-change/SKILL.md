@@ -153,11 +153,21 @@ team PR skips; a row you skip is a failure you push to `master`.
 | `formal/liveness/` (`.tla`, `.cfg`, counterexamples), or the Stateright mirror (`cgka-conformance-simulator`'s `lifecycle_model.rs`) | `just tla-liveness tla-liveness-counterexample` |
 | `formal/tamarin/` or `formal/pairing/` (`.spthy`, `policy_cases.json`), or `cgka-policy-casegen` | `just tamarin` |
 | Behavior a formal model makes claims about (lifecycle fairness, freeze/settle, restart rehydration, device linking, pairing, selector policy), even with no model file changed | Check the model still matches the code with `.agents/skills/formal-verification`; if you change the model, run its row above. Say in the review context which model you checked |
+| Code compiled only for Apple targets (`target_os = "ios"` or `"macos"`, `target_vendor = "apple"`; `marmot-account`'s keychain, for one), or `marmot-uniffi`'s Swift bindings | On a Mac: step 2's clippy for each changed crate, plus the commands of the `iOS keychain and Swift cancellation` and `MarmotKit native host lifecycle` jobs (`ios-account-clippy`, `marmotkit-native-host`): `cargo clippy -p marmot-account -p marmot-session --target aarch64-apple-ios --locked -- -D warnings`, `bash crates/marmot-uniffi/subscription-cancellation-smoke.sh`, `bash crates/marmot-uniffi/native-host-smoke.sh`. Without a Mac, those jobs stand in (`ci:apple`, below) only for the targets they build: the `marmot-account` and `marmot-session` libraries for iOS, and for macOS `marmot-uniffi`'s library, `uniffi-bindgen` binary and `native-host-relay` example with the `cli` feature, plus the libraries they depend on. Apple-only code in any other target, tests included (`marmot-uniffi`'s `runtime_threads` test, `wn-cli`'s daemon), needs a Mac |
+| Code compiled only for Windows (`cfg(windows)`, `target_os = "windows"`; `fs-private`'s lease, for one) | On Windows: the `cargo nextest run` commands of the `Windows filesystem contracts` job (`windows-filesystem` in `.github/workflows/ci.yml`). Without Windows, that job stands in (`ci:full`, below) only for the targets it builds: the libraries and tests of `fs-private`, `marmot-account` and `marmot-forensics`, the `marmot-session` and `marmot-app` libraries with their unit tests, and the libraries they depend on. Windows-only code in any other target (`wn-cli`, or `marmot-session`'s integration tests) needs a Windows machine |
 | A gate the nearest `AGENTS.md` names for the files you touched | that gate |
 
-If a row's tool is missing on your machine (no Android NDK, no `clang` for
-WASM), say so in the PR's Verification section and in the report; do not
-quietly skip it.
+**A row you cannot run here.** Linux compiles neither Apple- nor Windows-only
+code, and an unlabelled team PR compiles nothing at all, so a row you skip
+locally is checked nowhere before merge. When a row needs an OS or tool your
+machine lacks (a Mac, Windows, the Android NDK, `clang` for WASM), the
+matching hosted job stands in for it, but only where that job builds the
+Cargo target (library, test, example) and features you changed: label the PR `ci:apple` for the Apple row and `ci:full` for
+any other, keep it a draft, and mark it ready only once that job passed on the
+current head (steps 4 and 5). When no hosted job builds the code, stop and ask
+the user for a machine that can run the row. Name each stand-in row and its
+job in the PR's Verification section and in the report. Saying you skipped a
+row does not cover it.
 
 An initial cohort-release PR follows the release exception in the root
 `AGENTS.md` Verification section instead of this step: run only
@@ -266,6 +276,8 @@ Push only when all of these hold on HEAD:
 
 - HEAD is the reviewed head (step 3).
 - Step 2 ran on HEAD, or on a commit with the same tree.
+- Every step 2 row your change matches ran locally. A row a hosted job
+  stands in for (step 2) keeps the PR a draft until that job passes on HEAD.
 - HEAD is on top of current `origin/master` (`git fetch origin master`; `git
   merge-base --is-ancestor origin/master HEAD`). If master moved, rebase and
   apply step 3's clean-rebase rule before pushing.
@@ -273,24 +285,43 @@ Push only when all of these hold on HEAD:
 
 Then push the branch and open a ready (not draft) PR with a description from
 `.agents/skills/gh-create-pr`, including its Verification section with the
-end-to-end smoke and every step 2 row you ran or could not run. Put `Fixes
-#<n>` below Problem and Fix when there is an issue.
+end-to-end smoke and every step 2 row you ran or left to a hosted job. Put
+`Fixes #<n>` below Problem and Fix when there is an issue.
 
-If you need to open the PR before that (to share a branch, or to wait on a
-human), open it as a draft and mark it ready only once the list above holds.
+If you need to open the PR before that (to share a branch, to wait on a
+human, or to let a stand-in job run), open it as a draft and mark it ready
+(`gh pr ready <pr>`) only once the list above holds. Give a stand-in job's
+label at creation (`gh pr create --draft --label ci:apple`); a label added
+later applies only to the next push or to "Re-run all jobs".
+
+The same list holds for every head a ready PR gets, including a fix or a
+rebase from step 5. When its readiness rests on a stand-in job, mark it draft
+again (`gh pr ready <pr> --undo`) before pushing the new head, and ready once
+the job passed on it.
 
 ## 5. Make it ready
 
 The PR is ready when its head is the reviewed head (step 3), its required
-checks pass, it is up to date with `master`, and it has no conflicts. Read its
-state:
+checks pass, every stand-in job from step 2 passed on that head, it is up to
+date with `master`, and it has no conflicts. Read its state:
 
 ```sh
-gh pr view <pr> --json headRefOid,mergeable,mergeStateStatus,reviewDecision
+gh pr view <pr> --json headRefOid,isDraft,mergeable,mergeStateStatus,reviewDecision
+gh pr checks <pr>
 ```
 
-`headRefOid` must be the reviewed head. Then act on
-`mergeStateStatus`:
+`headRefOid` must be the reviewed head. A green `Required CI` does not say
+which jobs ran: on an unlabelled team PR it passes with no Rust compiled. Find
+each stand-in job by its display name (its `name:` in `ci.yml`, as step 2
+gives it) in `gh pr checks <pr>` and confirm it shows `pass`;
+a job that is missing or `skipping` means the label was not applied to this
+head.
+
+A draft is never ready, whatever `mergeStateStatus` says: GitHub reports
+some drafts as `DRAFT` and others as their underlying state, `CLEAN`
+included. While `isDraft` is `true`, work through the table below, then run
+`gh pr ready <pr>` once everything above holds, and read the state again. Go
+to step 6 or 7 only with `isDraft: false`. Then act on `mergeStateStatus`:
 
 | State | Meaning | What to do |
 | --- | --- | --- |
@@ -300,6 +331,7 @@ gh pr view <pr> --json headRefOid,mergeable,mergeStateStatus,reviewDecision
 | `DIRTY` | Conflicts | Rebase and resolve, redo steps 2 and 3 (resolving a conflict is never a clean rebase), push, check again |
 | `BLOCKED` | Required checks pending or failing, or a required human review | Wait for checks (below). If only a human approval is missing (`reviewDecision: REVIEW_REQUIRED`), it is ready: step 6, in either mode |
 | `UNKNOWN` | GitHub is still computing | Check again shortly |
+| `DRAFT` | A draft whose underlying state GitHub hides | Wait for checks (below), then handle it as a draft (above) |
 
 To wait for checks, use your host's PR watching if it has it, instead of a
 polling loop. The only required check, `Required CI`, does not exist until the
@@ -314,17 +346,25 @@ start): treat it as a failed gate.
 When a check fails, read `gh run view <id> --log-failed`. The failed job is
 the cause; jobs shown as cancelled were stopped by it.
 
-**On a team PR** the gate compiles no Rust, so a failure is a signature,
-formatting, static-contract, trailer, or `cargo-audit` problem. Run the
-failing command locally (`cargo fmt --all --check`, the `just` gate the job
-names, `cargo --locked audit`), fix it, redo step 2 for what the fix touched
-and step 3 (a fix is a new tree), and push. An audit advisory that also fails
-on `origin/master` is master being broken (table below).
+Classify a failure by the job that failed, not by who opened the PR: a team
+PR labelled `ci:apple` or `ci:full` builds and tests Rust like an external
+one.
 
-**On a full-matrix PR** (external or fork, or labelled `ci:full`), reproduce a
-failing test by name (`cargo nextest run -p <crate> -E 'test(=<name>)'`) after
-`git fetch origin master`, so every comparison uses current master, then
-decide which case it is:
+**A static job** (`PR signatures`, `Classify CI changes`, `Rust format`,
+`Rust audit`: all an unlabelled team PR runs) compiles no Rust, so a failure
+is a signature, formatting, static-contract, trailer, or `cargo-audit`
+problem. Run the failing command locally (`cargo fmt --all --check`, the
+`just` gate the job names, `cargo --locked audit`), fix it, redo step 2 for
+what the fix touched and step 3 (a fix is a new tree), and push. An audit
+advisory that also fails on `origin/master` is master being broken (table
+below).
+
+**Any other job** builds or tests Rust. Reproduce a failing test by name
+(`cargo nextest run -p <crate> -E 'test(=<name>)'`) after `git fetch origin
+master`, so every comparison uses current master. A macOS or Windows job you
+cannot run here is judged from its log and the same job's latest result on
+`master` in `Canary`; its hosted rerun confirms the fix. Then decide which
+case it is:
 
 | Case | How you know | What to do |
 | --- | --- | --- |
@@ -354,8 +394,8 @@ Stop here and tell the user, in a few lines:
 - Review: <seat> and <seat> both said merge at <short sha>, after <n> round(s).
 - CI: required checks green. Branch up to date with master, no conflicts.
 - <Only if it needs their attention: a finding you rejected and why, a flake
-  you filed, a step 2 row you could not run, a stated limitation, or a human
-  approval still required.>
+  you filed, a step 2 row a hosted job stood in for, a stated limitation, or
+  a human approval still required.>
 ```
 
 Nothing else: no finding lists, no round-by-round history, no diff tour.
@@ -366,11 +406,13 @@ If the user later tells you to merge it, go to step 7.
 
 Merge only in land mode, and only the head that was verified and reviewed.
 
-1. Wait until `Required CI` is green on the head. If a CODEOWNERS approval is
+1. Wait until `Required CI` is green on the head and every stand-in job from
+   step 2 passed on it (step 5). If a CODEOWNERS approval is
    required and missing, stop and report as in step 6, naming the approval;
    you cannot give it yourself.
-2. Re-read `gh pr view <pr> --json headRefOid,mergeStateStatus`.
-   `headRefOid` must be the reviewed head, and `mergeStateStatus` must be
+2. Re-read `gh pr view <pr> --json headRefOid,isDraft,mergeStateStatus`.
+   `headRefOid` must be the reviewed head, `isDraft` must be `false`, and
+   `mergeStateStatus` must be
    `CLEAN` or `HAS_HOOKS`. `BEHIND` means another PR landed first: handle it
    with the step 5 table, then start this list again.
 3. Squash-merge right away, pinned to that head; any wait between green and
