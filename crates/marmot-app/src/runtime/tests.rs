@@ -596,6 +596,7 @@ async fn worker_lookup_skips_reconcile() {
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
         },
     );
     // A lifecycle transaction for another account must not hold up this worker.
@@ -1661,6 +1662,7 @@ async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout(
         shutdown,
         unit: Default::default(),
         read_state: Default::default(),
+        relay_checks: tokio::sync::watch::channel(Default::default()).1,
     };
 
     let started = std::time::Instant::now();
@@ -3259,6 +3261,7 @@ async fn account_manager_shutdown_drains_worker_inserted_by_in_flight_catch_up()
                 shutdown: shutdown_tx,
                 unit: Default::default(),
                 read_state: Default::default(),
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
             },
         );
     });
@@ -3688,6 +3691,7 @@ async fn finished_worker_is_replaced_on_first_requested_lookup() {
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
         },
     );
 
@@ -3727,6 +3731,7 @@ async fn finished_worker_is_replaced_on_first_batch_reconcile() {
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
         },
     );
 
@@ -5170,6 +5175,7 @@ async fn stuck_worker_reap_does_not_block_a_healthy_account() {
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
         },
     );
 
@@ -5247,6 +5253,7 @@ async fn deactivation_waits_for_worker_abort_before_committing_sign_out() {
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
         },
     );
 
@@ -5503,6 +5510,7 @@ async fn catch_up_error_from_ready_account_takes_precedence_over_sibling_backoff
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
         },
     );
 

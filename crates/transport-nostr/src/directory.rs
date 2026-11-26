@@ -77,6 +77,21 @@ pub enum DirectoryInspectionError {
     InvalidRequest,
     /// The relay answered but said it holds more than it sent.
     Incomplete,
+    /// Relay health's inbox check only ([`DirectoryFetchRequest::verifying_inbox`]):
+    /// the relay ended the read without naming a refusal (a CLOSED reason
+    /// other than `restricted:`, `blocked:`, `payment-required:`,
+    /// `rate-limited:` or `auth-required:`), or sent more than asked.
+    Unexplained,
+    /// Relay health's inbox check only: the relay asked for authentication
+    /// and refused the signer's AUTH only as `rate-limited:`.
+    AuthenticationRateLimited,
+    /// Relay health's inbox check only: the relay asked for authentication,
+    /// and what it then answered the signer's AUTH names no policy: it
+    /// accepted it and still refused or withheld, refused it for an
+    /// unexplained or `error:` reason, never answered it or never completed
+    /// the challenge, or the notifications that could hold its reply were
+    /// dropped.
+    AuthenticationUnconfirmed,
     /// The relay returned one or more verified records before failing or ending
     /// incompletely.
     Partial {
@@ -199,6 +214,9 @@ pub struct DirectoryFetchRequest {
     /// caller with a shorter remaining budget gets `Partial { records, TimedOut }`
     /// from the collector instead of cancelling it from outside.
     pub(crate) inspection_budget: Option<Duration>,
+    /// Relay health's inbox check: classify the answer strictly (see
+    /// [`Self::verifying_inbox`]).
+    pub(crate) verify_inbox: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -302,9 +320,16 @@ pub struct NostrSdkDirectoryRelayFetcher {
     finite: FiniteRequests,
 }
 
-struct ScopedInspectionClient(NostrSdkClient);
+/// A client owned by one bounded read. Dropped, it stops the relay it holds
+/// at once (`Relay::shutdown` ends its dial, socket and AUTH handling before
+/// it returns), so a cancelled read leaves no connection behind, and then
+/// shuts the client down.
+struct ScopedInspectionClient(NostrSdkClient, Option<nostr_sdk::prelude::Relay>);
 impl Drop for ScopedInspectionClient {
     fn drop(&mut self) {
+        if let Some(relay) = &self.1 {
+            relay.shutdown();
+        }
         let client = self.0.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
@@ -455,7 +480,19 @@ impl DirectoryFetchRequest {
             endpoints,
             queries,
             inspection_budget: None,
+            verify_inbox: false,
         })
+    }
+
+    /// Classify an inbox read (kind 1059) for relay health: only a refusal the
+    /// relay names (`restricted:`, `blocked:`, `payment-required:`, or an AUTH
+    /// refused for one of those reasons) stays a refusal; an answer that
+    /// cannot be verified (an auth-gated EOSE, an AUTH whose outcome names no
+    /// policy or never completes) is [`DirectoryInspectionError::AuthenticationUnconfirmed`],
+    /// and any other close [`DirectoryInspectionError::Unexplained`].
+    pub fn verifying_inbox(mut self) -> Self {
+        self.verify_inbox = true;
+        self
     }
 
     /// Bound one-shot `inspect_directory_events` to at most `budget` across
@@ -1136,6 +1173,8 @@ pub async fn fetch_public_events(
 struct InspectionAuthenticator {
     signer: SignerAuthenticator<SdkSigner>,
     pending: Arc<AtomicBool>,
+    /// The AUTH events it signed, so a relay's reply is matched to them.
+    signed: Arc<std::sync::Mutex<Vec<EventId>>>,
 }
 
 impl Authenticator for InspectionAuthenticator {
@@ -1154,7 +1193,12 @@ impl Authenticator for InspectionAuthenticator {
 
             self.pending.store(true, Ordering::Relaxed);
             let _pending = PendingSignature(&self.pending);
-            self.signer.make_auth_event(relay_url, challenge).await
+            let event = self.signer.make_auth_event(relay_url, challenge).await?;
+            self.signed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event.id);
+            Ok(event)
         })
     }
 }
@@ -1170,16 +1214,19 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         // The signer belongs to this request only, never to a shared mutable
         // directory client that could authenticate as another account.
         let signing_pending = Arc::new(AtomicBool::new(false));
+        let auth_signed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let signed = signer.is_some();
         let builder = match signer {
             Some(signer) => super::nostr_builder().authenticator(InspectionAuthenticator {
                 signer: SignerAuthenticator::new(SdkSigner(signer)),
                 pending: signing_pending.clone(),
+                signed: auth_signed.clone(),
             }),
             None => super::nostr_builder(),
         };
         let (builder, finite) = FiniteRequests::install(builder);
-        let client = ScopedInspectionClient(builder.build());
-        let client = &client.0;
+        let mut scoped = ScopedInspectionClient(builder.build(), None);
+        let client = scoped.0.clone();
         let urls = parsed_directory_relay_urls(&request.endpoints).map_err(|_| InvalidRequest)?;
         if urls.len() != 1 {
             return Err(InvalidRequest);
@@ -1194,6 +1241,10 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .await
             .map_err(|_| Unreachable)?
             .ok_or(Unreachable)?;
+        scoped.1 = Some(relay.clone());
+        // Relay health reads the relay's own answers to the signer's AUTH,
+        // watched from before the dial too.
+        let mut auth_replies = relay.notifications().with_gaps();
         // Watched before the dial, so an authentication a challenge on
         // connect starts is seen however early it ends. Opt into the short
         // challenge grace so a bare `auth-required:` CLOSED with no AUTH
@@ -1269,6 +1320,10 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                     }
                 }
             };
+            if request.verify_inbox {
+                let evidence = signed.then(|| auth_evidence(&mut auth_replies, &auth_signed));
+                return verified_inbox_answer(&result, evidence, &signing_pending);
+            }
             match &result.end {
                 FiniteEnd::Eose if !result.auth && !result.more => {
                     collect_verified(&mut records);
@@ -1351,6 +1406,145 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
     }
 }
 
+/// What the signer's AUTH met, from the relay's messages read so far.
+struct AuthEvidence {
+    /// The relay sent an AUTH challenge.
+    challenged: bool,
+    /// What it answered the latest AUTH this read signed.
+    reply: AuthReply,
+}
+
+enum AuthReply {
+    /// No reply to an AUTH this read signed was read, or the notifications
+    /// that could hold one were dropped.
+    Unread,
+    Accepted,
+    /// Refused for a policy reason it names: `restricted:`, `blocked:` or
+    /// `payment-required:`.
+    Refused,
+    /// Refused as `rate-limited:` (behind one `error:` wrapper or none).
+    RateLimited,
+    /// Refused for a reason that names no policy.
+    Unexplained,
+}
+
+/// The relay's challenges and its latest reply to an AUTH in `signed` among
+/// the messages already buffered: the SDK reports an authentication's end
+/// after its OK, and an OK for any other event is not this AUTH's answer.
+fn auth_evidence<Gap>(
+    replies: &mut (
+             impl futures::Stream<Item = Result<nostr_sdk::prelude::RelayNotification, Gap>> + Unpin
+         ),
+    signed: &std::sync::Mutex<Vec<EventId>>,
+) -> AuthEvidence {
+    use futures::FutureExt;
+    use nostr_sdk::prelude::RelayNotification;
+    let signed = signed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let (mut challenged, mut dropped, mut reply) = (false, false, AuthReply::Unread);
+    while let Some(Some(notification)) = replies.next().now_or_never() {
+        let Ok(notification) = notification else {
+            dropped = true;
+            continue;
+        };
+        let RelayNotification::Message { message } = notification else {
+            continue;
+        };
+        match *message {
+            RelayMessage::Auth { .. } => challenged = true,
+            RelayMessage::Ok {
+                event_id,
+                status,
+                message,
+            } if signed.contains(&event_id) => {
+                reply = if status {
+                    AuthReply::Accepted
+                } else if unwrapped_reason(&message).starts_with("rate-limited:") {
+                    AuthReply::RateLimited
+                } else if ["restricted:", "blocked:", "payment-required:"]
+                    .iter()
+                    .any(|policy| message.starts_with(policy))
+                {
+                    AuthReply::Refused
+                } else {
+                    AuthReply::Unexplained
+                };
+            }
+            _ => {}
+        }
+    }
+    if dropped {
+        reply = AuthReply::Unread;
+    }
+    AuthEvidence { challenged, reply }
+}
+
+/// Relay health's reading of an inbox read's end: a refusal only where the
+/// relay named one, an answer it withheld or could not verify as
+/// `AuthenticationUnconfirmed`, never `Ok`.
+fn verified_inbox_answer(
+    result: &transport_nostr_adapter::FiniteReply,
+    evidence: Option<AuthEvidence>,
+    signing_pending: &AtomicBool,
+) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
+    use DirectoryInspectionError::*;
+    let challenged = evidence
+        .as_ref()
+        .is_some_and(|evidence| evidence.challenged);
+    Err(match &result.end {
+        // An EOSE still saying it withholds events until authentication
+        // proves the relay answered, not that it serves the inbox.
+        FiniteEnd::Eose if result.auth => AuthenticationUnconfirmed,
+        FiniteEnd::Eose => return Ok(Vec::new()),
+        FiniteEnd::Closed(reason) => match inbox_closed_reason(reason) {
+            AuthenticationRequired => match evidence.map(|evidence| evidence.reply) {
+                // No signer answered: nothing about this account's key.
+                None => AuthenticationUnconfirmed,
+                Some(AuthReply::Refused) => AuthenticationRequired,
+                Some(AuthReply::RateLimited) => AuthenticationRateLimited,
+                Some(AuthReply::Unread | AuthReply::Accepted | AuthReply::Unexplained) => {
+                    AuthenticationUnconfirmed
+                }
+            },
+            error => error,
+        },
+        FiniteEnd::TimedOut if signing_pending.load(Ordering::Relaxed) => AuthenticationTimedOut,
+        // A challenge the relay sent and never saw through: it answered.
+        FiniteEnd::TimedOut if challenged => AuthenticationUnconfirmed,
+        FiniteEnd::TimedOut => TimedOut,
+        FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => Unexplained,
+        _ => Unreachable,
+    })
+}
+
+/// A CLOSED reason as relay health reads it: only a refusal the relay names
+/// is one (behind one `error:` wrapper or none).
+fn inbox_closed_reason(reason: &str) -> DirectoryInspectionError {
+    use DirectoryInspectionError::*;
+    let reason = unwrapped_reason(reason);
+    if reason.starts_with("auth-required:") {
+        AuthenticationRequired
+    } else if reason.starts_with("payment-required:") {
+        PaymentRequired
+    } else if reason.starts_with("rate-limited:") {
+        RateLimited
+    } else if reason.starts_with("restricted:") || reason.starts_with("blocked:") {
+        Restricted
+    } else {
+        Unexplained
+    }
+}
+
+/// `reason` without one leading `error:` wrapper (mdk#3439).
+fn unwrapped_reason(reason: &str) -> &str {
+    reason
+        .get(..6)
+        .filter(|wrapper| wrapper.eq_ignore_ascii_case("error:"))
+        .map_or(reason, |_| reason[6..].trim_start())
+}
+
 /// Classifies a relay's CLOSED reason by its NIP-01 machine-readable prefix.
 /// Some relays put that prefix behind one `error:` wrapper (`ERROR:
 /// auth-required: ...`, mdk#3439); that wrapper alone is looked through.
@@ -1400,7 +1594,7 @@ async fn strict_fetch_endpoint(
     let builder = super::nostr_builder();
     let wire =
         super::directory_wire::DirectoryWireTransport::new(builder.websocket_transport.clone());
-    let owned = ScopedInspectionClient(builder.websocket_transport(wire.clone()).build());
+    let owned = ScopedInspectionClient(builder.websocket_transport(wire.clone()).build(), None);
     let client = &owned.0;
     let endpoint = TransportEndpoint(relay_url.to_string());
     if !matches!(client.relay(&relay_url).await, Ok(Some(_)))
@@ -3387,5 +3581,279 @@ mod tests {
             server.abort();
             let _ = server.await;
         }
+    }
+
+    /// How [`spawn_inbox_relay`] answers.
+    #[derive(Clone, Copy)]
+    struct InboxRelay {
+        /// Every REQ: CLOSED with this reason, or `None` for an EOSE carrying
+        /// NIP-67 `auth`.
+        req: Option<&'static str>,
+        /// An AUTH challenge after each answer.
+        challenge: bool,
+        /// The OKs answering each AUTH, in order: whether it names the AUTH
+        /// (else some other event), and `None` to accept or the refusal.
+        auth_replies: &'static [(bool, Option<&'static str>)],
+    }
+
+    async fn spawn_inbox_relay(
+        script: InboxRelay,
+    ) -> (TransportEndpoint, tokio::task::JoinHandle<()>) {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let mut replies = Vec::new();
+                match frame[0].as_str() {
+                    Some("REQ") => {
+                        replies.push(match script.req {
+                            Some(reason) => serde_json::json!(["CLOSED", frame[1], reason]),
+                            None => serde_json::json!(["EOSE", frame[1], ["auth"]]),
+                        });
+                        if script.challenge {
+                            replies.push(serde_json::json!(["AUTH", "inbox-challenge"]));
+                        }
+                    }
+                    Some("AUTH") => {
+                        let other = serde_json::json!("0".repeat(64));
+                        for (names_auth, refusal) in script.auth_replies {
+                            let id = if *names_auth { &frame[1]["id"] } else { &other };
+                            replies.push(match refusal {
+                                None => serde_json::json!(["OK", id, true, ""]),
+                                Some(reason) => serde_json::json!(["OK", id, false, reason]),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                for reply in replies {
+                    if socket
+                        .send(Message::Text(reply.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+        (endpoint, server)
+    }
+
+    async fn inspect_inbox_strictly(
+        endpoint: TransportEndpoint,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
+        let keys = nostr::prelude::Keys::generate();
+        let request = DirectoryFetchRequest::new(
+            vec![endpoint],
+            vec![DirectoryEventQuery::new(
+                1059,
+                vec![keys.public_key().to_hex()],
+                1,
+            )],
+        )
+        .unwrap()
+        .verifying_inbox();
+        timeout(
+            DIRECTORY_INSPECTION_WAIT + Duration::from_secs(1),
+            NostrSdkDirectoryRelayFetcher::standalone()
+                .inspect_directory_events(request, Some(Arc::new(keys))),
+        )
+        .await
+        .expect("an inbox check ends within its own budget")
+    }
+
+    /// Relay health's inbox check calls a relay's answer a refusal only where
+    /// the relay names one about this account, and never calls an answer it
+    /// could not verify served: a close that names no refusal is
+    /// `Unexplained`; an AUTH refused for no named policy, an unrelated
+    /// refusal before the AUTH's own answer, and an auth-gated EOSE whose AUTH
+    /// was refused are all `AuthenticationUnconfirmed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_inbox_check_names_a_refusal_only_when_the_relay_does() {
+        use DirectoryInspectionError::*;
+        const NONE: &[(bool, Option<&str>)] = &[];
+        let cases: [(&str, InboxRelay, Result<(), DirectoryInspectionError>); 11] = [
+            (
+                "a close that names nothing",
+                InboxRelay {
+                    req: Some("ignored"),
+                    challenge: false,
+                    auth_replies: NONE,
+                },
+                Err(Unexplained),
+            ),
+            (
+                "restricted",
+                InboxRelay {
+                    req: Some("restricted: members only"),
+                    challenge: false,
+                    auth_replies: NONE,
+                },
+                Err(Restricted),
+            ),
+            (
+                "blocked, wrapped",
+                InboxRelay {
+                    req: Some("ERROR: blocked: no"),
+                    challenge: false,
+                    auth_replies: NONE,
+                },
+                Err(Restricted),
+            ),
+            (
+                "payment",
+                InboxRelay {
+                    req: Some("payment-required: pay"),
+                    challenge: false,
+                    auth_replies: NONE,
+                },
+                Err(PaymentRequired),
+            ),
+            (
+                "rate limit",
+                InboxRelay {
+                    req: Some("rate-limited: slow down"),
+                    challenge: false,
+                    auth_replies: NONE,
+                },
+                Err(RateLimited),
+            ),
+            (
+                "invalid",
+                InboxRelay {
+                    req: Some("invalid: bad filter"),
+                    challenge: false,
+                    auth_replies: NONE,
+                },
+                Err(Unexplained),
+            ),
+            (
+                "AUTH refused for a policy",
+                InboxRelay {
+                    req: Some("ERROR: auth-required: sign in"),
+                    challenge: true,
+                    auth_replies: &[(true, Some("restricted: not a member"))],
+                },
+                Err(AuthenticationRequired),
+            ),
+            (
+                "AUTH rate-limited",
+                InboxRelay {
+                    req: Some("ERROR: auth-required: sign in"),
+                    challenge: true,
+                    auth_replies: &[(true, Some("ERROR: rate-limited: slow down"))],
+                },
+                Err(AuthenticationRateLimited),
+            ),
+            (
+                "AUTH refused for no named policy",
+                InboxRelay {
+                    req: Some("ERROR: auth-required: sign in"),
+                    challenge: true,
+                    auth_replies: &[(true, Some("error: temporary backend failure"))],
+                },
+                Err(AuthenticationUnconfirmed),
+            ),
+            (
+                "an unrelated refusal before the AUTH's own answer",
+                InboxRelay {
+                    req: Some("ERROR: auth-required: sign in"),
+                    challenge: true,
+                    auth_replies: &[
+                        (false, Some("restricted: not a member")),
+                        (true, Some("error: temporary backend failure")),
+                    ],
+                },
+                Err(AuthenticationUnconfirmed),
+            ),
+            (
+                "an auth-gated EOSE whose AUTH was refused",
+                InboxRelay {
+                    req: None,
+                    challenge: true,
+                    auth_replies: &[(true, Some("restricted: not a member"))],
+                },
+                Err(AuthenticationUnconfirmed),
+            ),
+        ];
+        for (case, script, expected) in cases {
+            let (endpoint, server) = spawn_inbox_relay(script).await;
+            let result = inspect_inbox_strictly(endpoint).await.map(drop);
+            server.abort();
+            assert_eq!(result, expected, "{case}");
+        }
+    }
+
+    /// An AUTH challenge the relay sends and never sees through leaves the
+    /// read `AuthenticationUnconfirmed` at its deadline: the relay answered,
+    /// so the check must not read it as offline. Real time, as for the
+    /// slow-EOSE test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_inbox_check_whose_challenge_never_completes_is_unconfirmed() {
+        let (endpoint, server) = spawn_inbox_relay(InboxRelay {
+            req: Some("ERROR: auth-required: sign in"),
+            challenge: true,
+            auth_replies: &[],
+        })
+        .await;
+        let result = inspect_inbox_strictly(endpoint).await.map(drop);
+        server.abort();
+        assert_eq!(
+            result,
+            Err(DirectoryInspectionError::AuthenticationUnconfirmed)
+        );
+    }
+
+    /// The latest reply to an AUTH this read signed decides, and a reply to
+    /// any other event, or a dropped notification, is no evidence. The SDK
+    /// acts on the first reply to an AUTH, so a relay that refuses and then
+    /// accepts the same AUTH cannot be ordered deterministically on the wire;
+    /// this reads the notification stream directly.
+    #[test]
+    fn the_latest_reply_to_a_signed_auth_decides() {
+        use nostr_sdk::prelude::RelayNotification;
+        let auth = EventId::from_slice(&[0; 32]).unwrap();
+        let other = EventId::from_slice(&[1; 32]).unwrap();
+        let ok = |event_id: EventId, status: bool, reason: &'static str| {
+            Ok(RelayNotification::Message {
+                message: Box::new(RelayMessage::Ok {
+                    event_id,
+                    status,
+                    message: std::borrow::Cow::Borrowed(reason),
+                }),
+            })
+        };
+        let signed = std::sync::Mutex::new(vec![auth]);
+        // `Err` is a dropped notification.
+        let read = |items: Vec<Result<RelayNotification, ()>>| {
+            auth_evidence(&mut futures::stream::iter(items), &signed).reply
+        };
+        assert!(matches!(
+            read(vec![ok(auth, false, "restricted: no"), ok(auth, true, "")]),
+            AuthReply::Accepted
+        ));
+        assert!(matches!(
+            read(vec![ok(auth, true, ""), ok(auth, false, "restricted: no")]),
+            AuthReply::Refused
+        ));
+        assert!(matches!(
+            read(vec![ok(other, false, "restricted: no")]),
+            AuthReply::Unread
+        ));
+        assert!(matches!(
+            read(vec![ok(auth, false, "restricted: no"), Err(()),]),
+            AuthReply::Unread
+        ));
     }
 }

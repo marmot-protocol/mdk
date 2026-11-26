@@ -62,7 +62,11 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   connect still decides a later close; a persistent NIP-67 `auth` EOSE hint is `AuthenticationRequired` and `more` is
   `Incomplete` (not for the inbox probe). `CLOSED` `rate-limited:` is `RateLimited` and bare `error: <other>` is
   `Unreachable`, while permanent prefixes stay `Restricted`; verified kind 10002/10050 records returned before an incomplete or closed
-  end are kept in `Partial { records, cause }`. Each query's relays share one byte budget
+  end are kept in `Partial { records, cause }`. Relay health's `inspect_inbox` sets `verifying_inbox` on its request,
+  which onboarding never does: its answer is classified strictly (`inbox_closed_reason`, `verified_inbox_answer`), the
+  AUTH reply is matched to the events the read's own authenticator signed, and an answer it cannot verify is
+  `AuthenticationUnconfirmed`; the new variants it adds reach no other caller. A dropped inspection client stops its
+  relay at once (`Relay::shutdown`). Each query's relays share one byte budget
   (`FiniteRequests::sharing`); directory and public reads set no item cap, since a relay's every EVENT frame would count,
   matching or not. Frames not yet read are bounded per relay request, not per query: a queue of the budget plus one
   frame, and the batch its collector is reading, so up to twice that. A public read past `max_events`, cut, or ending

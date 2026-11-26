@@ -2144,6 +2144,36 @@ impl MarmotRelayPlane {
         self.inner.directory.inspect_events(request, signer).await
     }
 
+    /// Relay health's inbox check of `endpoint`: one bounded read of
+    /// `recipient`'s gift wraps (kind 1059 addressed to it), answered with
+    /// `signer`, classified strictly ([`DirectoryFetchRequest::verifying_inbox`]).
+    /// `Ok` means the relay ended the read with EOSE and withheld nothing
+    /// behind authentication. No event is kept.
+    #[doc(hidden)]
+    pub async fn inspect_inbox(
+        &self,
+        endpoint: TransportEndpoint,
+        recipient: String,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+    ) -> Result<(), directory::DirectoryInspectionError> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(vec![endpoint], "inbox check")
+            .map_err(|_| directory::DirectoryInspectionError::InvalidRequest)?;
+        let request = DirectoryFetchRequest::new(
+            endpoints,
+            vec![DirectoryEventQuery::new(1059, vec![recipient], 1)],
+        )
+        .map_err(|_| directory::DirectoryInspectionError::InvalidRequest)?
+        .verifying_inbox();
+        self.inner
+            .directory
+            .inspect_events(request, Some(signer))
+            .await
+            .map(drop)
+    }
+
     /// Narrow discovered relay endpoints to the safe ones, dropping the rest.
     ///
     /// Unlike the fail-closed sanitize on the dial path, this is for endpoints

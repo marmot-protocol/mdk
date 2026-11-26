@@ -7511,6 +7511,7 @@ fn controlled_reap_worker() -> (
             commands,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
         },
         release,
         dropped,

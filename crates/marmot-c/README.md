@@ -76,6 +76,12 @@ in one `marmot_set_account_inbox_relays` call, since an empty inbox list is reje
 `MarmotRelayWarningKind`, `MarmotRelayHealthFault`, `MarmotRelayRepairAction`, `MarmotRelayRole` and
 `MarmotRelayHealthState`: keep a default case.
 
+`marmot_check_account_relays` runs the shared [inbox check](../marmot-uniffi/README.md#inbox-checks) and writes the
+account's relay health after it, freed with `marmot_account_relay_health_free`. It blocks the calling thread for up to
+about 15 seconds, so keep it off the UI thread. While a check of the account runs it returns
+`MARMOT_STATUS_RELAY_CHECK_RUNNING` at once; without a running account worker it fails and dials nothing. Read a row's `checked_at_unix` only when `has_checked_at_unix` is true; `checking` says a check
+of it is running.
+
 
 ## Direct-follow availability
 

@@ -328,6 +328,7 @@ impl AccountWorkerCommand {
             | Self::UnrecognizedSignIns { .. }
             | Self::AnswerSignIn { .. }
             | Self::CheckSignIns { .. }
+            | Self::CheckRelays { .. }
             | Self::StartFresh { .. }
             | Self::StartedFresh { .. }
             | Self::CompromiseWarning { .. }

@@ -103,6 +103,7 @@ mod push;
 pub(crate) mod read_state;
 mod receipts;
 pub(crate) mod recovery;
+pub(crate) mod relay_checks;
 mod retention;
 pub(crate) mod sibling_chat_gaps;
 pub(crate) mod sign_ins;
@@ -865,6 +866,10 @@ pub struct AppClient {
     /// persisted. Before this index existed, every inbound delivery and every
     /// publish-report batch rebuilt a `HashSet` from the full 16k-entry ring.
     pub(crate) seen_events_index: receipts::SeenEventIndex,
+    /// What this client's inbox relay checks established, by relay URL.
+    /// They go with the client (`relay_checks`).
+    pub(crate) inbox_relay_checks:
+        std::collections::BTreeMap<String, crate::relay_health::CheckRecord>,
     /// Number of ids at the tail of `state.seen_events` observed since the last
     /// successful account-projection checkpoint. The count saturates at the
     /// bounded ring length, so even a catch-up batch larger than the window

@@ -247,6 +247,9 @@ pub enum MarmotStatus {
     /// None of a recipient's available KeyPackages is compatible. No MLS group change was committed.
     /// Ask the recipient to update their client and publish a compatible KeyPackage.
     IncompatibleKeyPackage = 134,
+    /// A relay check of the account is running; nothing more was checked.
+    /// Ask again once its rows stop saying `checking`.
+    RelayCheckRunning = 135,
 }
 
 thread_local! {
@@ -437,6 +440,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         }
         MarmotKitError::ReactionNotFound => MarmotStatus::ReactionNotFound,
         MarmotKitError::IncompatibleKeyPackage => MarmotStatus::IncompatibleKeyPackage,
+        MarmotKitError::RelayCheckRunning => MarmotStatus::RelayCheckRunning,
     }
 }
 
@@ -648,6 +652,7 @@ mod tests {
             MarmotKitError::ReactionNotFound,
             MarmotKitError::NoUsableRelay,
             MarmotKitError::IncompatibleKeyPackage,
+            MarmotKitError::RelayCheckRunning,
             MarmotKitError::MemberNotInGroup {
                 group_id_hex: "aa".into(),
                 member_id_hex: "bb".into(),
@@ -841,6 +846,14 @@ mod tests {
         assert_eq!(
             status_from_error(&MarmotKitError::IncompatibleKeyPackage) as i32,
             134
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::RelayCheckRunning) as i32,
+            135
+        );
+        assert_eq!(
+            take_last_error().as_deref(),
+            Some("a relay check of this account is already running")
         );
         assert_eq!(
             status_from_error(&MarmotKitError::GroupRecoverySourceMismatch {

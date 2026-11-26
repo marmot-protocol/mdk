@@ -1221,6 +1221,18 @@ c_cmd! {
     /// Free with `marmot_account_relay_health_free`.
     async fn marmot_account_relay_health(account_ref: str) -> rec(MarmotAccountRelayHealth) = account_relay_health;
 
+    /// Check whether the account's inbox relays serve its inbox and return
+    /// the account's relay health after it. The account's worker runs one
+    /// bounded read per allowed inbox relay (at most 16) on a connection of
+    /// its own; blocks up to about 15 seconds. While a check of the account
+    /// runs it returns `MARMOT_STATUS_RELAY_CHECK_RUNNING` at once; without a
+    /// running account worker it fails and dials nothing. A remote signer may
+    /// be asked to sign a relay's authentication challenge. A check no relay
+    /// answered changes nothing. The written health is the answer;
+    /// `MARMOT_EVENT_RELAY_HEALTH_CHANGED` follows a changed answer from the
+    /// worker. Free with `marmot_account_relay_health_free`.
+    async fn marmot_check_account_relays(account_ref: str) -> rec(MarmotAccountRelayHealth) = check_account_relays;
+
     /// Reconnect one configured relay and return its next observed state.
     /// Free with `marmot_relay_liveness_free`.
     async fn marmot_reconnect_relay(account_ref: str, url: str) -> rec(MarmotRelayLiveness) = reconnect_relay;

@@ -3985,7 +3985,7 @@ pub fn telemetry_install_id(&self) -> Result<String, MarmotKitError>
 
 Consent-bound random OTLP identifier, stable until revocation. Requires a current combined grant; never use this value in product events.
 
-[Source](src/commands/relay.rs#L113)
+[Source](src/commands/relay.rs#L135)
 
 ### `Marmot::set_relay_telemetry_runtime_config`
 
@@ -3997,7 +3997,7 @@ pub async fn set_relay_telemetry_runtime_config( &self, config: RelayTelemetryRu
 
 Supply non-persisted OTLP runtime metadata: optional metrics URL override, bearer token from the host app's build-time secret, and resource attributes from the platform shell.
 
-[Source](src/commands/relay.rs#L120)
+[Source](src/commands/relay.rs#L142)
 
 ### `Marmot::set_relay_telemetry_settings`
 
@@ -4009,7 +4009,7 @@ pub async fn set_relay_telemetry_settings( &self, settings: RelayTelemetrySettin
 
 Deprecated consent control. Use `set_usage_diagnostics_consent` instead. Enable requires a combined grant; disable revokes both exporters. This compatibility setter still updates the telemetry interval.
 
-[Source](src/commands/relay.rs#L132)
+[Source](src/commands/relay.rs#L154)
 
 </details>
 
@@ -6039,7 +6039,7 @@ socket roles and ownership. New manual connections follow configured membership,
 After dispatch, wait up to five seconds for the next observed attempt state, which may be `Connecting` rather than a successful
 connection. Use the liveness subscription for the eventual outcome; this does not establish message delivery.
 
-[Source](src/commands/relay.rs#L99)
+[Source](src/commands/relay.rs#L121)
 
 ### `Marmot::subscribe_relay_liveness`
 
@@ -6051,7 +6051,7 @@ Open an account-scoped observer before reading its initial snapshot. Take `snaps
 `next()` list as a complete replacement. Updates follow socket, account-pool, and configured-list changes without
 polling and may coalesce intermediate states. Close the observer when leaving the settings screen.
 
-[Source](src/commands/relay.rs#L89)
+[Source](src/commands/relay.rs#L111)
 
 ### `RelayLivenessSubscription::cancel`
 
@@ -6095,13 +6095,31 @@ without configured relay entries. This method does not consume a later update or
 pub async fn account_relay_health( &self, account_ref: String, ) -> Result<conversions::AccountRelayHealthFfi, MarmotKitError>
 ```
 
-Read the account's relay health from its cached inbox and NIP-65 lists and the dial policy: one row per relay with its
+Read the account's relay health from its cached inbox and NIP-65 lists, the dial policy and this process's inbox checks: one row per relay with its
 roles, state, policy fault and liveness, and warnings about invitations sent through the published inbox list, each
 with a severity, the relays it concerns and the actions that would fix it. Never dials. An inbox list MDK does not hold reads as
 `inbox_list: Unknown` and raises no warning. Re-read on `RelayHealthChanged`. See the
 [conditions for each warning](README.md#account-relay-health); keep a default branch over its enums.
 
 [Source](src/commands/relay.rs#L77)
+
+### `Marmot::check_account_relays`
+
+```rust
+pub async fn check_account_relays( &self, account_ref: String, ) -> Result<conversions::AccountRelayHealthFfi, MarmotKitError>
+```
+
+Ask the account's worker to check whether its inbox relays serve the account's inbox, then return
+`account_relay_health` as it reads after the check. The worker gives each allowed inbox relay (the first 16 by URL) one
+bounded read of the account's gift wraps (kind 1059 addressed to it) on a connection of its own, answered with the
+signer it holds, within 15 seconds; a relay the policy refuses is never dialed. A remote or host signer may be asked to
+sign a relay's authentication challenge, so call it from a user action for such an account. While a check of the
+account runs it is refused at once with `RelayCheckRunning`; without a running account worker it fails as the account
+not being active and dials nothing. A check in which no relay answered changes nothing. The returned health is the
+answer; `RelayHealthChanged` follows a changed answer from the worker. See
+[what each state means](README.md#account-relay-health).
+
+[Source](src/commands/relay.rs#L99)
 
 <details>
 <summary>nip46.rs</summary>

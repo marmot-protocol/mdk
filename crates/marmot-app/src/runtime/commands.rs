@@ -3289,6 +3289,44 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    /// Ask the account's worker for an inbox check; it answers when the
+    /// check ends. Without a running worker nothing is dialed.
+    pub(super) async fn check_inbox_relays(&self, account_ref: &str) -> Result<(), AppError> {
+        let account = self.resolve(account_ref)?;
+        let not_active = || {
+            AppError::from(cgka_traits::TransportAdapterError::AccountNotActive(
+                cgka_traits::MemberId::new(
+                    hex::decode(&account.account_id_hex).unwrap_or_default(),
+                ),
+            ))
+        };
+        let command = self
+            .existing_worker_commands(account_ref)
+            .await?
+            .ok_or_else(not_active)?
+            .commands;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CheckRelays { respond })
+            .await
+            .map_err(|_| not_active())?;
+        long_account_worker_response(response).await
+    }
+
+    /// The account worker's inbox checks, as `account_relay_health` reads
+    /// them; nothing while no worker runs.
+    pub(super) async fn relay_check_snapshot(
+        &self,
+        account_id_hex: &str,
+    ) -> crate::relay_health::CheckSnapshot {
+        self.workers
+            .lock()
+            .await
+            .get(account_id_hex)
+            .map(|worker| worker.relay_checks.borrow().clone())
+            .unwrap_or_default()
+    }
+
     pub(super) async fn reconnect_relay(
         &self,
         account_ref: &str,
@@ -3421,6 +3459,7 @@ mod tests {
                 shutdown,
                 unit: Default::default(),
                 read_state: Default::default(),
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
             },
         );
         let error = manager
@@ -3503,6 +3542,7 @@ mod tests {
                 shutdown,
                 unit: Default::default(),
                 read_state: Default::default(),
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
             },
         );
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -3587,6 +3627,7 @@ mod tests {
                 shutdown,
                 unit: Default::default(),
                 read_state: Default::default(),
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
             },
         );
         assert!(
@@ -3677,6 +3718,7 @@ mod tests {
                 shutdown,
                 unit: Default::default(),
                 read_state,
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
             },
         );
         let telemetry = runtime.shared_services().observer.performance().clone();
