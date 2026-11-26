@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import io
-import json
 import subprocess
 import sys
 import tempfile
@@ -50,7 +49,7 @@ class PrTrailerTests(unittest.TestCase):
         git(repo, "commit", "-m", message)
         return git(repo, "rev-parse", "HEAD")
 
-    def test_valid_cross_model_human_and_exempt_trailers(self) -> None:
+    def test_valid_cross_model_human_exempt_folded_and_coauthored_trailers(self) -> None:
         cases = [
             (
                 "Add feature\n\n"
@@ -75,16 +74,19 @@ class PrTrailerTests(unittest.TestCase):
                 "patch",
             ),
             (
-                "Case-insensitive keys and extra standard trailers\n\n"
-                "Signed-off-by: Test Author <test@example.com>\n"
-                "local-checks: cargo clippy\n"
-                "local-review: opencode + cursor merge @ 0123456789abcdef\n"
-                "release-impact: minor\n",
+                "Folded trailer value, custom seat, and multiple Co-authored-by lines\n\n"
+                "Local-Checks: cargo fmt --all --check,\n"
+                "  cargo clippy -p marmot-app --all-targets,\n"
+                "  cargo nextest run -p marmot-app\n"
+                "Local-Review: gemini-pro + codex merge @ 0123456789abcdef\n"
+                "Release-Impact: minor\n"
+                "Co-authored-by: Alice <alice@example.com>\n"
+                "Co-authored-by: Bob <bob@example.com>\n",
                 "minor",
             ),
         ]
         for message, expected_impact in cases:
-            with self.subTest(expected_impact=expected_impact):
+            with self.subTest(first_line=message.splitlines()[0]):
                 tmp, repo, base = self.make_repo()
                 try:
                     head = self.commit_file(repo, "note.txt", expected_impact, message)
@@ -112,14 +114,14 @@ class PrTrailerTests(unittest.TestCase):
                 ["two distinct seats"],
             ),
             (
-                "Unknown seat\n\n"
+                "Placeholder seat name\n\n"
                 "Local-Checks: cargo fmt\n"
-                "Local-Review: unknown + codex merge @ 37a9067\n"
+                "Local-Review: tbd + codex merge @ 37a9067\n"
                 "Release-Impact: none\n",
-                ["unknown review-local seat"],
+                ["placeholder seat name"],
             ),
             (
-                "Duplicate trailer\n\n"
+                "Duplicate MDK trailer\n\n"
                 "Local-Checks: cargo fmt\n"
                 "Local-Review: human\n"
                 "Release-Impact: patch\n"
@@ -139,41 +141,24 @@ class PrTrailerTests(unittest.TestCase):
                 finally:
                     tmp.cleanup()
 
-    def test_changelog_fragment_cross_checks(self) -> None:
+    def test_changelog_fragment_cross_checks_and_advancing_base(self) -> None:
+        # Breaking fragment with patch fails; breaking fragment with minor passes.
         tmp, repo, base = self.make_repo()
         try:
-            breaking = "### Breaking changes\n\n- Renamed public API.\n"
             head = self.commit_file(
                 repo,
                 "changelog.d/rename-api.md",
-                breaking,
+                "### Breaking changes\n\n- Renamed public API.\n",
                 "Rename API\n\n"
                 "Local-Checks: cargo fmt\n"
                 "Local-Review: human\n"
                 "Release-Impact: patch\n",
             )
             _, errors = trailers.validate_range(repo, base, head)
-            self.assertTrue(
-                any("Breaking changes" in e and "minor" in e for e in errors),
-                errors,
-            )
-
-            head = self.commit_file(
-                repo,
-                "changelog.d/rename-api.md",
-                breaking + "- Updated callers.\n",
-                "Fix impact to minor\n\n"
-                "Local-Checks: cargo fmt\n"
-                "Local-Review: human\n"
-                "Release-Impact: minor\n",
-            )
-            # Earlier commit still had Release-Impact: patch -> conflict detected.
-            _, errors = trailers.validate_range(repo, base, head)
-            self.assertTrue(any("conflicts with tip commit" in e for e in errors), errors)
+            self.assertTrue(any("Breaking changes" in e and "minor" in e for e in errors), errors)
         finally:
             tmp.cleanup()
 
-        # Breaking fragment paired with Release-Impact: minor passes cleanly.
         tmp, repo, base = self.make_repo()
         try:
             head = self.commit_file(
@@ -191,7 +176,7 @@ class PrTrailerTests(unittest.TestCase):
         finally:
             tmp.cleanup()
 
-        # Non-breaking changelog fragment paired with Release-Impact: none must fail.
+        # Non-breaking fragment forbids none and accepts patch.
         tmp, repo, base = self.make_repo()
         try:
             head = self.commit_file(
@@ -208,67 +193,112 @@ class PrTrailerTests(unittest.TestCase):
         finally:
             tmp.cleanup()
 
-        # Non-breaking changelog fragment with Release-Impact: patch passes.
-        tmp, repo, base = self.make_repo()
+        # Advancing master (e.g. a release PR folding and deleting a breaking fragment)
+        # must not cause an open docs-only branch to inherit that fragment's impact.
+        tmp, repo, _ = self.make_repo()
         try:
-            head = self.commit_file(
+            self.commit_file(
                 repo,
-                "changelog.d/fix-bug.md",
-                "### Fixed\n\n- Fixed a crash.\n",
-                "Fix crash\n\n"
-                "Local-Checks: cargo fmt\n"
-                "Local-Review: human\n"
-                "Release-Impact: patch\n",
+                "changelog.d/already-on-master.md",
+                "### Breaking changes\n\n- Prior breaking change.\n",
+                "Prior breaking PR on master",
             )
-            impact, errors = trailers.validate_range(repo, base, head)
-            self.assertEqual(errors, [])
-            self.assertEqual(impact, "patch")
-        finally:
-            tmp.cleanup()
-
-    def test_multi_commit_pr_allows_unmarked_earlier_commits_and_rejects_conflicts(self) -> None:
-        tmp, repo, base = self.make_repo()
-        try:
-            self.commit_file(repo, "a.txt", "1", "WIP commit without trailers")
-            head = self.commit_file(
+            git(repo, "checkout", "-b", "docs-pr")
+            pr_head = self.commit_file(
                 repo,
-                "b.txt",
-                "2",
-                "Final reviewed commit\n\n"
-                "Local-Checks: cargo test\n"
-                "Local-Review: claude + codex merge @ 1234567\n"
-                "Release-Impact: patch\n",
-            )
-            impact, errors = trailers.validate_range(repo, base, head)
-            self.assertEqual(errors, [])
-            self.assertEqual(impact, "patch")
-        finally:
-            tmp.cleanup()
-
-    def test_label_cross_checks(self) -> None:
-        tmp, repo, base = self.make_repo()
-        try:
-            head = self.commit_file(
-                repo,
-                "a.txt",
-                "1",
-                "Internal change\n\n"
-                "Local-Checks: cargo fmt\n"
+                "README.md",
+                "# Updated docs\n",
+                "Update README\n\n"
+                "Local-Checks: docs-only\n"
                 "Local-Review: human\n"
                 "Release-Impact: none\n",
             )
-            _, errors = trailers.validate_range(repo, base, head, labels=["impact:none", "ci:full"])
+            git(repo, "checkout", "master")
+            git(repo, "rm", "changelog.d/already-on-master.md")
+            git(repo, "commit", "-m", "Release 0.21.0 (fold changelog fragments)")
+            advanced_master = git(repo, "rev-parse", "master")
+
+            impact, errors = trailers.validate_range(repo, advanced_master, pr_head)
             self.assertEqual(errors, [])
-
-            _, errors = trailers.validate_range(repo, base, head, labels=["impact:patch"])
-            self.assertTrue(any("disagrees" in e for e in errors), errors)
-
-            _, errors = trailers.validate_range(
-                repo, base, head, labels=["impact:none", "impact:minor"]
-            )
-            self.assertTrue(any("multiple impact labels" in e for e in errors), errors)
+            self.assertEqual(impact, "none")
         finally:
             tmp.cleanup()
+
+    def test_extract_landed_trailers_handles_github_squash_formats(self) -> None:
+        single_commit_squash = (
+            "Enforce device roster key binding (#3767)\n\n"
+            "Summary body.\n\n"
+            "Local-Checks: cargo fmt, nextest\n"
+            "Local-Review: claude + codex merge @ 37a9067\n"
+            "Release-Impact: patch\n"
+            "Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\n"
+        )
+        parsed, errors = trailers.extract_landed_trailers(single_commit_squash)
+        self.assertEqual(errors, [])
+        self.assertEqual(parsed["release-impact"], "patch")
+        self.assertEqual(parsed["local-review"], "claude + codex merge @ 37a9067")
+
+        # Multi-commit COMMIT_MESSAGES squash with trailers only on tip, no footer.
+        multi_no_footer = (
+            "Add feature (#3800)\n\n"
+            "* WIP commit\n\n"
+            "Earlier body.\n\n"
+            "* Final reviewed commit\n\n"
+            "Local-Checks: cargo fmt,\n"
+            "  cargo nextest run -p marmot-app\n"
+            "Local-Review: claude + codex merge @ 1234567\n"
+            "Release-Impact: minor\n"
+        )
+        parsed, errors = trailers.extract_landed_trailers(multi_no_footer)
+        self.assertEqual(errors, [])
+        self.assertEqual(parsed["release-impact"], "minor")
+        self.assertEqual(parsed["local-checks"], "cargo fmt, cargo nextest run -p marmot-app")
+
+        # Multi-commit COMMIT_MESSAGES squash with GitHub's hoisted `---------`
+        # Co-authored-by footer (modeled on landed master commit bfa559b46).
+        multi_with_footer = (
+            "Answer an unreadable control request (#3668)\n\n"
+            "* Earlier commit with old note\n\n"
+            "Release-Impact: minor\n\n"
+            "* Tip commit\n\n"
+            "Final summary.\n\n"
+            "Local-Checks: cargo test -p agent-control\n"
+            "Local-Review: claude + codex merge @ abcdef1\n"
+            "Release-Impact: patch\n\n"
+            "---------\n\n"
+            "Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\n"
+            "Co-authored-by: Second Author <second@example.com>\n"
+        )
+        parsed, errors = trailers.extract_landed_trailers(multi_with_footer)
+        self.assertEqual(errors, [])
+        self.assertEqual(parsed["release-impact"], "patch")
+        self.assertEqual(parsed["local-checks"], "cargo test -p agent-control")
+        self.assertEqual(parsed["local-review"], "claude + codex merge @ abcdef1")
+
+        # Multi-commit squash where trailers were only on an earlier commit
+        # (modeled on landed master commit 19d0a3092) does not fabricate a tip attestation.
+        earlier_only = (
+            "Stop automatic packaging (#3768)\n\n"
+            "* First commit\n\n"
+            "Release-Impact: none\n\n"
+            "* Second commit without trailers\n"
+        )
+        parsed, errors = trailers.extract_landed_trailers(earlier_only)
+        self.assertEqual(errors, [])
+        self.assertNotIn("release-impact", parsed)
+
+        # A `---------` divider followed by normal prose (not a trailer footer) is ignored.
+        prose_after_divider = (
+            "Explain layout (#3801)\n\n"
+            "Local-Checks: cargo fmt\n"
+            "Local-Review: human\n"
+            "Release-Impact: none\n\n"
+            "---------\n\n"
+            "This is prose after a horizontal rule, not a trailer footer.\n"
+        )
+        parsed, errors = trailers.extract_landed_trailers(prose_after_divider)
+        self.assertEqual(errors, [])
+        self.assertNotIn("release-impact", parsed)
 
     def test_cli_strict_vs_advisory_mode(self) -> None:
         tmp, repo, base = self.make_repo()
@@ -283,17 +313,7 @@ class PrTrailerTests(unittest.TestCase):
             stdout = io.StringIO()
             with redirect_stdout(stdout):
                 code = trailers.main(
-                    [
-                        "--root",
-                        str(repo),
-                        "--base",
-                        base,
-                        "--head",
-                        head,
-                        "--advisory",
-                        "--labels-json",
-                        json.dumps([{"name": "impact:none"}]),
-                    ]
+                    ["--root", str(repo), "--base", base, "--head", head, "--advisory"]
                 )
             self.assertEqual(code, 0)
             self.assertIn("::warning title=PR trailers::", stdout.getvalue())

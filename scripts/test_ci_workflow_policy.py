@@ -1344,17 +1344,72 @@ sha256sum() { shasum -a 256 "$@"; }
             self.assertFalse((Path(tmp) / "cargo-nextest-0.9.132").exists())
             self.assertFalse((Path(tmp) / "path").exists())
 
-    def test_rust_format_runs_pr_trailer_contract_and_advisory_check(self):
+    def test_pr_trailer_contract_and_advisory_step_resolve_pr_refs(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        changes = workflow.split("\n  changes:\n", 1)[1].split("\n  rust-format:\n", 1)[0]
         rust_format = workflow.split("\n  rust-format:\n", 1)[1].split("\n  rust-audit:\n", 1)[0]
-        self.assertIn(
-            "fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}",
-            rust_format,
-        )
+        self.assertIn("fetch-depth: 0", changes)
+        self.assertIn("fetch-depth: 1", rust_format)
+        self.assertIn("run: python3 scripts/test_check_pr_trailers.py", rust_format)
+
         script = workflow_step("ci.yml", "PR commit trailers (advisory)")
-        self.assertIn("python3 scripts/test_check_pr_trailers.py", script)
         self.assertIn("python3 scripts/check_pr_trailers.py --advisory", script)
         self.assertNotIn("${{", script)
+
+        # Execute the exact workflow step in a synthetic PR merge-ref checkout
+        # (matching `actions/checkout` with `fetch-depth: 0` on pull_request).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "-b", "master")
+            git("config", "user.name", "Test")
+            git("config", "user.email", "test@example.com")
+            git("config", "commit.gpgsign", "false")
+            scripts_dir = repo / "scripts"
+            scripts_dir.mkdir()
+            for name in ("check_pr_trailers.py", "changelog.py"):
+                (scripts_dir / name).write_text((ROOT / "scripts" / name).read_text())
+            git("add", "scripts")
+            git("commit", "-m", "Base commit")
+            git("checkout", "-b", "pr-branch")
+            (repo / "feature.txt").write_text("ok\n")
+            git("add", "feature.txt")
+            git(
+                "commit", "-m",
+                "Add feature\n\n"
+                "Local-Checks: cargo fmt\n"
+                "Local-Review: claude + codex merge @ 1234567\n"
+                "Release-Impact: patch\n",
+            )
+            head_sha = git("rev-parse", "HEAD")
+
+            git("checkout", "master")
+            (repo / "master.txt").write_text("advanced\n")
+            git("add", "master.txt")
+            git("commit", "-m", "Advance master")
+            base_sha = git("rev-parse", "HEAD")
+            git("merge", "--no-ff", "pr-branch", "-m", "Synthetic refs/pull/1/merge")
+
+            result = subprocess.run(
+                ["bash", "-c", script],
+                cwd=repo,
+                env={
+                    **os.environ,
+                    "EVENT_NAME": "pull_request",
+                    "BASE_SHA": base_sha,
+                    "HEAD_SHA": head_sha,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("pr-trailers: OK (Release-Impact: patch)", result.stdout)
+            self.assertNotIn("::warning", result.stdout)
 
 
 if __name__ == "__main__":
