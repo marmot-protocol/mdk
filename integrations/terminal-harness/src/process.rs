@@ -387,11 +387,17 @@ where
         idle_timeout,
         reply,
     } = spec;
+    // The reply lookup below counts against the backend's budget, so the
+    // budget starts before it.
+    let total_deadline = Instant::now() + total_timeout;
     let mut prompt = prompt;
     // An argument prompt is readable from spawn on.
     if let (Some(reply), PromptTransport::DelimitedArgument { prompt, .. }) = (&reply, &mut prompt)
+        && timeout_at(total_deadline, reply.render_into(prompt))
+            .await
+            .is_err()
     {
-        reply.render_into(prompt).await;
+        return Err(timed_out_before_prompt());
     }
     let mut command = Command::new(executable);
     crate::group_profile::configure_command(&mut command);
@@ -431,14 +437,21 @@ where
         observed_session: None,
     })?;
     let mut process_group = ProcessGroupGuard::new(&child);
-    let total_deadline = Instant::now() + total_timeout;
     let mut writer_task = match prompt {
         PromptTransport::Stdin(mut prompt) => match child.stdin.take() {
             Some(stdin) => {
                 // A stdin prompt is readable from its first write on, after
-                // any backend preflight and spawn.
-                if let Some(reply) = &reply {
-                    reply.render_into(&mut prompt).await;
+                // any backend preflight and spawn. The child is already
+                // running, so the lookup runs under its deadline; on expiry
+                // the process group is reaped and nothing is written.
+                if let Some(reply) = &reply
+                    && timeout_at(total_deadline, reply.render_into(&mut prompt))
+                        .await
+                        .is_err()
+                {
+                    drop(stdin);
+                    kill_and_reap(&mut child, &mut process_group).await;
+                    return Err(timed_out_before_prompt());
                 }
                 Some(write_stdin(stdin, prompt))
             }
@@ -679,6 +692,14 @@ where
                 observed_session,
             })
         }
+    }
+}
+
+/// The backend's budget ran out before its prompt was delivered.
+fn timed_out_before_prompt() -> RunFailure {
+    RunFailure {
+        error: HarnessError::BackendTimedOut,
+        observed_session: None,
     }
 }
 

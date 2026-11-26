@@ -243,6 +243,77 @@ printf '{{"type":"text","text":"done"}}\n'
     assert!(argument.ends_with("is this the one?"));
 }
 
+/// The reply lookup counts against the backend's budget. A lookup that never
+/// answers ends the run at the deadline with a timeout: a stdin child is
+/// reaped without the prompt being written, and an argument backend is never
+/// started.
+#[tokio::test]
+async fn a_stalled_reply_lookup_times_out_without_delivering_the_prompt() {
+    use agent_control::{AgentControlReferencedMessage, AgentControlReferencedMessageAvailability};
+    use marmot_terminal_harness::reply::DeferredReply;
+
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let received = root.path().join("received");
+    let started = root.path().join("started");
+    let stdin_script = executable_script(
+        root.path(),
+        "stdin-backend",
+        &format!("#!/bin/sh\ncat > \"{}\"\n", received.display()),
+    );
+    let argument_script = executable_script(
+        root.path(),
+        "argument-backend",
+        &format!("#!/bin/sh\n: > \"{}\"\n", started.display()),
+    );
+    let quote = AgentControlReferencedMessage {
+        message_id_hex: "ab".repeat(32),
+        availability: AgentControlReferencedMessageAvailability::Available,
+        sender: None,
+        recorded_at: None,
+        text_excerpt: Some("the secret plan".to_owned()),
+        text_truncated: false,
+        attachments: Vec::new(),
+        attachments_truncated: false,
+    };
+    for (executable, prompt) in [
+        (
+            stdin_script,
+            PromptTransport::Stdin("ordinary task".to_owned()),
+        ),
+        (
+            argument_script,
+            PromptTransport::DelimitedArgument {
+                delimiter: "--",
+                prompt: "ordinary task".to_owned(),
+            },
+        ),
+    ] {
+        let (tx, _rx) = mpsc::channel(2);
+        let mut spec = process_spec(&executable, root.path(), prompt);
+        spec.total_timeout = Duration::from_millis(300);
+        spec.reply = Some(DeferredReply::new(
+            quote.clone(),
+            0,
+            Arc::new(|_message_id_hex| Box::pin(std::future::pending())),
+        ));
+        let began = std::time::Instant::now();
+        let failure = run_jsonl_process(spec, tx, parse_event).await.unwrap_err();
+
+        assert!(matches!(failure.error, HarnessError::BackendTimedOut));
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the run ends at the backend deadline, not when the lookup would"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&received).unwrap_or_default(),
+        "",
+        "the stdin child never receives the prompt"
+    );
+    assert!(!started.exists(), "the argument backend is never started");
+}
+
 #[tokio::test]
 async fn shared_runner_applies_process_local_environment_changes() {
     let _permit = process_test_permit().await;
