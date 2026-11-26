@@ -420,6 +420,14 @@ async fn an_acceptance_saved_before_the_deadline_delivers_the_welcome_after_it()
         deadline.0 + 60,
         &audit,
     );
+    // A host's redelivery before any pass reconciles it too, and publishes
+    // nothing.
+    let redelivered = next.redeliver_welcome(&welcome.id).await.unwrap();
+    assert!(redelivered.welcome_failures.is_empty());
+    assert_eq!(
+        delivery_of(&next, &welcome).state,
+        WelcomeDeliveryState::RelayAccepted
+    );
     assert!(
         next.prepare_owed_welcome_retry_task_with_audit_context(Default::default())
             .unwrap()

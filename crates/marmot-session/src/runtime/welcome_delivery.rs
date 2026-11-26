@@ -426,15 +426,18 @@ where
         let now = self.wall_clock.now();
         match self.session.outbound_welcome_status(message_id, now)? {
             OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired) => return Ok(output),
-            OutboundWelcomeStatus::PastDeadline
-                if !self.expired_welcome_may_still_close(message_id)
-                    && self.session.expire_sent_welcome(message_id, now)?.is_some() =>
-            {
-                self.record_welcome_expiry_or_retry(message_id);
-                return Ok(output);
+            OutboundWelcomeStatus::PastDeadline => {
+                // An acceptance it holds was reconciled, or a wave holding it
+                // settles it: nothing to publish.
+                if self.expired_welcome_may_still_close(message_id) {
+                    return Ok(output);
+                }
+                if self.session.expire_sent_welcome(message_id, now)?.is_some() {
+                    self.record_welcome_expiry_or_retry(message_id);
+                    return Ok(output);
+                }
+                // Not owed (staged with its commit): refused below, as before.
             }
-            // Not marked (staged with its commit, or an acceptance may still
-            // deliver it): the publish check below refuses it by the clock.
             _ => {}
         }
         let (group_id, message) = self.session.stored_sent_welcome(message_id)?;
