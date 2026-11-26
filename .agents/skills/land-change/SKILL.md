@@ -154,9 +154,7 @@ you do not decide alone that it is good enough.
   ```
 
   Ensure `Release-Impact:` agrees with any `changelog.d/<slug>.md` fragments
-  (`### Breaking changes` requires `minor`; user-facing entries forbid `none`)
-  and that no earlier commit on the branch declares a conflicting
-  `Release-Impact:`.
+  (`### Breaking changes` requires `minor`; user-facing entries forbid `none`).
 
 Count the rounds; the report in step 6 says how many it took.
 

@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
-"""Validate commit trailers and changelog/label consistency for pull requests.
+"""Validate commit trailers and changelog consistency for pull requests.
 
-Every change targeting master records three trailers on its tip commit (which
-GitHub preserves in the squash commit under `COMMIT_MESSAGES`):
+Every change targeting master records three trailers in the final Git trailer
+block of its tip commit:
 
     Local-Checks: cargo fmt, clippy -p <crate>, nextest <area>, smoke
     Local-Review: claude + codex merge @ <short-sha>
     Release-Impact: none | patch | minor
 
-Cross-checks:
+Landed-commit contract (for Stage 3 release tooling reading `master`):
+  - Under GitHub's `COMMIT_MESSAGES` squash setting, a single-commit PR keeps
+    its tip trailer block at the end of the squash message, and a multi-commit
+    PR puts the tip commit last (optionally followed by GitHub's `---------`
+    separator and hoisted `Co-authored-by:` footer).
+  - `extract_landed_trailers(message)` parses the final Git trailer block via
+    `git interpret-trailers --parse --unfold` and strips a trailing GitHub
+    `---------` trailer footer when needed, recovering the tip commit's
+    attestation without reading earlier commits in the squash body.
+
+PR cross-checks (against the branch's merge-base with `base`):
   - Any added or modified `changelog.d/<slug>.md` with a `### Breaking changes`
     section requires `Release-Impact: minor`.
   - Any added or modified `changelog.d/<slug>.md` with other sections forbids
     `Release-Impact: none`.
-  - Earlier commits in `base..head` must not carry a conflicting
-    `Release-Impact:` trailer (squash merge concatenates commit messages).
-  - Optional PR labels (`impact:none`, `impact:patch`, `impact:minor`) must be
-    unique and agree with `Release-Impact:`.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import subprocess
 import sys
@@ -34,15 +39,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import changelog  # noqa: E402
 
 VALID_IMPACTS = ("none", "patch", "minor")
-VALID_SEATS = frozenset({"claude", "codex", "cursor", "opencode"})
-PLACEHOLDER_VALUES = frozenset({"", "-", "...", "?", "n/a", "na", "tbd", "todo"})
-TRAILER_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*):[ \t]*(.*)$")
+MDK_TRAILER_KEYS = frozenset({"local-checks", "local-review", "release-impact"})
+PLACEHOLDER_VALUES = frozenset({"", "-", "...", "?", "n/a", "na", "none", "tbd", "todo"})
 CROSS_MODEL_REVIEW = re.compile(
-    r"^(?P<seat_a>[a-z]+)\s*\+\s*(?P<seat_b>[a-z]+)\s+merge\s+@\s*(?P<sha>[0-9a-f]{7,40})(?:\s+.*)?$"
+    r"^(?P<seat_a>[a-z][a-z0-9_-]*)\s*\+\s*(?P<seat_b>[a-z][a-z0-9_-]*)"
+    r"\s+merge\s+@\s*(?P<sha>[0-9a-f]{7,40})(?:\s+.*)?$"
 )
 HUMAN_REVIEW = re.compile(r"^human(?:\s+\S.*)?$")
 EXEMPT_REVIEW = re.compile(r"^exempt\s*\((?P<reason>[^()]+)\)$")
 FRAGMENT_PATH = re.compile(r"(?:^|/)changelog\.d/[^/]+\.md$")
+GITHUB_SQUASH_SEPARATOR = "---------"
 
 
 def git(root: Path, *args: str) -> str:
@@ -56,49 +62,87 @@ def git(root: Path, *args: str) -> str:
 
 
 def parse_trailers(message: str) -> tuple[dict[str, str], list[str]]:
-    """Parse Git trailers from the final non-empty paragraph of a commit message.
+    """Parse Git trailers from a commit message using `git interpret-trailers`.
 
-    Returns (lowercased_key -> value, duplicate_or_format_errors).
+    Unfolds multi-line values via Git's parser, permits repeated standard
+    trailers (such as multiple `Co-authored-by:` lines), and rejects duplicate
+    MDK trailers (`Local-Checks`, `Local-Review`, `Release-Impact`).
     """
-    lines = message.splitlines()
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if not lines:
-        return {}, []
-
-    block: list[str] = []
-    for line in reversed(lines):
-        if not line.strip():
-            break
-        block.append(line)
-    block.reverse()
-
-    # A trailer block consists solely of `Key: value` lines (comment lines ignored).
-    parsed: list[tuple[str, str]] = []
-    for line in block:
-        if line.startswith("#"):
-            continue
-        match = TRAILER_LINE.match(line)
-        if not match:
-            return {}, []
-        parsed.append((match.group(1), match.group(2).strip()))
+    out = subprocess.run(
+        ["git", "-c", "trailer.separators=:", "interpret-trailers", "--parse", "--unfold"],
+        input=message,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout
 
     trailers: dict[str, str] = {}
     errors: list[str] = []
-    for raw_key, value in parsed:
-        key = raw_key.lower()
-        if key in trailers:
-            errors.append(f"duplicate trailer '{raw_key}'")
+    for line in out.splitlines():
+        raw_key, sep, raw_value = line.partition(":")
+        if not sep:
+            continue
+        key = raw_key.strip().lower()
+        value = raw_value.strip()
+        if key in MDK_TRAILER_KEYS:
+            if key in trailers:
+                errors.append(f"duplicate trailer '{raw_key.strip()}'")
+            else:
+                trailers[key] = value
         else:
-            trailers[key] = value
+            trailers.setdefault(key, value)
+    return trailers, errors
+
+
+def strip_github_squash_footer(message: str) -> str | None:
+    """Return `message` before GitHub's trailing `---------` trailer footer, if present."""
+    lines = message.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    sep_idx = None
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx] == GITHUB_SQUASH_SEPARATOR:
+            sep_idx = idx
+            break
+    if sep_idx is None:
+        return None
+
+    footer_slice = lines[sep_idx + 1 :]
+    while footer_slice and not footer_slice[0].strip():
+        footer_slice.pop(0)
+    if not footer_slice or any(not line.strip() for line in footer_slice):
+        return None
+    if not all(line.startswith((" ", "\t")) or ":" in line for line in footer_slice):
+        return None
+
+    footer_trailers, _ = parse_trailers("footer\n\n" + "\n".join(footer_slice) + "\n")
+    if not footer_trailers:
+        return None
+    return "\n".join(lines[:sep_idx]).rstrip() + "\n"
+
+
+def extract_landed_trailers(message: str) -> tuple[dict[str, str], list[str]]:
+    """Extract MDK trailers from a landed commit message on `master`.
+
+    Handles single-commit squash messages, multi-commit `COMMIT_MESSAGES`
+    squashes where the tip commit sits at the end, and multi-commit squashes
+    where GitHub appends a `---------` co-author footer after the tip commit.
+    """
+    trailers, errors = parse_trailers(message)
+    if any(key in trailers for key in MDK_TRAILER_KEYS):
+        return trailers, errors
+    prefix = strip_github_squash_footer(message)
+    if prefix is not None:
+        return parse_trailers(prefix)
     return trailers, errors
 
 
 def validate_local_checks(value: str | None) -> list[str]:
     if value is None:
         return ["missing required trailer 'Local-Checks:' on tip commit"]
-    normalized = value.strip().lower()
-    if normalized in PLACEHOLDER_VALUES:
+    if value.strip().lower() in PLACEHOLDER_VALUES:
         return [f"invalid 'Local-Checks:' value {value!r}; list the commands run locally"]
     return []
 
@@ -120,11 +164,8 @@ def validate_local_review(value: str | None) -> list[str]:
         return []
     if match := CROSS_MODEL_REVIEW.match(stripped):
         seat_a, seat_b = match.group("seat_a"), match.group("seat_b")
-        if seat_a not in VALID_SEATS or seat_b not in VALID_SEATS:
-            return [
-                f"unknown review-local seat in 'Local-Review: {stripped}'; "
-                f"expected two of {', '.join(sorted(VALID_SEATS))}"
-            ]
+        if seat_a in PLACEHOLDER_VALUES or seat_b in PLACEHOLDER_VALUES:
+            return [f"placeholder seat name in 'Local-Review: {stripped}'"]
         if seat_a == seat_b:
             return [f"'Local-Review:' requires two distinct seats, got '{seat_a} + {seat_b}'"]
         return []
@@ -149,13 +190,8 @@ def validate_release_impact(value: str | None) -> tuple[str | None, list[str]]:
     return stripped, []
 
 
-def validate_range(
-    root: Path,
-    base: str,
-    head: str,
-    labels: list[str] | None = None,
-) -> tuple[str | None, list[str]]:
-    """Validate commit trailers and changelog/label consistency for `base..head`."""
+def validate_range(root: Path, base: str, head: str) -> tuple[str | None, list[str]]:
+    """Validate tip-commit trailers and changelog consistency for `base..head`."""
     revs = git(root, "rev-list", "--reverse", f"{base}..{head}").splitlines()
     if not revs:
         return None, [f"no commits found in range {base}..{head}"]
@@ -169,26 +205,10 @@ def validate_range(
     impact, impact_errors = validate_release_impact(trailers.get("release-impact"))
     errors.extend(impact_errors)
 
-    # Check earlier commits for conflicting Release-Impact trailers that GitHub's
-    # COMMIT_MESSAGES squash would concatenate onto master.
-    if impact is not None:
-        for sha in revs[:-1]:
-            msg = git(root, "show", "-s", "--format=%B", sha)
-            earlier_trailers, earlier_errors = parse_trailers(msg)
-            for err in earlier_errors:
-                if "release-impact" in err.lower():
-                    errors.append(f"earlier commit {sha[:9]}: {err}")
-            earlier_impact = earlier_trailers.get("release-impact")
-            if earlier_impact is not None and earlier_impact.strip() != impact:
-                errors.append(
-                    f"earlier commit {sha[:9]} declares 'Release-Impact: {earlier_impact.strip()}' "
-                    f"which conflicts with tip commit 'Release-Impact: {impact}'; "
-                    "squash-merge would emit conflicting trailers on master"
-                )
-
-    # Cross-check added/modified changelog.d/ fragments against Release-Impact.
+    # Cross-check changelog.d/ fragments added or modified since the branch point
+    # (merge-base), so fragments folded or edited on master never pollute open PRs.
     changed_files = git(
-        root, "diff", "--no-renames", "--name-only", "--diff-filter=AM", base, head
+        root, "diff", "--no-renames", "--name-only", "--diff-filter=AM", f"{base}...{head}"
     ).splitlines()
     for rel_path in changed_files:
         if not FRAGMENT_PATH.search(rel_path):
@@ -213,42 +233,7 @@ def validate_range(
                 "cannot be 'none' (use 'patch' or 'minor')"
             )
 
-    # Cross-check optional PR impact:* labels.
-    if labels:
-        impact_labels = sorted(
-            {
-                label.split(":", 1)[1]
-                for label in labels
-                if label.startswith("impact:") and label.split(":", 1)[1] in VALID_IMPACTS
-            }
-        )
-        if len(impact_labels) > 1:
-            joined = ", ".join(f"impact:{lvl}" for lvl in impact_labels)
-            errors.append(f"multiple impact labels set on PR ({joined}); keep at most one")
-        elif len(impact_labels) == 1 and impact is not None and impact_labels[0] != impact:
-            errors.append(
-                f"PR label 'impact:{impact_labels[0]}' disagrees with tip commit "
-                f"'Release-Impact: {impact}'"
-            )
-
     return impact, errors
-
-
-def parse_labels_json(raw: str | None) -> list[str]:
-    if not raw or not raw.strip():
-        return []
-    decoded = json.loads(raw)
-    if not isinstance(decoded, list):
-        raise ValueError("--labels-json must decode to a JSON array")
-    labels: list[str] = []
-    for item in decoded:
-        if isinstance(item, str):
-            labels.append(item)
-        elif isinstance(item, dict) and isinstance(item.get("name"), str):
-            labels.append(item["name"])
-        else:
-            raise ValueError(f"unsupported label entry in --labels-json: {item!r}")
-    return labels
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -257,11 +242,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", default="origin/master", help="base commit or ref")
     parser.add_argument("--head", default="HEAD", help="head commit or ref")
     parser.add_argument(
-        "--labels-json",
-        default="",
-        help="optional JSON array of PR label names or GitHub label objects",
-    )
-    parser.add_argument(
         "--advisory",
         action="store_true",
         help="emit GitHub Actions warnings instead of failing (Phase 0-2 rollout mode)",
@@ -269,9 +249,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        labels = parse_labels_json(args.labels_json)
-        impact, errors = validate_range(args.root, args.base, args.head, labels=labels)
-    except (subprocess.CalledProcessError, ValueError, json.JSONDecodeError) as exc:
+        impact, errors = validate_range(args.root, args.base, args.head)
+    except subprocess.CalledProcessError as exc:
         msg = f"pr-trailers: failed to inspect {args.base}..{args.head}: {exc}"
         if args.advisory:
             print(f"::warning title=PR trailers::{msg}")
