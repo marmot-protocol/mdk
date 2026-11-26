@@ -314,6 +314,61 @@ async fn a_stalled_reply_lookup_times_out_without_delivering_the_prompt() {
     assert!(!started.exists(), "the argument backend is never started");
 }
 
+/// A lookup that answers on its first poll after the deadline has been reached
+/// must still be a timeout. The backend here does not exist, so a run
+/// that goes on to spawn it fails with `BackendSpawn`; a run that stops at the
+/// deadline reports `BackendTimedOut`. (The same rule guards the stdin write;
+/// `process::tests` checks it on the shared helper.)
+#[tokio::test]
+async fn a_reply_lookup_that_is_ready_after_the_deadline_never_reaches_spawn() {
+    use agent_control::{
+        AgentControlReferencedMessage, AgentControlReferencedMessageAvailability,
+        AgentControlTimelineMessageAvailability,
+    };
+    use marmot_terminal_harness::reply::DeferredReply;
+
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("no-such-backend");
+    let quote = AgentControlReferencedMessage {
+        message_id_hex: "ab".repeat(32),
+        availability: AgentControlReferencedMessageAvailability::Available,
+        sender: None,
+        recorded_at: None,
+        text_excerpt: Some("the secret plan".to_owned()),
+        text_truncated: false,
+        attachments: Vec::new(),
+        attachments_truncated: false,
+    };
+    let (tx, _rx) = mpsc::channel(2);
+    let mut spec = process_spec(
+        &missing,
+        root.path(),
+        PromptTransport::DelimitedArgument {
+            delimiter: "--",
+            prompt: "ordinary task".to_owned(),
+        },
+    );
+    // The budget is spent as the run starts, and the lookup answers on its
+    // first poll, which `timeout_at` runs before it looks at the timer.
+    spec.total_timeout = Duration::ZERO;
+    spec.reply = Some(DeferredReply::new(
+        quote,
+        0,
+        Arc::new(|_message_id_hex| {
+            Box::pin(async { Ok(Some(AgentControlTimelineMessageAvailability::Deleted)) })
+        }),
+    ));
+
+    let failure = run_jsonl_process(spec, tx, parse_event).await.unwrap_err();
+
+    assert!(
+        matches!(failure.error, HarnessError::BackendTimedOut),
+        "a late lookup result is a timeout and never reaches spawn, got {:?}",
+        failure.error
+    );
+}
+
 #[tokio::test]
 async fn shared_runner_applies_process_local_environment_changes() {
     let _permit = process_test_permit().await;

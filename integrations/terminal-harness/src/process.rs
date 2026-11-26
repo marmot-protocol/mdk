@@ -393,9 +393,7 @@ where
     let mut prompt = prompt;
     // An argument prompt is readable from spawn on.
     if let (Some(reply), PromptTransport::DelimitedArgument { prompt, .. }) = (&reply, &mut prompt)
-        && timeout_at(total_deadline, reply.render_into(prompt))
-            .await
-            .is_err()
+        && !render_reply_before(total_deadline, reply, prompt).await
     {
         return Err(timed_out_before_prompt());
     }
@@ -445,9 +443,7 @@ where
                 // running, so the lookup runs under its deadline; on expiry
                 // the process group is reaped and nothing is written.
                 if let Some(reply) = &reply
-                    && timeout_at(total_deadline, reply.render_into(&mut prompt))
-                        .await
-                        .is_err()
+                    && !render_reply_before(total_deadline, reply, &mut prompt).await
                 {
                     drop(stdin);
                     kill_and_reap(&mut child, &mut process_group).await;
@@ -693,6 +689,25 @@ where
             })
         }
     }
+}
+
+/// Checks the quoted message and renders it into `prompt`, and reports whether
+/// that finished within the backend's budget.
+///
+/// `timeout_at` alone is not enough: it polls the lookup before the timer, so
+/// a lookup that is already ready when the runner is polled returns `Ok` even
+/// if the deadline passed while the runner waited. The clock is read again
+/// after the lookup, so a result that arrives late is treated as a timeout and
+/// the prompt is never handed to the backend.
+async fn render_reply_before(
+    deadline: Instant,
+    reply: &crate::reply::DeferredReply,
+    prompt: &mut String,
+) -> bool {
+    timeout_at(deadline, reply.render_into(prompt))
+        .await
+        .is_ok()
+        && Instant::now() < deadline
 }
 
 /// The backend's budget ran out before its prompt was delivered.
@@ -998,5 +1013,71 @@ mod tests {
 
         assert!(status.success());
         assert!(guard.pgid.is_none());
+    }
+
+    fn quote_for_deadline_tests() -> agent_control::AgentControlReferencedMessage {
+        agent_control::AgentControlReferencedMessage {
+            message_id_hex: "ab".repeat(32),
+            availability: agent_control::AgentControlReferencedMessageAvailability::Available,
+            sender: None,
+            recorded_at: None,
+            text_excerpt: Some("the secret plan".to_owned()),
+            text_truncated: false,
+            attachments: Vec::new(),
+            attachments_truncated: false,
+        }
+    }
+
+    /// `timeout_at` polls the lookup before the timer, so a lookup that is
+    /// ready on its first poll returns `Ok` even when the deadline has already
+    /// been reached.
+    #[tokio::test]
+    async fn a_reply_lookup_that_is_ready_after_the_deadline_does_not_count_as_in_time() {
+        let reply = crate::reply::DeferredReply::new(
+            quote_for_deadline_tests(),
+            0,
+            Arc::new(|_message_id_hex| {
+                Box::pin(async {
+                    Ok(Some(
+                        agent_control::AgentControlTimelineMessageAvailability::Deleted,
+                    ))
+                })
+            }),
+        );
+        let mut prompt = "task".to_owned();
+
+        let in_time = render_reply_before(Instant::now(), &reply, &mut prompt).await;
+
+        assert!(
+            !in_time,
+            "a lookup that finishes after the deadline is late"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_lookup_that_is_ready_before_the_deadline_counts_as_in_time() {
+        let reply = crate::reply::DeferredReply::new(
+            quote_for_deadline_tests(),
+            0,
+            Arc::new(|_message_id_hex| {
+                Box::pin(async {
+                    Ok(Some(
+                        agent_control::AgentControlTimelineMessageAvailability::Deleted,
+                    ))
+                })
+            }),
+        );
+        let mut prompt = "task".to_owned();
+
+        let in_time = render_reply_before(
+            Instant::now() + Duration::from_secs(30),
+            &reply,
+            &mut prompt,
+        )
+        .await;
+
+        assert!(in_time);
+        assert!(prompt.contains(&"ab".repeat(32)));
+        assert!(!prompt.contains("the secret plan"));
     }
 }
