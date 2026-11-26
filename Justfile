@@ -48,6 +48,42 @@ clippy-all-features:
 wasm-check:
     RUSTFLAGS='-D warnings' CC_wasm32_unknown_unknown="${CC_wasm32_unknown_unknown:-clang}" cargo build --locked --target wasm32-unknown-unknown -p cgka-traits -p cgka-engine -p transport-nostr-peeler
 
+# Compile-check marmot-uniffi for Android arm64-v8a without full NDK packaging.
+# Requires the aarch64-linux-android Rust target and Android NDK
+# (ANDROID_NDK_HOME / ANDROID_NDK_ROOT, or an installed NDK under ANDROID_HOME/ndk).
+android-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${NDK_HOME:-}}}"
+    if [[ -z "$ndk" ]]; then
+        sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+        if [[ -n "$sdk_root" && -d "$sdk_root/ndk" ]]; then
+            ndk="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+        fi
+    fi
+    if [[ -z "$ndk" || ! -d "$ndk/toolchains/llvm/prebuilt" ]]; then
+        echo "error: Android NDK not found (set ANDROID_NDK_HOME or ANDROID_NDK_ROOT)" >&2
+        exit 1
+    fi
+    case "$(uname -s)" in
+        Linux) host_tag="linux-x86_64" ;;
+        Darwin) host_tag="$(basename "$(find "$ndk/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d -name 'darwin-*' | sort | tail -n 1)")" ;;
+        *) echo "error: unsupported host OS for android-check: $(uname -s)" >&2; exit 1 ;;
+    esac
+    toolchain_bin="$ndk/toolchains/llvm/prebuilt/$host_tag/bin"
+    clang="$toolchain_bin/aarch64-linux-android26-clang"
+    if [[ ! -x "$clang" ]]; then
+        echo "error: Android clang not found: $clang" >&2
+        exit 1
+    fi
+    CC_aarch64_linux_android="$clang" \
+    AR_aarch64_linux_android="$toolchain_bin/llvm-ar" \
+    RANLIB_aarch64_linux_android="$toolchain_bin/llvm-ranlib" \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$clang" \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="$toolchain_bin/llvm-ar" \
+    RUSTFLAGS='-D warnings' \
+    cargo check --locked --target aarch64-linux-android -p marmot-uniffi
+
 test: test-default test-otlp
 
 test-default:

@@ -1,0 +1,208 @@
+name: Canary
+
+# Continuous post-merge cross-platform verification of `master` (hourly cron +
+# manual dispatch). Skips in seconds when `master` matches the last successful
+# Canary run. Runs the full cross-platform `ci.yml` matrix (de-sharded to 6
+# workspace test shards for async runs, including Linux Android, WASM, C
+# bindings, macOS, Windows, and Tamarin) and conditionally runs
+# `bindings-profile.yml` under a serialized `macos-packaging` concurrency group
+# when binding/packaging inputs changed. Emits a `canary-summary.json` artifact
+# for the bare-metal Bisect Agent (`mdk-ci-1`).
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Run Canary even if master matches the last successful Canary run
+        type: boolean
+        default: false
+      run_bindings_profile:
+        description: Force MarmotKit Release Profile packaging validation
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: canary
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan Canary batch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.plan.outputs.should_run }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      previous_sha: ${{ steps.plan.outputs.previous_sha }}
+      run_bindings_profile: ${{ steps.plan.outputs.run_bindings_profile }}
+    steps:
+      - name: Check out master
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve Canary target and packaging trigger
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          FORCE: ${{ inputs.force == true }}
+          FORCE_BINDINGS_PROFILE: ${{ inputs.run_bindings_profile == true }}
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse 'HEAD^{commit}')"
+          last_green_sha="$(gh api "repos/$REPO/actions/workflows/canary.yml/runs?branch=master&status=success&per_page=20" \
+            --jq "[.workflow_runs[] | select(.id != ($RUN_ID | tonumber))][0].head_sha // \"\"" 2>/dev/null || true)"
+          if [[ "$last_green_sha" == "$source_sha" && "$FORCE" != "true" ]]; then
+            echo "Canary already verified $source_sha; skipping."
+            {
+              echo "should_run=false"
+              echo "source_sha=$source_sha"
+              echo "previous_sha=$last_green_sha"
+              echo "run_bindings_profile=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          previous_sha="$last_green_sha"
+          if [[ -z "$previous_sha" || "$previous_sha" == "$source_sha" ]]; then
+            git fetch --no-tags origin canary >/dev/null 2>&1 || true
+            previous_sha="$(git rev-parse 'origin/canary^{commit}' 2>/dev/null || true)"
+          fi
+
+          run_bindings_profile=false
+          if [[ "$FORCE_BINDINGS_PROFILE" == "true" ]]; then
+            run_bindings_profile=true
+          elif [[ -z "$previous_sha" || ! "$previous_sha" =~ ^[0-9a-f]{40}$ ]] \
+            || ! git cat-file -e "${previous_sha}^{commit}" 2>/dev/null; then
+            # No reachable baseline: skip heavy macOS packaging unless forced so
+            # initial bootstrap does not trigger a cold 200-minute packaging run.
+            run_bindings_profile=false
+          elif [[ "$previous_sha" != "$source_sha" ]]; then
+            while IFS= read -r -d '' changed; do
+              case "$changed" in
+                crates/marmot-uniffi/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/bindings.yaml|.github/workflows/bindings-profile.yml)
+                  run_bindings_profile=true
+                  break
+                  ;;
+              esac
+            done < <(git diff --no-renames --name-only -z "$previous_sha" "$source_sha")
+          fi
+
+          echo "Planning Canary for $source_sha (previous: ${previous_sha:-none}, bindings_profile: $run_bindings_profile)"
+          {
+            echo "should_run=true"
+            echo "source_sha=$source_sha"
+            echo "previous_sha=$previous_sha"
+            echo "run_bindings_profile=$run_bindings_profile"
+          } >> "$GITHUB_OUTPUT"
+
+  verify-ci:
+    name: Full cross-platform CI (6 shards)
+    needs: plan
+    if: needs.plan.outputs.should_run == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      source_sha: ${{ needs.plan.outputs.source_sha }}
+      rust_test_shards: 6
+
+  verify-bindings-profile:
+    name: MarmotKit Release Profile
+    needs: plan
+    if: needs.plan.outputs.should_run == 'true' && needs.plan.outputs.run_bindings_profile == 'true'
+    concurrency:
+      group: macos-packaging
+      cancel-in-progress: false
+    uses: ./.github/workflows/bindings-profile.yml
+    with:
+      source_sha: ${{ needs.plan.outputs.source_sha }}
+
+  summary:
+    name: Record Canary summary
+    needs: [plan, verify-ci, verify-bindings-profile]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write Canary summary artifact
+        id: record
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          SHOULD_RUN: ${{ needs.plan.outputs.should_run }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+          PREVIOUS_SHA: ${{ needs.plan.outputs.previous_sha }}
+          RUN_BINDINGS_PROFILE: ${{ needs.plan.outputs.run_bindings_profile }}
+          CI_RESULT: ${{ needs.verify-ci.result }}
+          BINDINGS_PROFILE_RESULT: ${{ needs.verify-bindings-profile.result }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          overall="failure"
+          if [[ "$PLAN_RESULT" != "success" ]]; then
+            overall="failure"
+          elif [[ "$SHOULD_RUN" != "true" ]]; then
+            overall="skipped"
+          elif [[ "$CI_RESULT" == "success" ]] \
+            && { [[ "$RUN_BINDINGS_PROFILE" != "true" ]] || [[ "$BINDINGS_PROFILE_RESULT" == "success" ]]; }; then
+            overall="success"
+          fi
+          jq -n \
+            --argjson schema_version 1 \
+            --arg overall "$overall" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg previous_sha "$PREVIOUS_SHA" \
+            --argjson should_run "$( [[ "$SHOULD_RUN" == "true" ]] && echo true || echo false )" \
+            --argjson run_bindings_profile "$( [[ "$RUN_BINDINGS_PROFILE" == "true" ]] && echo true || echo false )" \
+            --arg ci_result "$CI_RESULT" \
+            --arg bindings_profile_result "$BINDINGS_PROFILE_RESULT" \
+            --arg run_id "$RUN_ID" \
+            --arg run_url "$RUN_URL" \
+            --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              schema_version: $schema_version,
+              overall: $overall,
+              source_sha: $source_sha,
+              previous_sha: (if $previous_sha == "" then null else $previous_sha end),
+              should_run: $should_run,
+              run_bindings_profile: $run_bindings_profile,
+              jobs: {
+                verify_ci: $ci_result,
+                verify_bindings_profile: $bindings_profile_result
+              },
+              run_id: $run_id,
+              run_url: $run_url,
+              recorded_at: $recorded_at
+            }' > "$RUNNER_TEMP/canary-summary.json"
+          cat "$RUNNER_TEMP/canary-summary.json"
+          {
+            echo "## Canary Summary (\`$overall\`)"
+            echo "- **Source SHA:** \`${SOURCE_SHA:-unknown}\`"
+            echo "- **Previous SHA:** \`${PREVIOUS_SHA:-none}\`"
+            echo "- **CI (6 shards):** \`${CI_RESULT:-n/a}\`"
+            echo "- **MarmotKit Release Profile:** \`${BINDINGS_PROFILE_RESULT:-skipped}\` (triggered: \`${RUN_BINDINGS_PROFILE:-false}\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "overall=$overall" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Canary summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: canary-summary
+          path: ${{ runner.temp }}/canary-summary.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce Canary gate
+        env:
+          OVERALL: ${{ steps.record.outputs.overall }}
+        run: |
+          set -euo pipefail
+          [[ "$OVERALL" == "success" || "$OVERALL" == "skipped" ]]

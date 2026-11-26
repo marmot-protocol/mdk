@@ -476,7 +476,7 @@ Release mode without policy-override features is the production-policy verificat
 feature-unified CI runs are supplementary evidence. The six basic tests are ordinary tests, included by the existing
 simulator smoke filter. The `Simulator Nightly` workflow runs both ignored 1,024-message recovery variants
 on master every night, with production policy and retained JSON evidence. They do not block merging;
-the smaller recovery journeys and strict regressions remain in the merge queue. To run just the large recovery lane
+the smaller recovery journeys and strict regressions remain in the Canary and full-CI smoke gate. To run just the large recovery lane
 on demand, dispatch `simulator-nightly.yml` with `recovery_only=true` (and select the desired branch).
 These statements describe test selection; inspect the job at the revision under review for its observed result.
 
