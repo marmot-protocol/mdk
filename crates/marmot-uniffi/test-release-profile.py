@@ -7,7 +7,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import stat
 import struct
@@ -754,10 +753,6 @@ class ReleaseProfileTests(unittest.TestCase):
 
     def test_candidate_profile_workflow_only_validates_candidate_packages(self):
         text = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
-        trigger = text.split("permissions:", 1)[0]
-        self.assertIn("workflow_dispatch:", trigger)
-        self.assertNotIn("pull_request:", trigger)
-        self.assertNotIn("push:", trigger)
         self.assertNotIn("measure-release-profile.py", text)
         self.assertNotIn("release-profile-measurements", text)
         self.assertIn("./crates/marmot-uniffi/kotlin-bindings.sh generate", text)

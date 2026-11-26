@@ -2,16 +2,27 @@ name: wn-agent Binaries
 
 on:
   pull_request:
-    # Keep pre-merge coverage for Hermes and OpenClaw integrations (Linux only,
-    # no macOS runners) without running binary release builds on core crate PRs.
+    # Keep pre-merge plugin coverage for Hermes/OpenClaw and their shared
+    # agent-control contract without running native binary release builds on PRs.
     paths:
       - .github/workflows/wn-agent-binaries.yml
+      - .github/workflows/ci.yml
+      - .cargo/config.toml
+      - .config/nextest.toml
+      - Cargo.toml
+      - Cargo.lock
+      - Justfile
+      - rust-toolchain.toml
       - scripts/classify_ci_changes.py
       - scripts/test_classify_ci_changes.py
+      - crates/agent-control/**
+      - crates/agent-connector/**
+      - fixtures/agent-control-*.json
       - scripts/install-hermes-marmot.sh
       - scripts/hermes_marmot_configure_gateway.py
       - scripts/hermes_marmot_dev_setup.sh
       - scripts/hermes_marmot_verify_persisted_config.sh
+      - scripts/hermes_marmot_deterministic_e2e.sh
       - integrations/hermes/marmot/**
       - integrations/hermes/tests/marmot/**
       - scripts/install-openclaw-marmot.sh
@@ -82,7 +93,7 @@ jobs:
       - name: Classify changed paths
         id: classify
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EVENT_NAME: ${{ github.event_name }}
           NIGHTLY_VERSION: ${{ inputs.nightly_version }}
         run: |
@@ -90,8 +101,7 @@ jobs:
           if [[ "$GITHUB_REF_TYPE" == "tag" \
             || -n "$NIGHTLY_VERSION" \
             || "$EVENT_NAME" == "workflow_dispatch" \
-            || -z "$BASE_SHA" \
-            || "$BASE_SHA" =~ ^0+$ ]] \
+            || -z "$BASE_SHA" ]] \
             || ! git cat-file -e "${BASE_SHA}^{commit}"; then
             python3 scripts/classify_ci_changes.py --all --github-output "$GITHUB_OUTPUT" </dev/null
           else
@@ -101,13 +111,10 @@ jobs:
               | python3 scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
           fi
 
-      # The organization shares five macOS runners across every repository.
-      # Pull requests build Linux targets only; tags, nightlies, and manual
-      # runs also build and smoke-test both darwin targets.
+      # Tags, nightlies, and manual runs build and smoke-test all four targets.
+      # Pull requests skip `build` and run plugin checks only.
       - name: Select build targets
         id: targets
-        env:
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           targets='[
@@ -116,14 +123,11 @@ jobs:
             {"runner": "macos-latest", "target": "darwin-aarch64", "rust_target": "aarch64-apple-darwin"},
             {"runner": "macos-15", "target": "darwin-x86_64", "rust_target": "x86_64-apple-darwin"}
           ]'
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            targets="$(jq 'map(select(.target | startswith("darwin-") | not))' <<<"$targets")"
-          fi
           echo "build_targets=$(jq -c . <<<"$targets")" >> "$GITHUB_OUTPUT"
 
   build:
     needs: changes
-    if: needs.changes.outputs.run_binaries == 'true'
+    if: needs.changes.outputs.run_binaries == 'true' && github.event_name != 'pull_request'
     name: Build wn-agent and terminal harnesses (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -244,7 +248,6 @@ jobs:
   darwin-intel-smoke:
     name: Smoke test packaged binaries (darwin-x86_64)
     needs: build
-    if: github.event_name != 'pull_request'
     runs-on: macos-15-intel
     timeout-minutes: 5
 

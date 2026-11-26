@@ -415,10 +415,11 @@ The workflow lives at:
 .github/workflows/wn-agent-binaries.yml
 ```
 
-Hermes/OpenClaw plugin pull requests (Linux only) and manual workflow runs build validation artifacts only; `master`
-pushes and core-crate PRs do not trigger this workflow. Publishing happens only when a
-tag matching `wn-agent-v*` is pushed (or via `nightly-releases.yml` for nightly pre-releases). The workflow validates version-like tags such as `wn-agent-v0.9.0` and requires
-the tag version to match the root workspace version in `Cargo.toml`.
+Hermes/OpenClaw plugin and agent-control contract pull requests run plugin validation checks only (no native binary
+builds); `master` pushes and unrelated core-crate PRs do not trigger this workflow. Manual runs build all targets for
+validation only. Publishing happens only when a tag matching `wn-agent-v*` is pushed (or via `nightly-releases.yml` for
+nightly pre-releases). The workflow validates version-like tags such as `wn-agent-v0.9.0` and requires the tag version
+to match the root workspace version in `Cargo.toml`.
 
 Before a WN Agent release, run the normal preflight plus:
 

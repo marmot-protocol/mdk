@@ -238,9 +238,21 @@ class PackagingPolicyTests(unittest.TestCase):
                       if line.strip() and not line.strip().startswith("#")]
         self.assertEqual(push_lines, ["tags:", "- wn-agent-v*", '- "!wn-agent-v*-nightly.*"'])
         pr_block = wn_trigger.split("\n  pull_request:\n", 1)[1].split("\n  push:\n", 1)[0]
-        self.assertNotIn("crates/", pr_block)
-        self.assertIn("integrations/hermes/marmot/**", pr_block)
-        self.assertIn("integrations/openclaw/marmot/**", pr_block)
+        for expected_path in (
+            "crates/agent-control/**",
+            "crates/agent-connector/**",
+            "fixtures/agent-control-*.json",
+            "Cargo.lock",
+            "integrations/hermes/marmot/**",
+            "integrations/openclaw/marmot/**",
+        ):
+            self.assertIn(f"- {expected_path}", pr_block)
+        for excluded_crate in ("crates/cgka-engine/**", "crates/marmot-app/**", "crates/storage-sqlite/**"):
+            self.assertNotIn(excluded_crate, pr_block)
+        self.assertIn(
+            "if: needs.changes.outputs.run_binaries == 'true' && github.event_name != 'pull_request'",
+            wn_agent,
+        )
 
     def test_gate_requires_every_candidate_package(self):
         script = workflow_step("bindings-profile.yml", "Require every candidate package")
