@@ -1,15 +1,17 @@
 //! Opt-in native OpenCode transport. Each turn starts a private `opencode serve`
 //! and drives its HTTP API, so follow-ups can join the running turn.
 use marmot_terminal_harness::{
-    Attachment, HarnessError, Invocation, Outcome, RunFailure, RunnerEvent, SteerOutcome,
-    current_group_id,
+    Attachment, HarnessError, Invocation, MAX_TURN_TEXT_BYTES, Outcome, RunFailure, RunnerEvent,
+    SteerOutcome, current_group_id,
     process::{EnvironmentChange, OwnedProcess},
 };
 use reqwest::{Client, Method, Url};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
+    future::{Future, pending},
     path::Path,
+    pin::Pin,
     sync::Mutex,
     time::Duration,
 };
@@ -49,6 +51,22 @@ struct FollowUp {
 /// Follow-ups still buffered when a turn ends were never submitted, so they
 /// are released to run as the next turn, also when the turn is cancelled.
 struct FollowUps(mpsc::Receiver<FollowUp>);
+
+struct PendingFollowUp<'a> {
+    request: Pin<Box<dyn Future<Output = SteerOutcome> + Send + 'a>>,
+    reply: Option<oneshot::Sender<SteerOutcome>>,
+    started: bool,
+}
+
+impl Drop for PendingFollowUp<'_> {
+    fn drop(&mut self) {
+        if !self.started
+            && let Some(reply) = self.reply.take()
+        {
+            let _ = reply.send(SteerOutcome::Unavailable);
+        }
+    }
+}
 
 impl Drop for FollowUps {
     fn drop(&mut self) {
@@ -207,7 +225,7 @@ impl Native {
                 .to_owned(),
         };
         *observed_session = Some(session.clone());
-        let baseline = message_id(server.messages(&session, 1).await?.last());
+        let baseline = message_id(server.message_page(&session, None).await?.0.as_ref());
 
         let prompt = parts(&invocation.prompt, &files)?;
         let message_path = ["session", session.as_str(), "message"];
@@ -226,10 +244,12 @@ impl Native {
         let confirm_deadline = Instant::now() + STARTUP_TIMEOUT;
         let mut first_id = None;
         while first_id.is_none() && !matches!(completed, Some(Ok(_))) {
-            let messages = server.messages_since(&session, baseline.as_deref()).await?;
-            if let Some(message) = first_user_after(&messages, baseline.as_deref()) {
-                match stored(message, &invocation.prompt, &prompt) {
-                    Stored::Complete => first_id = message_id(Some(message)),
+            if let Some(message) = server
+                .first_user_since(&session, baseline.as_deref())
+                .await?
+            {
+                match stored(&message, &invocation.prompt, &prompt) {
+                    Stored::Complete => first_id = message_id(Some(&message)),
                     Stored::ReadFailed => return Err(HarnessError::AttachmentNotProcessed),
                     Stored::Pending => {}
                 }
@@ -258,33 +278,59 @@ impl Native {
         let mut leases = Vec::new();
         let mut answered = HashSet::new();
         let mut poll = tokio::time::interval(POLL_INTERVAL);
+        let mut in_flight: Option<PendingFollowUp<'_>> = None;
         let answer = loop {
             if let Some(result) = completed.take() {
                 break result;
             }
+            let accepting_follow_up = in_flight.is_none();
             tokio::select! {
                 biased;
                 result = &mut first => break result,
-                Some(follow_up) = follow_ups.0.recv() => {
+                result = async {
+                    match in_flight.as_mut() {
+                        Some(follow_up) => {
+                            follow_up.started = true;
+                            follow_up.request.as_mut().await
+                        }
+                        None => pending().await,
+                    }
+                } => {
+                    if let Some(reply) = in_flight.take().and_then(|mut follow_up| follow_up.reply.take()) {
+                        let _ = reply.send(result);
+                    }
+                }
+                Some(follow_up) = follow_ups.0.recv(), if accepting_follow_up => {
                     let FollowUp { text, files, lease, reply } = follow_up;
                     leases.extend(lease);
-                    let _ = reply.send(server.follow_up(&session, &text, &files).await);
+                    let server = &server;
+                    let session = &session;
+                    in_flight = Some(PendingFollowUp {
+                        request: Box::pin(async move { server.follow_up(session, &text, &files).await }),
+                        reply: Some(reply),
+                        started: false,
+                    });
                 }
                 _ = poll.tick() => {
                     server.answer_requests(approve_once, &mut answered).await?;
                 }
             }
         };
+        // A polled POST may have been accepted. Its reply is uncertain.
+        // Unstarted follow-ups still return unavailable.
+        drop(in_flight);
         drop(follow_ups);
         drop(registration);
         let answer = answer?;
 
-        let history = match &first_id {
-            Some(first_id) => server.turn_messages(&session, first_id).await.ok(),
-            None => None,
-        };
-        let (texts, unanswered) = match history {
-            Some(messages) => turn_text(&messages),
+        let (texts, unanswered) = match &first_id {
+            Some(first_id) => match server.turn_text(&session, first_id).await {
+                Ok(text) => text,
+                Err(HarnessError::OutputLimitExceeded) => {
+                    return Err(HarnessError::OutputLimitExceeded);
+                }
+                Err(_) => (completed_text(&answer), false),
+            },
             None => (completed_text(&answer), false),
         };
         for text in texts
@@ -406,6 +452,19 @@ impl Server {
         body: Option<Value>,
         limit: Option<Duration>,
     ) -> Result<Value, HarnessError> {
+        self.request_with_cursor(method, path, query, body, limit)
+            .await
+            .map(|(body, _)| body)
+    }
+
+    async fn request_with_cursor(
+        &self,
+        method: Method,
+        path: &[&str],
+        query: &[(&str, String)],
+        body: Option<Value>,
+        limit: Option<Duration>,
+    ) -> Result<(Value, Option<String>), HarnessError> {
         // The port is only trusted while the server that bound it is alive.
         if self.process.has_exited() {
             return Err(HarnessError::BackendStream);
@@ -433,6 +492,11 @@ impl Server {
             .await
             .and_then(reqwest::Response::error_for_status)
             .map_err(|_| HarnessError::BackendStream)?;
+        let cursor = response
+            .headers()
+            .get("x-next-cursor")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -444,67 +508,101 @@ impl Server {
             }
             bytes.extend_from_slice(&chunk);
         }
-        if bytes.is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_slice(&bytes).map_err(|_| HarnessError::BackendStream)
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).map_err(|_| HarnessError::BackendStream)?
+        };
+        Ok((body, cursor))
     }
 
-    /// Newest `limit` messages of the session, oldest first.
-    async fn messages(&self, session: &str, limit: usize) -> Result<Vec<Value>, HarnessError> {
-        match self
-            .request(
+    /// The response budget covers one user message with a full attachment batch.
+    /// Follow the server's opaque cursor without using its response's host URL.
+    async fn message_page(
+        &self,
+        session: &str,
+        before: Option<&str>,
+    ) -> Result<(Option<Value>, Option<String>), HarnessError> {
+        let mut query = vec![("limit", "1".to_owned())];
+        if let Some(before) = before {
+            query.push(("before", before.to_owned()));
+        }
+        let (body, next) = self
+            .request_with_cursor(
                 Method::GET,
                 &["session", session, "message"],
-                &[("limit", limit.to_string())],
+                &query,
                 None,
                 Some(REQUEST_TIMEOUT),
             )
-            .await?
-        {
-            Value::Array(messages) => Ok(messages),
+            .await?;
+        match body {
+            Value::Array(mut messages) if messages.len() <= 1 => Ok((messages.pop(), next)),
             _ => Err(HarnessError::BackendStream),
         }
     }
 
-    /// Messages newer than `baseline`, read in small pages. Until steering
-    /// opens these are the prompt and its replies, so reads stay narrow.
-    async fn messages_since(
+    /// Find the oldest user prompt after the previous turn's last message.
+    async fn first_user_since(
         &self,
         session: &str,
         baseline: Option<&str>,
-    ) -> Result<Vec<Value>, HarnessError> {
-        let mut limit = 2;
-        loop {
-            let messages = self.messages(session, limit).await?;
-            let has_baseline = baseline.is_none_or(|baseline| {
-                messages
-                    .iter()
-                    .any(|message| message_id(Some(message)).as_deref() == Some(baseline))
-            });
-            if has_baseline || messages.len() < limit || limit >= 64 {
-                return Ok(messages);
+    ) -> Result<Option<Value>, HarnessError> {
+        let mut candidate = None;
+        let mut cursor = None;
+        for _ in 0..64 {
+            let (Some(mut message), next) = self.message_page(session, cursor.as_deref()).await?
+            else {
+                break;
+            };
+            if message["info"]["id"].as_str() == baseline && baseline.is_some() {
+                break;
             }
-            limit *= 2;
+            if message["info"]["role"] == "user" {
+                if let Some(parts) = message["parts"].as_array_mut() {
+                    for part in parts {
+                        if part["type"] == "file"
+                            && part["url"]
+                                .as_str()
+                                .is_some_and(|url| url.starts_with("data:"))
+                        {
+                            part["url"] = Value::String("data:".to_owned());
+                        }
+                    }
+                }
+                candidate = Some(message);
+            }
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
         }
+        Ok(candidate)
     }
 
-    /// Messages from the turn's prompt onward, paging back until it is found.
-    async fn turn_messages(&self, session: &str, first: &str) -> Result<Vec<Value>, HarnessError> {
-        let mut limit = 16;
-        loop {
-            let mut messages = self.messages(session, limit).await?;
-            if let Some(start) = messages
-                .iter()
-                .position(|message| message_id(Some(message)).as_deref() == Some(first))
-            {
-                return Ok(messages.split_off(start));
+    /// Read backward one message at a time, retaining only bounded reply text.
+    async fn turn_text(
+        &self,
+        session: &str,
+        first: &str,
+    ) -> Result<(Vec<String>, bool), HarnessError> {
+        let mut history = TurnHistory::default();
+        let mut cursor = None;
+        for _ in 0..1024 {
+            let (Some(message), next) = self.message_page(session, cursor.as_deref()).await? else {
+                break;
+            };
+            let is_first = message["info"]["id"].as_str() == Some(first);
+            history.record(&message, is_first)?;
+            if is_first {
+                return Ok(history.finish());
             }
-            if messages.len() < limit || limit >= 1024 {
-                return Err(HarnessError::BackendStream);
+            cursor = next;
+            if cursor.is_none() {
+                break;
             }
-            limit *= 2;
         }
+        Err(HarnessError::BackendStream)
     }
 
     /// Adds a user message to the running loop without starting another one.
@@ -627,36 +725,42 @@ fn message_id(message: Option<&Value>) -> Option<String> {
     message?["info"]["id"].as_str().map(str::to_owned)
 }
 
-/// First user message newer than `baseline`, the newest message before the prompt.
-fn first_user_after<'a>(messages: &'a [Value], baseline: Option<&str>) -> Option<&'a Value> {
-    let start = baseline
-        .and_then(|baseline| {
-            messages
-                .iter()
-                .position(|message| message_id(Some(message)).as_deref() == Some(baseline))
-        })
-        .map_or(0, |index| index + 1);
-    // An absent baseline was pushed out of the page, so every listed message is newer.
-    messages[start..]
-        .iter()
-        .find(|message| message["info"]["role"] == "user")
+/// Collect a turn from newest to oldest while dropping each page's media and metadata.
+#[derive(Default)]
+struct TurnHistory {
+    replies: Vec<Vec<String>>,
+    bytes: usize,
+    unanswered: Option<bool>,
 }
 
-/// Completed text of every assistant message in the turn, and whether the
-/// newest user message (a late follow-up) was left without an answer.
-fn turn_text(messages: &[Value]) -> (Vec<String>, bool) {
-    let texts = messages
-        .iter()
-        .filter(|message| message["info"]["role"] == "assistant")
-        .flat_map(completed_text)
-        .collect();
-    let last_user = messages
-        .iter()
-        .rposition(|message| message["info"]["role"] == "user");
-    let last_assistant = messages
-        .iter()
-        .rposition(|message| message["info"]["role"] == "assistant");
-    (texts, last_user > last_assistant && last_user != Some(0))
+impl TurnHistory {
+    fn record(&mut self, message: &Value, is_first: bool) -> Result<(), HarnessError> {
+        match message["info"]["role"].as_str() {
+            Some("user") => {
+                self.unanswered.get_or_insert(!is_first);
+            }
+            Some("assistant") => {
+                self.unanswered.get_or_insert(false);
+                let texts = completed_text(message);
+                self.bytes = self
+                    .bytes
+                    .saturating_add(texts.iter().map(String::len).sum());
+                if self.bytes > MAX_TURN_TEXT_BYTES {
+                    return Err(HarnessError::OutputLimitExceeded);
+                }
+                self.replies.push(texts);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> (Vec<String>, bool) {
+        (
+            self.replies.into_iter().rev().flatten().collect(),
+            self.unanswered.unwrap_or(false),
+        )
+    }
 }
 
 fn completed_text(message: &Value) -> Vec<String> {
@@ -734,36 +838,87 @@ mod tests {
                 { "type": "text", "text": "hidden", "synthetic": true, "time": { "end": 4 } },
             ]),
         );
-        let (texts, unanswered) =
-            turn_text(&[first.clone(), early.clone(), follow_up.clone(), last]);
+        let read = |messages: &[Value]| {
+            let mut history = TurnHistory::default();
+            for (index, message) in messages.iter().enumerate().rev() {
+                history.record(message, index == 0).unwrap();
+            }
+            history.finish()
+        };
+        let (texts, unanswered) = read(&[first.clone(), early.clone(), follow_up.clone(), last]);
         assert_eq!(texts, ["partial answer", "final answer"]);
         assert!(!unanswered);
-        let (texts, unanswered) = turn_text(&[first.clone(), early, follow_up]);
+        let (texts, unanswered) = read(&[first.clone(), early, follow_up]);
         assert_eq!(texts, ["partial answer"]);
         assert!(unanswered);
-        assert_eq!(turn_text(&[first]), (vec![], false));
+        assert_eq!(read(&[first]), (vec![], false));
     }
 
-    #[test]
-    fn prompt_is_found_after_the_baseline_even_when_it_left_the_page() {
-        let messages = [
-            message("a", "user", json!([])),
-            message("b", "assistant", json!([])),
-            message("c", "user", json!([])),
+    #[tokio::test]
+    async fn history_pages_keep_earlier_text_when_multiple_media_batches_fill_the_budget() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let server = Server {
+            process: OwnedProcess::spawn("sleep", &["30"], Path::new("."), vec![]).unwrap(),
+            client: Client::builder().no_proxy().build().unwrap(),
+            base: format!("http://{}", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+            password: "test".to_owned(),
+            response_limit: 768,
+        };
+        let media = json!([{
+            "type": "file",
+            "url": format!("data:image/png;base64,{}", "x".repeat(512)),
+        }]);
+        let pages = [
+            ("", "prev-1", message("late", "user", media.clone())),
+            (
+                "&before=prev-1",
+                "prev-2",
+                message("answer", "assistant", json!([text("kept")])),
+            ),
+            ("&before=prev-2", "", message("first", "user", media)),
         ];
-        assert_eq!(
-            message_id(first_user_after(&messages, Some("b"))).as_deref(),
-            Some("c")
-        );
-        assert_eq!(
-            message_id(first_user_after(&messages, Some("gone"))).as_deref(),
-            Some("a")
-        );
-        assert_eq!(
-            message_id(first_user_after(&messages, None)).as_deref(),
-            Some("a")
-        );
-        assert!(first_user_after(&messages, Some("c")).is_none());
+        let replies = async {
+            for (before, next, item) in pages {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert_eq!(
+                    line,
+                    format!("GET /session/room/message?limit=1{before} HTTP/1.1\r\n")
+                );
+                loop {
+                    line.clear();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = json!([item]).to_string();
+                assert!(body.len() < server.response_limit);
+                let cursor = if next.is_empty() {
+                    String::new()
+                } else {
+                    format!("X-Next-Cursor: {next}\r\n")
+                };
+                socket.get_mut().write_all(format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n{cursor}\r\n{body}",
+                    body.len(),
+                ).as_bytes()).await.unwrap();
+            }
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(server.turn_text("room", "first"), replies)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), (vec!["kept".to_owned()], true));
     }
 
     #[test]
@@ -840,6 +995,17 @@ mod tests {
         drop(registration);
         assert!(native.groups.lock().unwrap().get("first").is_none());
         assert!(native.active("second"));
+    }
+
+    #[tokio::test]
+    async fn dropped_unstarted_follow_up_remains_available_to_queue() {
+        let (reply, outcome) = oneshot::channel();
+        drop(PendingFollowUp {
+            request: Box::pin(pending()),
+            reply: Some(reply),
+            started: false,
+        });
+        assert_eq!(outcome.await.unwrap(), SteerOutcome::Unavailable);
     }
 
     #[tokio::test]

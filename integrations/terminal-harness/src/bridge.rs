@@ -3216,7 +3216,7 @@ mod tests {
         drop(occupied);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelled_ingress_cannot_release_successor_before_predecessor() {
         let queues = GroupQueues::new(4);
         let first = queues.reserve_ingress("room").await.unwrap();
