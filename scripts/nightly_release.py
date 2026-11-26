@@ -396,8 +396,10 @@ def canary_tip_commit(canary_ref: str | None) -> str | None:
 def command_plan(args: argparse.Namespace) -> int:
     gh = github_from_env()
     day = today_utc(args.today)
-    shas = git("rev-list", "--first-parent", f"--max-count={args.depth}", args.master_ref).split()
+    all_master = git("rev-list", "--first-parent", args.master_ref).split()
+    shas = all_master[: args.depth]
     canary_tip = canary_tip_commit(args.canary_ref)
+    valid_canary_tip = canary_tip if (canary_tip is not None and canary_tip in all_master) else None
     latest = gh.read_latest()
     previous_sha = latest["source_sha"] if latest else None
     previous_version = latest["version"] if latest else "none"
@@ -405,12 +407,23 @@ def command_plan(args: argparse.Namespace) -> int:
     source_sha = select_source(
         shas,
         previous_sha,
-        lambda sha: (canary_tip is not None and sha == canary_tip) or gh.required_ci_passed(sha),
+        lambda sha: (valid_canary_tip is not None and sha == valid_canary_tip) or gh.required_ci_passed(sha),
     )
+    if source_sha is None and valid_canary_tip is not None:
+        # A valid first-parent Canary tip more than `depth` commits behind master
+        # still counts as verified, without ever moving backwards past previous_sha.
+        if (
+            previous_sha is not None
+            and previous_sha in all_master
+            and all_master.index(previous_sha) < all_master.index(valid_canary_tip)
+        ):
+            source_sha = previous_sha
+        else:
+            source_sha = valid_canary_tip
     if source_sha is None:
         raise NightlyError(
-            f"none of the newest {len(shas)} master commits is verified by canary "
-            "or has a successful merge-queue Required CI run"
+            f"none of the newest {len(shas)} master commits has a successful merge-queue Required CI run "
+            "and no valid first-parent canary tip was found"
         )
 
     outputs = {

@@ -142,9 +142,13 @@ you do not decide alone that it is good enough.
   including any rebase, needs a new round; there is no exception for small
   fixes. To make that rarer, rebase onto `origin/master` before the final
   round.
+- Put the proposed `Release-Impact: none | patch | minor` trailer on the tip
+  commit (or in the review context) **before** the final `review-local` round so
+  both seats audit it alongside any `changelog.d/<slug>.md` fragments.
 - Once both seats say `VERDICT: merge`, amend the signed tip commit message
-  (`git commit --amend -S`, preserving `HEAD^{tree}`) to record the three
-  required trailers and check them with `just pr-trailers-check`:
+  (`git commit --amend -S`, preserving `HEAD^{tree}`) to record `Local-Checks:`
+  and `Local-Review:` while keeping the reviewed `Release-Impact:` unchanged,
+  then verify with `just pr-trailers-check`:
 
   ```text
   Local-Checks: <commands run locally>
@@ -152,8 +156,10 @@ you do not decide alone that it is good enough.
   Release-Impact: none | patch | minor
   ```
 
-  Ensure `Release-Impact:` agrees with any `changelog.d/<slug>.md` fragments
-  (`### Breaking changes` requires `minor`; user-facing entries forbid `none`).
+  Changing `Release-Impact:` during or after the amend invalidates the prior
+  review and requires a fresh `review-local` round. Ensure `Release-Impact:`
+  agrees with any `changelog.d/<slug>.md` fragments (`### Breaking changes`
+  requires `minor`; user-facing entries forbid `none`).
 
 Count the rounds; the report in step 6 says how many it took.
 

@@ -278,22 +278,30 @@ class PackagingPolicyTests(unittest.TestCase):
 class MergeGatePolicyTests(unittest.TestCase):
     def test_pr_trust_only_marks_same_repo_collaborator_prs_as_team(self):
         script = workflow_step("ci.yml", "Classify PR trust")
+        fake_gh = textwrap.dedent("""\
+            gh() {
+              if [[ "$FAKE_PERM" == "error" ]]; then return 1; fi
+              printf '%s\\n' "$FAKE_PERM"
+            }
+        """)
         cases = [
-            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "OWNER", "true"),
-            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "MEMBER", "true"),
-            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "COLLABORATOR", "true"),
-            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "CONTRIBUTOR", "false"),
-            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "NONE", "false"),
-            ("pull_request", "marmot-protocol/mdk", "external/mdk", "true", "MEMBER", "false"),
-            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "true", "MEMBER", "false"),
-            ("pull_request", "marmot-protocol/mdk", "", "false", "MEMBER", "false"),
-            ("push", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "MEMBER", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "admin", "true"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "maintain", "true"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "write", "true"),
+            # Organization member without write access must fail closed into full CI.
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "org-reader", "read", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "outsider", "none", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "error", "false"),
+            ("pull_request", "marmot-protocol/mdk", "external/mdk", "true", "alice", "admin", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "true", "alice", "admin", "false"),
+            ("pull_request", "marmot-protocol/mdk", "", "false", "alice", "admin", "false"),
+            ("push", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "admin", "false"),
         ]
-        for event, repo, head_repo, head_fork, assoc, expected in cases:
-            with self.subTest(event=event, head_repo=head_repo, head_fork=head_fork, assoc=assoc), tempfile.TemporaryDirectory() as tmp:
+        for event, repo, head_repo, head_fork, author, perm, expected in cases:
+            with self.subTest(event=event, head_repo=head_repo, head_fork=head_fork, perm=perm), tempfile.TemporaryDirectory() as tmp:
                 output = Path(tmp) / "output"
                 subprocess.run(
-                    ["bash", "-c", script],
+                    ["bash", "-c", fake_gh + script],
                     check=True,
                     capture_output=True,
                     timeout=10,
@@ -303,7 +311,8 @@ class MergeGatePolicyTests(unittest.TestCase):
                         "REPO": repo,
                         "HEAD_REPO": head_repo,
                         "HEAD_FORK": head_fork,
-                        "AUTHOR_ASSOC": assoc,
+                        "PR_AUTHOR": author,
+                        "FAKE_PERM": perm,
                         "GITHUB_OUTPUT": str(output),
                     },
                 )
@@ -344,34 +353,50 @@ class MergeGatePolicyTests(unittest.TestCase):
             "changes": {"result": "success"},
             "rust-format": {"result": "success"},
             "rust-audit": {"result": "success"},
+            "ios-account-clippy": {"result": "success"},
+            "marmotkit-native-host": {"result": "success"},
             "rust-test": {"result": "success"},
         }
-        skipped = {**passed, "rust-test": {"result": "skipped"}}
+        skipped = {
+            **passed,
+            "ios-account-clippy": {"result": "skipped"},
+            "marmotkit-native-host": {"result": "skipped"},
+            "rust-test": {"result": "skipped"},
+        }
+        apple_passed = {
+            **skipped,
+            "ios-account-clippy": {"result": "success"},
+            "marmotkit-native-host": {"result": "success"},
+        }
         failed = {**passed, "rust-test": {"result": "failure"}}
         cancelled = {**passed, "rust-test": {"result": "cancelled"}}
-        for event, mode, is_team, needs, expected in [
-            ("pull_request", "fast", "true", skipped, True),
-            ("pull_request", "fast", "true", failed, False),
-            ("pull_request", "fast", "true", {**skipped, "signatures": {"result": "skipped"}}, False),
-            ("pull_request", "fast", "true", {**skipped, "changes": {"result": "skipped"}}, False),
-            ("pull_request", "fast", "true", {**skipped, "rust-format": {"result": "skipped"}}, False),
-            ("pull_request", "fast", "true", {**skipped, "rust-audit": {"result": "skipped"}}, False),
-            ("pull_request", "fast", "true", {**skipped, "rust-audit": {"result": "failure"}}, False),
-            ("pull_request", "fast", "true", {**skipped, "rust-format": {"result": "failure"}}, False),
-            ("pull_request", "fast", "true", cancelled, False),
-            ("pull_request", "fast", "false", skipped, False),
-            ("pull_request", "full", "false", passed, True),
-            ("pull_request", "full", "false", skipped, False),
-            ("pull_request", "full", "true", skipped, False),
-            ("pull_request", "", "true", skipped, False),
-            ("merge_group", "full", "false", passed, True),
-            ("merge_group", "full", "false", skipped, False),
-            ("merge_group", "full", "false", cancelled, False),
-            ("merge_group", "fast", "true", skipped, False),
-            ("merge_group", "", "false", skipped, False),
-            ("push", "warm", "false", skipped, True),
+        for event, mode, is_team, apple_opt_in, needs, expected in [
+            ("pull_request", "fast", "true", "false", skipped, True),
+            ("pull_request", "fast", "true", "true", apple_passed, True),
+            ("pull_request", "fast", "true", "true", skipped, False),
+            ("pull_request", "fast", "true", "true", {**apple_passed, "ios-account-clippy": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "true", {**apple_passed, "marmotkit-native-host": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", failed, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "signatures": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "changes": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-format": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-audit": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-audit": {"result": "failure"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-format": {"result": "failure"}}, False),
+            ("pull_request", "fast", "true", "false", cancelled, False),
+            ("pull_request", "fast", "false", "false", skipped, False),
+            ("pull_request", "full", "false", "false", passed, True),
+            ("pull_request", "full", "false", "false", skipped, False),
+            ("pull_request", "full", "true", "true", skipped, False),
+            ("pull_request", "", "true", "false", skipped, False),
+            ("merge_group", "full", "false", "false", passed, True),
+            ("merge_group", "full", "false", "false", skipped, False),
+            ("merge_group", "full", "false", "false", cancelled, False),
+            ("merge_group", "fast", "true", "false", skipped, False),
+            ("merge_group", "", "false", "false", skipped, False),
+            ("push", "warm", "false", "false", skipped, True),
         ]:
-            with self.subTest(event=event, mode=mode, is_team=is_team, needs=needs):
+            with self.subTest(event=event, mode=mode, is_team=is_team, apple=apple_opt_in, needs=needs):
                 result = subprocess.run(
                     ["bash", "-c", script],
                     capture_output=True,
@@ -381,6 +406,7 @@ class MergeGatePolicyTests(unittest.TestCase):
                         "EVENT_NAME": event,
                         "CI_MODE": mode,
                         "IS_TEAM_PR": is_team,
+                        "APPLE_OPT_IN": apple_opt_in,
                         "NEEDS": json.dumps(needs),
                     },
                 )
@@ -815,34 +841,79 @@ class NightlyReleasePolicyTests(unittest.TestCase):
             git("config", "user.name", "Test")
             git("config", "user.email", "test@example.com")
             git("config", "commit.gpgsign", "false")
-            (repo / "a.txt").write_text("1\n")
-            git("add", "a.txt")
-            git("commit", "-m", "c1")
-            c1 = git("rev-parse", "HEAD")
-            (repo / "a.txt").write_text("2\n")
-            git("add", "a.txt")
-            git("commit", "-m", "c2")
-            c2 = git("rev-parse", "HEAD")
-            git("branch", "canary", c2)
-            (repo / "a.txt").write_text("3\n")
-            git("add", "a.txt")
-            git("commit", "-m", "c3 unverified")
-            c3 = git("rev-parse", "HEAD")
+            (repo / "Cargo.toml").write_text('[workspace.package]\nversion = "0.20.0-dev"\n')
+            git("add", "Cargo.toml")
+            git("commit", "-m", "c0")
+            c0 = git("rev-parse", "HEAD")
 
-            cwd = os.getcwd()
-            try:
-                os.chdir(repo)
-                canary_tip = nightly_release.canary_tip_commit("canary")
-                missing_tip = nightly_release.canary_tip_commit("nonexistent")
-            finally:
-                os.chdir(cwd)
+            # Create a side branch to test diverged canary rejection.
+            git("checkout", "-b", "diverged")
+            (repo / "side.txt").write_text("side\n")
+            git("add", "side.txt")
+            git("commit", "-m", "diverged commit")
+            git("checkout", "master")
 
-            self.assertEqual(canary_tip, c2)
-            self.assertIsNone(missing_tip)
-            # Only the exact canary tip c2 is treated as Canary-verified (not unverified c3 or untested ancestor c1).
-            predicate = lambda sha: sha == canary_tip
-            self.assertEqual(nightly_release.select_source([c3, c2, c1], c1, predicate), c2)
-            self.assertIsNone(nightly_release.select_source([c1], None, predicate))
+            # Advance master by 52 first-parent commits; place canary 51 commits behind master.
+            shas = [c0]
+            for i in range(1, 53):
+                (repo / "a.txt").write_text(f"{i}\n")
+                git("add", "a.txt")
+                git("commit", "-m", f"c{i}")
+                shas.append(git("rev-parse", "HEAD"))
+            older_canary = shas[1]  # 51 commits behind master tip (shas[52])
+            git("branch", "canary-old", older_canary)
+            recent_canary = shas[50]
+            git("branch", "canary-recent", recent_canary)
+
+            class FakeGH:
+                def __init__(self, previous_sha):
+                    self.previous_sha = previous_sha
+                def read_latest(self):
+                    return {"source_sha": self.previous_sha, "version": "0.20.0-nightly.20261125"} if self.previous_sha else None
+                def required_ci_passed(self, _sha):
+                    return False
+                def tag_names(self, _prefix):
+                    return []
+
+            def run_plan(canary_ref, previous_sha=None):
+                import argparse
+                out_file = repo / "gh_output"
+                out_file.unlink(missing_ok=True)
+                args = argparse.Namespace(
+                    master_ref="master",
+                    canary_ref=canary_ref,
+                    depth=50,
+                    force=False,
+                    today="2026-11-26",
+                )
+                cwd = os.getcwd()
+                try:
+                    os.chdir(repo)
+                    with unittest.mock.patch.object(nightly_release, "github_from_env", return_value=FakeGH(previous_sha)), \
+                            unittest.mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(out_file)}, clear=False):
+                        nightly_release.command_plan(args)
+                finally:
+                    os.chdir(cwd)
+                return dict(line.split("=", 1) for line in out_file.read_text().splitlines() if "=" in line)
+
+            # Recent first-parent canary tip inside 50-commit window is selected.
+            recent_out = run_plan("canary-recent", previous_sha=c0)
+            self.assertEqual(recent_out["source_sha"], recent_canary)
+            self.assertEqual(recent_out["skip"], "false")
+
+            # Valid first-parent canary tip 51 commits behind master (outside depth=50) is still selected.
+            old_out = run_plan("canary-old", previous_sha=c0)
+            self.assertEqual(old_out["source_sha"], older_canary)
+            self.assertEqual(old_out["skip"], "false")
+
+            # Stale canary tip older than previous_sha never moves backwards.
+            no_rewind = run_plan("canary-old", previous_sha=recent_canary)
+            self.assertEqual(no_rewind["source_sha"], recent_canary)
+            self.assertEqual(no_rewind["skip"], "true")
+
+            # Diverged canary tip not on master's first-parent history is rejected.
+            with self.assertRaises(nightly_release.NightlyError):
+                run_plan("diverged", previous_sha=None)
 
     def test_nightly_jobs_require_their_dependencies_and_own_concurrency(self):
         workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()

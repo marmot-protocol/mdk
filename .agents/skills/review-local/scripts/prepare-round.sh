@@ -171,10 +171,11 @@ surrounding code you need. Do not edit files, commit, push or post anything.
 2. Then review the code. Report real defects: wrong behavior, broken
    documented invariants, missing or wrong tests for changed behavior, torn
    multi-step state changes, unsafe logging of private data, security
-   problems. Also check release-impact classification when stated in the
-   commit or context: flag as should-fix if a breaking public API, binding,
-   storage-migration, or protocol change is labeled none/patch instead of
-   minor, or lacks a matching changelog.d/ fragment when user-facing.
+   problems. Also check release-impact classification in the commit or context:
+   flag as should-fix if a breaking public API, binding, storage-migration, or
+   protocol change is labeled none/patch instead of minor, lacks a matching
+   changelog.d/ fragment with a `### Breaking changes` heading, or omits a
+   changelog.d/ fragment when user-facing.
 
 3. Judge simplicity as a defect class, not a style nit. Use
    $input/karpathy-guidelines.md and $input/simplicity-guidelines.md.

@@ -212,6 +212,23 @@ class PrTrailerTests(unittest.TestCase):
         finally:
             tmp.cleanup()
 
+        # Non-ASCII directory paths must not be Git-quoted and skipped.
+        tmp, repo, base = self.make_repo()
+        try:
+            head = self.commit_file(
+                repo,
+                "crates/café/changelog.d/rename-api.md",
+                "### Breaking changes\n\n- Renamed public API.\n",
+                "Rename API\n\n"
+                "Local-Checks: cargo fmt\n"
+                "Local-Review: human\n"
+                "Release-Impact: patch\n",
+            )
+            _, errors = trailers.validate_range(repo, base, head)
+            self.assertTrue(any("Breaking changes" in e and "minor" in e for e in errors), errors)
+        finally:
+            tmp.cleanup()
+
         # Advancing master (e.g. a release PR folding and deleting a breaking fragment)
         # must not cause an open docs-only branch to inherit that fragment's impact.
         tmp, repo, _ = self.make_repo()

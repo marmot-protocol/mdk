@@ -216,10 +216,14 @@ def validate_range(root: Path, base: str, head: str) -> tuple[str | None, list[s
     errors.extend(impact_errors)
 
     # Cross-check changelog.d/ fragments added or modified since the branch point
-    # (merge-base), so fragments folded or edited on master never pollute open PRs.
-    changed_files = git(
-        root, "diff", "--no-renames", "--name-only", "--diff-filter=AM", f"{base}...{head}"
-    ).splitlines()
+    # (merge-base), using -z so non-ASCII paths are never Git-quoted or skipped.
+    changed_files = [
+        rel_path
+        for rel_path in git(
+            root, "diff", "--no-renames", "--name-only", "-z", "--diff-filter=AM", f"{base}...{head}"
+        ).split("\0")
+        if rel_path
+    ]
     for rel_path in changed_files:
         if not FRAGMENT_PATH.search(rel_path):
             continue

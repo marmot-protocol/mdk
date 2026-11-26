@@ -114,24 +114,27 @@ jobs:
           echo "full_ci=$(jq 'index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
           echo "apple_opt_in=$(jq 'index("ci:apple") != null or index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
 
-      # Only branches pushed directly to this repository (non-fork) by a repo
-      # OWNER, MEMBER, or COLLABORATOR qualify for the fast static PR gate.
-      # External/fork PRs always fail closed into full CI on GitHub runners;
+      # Only branches pushed directly to this repository (non-fork) by an author
+      # with authoritative write, maintain, or admin repository permission
+      # qualify for the fast static PR gate. External/fork PRs, read-only org
+      # members, and unavailable permission checks all fail closed into full CI.
       # `.github/CODEOWNERS` requires owner review for any change to `.github/`.
       - name: Classify PR trust
         id: trust
         env:
           EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_FORK: ${{ github.event.pull_request.head.repo.fork }}
-          AUTHOR_ASSOC: ${{ github.event.pull_request.author_association }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -euo pipefail
           is_team_pr=false
-          if [[ "$EVENT_NAME" == "pull_request" && -n "$HEAD_REPO" && "$HEAD_REPO" == "$REPO" && "$HEAD_FORK" != "true" ]]; then
-            case "$AUTHOR_ASSOC" in
-              OWNER|MEMBER|COLLABORATOR) is_team_pr=true ;;
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$HEAD_REPO" && "$HEAD_REPO" == "$REPO" && "$HEAD_FORK" != "true" && -n "$PR_AUTHOR" ]]; then
+            permission="$(gh api "repos/$REPO/collaborators/$PR_AUTHOR/permission" --jq '.permission // ""' 2>/dev/null || true)"
+            case "$permission" in
+              write|maintain|admin) is_team_pr=true ;;
             esac
           fi
           echo "is_team_pr=$is_team_pr" >> "$GITHUB_OUTPUT"
@@ -1891,6 +1894,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           CI_MODE: ${{ needs.changes.outputs.ci_mode }}
           IS_TEAM_PR: ${{ needs.changes.outputs.is_team_pr }}
+          APPLE_OPT_IN: ${{ needs.changes.outputs.apple_opt_in }}
         run: |
           set -euo pipefail
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
@@ -1907,11 +1911,12 @@ jobs:
               jq --exit-status 'all(.[]; .result == "success")' <<<"$NEEDS"
               ;;
             fast)
-              jq --exit-status '
+              jq --exit-status --arg apple "$APPLE_OPT_IN" '
                 .signatures.result == "success"
                 and .changes.result == "success"
                 and .["rust-format"].result == "success"
                 and .["rust-audit"].result == "success"
+                and ($apple != "true" or (.["ios-account-clippy"].result == "success" and .["marmotkit-native-host"].result == "success"))
                 and all(.[]; .result | IN("success", "skipped"))
               ' <<<"$NEEDS"
               ;;
