@@ -994,3 +994,199 @@ async fn an_expired_current_key_package_is_not_republished_or_fanned_out() {
         ]
     );
 }
+
+#[tokio::test]
+async fn empty_routing_does_not_strand_key_package_publication_once_a_writable_relay_is_added() {
+    let dir = relaxed_storage_dir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("kp slot empty routing recovery").unwrap();
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let publisher = RecordingKeyPackages::default();
+
+    // Staging or publishing with zero endpoints refuses without persisting a
+    // zero-target pending replacement.
+    let mut empty_runtime = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[],
+    );
+    let err = empty_runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("empty routing must fail before staging");
+    assert!(matches!(
+        err,
+        marmot_session::AccountError::KeyPackage(ref err) if !err.externally_exposed
+    ));
+    assert!(
+        empty_runtime
+            .key_package_maintenance_status()
+            .unwrap()
+            .is_none_or(|lifecycle| lifecycle.pending_replacement.is_none()),
+        "empty routing must not persist a zero-target pending replacement"
+    );
+    drop(empty_runtime);
+
+    // Even if an existing persisted pending replacement has zero targets, adding
+    // a writable relay immediately makes maintenance due and publishes the exact
+    // signed artifact without waiting for expiry.
+    let mut seeded = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+    seeded
+        .prepare_fresh_key_package(vec![TransportEndpoint(KEY_ENDPOINT.into())])
+        .await
+        .unwrap();
+    let mut lifecycle = slot_lifecycle(&seeded);
+    let signed_before = lifecycle
+        .pending_replacement
+        .as_ref()
+        .unwrap()
+        .signed_event
+        .clone()
+        .unwrap();
+    lifecycle
+        .pending_replacement
+        .as_mut()
+        .unwrap()
+        .targets
+        .clear();
+    seeded
+        .session()
+        .put_key_package_lifecycle(&lifecycle)
+        .unwrap();
+    drop(seeded);
+
+    let writable = "wss://writable.example";
+    let mut recovered = slot_runtime(
+        current_session(database, &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[writable],
+    );
+    assert!(recovered.key_package_network_maintenance_due().unwrap());
+    assert!(recovered.maintenance_due(&[]).unwrap().retry_while_owed);
+    recovered.run_due_maintenance().await.unwrap();
+    let promoted = slot_lifecycle(&recovered);
+    assert!(promoted.pending_replacement.is_none());
+    assert_eq!(promoted.authored_signed_event, Some(signed_before));
+    let publications = publisher.publications();
+    assert_eq!(publications.len(), 1);
+    assert_eq!(
+        publications[0].endpoints,
+        vec![TransportEndpoint(writable.into())]
+    );
+}
+
+#[tokio::test]
+async fn persisted_pending_and_fanout_retries_respect_removed_or_read_only_relays() {
+    use cgka_traits::TransportFanoutAttemptState;
+
+    let dir = relaxed_storage_dir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("kp slot read-only retry policy").unwrap();
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let read_only = "wss://became-read-only.example";
+    let writable = "wss://writable.example";
+    let accepted = "wss://accepted.example";
+
+    // Part 1: A persisted pending replacement originally targeted a relay that
+    // later became read-only (removed from key_package_endpoints).
+    let failing = RefusingKeyPackages::default();
+    failing
+        .refuse_all
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut runtime = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        failing.clone(),
+        &wall,
+        0,
+        &[read_only],
+    );
+    runtime.publish_fresh_key_package().await.unwrap_err();
+    let pending = slot_lifecycle(&runtime).pending_replacement.unwrap();
+    let signed_event = pending.signed_event.clone().unwrap();
+    drop(runtime);
+
+    // When no writable relay remains, maintenance neither schedules nor sends to
+    // the removed/read-only relay.
+    let no_routes = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        RecordingKeyPackages::default(),
+        &wall,
+        0,
+        &[],
+    );
+    wall.set(now + 60);
+    assert!(!no_routes.key_package_network_maintenance_due().unwrap());
+    let due = no_routes.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(pending.not_after));
+    assert!(!due.retry_while_owed);
+    drop(no_routes);
+
+    // When a writable relay replaces the read-only relay, maintenance preserves
+    // the exact signed bytes, marks the old relay PolicyProhibited, and sends
+    // only to the writable relay.
+    let publisher = RecordingKeyPackages::default();
+    let mut switched = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[writable],
+    );
+    assert!(switched.key_package_network_maintenance_due().unwrap());
+    switched.run_due_maintenance().await.unwrap();
+    let calls = publisher.publications();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].endpoints, vec![TransportEndpoint(writable.into())]);
+    let promoted = slot_lifecycle(&switched);
+    assert_eq!(promoted.authored_signed_event, Some(signed_event));
+    assert!(promoted.publication_targets.iter().any(|target| {
+        target.endpoint == TransportEndpoint(read_only.into())
+            && target.state == TransportFanoutAttemptState::PolicyProhibited
+    }));
+    drop(switched);
+
+    // Part 2: Current publication fanout with one accepted relay and one failed
+    // relay that later becomes read-only (removed from routing).
+    let partial_db = dir.path().join("bob.sqlite");
+    let partial = PartialFanoutKeyPackages::default();
+    let mut fanout_runtime = slot_runtime(
+        current_session(partial_db.clone(), &key, b"bob"),
+        partial.clone(),
+        &wall,
+        0,
+        &[accepted, read_only],
+    );
+    fanout_runtime.publish_fresh_key_package().await.unwrap();
+    assert!(fanout_runtime.key_package_has_pending_fanout().unwrap());
+    drop(fanout_runtime);
+
+    // Removing the read-only relay from routing stops fanout scheduling and
+    // prevents any retry from contacting it.
+    let mut after_role_change = slot_runtime(
+        current_session(partial_db, &key, b"bob"),
+        partial.clone(),
+        &wall,
+        0,
+        &[accepted],
+    );
+    wall.set(now + 120);
+    assert!(!after_role_change.key_package_has_pending_fanout().unwrap());
+    after_role_change.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        partial.publications().len(),
+        1,
+        "fanout retry must not resend to a relay removed from routing"
+    );
+}

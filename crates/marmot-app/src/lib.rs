@@ -7166,20 +7166,22 @@ impl MarmotApp {
             .filter_map(|endpoint| RelayUrl::parse(endpoint).ok())
             .filter(|relay| !writes.contains(relay))
             .collect();
-        let fallback: Vec<_> = self
-            .relay_endpoints()
+        let default_endpoints = self.relay_endpoints();
+        let default_count = default_endpoints.len();
+        let fallback: Vec<_> = default_endpoints
             .into_iter()
             .filter(|endpoint| {
                 RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| !read_only.contains(&relay))
             })
             .collect();
-        if offered > 0 {
+        if offered > 0 || fallback.len() < default_count {
             tracing::warn!(
                 target: "marmot_app::relay_plane",
                 method = "key_package_endpoints",
                 offered = offered,
+                fallback_before_read_only = default_count,
                 fallback = fallback.len(),
-                "published account outbox has no usable endpoints; using configured defaults"
+                "published account outbox has no usable endpoints; using filtered configured defaults"
             );
         }
         Ok(fallback)

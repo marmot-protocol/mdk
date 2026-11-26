@@ -1694,18 +1694,24 @@ where
             );
             return self.publish_fresh_key_package().await;
         };
+        if lifecycle
+            .current_not_after
+            .is_some_and(|deadline| deadline <= self.wall_clock.now())
+        {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                method = "republish_key_package",
+                fallback_reason = "current_not_after_expired",
+                "no republishable current key package artifact; falling back to fresh publication"
+            );
+            return self.publish_fresh_key_package().await;
+        }
         self.ensure_key_package_announced(
             lifecycle
                 .current_key_package_ref
                 .as_deref()
                 .unwrap_or_default(),
         )?;
-        if lifecycle
-            .current_not_after
-            .is_some_and(|deadline| deadline <= self.wall_clock.now())
-        {
-            return self.publish_fresh_key_package().await;
-        }
 
         lifecycle.phase = cgka_traits::MaintenancePhase::Fanout;
         self.session.put_key_package_lifecycle(&lifecycle)?;
@@ -1877,6 +1883,12 @@ where
                 .as_ref()
                 .is_none_or(|pending| self.pending_replacement_obsolete(&lifecycle, pending, now))
         {
+            if endpoints.is_empty() {
+                return Err(crate::key_package::KeyPackagePublishError::unexposed(
+                    "no KeyPackage publication endpoints are configured",
+                )
+                .into());
+            }
             // Newer than every publication in the slot, a foreign one
             // included, and than its withdrawal: relays drop anything up to
             // that.
@@ -1927,15 +1939,11 @@ where
                     .collect(),
             )?;
         } else if let Some(pending) = lifecycle.pending_replacement.as_mut()
-            && !endpoints.is_empty()
+            && merge_republish_publication_targets(&mut pending.targets, &endpoints)
         {
             // Keep the exact durable signed KeyPackage and private material
             // when the account's write relays change before promotion (mdk#3747).
-            let before = pending.targets.clone();
-            merge_republish_publication_targets(&mut pending.targets, &endpoints);
-            if pending.targets != before {
-                self.session.put_key_package_lifecycle(&lifecycle)?;
-            }
+            self.session.put_key_package_lifecycle(&lifecycle)?;
         }
 
         if lifecycle
@@ -1947,17 +1955,24 @@ where
                 .pending_replacement
                 .as_ref()
                 .expect("unsigned pending replacement exists");
+            let active_endpoints: Vec<_> = pending
+                .targets
+                .iter()
+                .filter(|target| target.state != TransportFanoutAttemptState::PolicyProhibited)
+                .map(|target| target.endpoint.clone())
+                .collect();
+            if active_endpoints.is_empty() {
+                return Err(crate::key_package::KeyPackagePublishError::unexposed(
+                    "no KeyPackage publication endpoints are configured",
+                )
+                .into());
+            }
             let publication = KeyPackagePublication {
                 account_id: self.session.self_id().clone(),
                 key_package: pending.key_package.clone(),
                 slot_id: lifecycle.stable_slot_id.clone(),
                 created_at: pending.authored_created_at,
-                endpoints: pending
-                    .targets
-                    .iter()
-                    .filter(|target| target.state != TransportFanoutAttemptState::PolicyProhibited)
-                    .map(|target| target.endpoint.clone())
-                    .collect(),
+                endpoints: active_endpoints,
             };
             let artifact = self.key_packages.prepare_key_package(publication).await?;
             lifecycle
@@ -2016,17 +2031,24 @@ where
                 .as_ref()
                 .expect("prepared replacement has an exact signed event")
                 .clone();
+            let attempt_endpoints: Vec<_> = pending
+                .targets
+                .iter()
+                .filter(|target| target.state != TransportFanoutAttemptState::PolicyProhibited)
+                .map(|target| target.endpoint.clone())
+                .collect();
+            if attempt_endpoints.is_empty() {
+                return Err(crate::key_package::KeyPackagePublishError::unexposed(
+                    "no KeyPackage publication endpoints are configured",
+                )
+                .into());
+            }
             let publication = KeyPackagePublication {
                 account_id: self.session.self_id().clone(),
                 key_package: pending.key_package.clone(),
                 slot_id: lifecycle.stable_slot_id.clone(),
                 created_at: artifact.created_at,
-                endpoints: pending
-                    .targets
-                    .iter()
-                    .filter(|target| target.state != TransportFanoutAttemptState::PolicyProhibited)
-                    .map(|target| target.endpoint.clone())
-                    .collect(),
+                endpoints: attempt_endpoints,
             };
             let error = match self
                 .key_packages
@@ -2235,16 +2257,14 @@ where
             return Ok(false);
         }
         let now = self.wall_clock.now();
+        let current_endpoints = self.routing.key_package_endpoints();
         Ok(match self.session.key_package_lifecycle()? {
             None => true,
             Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
                 Some(pending) => {
                     self.pending_replacement_obsolete(&lifecycle, pending, now)
                         || pending.signed_event.is_none()
-                        || pending
-                            .targets
-                            .iter()
-                            .any(|target| key_package_target_retry_due(target, now))
+                        || pending_targets_need_publish(&pending.targets, &current_endpoints, now)
                 }
                 None => {
                     lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref
@@ -2309,6 +2329,7 @@ where
             return Ok(false);
         }
         let now = self.wall_clock.now();
+        let current_endpoints = self.routing.key_package_endpoints();
         // A withdrawn, superseded, or expired publication is replaced, not resent.
         Ok(self
             .session
@@ -2321,11 +2342,12 @@ where
                     && lifecycle.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
                     && lifecycle.authored_signed_event.is_some()
                     && lifecycle.publication_targets.iter().any(|target| {
-                        matches!(
-                            target.state,
-                            TransportFanoutAttemptState::Unattempted
-                                | TransportFanoutAttemptState::AttemptedFailed
-                        )
+                        current_endpoints.contains(&target.endpoint)
+                            && matches!(
+                                target.state,
+                                TransportFanoutAttemptState::Unattempted
+                                    | TransportFanoutAttemptState::AttemptedFailed
+                            )
                     })
             }))
     }
@@ -2440,10 +2462,30 @@ where
         let Some(artifact) = lifecycle.authored_signed_event.clone() else {
             return Ok(());
         };
+        let current_endpoints = self.routing.key_package_endpoints();
+        if prohibit_removed_fanout_targets(&mut lifecycle.publication_targets, &current_endpoints) {
+            if lifecycle.publication_targets.iter().all(|target| {
+                matches!(
+                    target.state,
+                    TransportFanoutAttemptState::Accepted
+                        | TransportFanoutAttemptState::PolicyProhibited
+                )
+            }) {
+                lifecycle.phase = cgka_traits::MaintenancePhase::Complete;
+            }
+            self.session.put_key_package_lifecycle(&lifecycle)?;
+        }
+        let now = self.wall_clock.now();
+        if lifecycle
+            .current_not_after
+            .is_some_and(|deadline| deadline <= now)
+        {
+            return Ok(());
+        }
         let endpoints = lifecycle
             .publication_targets
             .iter()
-            .filter(|target| key_package_target_retry_due(target, self.wall_clock.now()))
+            .filter(|target| key_package_target_retry_due(target, now))
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
         if endpoints.is_empty() {
@@ -2459,12 +2501,6 @@ where
                 .as_deref()
                 .unwrap_or_default(),
         )? {
-            return Ok(());
-        }
-        if lifecycle
-            .current_not_after
-            .is_some_and(|deadline| deadline <= self.wall_clock.now())
-        {
             return Ok(());
         }
         lifecycle.phase = cgka_traits::MaintenancePhase::Fanout;
@@ -8540,7 +8576,8 @@ fn current_key_package_republish_blocker(
 fn merge_republish_publication_targets(
     targets: &mut Vec<TransportFanoutTarget>,
     current_endpoints: &[TransportEndpoint],
-) {
+) -> bool {
+    let mut changed = false;
     for endpoint in current_endpoints {
         if let Some(target) = targets
             .iter_mut()
@@ -8551,6 +8588,7 @@ fn merge_republish_publication_targets(
                 target.attempt_count = 0;
                 target.last_attempt_at = None;
                 target.failure_code = None;
+                changed = true;
             }
             continue;
         }
@@ -8561,6 +8599,7 @@ fn merge_republish_publication_targets(
             last_attempt_at: None,
             failure_code: None,
         });
+        changed = true;
     }
     for target in targets.iter_mut() {
         if current_endpoints.contains(&target.endpoint) {
@@ -8571,7 +8610,47 @@ fn merge_republish_publication_targets(
         }
         target.state = TransportFanoutAttemptState::PolicyProhibited;
         target.failure_code = Some("endpoint_removed_from_policy".into());
+        changed = true;
     }
+    changed
+}
+
+fn prohibit_removed_fanout_targets(
+    targets: &mut [TransportFanoutTarget],
+    current_endpoints: &[TransportEndpoint],
+) -> bool {
+    let mut changed = false;
+    for target in targets {
+        if current_endpoints.contains(&target.endpoint)
+            || matches!(
+                target.state,
+                TransportFanoutAttemptState::Accepted
+                    | TransportFanoutAttemptState::PolicyProhibited
+            )
+        {
+            continue;
+        }
+        target.state = TransportFanoutAttemptState::PolicyProhibited;
+        target.failure_code = Some("endpoint_removed_from_policy".into());
+        changed = true;
+    }
+    changed
+}
+
+fn pending_targets_need_publish(
+    targets: &[TransportFanoutTarget],
+    current_endpoints: &[TransportEndpoint],
+    now: Timestamp,
+) -> bool {
+    current_endpoints.iter().any(|endpoint| {
+        targets
+            .iter()
+            .find(|target| target.endpoint == *endpoint)
+            .is_none_or(|target| {
+                target.state == TransportFanoutAttemptState::PolicyProhibited
+                    || key_package_target_retry_due(target, now)
+            })
+    })
 }
 
 fn note_key_package_attempt(
