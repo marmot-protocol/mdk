@@ -248,5 +248,5 @@ fn extended_activity_keeps_one_group_and_a_continuously_running_founder() {
     );
     assert!(!actions.iter().any(|a| matches!(&a.step,
         ScenarioStep::SetClientOffline { client } | ScenarioStep::RestartClient { client } if client == "alice")));
-    assert_eq!(case.generator_version, "1");
+    assert_eq!(case.generator_version, "2");
 }

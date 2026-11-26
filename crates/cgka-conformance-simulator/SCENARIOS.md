@@ -1277,7 +1277,7 @@ Keep those in the vector manifest. Add them here only if they become runnable `S
 
 ### Seeded app runtime faults and mixed recovery
 
-`public-app-stateful-recovery/v1` (generator version 1) emits bounded legal mixed histories for
+`public-app-stateful-recovery/v1` (generator version 2) emits bounded legal mixed histories for
 3–6 accounts, one device per account and one shared real local relay. Seed and case index drive the
 population, offline participant, shuffled operation motifs, additional motifs, message-burst lengths,
 admin/profile authors, removal/re-invitation targets, one/two offline intervals and recovery boundaries.
