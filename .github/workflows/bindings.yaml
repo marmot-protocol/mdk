@@ -194,6 +194,45 @@ jobs:
             echo "is_nightly=$is_nightly"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Stage UniFFI API reference
+        env:
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          # Historical snapshots still carry their reference in the source tree.
+          if [[ -f crates/marmot-uniffi/API-GUIDE.md ]]; then
+            python3 scripts/check_binding_docs.py
+          fi
+          python3 - <<'PY'
+          import os
+          import posixpath
+          import re
+          from pathlib import Path
+
+          repo = f'{os.environ["GITHUB_SERVER_URL"]}/{os.environ["GITHUB_REPOSITORY"]}'
+          sha = os.environ["SOURCE_SHA"]
+          crate = Path("crates/marmot-uniffi")
+          reference = crate / "API-REFERENCE.md"
+
+          def rebase(match):
+              path, anchor = match[1], match[2] or ""
+              if path.startswith("/"):
+                  return match[0]
+              source = posixpath.normpath(f"{crate}/{path}")
+              kind = "tree" if path.endswith("/") else "blob"
+              return f"]({repo}/{kind}/{sha}/{source}{anchor})"
+
+          output = Path(os.environ["RUNNER_TEMP"]) / reference.name
+          output.write_text(re.sub(r"\]\(([^)#:\s]+)(#[^)\s]*)?\)", rebase, reference.read_text()))
+          PY
+
+      - name: Upload UniFFI API reference
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: marmotkit-api-reference-${{ steps.identity.outputs.source_sha }}
+          path: ${{ runner.temp }}/API-REFERENCE.md
+          if-no-files-found: error
+
   apple-build:
     name: Build Apple input (${{ matrix.part }})
     runs-on: macos-latest
@@ -939,13 +978,15 @@ jobs:
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
         run: |
           set -euo pipefail
-          mkdir -p dist/ios dist/macos dist/android
+          mkdir -p dist/ios dist/macos dist/android dist/docs
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --name "marmotkit-ios-$SOURCE_SHA" --dir dist/ios
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --name "marmotkit-macos-$SOURCE_SHA" --dir dist/macos
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --name "marmotkit-android-$SOURCE_SHA" --dir dist/android
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "marmotkit-api-reference-$SOURCE_SHA" --dir dist/docs
 
       - name: Create and verify immutable release
         shell: bash
@@ -987,6 +1028,7 @@ jobs:
 
           Shared:
           - \`MarmotKit-$version.swift\`: generated Swift source matching both binaries.
+          - \`API-REFERENCE.md\`: UniFFI signatures and usage guidance, with links pinned to the source commit.
 
           Verify source and artifact provenance with \`marmotkit-ios-$version.manifest.json\`,
           \`marmotkit-macos-$version.manifest.json\`, and the matching \`.checksums.txt\` assets.
@@ -1026,7 +1068,7 @@ jobs:
             exit 1
           fi
 
-          assets=(dist/ios/* dist/macos/* dist/android/*)
+          assets=(dist/ios/* dist/macos/* dist/android/* dist/docs/API-REFERENCE.md)
           if [[ "$IS_NIGHTLY" == "true" ]]; then
             title="v$version - MarmotKit"
             release_flags=(--prerelease --latest=false --target "$SOURCE_SHA")
