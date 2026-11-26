@@ -228,7 +228,7 @@ impl SqliteAppStorage {
                         .map(|id| DraftAttachmentInput::Retained(id)),
                 );
             }
-            self.write_message_draft(&expected.group_id_hex, content, reply, &kept)?;
+            let _ = self.write_message_draft(&expected.group_id_hex, content, reply, &kept)?;
             Ok(self.selected_message_draft(&expected.group_id_hex)?)
         })
     }

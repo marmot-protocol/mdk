@@ -1392,8 +1392,8 @@ c_cmd! {
     /// `MARMOT_STATUS_OK` when unknown. Free with `marmot_string_free`.
     sync fn marmot_user_profile_website(account_id_hex: str) -> opt_string = user_profile_website;
 
-    /// Discard the stored draft for a conversation. Absent is not an
-    /// error.
+    /// Discard the active draft, if present. Use `marmot_delete_saved_message_draft`
+    /// to discard a saved draft.
     sync fn marmot_delete_message_draft(account_ref: str, group_id_hex: str) -> unit = delete_message_draft;
 
     /// Clear the group's encrypted Blossom avatar by committing the
@@ -1508,9 +1508,9 @@ c_cmd! {
     /// `marmot_identified_message_draft_summary_list_free`.
     sync fn marmot_group_message_drafts(account_ref: str, group_id_hex: str) -> rec(MarmotIdentifiedMessageDraftSummaryList) = group_message_drafts;
 
-    /// The stored draft for one conversation, with attachment bytes;
-    /// writes NULL with `MARMOT_STATUS_OK` when there is none. Free with
-    /// `marmot_message_draft_free`.
+    /// Load the active draft with attachment bytes. NULL with `MARMOT_STATUS_OK`
+    /// means the active slot is empty. Use `marmot_group_message_drafts` for saved
+    /// drafts. Free with `marmot_message_draft_free`.
     sync fn marmot_message_draft(account_ref: str, group_id_hex: str) -> opt_rec(MarmotMessageDraft) = message_draft;
 
     /// Check prospective members' KeyPackage readiness ahead of a group
@@ -2711,9 +2711,9 @@ pub unsafe extern "C" fn marmot_retired_relay_hosts(
     })
 }
 
-/// Store (or replace) the draft for a conversation. `attachments` are
-/// copied — the caller keeps ownership of every buffer. Free the result
-/// with `marmot_message_draft_free`.
+/// Save the active draft. An empty composition clears it and returns an empty
+/// snapshot. Attachment buffers are copied and remain owned by the caller.
+/// Free the result with `marmot_message_draft_free`.
 ///
 /// # Safety
 /// `client` must be a live handle; strings valid

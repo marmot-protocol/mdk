@@ -1748,7 +1748,7 @@ The active composer draft for an account and MLS group, if one exists.
 pub fn save_message_draft( &self, account_ref: String, group_id_hex: String, content: String, reply_to_message_id_hex: Option<String>, media_attachments: Vec<MessageDraftAttachmentFfi>, ) -> Result<MessageDraftFfi, MarmotKitError>
 ```
 
-Upsert a composer draft into the account's encrypted SQLCipher store.
+Save the active draft. An empty composition clears it and returns an empty snapshot.
 
 [Source](src/commands/draft.rs#L109)
 

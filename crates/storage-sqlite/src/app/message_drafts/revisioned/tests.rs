@@ -70,6 +70,72 @@ fn legacy_save_delete_recreate_never_reuses_a_draft_revision() {
     }
 }
 
+#[test]
+fn empty_message_draft_saves_clear_the_active_slot_and_keep_saved_drafts() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store);
+
+    app.save_message_draft(GROUP, "keep", None, &[]).unwrap();
+    let selected = app.selected_message_draft(GROUP).unwrap();
+    let saved = app.archive_message_draft(&selected.revision).unwrap();
+    let active = app.save_message_draft(GROUP, "clear", None, &[]).unwrap();
+    let cleared = app.save_message_draft(GROUP, "", None, &[]).unwrap();
+    assert_eq!(cleared.created_at_ms, active.created_at_ms);
+    assert!(cleared.content.is_empty());
+    assert!(app.message_draft(GROUP).unwrap().is_none());
+
+    let empty = app.selected_message_draft(GROUP).unwrap();
+    let reply = "ab".repeat(32);
+    let reply_only = app
+        .save_message_draft_if_revision(&empty.revision, "", Some(&reply), &[])
+        .unwrap();
+    assert_eq!(
+        reply_only.draft.unwrap().reply_to_message_id_hex,
+        Some(reply)
+    );
+    let cleared = app
+        .save_message_draft_if_revision(&reply_only.revision, "", None, &[])
+        .unwrap();
+    assert!(cleared.draft.is_none());
+    assert!(matches!(
+        app.archive_message_draft(&reply_only.revision),
+        Err(MessageDraftRevisionError::Conflict)
+    ));
+    assert_eq!(app.group_message_drafts(GROUP).unwrap()[0].id, saved);
+    assert_eq!(app.group_message_drafts(GROUP).unwrap().len(), 1);
+}
+
+#[test]
+fn local_group_wipe_cascades_to_active_and_saved_message_drafts() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store);
+
+    app.save_message_draft(GROUP, "saved", None, &[attachment()])
+        .unwrap();
+    let active = app.selected_message_draft(GROUP).unwrap();
+    app.archive_message_draft(&active.revision).unwrap();
+    app.save_message_draft(GROUP, "active", None, &[attachment()])
+        .unwrap();
+    assert_eq!(app.group_message_drafts(GROUP).unwrap().len(), 2);
+
+    assert!(store.delete_local_group_data(GROUP).unwrap().did_delete());
+    let conn = store.lock().unwrap();
+    for table in [
+        "message_drafts",
+        "message_draft_bodies",
+        "message_draft_attachments",
+    ] {
+        let remaining: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0, "{table}");
+    }
+}
+
 use cgka_traits::storage::{OutboundIntentStorage, QueuedOutboundIntent, StorageProvider};
 use cgka_traits::{GroupId, MessageId, SendIntent};
 const GROUP: &str = "22222222222222222222222222222222";

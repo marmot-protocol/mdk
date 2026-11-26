@@ -11822,8 +11822,8 @@ MarmotStatus marmot_user_profile_website(const struct MarmotClient *client,
                                          char **out);
 
 /**
- * Discard the stored draft for a conversation. Absent is not an
- * error.
+ * Discard the active draft, if present. Use `marmot_delete_saved_message_draft`
+ * to discard a saved draft.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -12225,9 +12225,9 @@ MarmotStatus marmot_group_message_drafts(const struct MarmotClient *client,
                                          struct MarmotIdentifiedMessageDraftSummaryList **out);
 
 /**
- * The stored draft for one conversation, with attachment bytes;
- * writes NULL with `MARMOT_STATUS_OK` when there is none. Free with
- * `marmot_message_draft_free`.
+ * Load the active draft with attachment bytes. NULL with `MARMOT_STATUS_OK`
+ * means the active slot is empty. Use `marmot_group_message_drafts` for saved
+ * drafts. Free with `marmot_message_draft_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -12992,9 +12992,9 @@ MarmotStatus marmot_retired_relay_hosts(const struct MarmotClient *client,
                                         struct MarmotStringList **out);
 
 /**
- * Store (or replace) the draft for a conversation. `attachments` are
- * copied — the caller keeps ownership of every buffer. Free the result
- * with `marmot_message_draft_free`.
+ * Save the active draft. An empty composition clears it and returns an empty
+ * snapshot. Attachment buffers are copied and remain owned by the caller.
+ * Free the result with `marmot_message_draft_free`.
  *
  * # Safety
  * `client` must be a live handle; strings valid

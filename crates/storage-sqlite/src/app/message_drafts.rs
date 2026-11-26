@@ -245,7 +245,8 @@ impl SqliteAppStorage {
     }
 
     /// Transactionally validate the group and upsert a draft plus its ordered
-    /// attachments, preserving unchanged attachment rows.
+    /// attachments. An empty composition clears the active draft and returns
+    /// an empty snapshot for compatibility.
     pub fn save_message_draft(
         &self,
         group_id_hex: &str,
@@ -259,12 +260,14 @@ impl SqliteAppStorage {
             .map(DraftAttachmentInput::Inline)
             .collect::<Vec<_>>();
         self.connection.with_transaction(|| {
-            self.write_message_draft(
+            if let Some(cleared) = self.write_message_draft(
                 group_id_hex,
                 content,
                 reply_to_message_id_hex,
                 &media_attachments,
-            )?;
+            )? {
+                return Ok(cleared);
+            }
             let conn = self.lock()?;
             load_message_draft(&conn, group_id_hex)?.ok_or_else(|| {
                 StorageError::Backend("saved message draft could not be reloaded".to_owned())
@@ -272,16 +275,15 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Write only: revisioned callers need descriptor metadata, not a second
-    /// hydrated copy of every attachment that the host just supplied. Callers
-    /// validate waveform samples before entering their outer transaction.
+    /// Write without hydrating attachments. Returns the compatibility snapshot
+    /// when an empty save clears the composer. Callers validate waveform samples.
     fn write_message_draft(
         &self,
         group_id_hex: &str,
         content: &str,
         reply_to_message_id_hex: Option<&str>,
         media_attachments: &[DraftAttachmentInput<'_>],
-    ) -> StorageResult<()> {
+    ) -> StorageResult<Option<StoredMessageDraft>> {
         let now_ms = unix_now_ms();
         self.connection.with_transaction(|| {
             let mut conn = self.lock()?;
@@ -295,6 +297,28 @@ impl SqliteAppStorage {
                 .storage()?;
             if !group_exists {
                 return Err(StorageError::NotFound);
+            }
+            if content.is_empty() && reply_to_message_id_hex.is_none() && media_attachments.is_empty()
+            {
+                let created_at_ms = tx
+                    .query_row_cached(
+                        "SELECT created_at_ms FROM message_drafts WHERE group_id_hex = ?1 AND active = 1",
+                        [group_id_hex],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .storage()?
+                    .unwrap_or(now_ms);
+                revisioned::end_composition_tx(&tx, group_id_hex)?;
+                tx.commit().storage()?;
+                return Ok(Some(StoredMessageDraft {
+                    group_id_hex: group_id_hex.to_owned(),
+                    content: String::new(),
+                    reply_to_message_id_hex: None,
+                    media_attachments: Vec::new(),
+                    created_at_ms,
+                    updated_at_ms: now_ms,
+                }));
             }
             let before = saved::DraftQuotaUsage::read(&tx, group_id_hex)?;
             let (draft_id, rowid): ([u8; 16], i64) = tx
@@ -316,17 +340,11 @@ impl SqliteAppStorage {
                  ON CONFLICT(draft_rowid) DO UPDATE SET content = excluded.content",
                 params![rowid, content],
             )
-            .map_err(|error| {
-                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::TooBig) {
-                    StorageError::MessageDraftQuotaExceeded
-                } else {
-                    crate::base::codec::map_sqlite_error(error)
-                }
-            })?;
+            .map_err(draft_write_error)?;
             sync_message_draft_attachments(&tx, &draft_id, media_attachments)?;
             saved::DraftQuotaUsage::read(&tx, group_id_hex)?.check_growth_from(&before)?;
             tx.commit().storage()?;
-            Ok(())
+            Ok(None)
         })
     }
 
@@ -568,7 +586,7 @@ fn insert_message_draft_attachment(
             waveform_samples,
         ],
     )
-    .storage()?;
+    .map_err(draft_write_error)?;
     Ok(())
 }
 
@@ -599,7 +617,7 @@ fn update_message_draft_attachment(
                 waveform_samples,
             ],
         )
-        .storage()?;
+        .map_err(draft_write_error)?;
     } else {
         tx.execute_cached(
             "UPDATE message_draft_attachments
@@ -619,9 +637,17 @@ fn update_message_draft_attachment(
                 waveform_samples,
             ],
         )
-        .storage()?;
+        .map_err(draft_write_error)?;
     }
     Ok(())
+}
+
+fn draft_write_error(error: rusqlite::Error) -> StorageError {
+    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::TooBig) {
+        StorageError::MessageDraftQuotaExceeded
+    } else {
+        crate::base::codec::map_sqlite_error(error)
+    }
 }
 
 fn encoded_waveform_samples(attachment: &StoredMessageDraftAttachment) -> StorageResult<String> {
@@ -1177,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn message_draft_text_above_sqlite_limit_returns_quota_error() {
+    fn message_draft_writes_above_sqlite_limit_return_quota_error() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         let app = storage.app_storage();
         storage
@@ -1187,7 +1213,18 @@ mod tests {
                 "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES ('chat','',0);",
             )
             .unwrap();
-        app.save_message_draft("chat", "draft", None, &[]).unwrap();
+        let mut attachment = StoredMessageDraftAttachment {
+            id: "existing".to_owned(),
+            file_name: "test.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            plaintext: vec![1],
+            dim: None,
+            thumbhash: None,
+            duration_seconds: None,
+            waveform_samples: Vec::new(),
+        };
+        app.save_message_draft("chat", "draft", None, std::slice::from_ref(&attachment))
+            .unwrap();
         let before = app.selected_message_draft("chat").unwrap();
         app.lock()
             .unwrap()
@@ -1198,6 +1235,14 @@ mod tests {
             app.save_message_draft("chat", &"a".repeat(8_001), None, &[]),
             Err(StorageError::MessageDraftQuotaExceeded)
         ));
+        attachment.plaintext.resize(8_001, 1);
+        for id in ["existing", "new"] {
+            attachment.id = id.to_owned();
+            assert!(matches!(
+                app.save_message_draft("chat", "edit", None, std::slice::from_ref(&attachment)),
+                Err(StorageError::MessageDraftQuotaExceeded)
+            ));
+        }
         let after = app.selected_message_draft("chat").unwrap();
         assert_eq!(after.revision, before.revision);
         assert_eq!(after.draft, before.draft);

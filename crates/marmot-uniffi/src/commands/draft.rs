@@ -105,7 +105,7 @@ impl Marmot {
             .map(Into::into))
     }
 
-    /// Upsert a composer draft into the account's encrypted SQLCipher store.
+    /// Save the active draft. An empty composition clears it and returns an empty snapshot.
     pub fn save_message_draft(
         &self,
         account_ref: String,

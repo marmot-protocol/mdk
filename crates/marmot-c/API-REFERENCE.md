@@ -1914,7 +1914,7 @@ Fetch a profile image by URL, refusing anything over `max_bytes`. Free the buffe
 MarmotStatus marmot_delete_message_draft(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex);
 ```
 
-Discard the stored draft for a conversation. Absent is not an error.
+Discard the active draft, if present. Use `marmot_delete_saved_message_draft` to discard a saved draft.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotdelete_message_draft) · [Header contract](include/marmot.h#L11834)
 
@@ -2943,7 +2943,7 @@ Lists active composer drafts for the account with attachment metadata. Use `marm
 MarmotStatus marmot_message_draft(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, struct MarmotMessageDraft **out);
 ```
 
-The stored draft for one conversation, with attachment bytes; writes NULL with `MARMOT_STATUS_OK` when there is none. Free with `marmot_message_draft_free`.
+Load the active draft with attachment bytes. NULL with `MARMOT_STATUS_OK` means the active slot is empty. Use `marmot_group_message_drafts` for saved drafts. Free with `marmot_message_draft_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotmessage_draft) · [Header contract](include/marmot.h#L12238)
 
@@ -5040,7 +5040,7 @@ Whether this client's storage has been closed (by `marmot_client_shutdown_and_cl
 MarmotStatus marmot_save_message_draft(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *content, const char *reply_to_message_id_hex, const struct MarmotMessageDraftAttachmentInput *attachments, uintptr_t attachments_len, struct MarmotMessageDraft **out);
 ```
 
-Store (or replace) the draft for a conversation. `attachments` are copied — the caller keeps ownership of every buffer. Free the result with `marmot_message_draft_free`.
+Save the active draft. An empty composition clears it and returns an empty snapshot. Attachment buffers are copied and remain owned by the caller. Free the result with `marmot_message_draft_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsave_message_draft) · [Header contract](include/marmot.h#L13005)
 

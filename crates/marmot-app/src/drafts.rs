@@ -626,10 +626,10 @@ impl MarmotApp {
             .map(Into::into))
     }
 
-    /// Validate and upsert one composer draft in the account's encrypted store.
-    /// Attachment identifiers must be unique, and all numeric media metadata
-    /// must be finite so callers receive a typed validation error rather than a
-    /// storage-backend failure.
+    /// Save the active composer in the account's encrypted store. An empty
+    /// composition clears the active draft and returns an empty snapshot.
+    /// Attachment identifiers must be unique, and numeric media metadata
+    /// must be finite.
     pub fn save_message_draft(
         &self,
         account_ref: &str,
