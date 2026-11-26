@@ -107,7 +107,10 @@ files, then:
 
 1. **Question the need**: is the change needed now, does it treat a symptom
    rather than the root cause, is there a smaller change (including none)?
-2. **Review the code** for real defects.
+2. **Review the code** for real defects, and verify the stated release impact
+   (`Release-Impact: none | patch | minor` and any `changelog.d/` fragments):
+   a breaking public API, binding, storage-migration, or wire change must be
+   classified `minor` with a `### Breaking changes` fragment.
 3. **Judge simplicity** against [karpathy-guidelines.md](karpathy-guidelines.md)
    and [simplicity-guidelines.md](simplicity-guidelines.md): fewer lines, net
    deletions, no needless abstraction, duplication, dead code or drive-by

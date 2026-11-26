@@ -68,6 +68,13 @@ reviews of the local diff (`.agents/skills/review-local`) until both recommend m
 (`.agents/skills/gh-create-pr`) brought to a green pre-check with no conflicts, then a report. Enqueue only when the
 user asks, and then own the queue result until the change merges.
 
+Record three commit trailers on the final signed commit (which GitHub preserves in squash commits under
+`COMMIT_MESSAGES`), and verify them locally with `just pr-trailers-check`:
+
+- `Local-Checks: <commands run locally>`
+- `Local-Review: <seat-a> + <seat-b> merge @ <short-sha>` (or `human` / `exempt (<reason>)`)
+- `Release-Impact: none | patch | minor` — cross-checked against any `changelog.d/<slug>.md` fragments (`### Breaking changes` requires `minor`; non-breaking user-facing fragments forbid `none`).
+
 ## Documentation
 
 - `README.md` files are for humans: what it is, how to use it, where to go next. `AGENTS.md` files are for agents:

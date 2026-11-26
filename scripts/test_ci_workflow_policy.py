@@ -1344,6 +1344,18 @@ sha256sum() { shasum -a 256 "$@"; }
             self.assertFalse((Path(tmp) / "cargo-nextest-0.9.132").exists())
             self.assertFalse((Path(tmp) / "path").exists())
 
+    def test_rust_format_runs_pr_trailer_contract_and_advisory_check(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        rust_format = workflow.split("\n  rust-format:\n", 1)[1].split("\n  rust-audit:\n", 1)[0]
+        self.assertIn(
+            "fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}",
+            rust_format,
+        )
+        script = workflow_step("ci.yml", "PR commit trailers (advisory)")
+        self.assertIn("python3 scripts/test_check_pr_trailers.py", script)
+        self.assertIn("python3 scripts/check_pr_trailers.py --advisory", script)
+        self.assertNotIn("${{", script)
+
 
 if __name__ == "__main__":
     unittest.main()
