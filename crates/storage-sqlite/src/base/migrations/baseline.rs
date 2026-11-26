@@ -10,72 +10,54 @@
 //! one transaction, records the covered migrations, and replays only later
 //! ones. A database with any ledger row never uses it.
 //!
-//! Values a fresh database draws for itself while migrating
-//! ([`RENEWED_PER_DATABASE`]) are stored as zeros in the file and drawn again
-//! after it is applied, so every new database keeps its own. Only columns the
-//! baseline creates are drawn here; a later migration that adds one draws it
-//! in its own body.
+//! Seed rows are inserted before triggers are created, and values a fresh
+//! database draws for itself while migrating ([`RENEWED_PER_DATABASE`]) are
+//! emitted as their SQL generator expressions in `baseline.sql`, so every new
+//! database draws its own without running a post-load `UPDATE` or firing
+//! triggers.
 //!
 //! `tests::baseline_file_matches_a_full_replay` fails if the file and a replay
 //! differ. Regenerate it after changing that range (registered migrations never
 //! change) with `MDK_WRITE_MIGRATION_BASELINE=1 cargo test -p storage-sqlite
-//! baseline_file_matches_a_full_replay`, or raise `BASELINE_VERSION` the same
-//! way so a new head joins the fast path.
+//! baseline_file_matches_a_full_replay`, or raise `BASELINE_VERSION` (up to
+//! `HEAD`) the same way so newer migrations join the fast path.
 use super::Migration;
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, TransactionBehavior, params};
 
 /// The last migration `baseline.sql` covers.
-pub(crate) const BASELINE_VERSION: i64 = 218;
+pub(crate) const BASELINE_VERSION: i64 = 227;
 
-/// The values a fresh database draws for itself while migrating, as
-/// (table, column, the statement that draws a new one). A migration that adds
-/// one needs a line here; `cross::migrated_template`'s
+/// A value a fresh database draws for itself while migrating. A migration that
+/// adds one needs an entry in [`RENEWED_PER_DATABASE`]; `cross::migrated_template`'s
 /// `two_fresh_databases_differ_only_in_renewed_values` finds it, including
 /// values drawn from the clock.
-pub(crate) const RENEWED_PER_DATABASE: &[(&str, &str, &str)] = &[
-    (
-        "chat_presentation_meta",
-        "store_epoch",
-        "UPDATE chat_presentation_meta SET store_epoch = randomblob(16)",
-    ),
-    (
-        "cgka_schema_migrations",
-        "applied_at_unix_seconds",
-        "UPDATE cgka_schema_migrations \
-         SET applied_at_unix_seconds = CAST(strftime('%s', 'now') AS INTEGER)",
-    ),
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct RenewedColumn {
+    pub(crate) table: &'static str,
+    pub(crate) column: &'static str,
+    pub(crate) expression: &'static str,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const RENEWED_PER_DATABASE: &[RenewedColumn] = &[
+    RenewedColumn {
+        table: "chat_presentation_meta",
+        column: "store_epoch",
+        expression: "randomblob(16)",
+    },
+    RenewedColumn {
+        table: "cgka_schema_migrations",
+        column: "applied_at_unix_seconds",
+        expression: "CAST(strftime('%s', 'now') AS INTEGER)",
+    },
 ];
 
 const BASELINE_SQL: &str = include_str!("baseline.sql");
 
 /// Tables the runner writes itself; their rows are not part of the baseline.
 const LEDGER_TABLES: [&str; 2] = ["cgka_schema_migrations", "cgka_database_origin"];
-
-/// The renewals for columns `connection` has outside the ledger tables. The
-/// ledger rows are written after the baseline with the current time, and a
-/// column a later migration adds does not exist yet.
-fn renewals_present(
-    connection: &Connection,
-) -> rusqlite::Result<Vec<&'static (&'static str, &'static str, &'static str)>> {
-    let mut present = Vec::new();
-    for renewal in RENEWED_PER_DATABASE {
-        let (table, column, _) = renewal;
-        if LEDGER_TABLES.contains(table) {
-            continue;
-        }
-        let exists: bool = connection.query_row(
-            "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
-            params![table, column],
-            |row| row.get(0),
-        )?;
-        if exists {
-            present.push(renewal);
-        }
-    }
-    Ok(present)
-}
 
 /// Whether `connection` holds the two ledger tables, empty, and no other
 /// schema object (not even an index or trigger on them). Any other database
@@ -92,9 +74,9 @@ fn starts_empty(connection: &Connection) -> rusqlite::Result<bool> {
     )
 }
 
-/// Apply the baseline to a database that [`starts_empty`], draw its own
-/// per-database values and record every migration it covers. Progress names
-/// [`BASELINE_VERSION`] once and reports the committed ledger count.
+/// Apply the baseline to a database that [`starts_empty`] and record every
+/// migration it covers. Progress names [`BASELINE_VERSION`] once and reports
+/// the committed ledger count.
 pub(super) fn apply(
     connection: &mut Connection,
     migrations: &[Migration],
@@ -126,10 +108,11 @@ pub(super) fn apply(
         if !starts_empty(&tx).storage()? {
             return Ok(0);
         }
+        // Defer FK enforcement until COMMIT so alphabetical seed inserts across
+        // referencing tables succeed while still validating FKs before commit.
+        tx.pragma_update(None, "defer_foreign_keys", true)
+            .storage()?;
         tx.execute_batch(BASELINE_SQL).storage()?;
-        for (_, _, renew) in renewals_present(&tx).storage()? {
-            tx.execute_batch(renew).storage()?;
-        }
         for migration in &covered {
             super::record_applied(&tx, migration)?;
         }
@@ -150,16 +133,29 @@ pub(super) fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::base::migrations::{MIGRATIONS, run, run_all, run_through};
+    use crate::base::migrations::{
+        MIGRATIONS, run, run_all, run_through, run_with_summary_observed,
+    };
 
-    /// The schema and rows of `connection` as replayable SQL, in an order that
-    /// creates tables before the indexes, views and triggers that use them.
-    /// Renewed values are dumped as zeros.
-    pub(super) fn dump(connection: &Connection) -> String {
-        let mut out = String::from(
-            "-- Generated by storage-sqlite migrations::baseline::tests::dump; do not edit.\n",
-        );
-        for kind in ["table", "index", "view", "trigger"] {
+    /// Open an in-memory database with foreign keys enabled, matching production opens.
+    fn open_in_memory_fk() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn
+    }
+
+    #[derive(Clone, Copy)]
+    enum RenewedRender {
+        /// Emit the SQL generator expression so `baseline.sql` draws fresh
+        /// per-database values directly on insert.
+        Expression,
+        /// Mask renewed values to type- and length-matched zeros so two
+        /// databases compare equal by everything they share.
+        Zeroed,
+    }
+
+    fn dump_objects(connection: &Connection, kinds: &[&str], out: &mut String) {
+        for kind in kinds {
             let mut statement = connection
                 .prepare(
                     "SELECT name, sql FROM sqlite_schema
@@ -182,15 +178,32 @@ mod tests {
                 out.push_str(";\n");
             }
         }
-        out.push_str(&dump_rows(connection, |name| {
-            !LEDGER_TABLES.contains(&name)
-        }));
+    }
+
+    /// The schema and rows of `connection` as replayable SQL: tables, indexes,
+    /// and views first, then seed rows (with renewed columns emitted as their
+    /// generator expressions), then triggers so seed inserts never trip triggers.
+    pub(super) fn dump(connection: &Connection) -> String {
+        let mut out = String::from(
+            "-- Generated by storage-sqlite migrations::baseline::tests::dump; do not edit.\n",
+        );
+        dump_objects(connection, &["table", "index", "view"], &mut out);
+        out.push_str(&dump_rows(
+            connection,
+            |name| !LEDGER_TABLES.contains(&name),
+            RenewedRender::Expression,
+        ));
+        dump_objects(connection, &["trigger"], &mut out);
         out
     }
 
     /// `INSERT` statements for every row of every table `keep` selects, plus
-    /// `sqlite_sequence`, in a stable order. Renewed values are read as zeros.
-    fn dump_rows(connection: &Connection, keep: impl Fn(&str) -> bool) -> String {
+    /// `sqlite_sequence`, in a stable order.
+    fn dump_rows(
+        connection: &Connection,
+        keep: impl Fn(&str) -> bool,
+        renewed_render: RenewedRender,
+    ) -> String {
         let mut tables = connection
             .prepare(
                 "SELECT name FROM sqlite_schema WHERE type = 'table'
@@ -202,11 +215,6 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         tables.retain(|name| keep(name));
-        let renewed = renewals_present(connection)
-            .unwrap()
-            .into_iter()
-            .map(|(table, column, _)| (*table, *column))
-            .collect::<Vec<_>>();
         let mut out = String::new();
         for table in tables {
             let mut columns = connection
@@ -237,21 +245,30 @@ mod tests {
                     .unwrap();
                 assert!(!truncated, "{table}.{column} holds text with a NUL");
             }
-            // A value the database drew for itself reads as zeros of the same
-            // type and size, so two databases compare by what they share. It is
-            // rewritten in the read, not stored: an update would fire triggers.
+            // Rewritten in the SELECT, never stored via UPDATE: an update would
+            // fire triggers and mutate the database being inspected.
             let quoted = columns
                 .iter()
                 .map(|column| {
-                    if renewed.contains(&(table.as_str(), column.as_str())) {
-                        format!(
+                    let renewed = RENEWED_PER_DATABASE.iter().find(|entry| {
+                        !LEDGER_TABLES.contains(&entry.table)
+                            && entry.table == table
+                            && entry.column == column
+                    });
+                    match (renewed, renewed_render) {
+                        (Some(entry), RenewedRender::Expression) => {
+                            let escaped = entry.expression.replace('\'', "''");
+                            format!(
+                                "CASE WHEN \"{column}\" IS NULL THEN 'NULL' ELSE '{escaped}' END"
+                            )
+                        }
+                        (Some(_), RenewedRender::Zeroed) => format!(
                             "quote(CASE typeof(\"{column}\")
                                 WHEN 'blob' THEN zeroblob(length(\"{column}\"))
                                 WHEN 'integer' THEN 0 WHEN 'real' THEN 0.0 WHEN 'text' THEN ''
                                 ELSE \"{column}\" END)"
-                        )
-                    } else {
-                        format!("quote(\"{column}\")")
+                        ),
+                        (None, _) => format!("quote(\"{column}\")"),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -293,9 +310,11 @@ mod tests {
             .unwrap()
             .join("\n");
         schema.push('\n');
-        schema.push_str(&dump_rows(connection, |name| {
-            !LEDGER_TABLES.contains(&name)
-        }));
+        schema.push_str(&dump_rows(
+            connection,
+            |name| !LEDGER_TABLES.contains(&name),
+            RenewedRender::Zeroed,
+        ));
         let ledger = connection
             .prepare("SELECT version || ' ' || name FROM cgka_schema_migrations ORDER BY version")
             .unwrap()
@@ -318,12 +337,16 @@ mod tests {
     }
 
     /// The checked-in file is exactly what a full replay through
-    /// `BASELINE_VERSION` dumps. Set `MDK_WRITE_MIGRATION_BASELINE=1` to rewrite it.
+    /// `BASELINE_VERSION` dumps, and dumping itself never writes to the
+    /// database. Set `MDK_WRITE_MIGRATION_BASELINE=1` to rewrite the file.
     #[test]
     fn baseline_file_matches_a_full_replay() {
-        let mut conn = Connection::open_in_memory().unwrap();
+        let mut conn = open_in_memory_fk();
         run_through(&mut conn, BASELINE_VERSION).unwrap();
+        let changes_before = conn.total_changes();
         let replayed = dump(&conn);
+        assert_eq!(conn.total_changes(), changes_before, "dump must not write");
+        assert_eq!(dump(&conn), replayed, "dump must be deterministic");
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/base/migrations/baseline.sql");
         if std::env::var_os("MDK_WRITE_MIGRATION_BASELINE").is_some() {
@@ -349,30 +372,33 @@ mod tests {
     }
 
     /// A fresh open through the baseline ends in the same observable state as
-    /// replaying every registered migration, and a second open applies nothing.
+    /// replaying every registered migration, draws its own per-database values,
+    /// and a second open applies nothing.
     #[test]
     fn fresh_baseline_open_matches_replaying_every_migration() {
-        let mut replayed = Connection::open_in_memory().unwrap();
+        let mut replayed = open_in_memory_fk();
         run(&mut replayed, MIGRATIONS).unwrap();
 
-        let mut fresh = Connection::open_in_memory().unwrap();
-        let progress = std::cell::RefCell::new(Vec::new());
-        let observer = |value| progress.borrow_mut().push(value);
-        assert_eq!(
-            super::super::run_all_observed(&mut fresh, Some(&observer)).unwrap(),
-            MIGRATIONS.len()
-        );
+        let mut fresh = open_in_memory_fk();
+        assert_eq!(run_all(&mut fresh).unwrap(), MIGRATIONS.len());
         assert_same_state(&fresh, &replayed);
-        let progress = progress.into_inner();
-        let tail = MIGRATIONS.last().unwrap().version as u32;
-        assert!(tail > BASELINE_VERSION as u32);
-        assert!(
-            progress.contains(&crate::StorageOpenProgress::MigrationFinished {
-                version: tail,
-                success: true,
-            })
-        );
         assert_eq!(run_all(&mut fresh).unwrap(), 0);
+
+        let mut second = open_in_memory_fk();
+        assert_eq!(run_all(&mut second).unwrap(), MIGRATIONS.len());
+        let first_epoch: Vec<u8> = fresh
+            .query_row("SELECT store_epoch FROM chat_presentation_meta", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let second_epoch: Vec<u8> = second
+            .query_row("SELECT store_epoch FROM chat_presentation_meta", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(first_epoch.len(), 16);
+        assert_ne!(first_epoch, vec![0u8; 16]);
+        assert_ne!(first_epoch, second_epoch);
 
         let violations: i64 = fresh
             .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
@@ -386,11 +412,63 @@ mod tests {
         assert_eq!(integrity, "ok");
     }
 
+    /// Migrations registered after `BASELINE_VERSION` replay normally after the
+    /// baseline commits, even when `BASELINE_VERSION` equals the current head.
+    #[test]
+    fn baseline_is_followed_by_later_migrations() {
+        use crate::StorageOpenProgress::{
+            MigrationBatchFinished, MigrationFinished, MigrationStarted,
+        };
+
+        let tail_version = MIGRATIONS.last().unwrap().version + 1;
+        let mut extended = MIGRATIONS.to_vec();
+        extended.push(Migration {
+            version: tail_version,
+            name: "9999_baseline_tail_probe",
+            suspend_foreign_keys: &[],
+            apply: |tx| {
+                tx.execute_batch("CREATE TABLE baseline_tail_probe (id INTEGER PRIMARY KEY);")
+                    .storage()
+            },
+        });
+
+        let mut fresh = open_in_memory_fk();
+        let progress = std::cell::RefCell::new(Vec::new());
+        let observer = |value| progress.borrow_mut().push(value);
+        assert_eq!(
+            run_with_summary_observed(&mut fresh, &extended, true, Some(&observer)).unwrap(),
+            extended.len()
+        );
+
+        let mut replayed = open_in_memory_fk();
+        run(&mut replayed, &extended).unwrap();
+        assert_same_state(&fresh, &replayed);
+
+        let baseline = BASELINE_VERSION as u32;
+        let covered_count = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= BASELINE_VERSION)
+            .count() as u32;
+        let tail = tail_version as u32;
+        let progress = progress.into_inner();
+        assert!(progress.contains(&MigrationStarted(baseline)));
+        assert!(progress.contains(&MigrationBatchFinished {
+            version: baseline,
+            success: true,
+            migrations_completed: covered_count,
+        }));
+        assert!(progress.contains(&MigrationStarted(tail)));
+        assert!(progress.contains(&MigrationFinished {
+            version: tail,
+            success: true,
+        }));
+    }
+
     /// A failure while recording the ledger rolls the whole baseline back and
     /// progress reports it as failed.
     #[test]
     fn a_failed_ledger_write_rolls_back_the_baseline_and_reports_failure() {
-        let mut conn = Connection::open_in_memory().unwrap();
+        let mut conn = open_in_memory_fk();
         run_through(&mut conn, 0).unwrap();
         conn.execute_batch(&format!(
             "CREATE TEMP TRIGGER refuse_ledger BEFORE INSERT ON main.cgka_schema_migrations
@@ -432,6 +510,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("baseline.sqlite");
         let mut first = Connection::open(&path).unwrap();
+        first.pragma_update(None, "foreign_keys", true).unwrap();
         run_through(&mut first, 0).unwrap();
         let version = BASELINE_VERSION as u32;
         let competing = std::cell::RefCell::new(None);
@@ -440,6 +519,7 @@ mod tests {
             progress.borrow_mut().push(value);
             if value == MigrationStarted(version) {
                 let mut other = Connection::open(&path).unwrap();
+                other.pragma_update(None, "foreign_keys", true).unwrap();
                 other.busy_timeout(std::time::Duration::ZERO).unwrap();
                 *competing.borrow_mut() = Some(apply(&mut other, MIGRATIONS, None));
             }
@@ -475,7 +555,7 @@ mod tests {
             "CREATE TABLE sqliteX_notes (id INTEGER PRIMARY KEY)",
             "CREATE INDEX ledger_names ON cgka_schema_migrations(name)",
         ] {
-            let mut conn = Connection::open_in_memory().unwrap();
+            let mut conn = open_in_memory_fk();
             run_through(&mut conn, 0).unwrap();
             conn.execute_batch(extra).unwrap();
             assert_eq!(apply(&mut conn, MIGRATIONS, None).unwrap(), 0, "{extra}");
@@ -488,27 +568,15 @@ mod tests {
         }
     }
 
-    /// Dumping reads only: rewriting a renewed value in place would fire the
-    /// store-reset triggers and could delete the rows a comparison is for.
-    #[test]
-    fn dumping_never_writes() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        run_through(&mut conn, BASELINE_VERSION).unwrap();
-        let before = conn.total_changes();
-        let first = dump(&conn);
-        assert_eq!(conn.total_changes(), before);
-        assert_eq!(dump(&conn), first);
-    }
-
     /// A database with any ledger row keeps replaying migrations one by one.
     #[test]
     fn partially_migrated_databases_never_take_the_baseline() {
-        let mut conn = Connection::open_in_memory().unwrap();
+        let mut conn = open_in_memory_fk();
         run_through(&mut conn, 1).unwrap();
         assert_eq!(apply(&mut conn, MIGRATIONS, None).unwrap(), 0);
         assert_eq!(run_all(&mut conn).unwrap(), MIGRATIONS.len() - 1);
 
-        let mut replayed = Connection::open_in_memory().unwrap();
+        let mut replayed = open_in_memory_fk();
         run(&mut replayed, MIGRATIONS).unwrap();
         assert_same_state(&conn, &replayed);
     }

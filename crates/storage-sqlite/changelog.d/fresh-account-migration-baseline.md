@@ -1,6 +1,6 @@
 ### Changed
 
-- A new account database applies its schema through migration 218 in one transaction from a checked-in baseline,
+- A new account database applies its schema through migration 227 in one transaction from a checked-in baseline,
   then replays only later migrations. Opening a fresh account no longer replays every migration, which took seconds.
   Databases with any recorded migration are unchanged.
 

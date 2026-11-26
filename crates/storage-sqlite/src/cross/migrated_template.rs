@@ -152,8 +152,13 @@ fn copy(template: &Path, options: &SqliteStorageOptions) -> StorageResult<Connec
         .run_to_completion(c_int::MAX, Duration::ZERO, None)
         .storage()?;
     drop(source);
-    for (_, _, renew) in RENEWED_PER_DATABASE {
-        connection.execute_batch(renew).storage()?;
+    for renewed in RENEWED_PER_DATABASE {
+        connection
+            .execute_batch(&format!(
+                "UPDATE \"{}\" SET \"{}\" = {}",
+                renewed.table, renewed.column, renewed.expression
+            ))
+            .storage()?;
     }
     Ok(connection)
 }
@@ -246,7 +251,7 @@ mod tests {
     fn renewed() -> BTreeSet<(String, String)> {
         RENEWED_PER_DATABASE
             .iter()
-            .map(|(table, column, _)| (table.to_string(), column.to_string()))
+            .map(|entry| (entry.table.to_string(), entry.column.to_string()))
             .collect()
     }
 

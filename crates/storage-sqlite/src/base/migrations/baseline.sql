@@ -98,7 +98,7 @@ CREATE TABLE message_timeline (
          AND source_epoch IS NOT NULL THEN 0
         ELSE timeline_at
     END
-) VIRTUAL, edit_json TEXT, deletion_source TEXT NOT NULL DEFAULT 'unknown', recipient_confirmed INTEGER NOT NULL DEFAULT 0,
+) VIRTUAL, edit_json TEXT, deletion_source TEXT NOT NULL DEFAULT 'unknown', recipient_confirmed INTEGER NOT NULL DEFAULT 0, timeline_order_seq INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (group_id_hex, message_id_hex)
 );
 CREATE TABLE account_state (
@@ -428,7 +428,7 @@ CREATE TABLE local_group_deletion_frontiers (
     group_id_hex TEXT PRIMARY KEY NOT NULL,
     message_insert_order INTEGER NOT NULL CHECK(message_insert_order >= 0),
     prior_nostr_routes_json TEXT NOT NULL DEFAULT '[]'
-);
+, pending_confirmation INTEGER CHECK(pending_confirmation IN (0, 1)), welcomer_account_id_hex TEXT, via_welcome_message_id_hex TEXT);
 CREATE TABLE pending_application_events (
     message_id BLOB PRIMARY KEY NOT NULL,
     group_id BLOB NOT NULL,
@@ -755,20 +755,6 @@ CREATE TABLE attachment_download_policy (
  disk_reserve INTEGER NOT NULL CHECK(disk_reserve>=0),
  transfer_limit INTEGER NOT NULL CHECK(transfer_limit BETWEEN 1 AND 536870912)
 );
-CREATE TABLE local_message_submissions (
-            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id_hex TEXT NOT NULL REFERENCES account_groups(group_id_hex) ON DELETE CASCADE,
-            client_token TEXT NOT NULL CHECK(length(client_token) BETWEEN 1 AND 128),
-            message_id_hex TEXT NOT NULL,
-            request_hash BLOB NOT NULL CHECK(length(request_hash) = 32),
-            payload_hash BLOB NOT NULL CHECK(length(payload_hash) = 32),
-            payload BLOB,
-            request_json TEXT,
-            state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0, 1, 3)),
-            outcome_json TEXT,
-            UNIQUE(group_id_hex, client_token),
-            UNIQUE(group_id_hex, message_id_hex)
-        );
 CREATE TABLE account_recovery_state (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     next_attempt INTEGER NOT NULL DEFAULT 0 CHECK(typeof(next_attempt) = 'integer' AND next_attempt >= 0),
@@ -994,7 +980,11 @@ CREATE TABLE "account_recovery_obligations" (
     parked_at_ms INTEGER CHECK(parked_at_ms IS NULL OR (typeof(parked_at_ms)='integer' AND parked_at_ms>=0)),
     dismissed_scopes BLOB CHECK(dismissed_scopes IS NULL OR typeof(dismissed_scopes)='blob'), recovery_attempts INTEGER NOT NULL
             DEFAULT 0 CHECK(typeof(recovery_attempts) = 'integer' AND recovery_attempts >= 0), recovery_admitted_high INTEGER NOT NULL
-            DEFAULT 0 CHECK(typeof(recovery_admitted_high) = 'integer' AND recovery_admitted_high >= 0),
+            DEFAULT 0 CHECK(typeof(recovery_admitted_high) = 'integer' AND recovery_admitted_high >= 0), evidence_floor_epoch
+         INTEGER CHECK (
+             evidence_floor_epoch IS NULL
+             OR (typeof(evidence_floor_epoch) = 'integer' AND evidence_floor_epoch >= 0)
+         ),
     CHECK((cause NOT IN (0, 6)) OR (account_label IS NOT NULL AND marker_token IS NOT NULL
           AND pending_since IS NOT NULL AND dropped_count IS NOT NULL)),
     CHECK((cause != 1) OR (group_id IS NOT NULL AND stalled_epoch IS NOT NULL))
@@ -1752,6 +1742,34 @@ CREATE TABLE link_chat_report_pages (
             tokens BLOB NOT NULL, message_id BLOB,
             PRIMARY KEY(group_id, page)
          );
+CREATE TABLE agent_item_expired_targets (
+    group_id_hex TEXT NOT NULL,
+    message_id_hex TEXT NOT NULL,
+    PRIMARY KEY (group_id_hex, message_id_hex)
+);
+CREATE TABLE small_state_broadcast_devices (
+            slot BLOB PRIMARY KEY CHECK(length(slot) = 32),
+            linked_at INTEGER NOT NULL CHECK(linked_at >= 0)
+        ) WITHOUT ROWID;
+CREATE TABLE cgka_welcome_delivery_ledger (
+            welcome_id BLOB PRIMARY KEY,
+            group_id BLOB NOT NULL REFERENCES cgka_groups(id) ON DELETE CASCADE,
+            record BLOB NOT NULL
+        );
+CREATE TABLE "local_message_submissions" (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id_hex TEXT NOT NULL REFERENCES account_groups(group_id_hex) ON DELETE CASCADE,
+            client_token TEXT NOT NULL CHECK(length(client_token) BETWEEN 1 AND 128),
+            message_id_hex TEXT NOT NULL,
+            request_hash BLOB NOT NULL CHECK(length(request_hash) = 32),
+            payload_hash BLOB NOT NULL CHECK(length(payload_hash) = 32),
+            payload BLOB,
+            request_json TEXT,
+            state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0, 1, 3, 4)),
+            outcome_json TEXT,
+            UNIQUE(group_id_hex, client_token),
+            UNIQUE(group_id_hex, message_id_hex)
+        );
 CREATE INDEX idx_cgka_queued_outbound_group
     ON cgka_queued_outbound (group_id, insert_order);
 CREATE UNIQUE INDEX idx_app_events_source_message
@@ -1816,15 +1834,6 @@ CREATE INDEX idx_cgka_transport_group_routes_group
     ON cgka_transport_group_routes(group_id, source_epoch);
 CREATE INDEX idx_pending_application_events_group
     ON pending_application_events(group_id, message_insert_order);
-CREATE INDEX idx_message_timeline_group_canonical_order
-    ON message_timeline (
-        group_id_hex,
-        timeline_order_class,
-        timeline_order_primary,
-        timeline_order_phase,
-        timeline_order_at,
-        message_id_hex
-    );
 CREATE INDEX idx_cgka_messages_group_epoch
     ON cgka_messages (group_id, epoch, insert_order);
 CREATE INDEX idx_cgka_messages_group_state_epoch
@@ -1911,7 +1920,6 @@ CREATE INDEX attachment_acquisition_active ON attachment_acquisition(state,token
 CREATE INDEX attachment_acquisition_priority ON attachment_acquisition(explicit_request DESC,due,priority_at DESC,token) WHERE due IS NOT NULL;
 CREATE INDEX attachment_history_recent_demand ON attachment_history(received_at DESC,group_id_hex,message_id_hex,attachment_index);
 CREATE INDEX attachment_permission_paused ON attachment_acquisition(permission_category,token) WHERE permission_paused=1 AND state=5;
-CREATE INDEX local_message_submissions_pending ON local_message_submissions(sequence) WHERE state = 0;
 CREATE INDEX idx_attachment_history_outgoing_slot ON attachment_history(group_id_hex,source_epoch,slot_json,message_id_hex,attachment_index);
 CREATE INDEX outgoing_attachment_upload_slot ON outgoing_attachment_uploads(group_id_hex,source_epoch,slot_json);
 CREATE INDEX outgoing_attachment_upload_expiry ON outgoing_attachment_uploads(expires_at,token);
@@ -2029,6 +2037,20 @@ CREATE INDEX message_draft_attachment_files
             ON message_draft_attachments(file_id) WHERE file_id IS NOT NULL;
 CREATE INDEX idx_cgka_changes_not_delivered_group
             ON cgka_changes_not_delivered(group_id);
+CREATE INDEX idx_message_timeline_group_canonical_order
+    ON message_timeline (
+        group_id_hex,
+        timeline_order_class,
+        timeline_order_primary,
+        timeline_order_phase,
+        timeline_order_at,
+        timeline_order_seq,
+        message_id_hex
+    );
+CREATE INDEX idx_cgka_welcome_delivery_ledger_group
+            ON cgka_welcome_delivery_ledger(group_id);
+CREATE INDEX local_message_submissions_pending ON local_message_submissions(sequence) WHERE state = 0;
+CREATE INDEX local_message_submissions_refused ON local_message_submissions(group_id_hex) WHERE state = 4;
 CREATE VIEW visible_message_timeline AS SELECT * FROM message_timeline
             WHERE sender NOT IN (SELECT public_key FROM user_blocks)
             AND group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites);
@@ -2117,6 +2139,30 @@ CREATE VIEW chat_attachment_history_source AS
               SELECT 1 FROM app_event_imports i
               WHERE i.group_id_hex=t.group_id_hex AND i.message_id_hex=t.message_id_hex))
           AND t.deleted=0 AND t.invalidation_status IS NULL;
+INSERT INTO "account_attachment_history_version" ("id", "revision", "additions") VALUES (1,0,0);
+INSERT INTO "account_recovery_comparison" ("singleton", "revision", "settled_revision", "request_key", "requested_at_ms", "requested_until_seconds", "blocked_route_revision", "blocked_capability_key", "attempt_serial", "frozen_revision", "plan_format", "plan_payload", "last_outcome") VALUES (1,0,0,NULL,0,0,NULL,NULL,0,0,1,NULL,NULL);
+INSERT INTO "account_recovery_conversion" ("singleton", "step", "notices_changed", "report_pending", "shadow_ranges", "shadow_remainders", "units_broken", "epoch_gaps_reopened") VALUES (1,0,0,0,0,0,0,0);
+INSERT INTO "account_recovery_coverage_uncover_state" ("singleton", "generation", "pruned_through") VALUES (1,0,0);
+INSERT INTO "account_recovery_park_revision" ("singleton", "revision") VALUES (1,0);
+INSERT INTO "account_recovery_state" ("singleton", "next_attempt", "loss_revision", "route_revision", "inventory_revision", "retry_ordinal", "retry_recorded_at_ms", "retry_delay_ms", "retry_not_before_ms", "route_snapshot", "next_engine_observation", "next_stall_sample", "acknowledged_import_revision") VALUES (1,0,0,0,0,0,0,0,0,NULL,0,0,0);
+INSERT INTO "attachment_body_removal_meta" ("id", "high_water") VALUES (1,0);
+INSERT INTO "attachment_partial_usage" ("id", "reserved_bytes") VALUES (1,0);
+INSERT INTO "attachment_retention_usage" ("id", "byte_count") VALUES (1,0);
+INSERT INTO "avatar_cache_meta" ("id", "access_seq") VALUES (1,0);
+INSERT INTO "cgka_committed_roster_revision" ("id", "last") VALUES (1,0);
+INSERT INTO "cgka_maintenance_settings" ("singleton", "periodic_policy") VALUES (1,1);
+INSERT INTO "cgka_pending_ref_watermark" ("singleton", "high_water") VALUES (1,X'0000000000000000');
+INSERT INTO "chat_list_navigation_meta" ("id", "revision", "pin_rewrite_in_progress") VALUES (1,0,0);
+INSERT INTO "chat_list_projection_meta" ("id", "mention_counts_version") VALUES (1,0);
+INSERT INTO "chat_presentation_checkpoint" ("id", "generation", "state") VALUES (1,0,NULL);
+INSERT INTO "chat_presentation_meta" ("id", "store_epoch", "revision") VALUES (1,randomblob(16),0);
+INSERT INTO "content_report_backfill" ("singleton", "after_order", "through_order") VALUES (1,0,0);
+INSERT INTO "message_draft_revision_clock" ("id", "revision") VALUES (1,0);
+INSERT INTO "outgoing_attachment_recovery_cursor" ("id", "group_id_hex", "message_id_hex", "upload_token") VALUES (1,'','',X'');
+INSERT INTO "sqlite_sequence" ("rowid", "name", "seq") VALUES (2,'cgka_queued_outbound',0);
+INSERT INTO "sqlite_sequence" ("rowid", "name", "seq") VALUES (3,'cgka_messages',0);
+INSERT INTO "sqlite_sequence" ("rowid", "name", "seq") VALUES (4,'local_message_submissions',0);
+INSERT INTO "user_block_list" ("id", "revision", "event_id", "event_created_at", "public_tags", "private_tags", "unreadable_event_id", "unreadable_event_created_at") VALUES (1,0,'',0,'[]','[]','',0);
 CREATE TRIGGER unpin_chat_when_archived
 AFTER UPDATE OF archived ON account_groups
 WHEN NEW.archived = 1
@@ -2443,10 +2489,6 @@ CREATE TRIGGER attachment_acquisition_priority_insert AFTER INSERT ON attachment
  UPDATE attachment_acquisition SET priority_at=COALESCE((SELECT received_at FROM attachment_history
  WHERE group_id_hex=NEW.group_id_hex AND message_id_hex=NEW.message_id_hex AND attachment_index=NEW.attachment_index),0) WHERE token=NEW.token;
 END;
-CREATE TRIGGER local_submission_source_deleted AFTER DELETE ON app_events BEGIN
-            DELETE FROM local_message_submissions
-            WHERE group_id_hex = OLD.group_id_hex AND message_id_hex = OLD.message_id_hex;
-        END;
 CREATE TRIGGER attachment_acquisition_priority_update AFTER UPDATE OF received_at ON attachment_history BEGIN
             UPDATE attachment_acquisition SET priority_at=NEW.received_at
             WHERE group_id_hex=NEW.group_id_hex AND message_id_hex=NEW.message_id_hex
@@ -3035,26 +3077,10 @@ CREATE TRIGGER attachment_body_completed_unretained AFTER UPDATE ON attachment_a
         AND NOT EXISTS(SELECT 1 FROM retained_attachment_files f WHERE f.token=q.token AND f.completed=0)) AND NOT EXISTS(SELECT 1 FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id
         WHERE mr.token=q.token AND mf.state=1);
         END;
-INSERT INTO "account_attachment_history_version" ("id", "revision", "additions") VALUES (1,0,0);
-INSERT INTO "account_recovery_comparison" ("singleton", "revision", "settled_revision", "request_key", "requested_at_ms", "requested_until_seconds", "blocked_route_revision", "blocked_capability_key", "attempt_serial", "frozen_revision", "plan_format", "plan_payload", "last_outcome") VALUES (1,0,0,NULL,0,0,NULL,NULL,0,0,1,NULL,NULL);
-INSERT INTO "account_recovery_conversion" ("singleton", "step", "notices_changed", "report_pending", "shadow_ranges", "shadow_remainders", "units_broken", "epoch_gaps_reopened") VALUES (1,0,0,0,0,0,0,0);
-INSERT INTO "account_recovery_coverage_uncover_state" ("singleton", "generation", "pruned_through") VALUES (1,0,0);
-INSERT INTO "account_recovery_park_revision" ("singleton", "revision") VALUES (1,0);
-INSERT INTO "account_recovery_state" ("singleton", "next_attempt", "loss_revision", "route_revision", "inventory_revision", "retry_ordinal", "retry_recorded_at_ms", "retry_delay_ms", "retry_not_before_ms", "route_snapshot", "next_engine_observation", "next_stall_sample", "acknowledged_import_revision") VALUES (1,0,0,0,0,0,0,0,0,NULL,0,0,0);
-INSERT INTO "attachment_body_removal_meta" ("id", "high_water") VALUES (1,0);
-INSERT INTO "attachment_partial_usage" ("id", "reserved_bytes") VALUES (1,0);
-INSERT INTO "attachment_retention_usage" ("id", "byte_count") VALUES (1,0);
-INSERT INTO "avatar_cache_meta" ("id", "access_seq") VALUES (1,0);
-INSERT INTO "cgka_committed_roster_revision" ("id", "last") VALUES (1,0);
-INSERT INTO "cgka_maintenance_settings" ("singleton", "periodic_policy") VALUES (1,1);
-INSERT INTO "cgka_pending_ref_watermark" ("singleton", "high_water") VALUES (1,X'0000000000000000');
-INSERT INTO "chat_list_navigation_meta" ("id", "revision", "pin_rewrite_in_progress") VALUES (1,0,0);
-INSERT INTO "chat_list_projection_meta" ("id", "mention_counts_version") VALUES (1,0);
-INSERT INTO "chat_presentation_checkpoint" ("id", "generation", "state") VALUES (1,0,NULL);
-INSERT INTO "chat_presentation_meta" ("id", "store_epoch", "revision") VALUES (1,X'00000000000000000000000000000000',0);
-INSERT INTO "content_report_backfill" ("singleton", "after_order", "through_order") VALUES (1,0,0);
-INSERT INTO "message_draft_revision_clock" ("id", "revision") VALUES (1,0);
-INSERT INTO "outgoing_attachment_recovery_cursor" ("id", "group_id_hex", "message_id_hex", "upload_token") VALUES (1,'','',X'');
-INSERT INTO "sqlite_sequence" ("rowid", "name", "seq") VALUES (2,'cgka_queued_outbound',0);
-INSERT INTO "sqlite_sequence" ("rowid", "name", "seq") VALUES (3,'cgka_messages',0);
-INSERT INTO "user_block_list" ("id", "revision", "event_id", "event_created_at", "public_tags", "private_tags", "unreadable_event_id", "unreadable_event_created_at") VALUES (1,0,'',0,'[]','[]','',0);
+CREATE TRIGGER agent_item_expired_targets_group_deleted AFTER DELETE ON account_groups BEGIN
+    DELETE FROM agent_item_expired_targets WHERE group_id_hex = OLD.group_id_hex;
+END;
+CREATE TRIGGER local_submission_source_deleted AFTER DELETE ON app_events BEGIN
+            DELETE FROM local_message_submissions
+            WHERE group_id_hex = OLD.group_id_hex AND message_id_hex = OLD.message_id_hex;
+        END;

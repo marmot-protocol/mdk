@@ -356,6 +356,7 @@ mod migration_0087_attachment_automatic_history;
 #[path = "migrations/0088_draft_attachment_descriptors.rs"]
 mod migration_0088_draft_attachment_descriptors;
 
+#[derive(Clone, Copy)]
 pub(crate) struct Migration {
     pub(crate) version: i64,
     pub(crate) name: &'static str,
