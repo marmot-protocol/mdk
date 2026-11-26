@@ -9310,12 +9310,6 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                     )
                     .with_endpoint_failures(endpoint_failures)
             })?;
-        if outcome.accepted.is_empty() && !outcome.failed.is_empty() {
-            return Err(KeyPackagePublishError::exposed(
-                "no KeyPackage relay acknowledged the publication",
-            )
-            .with_endpoint_failures(outcome.failed));
-        }
         let accepted = outcome
             .accepted
             .into_iter()

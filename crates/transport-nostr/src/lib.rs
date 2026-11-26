@@ -2120,19 +2120,28 @@ impl MarmotRelayPlane {
         query: DirectoryEventQuery,
         signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
     ) -> Result<Vec<DirectoryRelayEventRecord>, directory::DirectoryInspectionError> {
+        self.inspect_directory_events_within(endpoint, query, signer, None)
+            .await
+    }
+
+    pub async fn inspect_directory_events_within(
+        &self,
+        endpoint: TransportEndpoint,
+        query: DirectoryEventQuery,
+        signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
+        budget: Option<Duration>,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, directory::DirectoryInspectionError> {
         let endpoints = self
             .inner
             .relay_safety
             .sanitize_endpoints(vec![endpoint], "onboarding inspection")
             .map_err(|_| directory::DirectoryInspectionError::InvalidRequest)?;
-        self.inner
-            .directory
-            .inspect_events(
-                DirectoryFetchRequest::new(endpoints, vec![query])
-                    .map_err(|_| directory::DirectoryInspectionError::InvalidRequest)?,
-                signer,
-            )
-            .await
+        let mut request = DirectoryFetchRequest::new(endpoints, vec![query])
+            .map_err(|_| directory::DirectoryInspectionError::InvalidRequest)?;
+        if let Some(budget) = budget {
+            request = request.with_inspection_budget(budget);
+        }
+        self.inner.directory.inspect_events(request, signer).await
     }
 
     /// Narrow discovered relay endpoints to the safe ones, dropping the rest.

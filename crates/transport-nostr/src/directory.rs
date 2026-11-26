@@ -86,26 +86,24 @@ pub enum DirectoryInspectionError {
 }
 
 impl DirectoryInspectionError {
+    /// Wrap `cause` with any verified records returned before it failed.
+    pub fn partial(records: Vec<DirectoryRelayEventRecord>, cause: Self) -> Self {
+        if records.is_empty() {
+            cause
+        } else {
+            Self::Partial {
+                records,
+                cause: Box::new(cause),
+            }
+        }
+    }
+
     /// Unpack a partial inspection failure into any verified records it
     /// returned before failing and its underlying cause.
     pub fn into_parts(self) -> (Vec<DirectoryRelayEventRecord>, Self) {
         match self {
             Self::Partial { records, cause } => (records, *cause),
             cause => (Vec::new(), cause),
-        }
-    }
-}
-
-fn partial_or(
-    records: Vec<DirectoryRelayEventRecord>,
-    cause: DirectoryInspectionError,
-) -> DirectoryInspectionError {
-    if records.is_empty() {
-        cause
-    } else {
-        DirectoryInspectionError::Partial {
-            records,
-            cause: Box::new(cause),
         }
     }
 }
@@ -197,6 +195,10 @@ impl DirectorySubscriptionFilter {
 pub struct DirectoryFetchRequest {
     pub endpoints: Vec<TransportEndpoint>,
     pub queries: Vec<DirectoryEventQuery>,
+    /// Optional total deadline for one-shot `inspect_directory_events`, so a
+    /// caller with a shorter remaining budget gets `Partial { records, TimedOut }`
+    /// from the collector instead of cancelling it from outside.
+    pub(crate) inspection_budget: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -449,7 +451,18 @@ impl DirectoryFetchRequest {
                 return Err("directory fetch: query limit must be greater than zero".to_owned());
             }
         }
-        Ok(Self { endpoints, queries })
+        Ok(Self {
+            endpoints,
+            queries,
+            inspection_budget: None,
+        })
+    }
+
+    /// Bound one-shot `inspect_directory_events` to at most `budget` across
+    /// connect and EOSE so the collector returns any verified prefix on expiry.
+    pub fn with_inspection_budget(mut self, budget: Duration) -> Self {
+        self.inspection_budget = Some(budget);
+        self
     }
 
     fn key(&self) -> DirectoryFetchKey {
@@ -1192,11 +1205,20 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .map(|watch| watch.with_challenge_wait(transport_nostr_adapter::AUTH_CHALLENGE_WAIT));
         // `connect_relay` only queues the dial. Await the handshake, so the
         // EOSE window below is the relay's answer time alone.
+        let started = tokio::time::Instant::now();
+        let overall_deadline = request.inspection_budget.map(|budget| started + budget);
+        let connect_wait = match overall_deadline {
+            Some(overall) => {
+                DIRECTORY_RELAY_CONNECT_WAIT.min(overall.saturating_duration_since(started))
+            }
+            None => DIRECTORY_RELAY_CONNECT_WAIT,
+        };
+        if connect_wait.is_zero() {
+            return Err(TimedOut);
+        }
         match timeout(
-            DIRECTORY_RELAY_CONNECT_WAIT,
-            client
-                .try_connect_relay(url.clone())
-                .timeout(DIRECTORY_RELAY_CONNECT_WAIT),
+            connect_wait,
+            client.try_connect_relay(url.clone()).timeout(connect_wait),
         )
         .await
         {
@@ -1207,7 +1229,11 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             Ok(Err(_)) => return Err(Unreachable),
             Err(_) => return Err(TimedOut),
         }
-        let deadline = tokio::time::Instant::now() + DIRECTORY_INSPECTION_EOSE_WAIT;
+        let eose_deadline = tokio::time::Instant::now() + DIRECTORY_INSPECTION_EOSE_WAIT;
+        let deadline = match overall_deadline {
+            Some(overall) => eose_deadline.min(overall),
+            None => eose_deadline,
+        };
         let cancel = CancellationToken::new();
         let mut records = Vec::new();
         for query in request.queries {
@@ -1215,7 +1241,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 directory_query_filter(&query, query.kind == 1059).map_err(|_| InvalidRequest)?;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(partial_or(records, TimedOut));
+                return Err(DirectoryInspectionError::partial(records, TimedOut));
             }
             // A successful empty read can hide a CLOSED terminal; the finite
             // reply keeps its wire reason. With a signer, a relay that
@@ -1247,25 +1273,36 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 // `auth` hint means the relay still withholds events behind
                 // authentication. The inbox probe needs only an answer.
                 FiniteEnd::Eose if result.auth && query.kind != 1059 => {
-                    return Err(partial_or(records, AuthenticationRequired));
+                    return Err(DirectoryInspectionError::partial(
+                        records,
+                        AuthenticationRequired,
+                    ));
                 }
                 // NIP-67 `more`: the relay cut its answer, so a newer event
                 // may be unread.
                 FiniteEnd::Eose if result.more && query.kind != 1059 => {
-                    return Err(partial_or(records, Incomplete));
+                    return Err(DirectoryInspectionError::partial(records, Incomplete));
                 }
                 FiniteEnd::Eose => {}
                 FiniteEnd::Closed(reason) => {
-                    return Err(partial_or(records, directory_closed_reason(reason)));
+                    return Err(DirectoryInspectionError::partial(
+                        records,
+                        directory_closed_reason(reason),
+                    ));
                 }
                 FiniteEnd::TimedOut if signing_pending.load(Ordering::Relaxed) => {
-                    return Err(partial_or(records, AuthenticationTimedOut));
+                    return Err(DirectoryInspectionError::partial(
+                        records,
+                        AuthenticationTimedOut,
+                    ));
                 }
-                FiniteEnd::TimedOut => return Err(partial_or(records, TimedOut)),
+                FiniteEnd::TimedOut => {
+                    return Err(DirectoryInspectionError::partial(records, TimedOut));
+                }
                 FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => {
-                    return Err(partial_or(records, Restricted));
+                    return Err(DirectoryInspectionError::partial(records, Restricted));
                 }
-                _ => return Err(partial_or(records, Unreachable)),
+                _ => return Err(DirectoryInspectionError::partial(records, Unreachable)),
             }
         }
         Ok(records)
@@ -2354,18 +2391,30 @@ mod tests {
             .unwrap();
         let event_id = event.id.to_hex();
 
-        for (end_frame, expected_cause) in [
+        for (end_frame, budget, expected_cause) in [
             (
-                serde_json::json!(["EOSE", "SUB", ["more"]]),
+                Some(serde_json::json!(["EOSE", "SUB", ["more"]])),
+                None,
                 DirectoryInspectionError::Incomplete,
             ),
             (
-                serde_json::json!(["EOSE", "SUB", ["auth"]]),
+                Some(serde_json::json!(["EOSE", "SUB", ["auth"]])),
+                None,
                 DirectoryInspectionError::AuthenticationRequired,
             ),
             (
-                serde_json::json!(["CLOSED", "SUB", "rate-limited: slow down"]),
+                Some(serde_json::json!([
+                    "CLOSED",
+                    "SUB",
+                    "rate-limited: slow down"
+                ])),
+                None,
                 DirectoryInspectionError::RateLimited,
+            ),
+            (
+                None,
+                Some(Duration::from_millis(250)),
+                DirectoryInspectionError::TimedOut,
             ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2382,24 +2431,28 @@ mod tests {
                     if request[0] == "REQ" {
                         let sub_id = request[1].clone();
                         let ev = serde_json::json!(["EVENT", sub_id, event_json]);
-                        let mut end = end_frame.clone();
-                        end[1] = sub_id;
                         socket
                             .send(Message::Text(ev.to_string().into()))
                             .await
                             .unwrap();
-                        socket
-                            .send(Message::Text(end.to_string().into()))
-                            .await
-                            .unwrap();
+                        if let Some(mut end) = end_frame.clone() {
+                            end[1] = sub_id;
+                            socket
+                                .send(Message::Text(end.to_string().into()))
+                                .await
+                                .unwrap();
+                        }
                     }
                 }
             });
-            let request = DirectoryFetchRequest::new(
+            let mut request = DirectoryFetchRequest::new(
                 vec![endpoint],
                 vec![DirectoryEventQuery::new(10002, vec![author.clone()], 4)],
             )
             .unwrap();
+            if let Some(budget) = budget {
+                request = request.with_inspection_budget(budget);
+            }
             let result = timeout(
                 Duration::from_secs(5),
                 NostrSdkDirectoryRelayFetcher::standalone().inspect_directory_events(request, None),

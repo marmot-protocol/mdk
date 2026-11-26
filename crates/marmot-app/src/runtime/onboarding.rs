@@ -2539,11 +2539,13 @@ fn set_operation_error(c: &mut OnboardingCheckpoint, step: OnboardingStep, error
     c.set(step, status, vec![failure]);
 }
 
-type OnboardingInspection = (
-    Vec<NostrTransportEvent>,
-    Vec<OnboardingFinding>,
-    HashMap<String, String>,
-);
+struct OnboardingInspection {
+    records: Vec<NostrTransportEvent>,
+    /// Verified records returned by each relay that completed EOSE, keyed by `relay_key`.
+    completed_records: HashMap<String, Vec<NostrTransportEvent>>,
+    failures: Vec<OnboardingFinding>,
+    completed: HashMap<String, String>,
+}
 
 fn publish_endpoint_failure_issue(
     failure: &cgka_traits::TransportEndpointFailure,
@@ -2674,15 +2676,11 @@ fn is_newer_event(candidate: &NostrTransportEvent, current: &NostrTransportEvent
         || (candidate.created_at == current.created_at && candidate.id < current.id)
 }
 
-fn retryable_inspection_error(
-    error: &transport_nostr::DirectoryInspectionError,
-    external_signer: bool,
-) -> bool {
+fn retryable_inspection_error(error: &transport_nostr::DirectoryInspectionError) -> bool {
     use transport_nostr::DirectoryInspectionError::*;
     match error {
-        Partial { cause, .. } => retryable_inspection_error(cause, external_signer),
-        RateLimited => true,
-        Incomplete | Unreachable | TimedOut => !external_signer,
+        Partial { cause, .. } => retryable_inspection_error(cause),
+        RateLimited | Incomplete | Unreachable | TimedOut => true,
         AuthenticationRequired
         | AuthenticationTimedOut
         | PaymentRequired
@@ -2692,90 +2690,15 @@ fn retryable_inspection_error(
 }
 
 impl AccountSetup<'_> {
-    async fn inspect_onboarding_relays(
+    /// Classify, normalize, deduplicate, and apply the `MAX_RELAYS` non-indexer
+    /// cap to inspection candidates in one place so dialing, EOSE reuse, and
+    /// long-list repair previews agree.
+    fn select_inspection_endpoints(
         &self,
-        account_id: &str,
-        kind: u64,
         endpoints: Vec<String>,
-    ) -> OnboardingInspection {
-        let local_signer = self
-            .records()
-            .resolve(account_id)
-            .ok()
-            .filter(|account| account.local_signing)
-            .and_then(|account| self.app().account_signer_for_summary(&account).ok());
-        self.inspect_onboarding_relays_with_signer(account_id, kind, endpoints, local_signer)
-            .await
-    }
-
-    async fn inspect_onboarding_inbox(
-        &self,
-        account_id: &str,
-        endpoints: Vec<String>,
-    ) -> OnboardingInspection {
-        let (records, mut failures, mut completed) = self
-            .inspect_onboarding_relays(account_id, 1059, endpoints)
-            .await;
-        if !completed.is_empty() {
-            return (records, failures, completed);
-        }
-        let Ok(account) = self.records().resolve(account_id) else {
-            return (records, failures, completed);
-        };
-        if account.local_signing || !account.external_signing {
-            return (records, failures, completed);
-        }
-        // A single external AUTH request is enough to check an inbox route.
-        // Choose a route only after it actually refused the anonymous read.
-        let Some(index) = failures
-            .iter()
-            .enumerate()
-            .filter(|(_, failure)| failure.issue == OnboardingIssue::AuthenticationRequired)
-            .min_by_key(|(_, failure)| failure.endpoint.as_deref())
-            .map(|(index, _)| index)
-        else {
-            return (records, failures, completed);
-        };
-        let Some(endpoint) = failures[index].endpoint.clone() else {
-            return (records, failures, completed);
-        };
-        let Ok(signer) = self.app().account_signer_for_summary(&account) else {
-            failures[index] = OnboardingFinding {
-                endpoint: Some(endpoint),
-                ..finding(OnboardingIssue::SignerUnavailable)
-            };
-            return (records, failures, completed);
-        };
-        failures.swap_remove(index);
-        let (_, signed_failures, signed_completed) = self
-            .inspect_onboarding_relays_with_signer(account_id, 1059, vec![endpoint], Some(signer))
-            .await;
-        failures.extend(signed_failures);
-        completed.extend(signed_completed);
-        (records, failures, completed)
-    }
-
-    async fn inspect_onboarding_relays_with_signer(
-        &self,
-        account_id: &str,
-        kind: u64,
-        endpoints: Vec<String>,
-        account_signer: Option<crate::external_signer::AccountSigner>,
-    ) -> OnboardingInspection {
-        let external_signer = matches!(
-            account_signer,
-            Some(crate::external_signer::AccountSigner::External(_))
-        );
-        // Only the local key always answers a NIP-42 challenge; see
-        // `OnboardingFinding::local_key_held`.
-        let local_key_held = matches!(
-            account_signer,
-            Some(crate::external_signer::AccountSigner::Local(_))
-        );
-        let signer = account_signer.map(|signer| signer.as_nostr_signer());
-        let retry_transient = matches!(kind, 10002 | 10050);
-        let mut tasks = JoinSet::new();
+    ) -> (Vec<String>, Vec<OnboardingFinding>) {
         let classifications = self.app().relay_plane.classify_relay_endpoints(endpoints);
+        let mut selected = Vec::new();
         let mut failures = Vec::new();
         let mut seen = HashSet::new();
         // Public indexers are dialed on top of the cap, so they never take a
@@ -2825,6 +2748,130 @@ impl AccountSetup<'_> {
                     continue;
                 }
             }
+            selected.push(endpoint);
+        }
+        (selected, failures)
+    }
+
+    async fn inspect_onboarding_relays(
+        &self,
+        account_id: &str,
+        kind: u64,
+        endpoints: Vec<String>,
+    ) -> OnboardingInspection {
+        self.inspect_onboarding_relays_reusing(account_id, kind, endpoints, None)
+            .await
+    }
+
+    async fn inspect_onboarding_relays_reusing(
+        &self,
+        account_id: &str,
+        kind: u64,
+        endpoints: Vec<String>,
+        reuse_completed: Option<&HashMap<String, String>>,
+    ) -> OnboardingInspection {
+        let local_signer = self
+            .records()
+            .resolve(account_id)
+            .ok()
+            .filter(|account| account.local_signing)
+            .and_then(|account| self.app().account_signer_for_summary(&account).ok());
+        self.inspect_onboarding_relays_with_signer(
+            account_id,
+            kind,
+            endpoints,
+            local_signer,
+            reuse_completed,
+        )
+        .await
+    }
+
+    async fn inspect_onboarding_inbox(
+        &self,
+        account_id: &str,
+        endpoints: Vec<String>,
+    ) -> OnboardingInspection {
+        let mut inspection = self
+            .inspect_onboarding_relays(account_id, 1059, endpoints)
+            .await;
+        if !inspection.completed.is_empty() {
+            return inspection;
+        }
+        let Ok(account) = self.records().resolve(account_id) else {
+            return inspection;
+        };
+        if account.local_signing || !account.external_signing {
+            return inspection;
+        }
+        // A single external AUTH request is enough to check an inbox route.
+        // Choose a route only after it actually refused the anonymous read.
+        let Some(index) = inspection
+            .failures
+            .iter()
+            .enumerate()
+            .filter(|(_, failure)| failure.issue == OnboardingIssue::AuthenticationRequired)
+            .min_by_key(|(_, failure)| failure.endpoint.as_deref())
+            .map(|(index, _)| index)
+        else {
+            return inspection;
+        };
+        let Some(endpoint) = inspection.failures[index].endpoint.clone() else {
+            return inspection;
+        };
+        let Ok(signer) = self.app().account_signer_for_summary(&account) else {
+            inspection.failures[index] = OnboardingFinding {
+                endpoint: Some(endpoint),
+                ..finding(OnboardingIssue::SignerUnavailable)
+            };
+            return inspection;
+        };
+        inspection.failures.swap_remove(index);
+        let signed = self
+            .inspect_onboarding_relays_with_signer(
+                account_id,
+                1059,
+                vec![endpoint],
+                Some(signer),
+                None,
+            )
+            .await;
+        inspection.failures.extend(signed.failures);
+        inspection.completed.extend(signed.completed);
+        inspection
+            .completed_records
+            .extend(signed.completed_records);
+        inspection
+    }
+
+    async fn inspect_onboarding_relays_with_signer(
+        &self,
+        account_id: &str,
+        kind: u64,
+        endpoints: Vec<String>,
+        account_signer: Option<crate::external_signer::AccountSigner>,
+        reuse_completed: Option<&HashMap<String, String>>,
+    ) -> OnboardingInspection {
+        let external_signer = matches!(
+            account_signer,
+            Some(crate::external_signer::AccountSigner::External(_))
+        );
+        // Only the local key always answers a NIP-42 challenge; see
+        // `OnboardingFinding::local_key_held`.
+        let local_key_held = matches!(
+            account_signer,
+            Some(crate::external_signer::AccountSigner::Local(_))
+        );
+        let signer = account_signer.map(|signer| signer.as_nostr_signer());
+        let retry_transient = matches!(kind, 10002 | 10050);
+        let (selected, mut failures) = self.select_inspection_endpoints(endpoints);
+        let mut tasks = JoinSet::new();
+        let mut completed = HashMap::new();
+        for endpoint in selected {
+            let key = relay_key(&endpoint);
+            if let Some(answered) = reuse_completed.and_then(|prior| prior.get(&key)) {
+                completed.insert(key, answered.clone());
+                continue;
+            }
             let plane = self.app().relay_plane.clone();
             let signer = signer.clone();
             let query =
@@ -2836,13 +2883,21 @@ impl AccountSetup<'_> {
                     let endpoint = endpoint.clone();
                     let query = query.clone();
                     let signer = signer.clone();
+                    // Give the inner collector slightly less than `remaining` so
+                    // it finishes cleanly and returns any verified prefix in
+                    // `Partial { records, cause: TimedOut }` before the outer
+                    // timeout guard cancels it.
+                    let inner_budget = remaining
+                        .saturating_sub(Duration::from_millis(100))
+                        .max(Duration::from_millis(1));
                     async move {
                         match timeout(
                             remaining,
-                            plane.inspect_directory_events(
+                            plane.inspect_directory_events_within(
                                 TransportEndpoint(endpoint),
                                 query,
                                 signer,
+                                Some(inner_budget),
                             ),
                         )
                         .await
@@ -2854,8 +2909,9 @@ impl AccountSetup<'_> {
                 };
                 let mut result = inspect_once(CHECK_WAIT).await;
                 if retry_transient
+                    && !external_signer
                     && let Err(error) = &result
-                    && retryable_inspection_error(error, external_signer)
+                    && retryable_inspection_error(error)
                 {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining > TRANSIENT_RETRY_DELAY {
@@ -2872,14 +2928,10 @@ impl AccountSetup<'_> {
                                 Err(retry_error) => {
                                     let (mut retry_records, retry_cause) = retry_error.into_parts();
                                     prior_records.append(&mut retry_records);
-                                    Err(if prior_records.is_empty() {
-                                        retry_cause
-                                    } else {
-                                        transport_nostr::DirectoryInspectionError::Partial {
-                                            records: prior_records,
-                                            cause: Box::new(retry_cause),
-                                        }
-                                    })
+                                    Err(transport_nostr::DirectoryInspectionError::partial(
+                                        prior_records,
+                                        retry_cause,
+                                    ))
                                 }
                             };
                         }
@@ -2889,11 +2941,12 @@ impl AccountSetup<'_> {
             });
         }
         let mut records = Vec::new();
-        let mut completed = HashMap::new();
+        let mut completed_records: HashMap<String, Vec<NostrTransportEvent>> = HashMap::new();
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok((endpoint, Ok(events))) => {
-                    completed.insert(relay_key(&endpoint), endpoint);
+                    let key = relay_key(&endpoint);
+                    completed.insert(key.clone(), endpoint);
                     // A full bounded page may omit another installation's slot.
                     if kind == 30443
                         && events
@@ -2904,12 +2957,45 @@ impl AccountSetup<'_> {
                     {
                         failures.push(finding(OnboardingIssue::DiscoveryIncomplete));
                     }
-                    records.extend(events.into_iter().map(|r| r.event));
+                    let mut source_verified = Vec::new();
+                    for record in events {
+                        let event = record.event;
+                        let valid = event.kind == kind
+                            && event.pubkey == account_id
+                            && event.to_verified_nostr_event().is_ok();
+                        if kind == 30443
+                            && event.kind == kind
+                            && event.pubkey == account_id
+                            && !valid
+                        {
+                            failures.push(finding(OnboardingIssue::Malformed));
+                        }
+                        if valid {
+                            source_verified.push(event.clone());
+                            records.push(event);
+                        }
+                    }
+                    completed_records.insert(key, source_verified);
                 }
                 Ok((endpoint, Err(error))) => {
                     use transport_nostr::DirectoryInspectionError::*;
                     let (partial, cause) = error.into_parts();
-                    records.extend(partial.into_iter().map(|r| r.event));
+                    for record in partial {
+                        let event = record.event;
+                        let valid = event.kind == kind
+                            && event.pubkey == account_id
+                            && event.to_verified_nostr_event().is_ok();
+                        if kind == 30443
+                            && event.kind == kind
+                            && event.pubkey == account_id
+                            && !valid
+                        {
+                            failures.push(finding(OnboardingIssue::Malformed));
+                        }
+                        if valid {
+                            records.push(event);
+                        }
+                    }
                     let issue = match cause {
                         AuthenticationTimedOut if external_signer => {
                             OnboardingIssue::SignerUnavailable
@@ -2937,17 +3023,6 @@ impl AccountSetup<'_> {
                 Err(_) => failures.push(finding(OnboardingIssue::Interrupted)),
             }
         }
-        // Enforce the event boundary even for injected fetchers. Never let an
-        // older valid event hide a newer signed but malformed declaration.
-        records.retain(|event| {
-            let valid = event.kind == kind
-                && event.pubkey == account_id
-                && event.to_verified_nostr_event().is_ok();
-            if kind == 30443 && event.kind == kind && event.pubkey == account_id && !valid {
-                failures.push(finding(OnboardingIssue::Malformed));
-            }
-            valid
-        });
         records.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
         records.dedup_by(|a, b| a.id == b.id);
         let failures = failures
@@ -2959,20 +3034,25 @@ impl AccountSetup<'_> {
                 )
             })
             .collect();
-        (records, failures, completed)
+        OnboardingInspection {
+            records,
+            completed_records,
+            failures,
+            completed,
+        }
     }
-    /// Whether a lookup source that answered vouches for the account's own
-    /// records: a public indexer or a relay the account declares. The host's
-    /// other discovery relays are its own relays, which rarely hold an
-    /// imported account's lists (see `append_public_indexers`), so they vouch
-    /// only when no public indexer was searched: a host-selected or hermetic
-    /// discovery set.
-    fn authoritative_answered(
+    /// Completed lookup sources that vouch for the account's own records: a
+    /// public indexer or a relay the account declares. The host's other
+    /// discovery relays are its own relays, which rarely hold an imported
+    /// account's lists (see `append_public_indexers`), so they vouch only when
+    /// no public indexer was searched: a host-selected or hermetic discovery
+    /// set.
+    fn authoritative_completed_keys<'a>(
         &self,
         c: &OnboardingCheckpoint,
         sources: &[String],
-        completed: &HashMap<String, String>,
-    ) -> bool {
+        completed: &'a HashMap<String, String>,
+    ) -> Vec<&'a String> {
         let indexers: HashSet<String> = self
             .app()
             .discovery_indexer_relays()
@@ -2993,12 +3073,25 @@ impl AccountSetup<'_> {
             .iter()
             .map(|relay| relay_key(relay))
             .collect();
-        completed.keys().any(|key| {
-            !indexer_searched
-                || indexers.contains(key)
-                || declared.contains(key)
-                || !host.contains(key)
-        })
+        completed
+            .keys()
+            .filter(|key| {
+                !indexer_searched
+                    || indexers.contains(*key)
+                    || declared.contains(*key)
+                    || !host.contains(*key)
+            })
+            .collect()
+    }
+    fn authoritative_answered(
+        &self,
+        c: &OnboardingCheckpoint,
+        sources: &[String],
+        completed: &HashMap<String, String>,
+    ) -> bool {
+        !self
+            .authoritative_completed_keys(c, sources, completed)
+            .is_empty()
     }
     async fn onboarding_sources(
         &self,
@@ -3027,7 +3120,7 @@ impl AccountSetup<'_> {
             append_public_indexers(&mut lookup, &c.options, indexers);
             self.inspect_onboarding_relays(&c.snapshot.account_id_hex, 10002, lookup)
                 .await
-                .0
+                .records
                 .into_iter()
                 .next()
         } else {
@@ -3054,12 +3147,6 @@ impl AccountSetup<'_> {
     /// Whether inspecting the current NIP-65 declaration and discovery sources
     /// exceeds `MAX_RELAYS` non-indexer dialable endpoints (mdk#3727).
     fn nip65_exceeds_dial_cap(&self, c: &OnboardingCheckpoint) -> bool {
-        let indexers: HashSet<String> = self
-            .app()
-            .discovery_indexer_relays()
-            .iter()
-            .map(|endpoint| relay_key(&endpoint.0))
-            .collect();
         let mut sources = c.options.discovery_relays.clone();
         if let Some(event) = c.records[OnboardingStep::Relays.index()]
             .as_ref()
@@ -3072,28 +3159,10 @@ impl AccountSetup<'_> {
                 }
             }
         }
-        let mut seen = HashSet::new();
-        let mut capped = 0;
-        for classified in self.app().relay_plane.classify_relay_endpoints(sources) {
-            if is_onion_relay(&classified.endpoint)
-                || classified.policy != RelayEndpointPolicy::Allowed
-            {
-                continue;
-            }
-            let endpoint = classified
-                .normalized_endpoint
-                .unwrap_or(classified.endpoint);
-            let Ok(url) = nostr::prelude::RelayUrl::parse(&endpoint) else {
-                continue;
-            };
-            if seen.insert(url) && !indexers.contains(&relay_key(&endpoint)) {
-                capped += 1;
-                if capped > MAX_RELAYS {
-                    return true;
-                }
-            }
-        }
-        false
+        self.select_inspection_endpoints(sources)
+            .1
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::TooManyRelays)
     }
     async fn check_onboarding_step(
         &self,
@@ -3105,7 +3174,12 @@ impl AccountSetup<'_> {
         Option<NostrTransportEvent>,
     ) {
         let sources = self.onboarding_sources(c, step).await;
-        let (records, mut failures, discovery_completed) = self
+        let OnboardingInspection {
+            records,
+            mut failures,
+            completed: discovery_completed,
+            ..
+        } = self
             .inspect_onboarding_relays(&c.snapshot.account_id_hex, step.kind(), sources.clone())
             .await;
         let lookup_incomplete = discovery_completed.is_empty() || !failures.is_empty();
@@ -3288,67 +3362,21 @@ impl AccountSetup<'_> {
                     // the minimum local-use capability without editing it.
                     // On `Relays`, discovery already ran the exact same kind
                     // 10002 query: reuse EOSE answers and skip redialing them.
-                    let (route_failures, route_completed) = if step == OnboardingStep::Relays {
-                        let indexers: HashSet<String> = self
-                            .app()
-                            .discovery_indexer_relays()
-                            .iter()
-                            .map(|endpoint| relay_key(&endpoint.0))
-                            .collect();
-                        let mut seen = HashSet::new();
-                        let mut capped = 0;
-                        let mut reused = HashMap::new();
-                        let mut to_dial = Vec::new();
-                        let mut cap_failures = Vec::new();
-                        for classified in self.app().relay_plane.classify_relay_endpoints(endpoints)
-                        {
-                            if is_onion_relay(&classified.endpoint)
-                                || classified.policy != RelayEndpointPolicy::Allowed
-                            {
-                                continue;
-                            }
-                            let endpoint = classified
-                                .normalized_endpoint
-                                .unwrap_or(classified.endpoint);
-                            let Ok(url) = nostr::prelude::RelayUrl::parse(&endpoint) else {
-                                continue;
-                            };
-                            if !seen.insert(url) {
-                                continue;
-                            }
-                            let key = relay_key(&endpoint);
-                            if !indexers.contains(&key) {
-                                capped += 1;
-                                if capped > MAX_RELAYS {
-                                    if capped == MAX_RELAYS + 1 {
-                                        cap_failures.push(finding(OnboardingIssue::TooManyRelays));
-                                    }
-                                    continue;
-                                }
-                            }
-                            if let Some(answered) = discovery_completed.get(&key) {
-                                reused.insert(key, answered.clone());
-                            } else {
-                                to_dial.push(endpoint);
-                            }
-                        }
-                        if !to_dial.is_empty() {
-                            let (_, dialed_failures, dialed_completed) = self
-                                .inspect_onboarding_relays(
-                                    &c.snapshot.account_id_hex,
-                                    10002,
-                                    to_dial,
-                                )
-                                .await;
-                            cap_failures.extend(dialed_failures);
-                            reused.extend(dialed_completed);
-                        }
-                        (cap_failures, reused)
+                    let OnboardingInspection {
+                        failures: route_failures,
+                        completed: route_completed,
+                        ..
+                    } = if step == OnboardingStep::Relays {
+                        self.inspect_onboarding_relays_reusing(
+                            &c.snapshot.account_id_hex,
+                            10002,
+                            endpoints,
+                            Some(&discovery_completed),
+                        )
+                        .await
                     } else {
-                        let (_, failures, completed) = self
-                            .inspect_onboarding_inbox(&c.snapshot.account_id_hex, endpoints)
-                            .await;
-                        (failures, completed)
+                        self.inspect_onboarding_inbox(&c.snapshot.account_id_hex, endpoints)
+                            .await
                     };
                     let waiting_for_signer = route_failures
                         .iter()
@@ -3750,7 +3778,12 @@ impl AccountSetup<'_> {
             )
             .await?;
         self.require_live_onboarding_attempt(&c)?;
-        let (records, failures, completed) = self
+        let OnboardingInspection {
+            records,
+            completed_records,
+            failures,
+            completed,
+        } = self
             .await_while_onboarding_live(
                 &account_id,
                 attempt,
@@ -3770,11 +3803,22 @@ impl AccountSetup<'_> {
                 .all(|endpoint| completed.contains_key(&relay_key(endpoint)))
             && !(records.is_empty() && !failures.is_empty());
         // Unless the user approves a proposal displayed as inconclusive. Then a
-        // source that vouches for the account's records must answer, and the
-        // proposal's record must still be the newest that any answering source
-        // holds; a record only an unanswered source holds is the accepted risk.
-        let authoritative = self.authoritative_answered(&c, &sources, &completed);
-        let accepted_risk = !complete && proposal.inconclusive && authoritative;
+        // completed source that vouches for the account's records must itself
+        // corroborate the proposal's basis (never combining a partial relay's
+        // event with a separate authoritative empty EOSE), and the proposal's
+        // record must still be the newest any answering source holds; a record
+        // only an unanswered source holds is the accepted risk.
+        let auth_keys = self.authoritative_completed_keys(&c, &sources, &completed);
+        let authoritative = !auth_keys.is_empty();
+        let authoritative_corroborates_basis = match proposal.previous_event_id.as_ref() {
+            Some(expected_id) => auth_keys.iter().any(|key| {
+                completed_records
+                    .get(*key)
+                    .is_some_and(|events| events.iter().any(|event| &event.id == expected_id))
+            }),
+            None => authoritative && records.is_empty(),
+        };
+        let accepted_risk = !complete && proposal.inconclusive && authoritative_corroborates_basis;
         let basis_newest = records.first().map(|e| &e.id) == proposal.previous_event_id.as_ref();
         // Past a failed source, only a record that replaces the proposal's own
         // counts as a change; an older copy must not displace it.
@@ -3785,13 +3829,13 @@ impl AccountSetup<'_> {
             .first()
             .is_some_and(|event| basis.is_none_or(|basis| is_newer_event(event, basis)));
         // When a complete check's relay proposal hits a partial source failure
-        // during Save while an authoritative source still confirms the basis is
-        // newest, renew the proposal in place as `inconclusive` under a fresh
-        // revision instead of wiping it; nothing is signed without explicit
-        // confirmation of the inconclusive warning (mdk#3722).
+        // during Save while a completed authoritative source still corroborates
+        // that the basis is newest, renew the proposal in place as `inconclusive`
+        // under a fresh revision instead of wiping it; nothing is signed without
+        // explicit confirmation of the inconclusive warning (mdk#3722).
         let renew_inconclusive = !complete
             && !proposal.inconclusive
-            && authoritative
+            && authoritative_corroborates_basis
             && basis_newest
             && proposal.step.relay();
         if !basis_newest && (complete || (authoritative && newer_seen)) {
@@ -4062,10 +4106,17 @@ impl AccountSetup<'_> {
             "onboarding repair",
         );
         self.require_live_onboarding_attempt(c)?;
-        // Clear any earlier definitive-refusal flag before sending again so a
-        // crash or cancellation mid-retry stays conservative on resume.
-        if c.repair_may_have_published == Some(false) {
-            c.repair_may_have_published = None;
+        // Persist in-flight exposure BEFORE sending so a crash or interruption
+        // mid-publish leaves `Some(true)` on disk and a later retry with only
+        // definitive refusals can never erase that earlier exposure. Legacy
+        // checkpoints that already failed publish (`RetryableFailure` with
+        // `None`) also stay conservative.
+        let prior_exposed = c.repair_may_have_published == Some(true)
+            || (c.repair_may_have_published.is_none()
+                && c.snapshot.steps[proposal.step.index()].status
+                    == OnboardingStatus::RetryableFailure);
+        if c.repair_may_have_published != Some(true) {
+            c.repair_may_have_published = Some(true);
             self.save_onboarding(c)?;
         }
         #[cfg(test)]
@@ -4142,8 +4193,7 @@ impl AccountSetup<'_> {
                     }
                 };
                 let may_have_published = attempt_may_have_published(&endpoints, &endpoint_failures);
-                c.repair_may_have_published =
-                    Some(c.repair_may_have_published == Some(true) || may_have_published);
+                c.repair_may_have_published = Some(prior_exposed || may_have_published);
                 let findings = publish_failure_findings(
                     OnboardingFindingContext::RepairPublication,
                     None,

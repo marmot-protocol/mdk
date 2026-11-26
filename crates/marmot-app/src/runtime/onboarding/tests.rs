@@ -11386,3 +11386,164 @@ async fn write_refused_key_package_surfaces_findings_and_recovers_after_relay_ed
     );
     runtime.shutdown_and_close().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_repair_publish_stays_exposed_even_if_retry_is_blocked() {
+    use cgka_traits::{
+        TransportEndpointFailure, TransportEndpointFailureKind as Kind,
+        TransportEndpointRejectionCategory as Cat,
+    };
+
+    let (dir, runtime, network, keys, id) = fixture().await;
+    let relays = signed(
+        &keys,
+        10002,
+        vec![vec![
+            "r".into(),
+            "wss://read-only.example".into(),
+            "read".into(),
+        ]],
+        "",
+        unix_now_seconds() - 10,
+    );
+    *network.events.lock() = vec![
+        signed(
+            &keys,
+            0,
+            Vec::new(),
+            r#"{"name":"alice"}"#,
+            unix_now_seconds() - 10,
+        ),
+        signed(&keys, 3, Vec::new(), "", unix_now_seconds() - 10),
+        relays,
+    ];
+
+    let paused = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        paused.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    let proposed = runtime
+        .account_setup()
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let hold = runtime
+        .accounts()
+        .account_setup()
+        .install_onboarding_publication_hold();
+    let approve_runtime = runtime.clone();
+    let approve_id = id.clone();
+    let approve_rev = proposed.revision;
+    let approve_task = tokio::spawn(async move {
+        approve_runtime
+            .account_setup()
+            .approve_onboarding_repair(&approve_id, approve_rev)
+            .await
+    });
+    hold.entered.notified().await;
+    // Crash/interrupt before the publish settles: `repair_may_have_published`
+    // is already persisted as `Some(true)` before the send begins.
+    approve_task.abort();
+    let _ = approve_task.await;
+    runtime.shutdown_and_close().await.unwrap();
+
+    // Restart: every target now definitively blocks the retry.
+    network.publish_failures.lock().insert(
+        "wss://".into(),
+        TransportEndpointFailure {
+            endpoint: TransportEndpoint("wss://blocked.example".into()),
+            kind: Kind::TerminalRejected,
+            rejection_category: Some(Cat::Blocked),
+            reason: "blocked: no".into(),
+            size_class: None,
+            pre_send: false,
+        },
+    );
+    let runtime = super::tests::runtime(dir.path(), network.clone());
+    let resumed = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    let step = &resumed.steps[OnboardingStep::Relays.index()];
+    assert_eq!(step.status, OnboardingStatus::RetryableFailure);
+    assert!(step.actions.contains(&OnboardingAction::Retry));
+    assert!(
+        !step.actions.contains(&OnboardingAction::CancelRepair),
+        "interrupted prior publish must stay conservative and block CancelRepair"
+    );
+    assert!(!step.actions.contains(&OnboardingAction::EditRelays));
+    assert!(
+        runtime
+            .account_setup()
+            .cancel_onboarding_repair(&id)
+            .await
+            .is_err()
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_does_not_combine_partial_basis_with_empty_authoritative_eose() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let basis = signed(
+        &keys,
+        10002,
+        vec![vec![
+            "r".into(),
+            "wss://partial.example".into(),
+            "read".into(),
+        ]],
+        "",
+        unix_now_seconds() - 10,
+    );
+    *network.events.lock() = vec![
+        signed(
+            &keys,
+            0,
+            Vec::new(),
+            r#"{"name":"alice"}"#,
+            unix_now_seconds() - 10,
+        ),
+        signed(&keys, 3, Vec::new(), "", unix_now_seconds() - 10),
+        basis.clone(),
+    ];
+    let setup = runtime.account_setup();
+    let paused = setup.run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        paused.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    let proposed = setup
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    assert!(!proposed.proposal.as_ref().unwrap().inconclusive);
+
+    // During approval: `index.example` (authoritative) completes EOSE with NO
+    // events, while `partial.example` returns `basis` before failing. Neither
+    // completed authoritative source corroborated `basis`, so approval must
+    // neither renew nor publish.
+    network.events.lock().clear();
+    network.inspection_errors.lock().insert(
+        "partial.example".into(),
+        transport_nostr::DirectoryInspectionError::partial(
+            vec![DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://partial.example".into())],
+                event: basis.clone(),
+            }],
+            transport_nostr::DirectoryInspectionError::Unreachable,
+        ),
+    );
+    let after = setup
+        .approve_onboarding_repair(&id, proposed.revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::RetryableFailure
+    );
+    assert!(
+        after.proposal.is_none(),
+        "empty authoritative EOSE + partial basis must not renew the proposal"
+    );
+    assert!(network.attempts.lock().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
