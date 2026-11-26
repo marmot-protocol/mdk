@@ -90,7 +90,8 @@ mod tests {
             );
             let draft: (String, i64, i64) = conn
                 .query_row(
-                    "SELECT content,created_at_ms,updated_at_ms FROM message_drafts",
+                    "SELECT content, created_at_ms, updated_at_ms
+                     FROM message_drafts JOIN message_draft_bodies USING (draft_rowid)",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
