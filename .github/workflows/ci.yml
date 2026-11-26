@@ -141,12 +141,15 @@ jobs:
       # when `state == "red"`, Required CI fails PRs checked during the freeze
       # unless labelled `tree-fix` or `revert` (already-green PRs are also
       # checked manually/by agents at merge time per AGENTS.md). A genuinely
-      # absent branch on a fork (`git ls-remote` exit 2) defaults to `green`,
-      # while remote/fetch errors or a malformed `state.json` fail closed to `red`.
+      # absent branch on a standalone fork (`git ls-remote` exit 2) defaults to
+      # `green`; on the canonical repository (`marmot-protocol/mdk`, where the
+      # protected `tree-state` branch is already provisioned), a missing branch,
+      # remote/fetch error, or malformed `state.json` all fail closed to `red`.
       - name: Read tree state
         id: tree_state
         env:
           EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           state=green
@@ -155,7 +158,12 @@ jobs:
             ls_rc=0
             git ls-remote --exit-code origin refs/heads/tree-state >/dev/null 2>&1 || ls_rc=$?
             if [[ "$ls_rc" -eq 2 ]]; then
-              state=green
+              if [[ "${REPO:-}" == "marmot-protocol/mdk" ]]; then
+                state=red
+                reason="canonical origin/tree-state branch is missing (git ls-remote exit 2)"
+              else
+                state=green
+              fi
             elif [[ "$ls_rc" -ne 0 ]]; then
               state=red
               reason="unable to verify origin/tree-state (git ls-remote exit $ls_rc)"

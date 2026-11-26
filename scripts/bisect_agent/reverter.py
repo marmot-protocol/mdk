@@ -15,21 +15,66 @@ from .models import BisectOutcome, RunVerdict
 WorktreePredicate = Callable[[Path], tuple[RunVerdict, str]]
 
 
-def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+GIT_LOCAL_TIMEOUT_SECS = 120
+GIT_REMOTE_TIMEOUT_SECS = 120
+GIT_CLEANUP_TIMEOUT_SECS = 30
+MAX_REVERT_MASTER_RETRIES = 2
+
+
+def _git(
+    repo: Path,
+    *args: str,
+    check: bool = True,
+    timeout: float | None = GIT_LOCAL_TIMEOUT_SECS,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
         check=check,
         capture_output=True,
         text=True,
+        timeout=timeout,
     )
 
 
-def resolve_commit(repo: Path, rev: str) -> str | None:
+def _budget_timeout(
+    deadline: float | None,
+    now_fn: Callable[[], float],
+    default: float = GIT_LOCAL_TIMEOUT_SECS,
+) -> float:
+    """Return bounded seconds remaining before `deadline`, raising TimeoutError if exhausted."""
+    if deadline is None:
+        return default
+    remaining = deadline - now_fn()
+    if remaining <= 0:
+        raise TimeoutError("bisect wall-clock budget exceeded")
+    return min(default, remaining)
+
+
+def resolve_commit(
+    repo: Path,
+    rev: str,
+    *,
+    timeout: float | None = GIT_LOCAL_TIMEOUT_SECS,
+) -> str | None:
     """Resolve `rev` to a full 40-char commit SHA, or None if absent/invalid."""
     if not rev:
         return None
-    res = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}", check=False)
+    res = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}", check=False, timeout=timeout)
     return res.stdout.strip() if res.returncode == 0 else None
+
+
+def commit_parents(
+    repo: Path,
+    sha: str,
+    *,
+    timeout: float | None = GIT_LOCAL_TIMEOUT_SECS,
+) -> list[str]:
+    """Return the parent commit SHAs of `sha` in order (first parent at index 0)."""
+    res = _git(repo, "rev-list", "--parents", "-n", "1", sha, check=False, timeout=timeout)
+    if res.returncode != 0:
+        return []
+    parts = res.stdout.strip().split()
+    return parts[1:] if len(parts) > 1 else []
 
 
 def is_ancestor_or_equal(repo: Path, older_sha: str, newer_sha: str) -> bool:
@@ -45,32 +90,86 @@ def is_ancestor_or_equal(repo: Path, older_sha: str, newer_sha: str) -> bool:
 
 def cleanup_stale_worktrees(repo: Path, worktree_root: Path | None) -> None:
     """Prune stale git worktree metadata and leftover bisect/revert directories."""
-    _git(repo, "worktree", "prune", check=False)
+    try:
+        _git(repo, "worktree", "prune", check=False, timeout=GIT_CLEANUP_TIMEOUT_SECS)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
     if worktree_root is None or not worktree_root.is_dir():
         return
     for entry in worktree_root.iterdir():
         if entry.is_dir() and entry.name.startswith(("mdk-bisect-", "mdk-revert-")):
-            _git(repo, "worktree", "remove", "--force", str(entry), check=False)
+            try:
+                _git(repo, "worktree", "remove", "--force", str(entry), check=False, timeout=GIT_CLEANUP_TIMEOUT_SECS)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
             shutil.rmtree(entry, ignore_errors=True)
-    _git(repo, "worktree", "prune", check=False)
+    try:
+        _git(repo, "worktree", "prune", check=False, timeout=GIT_CLEANUP_TIMEOUT_SECS)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
-def first_parent_commits(repo: Path, baseline_sha: str, tip_sha: str) -> list[str]:
+def first_parent_commits(
+    repo: Path,
+    baseline_sha: str,
+    tip_sha: str,
+    *,
+    deadline: float | None = None,
+    now_fn: Callable[[], float] = time.time,
+) -> list[str]:
     """Return first-parent commits in `(baseline_sha, tip_sha]` oldest-first.
 
-    Raises ValueError if `baseline_sha` or `tip_sha` is missing or not an ancestor.
+    Requires `baseline_sha` to lie on `tip_sha`'s first-parent chain (not a merge's
+    side-branch second parent) so bisect predicates and parent checks remain aligned.
+    Raises ValueError on invalid/non-first-parent range, TimeoutError if `deadline`
+    expires.
     """
     if not baseline_sha or not tip_sha:
         raise ValueError("baseline_sha and tip_sha must both be non-empty")
-    if resolve_commit(repo, baseline_sha) is None:
+    resolved_base = resolve_commit(repo, baseline_sha, timeout=_budget_timeout(deadline, now_fn))
+    if resolved_base is None:
         raise ValueError(f"baseline commit {baseline_sha[:9]} is not present locally")
-    if resolve_commit(repo, tip_sha) is None:
+    resolved_tip = resolve_commit(repo, tip_sha, timeout=_budget_timeout(deadline, now_fn))
+    if resolved_tip is None:
         raise ValueError(f"tip commit {tip_sha[:9]} is not present locally")
-    anc = _git(repo, "merge-base", "--is-ancestor", baseline_sha, tip_sha, check=False)
+    if resolved_base == resolved_tip:
+        return []
+    anc = _git(
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        resolved_base,
+        resolved_tip,
+        check=False,
+        timeout=_budget_timeout(deadline, now_fn),
+    )
     if anc.returncode != 0:
         raise ValueError(f"baseline {baseline_sha[:9]} is not an ancestor of {tip_sha[:9]}")
-    out = _git(repo, "rev-list", "--first-parent", "--reverse", f"{baseline_sha}..{tip_sha}").stdout
-    return [line.strip() for line in out.splitlines() if line.strip()]
+    out = _git(
+        repo,
+        "rev-list",
+        "--first-parent",
+        "--reverse",
+        f"{resolved_base}..{resolved_tip}",
+        timeout=_budget_timeout(deadline, now_fn),
+    ).stdout
+    commits = [line.strip() for line in out.splitlines() if line.strip()]
+    if not commits:
+        return []
+    # Verify `baseline_sha` lies on `tip_sha`'s actual first-parent chain:
+    # `commits[0]` is the oldest first-parent commit after `baseline_sha`, so its
+    # first parent must equal `resolved_base`. If `baseline_sha` was on a merge's
+    # second-parent side branch, `commits[0]^1` is either absent or a different commit.
+    first_parent_of_oldest = resolve_commit(
+        repo,
+        f"{commits[0]}^1",
+        timeout=_budget_timeout(deadline, now_fn),
+    )
+    if first_parent_of_oldest != resolved_base:
+        raise ValueError(
+            f"baseline {baseline_sha[:9]} is not on the first-parent chain of {tip_sha[:9]}"
+        )
+    return commits
 
 
 def commit_metadata(repo: Path, sha: str) -> tuple[str, str]:
@@ -86,21 +185,44 @@ def run_in_detached_worktree(
     predicate: WorktreePredicate,
     *,
     worktree_root: Path | None = None,
+    deadline: float | None = None,
+    now_fn: Callable[[], float] = time.time,
 ) -> tuple[RunVerdict, str]:
     """Check out `sha` in a clean detached worktree, run `predicate`, and remove it."""
-    if resolve_commit(repo, sha) is None:
-        return RunVerdict.INCONCLUSIVE, f"commit {sha[:9] if sha else '<empty>'} not found locally"
+    try:
+        resolve_timeout = _budget_timeout(deadline, now_fn)
+        if resolve_commit(repo, sha, timeout=resolve_timeout) is None:
+            return RunVerdict.INCONCLUSIVE, f"commit {sha[:9] if sha else '<empty>'} not found locally"
+    except (TimeoutError, subprocess.TimeoutExpired):
+        return RunVerdict.INCONCLUSIVE, "bisect wall-clock budget exceeded"
+
     parent = worktree_root or Path(tempfile.gettempdir())
     parent.mkdir(parents=True, exist_ok=True)
     wt_dir = Path(tempfile.mkdtemp(prefix=f"mdk-bisect-{sha[:9]}-", dir=parent))
     wt_dir.rmdir()
     try:
-        add = _git(repo, "worktree", "add", "--detach", str(wt_dir), sha, check=False)
+        try:
+            add_timeout = _budget_timeout(deadline, now_fn)
+            add = _git(
+                repo,
+                "worktree",
+                "add",
+                "--detach",
+                str(wt_dir),
+                sha,
+                check=False,
+                timeout=add_timeout,
+            )
+        except (TimeoutError, subprocess.TimeoutExpired):
+            return RunVerdict.INCONCLUSIVE, f"bisect wall-clock budget exceeded during checkout of {sha[:9]}"
         if add.returncode != 0:
             return RunVerdict.INCONCLUSIVE, f"git worktree add failed for {sha[:9]}"
         return predicate(wt_dir)
     finally:
-        _git(repo, "worktree", "remove", "--force", str(wt_dir), check=False)
+        try:
+            _git(repo, "worktree", "remove", "--force", str(wt_dir), check=False, timeout=GIT_CLEANUP_TIMEOUT_SECS)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
         shutil.rmtree(wt_dir, ignore_errors=True)
 
 
@@ -117,13 +239,13 @@ def bisect_culprit(
     """Binary-search first-parent commits `(baseline_sha, tip_sha]` for the first failing commit.
 
     Explicitly confirms both that the isolated culprit returns `RunVerdict.FAIL` and
-    its parent returns `RunVerdict.PASS` or `RunVerdict.TEST_ABSENT`. Aborts cleanly
-    if `deadline` is exceeded (so the caller can freeze and alert before systemd kills
-    the oneshot unit) or if any midpoint is `RunVerdict.INCONCLUSIVE`.
+    its actual first parent returns `RunVerdict.PASS` or `RunVerdict.TEST_ABSENT`.
+    Aborts cleanly if `deadline` is exceeded (including during git history/worktree
+    operations) or if any midpoint is `RunVerdict.INCONCLUSIVE`.
     """
     try:
-        commits = first_parent_commits(repo, baseline_sha, tip_sha)
-    except (ValueError, subprocess.CalledProcessError) as exc:
+        commits = first_parent_commits(repo, baseline_sha, tip_sha, deadline=deadline, now_fn=now_fn)
+    except (ValueError, TimeoutError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         return None, str(exc)
 
     if not commits:
@@ -134,7 +256,14 @@ def bisect_culprit(
     def eval_sha(sha: str) -> tuple[RunVerdict, str]:
         if deadline is not None and now_fn() >= deadline:
             return RunVerdict.INCONCLUSIVE, "bisect wall-clock budget exceeded"
-        verdict, detail = run_in_detached_worktree(repo, sha, predicate, worktree_root=worktree_root)
+        verdict, detail = run_in_detached_worktree(
+            repo,
+            sha,
+            predicate,
+            worktree_root=worktree_root,
+            deadline=deadline,
+            now_fn=now_fn,
+        )
         tested[sha] = verdict
         return verdict, detail
 
@@ -159,7 +288,13 @@ def bisect_culprit(
                 f"candidate {culprit[:9]} did not reproduce failure ({culprit_verdict.value}: {culprit_detail})",
             )
 
-    parent = baseline_sha if lo == 0 else commits[lo - 1]
+    try:
+        parent = resolve_commit(repo, f"{culprit}^1", timeout=_budget_timeout(deadline, now_fn))
+    except (TimeoutError, subprocess.TimeoutExpired):
+        return None, "bisect wall-clock budget exceeded resolving candidate parent"
+    if parent is None:
+        return None, f"candidate {culprit[:9]} has no first parent to verify"
+
     if tested.get(parent) not in {RunVerdict.PASS, RunVerdict.TEST_ABSENT}:
         parent_verdict, parent_detail = eval_sha(parent)
         if parent_verdict == RunVerdict.INCONCLUSIVE:
@@ -215,167 +350,302 @@ def attempt_clean_revert(
     sign_commits: bool = True,
     dry_run: bool = True,
     open_revert_pr: Callable[[str, str, str], str] | None = None,
-    find_existing_pr: Callable[[str], str] | None = None,
+    find_existing_pr: Callable[[str], str | None] | None = None,
+    refresh_master: Callable[[], bool] | None = None,
     worktree_root: Path | None = None,
+    deadline: float | None = None,
+    now_fn: Callable[[], float] = time.time,
 ) -> BisectOutcome:
     """Attempt a strictly revert-only recovery of `culprit_sha` onto `master_ref`.
 
     Uses a detached worktree so neither dry-run nor failed pushes ever create,
-    reset, or delete local branches. In live mode, pushes `HEAD:refs/heads/revert/<sha>`
-    directly to `origin` only after verification passes.
+    reset, or delete local branches. Refreshes `master_ref` before the live-master
+    recheck and confirms `master_ref` has not advanced before publishing so a stale
+    revert is never published after a human fix lands. Rejects multi-parent merge
+    culprits explicitly instead of reporting them as revert conflicts.
     """
     subject, author = commit_metadata(repo, culprit_sha)
     branch_name = f"revert/{culprit_sha[:9]}"
-    master_sha = resolve_commit(repo, master_ref)
-    if master_sha is None:
+
+    parents = commit_parents(repo, culprit_sha)
+    if len(parents) > 1:
         return BisectOutcome(
             culprit_sha=culprit_sha,
             culprit_subject=subject,
             culprit_author_login=author,
+            clean_revert=False,
+            revert_verified=False,
             revert_branch=branch_name,
             meltdown_triggered=True,
-            reason=f"could not resolve target ref {master_ref}",
+            reason=(
+                f"merge commit culprit {culprit_sha[:9]} requires manual revert "
+                "(cannot safely auto-revert multi-parent merge)"
+            ),
         )
 
-    parent = worktree_root or Path(tempfile.gettempdir())
-    parent.mkdir(parents=True, exist_ok=True)
-    wt_dir = Path(tempfile.mkdtemp(prefix=f"mdk-revert-{culprit_sha[:9]}-", dir=parent))
-    wt_dir.rmdir()
-
-    try:
-        add = _git(repo, "worktree", "add", "--detach", str(wt_dir), master_sha, check=False)
-        if add.returncode != 0:
+    for _attempt in range(MAX_REVERT_MASTER_RETRIES):
+        if refresh_master is not None and not refresh_master():
             return BisectOutcome(
                 culprit_sha=culprit_sha,
                 culprit_subject=subject,
                 culprit_author_login=author,
                 revert_branch=branch_name,
-                meltdown_triggered=True,
-                reason=f"failed to create detached revert worktree at {master_sha[:9]}",
-            )
-
-        # Re-verify current master still exhibits the failure before reverting.
-        master_verdict, master_detail = predicate(wt_dir)
-        if master_verdict in {RunVerdict.PASS, RunVerdict.TEST_ABSENT}:
-            return BisectOutcome(
-                culprit_sha=culprit_sha,
-                culprit_subject=subject,
-                culprit_author_login=author,
-                revert_branch=branch_name,
-                already_healed=True,
+                pr_creation_failed=True,
                 meltdown_triggered=False,
-                reason=f"master {master_sha[:9]} already passes ({master_verdict.value}); revert skipped",
+                reason=f"failed to refresh {master_ref} before live-master recheck; will retry",
             )
-        if master_verdict == RunVerdict.INCONCLUSIVE:
+
+        master_sha = resolve_commit(repo, master_ref)
+        if master_sha is None:
             return BisectOutcome(
                 culprit_sha=culprit_sha,
                 culprit_subject=subject,
                 culprit_author_login=author,
                 revert_branch=branch_name,
                 meltdown_triggered=True,
-                reason=f"inconclusive live-master recheck at {master_sha[:9]} ({master_detail})",
+                reason=f"could not resolve target ref {master_ref}",
             )
 
-        revert = _git(wt_dir, "revert", "--no-edit", "--no-commit", culprit_sha, check=False)
-        if revert.returncode != 0:
-            _git(wt_dir, "revert", "--abort", check=False)
-            return BisectOutcome(
-                culprit_sha=culprit_sha,
-                culprit_subject=subject,
-                culprit_author_login=author,
-                clean_revert=False,
-                revert_verified=False,
-                revert_branch=branch_name,
-                meltdown_triggered=True,
-                reason=f"tangled revert: `git revert {culprit_sha[:9]}` had conflicts against {master_sha[:9]}",
-            )
+        parent = worktree_root or Path(tempfile.gettempdir())
+        parent.mkdir(parents=True, exist_ok=True)
+        wt_dir = Path(tempfile.mkdtemp(prefix=f"mdk-revert-{culprit_sha[:9]}-", dir=parent))
+        wt_dir.rmdir()
 
-        commit_msg = format_revert_message(
-            culprit_sha,
-            subject,
-            checks_summary=checks_summary,
-            run_url=run_url,
-        )
-        commit_args = ["commit", "-S" if sign_commits else "--no-gpg-sign", "-m", commit_msg]
-        commit_res = _git(wt_dir, *commit_args, check=False)
-        if commit_res.returncode != 0:
-            return BisectOutcome(
-                culprit_sha=culprit_sha,
-                culprit_subject=subject,
-                culprit_author_login=author,
-                clean_revert=False,
-                revert_verified=False,
-                revert_branch=branch_name,
-                meltdown_triggered=True,
-                reason=f"failed to commit signed revert of {culprit_sha[:9]} (git exit {commit_res.returncode})",
-            )
+        try:
+            try:
+                add_timeout = _budget_timeout(deadline, now_fn)
+                add = _git(
+                    repo,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(wt_dir),
+                    master_sha,
+                    check=False,
+                    timeout=add_timeout,
+                )
+            except (TimeoutError, subprocess.TimeoutExpired):
+                return BisectOutcome(
+                    culprit_sha=culprit_sha,
+                    culprit_subject=subject,
+                    culprit_author_login=author,
+                    revert_branch=branch_name,
+                    meltdown_triggered=True,
+                    reason=f"timed out creating detached revert worktree at {master_sha[:9]}",
+                )
+            if add.returncode != 0:
+                return BisectOutcome(
+                    culprit_sha=culprit_sha,
+                    culprit_subject=subject,
+                    culprit_author_login=author,
+                    revert_branch=branch_name,
+                    meltdown_triggered=True,
+                    reason=f"failed to create detached revert worktree at {master_sha[:9]}",
+                )
 
-        verdict, _detail = predicate(wt_dir)
-        if verdict not in {RunVerdict.PASS, RunVerdict.TEST_ABSENT}:
+            # Re-verify current master still exhibits the failure before reverting.
+            master_verdict, master_detail = predicate(wt_dir)
+            if master_verdict in {RunVerdict.PASS, RunVerdict.TEST_ABSENT}:
+                return BisectOutcome(
+                    culprit_sha=culprit_sha,
+                    culprit_subject=subject,
+                    culprit_author_login=author,
+                    revert_branch=branch_name,
+                    already_healed=True,
+                    meltdown_triggered=False,
+                    reason=f"master {master_sha[:9]} already passes ({master_verdict.value}); revert skipped",
+                )
+            if master_verdict == RunVerdict.INCONCLUSIVE:
+                return BisectOutcome(
+                    culprit_sha=culprit_sha,
+                    culprit_subject=subject,
+                    culprit_author_login=author,
+                    revert_branch=branch_name,
+                    meltdown_triggered=True,
+                    reason=f"inconclusive live-master recheck at {master_sha[:9]} ({master_detail})",
+                )
+
+            try:
+                revert = _git(
+                    wt_dir,
+                    "revert",
+                    "--no-edit",
+                    "--no-commit",
+                    culprit_sha,
+                    check=False,
+                    timeout=_budget_timeout(deadline, now_fn),
+                )
+            except (TimeoutError, subprocess.TimeoutExpired):
+                return BisectOutcome(
+                    culprit_sha=culprit_sha,
+                    culprit_subject=subject,
+                    culprit_author_login=author,
+                    clean_revert=False,
+                    revert_verified=False,
+                    revert_branch=branch_name,
+                    meltdown_triggered=True,
+                    reason=f"timed out running `git revert {culprit_sha[:9]}` against {master_sha[:9]}",
+                )
+            if revert.returncode != 0:
+                try:
+                    _git(wt_dir, "revert", "--abort", check=False, timeout=GIT_CLEANUP_TIMEOUT_SECS)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                return BisectOutcome(
+                    culprit_sha=culprit_sha,
+                    culprit_subject=subject,
+                    culprit_author_login=author,
+                    clean_revert=False,
+                    revert_verified=False,
+                    revert_branch=branch_name,
+                    meltdown_triggered=True,
+                    reason=f"tangled revert: `git revert {culprit_sha[:9]}` had conflicts against {master_sha[:9]}",
+                )
+
+            commit_msg = format_revert_message(
+                culprit_sha,
+                subject,
+                checks_summary=checks_summary,
+                run_url=run_url,
+            )
+            commit_args = ["commit", "-S" if sign_commits else "--no-gpg-sign", "-m", commit_msg]
+            try:
+                commit_res = _git(wt_dir, *commit_args, check=False, timeout=_budget_timeout(deadline, now_fn))
+            except (TimeoutError, subprocess.TimeoutExpired):
+                return BisectOutcome(
+                    culprit_sha=culprit_sha,
+                    culprit_subject=subject,
+                    culprit_author_login=author,
+                    clean_revert=False,
+                    revert_verified=False,
+                    revert_branch=branch_name,
+                    meltdown_triggered=True,
+                    reason=f"timed out committing signed revert of {culprit_sha[:9]}",
+                )
+            if commit_res.returncode != 0:
+                return BisectOutcome(
+                    culprit_sha=culprit_sha,
+                    culprit_subject=subject,
+                    culprit_author_login=author,
+                    clean_revert=False,
+                    revert_verified=False,
+                    revert_branch=branch_name,
+                    meltdown_triggered=True,
+                    reason=f"failed to commit signed revert of {culprit_sha[:9]} (git exit {commit_res.returncode})",
+                )
+
+            verdict, _detail = predicate(wt_dir)
+            if verdict not in {RunVerdict.PASS, RunVerdict.TEST_ABSENT}:
+                return BisectOutcome(
+                    culprit_sha=culprit_sha,
+                    culprit_subject=subject,
+                    culprit_author_login=author,
+                    clean_revert=True,
+                    revert_verified=False,
+                    revert_branch=branch_name,
+                    meltdown_triggered=True,
+                    reason=(
+                        f"clean revert of {culprit_sha[:9]} did not restore green "
+                        f"(likely multi-commit interaction; verdict={verdict.value})"
+                    ),
+                )
+
+            # Confirm master has not advanced (e.g., gained a human fix) while verification ran.
+            if refresh_master is not None:
+                if not refresh_master():
+                    return BisectOutcome(
+                        culprit_sha=culprit_sha,
+                        culprit_subject=subject,
+                        culprit_author_login=author,
+                        clean_revert=True,
+                        revert_verified=True,
+                        revert_branch=branch_name,
+                        pr_creation_failed=True,
+                        meltdown_triggered=False,
+                        reason=f"failed to reconfirm {master_ref} before publishing revert; will retry",
+                    )
+                latest_master_sha = resolve_commit(repo, master_ref)
+                if latest_master_sha != master_sha:
+                    # Master moved during verification: retry against the fresh tip instead of pushing stale revert.
+                    continue
+
+            pr_url = ""
+            if not dry_run:
+                try:
+                    push = _git(
+                        wt_dir,
+                        "push",
+                        "--force-with-lease",
+                        "origin",
+                        f"HEAD:refs/heads/{branch_name}",
+                        check=False,
+                        timeout=GIT_REMOTE_TIMEOUT_SECS,
+                    )
+                except subprocess.TimeoutExpired:
+                    return BisectOutcome(
+                        culprit_sha=culprit_sha,
+                        culprit_subject=subject,
+                        culprit_author_login=author,
+                        clean_revert=True,
+                        revert_verified=True,
+                        revert_branch=branch_name,
+                        pr_creation_failed=True,
+                        meltdown_triggered=False,
+                        reason=f"timed out pushing revert branch {branch_name}; will retry",
+                    )
+                if push.returncode != 0:
+                    return BisectOutcome(
+                        culprit_sha=culprit_sha,
+                        culprit_subject=subject,
+                        culprit_author_login=author,
+                        clean_revert=True,
+                        revert_verified=True,
+                        revert_branch=branch_name,
+                        pr_creation_failed=True,
+                        meltdown_triggered=False,
+                        reason=f"failed to push revert branch {branch_name} (git exit {push.returncode})",
+                    )
+                if open_revert_pr is not None:
+                    pr_url = open_revert_pr(branch_name, f'Revert "{subject}"', commit_msg)
+                if not pr_url and find_existing_pr is not None:
+                    pr_url = find_existing_pr(branch_name) or ""
+                if not pr_url:
+                    return BisectOutcome(
+                        culprit_sha=culprit_sha,
+                        culprit_subject=subject,
+                        culprit_author_login=author,
+                        clean_revert=True,
+                        revert_verified=True,
+                        revert_branch=branch_name,
+                        pr_creation_failed=True,
+                        meltdown_triggered=False,
+                        reason=f"pushed {branch_name} but PR creation returned no URL; will retry",
+                    )
+
             return BisectOutcome(
                 culprit_sha=culprit_sha,
                 culprit_subject=subject,
                 culprit_author_login=author,
                 clean_revert=True,
-                revert_verified=False,
+                revert_verified=True,
                 revert_branch=branch_name,
-                meltdown_triggered=True,
-                reason=(
-                    f"clean revert of {culprit_sha[:9]} did not restore green "
-                    f"(likely multi-commit interaction; verdict={verdict.value})"
-                ),
+                revert_pr_url=pr_url,
+                meltdown_triggered=False,
+                reason=f"{'dry-run: ' if dry_run else ''}clean revert of {culprit_sha[:9]} restored green",
             )
+        finally:
+            try:
+                _git(repo, "worktree", "remove", "--force", str(wt_dir), check=False, timeout=GIT_CLEANUP_TIMEOUT_SECS)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            shutil.rmtree(wt_dir, ignore_errors=True)
 
-        pr_url = ""
-        if not dry_run:
-            push = _git(
-                wt_dir,
-                "push",
-                "--force-with-lease",
-                "origin",
-                f"HEAD:refs/heads/{branch_name}",
-                check=False,
-            )
-            if push.returncode != 0:
-                return BisectOutcome(
-                    culprit_sha=culprit_sha,
-                    culprit_subject=subject,
-                    culprit_author_login=author,
-                    clean_revert=True,
-                    revert_verified=True,
-                    revert_branch=branch_name,
-                    pr_creation_failed=True,
-                    meltdown_triggered=False,
-                    reason=f"failed to push revert branch {branch_name} (git exit {push.returncode})",
-                )
-            if open_revert_pr is not None:
-                pr_url = open_revert_pr(branch_name, f'Revert "{subject}"', commit_msg)
-            if not pr_url and find_existing_pr is not None:
-                pr_url = find_existing_pr(branch_name)
-            if not pr_url:
-                return BisectOutcome(
-                    culprit_sha=culprit_sha,
-                    culprit_subject=subject,
-                    culprit_author_login=author,
-                    clean_revert=True,
-                    revert_verified=True,
-                    revert_branch=branch_name,
-                    pr_creation_failed=True,
-                    meltdown_triggered=False,
-                    reason=f"pushed {branch_name} but PR creation returned no URL; will retry",
-                )
-
-        return BisectOutcome(
-            culprit_sha=culprit_sha,
-            culprit_subject=subject,
-            culprit_author_login=author,
-            clean_revert=True,
-            revert_verified=True,
-            revert_branch=branch_name,
-            revert_pr_url=pr_url,
-            meltdown_triggered=False,
-            reason=f"{'dry-run: ' if dry_run else ''}clean revert of {culprit_sha[:9]} restored green",
-        )
-    finally:
-        _git(repo, "worktree", "remove", "--force", str(wt_dir), check=False)
-        shutil.rmtree(wt_dir, ignore_errors=True)
+    return BisectOutcome(
+        culprit_sha=culprit_sha,
+        culprit_subject=subject,
+        culprit_author_login=author,
+        revert_branch=branch_name,
+        pr_creation_failed=True,
+        meltdown_triggered=False,
+        reason=f"{master_ref} moved repeatedly during revert verification; will retry on next poll",
+    )

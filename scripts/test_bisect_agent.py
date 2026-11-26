@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -21,12 +22,14 @@ from scripts.bisect_agent.classifier import (
     evaluate_command_result,
     extract_bare_metal_signal,
     extract_hosted_signal,
+    match_known_flake_issue,
     nextest_command_for_test,
     parse_first_nextest_failure,
     stress_command,
 )
 from scripts.bisect_agent.controller import (
     BisectController,
+    GitHubOps,
     build_sanitized_predicate_env,
     default_worktree_runner,
     is_wrapper_job,
@@ -36,6 +39,7 @@ from scripts.bisect_agent.models import (
     AgentState,
     Bucket,
     FailureSignal,
+    IncidentRecord,
     RunVerdict,
     load_state,
     save_state,
@@ -56,7 +60,7 @@ def _git(repo: Path, *args: str) -> str:
 
 def _init_repo(tmp: Path, *, with_bare_origin: bool = False) -> tuple[Path, Path | None]:
     repo = tmp / "repo"
-    repo.mkdir()
+    repo.mkdir(parents=True, exist_ok=True)
     _git(repo, "init", "-b", "master")
     _git(repo, "config", "user.name", "Test Bot")
     _git(repo, "config", "user.email", "bot@example.com")
@@ -100,22 +104,27 @@ class StubGitHub:
         author: str = "dev-author",
         runs_by_workflow: dict[str, list[dict]] | None = None,
         verification_status_by_run: dict[int, str] | None = None,
-        failed_jobs_by_run: dict[int, list[dict]] | None = None,
+        failed_jobs_by_run: dict[int, list[dict] | None] | None = None,
         logs_by_job: dict[int, str] | None = None,
         open_pr_by_branch: dict[str, str] | None = None,
         fail_pr_create: bool = False,
+        fail_pr_lookup: bool = False,
+        fail_rerun: bool = False,
         fail_issue_create: bool = False,
     ) -> None:
         self._open_issues = list(open_issues or [])
         self._author = author
         self.runs_by_workflow = runs_by_workflow or {}
         self.verification_status_by_run = dict(verification_status_by_run or {})
-        self.failed_jobs_by_run = failed_jobs_by_run or {}
-        self.logs_by_job = logs_by_job or {}
+        self.failed_jobs_by_run = dict(failed_jobs_by_run or {})
+        self.logs_by_job = dict(logs_by_job or {})
         self.open_pr_by_branch = dict(open_pr_by_branch or {})
         self.fail_pr_create = fail_pr_create
+        self.fail_pr_lookup = fail_pr_lookup
+        self.fail_rerun = fail_rerun
         self.fail_issue_create = fail_issue_create
         self.reruns: list[str] = []
+        self.recorded_attempts: list[tuple[str, int, int | None]] = []
         self.dispatches: int = 0
         self.issues: list[dict] = []
         self.prs: list[dict] = []
@@ -126,13 +135,18 @@ class StubGitHub:
     def recent_workflow_runs(self, workflow: str, *, limit: int = 10):
         return list(self.runs_by_workflow.get(workflow, []))[:limit]
 
-    def hosted_run_verification_status(self, run_id: int) -> str:
+    def hosted_run_verification_status(self, run_id: int, *, attempt: int | None = None) -> str:
+        self.recorded_attempts.append(("verify", run_id, attempt))
         return self.verification_status_by_run.get(run_id, "skipped")
 
-    def failed_jobs_for_run(self, run_id: int):
+    def failed_jobs_for_run(self, run_id: int, *, attempt: int | None = None):
+        self.recorded_attempts.append(("failed_jobs", run_id, attempt))
         if run_id in self.failed_jobs_by_run:
             return self.failed_jobs_by_run[run_id]
         return []
+
+    def job_log(self, _run_id: int, job_id: int) -> str:
+        return self.logs_by_job.get(job_id, "")
 
     def job_log_tail(self, _run_id: int, job_id: int, *, lines: int = 120) -> str:
         return "\n".join(self.logs_by_job.get(job_id, "").splitlines()[-lines:])
@@ -140,11 +154,16 @@ class StubGitHub:
     def commit_author_login(self, _sha: str) -> str:
         return self._author
 
-    def find_open_revert_pr(self, branch: str) -> str:
+    def find_open_revert_pr(self, branch: str) -> str | None:
+        if self.fail_pr_lookup:
+            return None
         return self.open_pr_by_branch.get(branch, "")
 
-    def rerun_failed_jobs(self, run_id: str) -> None:
+    def rerun_failed_jobs(self, run_id: str) -> bool:
+        if self.fail_rerun:
+            return False
         self.reruns.append(run_id)
+        return True
 
     def dispatch_canary(self) -> None:
         self.dispatches += 1
@@ -714,9 +733,717 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
             self.assertFalse(ctrl.handle_green_canary(source="hosted_canary", sha=c0, run_id="102:1", run_url=""))
             self.assertEqual(tree_ctrl.read_remote_status(), "red")
 
-            # Newer-SHA green c2 clears hosted incident and restores tree-state=green.
-            self.assertTrue(ctrl.handle_green_canary(source="hosted_canary", sha=c2, run_id="103:1", run_url=""))
+            # Open a second active incident (`bare_metal_canary`) while `hosted_canary` is frozen:
+            # recovering `hosted_canary` alone must leave remote `tree-state=red`, and recovering
+            # `bare_metal_canary` afterwards must clear remote `tree-state=green`.
+            ctrl._trigger_meltdown(
+                reason="bare-metal failure",
+                signal=FailureSignal(
+                    source="bare_metal_canary",
+                    run_id="bare-metal:c1:1",
+                    run_url="",
+                    tip_sha=c1,
+                    baseline_sha=c0,
+                    failed_job="mdk-canary:fast-ci",
+                ),
+                culprit_sha=None,
+                notified=[],
+                seen_key="fail:bare_metal_canary:bare-metal:c1:1",
+            )
+            self.assertFalse(ctrl.handle_green_canary(source="hosted_canary", sha=c2, run_id="103:1", run_url=""))
+            self.assertEqual(tree_ctrl.read_remote_status(), "red")
+            self.assertIn("bare_metal_canary", state.active_incidents)
+            self.assertNotIn("hosted_canary", state.active_incidents)
+
+            self.assertTrue(ctrl.handle_green_canary(source="bare_metal_canary", sha=c2, run_id="bm-green:1", run_url=""))
             self.assertEqual(tree_ctrl.read_remote_status(), "green")
+
+    def test_exact_step_replay_nextest_statuses_flake_identity_and_stress_reasons(self):
+        # 1. C bindings smoke & Tamarin proofs map ONLY exact reproducible steps;
+        # Header diff gate, Tamarin/pairing proofs, and Relay CLI E2E stay UNREPRODUCIBLE.
+        c_alloc = extract_hosted_signal(
+            source="hosted_canary",
+            run_id="1:1",
+            run_url="https://example.com/1",
+            tip_sha="a" * 40,
+            baseline_sha="b" * 40,
+            failed_job="Full cross-platform CI (6 shards) / C bindings smoke",
+            failed_step="Alloc-audit tests",
+            log_text="assertion failed\n",
+        )
+        self.assertEqual(c_alloc.command, ("cargo", "test", "-p", "marmot-c", "--features", "alloc-audit", "--locked"))
+
+        c_header = extract_hosted_signal(
+            source="hosted_canary",
+            run_id="1:1",
+            run_url="https://example.com/1",
+            tip_sha="a" * 40,
+            baseline_sha="b" * 40,
+            failed_job="Full cross-platform CI (6 shards) / C bindings smoke",
+            failed_step="Header diff gate",
+            log_text="diff --git a/crates/marmot-c/include/marmot.h\n",
+        )
+        self.assertFalse(c_header.reproducible_locally)
+        self.assertEqual(c_header.command, ())
+
+        pairing_proof = extract_hosted_signal(
+            source="hosted_canary",
+            run_id="1:1",
+            run_url="https://example.com/1",
+            tip_sha="a" * 40,
+            baseline_sha="b" * 40,
+            failed_job="Full cross-platform CI (6 shards) / Tamarin proofs",
+            failed_step="Verify pairing authentication and model controls",
+            log_text="lemma falsified\n",
+        )
+        self.assertFalse(pairing_proof.reproducible_locally)
+
+        pairing_unit = extract_hosted_signal(
+            source="hosted_canary",
+            run_id="1:1",
+            run_url="https://example.com/1",
+            tip_sha="a" * 40,
+            baseline_sha="b" * 40,
+            failed_job="Full cross-platform CI (6 shards) / Tamarin proofs",
+            failed_step="Check pairing verifier timeout handling",
+            log_text="FAIL: test_timeout\n",
+        )
+        self.assertEqual(
+            pairing_unit.command,
+            ("python3", "-B", "-m", "unittest", "discover", "-s", "formal/pairing", "-p", "test_*.py"),
+        )
+
+        # Relay CLI E2E requires Docker relays + MDK_E2E_REQUIRE_RELAYS=1 -> NEVER replay as bare nextest!
+        relay_e2e = extract_hosted_signal(
+            source="hosted_canary",
+            run_id="1:1",
+            run_url="https://example.com/1",
+            tip_sha="a" * 40,
+            baseline_sha="b" * 40,
+            failed_job="Full cross-platform CI (6 shards) / Relay CLI E2E",
+            failed_step="Run real relay CLI E2E",
+            log_text="  FAIL [ 5.100s] wn-cli::cli real_local_relays_deliver_cli_messages_over_sdk_path\n",
+        )
+        self.assertFalse(relay_e2e.reproducible_locally)
+        self.assertEqual(relay_e2e.command, ())
+        self.assertEqual(relay_e2e.failed_test, "wn-cli::cli::real_local_relays_deliver_cli_messages_over_sdk_path")
+
+        # Device linking at production timing runs WITHOUT test-policy-overrides!
+        dev_link = extract_hosted_signal(
+            source="hosted_canary",
+            run_id="1:1",
+            run_url="https://example.com/1",
+            tip_sha="a" * 40,
+            baseline_sha="b" * 40,
+            failed_job="Full cross-platform CI (6 shards) / Build CLI tests",
+            failed_step="Device linking at production timing",
+            log_text="  FAIL [ 2.000s] wn-cli::cli devices_link_across_daemon_commands_at_production_timing\n",
+        )
+        self.assertTrue(dev_link.reproducible_locally)
+        self.assertNotIn("test-policy-overrides", " ".join(dev_link.command))
+
+        # 2. Nextest terminal statuses (TIMEOUT / ABORT / LEAK-FAIL) and strict exit-4 TEST_ABSENT.
+        cmd = nextest_command_for_test("marmot-app", "relay_runtime", "hangs_forever")
+        timeout_log = "  TRY 2 TIMEOUT [ 120.004s] ( 12/100) marmot-app::relay_runtime hangs_forever\n"
+        self.assertEqual(parse_first_nextest_failure(timeout_log), ("marmot-app", "relay_runtime", "hangs_forever"))
+        self.assertEqual(evaluate_command_result(100, timeout_log, cmd)[0], RunVerdict.FAIL)
+        # Exit 100 with FAIL + "error: no tests to run" in stdout MUST remain FAIL, NEVER TEST_ABSENT!
+        tricky_fail = "error: no tests to run\n  FAIL [ 0.25s] marmot-app::relay_runtime hangs_forever\n"
+        self.assertEqual(evaluate_command_result(100, tricky_fail, cmd)[0], RunVerdict.FAIL)
+        self.assertEqual(evaluate_command_result(4, "error: no tests to run\n", cmd)[0], RunVerdict.TEST_ABSENT)
+
+        # 3. Full log parsed before tail truncation; tail network noise does not override parsed test failure.
+        long_log = (
+            "  FAIL [ 0.500s] ( 1/50) cgka-engine::state real_failure\n"
+            + "".join(f"diag line {i}\n" for i in range(200))
+            + "Connection reset by peer\n"
+        )
+        long_sig = extract_hosted_signal(
+            source="hosted_canary",
+            run_id="2:1",
+            run_url="https://example.com/2",
+            tip_sha="a" * 40,
+            baseline_sha="b" * 40,
+            failed_job="Full cross-platform CI (6 shards) / Rust tests (4/6)",
+            failed_step="Run workspace tests",
+            log_text=long_log,
+        )
+        self.assertEqual(long_sig.failed_test, "cgka-engine::state::real_failure")
+        self.assertFalse(long_sig.infra_hint)
+        self.assertTrue(long_sig.reproducible_locally)
+
+        # 4. Known-flake matching rejects substrings (`connect` vs `reconnect` or `other::connect`).
+        self.assertIsNone(
+            match_known_flake_issue("core::jobs::connect", [{"number": 10, "title": "Flaky: reconnect", "body": ""}])
+        )
+        self.assertIsNone(
+            match_known_flake_issue("core::jobs::connect", [{"number": 11, "title": "Flaky: other::connect", "body": ""}])
+        )
+        self.assertEqual(
+            match_known_flake_issue(
+                "core::jobs::connect",
+                [{"number": 12, "title": "Flaky test leaderboard", "body": "| `core::jobs::connect` | 3 |"}],
+            ),
+            12,
+        )
+        self.assertEqual(
+            match_known_flake_issue("core::jobs::connect", [{"number": 13, "title": "Flaky: connect", "body": ""}]),
+            13,
+        )
+        # Ambiguous legacy short-name matches do not auto-classify as known flake.
+        self.assertIsNone(
+            match_known_flake_issue(
+                "core::jobs::connect",
+                [
+                    {"number": 13, "title": "Flaky: connect", "body": ""},
+                    {"number": 14, "title": "Flaky: `connect`", "body": ""},
+                ],
+            )
+        )
+
+        # 5. Stress classification reports exact observed outcomes (skipped baseline, baseline-only failure, TEST_ABSENT).
+        base_sig = FailureSignal(
+            source="hosted_canary",
+            run_id="3:1",
+            run_url="https://example.com/3",
+            tip_sha="1" * 40,
+            baseline_sha="",
+            failed_job="Rust tests (1/6)",
+            failed_test="cgka-engine::a::t",
+            command=nextest_command_for_test("cgka-engine", "a", "t"),
+        )
+        no_base_stress = classify_failure(
+            base_sig,
+            run_on_sha=lambda _s, c: (RunVerdict.FAIL if "--stress-count" in c else RunVerdict.PASS, ""),
+            stress_count=5,
+        )
+        self.assertIn("baseline stress skipped", no_base_stress.reason)
+        self.assertNotIn("passed baseline", no_base_stress.reason)
+
+        base_only_fail = classify_failure(
+            FailureSignal(**{**base_sig.__dict__, "baseline_sha": "0" * 40}),
+            run_on_sha=lambda s, c: (
+                RunVerdict.FAIL if "--stress-count" in c and s == "0" * 40 else RunVerdict.PASS,
+                "",
+            ),
+            stress_count=5,
+        )
+        self.assertIn("on baseline 000000000", base_only_fail.reason)
+        self.assertNotIn("on both tip", base_only_fail.reason)
+
+        # 6. Tracked systemd unit enforces `--predicate-runner-prefix` even in dry-run mode.
+        unit_text = (REPO_ROOT / "scripts/bisect_agent/deploy/mdk-bisect-agent.service").read_text(encoding="utf-8")
+        self.assertIn("--predicate-runner-prefix", unit_text)
+
+    def test_multi_failed_jobs_attempt_binding_rerun_rejection_and_flake_streaks(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo, _ = _init_repo(tmp, with_bare_origin=True)
+            c0 = _commit_file(repo, "app.txt", "good\n", "c0")
+            c1 = _commit_file(repo, "app.txt", "bad\n", "c1")
+            _git(repo, "push", "origin", "master")
+
+            # Run 300 has TWO failed shards: shard 4 is a known flake, shard 6 is a deterministic regression.
+            # Both MUST be processed so shard 4's known flake never hides shard 6's regression!
+            gh = StubGitHub(
+                open_issues=[{"number": 77, "title": "Flaky: cgka-engine::net::known_flake", "body": ""}],
+                author="dev",
+                runs_by_workflow={
+                    "canary.yml": [
+                        {
+                            "id": 300,
+                            "run_attempt": 2,
+                            "conclusion": "failure",
+                            "head_sha": c1,
+                            "html_url": "https://example.com/300",
+                            "updated_at": "2026-11-26T16:00:00Z",
+                        },
+                        {
+                            "id": 299,
+                            "run_attempt": 1,
+                            "conclusion": "success",
+                            "head_sha": c0,
+                            "html_url": "https://example.com/299",
+                            "updated_at": "2026-11-26T15:00:00Z",
+                        },
+                    ]
+                },
+                failed_jobs_by_run={
+                    300: [
+                        {"id": 1001, "name": "Full cross-platform CI (6 shards) / Rust tests (4/6)", "conclusion": "failure", "steps": [{"name": "Run workspace tests", "conclusion": "failure"}]},
+                        {"id": 1002, "name": "Full cross-platform CI (6 shards) / Rust tests (6/6)", "conclusion": "failure", "steps": [{"name": "Run workspace tests", "conclusion": "failure"}]},
+                    ]
+                },
+                logs_by_job={
+                    1001: "  FAIL [ 0.40s] cgka-engine::net known_flake\n",
+                    1002: "  FAIL [ 0.40s] cgka-engine::core deterministic_bug\n",
+                },
+                fail_pr_lookup=True,  # Shard 6 defers on first poll due to lookup failure!
+            )
+            state = AgentState()
+            ctrl = BisectController(
+                repo=repo,
+                state=state,
+                github=gh,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=TreeStateController(repo, dry_run=True, sign_commits=False),
+                dry_run=False,
+                sign_commits=False,
+                worktree_root=tmp / "wts",
+                run_in_wt=lambda wt, _cmd: (
+                    RunVerdict.PASS if (wt / "app.txt").read_text(encoding="utf-8").strip() == "good" else RunVerdict.FAIL,
+                    "",
+                ),
+            )
+            res1 = ctrl.poll_once(hosted_workflows=("canary.yml",), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual([a["bucket"] for a in res1["actions"]], ["known_flake", "deterministic_regression"])
+            # Attempt number 2 was passed to failed_jobs_for_run!
+            self.assertIn(("failed_jobs", 300, 2), gh.recorded_attempts)
+            # Because shard 6 deferred on PR lookup error, the run attempt stays PENDING (unseen),
+            # while shard 4 IS already marked seen so it won't re-run on the next poll!
+            self.assertIn("fail:hosted_canary:300:2:job:1001", state.seen_runs)
+            self.assertNotIn("fail:hosted_canary:300:2:job:1002", state.seen_runs)
+            self.assertNotIn("fail:hosted_canary:300:2", state.seen_runs)
+            self.assertEqual(len(gh.prs), 0)
+
+            # Next poll: PR lookup succeeds -> only shard 6 runs, opens revert PR, and marks run 300:2 seen!
+            gh.fail_pr_lookup = False
+            res2 = ctrl.poll_once(hosted_workflows=("canary.yml",), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual(len(res2["actions"]), 1)
+            self.assertEqual(res2["actions"][0]["culprit"], c1)
+            self.assertEqual(len(gh.prs), 1)
+            self.assertIn("fail:hosted_canary:300:2", state.seen_runs)
+
+            # Flake streaks are keyed per source and reset on that source's green recovery.
+            self.assertEqual(state.consecutive_flake_blocks.get("hosted_canary:cgka-engine::net::known_flake"), 1)
+            state.consecutive_flake_blocks["bare_metal_canary:cgka-engine::net::known_flake"] = 1
+            ctrl.handle_green_canary(source="hosted_canary", sha=c1, run_id="301:1", run_url="")
+            self.assertNotIn("hosted_canary:cgka-engine::net::known_flake", state.consecutive_flake_blocks)
+            self.assertEqual(state.consecutive_flake_blocks.get("bare_metal_canary:cgka-engine::net::known_flake"), 1)
+
+            # Rejected `gh run rerun` leaves `retried_runs` and `seen_runs` unrecorded so next poll retries!
+            gh_rej = StubGitHub(fail_rerun=True)
+            state_rej = AgentState()
+            ctrl_rej = BisectController(
+                repo=repo,
+                state=state_rej,
+                github=gh_rej,
+                alerter=MarmotAlerter(Roster(), dry_run=True),
+                tree_state=TreeStateController(repo, dry_run=True, sign_commits=False),
+                dry_run=False,
+                sign_commits=False,
+            )
+            sig_infra = FailureSignal(
+                source="hosted_canary",
+                run_id="600:1",
+                run_url="https://example.com/600",
+                tip_sha=c1,
+                baseline_sha=c0,
+                failed_job="Rust audit",
+                log_excerpt="No space left on device",
+            )
+            ctrl_rej.handle_failure(sig_infra)
+            self.assertEqual(state_rej.retried_runs, [])
+            self.assertNotIn("fail:hosted_canary:600:1", state_rej.seen_runs)
+            gh_rej.fail_rerun = False
+            ctrl_rej.handle_failure(sig_infra)
+            self.assertEqual(state_rej.retried_runs, ["600"])
+            self.assertIn("fail:hosted_canary:600:1", state_rej.seen_runs)
+
+            # Two unreproducible macOS jobs in ONE single hosted run count as only 1 red run (not 2!).
+            gh_mac = StubGitHub(
+                runs_by_workflow={
+                    "canary.yml": [
+                        {
+                            "id": 310,
+                            "run_attempt": 1,
+                            "conclusion": "failure",
+                            "head_sha": c1,
+                            "html_url": "https://example.com/310",
+                            "updated_at": "2026-11-26T16:30:00Z",
+                        }
+                    ]
+                },
+                failed_jobs_by_run={
+                    310: [
+                        {"id": 2001, "name": "iOS keychain and Swift cancellation", "conclusion": "failure"},
+                        {"id": 2002, "name": "MarmotKit native host lifecycle", "conclusion": "failure"},
+                    ]
+                },
+            )
+            state_mac = AgentState()
+            ctrl_mac = BisectController(
+                repo=repo,
+                state=state_mac,
+                github=gh_mac,
+                alerter=MarmotAlerter(Roster(), dry_run=True),
+                tree_state=TreeStateController(repo, dry_run=True, sign_commits=False),
+                dry_run=False,
+                sign_commits=False,
+            )
+            res_mac = ctrl_mac.poll_once(hosted_workflows=("canary.yml",), fetch_remote=False)
+            self.assertEqual(len(res_mac["actions"]), 2)
+            self.assertFalse(any(a["meltdown"] for a in res_mac["actions"]))
+            self.assertEqual(state_mac.consecutive_unreproducible_reds.get("hosted_canary"), 1)
+            self.assertEqual(gh_mac.reruns, ["310:1:job:2001"])
+
+            # GitHubOps.jobs_for_run binds to `/attempts/{attempt}/jobs` when attempt is supplied.
+            gh_ops = GitHubOps("marmot-protocol/mdk", dry_run=True)
+            with mock.patch.object(gh_ops, "_run_gh_safe") as mocked_gh:
+                mocked_gh.return_value = subprocess.CompletedProcess([], 0, stdout='{"jobs":[]}', stderr="")
+                gh_ops.jobs_for_run(42, attempt=3)
+                mocked_gh.assert_called_once_with(
+                    "api", "repos/marmot-protocol/mdk/actions/runs/42/attempts/3/jobs?per_page=100"
+                )
+
+    def test_fresh_master_recheck_post_bisect_budget_first_parent_and_merge_culprit(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo, origin = _init_repo(tmp, with_bare_origin=True)
+            assert origin is not None
+            c0 = _commit_file(repo, "app.txt", "good\n", "c0")
+            c1 = _commit_file(repo, "app.txt", "broken\n", "c1")
+            _git(repo, "push", "origin", "master")
+
+            # Clone a second checkout to push a human fix to origin/master DURING bisect!
+            pusher = tmp / "pusher"
+            subprocess.run(["git", "clone", str(origin), str(pusher)], check=True, capture_output=True)
+            _git(pusher, "config", "user.name", "Human")
+            _git(pusher, "config", "user.email", "human@example.com")
+            _git(pusher, "config", "commit.gpgsign", "false")
+
+            pushed_fix = {"done": False}
+            clock = {"t": 1000.0}
+
+            def slow_bisect_then_master_fix(wt: Path, _cmd: tuple[str, ...]) -> tuple[RunVerdict, str]:
+                val = (wt / "app.txt").read_text(encoding="utf-8").strip()
+                # Advance clock during bisect near the 100s bisect budget, AND push a fix to origin/master!
+                if not pushed_fix["done"] and val == "broken":
+                    clock["t"] = 1095.0
+                    _commit_file(pusher, "app.txt", "good\n", "human fix landed")
+                    _git(pusher, "push", "origin", "master")
+                    pushed_fix["done"] = True
+                return (RunVerdict.PASS if val == "good" else RunVerdict.FAIL), ""
+
+            gh = StubGitHub(author="dev")
+            state = AgentState()
+            ctrl = BisectController(
+                repo=repo,
+                state=state,
+                github=gh,
+                alerter=MarmotAlerter(Roster(), dry_run=True),
+                tree_state=TreeStateController(repo, dry_run=True, sign_commits=False),
+                dry_run=False,
+                sign_commits=False,
+                timeout_secs=60,
+                bisect_budget_secs=100,
+                now_fn=lambda: clock["t"],
+                worktree_root=tmp / "wts",
+                run_in_wt=slow_bisect_then_master_fix,
+            )
+            _cls, out = ctrl.handle_failure(
+                FailureSignal(
+                    source="hosted_canary",
+                    run_id="400:1",
+                    run_url="https://example.com/400",
+                    tip_sha=c1,
+                    baseline_sha=c0,
+                    failed_job="Rust format",
+                    failed_step="Check formatting",
+                    command=("just", "fmt-check"),
+                ),
+                master_ref="origin/master",
+                poll_deadline=1100.0,
+                fetch_remote=True,
+            )
+            assert out is not None
+            # Agent refreshed origin/master before recheck, saw the human fix, and skipped reverting!
+            self.assertTrue(out.already_healed)
+            self.assertFalse(out.meltdown_triggered)
+            self.assertEqual(len(gh.prs), 0)
+
+            # Side-branch baseline rejection & merge-commit culprit handling.
+            repo2, _ = _init_repo(tmp / "m2", with_bare_origin=False)
+            m0 = _commit_file(repo2, "main.txt", "v0\n", "m0")
+            _git(repo2, "checkout", "-b", "side")
+            side_c = _commit_file(repo2, "side.txt", "side\n", "side commit")
+            _git(repo2, "checkout", "master")
+            _commit_file(repo2, "main.txt", "v1\n", "m1")
+            _git(repo2, "merge", "--no-ff", "side", "-m", "merge side")
+            merge_sha = _git(repo2, "rev-parse", "HEAD")
+
+            # `side_c` is on second-parent history, NOT first-parent chain -> bisect refuses cleanly!
+            culp, reason = bisect_culprit(repo2, side_c, merge_sha, lambda _wt: (RunVerdict.FAIL, ""))
+            self.assertIsNone(culp)
+            self.assertIn("not on the first-parent chain", reason)
+
+            # Attempting revert of a merge commit returns explicit merge-culprit reason (not revert conflict).
+            merge_out = attempt_clean_revert(
+                repo2,
+                merge_sha,
+                "HEAD",
+                lambda _wt: (RunVerdict.FAIL, ""),
+                checks_summary="just fmt-check",
+                sign_commits=False,
+                dry_run=True,
+                worktree_root=tmp / "wts2",
+            )
+            self.assertTrue(merge_out.meltdown_triggered)
+            self.assertIn("merge commit culprit", merge_out.reason)
+            self.assertNotIn("tangled revert", merge_out.reason)
+
+            # Post-bisect revert budget: even when bisect finishes right at `poll_deadline`
+            # (leaving 0s on the poll budget), live-master recheck + revert check STILL get
+            # their own post-bisect budget (`2 * timeout_secs`) and succeed without Meltdown!
+            c_good_base = _git(pusher, "rev-parse", "HEAD")
+            c_fix = _commit_file(pusher, "app.txt", "broken2\n", "c_broken2")
+            _git(pusher, "push", "origin", "master")
+            _git(repo, "fetch", "origin", "+refs/heads/master:refs/remotes/origin/master")
+            t_state = {"now": 2000.0}
+
+            def finish_late_predicate(wt: Path, _cmd: tuple[str, ...]) -> tuple[RunVerdict, str]:
+                val = (wt / "app.txt").read_text(encoding="utf-8").strip()
+                t_state["now"] += 30.0
+                return (RunVerdict.PASS if val == "good" else RunVerdict.FAIL), ""
+
+            ctrl_budget = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=StubGitHub(author="dev"),
+                alerter=MarmotAlerter(Roster(), dry_run=True),
+                tree_state=TreeStateController(repo, dry_run=True, sign_commits=False),
+                dry_run=True,
+                sign_commits=False,
+                timeout_secs=60,
+                bisect_budget_secs=120,
+                now_fn=lambda: t_state["now"],
+                worktree_root=tmp / "wts3",
+                run_in_wt=finish_late_predicate,
+            )
+            _cls_b, out_b = ctrl_budget.handle_failure(
+                FailureSignal(
+                    source="hosted_canary",
+                    run_id="401:1",
+                    run_url="https://example.com/401",
+                    tip_sha=c_fix,
+                    baseline_sha=c_good_base,
+                    failed_job="Rust format",
+                    failed_step="Check formatting",
+                    command=("just", "fmt-check"),
+                ),
+                master_ref="origin/master",
+                poll_deadline=2120.0,
+                fetch_remote=False,
+            )
+            assert out_b is not None
+            self.assertGreater(t_state["now"], 2120.0)
+            self.assertTrue(out_b.revert_verified)
+            self.assertFalse(out_b.meltdown_triggered)
+
+            # Worktree checkout timeout inside bisect aborts cleanly as inconclusive with bounded cleanup.
+            real_run = subprocess.run
+
+            def timeout_on_wt_add(argv, *args, **kwargs):
+                if isinstance(argv, list) and "worktree" in argv and "add" in argv:
+                    raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 1))
+                return real_run(argv, *args, **kwargs)
+
+            with mock.patch("scripts.bisect_agent.reverter.subprocess.run", side_effect=timeout_on_wt_add):
+                culp_to, reason_to = bisect_culprit(
+                    repo,
+                    c0,
+                    c_fix,
+                    lambda _wt: (RunVerdict.FAIL, ""),
+                    worktree_root=tmp / "wts4",
+                    deadline=5000.0,
+                    now_fn=lambda: 4995.0,
+                )
+            self.assertIsNone(culp_to)
+            self.assertIn("budget exceeded during checkout", reason_to)
+
+            # Confirm master advancing DURING revert verification triggers re-check instead of stale push.
+            _commit_file(pusher, "app.txt", "good\n", "restore good before c_bad3")
+            c_bad3 = _commit_file(pusher, "app.txt", "broken3\n", "c_broken3")
+            _git(pusher, "push", "origin", "master")
+            _git(repo, "fetch", "origin", "+refs/heads/master:refs/remotes/origin/master")
+            moved_during_verify = {"done": False}
+
+            def verify_while_master_moves(wt: Path) -> tuple[RunVerdict, str]:
+                val = (wt / "app.txt").read_text(encoding="utf-8").strip()
+                if val == "good" and not moved_during_verify["done"]:
+                    _commit_file(pusher, "app.txt", "good\n", "human fix during revert test")
+                    _git(pusher, "push", "origin", "master")
+                    moved_during_verify["done"] = True
+                return (RunVerdict.PASS if val == "good" else RunVerdict.FAIL), ""
+
+            out_moved = attempt_clean_revert(
+                repo,
+                c_bad3,
+                "origin/master",
+                verify_while_master_moves,
+                checks_summary="just fmt-check",
+                sign_commits=False,
+                dry_run=False,
+                open_revert_pr=lambda _b, _t, _body: "https://example.com/should-not-open",
+                refresh_master=ctrl._refresh_master,
+                worktree_root=tmp / "wts5",
+            )
+            self.assertTrue(out_moved.already_healed)
+            self.assertEqual(out_moved.revert_pr_url, "")
+
+    def test_durable_remote_incident_recovery_manual_freeze_skipped_error_and_resilience(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo, origin = _init_repo(tmp, with_bare_origin=True)
+            assert origin is not None
+            c0 = _commit_file(repo, "app.txt", "good\n", "c0")
+            c1 = _commit_file(repo, "app.txt", "bad\n", "c1")
+            c2 = _commit_file(repo, "app.txt", "fixed\n", "c2")
+            _git(repo, "push", "origin", "master")
+            _seed_tree_state(tmp, origin, state="green")
+
+            tree_ctrl = TreeStateController(repo, dry_run=False, sign_commits=False)
+
+            # 1. Simulate crash AFTER remote `tree-state=red` push with durable `incidents`,
+            # BEFORE local `bisect-state.json` was saved (fresh empty AgentState on restart!).
+            tree_ctrl.set_state(
+                "red",
+                reason="hosted_canary failed on c1",
+                run_url="https://example.com/500",
+                incidents={
+                    "hosted_canary": {
+                        "source": "hosted_canary",
+                        "tip_sha": c1,
+                        "started_at": 100.0,
+                        "reason": "hosted_canary failed on c1",
+                        "run_url": "https://example.com/500",
+                        "culprit_sha": None,
+                    }
+                },
+            )
+            restarted_state = AgentState()
+            gh_restart = StubGitHub(
+                runs_by_workflow={
+                    "canary.yml": [
+                        {"id": 802, "run_attempt": 1, "conclusion": "success", "head_sha": c2, "html_url": "https://example.com/802", "updated_at": "2026-11-26T18:00:00Z"},
+                        {"id": 801, "run_attempt": 1, "conclusion": "success", "head_sha": c2, "html_url": "https://example.com/801", "updated_at": "2026-11-26T17:00:00Z"},
+                    ]
+                },
+                verification_status_by_run={802: "skipped", 801: "error"},
+            )
+            ctrl_restart = BisectController(
+                repo=repo,
+                state=restarted_state,
+                github=gh_restart,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree_ctrl,
+                dry_run=False,
+                sign_commits=False,
+                now_fn=lambda: 200.0,
+            )
+            # An older green on c0 or a green from `bare_metal_canary` MUST NOT clear hosted_canary's freeze!
+            self.assertFalse(ctrl_restart.handle_green_canary(source="hosted_canary", sha=c0, run_id="old:1", run_url=""))
+            self.assertEqual(tree_ctrl.read_remote_status(), "red")
+            self.assertFalse(ctrl_restart.handle_green_canary(source="bare_metal_canary", sha=c2, run_id="bm:1", run_url=""))
+            self.assertEqual(tree_ctrl.read_remote_status(), "red")
+
+            # Skipped run 802 with candidate 801 returning `error` MUST leave 802 unseen!
+            res_err = ctrl_restart.poll_once(hosted_workflows=("canary.yml",), fetch_remote=False)
+            self.assertEqual(res_err["actions"][0]["result"], "jobs_api_error")
+            self.assertNotIn("green:hosted_canary:802:1", restarted_state.seen_runs)
+            self.assertEqual(tree_ctrl.read_remote_status(), "red")
+
+            # Once 801 resolves as `verified`, next poll discovers 801 and clears the hydrated freeze!
+            gh_restart.verification_status_by_run[801] = "verified"
+            res_ok = ctrl_restart.poll_once(hosted_workflows=("canary.yml",), fetch_remote=False)
+            self.assertTrue(res_ok["actions"][0]["cleared_meltdown"])
+            self.assertEqual(tree_ctrl.read_remote_status(), "green")
+
+            # 2. Manual freeze (`state="red"` with NO `incidents` metadata): automated green MUST NOT clear it!
+            tree_ctrl.set_state("red", reason="manual release freeze", incidents={})
+            manual_ctrl = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=StubGitHub(),
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree_ctrl,
+                dry_run=False,
+                sign_commits=False,
+            )
+            self.assertFalse(manual_ctrl.handle_green_canary(source="hosted_canary", sha=c2, run_id="man:1", run_url=""))
+            self.assertEqual(tree_ctrl.read_remote_status(), "red")
+
+            # 3. Escalation stays pending when White Noise fails/times out, and alert-log OSError never aborts send!
+            unwritable_log = tmp / "not-a-dir"
+            unwritable_log.write_text("file blocking dir", encoding="utf-8")
+            roster = Roster(engineering_group_id="eng-group", wn_bin="wn", alert_log_path=str(unwritable_log / "alerts.jsonl"))
+            alerter = MarmotAlerter(roster, dry_run=False)
+            esc_state = AgentState(
+                tree_state="red",
+                active_incidents={
+                    "hosted_canary": IncidentRecord(
+                        started_at=100.0,
+                        reason="frozen",
+                        run_url="https://example.com/1",
+                        tip_sha=c1,
+                        source="hosted_canary",
+                    )
+                },
+            )
+            esc_ctrl = BisectController(
+                repo=repo,
+                state=esc_state,
+                github=StubGitHub(),
+                alerter=alerter,
+                tree_state=TreeStateController(repo, dry_run=True, sign_commits=False),
+                dry_run=False,
+                now_fn=lambda: 5000.0,
+            )
+            with mock.patch("scripts.bisect_agent.notify.shutil.which", return_value="/usr/bin/wn"), \
+                 mock.patch("scripts.bisect_agent.notify.subprocess.run", side_effect=subprocess.TimeoutExpired("wn", 60)):
+                self.assertFalse(esc_ctrl.check_escalation())
+                self.assertIsNone(esc_state.active_incidents["hosted_canary"].escalated_at)
+            with mock.patch("scripts.bisect_agent.notify.shutil.which", return_value="/usr/bin/wn"), \
+                 mock.patch(
+                     "scripts.bisect_agent.notify.subprocess.run",
+                     return_value=subprocess.CompletedProcess([], 0, stdout="sent", stderr=""),
+                 ):
+                self.assertTrue(esc_ctrl.check_escalation())
+                self.assertEqual(esc_state.active_incidents["hosted_canary"].escalated_at, 5000.0)
+
+            # 4. Invalid tree-state JSON shapes and git timeouts return `error` instead of crashing.
+            with mock.patch("scripts.bisect_agent.notify.subprocess.run") as mock_git:
+                mock_git.side_effect = [
+                    subprocess.CompletedProcess([], 0, stdout="sha refs/heads/tree-state\n", stderr=""),
+                    subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+                    subprocess.CompletedProcess([], 0, stdout='{"state":[]}', stderr=""),
+                ]
+                self.assertEqual(tree_ctrl.read_remote_status(), "error")
+            with mock.patch(
+                "scripts.bisect_agent.notify.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("git", 60),
+            ):
+                self.assertEqual(tree_ctrl.read_remote_status(), "error")
+
+            # Push timeout during tree-state write raises RuntimeError cleanly (retryable failure).
+            real_notify_run = subprocess.run
+
+            def timeout_on_push(argv, *args, **kwargs):
+                if isinstance(argv, list) and "push" in argv:
+                    raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 60))
+                return real_notify_run(argv, *args, **kwargs)
+
+            with mock.patch("scripts.bisect_agent.notify.subprocess.run", side_effect=timeout_on_push):
+                with self.assertRaisesRegex(RuntimeError, "failed to update origin/tree-state"):
+                    tree_ctrl.set_state("green", reason="should fail on push timeout")
+
+            # 5. Best-effort `refresh_repo` catches TimeoutExpired per branch and still completes escalation!
+            with mock.patch(
+                "scripts.bisect_agent.controller.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("git", 120),
+            ):
+                errs = esc_ctrl.refresh_repo()
+                self.assertEqual(len(errs), 3)
 
 
 if __name__ == "__main__":

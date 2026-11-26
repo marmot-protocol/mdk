@@ -42,6 +42,11 @@ class Roster:
         )
 
 
+GIT_REMOTE_TIMEOUT_SECS = 60
+GIT_LOCAL_TIMEOUT_SECS = 30
+WN_SEND_TIMEOUT_SECS = 60
+
+
 class MarmotAlerter:
     """Deliver concise alerts via White Noise (`wn`) or record them in dry-run mode."""
 
@@ -55,48 +60,66 @@ class MarmotAlerter:
         delivered: list[str] = []
         for login in logins:
             group_id = self.roster.github_to_group.get(login)
-            if group_id:
-                self._send(target=f"direct:{login}", group_id=group_id, message=message)
+            if group_id and self._send(target=f"direct:{login}", group_id=group_id, message=message):
                 delivered.append(login)
         if not delivered and self.roster.engineering_group_id:
             self.notify_engineering_group(message)
         return delivered
 
-    def notify_engineering_group(self, message: str) -> None:
-        """Send an escalation or ops alert to the MDK engineering White Noise group."""
-        self._send(
+    def notify_engineering_group(self, message: str) -> bool:
+        """Send an escalation or ops alert to the MDK engineering White Noise group.
+
+        Returns True when the alert was accepted (or recorded in dry-run mode),
+        False when delivery failed, timed out, or had no configured target/binary.
+        """
+        return self._send(
             target="engineering_group",
             group_id=self.roster.engineering_group_id,
             message=message,
         )
 
-    def _send(self, *, target: str, group_id: str, message: str) -> None:
+    def _send(self, *, target: str, group_id: str, message: str) -> bool:
         record = {
             "timestamp": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "dry_run": self.dry_run,
             "target": target,
             "has_group": bool(group_id),
             "message": sanitize_single_line(message, max_len=400),
+            "accepted": False,
         }
         self.sent.append(record)
+        # Alert log writes are best-effort and must never block delivery or escape to callers.
         if self.roster.alert_log_path:
-            log_path = Path(self.roster.alert_log_path)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with log_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record) + "\n")
-        if self.dry_run or not group_id:
-            return
+            try:
+                log_path = Path(self.roster.alert_log_path)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record) + "\n")
+            except OSError:
+                pass
+        if self.dry_run:
+            record["accepted"] = True
+            return True
+        if not group_id:
+            return False
         wn_path = shutil.which(self.roster.wn_bin)
         if not wn_path:
-            return
-        # Best-effort delivery; notification failure must never abort tree-state updates.
-        subprocess.run(
-            [wn_path, "messages", "send", group_id, message],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+            return False
+        # Best-effort delivery; notification failure must never abort tree-state updates,
+        # while returning False lets escalation callers keep the alert pending for retry.
+        try:
+            proc = subprocess.run(
+                [wn_path, "messages", "send", group_id, message],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=WN_SEND_TIMEOUT_SECS,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        accepted = proc.returncode == 0
+        record["accepted"] = accepted
+        return accepted
 
 
 class TreeStateController:
@@ -108,62 +131,84 @@ class TreeStateController:
         *,
         dry_run: bool = True,
         sign_commits: bool = True,
+        remote_timeout_secs: int = GIT_REMOTE_TIMEOUT_SECS,
+        local_timeout_secs: int = GIT_LOCAL_TIMEOUT_SECS,
     ) -> None:
         self.repo = repo
         self.dry_run = dry_run
         self.sign_commits = sign_commits
+        self.remote_timeout_secs = remote_timeout_secs
+        self.local_timeout_secs = local_timeout_secs
 
-    def read_remote_status(self) -> str:
-        """Return confirmed remote status: `green`, `red`, `absent`, or `error`.
+    def read_remote_document(self) -> tuple[str, dict[str, Any] | None]:
+        """Return `(status, parsed_doc)` where `status` is `green`, `red`, `absent`, or `error`.
 
-        Explicitly distinguishes an unavailable remote/fetch failure (`error`) from a
-        confirmed `red` state so `set_state("red")` never treats a read error as a
-        completed freeze.
+        Explicitly distinguishes an unavailable remote/fetch/timeout failure (`error`) from a
+        confirmed `red` state and rejects invalid JSON shapes so exceptions never escape.
         """
-        ls_res = subprocess.run(
-            ["git", "-C", str(self.repo), "ls-remote", "--exit-code", "origin", "refs/heads/tree-state"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            ls_res = subprocess.run(
+                ["git", "-C", str(self.repo), "ls-remote", "--exit-code", "origin", "refs/heads/tree-state"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.remote_timeout_secs,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return "error", None
         if ls_res.returncode == 2:
-            return "absent"
+            return "absent", None
         if ls_res.returncode != 0:
-            return "error"
+            return "error", None
 
-        fetch_res = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(self.repo),
-                "fetch",
-                "--no-tags",
-                "origin",
-                "+refs/heads/tree-state:refs/remotes/origin/tree-state",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            fetch_res = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.repo),
+                    "fetch",
+                    "--no-tags",
+                    "origin",
+                    "+refs/heads/tree-state:refs/remotes/origin/tree-state",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.remote_timeout_secs,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return "error", None
         if fetch_res.returncode != 0:
-            return "error"
+            return "error", None
 
-        show = subprocess.run(
-            ["git", "-C", str(self.repo), "show", "origin/tree-state:state.json"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            show = subprocess.run(
+                ["git", "-C", str(self.repo), "show", "origin/tree-state:state.json"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.local_timeout_secs,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return "error", None
         if show.returncode != 0:
-            return "error"
+            return "error", None
         try:
             doc = json.loads(show.stdout)
-            state = doc.get("state")
-            if state in {"green", "red"}:
-                return str(state)
-            return "error"
         except json.JSONDecodeError:
-            return "error"
+            return "error", None
+        if not isinstance(doc, dict):
+            return "error", None
+        state = doc.get("state")
+        if not isinstance(state, str) or state not in {"green", "red"}:
+            return "error", None
+        return state, doc
+
+    def read_remote_status(self) -> str:
+        """Return confirmed remote status: `green`, `red`, `absent`, or `error`."""
+        status, _doc = self.read_remote_document()
+        return status
 
     def set_state(
         self,
@@ -171,26 +216,31 @@ class TreeStateController:
         *,
         reason: str,
         run_url: str | None = None,
+        incidents: dict[str, dict[str, Any]] | None = None,
     ) -> bool:
-        """Set `origin/tree-state` to `green` or `red`.
+        """Set `origin/tree-state` to `green` or `red` with durable incident metadata.
 
-        Raises RuntimeError if `origin/tree-state` cannot be read or updated, so
-        callers never silently mark a transition as completed when the push failed.
+        Raises RuntimeError if `origin/tree-state` cannot be read or updated (including
+        remote timeouts), so callers never silently mark a transition as completed when
+        the push failed.
         """
         if new_state not in {"green", "red"}:
             raise ValueError(f"invalid tree state: {new_state}")
         clean_reason = sanitize_single_line(reason, max_len=240)
         public_url = run_url if isinstance(run_url, str) and run_url.startswith(("http://", "https://")) else None
+        payload_incidents = dict(incidents) if new_state == "red" and incidents else {}
         if self.dry_run:
             return True
 
-        current = self.read_remote_status()
+        current, current_doc = self.read_remote_document()
         if current == "error":
             raise RuntimeError("unable to read origin/tree-state before transition")
         if current == "absent":
             raise RuntimeError("origin/tree-state branch does not exist")
         if current == new_state:
-            return False
+            existing_incidents = current_doc.get("incidents") if isinstance(current_doc, dict) else None
+            if new_state == "green" or existing_incidents == payload_incidents:
+                return False
 
         wt_dir = Path(tempfile.mkdtemp(prefix="mdk-tree-state-"))
         wt_dir.rmdir()
@@ -209,32 +259,53 @@ class TreeStateController:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=self.local_timeout_secs,
             )
-            payload = {
+            payload: dict[str, Any] = {
                 "schema_version": 1,
                 "state": new_state,
                 "updated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "reason": clean_reason,
                 "run_url": public_url,
+                "incidents": payload_incidents,
             }
             (wt_dir / "state.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(wt_dir), "add", "state.json"], check=True)
+            subprocess.run(
+                ["git", "-C", str(wt_dir), "add", "state.json"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=self.local_timeout_secs,
+            )
             commit_cmd = ["git", "-C", str(wt_dir), "commit"]
             commit_cmd.append("-S" if self.sign_commits else "--no-gpg-sign")
             commit_cmd.extend(["-m", f"Set tree-state to {new_state}: {clean_reason}"])
-            subprocess.run(commit_cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                commit_cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=self.local_timeout_secs,
+            )
             subprocess.run(
                 ["git", "-C", str(wt_dir), "push", "origin", "HEAD:refs/heads/tree-state"],
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=self.remote_timeout_secs,
             )
             return True
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as exc:
+            raise RuntimeError(f"failed to update origin/tree-state to {new_state}: {exc}") from exc
         finally:
-            subprocess.run(
-                ["git", "-C", str(self.repo), "worktree", "remove", "--force", str(wt_dir)],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            try:
+                subprocess.run(
+                    ["git", "-C", str(self.repo), "worktree", "remove", "--force", str(wt_dir)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.local_timeout_secs,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                pass
             shutil.rmtree(wt_dir, ignore_errors=True)

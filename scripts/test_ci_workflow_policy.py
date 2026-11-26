@@ -500,7 +500,7 @@ class MergeGatePolicyTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(work), "commit", "-m", "init"], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(work), "push", "origin", "master"], check=True, capture_output=True)
 
-            def run_read(event="pull_request"):
+            def run_read(event="pull_request", repo="marmot-protocol/mdk"):
                 out = Path(tmp) / "out"
                 out.unlink(missing_ok=True)
                 subprocess.run(
@@ -509,12 +509,16 @@ class MergeGatePolicyTests(unittest.TestCase):
                     check=True,
                     capture_output=True,
                     timeout=10,
-                    env={**os.environ, "EVENT_NAME": event, "GITHUB_OUTPUT": str(out)},
+                    env={**os.environ, "EVENT_NAME": event, "REPO": repo, "GITHUB_OUTPUT": str(out)},
                 )
                 return dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
 
-            # Missing tree-state branch (e.g. a fresh fork) defaults to green.
-            self.assertEqual(run_read()["tree_state"], "green")
+            # Missing tree-state branch defaults to green ONLY on standalone forks;
+            # the canonical repository fails closed to red.
+            self.assertEqual(run_read("pull_request", repo="someone/mdk")["tree_state"], "green")
+            canonical_missing = run_read("pull_request", repo="marmot-protocol/mdk")
+            self.assertEqual(canonical_missing["tree_state"], "red")
+            self.assertIn("canonical origin/tree-state branch is missing", canonical_missing["tree_state_reason"])
 
             # Push orphan tree-state branch with green, red, and malformed JSON.
             ts = Path(tmp) / "ts"

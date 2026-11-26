@@ -99,6 +99,8 @@ class AgentState:
     retried_runs: list[str] = field(default_factory=list)
     consecutive_unreproducible_reds: dict[str, int] = field(default_factory=dict)
     consecutive_infra_failures: dict[str, int] = field(default_factory=dict)
+    last_unreproducible_attempt: dict[str, str] = field(default_factory=dict)
+    last_infra_attempt: dict[str, str] = field(default_factory=dict)
     consecutive_flake_blocks: dict[str, int] = field(default_factory=dict)
     intermittent_hits: dict[str, int] = field(default_factory=dict)
     open_revert_prs: dict[str, str] = field(default_factory=dict)
@@ -150,6 +152,12 @@ class AgentState:
             },
             consecutive_infra_failures={
                 str(k): int(v) for k, v in dict(data.get("consecutive_infra_failures", {})).items()
+            },
+            last_unreproducible_attempt={
+                str(k): str(v) for k, v in dict(data.get("last_unreproducible_attempt", {})).items()
+            },
+            last_infra_attempt={
+                str(k): str(v) for k, v in dict(data.get("last_infra_attempt", {})).items()
             },
             consecutive_flake_blocks={
                 str(k): int(v) for k, v in dict(data.get("consecutive_flake_blocks", {})).items()

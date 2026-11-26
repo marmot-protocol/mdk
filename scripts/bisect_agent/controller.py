@@ -106,8 +106,14 @@ class GitHubOps:
             timeout=60,
         )
 
+    def _run_gh_safe(self, *args: str) -> subprocess.CompletedProcess[str] | None:
+        try:
+            return self._run_gh(*args, check=False)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+
     def open_flake_issues(self) -> list[dict[str, Any]]:
-        res = self._run_gh(
+        res = self._run_gh_safe(
             "issue",
             "list",
             "--repo",
@@ -118,9 +124,8 @@ class GitHubOps:
             "200",
             "--json",
             "number,title,body,labels",
-            check=False,
         )
-        if res.returncode != 0:
+        if res is None or res.returncode != 0:
             return []
         try:
             data = json.loads(res.stdout)
@@ -129,12 +134,11 @@ class GitHubOps:
             return []
 
     def recent_workflow_runs(self, workflow: str, *, limit: int = 10) -> list[dict[str, Any]]:
-        res = self._run_gh(
+        res = self._run_gh_safe(
             "api",
             f"repos/{self.repo}/actions/workflows/{workflow}/runs?branch=master&status=completed&per_page={limit}",
-            check=False,
         )
-        if res.returncode != 0:
+        if res is None or res.returncode != 0:
             return []
         try:
             doc = json.loads(res.stdout)
@@ -143,14 +147,14 @@ class GitHubOps:
         except json.JSONDecodeError:
             return []
 
-    def jobs_for_run(self, run_id: int) -> list[dict[str, Any]] | None:
-        """Return the jobs list for `run_id`, or `None` when the GitHub API call fails."""
-        res = self._run_gh(
-            "api",
-            f"repos/{self.repo}/actions/runs/{run_id}/jobs?per_page=100",
-            check=False,
-        )
-        if res.returncode != 0:
+    def jobs_for_run(self, run_id: int, *, attempt: int | None = None) -> list[dict[str, Any]] | None:
+        """Return the jobs list for `run_id` (bound to `attempt` when given), or `None` on API failure."""
+        if attempt is not None:
+            endpoint = f"repos/{self.repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100"
+        else:
+            endpoint = f"repos/{self.repo}/actions/runs/{run_id}/jobs?per_page=100"
+        res = self._run_gh_safe("api", endpoint)
+        if res is None or res.returncode != 0:
             return None
         try:
             doc = json.loads(res.stdout)
@@ -159,8 +163,8 @@ class GitHubOps:
         except json.JSONDecodeError:
             return None
 
-    def failed_jobs_for_run(self, run_id: int) -> list[dict[str, Any]] | None:
-        jobs = self.jobs_for_run(run_id)
+    def failed_jobs_for_run(self, run_id: int, *, attempt: int | None = None) -> list[dict[str, Any]] | None:
+        jobs = self.jobs_for_run(run_id, attempt=attempt)
         if jobs is None:
             return None
         return [
@@ -170,9 +174,9 @@ class GitHubOps:
             and not is_wrapper_job(str(job.get("name") or ""))
         ]
 
-    def hosted_run_verification_status(self, run_id: int) -> str:
-        """Return `verified`, `skipped`, or `error` for a completed hosted Canary run."""
-        jobs = self.jobs_for_run(run_id)
+    def hosted_run_verification_status(self, run_id: int, *, attempt: int | None = None) -> str:
+        """Return `verified`, `skipped`, or `error` for a completed hosted Canary run attempt."""
+        jobs = self.jobs_for_run(run_id, attempt=attempt)
         if jobs is None:
             return "error"
         verified_jobs = [
@@ -183,8 +187,9 @@ class GitHubOps:
         ]
         return "verified" if verified_jobs else "skipped"
 
-    def job_log_tail(self, run_id: int, job_id: int, *, lines: int = 120) -> str:
-        res = self._run_gh(
+    def job_log(self, run_id: int, job_id: int) -> str:
+        """Fetch full job log so failure records earlier than the tail remain detectable."""
+        res = self._run_gh_safe(
             "run",
             "view",
             str(run_id),
@@ -193,25 +198,29 @@ class GitHubOps:
             "--job",
             str(job_id),
             "--log",
-            check=False,
         )
-        if res.returncode != 0:
+        if res is None or res.returncode != 0:
             return ""
-        return "\n".join(res.stdout.splitlines()[-lines:])
+        return res.stdout
+
+    def job_log_tail(self, run_id: int, job_id: int, *, lines: int = 120) -> str:
+        full_log = self.job_log(run_id, job_id)
+        if not full_log:
+            return ""
+        return "\n".join(full_log.splitlines()[-lines:])
 
     def commit_author_login(self, sha: str) -> str:
-        res = self._run_gh(
+        res = self._run_gh_safe(
             "api",
             f"repos/{self.repo}/commits/{sha}",
             "--jq",
             '.author.login // .commit.author.name // ""',
-            check=False,
         )
-        return res.stdout.strip() if res.returncode == 0 else ""
+        return res.stdout.strip() if res is not None and res.returncode == 0 else ""
 
-    def find_open_revert_pr(self, branch: str) -> str:
-        """Return URL of an existing open PR for `branch`, or empty string if none."""
-        res = self._run_gh(
+    def find_open_revert_pr(self, branch: str) -> str | None:
+        """Return open PR URL for `branch`, `""` when confirmed absent, or `None` on lookup error."""
+        res = self._run_gh_safe(
             "pr",
             "list",
             "--repo",
@@ -224,20 +233,25 @@ class GitHubOps:
             "url",
             "--jq",
             '.[0].url // ""',
-            check=False,
         )
-        return res.stdout.strip() if res.returncode == 0 else ""
+        if res is None or res.returncode != 0:
+            return None
+        return res.stdout.strip()
 
-    def rerun_failed_jobs(self, run_id: str) -> None:
+    def rerun_failed_jobs(self, run_id: str) -> bool:
+        """Request a failed-jobs rerun on GitHub; return True only when accepted (or dry-run)."""
         base_id = run_id.split(":", 1)[0]
-        if self.dry_run or not base_id.isdigit():
-            return
-        self._run_gh("run", "rerun", base_id, "--failed", "--repo", self.repo, check=False)
+        if not base_id.isdigit():
+            return False
+        if self.dry_run:
+            return True
+        res = self._run_gh_safe("run", "rerun", base_id, "--failed", "--repo", self.repo)
+        return res is not None and res.returncode == 0
 
     def dispatch_canary(self) -> None:
         if self.dry_run:
             return
-        self._run_gh(
+        self._run_gh_safe(
             "workflow",
             "run",
             "canary.yml",
@@ -247,7 +261,6 @@ class GitHubOps:
             "master",
             "-f",
             "force=true",
-            check=False,
         )
 
     def open_or_comment_issue(
@@ -260,7 +273,7 @@ class GitHubOps:
         if self.dry_run:
             return issue_number
         if issue_number is not None:
-            self._run_gh(
+            self._run_gh_safe(
                 "issue",
                 "comment",
                 str(issue_number),
@@ -268,10 +281,9 @@ class GitHubOps:
                 self.repo,
                 "--body",
                 body,
-                check=False,
             )
             return issue_number
-        res = self._run_gh(
+        res = self._run_gh_safe(
             "issue",
             "create",
             "--repo",
@@ -280,9 +292,8 @@ class GitHubOps:
             title,
             "--body",
             body,
-            check=False,
         )
-        if res.returncode == 0:
+        if res is not None and res.returncode == 0:
             tail = res.stdout.strip().rsplit("/", 1)[-1]
             if tail.isdigit():
                 return int(tail)
@@ -291,7 +302,7 @@ class GitHubOps:
     def open_revert_pr(self, branch: str, title: str, body: str) -> str:
         if self.dry_run:
             return f"dry-run://pr/{branch}"
-        res = self._run_gh(
+        res = self._run_gh_safe(
             "pr",
             "create",
             "--repo",
@@ -306,9 +317,8 @@ class GitHubOps:
             title,
             "--body",
             body,
-            check=False,
         )
-        return res.stdout.strip() if res.returncode == 0 else ""
+        return res.stdout.strip() if res is not None and res.returncode == 0 else ""
 
 
 def build_sanitized_predicate_env(
@@ -417,14 +427,124 @@ class BisectController:
         if self._on_state_change is not None:
             self._on_state_change(self.state)
 
-    def _rerun_once(self, run_id: str) -> bool:
-        """Request a GitHub Actions failed-job rerun at most once per base run_id."""
+    def _rerun_once(self, run_id: str) -> str:
+        """Request a GitHub Actions failed-job rerun at most once per base run_id.
+
+        Returns one of:
+          - `not_applicable`: non-GitHub run id (e.g. bare-metal)
+          - `already_retried`: base run id was already retried
+          - `retried`: GitHub accepted the rerun request (recorded in `retried_runs`)
+          - `failed`: GitHub rejected or timed out the rerun request (left unrecorded)
+        """
         base_id = run_id.split(":", 1)[0]
-        if not base_id or base_id in self.state.retried_runs:
-            return False
+        if not base_id or not base_id.isdigit():
+            return "not_applicable"
+        if base_id in self.state.retried_runs:
+            return "already_retried"
+        accepted = bool(self.github.rerun_failed_jobs(run_id))
+        if not accepted:
+            return "failed"
         self.state.mark_retried(base_id)
-        self.github.rerun_failed_jobs(run_id)
-        return True
+        return "retried"
+
+    @staticmethod
+    def _attempt_key_from_run_id(run_id: str) -> str:
+        if ":job:" in run_id:
+            return run_id.split(":job:", 1)[0]
+        return run_id
+
+    @staticmethod
+    def _serialize_incidents(incidents: dict[str, IncidentRecord]) -> dict[str, dict[str, Any]]:
+        serialized: dict[str, dict[str, Any]] = {}
+        for source, inc in sorted(incidents.items()):
+            serialized[source] = {
+                "source": inc.source,
+                "tip_sha": inc.tip_sha,
+                "started_at": inc.started_at,
+                "reason": sanitize_single_line(inc.reason, max_len=240),
+                "run_url": inc.run_url if inc.run_url.startswith(("http://", "https://")) else "",
+                "culprit_sha": inc.culprit_sha,
+            }
+        return serialized
+
+    @staticmethod
+    def _is_full_sha(value: Any) -> bool:
+        return isinstance(value, str) and len(value) == 40 and all(ch in "0123456789abcdefABCDEF" for ch in value)
+
+    @classmethod
+    def _parse_remote_incidents(cls, doc: dict[str, Any] | None) -> dict[str, IncidentRecord]:
+        if not isinstance(doc, dict):
+            return {}
+        raw = doc.get("incidents")
+        if not isinstance(raw, dict):
+            return {}
+        parsed: dict[str, IncidentRecord] = {}
+        for key, item in raw.items():
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source") or key).strip()
+            tip_sha = item.get("tip_sha")
+            if not source or not cls._is_full_sha(tip_sha):
+                continue
+            started_raw = item.get("started_at")
+            started_at = float(started_raw) if isinstance(started_raw, (int, float)) else 0.0
+            reason = str(item.get("reason") or doc.get("reason") or "remote freeze")
+            run_url = str(item.get("run_url") or "")
+            culprit_raw = item.get("culprit_sha")
+            culprit_sha = str(culprit_raw) if cls._is_full_sha(culprit_raw) else None
+            parsed[source] = IncidentRecord(
+                started_at=started_at,
+                reason=reason,
+                run_url=run_url,
+                tip_sha=str(tip_sha),
+                source=source,
+                culprit_sha=culprit_sha,
+            )
+        return parsed
+
+    def _hydrate_remote_incidents(self) -> tuple[str, bool]:
+        """Reconcile durable freeze metadata from `origin/tree-state:state.json`.
+
+        Returns `(remote_status, unknown_remote_freeze)`:
+          - When remote is `red` and carries valid durable `incidents`, merges them
+            into local `active_incidents` so a crash between remote push and local
+            save preserves exact `(source, tip_sha)` recovery boundaries.
+          - When remote is `red` with NO durable `incidents` (e.g. a manual freeze
+            pushed by an admin) and local has no recorded incidents, returns
+            `unknown_remote_freeze=True` so automated greens never unfreeze it.
+        """
+        if self.dry_run:
+            return self.state.tree_state, False
+        remote_status, remote_doc = self.tree_state.read_remote_document()
+        if remote_status != "red":
+            return remote_status, False
+        remote_incidents = self._parse_remote_incidents(remote_doc)
+        if remote_incidents:
+            changed = self.state.tree_state != "red"
+            self.state.tree_state = "red"
+            for source, remote_inc in remote_incidents.items():
+                local_inc = self.state.active_incidents.get(source)
+                if local_inc is None:
+                    self.state.active_incidents[source] = remote_inc
+                    changed = True
+                elif remote_inc.tip_sha != local_inc.tip_sha and is_ancestor_or_equal(
+                    self.repo, local_inc.tip_sha, remote_inc.tip_sha
+                ):
+                    remote_inc.issue_number = local_inc.issue_number
+                    remote_inc.escalated_at = local_inc.escalated_at
+                    if local_inc.started_at:
+                        remote_inc.started_at = min(local_inc.started_at, remote_inc.started_at or local_inc.started_at)
+                    self.state.active_incidents[source] = remote_inc
+                    changed = True
+            if changed:
+                self._persist()
+            return "red", False
+        if not self.state.active_incidents:
+            if self.state.tree_state != "red":
+                self.state.tree_state = "red"
+                self._persist()
+            return "red", True
+        return "red", False
 
     def _exec_in_wt(
         self,
@@ -457,10 +577,38 @@ class BisectController:
             worktree_root=self.worktree_root,
         )
 
-    def refresh_repo(self) -> None:
+    def refresh_repo(self) -> list[str]:
         """Fetch latest master, canary, and tree-state refs from origin (best-effort)."""
+        errors: list[str] = []
         for branch in ("master", "canary", "tree-state"):
-            subprocess.run(
+            try:
+                res = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(self.repo),
+                        "fetch",
+                        "--no-tags",
+                        "origin",
+                        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if res.returncode != 0:
+                    errors.append(f"fetch {branch}: exit {res.returncode}")
+            except subprocess.TimeoutExpired:
+                errors.append(f"fetch {branch}: timed out after 120s")
+            except OSError as exc:
+                errors.append(f"fetch {branch}: {sanitize_single_line(str(exc), max_len=120)}")
+        return errors
+
+    def _refresh_master(self) -> bool:
+        """Fetch `origin/master` before live-master recheck and revert publication."""
+        try:
+            res = subprocess.run(
                 [
                     "git",
                     "-C",
@@ -468,13 +616,16 @@ class BisectController:
                     "fetch",
                     "--no-tags",
                     "origin",
-                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                    "+refs/heads/master:refs/remotes/origin/master",
                 ],
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=120,
             )
+            return res.returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
 
     def handle_green_canary(
         self,
@@ -484,8 +635,9 @@ class BisectController:
         run_id: str,
         run_url: str,
     ) -> bool:
-        """Clear a source's incident on a green at/after its failing SHA; unfreeze once all sources recover."""
+        """Clear a source's recorded incident on a green at/after its failing SHA; unfreeze once all clear."""
         seen_key = f"green:{source}:{run_id}"
+        _remote_status, unknown_freeze = self._hydrate_remote_incidents()
         inc = self.state.active_incidents.get(source)
 
         # A green run on an older SHA than the active incident cannot clear that incident.
@@ -495,32 +647,49 @@ class BisectController:
             return False
 
         remaining = {k: v for k, v in self.state.active_incidents.items() if k != source}
-        remote_needs_reconcile = (
-            not remaining
-            and self.state.tree_state != "red"
-            and inc is None
-            and not self.dry_run
-            and self.tree_state.read_remote_status() == "red"
-        )
-        would_clear_tree = not remaining and (
-            self.state.tree_state == "red" or inc is not None or remote_needs_reconcile
-        )
+        # Only a recorded incident with matching source and qualifying SHA can clear a freeze.
+        # A manual or unknown-boundary remote freeze (`unknown_freeze=True`) is never cleared automatically.
+        would_clear_tree = (inc is not None) and (not remaining) and (not unknown_freeze)
+        partial_recovery = (inc is not None) and bool(remaining)
 
         # Perform remote tree-state write BEFORE marking the green run seen so a
         # transient git/network failure is retried cleanly on the next poll.
         if would_clear_tree:
             reason = f"{source} recovered green on {sha[:9]}"
             try:
-                self.tree_state.set_state("green", reason=reason, run_url=run_url)
+                self.tree_state.set_state("green", reason=reason, run_url=run_url, incidents={})
             except Exception as exc:
                 self.alerter.notify_engineering_group(
                     f"MDK ops alert: failed to clear tree-state to GREEN ({source} @ {sha[:9]}): "
                     f"{sanitize_single_line(str(exc))}"
                 )
                 return False
+        elif partial_recovery:
+            # Keep remote durable incidents in sync while other frozen sources remain active.
+            remaining_sources = ", ".join(sorted(remaining))
+            reason = f"{source} recovered on {sha[:9]}; still frozen for {remaining_sources}"
+            try:
+                self.tree_state.set_state(
+                    "red",
+                    reason=reason,
+                    run_url=run_url,
+                    incidents=self._serialize_incidents(remaining),
+                )
+            except Exception as exc:
+                self.alerter.notify_engineering_group(
+                    f"MDK ops alert: failed to update tree-state incidents after {source} recovery: "
+                    f"{sanitize_single_line(str(exc))}"
+                )
+                return False
 
         self.state.consecutive_unreproducible_reds[source] = 0
         self.state.consecutive_infra_failures[source] = 0
+        self.state.last_unreproducible_attempt.pop(source, None)
+        self.state.last_infra_attempt.pop(source, None)
+        flake_prefix = f"{source}:"
+        for key in [k for k in self.state.consecutive_flake_blocks if k.startswith(flake_prefix)]:
+            self.state.consecutive_flake_blocks.pop(key, None)
+
         self.state.active_incidents = remaining
         self.state.mark_seen(seen_key)
         if would_clear_tree:
@@ -542,6 +711,11 @@ class BisectController:
             self.alerter.notify_engineering_group(
                 f"MDK tree-state cleared to GREEN ({source} @ {sha[:9]}){ref_suffix}"
             )
+        elif unknown_freeze:
+            self.alerter.notify_engineering_group(
+                f"MDK ops notice: {source} passed green on {sha[:9]}, but remote tree-state=RED "
+                "has no recorded incident boundary (manual or external freeze); leaving tree frozen for manual reconciliation"
+            )
         return would_clear_tree
 
     def check_escalation(self) -> bool:
@@ -553,19 +727,24 @@ class BisectController:
                 continue
             if now - inc.started_at < ESCALATION_WINDOW_SECS:
                 continue
-            inc.escalated_at = now
-            self._persist()
             ref_suffix = f", run {inc.run_url}" if inc.run_url else ""
-            self.alerter.notify_engineering_group(
+            accepted = self.alerter.notify_engineering_group(
                 f"ESCALATION (>30m): MDK tree-state=RED ({inc.source}) — {inc.reason} "
                 f"(tip {inc.tip_sha[:9]}{ref_suffix})"
             )
+            if not accepted:
+                continue
+            inc.escalated_at = now
+            self._persist()
             escalated = True
         return escalated
 
-    def _find_open_revert_pr(self, culprit_sha: str, branch: str) -> str:
+    def _find_open_revert_pr(self, culprit_sha: str, branch: str) -> str | None:
+        """Return open PR URL, `""` when confirmed absent, or `None` when lookup failed."""
         cached = self.state.open_revert_prs.get(culprit_sha, "")
         live = self.github.find_open_revert_pr(branch)
+        if live is None:
+            return None
         if live:
             self.state.open_revert_prs[culprit_sha] = live
             return live
@@ -585,30 +764,17 @@ class BisectController:
         issue_title: str | None = None,
         issue_body: str | None = None,
     ) -> bool:
-        """Freeze `origin/tree-state` to red, persist the incident immediately, then notify.
+        """Freeze `origin/tree-state` to red with durable incident metadata, persist locally, then notify.
 
-        Persisting the incident BEFORE opening issues or delivering alerts ensures a
-        timeout/crash during notification can never leave `origin/tree-state` red with
-        local state green.
+        Records `(source, tip_sha)` in both `origin/tree-state:state.json` and local state
+        so even a crash between the remote push and local save preserves the exact
+        recovery boundary on restart.
         """
         clean_reason = sanitize_single_line(reason, max_len=240)
-        try:
-            self.tree_state.set_state(
-                "red",
-                reason=clean_reason,
-                run_url=signal.run_url or None,
-            )
-        except Exception as exc:
-            self.alerter.notify_engineering_group(
-                f"MDK ops alert: FAILED to set tree-state=RED ({signal.source} @ {signal.tip_sha[:9]}): "
-                f"{sanitize_single_line(str(exc))}"
-            )
-            return False
-
-        self.state.tree_state = "red"
-        existing = self.state.active_incidents.get(signal.source)
+        next_incidents = dict(self.state.active_incidents)
+        existing = next_incidents.get(signal.source)
         if existing is None or is_ancestor_or_equal(self.repo, existing.tip_sha, signal.tip_sha):
-            self.state.active_incidents[signal.source] = IncidentRecord(
+            next_incidents[signal.source] = IncidentRecord(
                 started_at=existing.started_at if existing is not None else self.now_fn(),
                 reason=clean_reason,
                 run_url=signal.run_url,
@@ -618,6 +784,23 @@ class BisectController:
                 issue_number=existing.issue_number if existing else None,
                 escalated_at=existing.escalated_at if existing is not None else None,
             )
+
+        try:
+            self.tree_state.set_state(
+                "red",
+                reason=clean_reason,
+                run_url=signal.run_url or None,
+                incidents=self._serialize_incidents(next_incidents),
+            )
+        except Exception as exc:
+            self.alerter.notify_engineering_group(
+                f"MDK ops alert: FAILED to set tree-state=RED ({signal.source} @ {signal.tip_sha[:9]}): "
+                f"{sanitize_single_line(str(exc))}"
+            )
+            return False
+
+        self.state.tree_state = "red"
+        self.state.active_incidents = next_incidents
         self.state.mark_seen(seen_key)
         self._persist()
 
@@ -641,9 +824,13 @@ class BisectController:
         *,
         master_ref: str = "origin/master",
         poll_deadline: float | None = None,
+        fetch_remote: bool = False,
+        attempt_key: str | None = None,
+        reset_sibling_counters: bool = True,
     ) -> tuple[ClassificationResult, BisectOutcome | None]:
         """Classify and respond to a single Canary failure signal."""
         seen_key = f"fail:{signal.source}:{signal.run_id}"
+        eff_attempt = attempt_key or self._attempt_key_from_run_id(signal.run_id)
         open_issues = self.github.open_flake_issues()
         effective_deadline = poll_deadline if poll_deadline is not None else (self.now_fn() + self.bisect_budget_secs)
         classification = classify_failure(
@@ -653,6 +840,8 @@ class BisectController:
                 sha,
                 lambda wt: self._exec_in_wt(wt, cmd, deadline=effective_deadline),
                 worktree_root=self.worktree_root,
+                deadline=effective_deadline,
+                now_fn=self.now_fn,
             ),
             open_flake_issues=open_issues,
             stress_count=self.stress_count,
@@ -660,11 +849,19 @@ class BisectController:
 
         # Bucket 1: Infra / baseline environment error -> retry at most once per base run; alert ops.
         if classification.bucket == Bucket.INFRA_ERROR:
-            self.state.consecutive_unreproducible_reds[signal.source] = 0
-            infra_count = self.state.consecutive_infra_failures.get(signal.source, 0) + 1
-            self.state.consecutive_infra_failures[signal.source] = infra_count
+            rerun_status = self._rerun_once(signal.run_id)
+            if rerun_status == "failed":
+                return classification, None
+            if reset_sibling_counters:
+                self.state.consecutive_unreproducible_reds[signal.source] = 0
+                self.state.last_unreproducible_attempt.pop(signal.source, None)
+            if self.state.last_infra_attempt.get(signal.source) != eff_attempt:
+                infra_count = self.state.consecutive_infra_failures.get(signal.source, 0) + 1
+                self.state.consecutive_infra_failures[signal.source] = infra_count
+                self.state.last_infra_attempt[signal.source] = eff_attempt
+            else:
+                infra_count = self.state.consecutive_infra_failures.get(signal.source, 0)
             self.state.mark_seen(seen_key)
-            self._rerun_once(signal.run_id)
             self._persist()
             if infra_count >= 2 or "baseline break:" in classification.reason:
                 ref_suffix = f" ({signal.run_url})" if signal.run_url else ""
@@ -673,16 +870,23 @@ class BisectController:
                 )
             return classification, None
 
-        self.state.consecutive_infra_failures[signal.source] = 0
+        if reset_sibling_counters:
+            self.state.consecutive_infra_failures[signal.source] = 0
+            self.state.last_infra_attempt.pop(signal.source, None)
 
         # Bucket 2: Known flake -> comment on existing issue, retry at most once per base run, alert on 2 blocks.
         if classification.bucket == Bucket.KNOWN_FLAKE:
-            self.state.consecutive_unreproducible_reds[signal.source] = 0
+            rerun_status = self._rerun_once(signal.run_id)
+            if rerun_status == "failed":
+                return classification, None
+            if reset_sibling_counters:
+                self.state.consecutive_unreproducible_reds[signal.source] = 0
+                self.state.last_unreproducible_attempt.pop(signal.source, None)
             self.state.mark_seen(seen_key)
             flake_key = signal.failed_test or signal.failed_job
-            hits = self.state.consecutive_flake_blocks.get(flake_key, 0) + 1
-            self.state.consecutive_flake_blocks[flake_key] = hits
-            self._rerun_once(signal.run_id)
+            counter_key = f"{signal.source}:{flake_key}"
+            hits = self.state.consecutive_flake_blocks.get(counter_key, 0) + 1
+            self.state.consecutive_flake_blocks[counter_key] = hits
             self._persist()
             run_line = f"\n\nRun: {signal.run_url}" if signal.run_url else ""
             self.github.open_or_comment_issue(
@@ -702,7 +906,9 @@ class BisectController:
 
         # Bucket 3: Suspected new intermittent race -> comment on existing issue (or open once) and notify.
         if classification.bucket == Bucket.NEW_INTERMITTENT:
-            self.state.consecutive_unreproducible_reds[signal.source] = 0
+            if reset_sibling_counters:
+                self.state.consecutive_unreproducible_reds[signal.source] = 0
+                self.state.last_unreproducible_attempt.pop(signal.source, None)
             self.state.mark_seen(seen_key)
             key = signal.failed_test or signal.failed_job
             hits = self.state.intermittent_hits.get(key, 0) + 1
@@ -727,15 +933,19 @@ class BisectController:
             )
             return classification, None
 
-        # Bucket 5: Non-Linux, unparsed, or missing-baseline failure -> rerun once, Meltdown on 2 consecutive.
+        # Bucket 5: Non-Linux, unparsed, or missing-baseline failure -> rerun once, Meltdown on 2 consecutive runs.
         if classification.bucket == Bucket.UNREPRODUCIBLE:
-            unrepro_reds = self.state.consecutive_unreproducible_reds.get(signal.source, 0) + 1
+            already_counted = self.state.last_unreproducible_attempt.get(signal.source) == eff_attempt
+            unrepro_reds = self.state.consecutive_unreproducible_reds.get(signal.source, 0) + (
+                0 if already_counted else 1
+            )
             if unrepro_reds >= 2:
                 author = self.github.commit_author_login(signal.tip_sha)
                 step_note = f" (step `{signal.failed_step}`)" if signal.failed_step else ""
                 kind = "non-Linux job" if is_non_linux_job(signal.failed_job) else "unreproducible job"
                 reason = f"2 consecutive red {signal.source} runs on {kind} `{signal.failed_job}`{step_note}"
                 self.state.consecutive_unreproducible_reds[signal.source] = unrepro_reds
+                self.state.last_unreproducible_attempt[signal.source] = eff_attempt
                 frozen = self._trigger_meltdown(
                     reason=reason,
                     signal=signal,
@@ -748,9 +958,16 @@ class BisectController:
                     meltdown_triggered=frozen,
                     reason=reason if frozen else f"failed to freeze tree-state for {signal.failed_job}",
                 )
+            rerun_status = self._rerun_once(signal.run_id)
+            if rerun_status == "failed":
+                return classification, BisectOutcome(
+                    culprit_sha=None,
+                    meltdown_triggered=False,
+                    reason=f"failed to request rerun for {signal.failed_job}; will retry",
+                )
             self.state.consecutive_unreproducible_reds[signal.source] = unrepro_reds
+            self.state.last_unreproducible_attempt[signal.source] = eff_attempt
             self.state.mark_seen(seen_key)
-            self._rerun_once(signal.run_id)
             self._persist()
             return classification, BisectOutcome(
                 culprit_sha=None,
@@ -759,12 +976,11 @@ class BisectController:
             )
 
         # Bucket 4: Deterministic regression -> bounded bisect + strictly revert-only recovery.
-        # Reserve up to one timeout window after bisect for live-master recheck + revert verification.
-        self.state.consecutive_unreproducible_reds[signal.source] = 0
+        if reset_sibling_counters:
+            self.state.consecutive_unreproducible_reds[signal.source] = 0
+            self.state.last_unreproducible_attempt.pop(signal.source, None)
         bisect_deadline = effective_deadline
-        revert_deadline = max(effective_deadline, self.now_fn() + self.timeout_secs)
         bisect_predicate = lambda wt: self._exec_in_wt(wt, signal.command, deadline=bisect_deadline)
-        revert_predicate = lambda wt: self._exec_in_wt(wt, signal.command, deadline=revert_deadline)
         culprit_sha, bisect_reason = bisect_culprit(
             self.repo,
             signal.baseline_sha,
@@ -791,6 +1007,15 @@ class BisectController:
 
         branch_name = f"revert/{culprit_sha[:9]}"
         existing_pr = self._find_open_revert_pr(culprit_sha, branch_name)
+        if existing_pr is None:
+            # Lookup failed transiently: keep cached URL, leave unseen, and defer publication.
+            return classification, BisectOutcome(
+                culprit_sha=culprit_sha,
+                revert_branch=branch_name,
+                pr_creation_failed=True,
+                meltdown_triggered=False,
+                reason=f"failed to query existing revert PRs for {culprit_sha[:9]}; will retry",
+            )
         if existing_pr:
             self.state.mark_seen(seen_key)
             self._persist()
@@ -805,6 +1030,10 @@ class BisectController:
                 reason=f"revert PR already open for {culprit_sha[:9]}: {existing_pr}",
             )
 
+        # Allocate explicit verification budget AFTER bisect completes so a slow search
+        # cannot starve either the live-master recheck or the reverted-tree verification.
+        revert_deadline = self.now_fn() + (2 * self.timeout_secs)
+        revert_predicate = lambda wt: self._exec_in_wt(wt, signal.command, deadline=revert_deadline)
         checks_summary = " ".join(signal.command)
         outcome = attempt_clean_revert(
             self.repo,
@@ -817,7 +1046,10 @@ class BisectController:
             dry_run=self.dry_run,
             open_revert_pr=self.github.open_revert_pr,
             find_existing_pr=self.github.find_open_revert_pr,
+            refresh_master=(self._refresh_master if fetch_remote else None),
             worktree_root=self.worktree_root,
+            deadline=revert_deadline,
+            now_fn=self.now_fn,
         )
         if outcome.already_healed:
             self.state.mark_seen(seen_key)
@@ -827,7 +1059,8 @@ class BisectController:
         if outcome.pr_creation_failed:
             ref_suffix = f" ({signal.run_url})" if signal.run_url else ""
             self.alerter.notify_engineering_group(
-                f"MDK Bisect Agent verified revert for {culprit_sha[:9]} but PR creation failed; will retry{ref_suffix}"
+                f"MDK Bisect Agent deferred revert publication for {culprit_sha[:9]} "
+                f"({sanitize_single_line(outcome.reason)}){ref_suffix}"
             )
             return classification, outcome
 
@@ -855,7 +1088,7 @@ class BisectController:
             )
             return classification, outcome
 
-        # Tangled revert or revert failed to restore green -> Meltdown Mode.
+        # Tangled revert, merge culprit, or revert failed to restore green -> Meltdown Mode.
         safe_reason = sanitize_single_line(outcome.reason)
         run_line = f"\n\nRun: {signal.run_url}" if signal.run_url else ""
         frozen = self._trigger_meltdown(
@@ -923,8 +1156,8 @@ class BisectController:
         actions: list[dict[str, Any]] = []
         poll_deadline = self.now_fn() + self.bisect_budget_secs
         cleanup_stale_worktrees(self.repo, self.worktree_root)
-        if fetch_remote:
-            self.refresh_repo()
+        refresh_errors = self.refresh_repo() if fetch_remote else []
+        _remote_status, unknown_remote_freeze = self._hydrate_remote_incidents()
 
         # 1. Inspect local bare-metal Canary status if present.
         if bare_metal_status_path and bare_metal_status_path.is_file():
@@ -946,7 +1179,10 @@ class BisectController:
                     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
                     signal = extract_bare_metal_signal(doc, log_text)
                     classification, outcome = self.handle_failure(
-                        signal, master_ref=master_ref, poll_deadline=poll_deadline
+                        signal,
+                        master_ref=master_ref,
+                        poll_deadline=poll_deadline,
+                        fetch_remote=fetch_remote,
                     )
                     actions.append(
                         {
@@ -987,7 +1223,7 @@ class BisectController:
 
                 if conclusion == "success" and f"green:{source}:{attempt_key}" not in self.state.seen_runs:
                     status = (
-                        self.github.hosted_run_verification_status(int(raw_id))
+                        self.github.hosted_run_verification_status(int(raw_id), attempt=attempt)
                         if raw_id.isdigit()
                         else "error"
                     )
@@ -997,15 +1233,23 @@ class BisectController:
                         # If a skipped run arrived after an earlier verified green on the exact
                         # same SHA (e.g. a transient jobs API error delayed recovery), recover
                         # using that verified green run rather than losing it behind the skip.
+                        # If any candidate lookup returns `error`, leave this skipped run unseen
+                        # so the next poll retries verification instead of stranding the freeze.
                         recovered_via: dict[str, Any] | None = None
+                        candidate_error = False
                         if source in self.state.active_incidents:
                             for cand in ordered[1:]:
                                 if cand.get("conclusion") != "success" or str(cand.get("head_sha") or "") != head_sha:
                                     continue
                                 cid = cand.get("id")
-                                if isinstance(cid, int) and self.github.hosted_run_verification_status(cid) == "verified":
-                                    recovered_via = cand
-                                    break
+                                cattempt = int(cand.get("run_attempt") or 1)
+                                if isinstance(cid, int):
+                                    cstatus = self.github.hosted_run_verification_status(cid, attempt=cattempt)
+                                    if cstatus == "verified":
+                                        recovered_via = cand
+                                        break
+                                    if cstatus == "error":
+                                        candidate_error = True
                         if recovered_via is not None:
                             cleared = self.handle_green_canary(
                                 source=source,
@@ -1014,6 +1258,8 @@ class BisectController:
                                 run_url=str(recovered_via.get("html_url") or run_url),
                             )
                             actions.append({"source": workflow, "result": "green", "cleared_meltdown": cleared})
+                        elif candidate_error:
+                            actions.append({"source": workflow, "result": "jobs_api_error", "cleared_meltdown": False})
                         else:
                             self.state.mark_seen(f"green:{source}:{attempt_key}")
                             self._persist()
@@ -1030,42 +1276,79 @@ class BisectController:
                         self._persist()
                         actions.append({"source": workflow, "result": "stale_failure_ignored"})
                         continue
-                    failed_jobs = self.github.failed_jobs_for_run(int(raw_id)) if raw_id.isdigit() else None
+                    failed_jobs = (
+                        self.github.failed_jobs_for_run(int(raw_id), attempt=attempt)
+                        if raw_id.isdigit()
+                        else None
+                    )
                     if failed_jobs is None:
                         # Transient GitHub API failure: leave unseen so the next poll retries cleanly.
                         actions.append({"source": workflow, "result": "jobs_api_error"})
                         continue
-                    first_job = failed_jobs[0] if failed_jobs else {"id": 0, "name": workflow, "conclusion": conclusion}
-                    failed_step = first_failed_step_name(first_job)
-                    log_text = (
-                        self.github.job_log_tail(int(raw_id), int(first_job["id"]))
-                        if raw_id.isdigit() and first_job.get("id")
-                        else ""
+                    jobs_to_process = (
+                        sorted(
+                            failed_jobs,
+                            key=lambda j: (int(j.get("id") or 0), str(j.get("name") or "")),
+                        )
+                        if failed_jobs
+                        else [{"id": 0, "name": workflow, "conclusion": conclusion}]
                     )
                     prev_green = self._resolve_hosted_baseline(ordered, head_sha)
-                    signal = extract_hosted_signal(
-                        source=source,
-                        run_id=attempt_key,
-                        run_url=run_url,
-                        tip_sha=head_sha,
-                        baseline_sha=prev_green,
-                        failed_job=str(first_job.get("name") or workflow),
-                        failed_step=failed_step,
-                        log_text=log_text,
-                        conclusion=str(first_job.get("conclusion") or conclusion),
-                    )
-                    classification, outcome = self.handle_failure(
-                        signal, master_ref=master_ref, poll_deadline=poll_deadline
-                    )
-                    actions.append(
-                        {
-                            "source": workflow,
-                            "bucket": classification.bucket.value,
-                            "reason": classification.reason,
-                            "culprit": outcome.culprit_sha if outcome else None,
-                            "meltdown": outcome.meltdown_triggered if outcome else False,
-                        }
-                    )
+                    job_seen_keys: list[str] = []
+                    for idx, job in enumerate(jobs_to_process):
+                        job_id = int(job.get("id") or 0)
+                        job_key = f"{attempt_key}:job:{job_id if job_id else idx}"
+                        job_seen_key = f"fail:{source}:{job_key}"
+                        job_seen_keys.append(job_seen_key)
+                        if job_seen_key in self.state.seen_runs:
+                            continue
+                        failed_step = first_failed_step_name(job)
+                        if raw_id.isdigit() and job_id:
+                            if hasattr(self.github, "job_log"):
+                                log_text = self.github.job_log(int(raw_id), job_id)
+                            else:
+                                log_text = self.github.job_log_tail(int(raw_id), job_id)
+                        else:
+                            log_text = ""
+                        signal = extract_hosted_signal(
+                            source=source,
+                            run_id=job_key,
+                            run_url=run_url,
+                            tip_sha=head_sha,
+                            baseline_sha=prev_green,
+                            failed_job=str(job.get("name") or workflow),
+                            failed_step=failed_step,
+                            log_text=log_text,
+                            conclusion=str(job.get("conclusion") or conclusion),
+                        )
+                        classification, outcome = self.handle_failure(
+                            signal,
+                            master_ref=master_ref,
+                            poll_deadline=poll_deadline,
+                            fetch_remote=fetch_remote,
+                            attempt_key=attempt_key,
+                            reset_sibling_counters=False,
+                        )
+                        actions.append(
+                            {
+                                "source": workflow,
+                                "job": signal.failed_job,
+                                "bucket": classification.bucket.value,
+                                "reason": classification.reason,
+                                "culprit": outcome.culprit_sha if outcome else None,
+                                "meltdown": outcome.meltdown_triggered if outcome else False,
+                            }
+                        )
+                    # Mark the run attempt seen ONLY after every failed job has a disposition.
+                    if all(key in self.state.seen_runs for key in job_seen_keys):
+                        if self.state.last_infra_attempt.get(source) != attempt_key:
+                            self.state.consecutive_infra_failures[source] = 0
+                            self.state.last_infra_attempt.pop(source, None)
+                        if self.state.last_unreproducible_attempt.get(source) != attempt_key:
+                            self.state.consecutive_unreproducible_reds[source] = 0
+                            self.state.last_unreproducible_attempt.pop(source, None)
+                        self.state.mark_seen(f"fail:{source}:{attempt_key}")
+                        self._persist()
             except Exception as exc:
                 actions.append(
                     {
@@ -1075,12 +1358,17 @@ class BisectController:
                 )
 
         escalated = self.check_escalation()
-        return {
+        result: dict[str, Any] = {
             "dry_run": self.dry_run,
             "actions": actions,
             "escalated": escalated,
             "tree_state": self.state.tree_state,
         }
+        if unknown_remote_freeze:
+            result["reconciliation_needed"] = True
+        if refresh_errors:
+            result["refresh_errors"] = refresh_errors
+        return result
 
 
 def build_parser() -> argparse.ArgumentParser:
