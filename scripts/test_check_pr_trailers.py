@@ -84,6 +84,16 @@ class PrTrailerTests(unittest.TestCase):
                 "Co-authored-by: Bob <bob@example.com>\n",
                 "minor",
             ),
+            (
+                "Markdown horizontal rule before valid trailer block\n\n"
+                "Section 1\n\n"
+                "---\n\n"
+                "Section 2\n\n"
+                "Local-Checks: cargo fmt\n"
+                "Local-Review: human\n"
+                "Release-Impact: none\n",
+                "none",
+            ),
         ]
         for message, expected_impact in cases:
             with self.subTest(first_line=message.splitlines()[0]):
@@ -127,6 +137,15 @@ class PrTrailerTests(unittest.TestCase):
                 "Release-Impact: patch\n"
                 "Release-Impact: minor\n",
                 ["duplicate trailer"],
+            ),
+            (
+                "Trailer-shaped example before --- divider followed by trailing prose\n\n"
+                "Local-Checks: cargo fmt\n"
+                "Local-Review: human\n"
+                "Release-Impact: none\n\n"
+                "---\n\n"
+                "Trailing prose after a Markdown rule.\n",
+                ["Local-Checks", "Local-Review", "Release-Impact"],
             ),
         ]
         for message, expected_substrings in bad_messages:
@@ -287,18 +306,23 @@ class PrTrailerTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertNotIn("release-impact", parsed)
 
-        # A `---------` divider followed by normal prose (not a trailer footer) is ignored.
-        prose_after_divider = (
-            "Explain layout (#3801)\n\n"
-            "Local-Checks: cargo fmt\n"
-            "Local-Review: human\n"
-            "Release-Impact: none\n\n"
-            "---------\n\n"
-            "This is prose after a horizontal rule, not a trailer footer.\n"
-        )
-        parsed, errors = trailers.extract_landed_trailers(prose_after_divider)
-        self.assertEqual(errors, [])
-        self.assertNotIn("release-impact", parsed)
+        # A `---------` divider followed by normal or colon-bearing prose is ignored.
+        for suffix in (
+            "This is prose after a horizontal rule, not a trailer footer.\n",
+            "Example: cargo fmt\n",
+        ):
+            with self.subTest(suffix=suffix.strip()):
+                prose_after_divider = (
+                    "Explain layout (#3801)\n\n"
+                    "Local-Checks: cargo fmt\n"
+                    "Local-Review: human\n"
+                    "Release-Impact: minor\n\n"
+                    "---------\n\n"
+                    + suffix
+                )
+                parsed, errors = trailers.extract_landed_trailers(prose_after_divider)
+                self.assertEqual(errors, [])
+                self.assertNotIn("release-impact", parsed)
 
     def test_cli_strict_vs_advisory_mode(self) -> None:
         tmp, repo, base = self.make_repo()
