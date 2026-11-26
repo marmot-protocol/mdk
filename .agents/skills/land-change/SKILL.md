@@ -417,7 +417,7 @@ Merge only in land mode, and only the head that was verified and reviewed.
    block a concurrent freeze at merge time):
 
    ```sh
-   git fetch --no-tags --depth=1 origin tree-state && git show FETCH_HEAD:state.json
+   git fetch --no-tags --depth=1 origin refs/heads/tree-state && git show FETCH_HEAD:state.json
    ```
 
    Proceed only when `"state"` is `"green"`.

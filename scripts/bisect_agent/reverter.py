@@ -77,15 +77,28 @@ def commit_parents(
     return parts[1:] if len(parts) > 1 else []
 
 
-def is_ancestor_or_equal(repo: Path, older_sha: str, newer_sha: str) -> bool:
-    """Return True when `older_sha` is equal to or an ancestor of `newer_sha`."""
+def commit_ancestry(repo: Path, older_sha: str, newer_sha: str) -> bool | None:
+    """Return `True` if `older_sha` is an ancestor of (or equal to) `newer_sha`,
+    `False` if both commits exist locally and `older_sha` is not an ancestor,
+    or `None` when commit ancestry cannot be determined (missing local objects or git error).
+    """
     if not older_sha or not newer_sha:
-        return False
+        return None
     if older_sha == newer_sha:
         return True
     if resolve_commit(repo, older_sha) is None or resolve_commit(repo, newer_sha) is None:
+        return None
+    res = _git(repo, "merge-base", "--is-ancestor", older_sha, newer_sha, check=False)
+    if res.returncode == 0:
+        return True
+    if res.returncode == 1:
         return False
-    return _git(repo, "merge-base", "--is-ancestor", older_sha, newer_sha, check=False).returncode == 0
+    return None
+
+
+def is_ancestor_or_equal(repo: Path, older_sha: str, newer_sha: str) -> bool:
+    """Return True when `older_sha` is confirmed equal to or an ancestor of `newer_sha`."""
+    return commit_ancestry(repo, older_sha, newer_sha) is True
 
 
 def cleanup_stale_worktrees(repo: Path, worktree_root: Path | None) -> None:
@@ -366,45 +379,44 @@ def attempt_clean_revert(
     """
     subject, author = commit_metadata(repo, culprit_sha)
     branch_name = f"revert/{culprit_sha[:9]}"
-
     parents = commit_parents(repo, culprit_sha)
-    if len(parents) > 1:
+
+    def _deferred(reason: str, *, clean_revert: bool = False, revert_verified: bool = False) -> BisectOutcome:
         return BisectOutcome(
             culprit_sha=culprit_sha,
             culprit_subject=subject,
             culprit_author_login=author,
-            clean_revert=False,
-            revert_verified=False,
+            clean_revert=clean_revert,
+            revert_verified=revert_verified,
             revert_branch=branch_name,
-            meltdown_triggered=True,
-            reason=(
-                f"merge commit culprit {culprit_sha[:9]} requires manual revert "
-                "(cannot safely auto-revert multi-parent merge)"
-            ),
+            pr_creation_failed=True,
+            meltdown_triggered=False,
+            reason=reason,
         )
 
+    def _check_master_moved(checked_sha: str) -> str:
+        """Return `unchanged`, `moved`, or `refresh_failed` after refreshing `master_ref`."""
+        if refresh_master is None:
+            return "unchanged"
+        if not refresh_master():
+            return "refresh_failed"
+        latest = resolve_commit(repo, master_ref)
+        if latest is None:
+            return "refresh_failed"
+        return "unchanged" if latest == checked_sha else "moved"
+
+    def _budget_expired() -> bool:
+        return deadline is not None and now_fn() >= deadline
+
     for _attempt in range(MAX_REVERT_MASTER_RETRIES):
+        if _budget_expired():
+            return _deferred(f"revert verification budget expired before checking {master_ref}; will retry")
         if refresh_master is not None and not refresh_master():
-            return BisectOutcome(
-                culprit_sha=culprit_sha,
-                culprit_subject=subject,
-                culprit_author_login=author,
-                revert_branch=branch_name,
-                pr_creation_failed=True,
-                meltdown_triggered=False,
-                reason=f"failed to refresh {master_ref} before live-master recheck; will retry",
-            )
+            return _deferred(f"failed to refresh {master_ref} before live-master recheck; will retry")
 
         master_sha = resolve_commit(repo, master_ref)
         if master_sha is None:
-            return BisectOutcome(
-                culprit_sha=culprit_sha,
-                culprit_subject=subject,
-                culprit_author_login=author,
-                revert_branch=branch_name,
-                meltdown_triggered=True,
-                reason=f"could not resolve target ref {master_ref}",
-            )
+            return _deferred(f"could not resolve target ref {master_ref}; will retry")
 
         parent = worktree_root or Path(tempfile.gettempdir())
         parent.mkdir(parents=True, exist_ok=True)
@@ -425,25 +437,14 @@ def attempt_clean_revert(
                     timeout=add_timeout,
                 )
             except (TimeoutError, subprocess.TimeoutExpired):
-                return BisectOutcome(
-                    culprit_sha=culprit_sha,
-                    culprit_subject=subject,
-                    culprit_author_login=author,
-                    revert_branch=branch_name,
-                    meltdown_triggered=True,
-                    reason=f"timed out creating detached revert worktree at {master_sha[:9]}",
+                return _deferred(
+                    f"timed out creating detached revert worktree at {master_sha[:9]}; will retry"
                 )
             if add.returncode != 0:
-                return BisectOutcome(
-                    culprit_sha=culprit_sha,
-                    culprit_subject=subject,
-                    culprit_author_login=author,
-                    revert_branch=branch_name,
-                    meltdown_triggered=True,
-                    reason=f"failed to create detached revert worktree at {master_sha[:9]}",
-                )
+                return _deferred(f"failed to create detached revert worktree at {master_sha[:9]}; will retry")
 
-            # Re-verify current master still exhibits the failure before reverting.
+            # Re-verify current master still exhibits the failure before reverting or freezing
+            # (including for multi-parent merge culprits in case a manual repair already landed).
             master_verdict, master_detail = predicate(wt_dir)
             if master_verdict in {RunVerdict.PASS, RunVerdict.TEST_ABSENT}:
                 return BisectOutcome(
@@ -456,13 +457,45 @@ def attempt_clean_revert(
                     reason=f"master {master_sha[:9]} already passes ({master_verdict.value}); revert skipped",
                 )
             if master_verdict == RunVerdict.INCONCLUSIVE:
+                if _budget_expired() or "budget exceeded" in master_detail:
+                    return _deferred(
+                        f"deferred live-master recheck at {master_sha[:9]} ({master_detail}); will retry"
+                    )
+                move_state = _check_master_moved(master_sha)
+                if move_state == "refresh_failed":
+                    return _deferred(f"failed to recheck {master_ref} after inconclusive live-master check; will retry")
+                if move_state == "moved":
+                    if _budget_expired():
+                        return _deferred(
+                            f"{master_ref} moved while live-master check was inconclusive and budget expired; will retry"
+                        )
+                    continue
+                return _deferred(
+                    f"inconclusive live-master recheck at {master_sha[:9]} ({master_detail}); will retry"
+                )
+
+            if len(parents) > 1:
+                move_state = _check_master_moved(master_sha)
+                if move_state == "refresh_failed":
+                    return _deferred(f"failed to reconfirm {master_ref} before freezing merge culprit; will retry")
+                if move_state == "moved":
+                    if _budget_expired():
+                        return _deferred(
+                            f"{master_ref} moved before merge culprit {culprit_sha[:9]} could be rechecked; will retry"
+                        )
+                    continue
                 return BisectOutcome(
                     culprit_sha=culprit_sha,
                     culprit_subject=subject,
                     culprit_author_login=author,
+                    clean_revert=False,
+                    revert_verified=False,
                     revert_branch=branch_name,
                     meltdown_triggered=True,
-                    reason=f"inconclusive live-master recheck at {master_sha[:9]} ({master_detail})",
+                    reason=(
+                        f"merge commit culprit {culprit_sha[:9]} requires manual revert "
+                        "(cannot safely auto-revert multi-parent merge)"
+                    ),
                 )
 
             try:
@@ -476,21 +509,25 @@ def attempt_clean_revert(
                     timeout=_budget_timeout(deadline, now_fn),
                 )
             except (TimeoutError, subprocess.TimeoutExpired):
-                return BisectOutcome(
-                    culprit_sha=culprit_sha,
-                    culprit_subject=subject,
-                    culprit_author_login=author,
-                    clean_revert=False,
-                    revert_verified=False,
-                    revert_branch=branch_name,
-                    meltdown_triggered=True,
-                    reason=f"timed out running `git revert {culprit_sha[:9]}` against {master_sha[:9]}",
+                return _deferred(
+                    f"timed out running `git revert {culprit_sha[:9]}` against {master_sha[:9]}; will retry"
                 )
             if revert.returncode != 0:
                 try:
                     _git(wt_dir, "revert", "--abort", check=False, timeout=GIT_CLEANUP_TIMEOUT_SECS)
                 except (subprocess.TimeoutExpired, OSError):
                     pass
+                move_state = _check_master_moved(master_sha)
+                if move_state == "refresh_failed":
+                    return _deferred(
+                        f"failed to reconfirm {master_ref} after revert conflict on {culprit_sha[:9]}; will retry"
+                    )
+                if move_state == "moved":
+                    if _budget_expired():
+                        return _deferred(
+                            f"{master_ref} moved during revert conflict on {culprit_sha[:9]} and budget expired; will retry"
+                        )
+                    continue
                 return BisectOutcome(
                     culprit_sha=culprit_sha,
                     culprit_subject=subject,
@@ -512,16 +549,7 @@ def attempt_clean_revert(
             try:
                 commit_res = _git(wt_dir, *commit_args, check=False, timeout=_budget_timeout(deadline, now_fn))
             except (TimeoutError, subprocess.TimeoutExpired):
-                return BisectOutcome(
-                    culprit_sha=culprit_sha,
-                    culprit_subject=subject,
-                    culprit_author_login=author,
-                    clean_revert=False,
-                    revert_verified=False,
-                    revert_branch=branch_name,
-                    meltdown_triggered=True,
-                    reason=f"timed out committing signed revert of {culprit_sha[:9]}",
-                )
+                return _deferred(f"timed out committing signed revert of {culprit_sha[:9]}; will retry")
             if commit_res.returncode != 0:
                 return BisectOutcome(
                     culprit_sha=culprit_sha,
@@ -534,8 +562,44 @@ def attempt_clean_revert(
                     reason=f"failed to commit signed revert of {culprit_sha[:9]} (git exit {commit_res.returncode})",
                 )
 
-            verdict, _detail = predicate(wt_dir)
+            verdict, verify_detail = predicate(wt_dir)
+            if verdict == RunVerdict.INCONCLUSIVE:
+                if _budget_expired() or "budget exceeded" in verify_detail:
+                    return _deferred(
+                        f"revert verification budget expired for {culprit_sha[:9]} ({verify_detail}); will retry",
+                        clean_revert=True,
+                    )
+                move_state = _check_master_moved(master_sha)
+                if move_state == "refresh_failed":
+                    return _deferred(
+                        f"failed to reconfirm {master_ref} after inconclusive revert verification; will retry",
+                        clean_revert=True,
+                    )
+                if move_state == "moved":
+                    if _budget_expired():
+                        return _deferred(
+                            f"{master_ref} moved during inconclusive revert check and budget expired; will retry",
+                            clean_revert=True,
+                        )
+                    continue
+                return _deferred(
+                    f"inconclusive revert verification for {culprit_sha[:9]} ({verify_detail}); will retry",
+                    clean_revert=True,
+                )
             if verdict not in {RunVerdict.PASS, RunVerdict.TEST_ABSENT}:
+                move_state = _check_master_moved(master_sha)
+                if move_state == "refresh_failed":
+                    return _deferred(
+                        f"failed to reconfirm {master_ref} after failed revert of {culprit_sha[:9]}; will retry",
+                        clean_revert=True,
+                    )
+                if move_state == "moved":
+                    if _budget_expired():
+                        return _deferred(
+                            f"{master_ref} moved during failed revert verification and budget expired; will retry",
+                            clean_revert=True,
+                        )
+                    continue
                 return BisectOutcome(
                     culprit_sha=culprit_sha,
                     culprit_subject=subject,
@@ -551,23 +615,22 @@ def attempt_clean_revert(
                 )
 
             # Confirm master has not advanced (e.g., gained a human fix) while verification ran.
-            if refresh_master is not None:
-                if not refresh_master():
-                    return BisectOutcome(
-                        culprit_sha=culprit_sha,
-                        culprit_subject=subject,
-                        culprit_author_login=author,
+            move_state = _check_master_moved(master_sha)
+            if move_state == "refresh_failed":
+                return _deferred(
+                    f"failed to reconfirm {master_ref} before publishing revert; will retry",
+                    clean_revert=True,
+                    revert_verified=True,
+                )
+            if move_state == "moved":
+                if _budget_expired():
+                    return _deferred(
+                        f"{master_ref} moved during revert verification and no budget remained to re-verify; will retry",
                         clean_revert=True,
-                        revert_verified=True,
-                        revert_branch=branch_name,
-                        pr_creation_failed=True,
-                        meltdown_triggered=False,
-                        reason=f"failed to reconfirm {master_ref} before publishing revert; will retry",
+                        revert_verified=False,
                     )
-                latest_master_sha = resolve_commit(repo, master_ref)
-                if latest_master_sha != master_sha:
-                    # Master moved during verification: retry against the fresh tip instead of pushing stale revert.
-                    continue
+                # Master moved during verification: retry against the fresh tip instead of pushing stale revert.
+                continue
 
             pr_url = ""
             if not dry_run:

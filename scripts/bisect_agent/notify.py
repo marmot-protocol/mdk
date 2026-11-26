@@ -122,6 +122,39 @@ class MarmotAlerter:
         return accepted
 
 
+class ManualFreezeError(RuntimeError):
+    """Raised when an automated transition attempts to clear a manual tree-state freeze."""
+
+
+def _is_full_sha(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 40 and all(ch in "0123456789abcdefABCDEF" for ch in value)
+
+
+def _has_valid_incidents(doc: dict[str, Any] | None) -> bool:
+    """Return True when `doc` carries at least one valid durable `(source, tip_sha)` incident."""
+    if not isinstance(doc, dict):
+        return False
+    raw = doc.get("incidents")
+    if not isinstance(raw, dict):
+        return False
+    for key, item in raw.items():
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or key).strip()
+        if source and _is_full_sha(item.get("tip_sha")):
+            return True
+    return False
+
+
+def is_manual_freeze_document(doc: dict[str, Any] | None) -> bool:
+    """Return True when `doc` represents a manual/external `red` freeze rather than an agent incident."""
+    if not isinstance(doc, dict) or doc.get("state") != "red":
+        return False
+    if doc.get("manual") is True:
+        return True
+    return not _has_valid_incidents(doc)
+
+
 class TreeStateController:
     """Read and update the signed orphan `origin/tree-state` branch (`state.json`)."""
 
@@ -140,9 +173,11 @@ class TreeStateController:
         self.remote_timeout_secs = remote_timeout_secs
         self.local_timeout_secs = local_timeout_secs
 
-    def read_remote_document(self) -> tuple[str, dict[str, Any] | None]:
-        """Return `(status, parsed_doc)` where `status` is `green`, `red`, `absent`, or `error`.
+    def read_remote_snapshot(self) -> tuple[str, dict[str, Any] | None, str]:
+        """Return `(status, parsed_doc, rev_sha)` where `status` is `green`, `red`, `absent`, or `error`.
 
+        `rev_sha` is the exact 40-char commit SHA of `refs/remotes/origin/tree-state` read,
+        enabling compare-and-swap transitions bound to the checked revision.
         Explicitly distinguishes an unavailable remote/fetch/timeout failure (`error`) from a
         confirmed `red` state and rejects invalid JSON shapes so exceptions never escape.
         """
@@ -155,11 +190,11 @@ class TreeStateController:
                 timeout=self.remote_timeout_secs,
             )
         except (subprocess.TimeoutExpired, OSError):
-            return "error", None
+            return "error", None, ""
         if ls_res.returncode == 2:
-            return "absent", None
+            return "absent", None, ""
         if ls_res.returncode != 0:
-            return "error", None
+            return "error", None, ""
 
         try:
             fetch_res = subprocess.run(
@@ -178,36 +213,57 @@ class TreeStateController:
                 timeout=self.remote_timeout_secs,
             )
         except (subprocess.TimeoutExpired, OSError):
-            return "error", None
+            return "error", None, ""
         if fetch_res.returncode != 0:
-            return "error", None
+            return "error", None, ""
 
         try:
-            show = subprocess.run(
-                ["git", "-C", str(self.repo), "show", "origin/tree-state:state.json"],
+            rev_res = subprocess.run(
+                ["git", "-C", str(self.repo), "rev-parse", "--verify", "refs/remotes/origin/tree-state^{commit}"],
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=self.local_timeout_secs,
             )
         except (subprocess.TimeoutExpired, OSError):
-            return "error", None
+            return "error", None, ""
+        if rev_res.returncode != 0:
+            return "error", None, ""
+        rev_sha = rev_res.stdout.strip()
+        if not _is_full_sha(rev_sha):
+            return "error", None, ""
+
+        try:
+            show = subprocess.run(
+                ["git", "-C", str(self.repo), "show", f"{rev_sha}:state.json"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.local_timeout_secs,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return "error", None, ""
         if show.returncode != 0:
-            return "error", None
+            return "error", None, ""
         try:
             doc = json.loads(show.stdout)
         except json.JSONDecodeError:
-            return "error", None
+            return "error", None, ""
         if not isinstance(doc, dict):
-            return "error", None
+            return "error", None, ""
         state = doc.get("state")
         if not isinstance(state, str) or state not in {"green", "red"}:
-            return "error", None
-        return state, doc
+            return "error", None, ""
+        return state, doc, rev_sha
+
+    def read_remote_document(self) -> tuple[str, dict[str, Any] | None]:
+        """Return `(status, parsed_doc)` where `status` is `green`, `red`, `absent`, or `error`."""
+        status, doc, _rev = self.read_remote_snapshot()
+        return status, doc
 
     def read_remote_status(self) -> str:
         """Return confirmed remote status: `green`, `red`, `absent`, or `error`."""
-        status, _doc = self.read_remote_document()
+        status, _doc, _rev = self.read_remote_snapshot()
         return status
 
     def set_state(
@@ -217,12 +273,17 @@ class TreeStateController:
         reason: str,
         run_url: str | None = None,
         incidents: dict[str, dict[str, Any]] | None = None,
+        expected_rev: str | None = None,
+        allow_manual_override: bool = False,
     ) -> bool:
         """Set `origin/tree-state` to `green` or `red` with durable incident metadata.
 
-        Raises RuntimeError if `origin/tree-state` cannot be read or updated (including
-        remote timeouts), so callers never silently mark a transition as completed when
-        the push failed.
+        Binds the update to `expected_rev` (when provided) and the exact fetched
+        `current_rev` via non-force push so concurrent updates never clobber each other.
+        Preserves manual freezes in both directions unless `allow_manual_override=True`:
+          - Refuses `green` transitions while remote holds a manual freeze (`ManualFreezeError`).
+          - Refuses to overwrite a manual `red` freeze with agent incidents (returns `False`),
+            preventing a subsequent automated green from clearing an operator freeze.
         """
         if new_state not in {"green", "red"}:
             raise ValueError(f"invalid tree state: {new_state}")
@@ -232,11 +293,24 @@ class TreeStateController:
         if self.dry_run:
             return True
 
-        current, current_doc = self.read_remote_document()
+        current, current_doc, current_rev = self.read_remote_snapshot()
         if current == "error":
             raise RuntimeError("unable to read origin/tree-state before transition")
         if current == "absent":
             raise RuntimeError("origin/tree-state branch does not exist")
+        if expected_rev is not None and current_rev != expected_rev:
+            raise RuntimeError(
+                f"origin/tree-state changed concurrently ({expected_rev[:9]} -> {current_rev[:9]})"
+            )
+
+        remote_is_manual = is_manual_freeze_document(current_doc)
+        if remote_is_manual and not allow_manual_override:
+            if new_state == "green":
+                raise ManualFreezeError("refusing to clear manual origin/tree-state freeze automatically")
+            # Keep an existing manual freeze intact rather than converting it into an
+            # agent-clearable incident that the next automated green could clear.
+            return False
+
         if current == new_state:
             existing_incidents = current_doc.get("incidents") if isinstance(current_doc, dict) else None
             if new_state == "green" or existing_incidents == payload_incidents:
@@ -254,7 +328,7 @@ class TreeStateController:
                     "add",
                     "--detach",
                     str(wt_dir),
-                    "origin/tree-state",
+                    current_rev,
                 ],
                 check=True,
                 capture_output=True,

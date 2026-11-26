@@ -542,6 +542,20 @@ class MergeGatePolicyTests(unittest.TestCase):
                 subprocess.run(["git", "-C", str(ts), "push", "-f", "origin", "tree-state"], check=True, capture_output=True)
                 with self.subTest(payload=payload.strip()):
                     self.assertEqual(run_read("pull_request")["tree_state"], expected_state)
+            # A colliding tag `refs/tags/tree-state` pointing to green must NOT shadow a red
+            # `refs/heads/tree-state` branch (fetch must name `refs/heads/tree-state` explicitly).
+            (ts / "state.json").write_text('{"schema_version":1,"state":"green","reason":"tag decoy"}\n')
+            subprocess.run(["git", "-C", str(ts), "add", "state.json"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "commit", "-m", "tag green decoy"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "tag", "tree-state"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "push", "origin", "refs/tags/tree-state"], check=True, capture_output=True)
+            (ts / "state.json").write_text('{"schema_version":1,"state":"red","reason":"real branch red"}\n')
+            subprocess.run(["git", "-C", str(ts), "add", "state.json"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "commit", "-m", "branch red"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "push", "-f", "origin", "refs/heads/tree-state"], check=True, capture_output=True)
+            colliding = run_read("pull_request")
+            self.assertEqual(colliding["tree_state"], "red")
+            self.assertEqual(colliding["tree_state_reason"].strip(), "real branch red")
             # Non-PR events skip freeze check.
             self.assertEqual(run_read("schedule")["tree_state"], "green")
 

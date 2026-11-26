@@ -167,7 +167,7 @@ jobs:
             elif [[ "$ls_rc" -ne 0 ]]; then
               state=red
               reason="unable to verify origin/tree-state (git ls-remote exit $ls_rc)"
-            elif git fetch --no-tags --depth=1 origin tree-state >/dev/null 2>&1; then
+            elif git fetch --no-tags --depth=1 origin refs/heads/tree-state >/dev/null 2>&1; then
               if doc="$(git show FETCH_HEAD:state.json 2>/dev/null)" && parsed_state="$(jq -er '.state | select(type == "string")' <<<"$doc" 2>/dev/null)"; then
                 if [[ "$parsed_state" == "green" ]]; then
                   state=green

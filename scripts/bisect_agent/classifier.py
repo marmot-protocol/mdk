@@ -33,18 +33,27 @@ INFRA_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"command timed out after \d+s", re.IGNORECASE),
 )
 
-# Nextest terminal failure statuses (supports optional stress `[1/10]`, retry `TRY 2`,
-# and progress `( 988/1564)`):
+# Nextest terminal failure statuses (matches pinned cargo-nextest 0.9.132/0.9.148
+# `status_str` / `short_status_str`, optional retry `TRY <n>`, duration `[...s]`,
+# optional post-duration stress counter `[1/10]` or `[1]`, and optional progress
+# `( 988/1564)` or `(─────────)`):
 #   FAIL [  12.345s] cgka-engine::crash_recovery_sqlite some::test_name
 #   TRY 2 FAIL [   1.432s] ( 988/1564) marmot-session::runtime some::test_name
-#   TIMEOUT [ 120.004s] (  12/100) marmot-app::relay_runtime hangs_forever
+#   TRY 1 TMT [ 240.004s] (─────────) wn-cli::cli hangs_forever
+#   SIGSEGV [   0.012s] [1/10] (1/1) marmot-c::ffi segfault_case
+#   TRY 1 XFAIL [   0.001s] (─────────) cgka-engine::a exec_failed
 NEXTEST_FAIL_RE = re.compile(
-    r"^\s*(?:\[\d+/\d+\]\s+)?(?:TRY\s+\d+\s+)?(?:FAIL|TIMEOUT|ABORT|LEAK-FAIL|EXECFAIL)\s+\[[^\]]+\]\s+(?:\(\s*\d+/\d+\)\s+)?([A-Za-z0-9_-]+)(?:::([A-Za-z0-9_/-]+))?\s+(\S+)\s*$",
+    r"^\s*(?:\[\s*\d+(?:/\d+)?\s*\]\s+)?(?:TRY\s+\d+\s+)?"
+    r"(?:FAIL|XFAIL|TIMEOUT|TMT|ABORT|ABRT|LEAK-FAIL|LKFL|EXECFAIL|SIG[A-Z0-9]+)"
+    r"\s+\[[^\]]+\]\s+(?:\[\s*\d+(?:/\d+)?\s*\]\s+)?(?:\([^)]+\)\s+)?"
+    r"([A-Za-z0-9_-]+)(?:::([A-Za-z0-9_/-]+))?\s+(\S+)\s*$",
     re.MULTILINE,
 )
 
 NEXTEST_PASS_RE = re.compile(
-    r"^\s*(?:\[\d+/\d+\]\s+)?(?:TRY\s+\d+\s+)?(?:PASS|LEAK)\s+\[[^\]]+\]\s+(?:\(\s*\d+/\d+\)\s+)?([A-Za-z0-9_-]+)(?:::([A-Za-z0-9_/-]+))?\s+(\S+)\s*$",
+    r"^\s*(?:\[\s*\d+(?:/\d+)?\s*\]\s+)?(?:(?:TRY\s+\d+\s+)?(?:PASS|LEAK)|FLAKY\s+\d+/\d+)"
+    r"\s+\[[^\]]+\]\s+(?:\[\s*\d+(?:/\d+)?\s*\]\s+)?(?:\([^)]+\)\s+)?"
+    r"([A-Za-z0-9_-]+)(?:::([A-Za-z0-9_/-]+))?\s+(\S+)\s*$",
     re.MULTILINE,
 )
 
@@ -217,25 +226,56 @@ HOSTED_STEP_COMMANDS: dict[str, tuple[str, ...]] = {
 
 # Allowlist of hosted nextest jobs whose individual failing tests can be replayed
 # faithfully on Linux with `nextest_command_for_test` (without external Docker relays
-# or non-standard feature flags). `Relay CLI E2E` is deliberately NOT in this allowlist.
-NEXTEST_REPLAYABLE_HOSTED_JOBS: tuple[tuple[str, frozenset[str]], ...] = (
-    ("Rust tests (", frozenset({"", "Run workspace tests", "Run archived workspace tests"})),
-    ("CLI e2e (mock relay, ", frozenset({"", "Run CLI end-to-end tests"})),
+# or non-standard feature flags), preserving the originating nextest profile and
+# concurrency settings from `.github/workflows/ci.yml`.
+# `Relay CLI E2E` is deliberately NOT in this allowlist.
+# Entries: `(job_prefix, step_name_to_(profile, test_threads))`
+NEXTEST_REPLAYABLE_HOSTED_JOBS: tuple[tuple[str, dict[str, tuple[str, int | None]]], ...] = (
+    (
+        "Rust tests (",
+        {
+            "": ("ci", None),
+            "Run workspace tests": ("ci", None),
+            "Run archived workspace tests": ("ci", None),
+        },
+    ),
+    (
+        "CLI e2e (mock relay, ",
+        {
+            "": ("ci", None),
+            "Run CLI end-to-end tests": ("ci", None),
+        },
+    ),
     (
         "Relay runtime tests (",
-        frozenset({"", "Run relay runtime tests serially", "Run held peer-index upgrade lookup"}),
+        {
+            "": ("ci", 1),
+            "Run relay runtime tests serially": ("ci", 1),
+            "Run held peer-index upgrade lookup": ("default", None),
+        },
     ),
-    ("Simulator and vectors (", frozenset({"", "Run archived simulator tests"})),
+    (
+        "Simulator and vectors (",
+        {
+            "": ("default", None),
+            "Run archived simulator tests": ("default", None),
+        },
+    ),
 )
+
+
+def nextest_replay_profile_for_hosted_job(failed_job: str, failed_step: str = "") -> tuple[str, int | None] | None:
+    """Return `(profile, test_threads)` when a hosted job+step can be replayed faithfully via nextest."""
+    leaf = failed_job.rsplit("/ ", 1)[-1].strip()
+    for prefix, step_profiles in NEXTEST_REPLAYABLE_HOSTED_JOBS:
+        if leaf.startswith(prefix):
+            return step_profiles.get(failed_step)
+    return None
 
 
 def is_nextest_replayable_hosted_job(failed_job: str, failed_step: str = "") -> bool:
     """Return True only when a hosted job+step can be replayed faithfully via single-test nextest."""
-    leaf = failed_job.rsplit("/ ", 1)[-1].strip()
-    for prefix, allowed_steps in NEXTEST_REPLAYABLE_HOSTED_JOBS:
-        if leaf.startswith(prefix):
-            return failed_step in allowed_steps
-    return False
+    return nextest_replay_profile_for_hosted_job(failed_job, failed_step) is not None
 
 
 def normalize_log_text(log_text: str) -> str:
@@ -280,18 +320,26 @@ def nextest_command_for_test(
     binary: str | None,
     test_name: str,
     *,
+    profile: str | None = None,
+    test_threads: int | None = None,
     stress_count: int = 1,
 ) -> tuple[str, ...]:
     """Build the narrowest reproducible `cargo nextest run` command for one failing test.
 
     Uses nextest's exact `binary_id(=...)` filterset so lib tests, integration tests,
-    and binary-crate tests (`bin/...`) are all targeted unambiguously, with
-    `--no-tests=fail` so a renamed/absent test is never misread as a pass.
+    and binary-crate tests (`bin/...`) are all targeted unambiguously, preserves the
+    originating nextest `--profile` (e.g. `ci` for `wn-cli::cli` timeout backstops)
+    and `--test-threads`, and pins `--retries 0 --no-tests=fail` so a renamed/absent
+    test is never misread as a pass.
     """
     cmd: list[str] = ["cargo", "nextest", "run", "--locked", "-p", package]
     features = STRESS_FEATURES.get(package)
     if features:
         cmd.extend(["--features", features])
+    if profile:
+        cmd.extend(["--profile", profile])
+    if test_threads is not None:
+        cmd.extend(["--test-threads", str(test_threads)])
     binary_id = f"{package}::{binary}" if binary else package
     filter_expr = f"binary_id(={binary_id}) & test(={test_name})"
     cmd.extend(["-E", filter_expr, "--no-tests=fail", "--retries", "0", "--no-fail-fast"])
@@ -300,11 +348,11 @@ def nextest_command_for_test(
     return tuple(cmd)
 
 
-def parse_first_nextest_failure(log_text: str) -> tuple[str, str | None, str] | None:
-    """Return `(package, binary_or_none, test_name)` for the first test whose final outcome is FAIL.
+def parse_nextest_failures(log_text: str) -> list[tuple[str, str | None, str]]:
+    """Return all `(package, binary_or_none, test_name)` records whose final outcome is failure.
 
-    Ignores tests that failed on an earlier retry (`TRY 1 FAIL`) and subsequently passed
-    (`TRY 2 PASS`) in the same run.
+    Preserves order of first appearance and ignores tests that failed on an earlier retry
+    (`TRY 1 FAIL` / `TRY 1 TMT`) and subsequently passed (`TRY 2 PASS` / `FLAKY 2/2`).
     """
     cleaned = normalize_log_text(log_text)
     outcomes: dict[tuple[str, str | None, str], str] = {}
@@ -316,10 +364,13 @@ def parse_first_nextest_failure(log_text: str) -> tuple[str, str | None, str] | 
         pass_m = NEXTEST_PASS_RE.match(line)
         if pass_m:
             outcomes[(pass_m.group(1), pass_m.group(2), pass_m.group(3))] = "pass"
-    for key, status in outcomes.items():
-        if status == "fail":
-            return key
-    return None
+    return [key for key, status in outcomes.items() if status == "fail"]
+
+
+def parse_first_nextest_failure(log_text: str) -> tuple[str, str | None, str] | None:
+    """Return `(package, binary_or_none, test_name)` for the first test whose final outcome is failure."""
+    failures = parse_nextest_failures(log_text)
+    return failures[0] if failures else None
 
 
 def evaluate_command_result(
@@ -358,50 +409,186 @@ def evaluate_command_result(
     return RunVerdict.FAIL, f"command exited with status {returncode}"
 
 
-def extract_bare_metal_signal(
+def extract_bare_metal_signals(
     status_doc: dict,
     log_text: str,
     *,
     run_url: str = "",
-) -> FailureSignal:
-    """Convert a red `/srv/mdk/state/canary-status.json` snapshot into a FailureSignal.
+) -> list[FailureSignal]:
+    """Convert a red `/srv/mdk/state/canary-status.json` snapshot into one FailureSignal per terminal failure.
 
     Expected status schema from `/srv/mdk/bin/mdk-canary.sh`:
       {state, sha, canary_sha|previous_canary, failed_step, updated_at, duration_sec, consecutive_failures, log}
 
-    Never places local host file paths into `run_url` (public surfaces only receive
-    HTTP(S) URLs or empty string).
+    Emits one signal for each terminal failing nextest test so a known flake can never hide
+    a deterministic regression in the same run. Never places local host file paths into `run_url`.
     """
     step = str(status_doc.get("failed_step") or "")
     tip_sha = str(status_doc.get("sha") or "")
     baseline_sha = str(status_doc.get("canary_sha") or status_doc.get("previous_canary") or "")
     cleaned = normalize_log_text(log_text)
     excerpt = "\n".join(cleaned.splitlines()[-80:])
-    failed_test: str | None = None
-    command = BARE_METAL_STEP_COMMANDS.get(step, ())
-
-    parsed = parse_first_nextest_failure(cleaned)
-    if parsed and step in {"workspace-nextest", "simulator-smoke"}:
-        pkg, binary, test_name = parsed
-        failed_test = f"{pkg}::{binary}::{test_name}" if binary else f"{pkg}::{test_name}"
-        command = nextest_command_for_test(pkg, binary, test_name)
-
     public_url = run_url if run_url.startswith(("http://", "https://")) else ""
-    return FailureSignal(
-        source="bare_metal_canary",
-        run_id=f"bare-metal:{tip_sha[:12]}:{status_doc.get('updated_at', '')}",
-        run_url=public_url,
-        tip_sha=tip_sha,
-        baseline_sha=baseline_sha,
-        failed_job=f"mdk-canary:{step or 'unknown'}",
-        failed_step=step,
-        failed_test=failed_test,
-        command=command,
-        log_excerpt=excerpt,
-        conclusion="failure",
-        reproducible_locally=bool(command),
-        infra_hint=False if parsed else is_infra_failure(cleaned),
-    )
+    base_run_id = f"bare-metal:{tip_sha[:12]}:{status_doc.get('updated_at', '')}"
+
+    parsed_failures = parse_nextest_failures(cleaned)
+    if parsed_failures and step in {"workspace-nextest", "simulator-smoke"}:
+        profile = "ci" if step == "workspace-nextest" else "default"
+        signals: list[FailureSignal] = []
+        for pkg, binary, test_name in parsed_failures:
+            failed_test = f"{pkg}::{binary}::{test_name}" if binary else f"{pkg}::{test_name}"
+            cmd = nextest_command_for_test(pkg, binary, test_name, profile=profile)
+            sig_run_id = f"{base_run_id}:test:{failed_test}" if len(parsed_failures) > 1 else base_run_id
+            signals.append(
+                FailureSignal(
+                    source="bare_metal_canary",
+                    run_id=sig_run_id,
+                    run_url=public_url,
+                    tip_sha=tip_sha,
+                    baseline_sha=baseline_sha,
+                    failed_job=f"mdk-canary:{step or 'unknown'}",
+                    failed_step=step,
+                    failed_test=failed_test,
+                    command=cmd,
+                    log_excerpt=excerpt,
+                    conclusion="failure",
+                    reproducible_locally=True,
+                    infra_hint=False,
+                )
+            )
+        return signals
+
+    command = BARE_METAL_STEP_COMMANDS.get(step, ())
+    return [
+        FailureSignal(
+            source="bare_metal_canary",
+            run_id=base_run_id,
+            run_url=public_url,
+            tip_sha=tip_sha,
+            baseline_sha=baseline_sha,
+            failed_job=f"mdk-canary:{step or 'unknown'}",
+            failed_step=step,
+            failed_test=None,
+            command=command,
+            log_excerpt=excerpt,
+            conclusion="failure",
+            reproducible_locally=bool(command),
+            infra_hint=is_infra_failure(cleaned),
+        )
+    ]
+
+
+def extract_bare_metal_signal(
+    status_doc: dict,
+    log_text: str,
+    *,
+    run_url: str = "",
+) -> FailureSignal:
+    """Convert a red bare-metal snapshot into its first FailureSignal."""
+    return extract_bare_metal_signals(status_doc, log_text, run_url=run_url)[0]
+
+
+def extract_hosted_signals(
+    *,
+    source: str,
+    run_id: str,
+    run_url: str,
+    tip_sha: str,
+    baseline_sha: str,
+    failed_job: str,
+    log_text: str,
+    failed_step: str = "",
+    conclusion: str = "failure",
+) -> list[FailureSignal]:
+    """Convert a failed hosted Canary workflow job into one FailureSignal per terminal failure.
+
+    Parses all terminal nextest failures from the full fetched log before slicing `log_excerpt`
+    so a known flake in a shard never masks a deterministic regression in the same shard, and
+    only emits local replay commands for exact steps in `HOSTED_STEP_COMMANDS` or allowlisted
+    nextest jobs with their originating `--profile` / `--test-threads`.
+    """
+    cleaned = normalize_log_text(log_text)
+    excerpt = "\n".join(cleaned.splitlines()[-80:])
+    non_linux = is_non_linux_job(failed_job)
+    parsed_failures = parse_nextest_failures(cleaned)
+    base_run_id = str(run_id)
+
+    if not non_linux and failed_step and failed_step in HOSTED_STEP_COMMANDS:
+        command = HOSTED_STEP_COMMANDS[failed_step]
+        first_test: str | None = None
+        if parsed_failures:
+            pkg, binary, test_name = parsed_failures[0]
+            first_test = f"{pkg}::{binary}::{test_name}" if binary else f"{pkg}::{test_name}"
+        return [
+            FailureSignal(
+                source=source,
+                run_id=base_run_id,
+                run_url=run_url,
+                tip_sha=tip_sha,
+                baseline_sha=baseline_sha,
+                failed_job=failed_job,
+                failed_step=failed_step,
+                failed_test=first_test,
+                command=command,
+                log_excerpt=excerpt,
+                conclusion=conclusion,
+                reproducible_locally=True,
+                infra_hint=False if parsed_failures else is_infra_failure(cleaned, conclusion),
+            )
+        ]
+
+    if parsed_failures:
+        replay_profile = None if non_linux else nextest_replay_profile_for_hosted_job(failed_job, failed_step)
+        signals: list[FailureSignal] = []
+        for pkg, binary, test_name in parsed_failures:
+            failed_test = f"{pkg}::{binary}::{test_name}" if binary else f"{pkg}::{test_name}"
+            cmd: tuple[str, ...] = ()
+            if replay_profile is not None:
+                profile, test_threads = replay_profile
+                cmd = nextest_command_for_test(
+                    pkg,
+                    binary,
+                    test_name,
+                    profile=profile,
+                    test_threads=test_threads,
+                )
+            sig_run_id = f"{base_run_id}:test:{failed_test}" if len(parsed_failures) > 1 else base_run_id
+            signals.append(
+                FailureSignal(
+                    source=source,
+                    run_id=sig_run_id,
+                    run_url=run_url,
+                    tip_sha=tip_sha,
+                    baseline_sha=baseline_sha,
+                    failed_job=failed_job,
+                    failed_step=failed_step,
+                    failed_test=failed_test,
+                    command=cmd,
+                    log_excerpt=excerpt,
+                    conclusion=conclusion,
+                    reproducible_locally=(not non_linux and bool(cmd)),
+                    infra_hint=False,
+                )
+            )
+        return signals
+
+    return [
+        FailureSignal(
+            source=source,
+            run_id=base_run_id,
+            run_url=run_url,
+            tip_sha=tip_sha,
+            baseline_sha=baseline_sha,
+            failed_job=failed_job,
+            failed_step=failed_step,
+            failed_test=None,
+            command=(),
+            log_excerpt=excerpt,
+            conclusion=conclusion,
+            reproducible_locally=False,
+            infra_hint=is_infra_failure(cleaned, conclusion),
+        )
+    ]
 
 
 def extract_hosted_signal(
@@ -416,44 +603,18 @@ def extract_hosted_signal(
     failed_step: str = "",
     conclusion: str = "failure",
 ) -> FailureSignal:
-    """Convert a failed hosted Canary workflow job into a FailureSignal.
-
-    Parses test identity from the full fetched log before slicing `log_excerpt`, and
-    only emits a local replay command for exact steps in `HOSTED_STEP_COMMANDS` or
-    allowlisted nextest jobs whose prerequisites match the bare-metal Linux host.
-    """
-    cleaned = normalize_log_text(log_text)
-    excerpt = "\n".join(cleaned.splitlines()[-80:])
-    non_linux = is_non_linux_job(failed_job)
-    parsed = parse_first_nextest_failure(cleaned)
-    failed_test: str | None = None
-    if parsed:
-        pkg, binary, test_name = parsed
-        failed_test = f"{pkg}::{binary}::{test_name}" if binary else f"{pkg}::{test_name}"
-
-    command: tuple[str, ...] = ()
-    if not non_linux:
-        if failed_step and failed_step in HOSTED_STEP_COMMANDS:
-            command = HOSTED_STEP_COMMANDS[failed_step]
-        elif parsed and is_nextest_replayable_hosted_job(failed_job, failed_step):
-            pkg, binary, test_name = parsed
-            command = nextest_command_for_test(pkg, binary, test_name)
-
-    return FailureSignal(
+    """Convert a failed hosted Canary workflow job into its first FailureSignal."""
+    return extract_hosted_signals(
         source=source,
-        run_id=str(run_id),
+        run_id=run_id,
         run_url=run_url,
         tip_sha=tip_sha,
         baseline_sha=baseline_sha,
         failed_job=failed_job,
+        log_text=log_text,
         failed_step=failed_step,
-        failed_test=failed_test,
-        command=command,
-        log_excerpt=excerpt,
         conclusion=conclusion,
-        reproducible_locally=(not non_linux and bool(command)),
-        infra_hint=False if parsed else is_infra_failure(cleaned, conclusion),
-    )
+    )[0]
 
 
 def _contains_exact_test_token(text: str, token: str) -> bool:
@@ -635,21 +796,25 @@ def classify_failure(
             reason=f"passed single retry on {signal.tip_sha[:9]} (non-nextest command; stress skipped)",
         )
 
-    tip_stress = _run_nextest_stress(run_on_sha, signal.tip_sha, signal.command, stress_count)
+    tip_stress, tip_stress_detail = _run_nextest_stress(run_on_sha, signal.tip_sha, signal.command, stress_count)
     if tip_stress == RunVerdict.INCONCLUSIVE:
+        suffix = f" ({tip_stress_detail})" if tip_stress_detail else ""
         return ClassificationResult(
             bucket=Bucket.INFRA_ERROR,
-            reason=f"inconclusive stress check on tip {signal.tip_sha[:9]}",
+            reason=f"inconclusive stress check on tip {signal.tip_sha[:9]}{suffix}",
         )
 
     base_stress: RunVerdict | None = None
     has_distinct_baseline = bool(signal.baseline_sha and signal.baseline_sha != signal.tip_sha)
     if has_distinct_baseline:
-        base_stress = _run_nextest_stress(run_on_sha, signal.baseline_sha, signal.command, stress_count)
+        base_stress, base_stress_detail = _run_nextest_stress(
+            run_on_sha, signal.baseline_sha, signal.command, stress_count
+        )
         if base_stress == RunVerdict.INCONCLUSIVE:
+            suffix = f" ({base_stress_detail})" if base_stress_detail else ""
             return ClassificationResult(
                 bucket=Bucket.INFRA_ERROR,
-                reason=f"inconclusive stress check on baseline {signal.baseline_sha[:9]}",
+                reason=f"inconclusive stress check on baseline {signal.baseline_sha[:9]}{suffix}",
             )
 
     if tip_stress == RunVerdict.FAIL and base_stress == RunVerdict.FAIL:
@@ -707,8 +872,7 @@ def _run_nextest_stress(
     sha: str,
     command: tuple[str, ...],
     stress_count: int,
-) -> RunVerdict:
-    """Run a `cargo nextest run` command with `--stress-count` and preserve its observed RunVerdict."""
+) -> tuple[RunVerdict, str]:
+    """Run a `cargo nextest run` command with `--stress-count` and preserve its observed verdict and detail."""
     scmd = stress_command(command, stress_count)
-    verdict, _detail = run_on_sha(sha, scmd)
-    return verdict
+    return run_on_sha(sha, scmd)
