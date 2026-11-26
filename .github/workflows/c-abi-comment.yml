@@ -1,0 +1,71 @@
+name: C ABI PR notice
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  actions: read
+  pull-requests: write
+
+jobs:
+  comment:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      contains(fromJSON('["success", "failure"]'), github.event.workflow_run.conclusion)
+    concurrency:
+      group: c-abi-comment-${{ github.event.workflow_run.head_repository.id }}-${{ github.event.workflow_run.head_branch }}
+      queue: max
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Update C ABI notice for the current PR revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+          HEAD_REPO_ID: ${{ github.event.workflow_run.head_repository.id }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          [[ -n "$HEAD_REPO_ID" ]] || exit 0
+          repo="repos/$GITHUB_REPOSITORY"
+          marker='<!-- mdk-c-abi -->'
+
+          # Never check out PR code or download artifacts with a write token.
+          artifacts="$(gh api --paginate "$repo/actions/runs/$RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.expired | not) | [.name, .id] | @tsv')"
+          [[ -n "$artifacts" ]] || exit 0
+          # workflow_run.pull_requests can be empty for fork PRs.
+          pulls="$(gh api --paginate --method GET "$repo/pulls" -f state=open \
+            -f head="$HEAD_OWNER:$HEAD_BRANCH" | jq -r --arg sha "$HEAD_SHA" --arg id "$HEAD_REPO_ID" \
+            '.[] | select(.head.sha == $sha and (.head.repo.id | tostring) == $id) | [.number, .base.ref] | @tsv')"
+
+          while IFS=$'\t' read -r number ref; do
+            [[ -n "$number" ]] || continue
+            target="$(printf '%s' "$ref" | sha256sum | cut -d ' ' -f 1)"
+            prefix="c-abi-$number-$target-"
+            result="$(awk -F '\t' -v prefix="$prefix" 'index($1, prefix) == 1' <<< "$artifacts")"
+            pattern="^${prefix}([0-9a-f]{40})-(changed|unchanged|skipped)"$'\t''([0-9]+)$'
+            [[ "$result" =~ $pattern ]] || continue
+            base="${BASH_REMATCH[1]}"
+            state="${BASH_REMATCH[2]}"
+            artifact="${BASH_REMATCH[3]}"
+
+            comments="$(gh api --paginate "$repo/issues/$number/comments" | jq -r --arg marker "$marker" \
+              '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith($marker))) | .id')"
+            if [[ "$state" == changed ]]; then
+              url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts/$artifact"
+              printf -v body '%s\n**C ABI declarations changed** at `%s` against base `%s`. [Download the declaration diff](%s). This is not an ABI compatibility verdict.' \
+                "$marker" "${HEAD_SHA:0:12}" "${base:0:12}" "$url"
+              if [[ -n "$comments" ]]; then
+                gh api --method PATCH "$repo/issues/comments/$comments" -f body="$body" >/dev/null
+              else
+                gh api --method POST "$repo/issues/$number/comments" -f body="$body" >/dev/null
+              fi
+            elif [[ -n "$comments" ]]; then
+              gh api --method DELETE "$repo/issues/comments/$comments"
+            fi
+          done <<< "$pulls"

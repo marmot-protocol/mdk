@@ -947,5 +947,7 @@ just c-header
 
 The mirror surface is macro-generated, so header generation runs cbindgen
 with macro expansion (`RUSTC_BOOTSTRAP=1` on the stable toolchain).
-CI builds the header and tests it against the library. See the
+CI builds the header and tests it against the library. On pull requests that
+change C declarations, the CI bot links the diff against the tested base commit.
+The notice flags declaration changes; it does not judge ABI compatibility. See the
 [repository README](../../README.md#build-an-app-on-mdk) for the generated references.

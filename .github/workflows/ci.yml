@@ -77,6 +77,8 @@ jobs:
     timeout-minutes: 5
     outputs:
       ci_mode: ${{ steps.mode.outputs.ci_mode }}
+      pr_base: ${{ steps.pr.outputs.base }}
+      c_abi_key: ${{ steps.pr.outputs.abi_key }}
       run_full: ${{ steps.classify.outputs.run_full }}
       run_c: ${{ steps.classify.outputs.run_c }}
       run_conformance: ${{ steps.classify.outputs.run_conformance }}
@@ -131,10 +133,23 @@ jobs:
           esac
           echo "ci_mode=$mode" >> "$GITHUB_OUTPUT"
 
+      - name: Identify the tested PR base
+        if: github.event_name == 'pull_request'
+        id: pr
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          base="$(git rev-parse HEAD^1)"
+          target="$(printf '%s' "$BASE_REF" | sha256sum | cut -d ' ' -f 1)"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "abi_key=$PR_NUMBER-$target-$base" >> "$GITHUB_OUTPUT"
+
       - name: Classify changed paths
         id: classify
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ steps.pr.outputs.base }}
           CI_MODE: ${{ steps.mode.outputs.ci_mode }}
         run: |
           set -euo pipefail
@@ -150,6 +165,19 @@ jobs:
             git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" > "$paths"
           fi
           python3 scripts/classify_ci_changes.py "${flags[@]}" --github-output "$GITHUB_OUTPUT" < "$paths"
+
+      - name: Record a skipped C ABI comparison
+        if: github.event_name == 'pull_request' && steps.classify.outputs.run_c == 'false'
+        run: echo 'C bindings smoke was skipped for these paths.' > "$RUNNER_TEMP/c-abi.diff"
+
+      - name: Upload skipped C ABI result
+        if: github.event_name == 'pull_request' && steps.classify.outputs.run_c == 'false'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: c-abi-${{ steps.pr.outputs.abi_key }}-skipped
+          path: ${{ runner.temp }}/c-abi.diff
+          if-no-files-found: error
+          overwrite: true
 
   rust-format:
     name: Rust format
@@ -451,6 +479,58 @@ jobs:
             crates/marmot-c/include/marmot.h
             crates/marmot-uniffi/API-REFERENCE.md
           if-no-files-found: error
+
+      - name: Check out exact PR base for C ABI comparison
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.changes.outputs.pr_base }}
+          path: abi-base
+          persist-credentials: false
+
+      - name: Compare C declarations
+        if: github.event_name == 'pull_request'
+        id: c-abi
+        env:
+          BASE_SHA: ${{ needs.changes.outputs.pr_base }}
+        run: |
+          set -euo pipefail
+          header=crates/marmot-c/include/marmot.h
+          # Older bases ship a CI-checked header; later bases generate it on demand.
+          if [[ ! -s "abi-base/$header" ]]; then
+            bash abi-base/crates/marmot-c/c-header.sh
+          fi
+          [[ -s "abi-base/$header" && -s "$header" ]]
+
+          # Strip comments without expanding macros or choosing a C/C++ branch.
+          declarations() {
+            gcc -E -P -dD -fpreprocessed -Wno-pragma-once-outside-header -x c "$1" |
+              clang-format --assume-filename=marmot.h \
+                --style='{BasedOnStyle: LLVM, SortIncludes: Never, ColumnLimit: 100}'
+          }
+          declarations "abi-base/$header" > "$RUNNER_TEMP/base-declarations.h"
+          declarations "$header" > "$RUNNER_TEMP/merge-declarations.h"
+          patch="$RUNNER_TEMP/c-abi.diff"
+          state=unchanged
+          if diff -u --label "base/$BASE_SHA/marmot.h" "$RUNNER_TEMP/base-declarations.h" \
+            --label "merge/$GITHUB_SHA/marmot.h" "$RUNNER_TEMP/merge-declarations.h" > "$patch"; then
+            echo 'No C declaration changes.' > "$patch"
+          else
+            [[ $? -eq 1 ]]
+            state=changed
+            echo 'C ABI declarations changed. See the C ABI diff artifact.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Upload C ABI comparison
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          # Partial reruns keep the completed comparison for the same source.
+          name: c-abi-${{ needs.changes.outputs.c_abi_key }}-${{ steps.c-abi.outputs.state }}
+          path: ${{ runner.temp }}/c-abi.diff
+          if-no-files-found: error
+          overwrite: true
 
       - name: Alloc-audit tests
         if: needs.changes.outputs.ci_mode != 'precheck'
