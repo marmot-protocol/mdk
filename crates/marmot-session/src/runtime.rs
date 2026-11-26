@@ -736,11 +736,11 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     entropy: Arc<dyn EntropySource>,
     maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
-    /// The staged commit whose Welcomes are being sealed, set only across
-    /// that await (see [`Self::seal_commit_welcomes`]). Still set when no
-    /// call is sealing, it names a commit whose call was dropped mid-seal,
+    /// Staged commits whose Welcomes are being sealed, each held only across
+    /// that await (see [`Self::seal_commit_welcomes`]). One still held when
+    /// no call is sealing names a commit whose call was dropped mid-seal,
     /// which maintenance rolls back.
-    sealing_commit: Option<PendingStateRef>,
+    sealing_commits: Vec<PendingStateRef>,
     /// This runtime was asked to withdraw the device's slot for sign-out, so
     /// it publishes nothing more, whether or not a relay accepted. The next
     /// runtime for the account republishes.
@@ -868,7 +868,7 @@ where
             entropy: Arc::new(OsEntropy),
             maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
-            sealing_commit: None,
+            sealing_commits: Vec::new(),
             key_package_slot_withdrawn: false,
             key_package_announcement_group: None,
             slot_superseded_through: None,
@@ -2949,7 +2949,7 @@ where
             let recovered = boxed(|| self.publish_session_effects(recovered)).await?;
             output.absorb_account_effects(recovered);
         }
-        let settled = boxed(|| self.settle_dropped_seal()).await?;
+        let settled = boxed(|| self.settle_dropped_seals()).await?;
         output.absorb_account_effects(settled);
         let now = self.wall_clock.now();
         // Before anything reads an evolution or an obligation: repair the
@@ -6781,30 +6781,48 @@ where
     /// Seal the Welcomes of the staged commit `pending`. A remote signer can
     /// hold the seal for minutes, and no fanout names the commit yet, so a
     /// call dropped here would leave it pending for good. The commit is noted
-    /// across the await for [`Self::settle_dropped_seal`] to roll back, as a
-    /// seal failure would.
+    /// across the await for [`Self::settle_dropped_seals`] to roll back, as a
+    /// seal failure would. A later seal keeps the notes of earlier dropped
+    /// ones.
     async fn seal_commit_welcomes(
         &mut self,
         pending: PendingStateRef,
         welcomes: &[OutboundWelcome],
     ) -> Result<Vec<SealedWelcome>, cgka_traits::error::PeelerError> {
-        self.sealing_commit = Some(pending);
+        self.sealing_commits.push(pending);
         let sealed = self.session.seal_welcomes(welcomes).await;
-        self.sealing_commit = None;
+        self.sealing_commits.retain(|noted| *noted != pending);
         sealed
     }
 
-    /// Roll back the commit a call dropped mid-seal left staged; see
-    /// [`Self::seal_commit_welcomes`].
-    async fn settle_dropped_seal(&mut self) -> AccountResult<AccountDeviceEffects> {
+    /// Roll back each commit a call dropped mid-seal left staged; see
+    /// [`Self::seal_commit_welcomes`]. A commit the engine no longer holds is
+    /// settled: a rollback that failed after taking it left nothing to retry.
+    /// Any other failure keeps the commit for the next pass, which
+    /// [`Self::maintenance_due`] reports as owed.
+    async fn settle_dropped_seals(&mut self) -> AccountResult<AccountDeviceEffects> {
         let mut output = AccountDeviceEffects::default();
-        let Some(pending) = self.sealing_commit else {
-            return Ok(output);
-        };
         let mut queue = VecDeque::new();
-        self.rollback_unstaged_pending(Some(pending), &mut output, &mut queue)
-            .await?;
-        self.sealing_commit = None;
+        for pending in std::mem::take(&mut self.sealing_commits) {
+            match self.session.publish_failed(pending).await {
+                Ok(effects) => {
+                    output
+                        .pending
+                        .push(PendingResolution::RolledBack { pending });
+                    output.absorb_session_effects(effects, &mut queue);
+                }
+                Err(error) if matches!(error.as_engine_error(), EngineError::UnknownPending) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        method = "settle_dropped_seals",
+                        error_kind = error.as_engine_error().privacy_safe_kind(),
+                        "dropped-seal rollback failed; retried next pass"
+                    );
+                    self.sealing_commits.push(pending);
+                }
+            }
+        }
         self.publish_queue(&mut output, &mut queue, None).await?;
         Ok(output)
     }

@@ -1266,7 +1266,8 @@ async fn invite_seal_failure_rolls_back_staged_commit() {
 
 /// A send dropped while its Welcomes are sealed (a remote signer can hold
 /// the seal for minutes) leaves its commit staged with no fanout. Maintenance
-/// rolls it back, so the group takes a new change again.
+/// rolls it back, so the group takes a new change again, even after another
+/// group's invite sealed in the meantime.
 #[tokio::test]
 async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
     let dir = relaxed_storage_dir().unwrap();
@@ -1280,7 +1281,9 @@ async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
     ))
     .unwrap();
     let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let mut carol = current_session(dir.path().join("carol.sqlite"), &key, b"carol");
     let bob_id = bob.self_id();
+    let carol_id = carol.self_id();
     let key_package = bob.fresh_key_package().await.unwrap();
     let adapter = RecordingAdapter::default();
     let routing = SharedRouting(Arc::new(Mutex::new(StaticTransportRouting::new(vec![]))));
@@ -1290,21 +1293,35 @@ async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
         routing.clone(),
         RecordingKeyPackages::default(),
     );
-    let (group, _) = runtime
-        .create_group(CreateGroupRequest {
-            name: "invite dropped mid seal".into(),
-            description: String::new(),
-            members: Vec::new(),
-            required_features: Vec::new(),
-            app_components: Vec::new(),
-            initial_admins: Vec::new(),
-        })
-        .await
-        .unwrap();
+    let mut groups = Vec::new();
+    for name in ["invite dropped mid seal", "invite sealed meanwhile"] {
+        let (group, _) = runtime
+            .create_group(CreateGroupRequest {
+                name: name.into(),
+                description: String::new(),
+                members: Vec::new(),
+                required_features: Vec::new(),
+                app_components: Vec::new(),
+                initial_admins: Vec::new(),
+            })
+            .await
+            .unwrap();
+        groups.push(group);
+    }
+    let [group, other] = <[GroupId; 2]>::try_from(groups).unwrap();
     let relay = TransportEndpoint("wss://group.example".into());
-    let inbox = TransportEndpoint("wss://bob-inbox.example".into());
+    let other_relay = TransportEndpoint("wss://other-group.example".into());
     routing.update(|_| {
-        staged_invite_routing(&group, &relay).with_inbox_route(bob_id.clone(), vec![inbox])
+        staged_invite_routing(&group, &relay)
+            .with_group_route(other.clone(), other.as_slice().to_vec(), vec![other_relay])
+            .with_inbox_route(
+                bob_id.clone(),
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            )
+            .with_inbox_route(
+                carol_id.clone(),
+                vec![TransportEndpoint("wss://carol-inbox.example".into())],
+            )
     });
     let members = runtime.members(&group).unwrap();
     let invite = SendIntent::Invite {
@@ -1322,6 +1339,16 @@ async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
     assert!(runtime.maintenance_due(&[]).unwrap().retry_while_owed);
 
     sealer.park.store(false, Ordering::SeqCst);
+    // Another group's seal starts and finishes before maintenance runs.
+    runtime
+        .send(SendIntent::Invite {
+            group_id: other.clone(),
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(runtime.maintenance_due(&[]).unwrap().retry_while_owed);
     let maintained = runtime.run_due_maintenance().await.unwrap();
     assert!(
         maintained
@@ -1330,7 +1357,6 @@ async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
             .any(|resolution| matches!(resolution, PendingResolution::RolledBack { .. }))
     );
     assert_eq!(runtime.members(&group).unwrap(), members);
-    assert!(adapter.inner.commit_publishes.lock().unwrap().is_empty());
 
     let sent = runtime.send(invite).await.unwrap();
     assert!(matches!(
@@ -1344,7 +1370,7 @@ async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
             .iter()
             .any(|member| member.id == bob_id)
     );
-    assert_eq!(staged_welcome_publishes(&adapter).len(), 1);
+    assert_eq!(staged_welcome_publishes(&adapter).len(), 2);
 }
 
 include!("runtime/frozen_fanout.rs");
