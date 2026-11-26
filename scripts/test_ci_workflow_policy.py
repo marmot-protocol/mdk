@@ -471,13 +471,17 @@ class MergeGatePolicyTests(unittest.TestCase):
 
     def test_android_check_and_workflow_call_contracts(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        justfile = (ROOT / "Justfile").read_text()
         self.assertIn("  workflow_call:\n", workflow)
         self.assertIn("ANDROID_NDK_VERSION: 27.2.12479018", workflow)
         android_job = workflow.split("\n  rust-android-check:\n", 1)[1].split("\n  rust-clippy:\n", 1)[0]
         # `ci_runner.py prepare` deletes /usr/local/lib/android, so android-check must skip it.
         self.assertNotIn("ci_runner.py prepare", android_job)
-        self.assertIn("cargo check --locked --target aarch64-linux-android -p marmot-uniffi", android_job)
-        self.assertIn("aarch64-linux-android26-clang", android_job)
+        self.assertNotIn("Upload runner diagnostics", android_job)
+        # CI and local development share the single `just android-check` recipe.
+        self.assertIn("run: just android-check", android_job)
+        self.assertIn("cargo check --locked --target aarch64-linux-android -p marmot-uniffi", justfile)
+        self.assertIn("aarch64-linux-android26-clang", justfile)
         # Every checkout in ci.yml must honor optional inputs.source_sha for Canary pinning.
         checkouts = workflow.count("uses: actions/checkout@")
         pinned = workflow.count("ref: ${{ inputs.source_sha }}")
@@ -1658,18 +1662,58 @@ sha256sum() { shasum -a 256 "$@"; }
 
 
 class CanaryWorkflowPolicyTests(unittest.TestCase):
+    @staticmethod
+    def _permissions_union(text: str) -> dict[str, str]:
+        rank = {"none": 0, "read": 1, "write": 2}
+        merged: dict[str, str] = {}
+        for match in re.finditer(r"(?m)^([ ]*)permissions:\n((?:\1  [a-z-]+: [a-z]+\n)+)", text):
+            for scope, level in re.findall(r"([a-z-]+): ([a-z]+)", match.group(2)):
+                if rank.get(level, -1) > rank.get(merged.get(scope, "none"), -1):
+                    merged[scope] = level
+        return merged
+
     def test_canary_workflow_structure_permissions_and_concurrency(self):
         workflow = (ROOT / ".github/workflows/canary.yml").read_text()
+        ci_workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        bp_workflow = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
+
         self.assertIn('    - cron: "7 * * * *"\n', workflow)
         self.assertIn("  workflow_dispatch:\n", workflow)
         self.assertNotIn("  pull_request:", workflow)
         self.assertIn("permissions:\n  actions: read\n  contents: read\n", workflow)
-        self.assertNotIn(": write", workflow)
         self.assertIn("concurrency:\n  group: canary\n  cancel-in-progress: false\n", workflow)
         self.assertIn("uses: ./.github/workflows/ci.yml", workflow)
         self.assertIn("rust_test_shards: 6", workflow)
         self.assertIn("uses: ./.github/workflows/bindings-profile.yml", workflow)
-        self.assertIn("group: macos-packaging", workflow)
+
+        # `verify-ci` must cover the full permission union requested by `ci.yml`
+        # (GitHub validates nested permissions before evaluating job `if:`s),
+        # while no other Canary job may hold write permissions.
+        verify_ci = workflow.split("\n  verify-ci:\n", 1)[1].split("\n  # Serialization", 1)[0]
+        verify_bp = workflow.split("\n  verify-bindings-profile:\n", 1)[1].split("\n  summary:\n", 1)[0]
+        plan_block = workflow.split("\n  plan:\n", 1)[1].split("\n  # GitHub validates", 1)[0]
+        summary_block = workflow.split("\n  summary:\n", 1)[1]
+
+        rank = {"none": 0, "read": 1, "write": 2}
+        ci_required = self._permissions_union(ci_workflow)
+        verify_ci_granted = self._permissions_union(verify_ci)
+        for scope, level in ci_required.items():
+            with self.subTest(scope=scope, required=level):
+                self.assertGreaterEqual(rank[verify_ci_granted.get(scope, "none")], rank[level])
+
+        bp_required = self._permissions_union(bp_workflow)
+        verify_bp_granted = self._permissions_union(verify_bp)
+        for scope, level in bp_required.items():
+            with self.subTest(bp_scope=scope, required=level):
+                self.assertGreaterEqual(rank[verify_bp_granted.get(scope, "none")], rank[level])
+
+        for readonly_name, block in (("plan", plan_block), ("verify-bindings-profile", verify_bp), ("summary", summary_block)):
+            with self.subTest(job=readonly_name):
+                self.assertNotIn(": write", block)
+
+        # Avoid nested concurrency deadlock: `bindings-profile.yml` owns `macos-packaging`.
+        self.assertNotIn("concurrency:", verify_bp)
+        self.assertIn("group: macos-packaging", bp_workflow)
 
     def test_canary_plan_skips_unchanged_master_and_triggers_packaging_only_on_binding_diffs(self):
         script = workflow_step("canary.yml", "Resolve Canary target and packaging trigger")
@@ -1708,6 +1752,15 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
             git("commit", "-m", "c2")
             c2 = git("rev-parse", "HEAD")
 
+            (repo / ".github/actions/setup-odin").mkdir(parents=True)
+            (repo / ".github/actions/setup-odin/action.yml").write_text("name: setup-odin\n")
+            git("add", ".")
+            git("commit", "-m", "c3")
+            c3 = git("rev-parse", "HEAD")
+
+            # Simulate bare-metal Canary already sitting at c2.
+            git("update-ref", "refs/remotes/origin/canary", c2)
+
             def run_plan(checkout_sha, last_green, force="false", force_bp="false"):
                 git("checkout", "-q", checkout_sha)
                 out = repo / "gh_out"
@@ -1735,15 +1788,24 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
             # Force overrides skip.
             forced = run_plan(c1, c1, force="true")
             self.assertEqual((forced["should_run"], forced["run_bindings_profile"]), ("true", "false"))
+            # Manual run_bindings_profile=true also bypasses early skip on an already-green SHA.
+            forced_bp = run_plan(c1, c1, force="false", force_bp="true")
+            self.assertEqual((forced_bp["should_run"], forced_bp["run_bindings_profile"]), ("true", "true"))
             # Core-only diff runs CI without heavy macOS bindings-profile packaging.
             core = run_plan(c1, c0)
             self.assertEqual((core["should_run"], core["run_bindings_profile"]), ("true", "false"))
             # Binding diff triggers bindings-profile packaging.
             binding = run_plan(c2, c1)
             self.assertEqual((binding["should_run"], binding["run_bindings_profile"]), ("true", "true"))
-            # API lookup failure fails open to running CI.
+            # Tooling-only diff (setup-odin) also triggers bindings-profile packaging.
+            odin_tooling = run_plan(c3, c2)
+            self.assertEqual((odin_tooling["should_run"], odin_tooling["run_bindings_profile"]), ("true", "true"))
+            # API failure or missing hosted baseline fails safe to running packaging
+            # even if bare-metal `origin/canary` already sits at `source_sha`.
             api_err = run_plan(c2, "error")
-            self.assertEqual(api_err["should_run"], "true")
+            self.assertEqual((api_err["should_run"], api_err["run_bindings_profile"]), ("true", "true"))
+            first_run = run_plan(c2, "")
+            self.assertEqual((first_run["should_run"], first_run["run_bindings_profile"]), ("true", "true"))
 
     def test_canary_summary_records_json_and_enforces_gate(self):
         write_script = workflow_step("canary.yml", "Write Canary summary artifact")

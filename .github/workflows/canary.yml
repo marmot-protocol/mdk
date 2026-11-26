@@ -60,7 +60,7 @@ jobs:
           source_sha="$(git rev-parse 'HEAD^{commit}')"
           last_green_sha="$(gh api "repos/$REPO/actions/workflows/canary.yml/runs?branch=master&status=success&per_page=20" \
             --jq "[.workflow_runs[] | select(.id != ($RUN_ID | tonumber))][0].head_sha // \"\"" 2>/dev/null || true)"
-          if [[ "$last_green_sha" == "$source_sha" && "$FORCE" != "true" ]]; then
+          if [[ "$last_green_sha" == "$source_sha" && "$FORCE" != "true" && "$FORCE_BINDINGS_PROFILE" != "true" ]]; then
             echo "Canary already verified $source_sha; skipping."
             {
               echo "should_run=false"
@@ -71,24 +71,27 @@ jobs:
             exit 0
           fi
 
+          # Use only the prior successful hosted Canary run as the packaging
+          # diff baseline (never bare-metal `origin/canary`, which can already
+          # sit at `source_sha` without having run macOS/Android packaging).
           previous_sha="$last_green_sha"
-          if [[ -z "$previous_sha" || "$previous_sha" == "$source_sha" ]]; then
-            git fetch --no-tags origin canary >/dev/null 2>&1 || true
-            previous_sha="$(git rev-parse 'origin/canary^{commit}' 2>/dev/null || true)"
-          fi
-
           run_bindings_profile=false
           if [[ "$FORCE_BINDINGS_PROFILE" == "true" ]]; then
             run_bindings_profile=true
           elif [[ -z "$previous_sha" || ! "$previous_sha" =~ ^[0-9a-f]{40}$ ]] \
             || ! git cat-file -e "${previous_sha}^{commit}" 2>/dev/null; then
-            # No reachable baseline: skip heavy macOS packaging unless forced so
-            # initial bootstrap does not trigger a cold 200-minute packaging run.
-            run_bindings_profile=false
+            # Fail safe when no prior hosted Canary baseline is available so a
+            # first run or transient API failure never erases pending packaging
+            # verification.
+            run_bindings_profile=true
           elif [[ "$previous_sha" != "$source_sha" ]]; then
+            # Trigger heavy macOS/Android candidate packaging when binding or
+            # packaging-toolchain inputs change. Upstream core crates are still
+            # cross-checked every Canary via rust-android-check, ios-account-clippy,
+            # and marmotkit-native-host, and packaged daily by nightly-releases.yml.
             while IFS= read -r -d '' changed; do
               case "$changed" in
-                crates/marmot-uniffi/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/bindings.yaml|.github/workflows/bindings-profile.yml)
+                crates/marmot-uniffi/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/bindings.yaml|.github/workflows/bindings-profile.yml|.github/actions/setup-odin/*|scripts/install-odin.sh)
                   run_bindings_profile=true
                   break
                   ;;
@@ -104,22 +107,34 @@ jobs:
             echo "run_bindings_profile=$run_bindings_profile"
           } >> "$GITHUB_OUTPUT"
 
+  # GitHub validates caller permissions against the union of all callee jobs'
+  # declared permissions before evaluating job `if:` conditions. `ci.yml`
+  # declares `pull-requests: read` on `changes` and `actions: write` +
+  # `checks: read` on `merge-group-fail-fast` (which remains skipped outside
+  # `merge_group`). Top-level Canary permissions stay read-only.
   verify-ci:
     name: Full cross-platform CI (6 shards)
     needs: plan
     if: needs.plan.outputs.should_run == 'true'
+    permissions:
+      actions: write
+      checks: read
+      contents: read
+      pull-requests: read
     uses: ./.github/workflows/ci.yml
     with:
       source_sha: ${{ needs.plan.outputs.source_sha }}
       rust_test_shards: 6
 
+  # Serialization is owned by `bindings-profile.yml`'s top-level
+  # `concurrency: group: macos-packaging`; do not acquire the same group here
+  # or GitHub cancels the nested call as a concurrency deadlock.
   verify-bindings-profile:
     name: MarmotKit Release Profile
     needs: plan
     if: needs.plan.outputs.should_run == 'true' && needs.plan.outputs.run_bindings_profile == 'true'
-    concurrency:
-      group: macos-packaging
-      cancel-in-progress: false
+    permissions:
+      contents: read
     uses: ./.github/workflows/bindings-profile.yml
     with:
       source_sha: ${{ needs.plan.outputs.source_sha }}

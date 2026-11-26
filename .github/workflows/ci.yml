@@ -480,6 +480,11 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Install just
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # just
+        with:
+          tool: just
+
       - name: Configure Android NDK
         run: |
           set -euo pipefail
@@ -512,20 +517,7 @@ jobs:
             set -o pipefail
             "$sdkmanager_bin" "ndk;$ANDROID_NDK_VERSION"
           fi
-          toolchain_bin="$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          clang="$toolchain_bin/aarch64-linux-android26-clang"
-          if [[ ! -x "$clang" ]]; then
-            echo "error: Android clang not found: $clang" >&2
-            exit 1
-          fi
-          {
-            echo "ANDROID_NDK_HOME=$ndk_dir"
-            echo "CC_aarch64_linux_android=$clang"
-            echo "AR_aarch64_linux_android=$toolchain_bin/llvm-ar"
-            echo "RANLIB_aarch64_linux_android=$toolchain_bin/llvm-ranlib"
-            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$clang"
-            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=$toolchain_bin/llvm-ar"
-          } >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ndk_dir" >> "$GITHUB_ENV"
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -533,18 +525,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Check marmot-uniffi for Android arm64-v8a
-        env:
-          RUSTFLAGS: -D warnings
-        run: cargo check --locked --target aarch64-linux-android -p marmot-uniffi
-
-      - name: Upload runner diagnostics
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/mdk-ci-reports
-          retention-days: 7
-          if-no-files-found: warn
+        run: just android-check
 
   rust-clippy:
     name: Rust check and clippy
@@ -893,8 +874,9 @@ jobs:
   # taken up to 20 minutes on central and western ones (#2568), and has also
   # stalled until timeout (#3465). A 5-minute first attempt cuts a stalled
   # connection short and retries once with the full 25-minute budget so slow
-  # runners still finish, keeping download and test budgets separate inside 65
-  # minutes.
+  # runners still finish. Async Canary runs consolidate to 6 shards (~30-40 min
+  # test runtime), so download (5 + 25 min) and test (50 min) budgets stay
+  # separate inside 85 minutes.
   rust-test:
     name: Rust tests (${{ matrix.partition }}/${{ needs.changes.outputs.rust_test_shards }})
     needs: [changes, rust-test-build]
@@ -904,7 +886,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: ${{ fromJSON(needs.changes.outputs.rust_test_partitions || '[1]') }}
+        partition: ${{ fromJSON(needs.changes.outputs.rust_test_partitions) }}
 
     steps:
       - name: Check out repository
