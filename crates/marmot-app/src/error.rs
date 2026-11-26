@@ -606,18 +606,7 @@ impl From<TransportAdapterError> for AppError {
 
 impl From<AccountError> for AppError {
     fn from(error: AccountError) -> Self {
-        if is_external_signer_rejection(&error) {
-            Self::ExternalSignerRejected
-        } else {
-            let wrapped = Self::Account(error);
-            match wrapped.as_oversized_event() {
-                Some(cause) => Self::EventTooLarge {
-                    artifact: cause.artifact,
-                    size_class: cause.size_class,
-                },
-                None => wrapped,
-            }
-        }
+        Self::from_account_error(error, false)
     }
 }
 
@@ -632,6 +621,30 @@ impl From<marmot_session::SessionError> for AppError {
 }
 
 impl AppError {
+    /// Keep the per-relay failure evidence while onboarding can still try
+    /// another route. Signer rejection takes precedence on every path.
+    pub(crate) fn from_account_error(
+        error: AccountError,
+        preserve_exposed_key_package: bool,
+    ) -> Self {
+        if is_external_signer_rejection(&error) {
+            return Self::ExternalSignerRejected;
+        }
+        if preserve_exposed_key_package
+            && matches!(&error, AccountError::KeyPackage(details) if details.externally_exposed)
+        {
+            return Self::Account(error);
+        }
+        let wrapped = Self::Account(error);
+        match wrapped.as_oversized_event() {
+            Some(cause) => Self::EventTooLarge {
+                artifact: cause.artifact,
+                size_class: cause.size_class,
+            },
+            None => wrapped,
+        }
+    }
+
     /// `EventTooLarge` for a size refusal of an account publish, which only
     /// [`publish_size_refusal`] proves, and `otherwise` for any other failure.
     pub(crate) fn account_publish_failure(

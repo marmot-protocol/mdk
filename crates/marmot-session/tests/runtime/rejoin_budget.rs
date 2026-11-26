@@ -39,6 +39,92 @@ async fn rejoin_retry_keeps_handshake() {
 }
 
 #[tokio::test]
+async fn recovery_defers_a_recipient_challenge_until_key_package_publication_is_allowed() {
+    let mut peers = recovery_peers(0).await;
+    let challenge = issue_recovery_challenge(&mut peers).await;
+    let accepted = peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(
+            peers.recipient.self_id(),
+            challenge,
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        accepted.outcome,
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
+    ));
+    assert!(!accepted.left_object_unpersisted);
+
+    let before = peers.recipient.key_package_maintenance_status().unwrap();
+    let control_sends = peers.bob_adapter.publishes().len();
+    assert!(
+        peers
+            .recipient
+            .prepare_group_recovery_with_key_package_publication(false)
+            .unwrap()
+            .is_empty()
+    );
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        peers.recipient.key_package_maintenance_status().unwrap(),
+        before
+    );
+    assert_eq!(peers.bob_adapter.publishes().len(), control_sends);
+
+    // A deferred Challenge stays due without spending a backoff or a retry.
+    assert_eq!(
+        peers
+            .recipient
+            .prepare_group_recovery_with_key_package_publication(true)
+            .unwrap(),
+        vec![peers.coordinator.self_id()]
+    );
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
+    let publications = peers.bob_adapter.publishes();
+    assert_eq!(publications.len(), control_sends + 1);
+    let grant = &publications.last().unwrap().message;
+    let grant_body = recovery_control(b"cancel-alice", grant).await.message.body;
+    let cgka_traits::GroupRecoveryBody::Grant { key_package, .. } = grant_body else {
+        panic!("the recipient must publish its Grant after the deferral ends");
+    };
+    let current = peers
+        .recipient
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        key_package.source.unwrap().event_id,
+        current.authored_event_id.unwrap()
+    );
+
+    let accepted = peers
+        .coordinator
+        .ingest_delivery(&recovery_inbox_delivery(
+            peers.coordinator.self_id(),
+            grant.clone(),
+        ))
+        .await
+        .unwrap();
+    assert!(!accepted.left_object_unpersisted);
+    assert_eq!(
+        peers
+            .coordinator
+            .prepare_group_recovery_with_key_package_publication(false)
+            .unwrap(),
+        vec![peers.recipient.self_id()]
+    );
+}
+
+#[tokio::test]
 async fn recovery_batch_keeps_effects() {
     let mut peers = recovery_peers(0).await;
     exchange_recovery(&mut peers).await;

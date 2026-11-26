@@ -309,7 +309,14 @@ impl AppClient {
                 before.push((group_id, parked));
             }
         }
-        let peers = self.runtime.prepare_group_recovery();
+        let allow_key_package_publication =
+            !crate::runtime::onboarding_defers_key_package_maintenance(
+                &self.app,
+                &self.state.label,
+            );
+        let peers = self
+            .runtime
+            .prepare_group_recovery_with_key_package_publication(allow_key_package_publication);
         // Preparation can commit earlier groups before a later group fails.
         let mut status_changes = Ok(());
         for (group_id, parked) in before {

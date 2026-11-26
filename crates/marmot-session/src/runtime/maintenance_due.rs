@@ -203,7 +203,7 @@ where
     }
 
     fn key_package_due(&self, now: Timestamp, due: &mut MaintenanceDue) -> AccountResult<()> {
-        let Some(lifecycle) = self.session.key_package_lifecycle()? else {
+        let Some(mut lifecycle) = self.session.key_package_lifecycle()? else {
             // Paused maintenance prepares no new KeyPackage.
             if !self.key_package_slot_withdrawn && !self.maintenance_paused {
                 due.owed();
@@ -229,6 +229,11 @@ where
             for target in &lifecycle.publication_targets {
                 due.at_opt(target_retry_at(target));
             }
+        }
+        if self.reconcile_pending_setup_targets(&mut lifecycle) {
+            // A route edit has no stored due time until the next maintenance pass.
+            due.owed();
+            return Ok(());
         }
         // Paused maintenance finishes publishing what is prepared and
         // prepares nothing new, as the run does.

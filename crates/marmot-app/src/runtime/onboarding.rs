@@ -879,6 +879,24 @@ impl OnboardingCheckpoint {
             && (state.status == OnboardingStatus::NeedsInput
                 || self.relay_check_failed_editably(step, state.status, &state.findings))
     }
+
+    fn set_changed_repair_basis(
+        &mut self,
+        step: OnboardingStep,
+        event: Option<NostrTransportEvent>,
+    ) {
+        self.records[step.index()] = event;
+        self.snapshot.proposal = None;
+        self.set(
+            step,
+            OnboardingStatus::RetryableFailure,
+            vec![finding(OnboardingIssue::RecordChanged).in_context(
+                OnboardingFindingContext::RepairApproval,
+                OnboardingCheckPurpose::SourceFreshness,
+            )],
+        );
+    }
+
     fn attempt(&self) -> OnboardingAttempt {
         use sha2::{Digest, Sha256};
         OnboardingAttempt {
@@ -1183,6 +1201,12 @@ fn check_inconclusive(findings: &[OnboardingFinding]) -> bool {
         _ => false,
     })
 }
+
+fn onboarding_record_replaces(event: &NostrTransportEvent, basis: &NostrTransportEvent) -> bool {
+    event.created_at > basis.created_at
+        || (event.created_at == basis.created_at && event.id < basis.id)
+}
+
 /// A preview saved before mdk#3449 has no removal reasons, and could remove
 /// only retired relays. Fill those in from the rebuilt preview so approval
 /// after an upgrade compares like with like; nothing else is filled in.
@@ -1292,6 +1316,15 @@ fn decode_onboarding_checkpoint(
             .retain(|action| *action != OnboardingAction::UseRecommendedRelays);
     }
     Ok(checkpoint)
+}
+
+pub(crate) fn onboarding_defers_key_package_maintenance(
+    app: &MarmotApp,
+    account_ref: &str,
+) -> bool {
+    SetupRecords::new(app)
+        .require_onboarding_complete(account_ref)
+        .is_err()
 }
 
 pub(crate) fn initial_key_package_onboarding_attempt(
@@ -2499,6 +2532,12 @@ fn set_initial_key_package_error(c: &mut OnboardingCheckpoint, error: &AppError)
     let relays = &c.snapshot.steps[OnboardingStep::Relays.index()];
     let checked_at = relays.checked_at;
     let mut findings = relays.findings.clone();
+    let route_finding = |issue| {
+        finding(issue).in_context(
+            OnboardingFindingContext::DeclaredRoute,
+            OnboardingCheckPurpose::EventPublication,
+        )
+    };
     if matches!(error, AppError::DirectoryLookupIncomplete(_)) {
         let lookup = finding(OnboardingIssue::DiscoveryIncomplete).in_context(
             OnboardingFindingContext::DeclaredRoute,
@@ -2510,6 +2549,14 @@ fn set_initial_key_package_error(c: &mut OnboardingCheckpoint, error: &AppError)
             vec![lookup.clone()],
         );
         findings.push(lookup);
+    } else if matches!(error, AppError::NoUsableRelay) {
+        let unavailable = route_finding(OnboardingIssue::NoUsableRoute);
+        c.set(
+            OnboardingStep::KeyPackage,
+            OnboardingStatus::RetryableFailure,
+            vec![unavailable.clone()],
+        );
+        findings.push(unavailable);
     } else {
         set_operation_error(c, OnboardingStep::KeyPackage, error);
         let AppError::Account(marmot_session::AccountError::KeyPackage(error)) = error else {
@@ -2518,12 +2565,6 @@ fn set_initial_key_package_error(c: &mut OnboardingCheckpoint, error: &AppError)
         if error.endpoint_failures.is_empty() {
             return;
         }
-        let route_finding = |issue| {
-            finding(issue).in_context(
-                OnboardingFindingContext::DeclaredRoute,
-                OnboardingCheckPurpose::EventPublication,
-            )
-        };
         findings.push(route_finding(OnboardingIssue::NoUsableRoute));
         let capabilities = c.records[OnboardingStep::Relays.index()]
             .as_ref()
@@ -3188,6 +3229,60 @@ impl AccountSetup<'_> {
         let manual_review = relay_repair
             .as_ref()
             .is_some_and(|repair| repair.mode == OnboardingRelayRepairMode::ManualReview);
+        let findings = &c.snapshot.steps[step.index()].findings;
+        let mut inconclusive = check_inconclusive(findings);
+        if !manual_review
+            && !inconclusive
+            && step == OnboardingStep::Relays
+            && findings.iter().any(key_package_route_finding)
+            && let Some(basis) = c.records[step.index()].as_ref()
+            && let Some(declaration) = crate::relay_list_state_from_event(basis)
+        {
+            // A relay can reject the KeyPackage write and still serve a newer
+            // declaration. Check the declared outboxes as read sources before
+            // offering a proposal that can go past an unanswered source.
+            let outboxes = self.app().retain_safe_discovered_endpoints(
+                declaration
+                    .relays
+                    .into_iter()
+                    .map(TransportEndpoint)
+                    .collect(),
+                "onboarding relay edit outbox freshness",
+            );
+            if !outboxes.is_empty() {
+                let endpoints = outboxes.into_iter().map(|endpoint| endpoint.0).collect();
+                let (records, failures, _) = self
+                    .await_while_onboarding_live(
+                        &account_id,
+                        attempt,
+                        self.inspect_onboarding_relays(&account_id, step.kind(), endpoints),
+                    )
+                    .await?;
+                self.require_live_onboarding_attempt(&c)?;
+                if let Some(newer) = records
+                    .into_iter()
+                    .next()
+                    .filter(|event| onboarding_record_replaces(event, basis))
+                {
+                    // An outbox that answered here may not answer at approval.
+                    c.set_changed_repair_basis(step, Some(newer));
+                    self.save_onboarding(&mut c)?;
+                    return Ok(c.snapshot);
+                }
+                inconclusive = failures.iter().any(|failure| {
+                    failure.endpoint.is_some()
+                        && matches!(
+                            failure.issue,
+                            OnboardingIssue::TimedOut
+                                | OnboardingIssue::Unreachable
+                                | OnboardingIssue::AuthenticationRequired
+                                | OnboardingIssue::PaymentRequired
+                                | OnboardingIssue::AccessRestricted
+                                | OnboardingIssue::DiscoveryIncomplete
+                        )
+                });
+            }
+        }
         c.snapshot.proposal = Some(OnboardingRepairProposal {
             step,
             revision: c
@@ -3201,7 +3296,7 @@ impl AccountSetup<'_> {
             profile: None,
             follows: None,
             relay_repair,
-            inconclusive: check_inconclusive(&c.snapshot.steps[step.index()].findings),
+            inconclusive,
             unusable_routes: BTreeMap::new(),
         });
         c.snapshot.steps[step.index()].actions = if manual_review {
@@ -3441,22 +3536,10 @@ impl AccountSetup<'_> {
             .as_ref()
             .filter(|event| Some(&event.id) == proposal.previous_event_id.as_ref());
         let newer_seen = records.first().is_some_and(|event| {
-            basis.is_none_or(|basis| {
-                event.created_at > basis.created_at
-                    || (event.created_at == basis.created_at && event.id < basis.id)
-            })
+            basis.is_none_or(|basis| onboarding_record_replaces(event, basis))
         });
         if !basis_newest && (complete || (accepted_risk && newer_seen)) {
-            c.records[proposal.step.index()] = records.first().cloned();
-            c.snapshot.proposal = None;
-            c.set(
-                proposal.step,
-                OnboardingStatus::RetryableFailure,
-                vec![finding(OnboardingIssue::RecordChanged).in_context(
-                    OnboardingFindingContext::RepairApproval,
-                    OnboardingCheckPurpose::SourceFreshness,
-                )],
-            );
+            c.set_changed_repair_basis(proposal.step, records.into_iter().next());
         } else if !complete && !(accepted_risk && basis_newest) {
             let failures = if failures.is_empty() {
                 vec![finding(OnboardingIssue::DiscoveryIncomplete)]

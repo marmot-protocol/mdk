@@ -1998,6 +1998,14 @@ where
         &mut self,
         routes: Option<KeyPackagePublicationRoutes<'_>>,
     ) -> AccountResult<KeyPackage> {
+        self.publish_key_package_replacement(routes, false).await
+    }
+
+    async fn publish_key_package_replacement(
+        &mut self,
+        routes: Option<KeyPackagePublicationRoutes<'_>>,
+        maintenance: bool,
+    ) -> AccountResult<KeyPackage> {
         let authorized = routes.map_or_else(
             || self.routing.key_package_endpoints().to_vec(),
             KeyPackagePublicationRoutes::journaled_endpoints,
@@ -2046,6 +2054,7 @@ where
                 .as_ref()
                 .expect("prepared replacement has an exact signed event")
                 .clone();
+            let now = self.wall_clock.now();
             let publication = KeyPackagePublication {
                 account_id: self.session.self_id().clone(),
                 key_package: pending.key_package.clone(),
@@ -2058,6 +2067,9 @@ where
                             .iter()
                             .filter(|target| {
                                 target.state != TransportFanoutAttemptState::PolicyProhibited
+                                    && (!maintenance
+                                        || !setup_publication
+                                        || key_package_target_retry_due(target, now))
                             })
                             .map(|target| target.endpoint.clone())
                             .collect()
@@ -2295,24 +2307,38 @@ where
         if self.key_package_slot_withdrawn {
             return Ok(false);
         }
+        let Some(mut lifecycle) = self.session.key_package_lifecycle()? else {
+            return Ok(true);
+        };
+        self.reconcile_pending_setup_targets(&mut lifecycle);
         let now = self.wall_clock.now();
-        Ok(match self.session.key_package_lifecycle()? {
-            None => true,
-            Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
-                Some(pending) => {
-                    self.pending_replacement_obsolete(&lifecycle, pending)
-                        || pending.signed_event.is_none()
-                        || pending
-                            .targets
-                            .iter()
-                            .any(|target| key_package_target_retry_due(target, now))
-                }
-                None => {
-                    lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref
-                        || self.current_key_package_replacement_due(&lifecycle, now)
-                }
-            },
+        Ok(match lifecycle.pending_replacement.as_ref() {
+            Some(pending) => {
+                self.pending_replacement_obsolete(&lifecycle, pending)
+                    || pending.signed_event.is_none()
+                    || pending
+                        .targets
+                        .iter()
+                        .any(|target| key_package_target_retry_due(target, now))
+            }
+            None => {
+                lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref
+                    || self.current_key_package_replacement_due(&lifecycle, now)
+            }
         })
+    }
+
+    fn reconcile_pending_setup_targets(&self, lifecycle: &mut KeyPackageLifecycleState) -> bool {
+        lifecycle
+            .pending_replacement
+            .as_mut()
+            .is_some_and(|pending| {
+                (lifecycle.pending_setup_publication || pending.fallback_publication_started)
+                    && merge_republish_publication_targets(
+                        &mut pending.targets,
+                        &self.routing.key_package_endpoints(),
+                    )
+            })
     }
 
     /// Whether the current KeyPackage is due for replacement for any reason
@@ -3013,6 +3039,85 @@ where
         Ok(())
     }
 
+    async fn advance_key_package_maintenance(
+        &mut self,
+        held: &[GroupId],
+        output: &mut AccountDeviceEffects,
+    ) -> AccountResult<()> {
+        let tag_key_settled = self.device_tag_key_settled()?;
+        // Save policy removals even when no currently authorized target is due.
+        if !self.key_package_slot_withdrawn
+            && let Some(mut lifecycle) = self.session.key_package_lifecycle()?
+            && self.reconcile_pending_setup_targets(&mut lifecycle)
+        {
+            self.session.put_key_package_lifecycle(&lifecycle)?;
+        }
+        // While a device group is set, its roster names a KeyPackage before
+        // it reaches the slot (mdk#2628 3.4), so announce first.
+        if tag_key_settled {
+            let announced = boxed(|| self.announce_key_package_for_maintenance(held)).await?;
+            output.absorb_account_effects(announced);
+        }
+        // Fanout of an already-acknowledged exact event is publication
+        // recovery, not a new preparation, so it continues while paused.
+        if self.key_package_has_pending_fanout()? {
+            let started = self.monotonic_clock.elapsed();
+            let result = self.retry_key_package_fanout().await;
+            self.note_key_package_maintenance_attempt(result.is_err());
+            self.note_maintenance_duration(started, true, result.is_err());
+            if let Err(error) = &result {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "run_due_maintenance",
+                    error_kind = error.key_package_failure_kind("key_package_fanout_retry"),
+                    "key package exact-event fanout remains retryable"
+                );
+            }
+        }
+        let key_package_due = tag_key_settled && self.key_package_network_maintenance_due()?;
+        // Paused maintenance may finish existing publication intent, but an
+        // obsolete pending replacement requires fresh private material and
+        // therefore waits for resume like every other new preparation.
+        let key_package_prepared = self
+            .session
+            .key_package_lifecycle()?
+            .is_some_and(|lifecycle| {
+                lifecycle
+                    .pending_replacement
+                    .as_ref()
+                    .is_some_and(|pending| !self.pending_replacement_obsolete(&lifecycle, pending))
+            });
+        if key_package_due && (!self.maintenance_paused || key_package_prepared) {
+            let started = self.monotonic_clock.elapsed();
+            match self.publish_key_package_replacement(None, true).await {
+                // Nothing went out: the announcement above is not confirmed
+                // yet, and a later pass publishes.
+                Err(AccountError::KeyPackageAnnouncementPending) => tracing::debug!(
+                    target: TRACE_TARGET,
+                    method = "run_due_maintenance",
+                    "key package publication waits for its announcement"
+                ),
+                result => {
+                    self.note_key_package_maintenance_attempt(result.is_err());
+                    self.note_maintenance_duration(started, true, result.is_err());
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            method = "run_due_maintenance",
+                            error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
+                                "clock_skew_blocked"
+                            } else {
+                                error.key_package_failure_kind("key_package_retry")
+                            },
+                            "key package maintenance remains retryable"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Advance durable maintenance state and publish work whose safety windows
     /// have elapsed. Callers may invoke this from any timer cadence; all
     /// deadlines and sampled jitter are persisted.
@@ -3028,6 +3133,18 @@ where
     pub async fn run_due_maintenance_holding(
         &mut self,
         held: &[GroupId],
+    ) -> AccountResult<AccountDeviceEffects> {
+        self.run_due_maintenance_with_key_package_publication(held, true)
+            .await
+    }
+
+    /// Run maintenance while allowing the host to defer KeyPackage writes.
+    /// Interactive onboarding uses this to reserve publication for its
+    /// explicit setup command while keeping other maintenance active.
+    pub async fn run_due_maintenance_with_key_package_publication(
+        &mut self,
+        held: &[GroupId],
+        allow_key_package_publication: bool,
     ) -> AccountResult<AccountDeviceEffects> {
         use sha2::{Digest, Sha256};
 
@@ -3067,69 +3184,9 @@ where
         // roster carries the key, nothing is staged, announced or published.
         let tag_key = boxed(|| self.set_device_tag_key_for_maintenance(held)).await;
         output.absorb_account_effects(tag_key);
-        let tag_key_settled = self.device_tag_key_settled()?;
-        // While a device group is set, its roster names a KeyPackage before
-        // it reaches the slot (mdk#2628 3.4), so announce first.
-        if tag_key_settled {
-            let announced = boxed(|| self.announce_key_package_for_maintenance(held)).await?;
-            output.absorb_account_effects(announced);
-        }
-        // Fanout of an already-acknowledged exact event is publication
-        // recovery, not a new preparation, so it continues while paused.
-        if self.key_package_has_pending_fanout()? {
-            let started = self.monotonic_clock.elapsed();
-            let result = self.retry_key_package_fanout().await;
-            self.note_key_package_maintenance_attempt(result.is_err());
-            self.note_maintenance_duration(started, true, result.is_err());
-            if let Err(error) = &result {
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "run_due_maintenance",
-                    error_kind = error.key_package_failure_kind("key_package_fanout_retry"),
-                    "key package exact-event fanout remains retryable"
-                );
-            }
-        }
-        let key_package_due = tag_key_settled && self.key_package_network_maintenance_due()?;
-        // Paused maintenance may finish existing publication intent, but an
-        // obsolete pending replacement requires fresh private material and
-        // therefore waits for resume like every other new preparation.
-        let key_package_prepared = self
-            .session
-            .key_package_lifecycle()?
-            .is_some_and(|lifecycle| {
-                lifecycle
-                    .pending_replacement
-                    .as_ref()
-                    .is_some_and(|pending| !self.pending_replacement_obsolete(&lifecycle, pending))
-            });
-        if key_package_due && (!self.maintenance_paused || key_package_prepared) {
-            let started = self.monotonic_clock.elapsed();
-            match self.publish_fresh_key_package().await {
-                // Nothing went out: the announcement above is not confirmed
-                // yet, and a later pass publishes.
-                Err(AccountError::KeyPackageAnnouncementPending) => tracing::debug!(
-                    target: TRACE_TARGET,
-                    method = "run_due_maintenance",
-                    "key package publication waits for its announcement"
-                ),
-                result => {
-                    self.note_key_package_maintenance_attempt(result.is_err());
-                    self.note_maintenance_duration(started, true, result.is_err());
-                    if let Err(error) = result {
-                        tracing::warn!(
-                            target: TRACE_TARGET,
-                            method = "run_due_maintenance",
-                            error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
-                                "clock_skew_blocked"
-                            } else {
-                                error.key_package_failure_kind("key_package_retry")
-                            },
-                            "key package maintenance remains retryable"
-                        );
-                    }
-                }
-            }
+        if allow_key_package_publication {
+            self.advance_key_package_maintenance(held, &mut output)
+                .await?;
         }
         self.retry_confirmed_transport_fanouts(&mut output).await?;
         boxed(|| self.deliver_watched_welcomes(&mut output)).await?;

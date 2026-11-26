@@ -2640,6 +2640,11 @@ impl MarmotApp {
             .app
             .retire_cached_non_current_key_package(&client.state.label)
             .await;
+        // Interactive setup owns the first publication and its discovery check.
+        // Opening a fresh slot can also set the strict-cutover marker.
+        if runtime::onboarding_defers_key_package_maintenance(self, &client.state.label) {
+            return;
+        }
         if client
             .app
             .key_package_cutover_replacement_pending(&client.state.label)
@@ -7106,38 +7111,58 @@ impl MarmotApp {
         // list. Fall back to the configured default relays when the account has
         // no usable NIP-65 relay. This runtime fallback is not published as a
         // replacement for the account's relay list.
-        let mut outbox = relay_lists
-            .nip65
-            .relays
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect::<Vec<_>>();
-        if outbox.is_empty() {
+        let refreshed_nip65;
+        let mut nip65 = &relay_lists.nip65;
+        let generated_outbox = if nip65.relays.is_empty() {
             // An open generated setup has not projected the NIP-65 list its
             // bootstrap publishes yet. Route to the relays that list declares,
             // not to the app's (mdk#2359).
-            outbox = match self.generated_setup_outbox_relays(label)? {
-                Some(relays) => relays,
-                // Setup removes its journal and context only after projecting
-                // its lists, so one that completed since `relay_lists` was
-                // read shows them in a fresh read.
-                None => self
-                    .account_relay_list_status(label)?
-                    .nip65
-                    .relays
-                    .into_iter()
-                    .map(TransportEndpoint)
-                    .collect(),
-            };
-        }
+            let generated = self.generated_setup_outbox_relays(label)?;
+            if generated.is_none() {
+                // A setup that completed after `relay_lists` was read has
+                // already projected its lists. Use its current relay roles.
+                refreshed_nip65 = self.account_relay_list_status(label)?.nip65;
+                nip65 = &refreshed_nip65;
+            }
+            generated
+        } else {
+            None
+        };
+        let outbox = generated_outbox.unwrap_or_else(|| {
+            nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect()
+        });
         let offered = outbox.len();
         let safe =
             self.retain_safe_discovered_endpoints(outbox, "local account key package routing");
         if !safe.is_empty() {
             return Ok(safe);
         }
-        let fallback = self.relay_endpoints();
+        // The ordinary retry/maintenance path must respect the same declared
+        // read-only role as setup, even when every declared write is unsafe.
+        use nostr::prelude::RelayUrl;
+        let writes: BTreeSet<_> = nip65
+            .relays
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint).ok())
+            .collect();
+        let read_only: BTreeSet<_> = nip65
+            .read_relays
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint).ok())
+            .filter(|relay| !writes.contains(relay))
+            .collect();
+        let fallback: Vec<_> = self
+            .relay_endpoints()
+            .into_iter()
+            .filter(|endpoint| {
+                RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| !read_only.contains(&relay))
+            })
+            .collect();
         if offered > 0 {
             tracing::warn!(
                 target: "marmot_app::relay_plane",

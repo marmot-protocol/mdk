@@ -126,6 +126,96 @@ async fn assert_key_package_pending_setup_restarts_on_declared_routes_only(via_f
 }
 
 #[tokio::test]
+async fn key_package_pending_setup_maintenance_retries_edited_routes() {
+    use cgka_traits::TransportFanoutAttemptState;
+    use marmot_session::KeyPackagePublicationRoutes;
+
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("kp pending setup maintenance restart").unwrap();
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let old = TransportEndpoint(KEY_ENDPOINT.into());
+    let repaired = TransportEndpoint("wss://repaired.example".into());
+    let added = TransportEndpoint("wss://added.example".into());
+    let routing = SharedRouting(Arc::new(Mutex::new(
+        StaticTransportRouting::new(Vec::new()).key_package_endpoints(vec![old.clone()]),
+    )));
+    let publisher = FlakyKeyPackages::new(2);
+    let open = || {
+        AccountDeviceRuntime::new(
+            current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+            RecordingAdapter::default(),
+            routing.clone(),
+            publisher.clone(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        )
+    };
+    let mut runtime = open();
+    runtime
+        .publish_fresh_key_package_with_routes(Some(KeyPackagePublicationRoutes {
+            attempt: std::slice::from_ref(&old),
+            retain: &[],
+            via_fallback: false,
+        }))
+        .await
+        .expect_err("the original relay did not acknowledge the package");
+    let first = slot_lifecycle(&runtime).pending_replacement.unwrap();
+
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(Timestamp(wall.now().0 + 30)));
+    assert!(!due.retry_while_owed);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(publisher.publications().len(), 1);
+
+    routing.update(|policy| policy.key_package_endpoints(Vec::new()));
+    wall.set(wall.now().0 + 30);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(publisher.publications().len(), 1);
+    let pending = slot_lifecycle(&runtime).pending_replacement.unwrap();
+    assert_eq!(
+        pending.targets[0].state,
+        TransportFanoutAttemptState::PolicyProhibited
+    );
+    assert_eq!(pending.signed_event, first.signed_event);
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(pending.not_after));
+    assert!(!due.retry_while_owed);
+    assert!(!runtime.key_package_network_maintenance_due().unwrap());
+    drop(runtime);
+
+    routing.update(|policy| policy.key_package_endpoints(vec![repaired.clone()]));
+    let mut restarted = open();
+    assert!(restarted.maintenance_due(&[]).unwrap().retry_while_owed);
+    restarted.run_due_maintenance().await.unwrap();
+    let due = restarted.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(Timestamp(wall.now().0 + 30)));
+    assert!(!due.retry_while_owed);
+    let pending = slot_lifecycle(&restarted).pending_replacement.unwrap();
+    assert_eq!(pending.signed_event, first.signed_event);
+
+    // The added relay is due immediately. The repaired relay still backs off.
+    routing.update(|policy| policy.key_package_endpoints(vec![repaired.clone(), added.clone()]));
+    assert!(restarted.maintenance_due(&[]).unwrap().retry_while_owed);
+    restarted.run_due_maintenance().await.unwrap();
+    let lifecycle = slot_lifecycle(&restarted);
+    assert_eq!(lifecycle.authored_signed_event, first.signed_event);
+    assert!(lifecycle.publication_targets.iter().any(|target| {
+        target.endpoint == old && target.state == TransportFanoutAttemptState::PolicyProhibited
+    }));
+    assert_eq!(
+        publisher
+            .publications()
+            .into_iter()
+            .map(|publication| publication.endpoints)
+            .collect::<Vec<_>>(),
+        [vec![old], vec![repaired], vec![added]]
+    );
+}
+
+#[tokio::test]
 async fn key_package_current_fallback_fanout_restarts_on_declared_routes_only() {
     assert_key_package_current_setup_fanout_restarts_on_declared_routes_only(true).await;
 }

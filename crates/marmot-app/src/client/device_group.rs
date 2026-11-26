@@ -855,14 +855,7 @@ impl AppClient {
         result: Result<KeyPackage, AccountError>,
         routes: Option<KeyPackagePublicationRoutes<'_>>,
     ) -> Result<KeyPackage, AppError> {
-        result.map_err(|error| match &error {
-            AccountError::KeyPackage(error_details)
-                if routes.is_some() && error_details.externally_exposed =>
-            {
-                AppError::Account(error)
-            }
-            _ => error.into(),
-        })
+        result.map_err(|error| AppError::from_account_error(error, routes.is_some()))
     }
 
     /// Announce the KeyPackage about to go out: a fresh one, staged now if
@@ -1267,4 +1260,46 @@ pub(super) fn device_slot(slot_hex: &str) -> Result<DeviceSlotId, AppError> {
         .ok()
         .and_then(|bytes| DeviceSlotId::try_from(bytes).ok())
         .ok_or(AppError::DeviceGroupRefused("slot_unavailable"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cgka_traits::EventSizeClass;
+    use marmot_session::KeyPackagePublishError;
+
+    #[test]
+    fn key_package_publication_result_classifies_signer_rejection_before_route_evidence() {
+        let routes = Some(KeyPackagePublicationRoutes {
+            attempt: &[],
+            retain: &[],
+            via_fallback: false,
+        });
+        let rejection = KeyPackagePublishError::exposed(format!(
+            "publish failed: {}",
+            crate::EXTERNAL_SIGNER_REJECTED
+        ));
+        assert!(matches!(
+            AppClient::key_package_publication_result(Err(rejection.into()), routes),
+            Err(AppError::ExternalSignerRejected)
+        ));
+
+        let size_class = EventSizeClass::Under64Kib;
+        let refusal = || {
+            KeyPackagePublishError::exposed("publish failed")
+                .with_event_size_class(Some(size_class))
+        };
+        assert!(matches!(
+            AppClient::key_package_publication_result(Err(refusal().into()), routes),
+            Err(AppError::Account(AccountError::KeyPackage(error)))
+                if error.event_size_class == Some(size_class)
+        ));
+        assert!(matches!(
+            AppClient::key_package_publication_result(Err(refusal().into()), None),
+            Err(AppError::EventTooLarge {
+                artifact: crate::OversizedArtifact::Other,
+                size_class: EventSizeClass::Under64Kib,
+            })
+        ));
+    }
 }

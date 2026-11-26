@@ -1508,19 +1508,36 @@ impl AppClient {
         // lists. A publication retry never writes relay declarations itself.
         self.refresh_routing()?;
         self.runtime.sweep_expired_key_package_private_material()?;
-        let outboxes = self.routing.key_package_endpoints().to_vec();
+        let (nip65, outboxes) = self.setup_key_package_outboxes()?;
         let directory = self.app.directory();
-        let primary = KeyPackagePublicationRoutes {
-            attempt: &outboxes,
+        let fallback;
+        let first_wave = KeyPackagePublicationRoutes {
+            attempt: if outboxes.is_empty() {
+                fallback = directory.key_package_publication_fallback_relays(&outboxes, &nip65);
+                if fallback.is_empty() {
+                    return self
+                        .discover_acknowledged_setup_key_package(&directory, attempt)
+                        .await?
+                        .ok_or(AppError::NoUsableRelay);
+                }
+                &fallback
+            } else {
+                &outboxes
+            },
             retain: &[],
-            via_fallback: false,
+            via_fallback: outboxes.is_empty(),
         };
-        let mut primary_error = match self.publish_key_package_from_lifecycle(Some(primary)).await {
+        self.require_current_key_package_onboarding_attempt(attempt)?;
+        let mut first_error = match self
+            .publish_key_package_from_lifecycle(Some(first_wave))
+            .await
+        {
             Ok(package) => {
-                if self
-                    .runtime
-                    .key_package_maintenance_status()?
-                    .is_some_and(|lifecycle| lifecycle.fallback_publication.is_some())
+                if first_wave.via_fallback
+                    || self
+                        .runtime
+                        .key_package_maintenance_status()?
+                        .is_some_and(|lifecycle| lifecycle.fallback_publication.is_some())
                 {
                     self.require_setup_key_package_discoverable(&directory, attempt, &package)
                         .await?;
@@ -1532,8 +1549,17 @@ impl AppClient {
             }
             result => return result,
         };
-        let nip65 = self.app.account_relay_list_status(&self.state.label)?.nip65;
-        let fallback = directory.key_package_publication_fallback_relays(&outboxes, &nip65);
+        let (fallback, outboxes) = if first_wave.via_fallback {
+            (Vec::new(), outboxes)
+        } else {
+            // The declared roles may have changed while the first write waited
+            // for its acknowledgement.
+            let (nip65, outboxes) = self.setup_key_package_outboxes()?;
+            (
+                directory.key_package_publication_fallback_relays(&outboxes, &nip65),
+                outboxes,
+            )
+        };
         if !fallback.is_empty() {
             self.require_current_key_package_onboarding_attempt(attempt)?;
             let routes = KeyPackagePublicationRoutes {
@@ -1548,12 +1574,12 @@ impl AppClient {
                     return Ok(package);
                 }
                 Err(AppError::Account(AccountError::KeyPackage(mut error)))
-                    if !error.artifact_unusable =>
+                    if error.externally_exposed =>
                 {
-                    primary_error
+                    first_error
                         .endpoint_failures
                         .append(&mut error.endpoint_failures);
-                    primary_error.event_size_class = primary_error
+                    first_error.event_size_class = first_error
                         .event_size_class
                         .zip(error.event_size_class)
                         .map(|(primary, _)| primary);
@@ -1561,14 +1587,42 @@ impl AppClient {
                 Err(error) => return Err(error),
             }
         }
-        // A relay can keep serving an already acknowledged event while
-        // refusing new writes. Retry the exact invite proof even then.
+        self.discover_acknowledged_setup_key_package(&directory, attempt)
+            .await?
+            .ok_or_else(|| {
+                AppError::from_account_error(AccountError::KeyPackage(first_error), true)
+            })
+    }
+
+    async fn discover_acknowledged_setup_key_package(
+        &self,
+        directory: &nostr_directory::Directory<MarmotApp>,
+        attempt: crate::runtime::OnboardingAttempt,
+    ) -> Result<Option<KeyPackage>, AppError> {
+        // The relay may still serve an acknowledged event after its write
+        // permission changes. Verify that exact event without sending again.
         let Some(package) = self.runtime.acknowledged_fallback_key_package()? else {
-            return Err(AppError::Account(AccountError::KeyPackage(primary_error)));
+            return Ok(None);
         };
-        self.require_setup_key_package_discoverable(&directory, attempt, &package)
+        self.require_setup_key_package_discoverable(directory, attempt, &package)
             .await?;
-        Ok(package)
+        Ok(Some(package))
+    }
+
+    fn setup_key_package_outboxes(
+        &self,
+    ) -> Result<(crate::AccountRelayListState, Vec<TransportEndpoint>), AppError> {
+        let nip65 = self.app.account_relay_list_status(&self.state.label)?.nip65;
+        let outboxes = self.app.retain_safe_discovered_endpoints(
+            nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            "setup KeyPackage publication outboxes",
+        );
+        Ok((nip65, outboxes))
     }
 
     fn require_current_key_package_onboarding_attempt(
@@ -1855,7 +1909,19 @@ impl AppClient {
         finish_maintenance_step(app_passes, marmot_observability::Outcome::Success);
         let session =
             self.maintenance_step(crate::RuntimePerformanceOperation::WorkerMaintenanceSession);
-        let effects = boxed(|| self.runtime.run_due_maintenance_holding(&held)).await;
+        let allow_key_package_publication =
+            !crate::runtime::onboarding_defers_key_package_maintenance(
+                &self.app,
+                &self.state.label,
+            );
+        let effects = boxed(|| {
+            self.runtime
+                .run_due_maintenance_with_key_package_publication(
+                    &held,
+                    allow_key_package_publication,
+                )
+        })
+        .await;
         finish_maintenance_step(
             session,
             if effects.is_ok() {

@@ -215,6 +215,15 @@ where
     /// Reserve one bounded recovery turn before the host resolves inbox routes.
     /// Cancellation retains the durable retry deadline, never a reusable permit.
     pub fn prepare_group_recovery(&mut self) -> AccountResult<Vec<MemberId>> {
+        self.prepare_group_recovery_with_key_package_publication(true)
+    }
+
+    /// Reserve recovery work, deferring a recipient's Challenge if the host
+    /// has reserved public KeyPackage writes for interactive onboarding.
+    pub fn prepare_group_recovery_with_key_package_publication(
+        &mut self,
+        allow_key_package_publication: bool,
+    ) -> AccountResult<Vec<MemberId>> {
         self.recovery_turn.clear();
         if self.maintenance_paused {
             return Ok(Vec::new());
@@ -433,6 +442,9 @@ where
         records.retain(|record| {
             record.phase != Phase::Complete
                 && record.phase != Phase::Parked
+                && (allow_key_package_publication
+                    || record.role != Role::Recipient
+                    || record.phase != Phase::Challenge)
                 && (record.role != Role::Coordinator
                     || !self.recovery_group_quarantined(&record.group_id))
                 && (record.role != Role::Recipient
