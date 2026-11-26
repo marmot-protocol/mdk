@@ -1049,16 +1049,17 @@ Direct-chat creation remains atomic. A peer that cannot resolve produces an erro
 ## Account relay health
 
 `account_relay_health(account_ref)` says what MDK already holds about invitations sent through the account's published
-inbox list: the account's cached inbox (kind 10050) and NIP-65 lists and the relay policy that
-`classify_relay_endpoints` exposes. It never dials, waits on a relay or stores anything. A sender on another install
+inbox list: the account's cached inbox (kind 10050) and NIP-65 lists, the relay policy that
+`classify_relay_endpoints` exposes, and what this process's inbox checks found (below). It never dials, waits on a
+relay or stores anything. A sender on another install
 sends an invitation (Welcome) to the relays of the published inbox list; an MDK sender finds no route when that list is
 empty or the policy allows none of it, and never falls back to defaults. This device's inbox route is the entries of the
 list the policy allows, or the configured defaults when it allows none. A sender on this same install (another local
 account, or this account linking a new device) resolves the route through the same fallback to the defaults and may
 still get through. The answer describes the route MDK builds from the held lists: a running device takes a changed route
 at its next routing refresh, so a warning that clears says the lists are fixed, not yet that this device listens on
-them. It says nothing about whether an allowed relay is up or accepts invitations; `liveness` is only the connection
-state.
+them. Without a check it says nothing about whether an allowed relay is up or serves invitations; `liveness` is only
+the connection state.
 
 `AccountRelayHealthFfi` holds:
 
@@ -1067,11 +1068,12 @@ state.
   a read found none, so it cannot tell them apart, and raises no warning for it.
 - `rows`: one `RelayHealthRowFfi` per relay the inbox and NIP-65 lists name, ordered by `url`. `url` is the canonical
   URL that `account_relay_liveness` rows use; an entry that does not parse appears as published. `roles` lists `Inbox`,
-  `Write` (NIP-65 write or unmarked) and `Read` (NIP-65 read or unmarked), in that order. `state` is `Unchecked`
-  (allowed, not checked) or `NotAllowed` (the policy refuses it; this device never dials it), and `fault` says why for
-  `NotAllowed` only: `Retired`, `Invalid` or `Unsafe` (plaintext, a private address, localhost or onion). `liveness` is
-  the row's `account_relay_liveness` status. The states `Healthy`, `Suspected` and `Failing` are defined but not
-  produced yet; they are reserved for relay checks.
+  `Write` (NIP-65 write or unmarked) and `Read` (NIP-65 read or unmarked), in that order. `state` is `NotAllowed` (the
+  policy refuses it; this device never dials it), `Unchecked` (allowed, and no check established anything), or one of
+  the check states below. `fault` says why for `NotAllowed` (`Retired`, `Invalid` or `Unsafe`: plaintext, a private
+  address, localhost or onion), `Failing` and `Suspected`, and is `None` otherwise. `liveness` is the row's
+  `account_relay_liveness` status. `checked_at_unix` is when the check that decided `state` asked the relay, and
+  `checking` says a check of it is running.
 - `warnings`, ordered from the most severe, and `highest_severity`, the first one's (`None` without warnings).
 - `falls_back_to_defaults`: no inbox relay MDK holds is allowed, so the inbox route MDK builds is the configured
   defaults. It is also true while `inbox_list` is `Unknown`, when the real list may name those same relays, so on its
@@ -1083,11 +1085,14 @@ kind needs `inbox_list == Published`; "allowed" means the policy allows it, coun
 | Kind | Severity | Condition | `relays` | `actions` |
 | --- | --- | --- | --- | --- |
 | `InboxListEmpty` | `Critical` | The published inbox list names no relay: an invitation sent through it has nowhere to go | none | `AddInboxRelay` |
-| `NoAllowedInboxRelay` | `Critical` | It names relays and none is allowed: this device never listens on them, so an invitation sent through the list cannot reach it | the entries not allowed | `RemoveInboxRelay`, `AddInboxRelay` |
-| `InboxRelaysNotAllowed` | `Warning` | Some entries are not allowed, beside at least one that is: an invitation sent only to those does not reach this device | the entries not allowed | `RemoveInboxRelay` |
-| `SingleInboxRelay` | `Notice` | Exactly one entry is allowed: an invitation sent through the list reaches this device only there | that relay | `AddInboxRelay` |
+| `NoAllowedInboxRelay` | `Critical` | It names relays and each is not allowed or `Failing`: this device never listens on a refused one, and each failing one refused to serve this account's inbox when checked | every entry | `RemoveInboxRelay`, `AddInboxRelay` |
+| `InboxRelaysNotAllowed` | `Warning` | Some entries are not allowed, beside at least one allowed entry that is not `Failing`: an invitation sent only to those does not reach this device | the entries not allowed | `RemoveInboxRelay` |
+| `InboxRelayFailing` | `Warning` | Some entries are `Failing`, beside at least one allowed entry that is not: each refused to serve this account's inbox when checked (see its `checked_at_unix`) | the failing entries | `RemoveInboxRelay` |
+| `SingleInboxRelay` | `Notice` | Exactly one entry is allowed and not `Failing`: an invitation sent through the list reaches this device at most there | that relay | `AddInboxRelay` |
 
-A list with one allowed entry and some refused ones raises both `InboxRelaysNotAllowed` and `SingleInboxRelay`. The two
+`Unchecked` and `Suspected` entries count as usable: only a refusal a check established takes an entry out, so neither
+ever raises a `Critical`. A list with one usable entry and some refused or failing ones raises the matching `Warning`
+and `SingleInboxRelay`. The two
 `Critical` kinds are about senders that use the published list; a sender on this same install (another local account, or
 this account linking a new device) resolves the route through the same fallback to the defaults and may still get
 through. Severity is for presentation: for example a blocking banner for `Critical`, a dismissible one for `Warning` and
@@ -1097,10 +1102,39 @@ removing every entry first would save an empty inbox list, which that call rejec
 warning: when none is allowed, this device publishes its KeyPackages to its defaults, and an MDK sender that allows none
 reads them from its own defaults, so what MDK holds cannot say that invitations will not arrive.
 
+### Inbox checks
+
+An inbox check asks each allowed inbox relay (the first 16 by URL) once for this account's gift wraps (kind 1059
+addressed to it), on a connection of its own, never the live pool's, answered with the signer the account worker holds,
+and keeps no event. It proves whether the relay served that read when asked, not what any sender will experience. The
+account worker runs it beside its loop. `check_account_relays(account_ref)` asks it for a check and returns
+`account_relay_health` as it reads afterwards; that return value is the answer, and `RelayHealthChanged` follows a
+changed answer from the worker. Without a running account worker the call fails as the account not being active and
+dials nothing. Each relay gets at most 15 seconds; a relay the policy refuses is never dialed. One check runs per account
+at a time: a call while one runs is refused at once with `MarmotKitError.RelayCheckRunning` (nothing was checked; ask
+again once no row says `checking`). The worker also checks once each time it starts or reconnects, only when the
+account's own key signs: a remote or host signer (NIP-46, Amber) is asked to sign a relay's authentication challenge only
+when the host calls `check_account_relays`, so call it from a user action for such an account. Results belong to the
+worker's client and go with it: they last while the account runs, nothing is stored, and a reconnected, restarted or
+re-imported account starts `Unchecked`.
+
+| State | When |
+| --- | --- |
+| `Healthy` | The relay ended the read with EOSE, retried after authenticating when it asked for that. An EOSE carrying NIP-67 `auth` (the relay may withhold events until authentication) still counts: the check proves the relay answered, not that it held nothing back |
+| `Failing` | The account's own key signs and the relay gave an explicit policy answer about this account: it required authentication and then refused the AUTH as `restricted:`, `blocked:` or `payment-required:` (`AuthenticationRequired`), or it closed the read as `payment-required:` (`PaymentRequired`), `restricted:` or `blocked:` (`Restricted`). A refusal like that does not change by asking again |
+| `Suspected` | The same refusals under a remote or host signer, which may not have answered the challenge; an authentication that ended any other way (accepted and still refused, refused for an unexplained or `error:` reason, no reply, a dropped notification, or a signer still signing at the deadline); no connection (`Unreachable`) or no answer in 15 seconds (`TimedOut`) while another relay of the same check answered; or a close that names no refusal (`Unexplained`). Render it as "could not verify" |
+
+A check in which no relay answered establishes nothing and changes no row: the device may be offline. A relay that
+answers `rate-limited:`, to the read or to its authentication, keeps its previous state, and a failed connection never
+makes a relay `Failing`. The worker's own check runs once per start; when the device is offline then, it establishes
+nothing until the next start or a check command. A later check replaces a relay's state with what it establishes.
+
 `RelayHealthChanged { account_id_hex, account_label }` says to read the query again. It fires when the answer, apart
-from each row's `liveness`, differs from the one last announced, which only a change to the account's held relay lists
-causes, and once each time the account's worker starts. A relay connecting or disconnecting never fires it;
-`subscribe_relay_liveness` reports those. Only a running account worker sends it: a list that changes while none runs
+from each row's `liveness`, `checked_at_unix` and `checking`, differs from the one last announced, which a change to the
+account's held relay lists or a state an inbox check established causes, and once each time the account's worker
+starts. It follows the relay lists and check results, not connects and disconnects: connection changes come from
+`subscribe_relay_liveness`. A check that confirms every state, or one starting, fires nothing; the check commands
+return their answer. Only a running account worker sends it: a list that changes while none runs
 (an external-signer account whose signer is not registered, say) announces nothing, so read the query when the account
 starts and when the relay screen opens. It carries no relays, and a missed, late or repeated event is harmless because
 the query is the source of truth.

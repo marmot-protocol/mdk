@@ -2971,6 +2971,7 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
         AppError::RuntimeBusy => "runtime_busy",
         AppError::RuntimeStopping => "runtime_stopping",
+        AppError::RelayCheckRunning => "relay_check_running",
         AppError::TransportClosed => "transport_closed",
         AppError::AccountCatchUp(_) => "account_catch_up",
         AppError::Publish(_) => "publish",
@@ -3088,6 +3089,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::ChatPresentationNotReady
         | AppError::DirectConversationIndexNotReady
         | AppError::RuntimeStopping
+        | AppError::RelayCheckRunning
         | AppError::TransportClosed
         | AppError::AccountCatchUp(_)
         | AppError::GroupCatchingUp(_)

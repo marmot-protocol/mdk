@@ -58,12 +58,19 @@ c_enum! {
 }
 
 c_enum! {
-    /// What MDK knows of a relay. Only `Unchecked` and `NotAllowed` are
-    /// produced yet.
+    /// What MDK knows of a relay. `Healthy`, `Suspected` and `Failing` come
+    /// from an inbox check and describe one read of the account's inbox at
+    /// the row's `checked_at_unix` (see the shared contract). Later versions
+    /// may append states: keep a default case.
     MarmotRelayHealthState from RelayHealthStateFfi {
+        /// Allowed, and no check has established anything about it.
         Unchecked,
+        /// The relay answered the inbox check with EOSE.
         Healthy,
+        /// The check could not verify the relay: render "could not verify".
         Suspected,
+        /// The relay refused to serve this account's inbox when checked,
+        /// with the account's own key answering any authentication.
         Failing,
         /// The relay policy refuses it: this device never dials it.
         NotAllowed,
@@ -71,12 +78,27 @@ c_enum! {
 }
 
 c_enum! {
-    /// Why a relay is not allowed. Later versions may append faults: keep a
-    /// default case.
+    /// Why a row is not `Unchecked` or `Healthy`. Later versions may append
+    /// faults: keep a default case.
     MarmotRelayHealthFault from RelayHealthFaultFfi {
+        /// `NotAllowed`: on the retired-relay list.
         Retired,
+        /// `NotAllowed`: not a relay URL.
         Invalid,
+        /// `NotAllowed`: a host this device refuses to dial.
         Unsafe,
+        /// `Failing` or `Suspected`: authentication required and not accepted.
+        AuthenticationRequired,
+        /// `Failing` or `Suspected`: payment required.
+        PaymentRequired,
+        /// `Failing` or `Suspected`: restricted or blocked.
+        Restricted,
+        /// `Suspected`: no connection while another relay answered.
+        Unreachable,
+        /// `Suspected`: no answer in time while another relay answered.
+        TimedOut,
+        /// `Suspected`: ended without naming a refusal.
+        Unexplained,
     }
 }
 
@@ -95,14 +117,20 @@ c_enum! {
         /// sent through it has nowhere to go (see the shared contract for a
         /// sender on this same install).
         InboxListEmpty,
-        /// Critical: the published inbox list allows no relay, so an
-        /// invitation sent through it cannot reach this device (see the
-        /// shared contract for a sender on this same install).
+        /// Critical: every entry of the published inbox list is refused by
+        /// the policy or `Failing` (see the shared contract for a sender on
+        /// this same install). An `Unchecked` or `Suspected` entry never
+        /// raises it.
         NoAllowedInboxRelay,
-        /// Warning: some entries are refused beside at least one allowed.
+        /// Warning: some entries are refused beside at least one allowed
+        /// entry that is not `Failing`.
         InboxRelaysNotAllowed,
-        /// Notice: exactly one entry is allowed.
+        /// Notice: exactly one entry is allowed and not `Failing`.
         SingleInboxRelay,
+        /// Warning: some entries are `Failing` beside at least one allowed
+        /// entry that is not; each refused to serve this account's inbox when
+        /// checked.
+        InboxRelayFailing,
     }
 }
 
@@ -141,9 +169,14 @@ c_mirror! {
         /// In the order Inbox, Write, Read.
         vec roles/roles_len: MarmotRelayRole,
         copy state: MarmotRelayHealthState,
-        /// Set exactly when `state` is `NotAllowed`.
+        /// Set when `state` is `NotAllowed`, `Failing` or `Suspected`.
         opt_copy has_fault/fault: MarmotRelayHealthFault,
         copy liveness: MarmotRelayStatus,
+        /// When the inbox check that decided `state` asked the relay, in
+        /// Unix seconds; absent while no check has established anything.
+        opt_copy has_checked_at_unix/checked_at_unix: u64,
+        /// An inbox check of this relay is running.
+        copy checking: bool,
     }
 }
 
@@ -160,8 +193,9 @@ c_mirror! {
 }
 
 c_mirror! {
-    /// The account's relay health from its held lists and the relay policy.
-    /// Free with `marmot_account_relay_health_free`.
+    /// The account's relay health from its held lists, the relay policy and
+    /// this process's inbox checks. Free with
+    /// `marmot_account_relay_health_free`.
     MarmotAccountRelayHealth from AccountRelayHealthFfi,
     free marmot_account_relay_health_free {
         copy inbox_list: MarmotRelayListPresence,
@@ -357,6 +391,8 @@ mod tests {
                     state: RelayHealthStateFfi::Unchecked,
                     fault: None,
                     liveness: RelayStatusFfi::Connected,
+                    checked_at_unix: None,
+                    checking: true,
                 },
                 RelayHealthRowFfi {
                     url: "ws://plain.example".into(),
@@ -364,6 +400,17 @@ mod tests {
                     state: RelayHealthStateFfi::NotAllowed,
                     fault: Some(RelayHealthFaultFfi::Unsafe),
                     liveness: RelayStatusFfi::Unknown,
+                    checked_at_unix: None,
+                    checking: false,
+                },
+                RelayHealthRowFfi {
+                    url: "wss://failing.example".into(),
+                    roles: vec![RelayRoleFfi::Inbox],
+                    state: RelayHealthStateFfi::Failing,
+                    fault: Some(RelayHealthFaultFfi::AuthenticationRequired),
+                    liveness: RelayStatusFfi::Connected,
+                    checked_at_unix: Some(1_700_000_000),
+                    checking: false,
                 },
             ],
             warnings: vec![AccountRelayWarningFfi {
@@ -377,7 +424,7 @@ mod tests {
         });
         unsafe {
             assert_eq!(health.inbox_list, MarmotRelayListPresence::Published);
-            assert_eq!(health.rows_len, 2);
+            assert_eq!(health.rows_len, 3);
             let allowed = &*health.rows;
             assert_eq!(
                 std::ffi::CStr::from_ptr(allowed.url).to_str().unwrap(),
@@ -390,10 +437,22 @@ mod tests {
             assert_eq!(allowed.state, MarmotRelayHealthState::Unchecked);
             assert!(!allowed.has_fault);
             assert_eq!(allowed.liveness, MarmotRelayStatus::Connected);
+            assert!(!allowed.has_checked_at_unix);
+            assert!(allowed.checking);
             let refused = &*health.rows.add(1);
             assert_eq!(refused.state, MarmotRelayHealthState::NotAllowed);
             assert!(refused.has_fault);
             assert_eq!(refused.fault, MarmotRelayHealthFault::Unsafe);
+            assert!(!refused.checking);
+            let failing = &*health.rows.add(2);
+            assert_eq!(failing.state, MarmotRelayHealthState::Failing);
+            assert!(failing.has_fault);
+            assert_eq!(
+                failing.fault,
+                MarmotRelayHealthFault::AuthenticationRequired
+            );
+            assert!(failing.has_checked_at_unix);
+            assert_eq!(failing.checked_at_unix, 1_700_000_000);
             assert_eq!(health.warnings_len, 1);
             let warning = &*health.warnings;
             assert_eq!(warning.kind, MarmotRelayWarningKind::SingleInboxRelay);

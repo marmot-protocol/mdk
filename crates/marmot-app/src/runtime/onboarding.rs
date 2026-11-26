@@ -2691,6 +2691,8 @@ fn retryable_inspection_error(error: &transport_nostr::DirectoryInspectionError)
         | PaymentRequired
         | Restricted
         | InvalidRequest => false,
+        // Only relay health's inbox check produces these.
+        Unexplained | AuthenticationRateLimited | AuthenticationUnconfirmed => false,
     }
 }
 
@@ -2995,6 +2997,11 @@ impl AccountSetup<'_> {
                         PaymentRequired => OnboardingIssue::PaymentRequired,
                         RateLimited => OnboardingIssue::RateLimited,
                         Restricted => OnboardingIssue::AccessRestricted,
+                        // Only relay health's inbox check produces these.
+                        Unexplained => OnboardingIssue::AccessRestricted,
+                        AuthenticationRateLimited | AuthenticationUnconfirmed => {
+                            OnboardingIssue::AuthenticationRequired
+                        }
                         Unreachable => OnboardingIssue::Unreachable,
                         InvalidRequest => OnboardingIssue::InvalidRelay,
                         Incomplete | Partial { .. } => OnboardingIssue::DiscoveryIncomplete,

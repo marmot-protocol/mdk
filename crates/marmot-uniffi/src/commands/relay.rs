@@ -70,10 +70,10 @@ impl Marmot {
             .collect())
     }
 
-    /// The account's relay health from its held lists and the relay policy:
-    /// one row per relay its inbox and NIP-65 lists name, and warnings about
-    /// invitations sent through its published inbox list. Local read; never
-    /// dials. Re-read on `RelayHealthChanged`.
+    /// The account's relay health from its held lists, the relay policy and
+    /// this process's inbox checks: one row per relay its inbox and NIP-65
+    /// lists name, and warnings about invitations sent through its published
+    /// inbox list. Local read; never dials. Re-read on `RelayHealthChanged`.
     pub async fn account_relay_health(
         &self,
         account_ref: String,
@@ -81,6 +81,28 @@ impl Marmot {
         Ok(self
             .runtime
             .account_relay_health(&account_ref)
+            .await?
+            .into())
+    }
+
+    /// Check whether the account's inbox relays serve its inbox, and return
+    /// the account's relay health after it. The account's worker runs it: one
+    /// bounded read per allowed inbox relay (at most 16, 15 seconds each) on
+    /// a connection of its own, answered with the signer the worker holds; a
+    /// remote or host signer may be asked to sign a relay's authentication
+    /// challenge. A relay the policy refuses is never dialed. Refused at once
+    /// with `RelayCheckRunning` while a check of the account runs; without a
+    /// running account worker it fails as the account not being active and
+    /// dials nothing. A check no relay answered changes nothing. The returned
+    /// health is the answer; `RelayHealthChanged` follows a changed answer
+    /// from the worker.
+    pub async fn check_account_relays(
+        &self,
+        account_ref: String,
+    ) -> Result<conversions::AccountRelayHealthFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .check_account_relays(&account_ref)
             .await?
             .into())
     }

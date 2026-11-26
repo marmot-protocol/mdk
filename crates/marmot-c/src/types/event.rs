@@ -468,10 +468,13 @@ pub enum MarmotEvent {
     },
     /// The account's relay health changed; re-read
     /// `marmot_account_relay_health`. Fires when its answer, apart from each
-    /// row's liveness, differs from the one last announced, which only a
-    /// change to the account's held relay lists causes, and once each time
-    /// the account's worker starts; never for a relay connecting or
-    /// disconnecting. Carries no relays.
+    /// row's liveness, `checked_at_unix` and `checking`, differs from the one
+    /// last announced, which a change to the account's held relay lists or a
+    /// state an inbox check established causes, and once each time the
+    /// account's worker starts. It follows the relay lists and check results,
+    /// not connects and disconnects: connection changes come from
+    /// `marmot_subscribe_relay_liveness`. A check that confirms every state
+    /// fires nothing. Carries no relays.
     /// Only a running account worker sends it: a list that changes while
     /// none runs (an external-signer account whose signer is not registered,
     /// say) announces nothing, so read the query when the account starts and

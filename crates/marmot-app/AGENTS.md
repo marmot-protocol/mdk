@@ -1450,8 +1450,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
   `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `relay_health.rs`
-  (the account's relay rows and inbox warnings from its held lists and the dial policy, never dialing; the worker's
-  relay-configuration seam announces `RelayHealthChanged` when that answer differs, so liveness never moves it), `profile_pseudonyms.rs` (cosmetic display names; not a
+  (the account's relay rows and inbox warnings from its held lists, the dial policy and the worker's inbox checks; the
+  query never dials. `relay_health/checks.rs` is the inbox probe (the plane's strict `inspect_inbox` read, every probe a
+  future of one task) and what its answers establish; a run no relay answered establishes nothing. The account worker owns the check like its inbox-route lookups:
+  `runtime/account_worker/relay_checks.rs` runs one at a time beside the loop, refuses a host check while one runs
+  (`AppError::RelayCheckRunning`), and cancels and joins it on every exit that drops the client;
+  `client/relay_checks.rs` builds it from the client's own signer and keeps its results on the client, so they go with
+  it. The worker publishes the check state for the query on a `watch` its `ManagedAccountWorker` holds, and announces
+  `RelayHealthChanged` at its relay-configuration seam and when a check ends, comparing `AccountRelayHealth::announced`,
+  so neither liveness nor a confirming check moves it; it starts one check per client, local key only), `profile_pseudonyms.rs` (cosmetic display names; not a
   security primitive), `root_runtime_lease.rs` (cross-process exclusive root lease), `usage_diagnostics.rs`
   (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
   product collector only through `marmot_observability::wiring`, consent lock before state lock), `projection.rs` (legacy account

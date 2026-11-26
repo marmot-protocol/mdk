@@ -80,19 +80,27 @@ impl MarmotAppRuntime {
         Ok(rows)
     }
 
-    /// The account's relay health from its held lists and the relay policy:
-    /// one row per relay its inbox and NIP-65 lists name, and warnings about
-    /// invitations sent through its published inbox list. Reads only held
-    /// lists, the relay policy and the account's pool state; never dials.
+    /// The account's relay health from its held lists, the relay policy and
+    /// the account worker's inbox checks: one row per relay its inbox and
+    /// NIP-65 lists name, and warnings about invitations sent through its
+    /// published inbox list. Reads only held lists, the relay policy, the
+    /// worker's check results and the account's pool state; never dials.
     /// [`super::MarmotAppEvent::RelayHealthChanged`] reports changes other
-    /// than liveness.
+    /// than liveness, check times and checks in progress.
     pub async fn account_relay_health(
         &self,
         account_ref: &str,
     ) -> Result<crate::AccountRelayHealth, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
-        let mut health = self.accounts.app.account_relay_health(&account.label)?;
+        let checks = self
+            .accounts
+            .relay_check_snapshot(&account.account_id_hex)
+            .await;
+        let mut health = self
+            .accounts
+            .app
+            .account_relay_health(&account.label, &checks)?;
         let liveness = self.account_relay_liveness(&account.label).await?;
         for row in &mut health.rows {
             if let Ok(index) = liveness.binary_search_by(|current| current.url.cmp(&row.url)) {
@@ -100,6 +108,30 @@ impl MarmotAppRuntime {
             }
         }
         Ok(health)
+    }
+
+    /// Check whether the account's inbox relays serve this account's inbox,
+    /// and return the account's relay health after it. The account's worker
+    /// runs it: each allowed inbox relay (at most 16) gets one bounded read
+    /// of the account's gift wraps (kind 1059 addressed to it) on a
+    /// connection of its own, within 15 seconds, answered with the signer
+    /// the worker holds: a remote or host signer may be asked to sign the
+    /// relay's authentication challenge. A relay the policy refuses is never
+    /// dialed. One check runs per account: a call while one runs is refused
+    /// at once with [`AppError::RelayCheckRunning`]. Without a running
+    /// worker the call fails as the account not being active and dials
+    /// nothing. A check in which no relay answered changes nothing. Results
+    /// belong to the worker's client and go with it. The returned health is
+    /// the answer; [`super::MarmotAppEvent::RelayHealthChanged`] follows a
+    /// changed answer from the worker.
+    pub async fn check_account_relays(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::AccountRelayHealth, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts.check_inbox_relays(&account.label).await?;
+        self.account_relay_health(&account.label).await
     }
 
     /// Subscribe before reading, so a concurrent transport or list change is retained.

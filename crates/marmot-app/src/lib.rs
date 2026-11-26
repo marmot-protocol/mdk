@@ -2494,6 +2494,7 @@ impl MarmotApp {
             ),
             state: open.state,
             seen_events_index,
+            inbox_relay_checks: Default::default(),
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
             announced_convergence_parks: std::collections::HashSet::new(),

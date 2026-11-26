@@ -1626,10 +1626,13 @@ pub enum MarmotAppEvent {
     },
     /// The account's relay health changed: re-read
     /// [`MarmotAppRuntime::account_relay_health`]. Fires when its answer,
-    /// apart from each row's liveness, differs from the one last announced,
-    /// which only a change to the account's held relay lists causes, and once
-    /// each time the account's worker starts. A relay connecting or
-    /// disconnecting never fires it; `subscribe_relay_liveness` reports those.
+    /// apart from each row's liveness, `checked_at_unix` and `checking`,
+    /// differs from the one last announced, which a change to the account's
+    /// held relay lists or a state an inbox check established causes, and
+    /// once each time the account's worker starts. It follows the relay lists
+    /// and check results, not connects and disconnects: connection changes
+    /// come from `subscribe_relay_liveness`. A check that confirms every
+    /// state, or starts, fires nothing; the check commands return the answer.
     /// Only a running account worker sends it: a list that changes while
     /// none runs (an external-signer account whose signer is not registered,
     /// say) announces nothing, so read the query when the account starts and
@@ -8160,6 +8163,7 @@ impl AccountManager {
                         self.shared.observer.performance().clone(),
                     ));
                     let (read_state_tx, read_state) = read_state_channel();
+                    let (relay_checks_tx, relay_checks) = watch::channel(Default::default());
                     let (unlinked_tx, unlinked_rx) = oneshot::channel();
                     self.deactivate_when_unlinked(
                         account.account_id_hex.clone(),
@@ -8178,6 +8182,7 @@ impl AccountManager {
                             unlinked: unlinked_tx,
                             unit: unit.clone(),
                             read_state: read_state_tx,
+                            relay_checks: relay_checks_tx,
                         },
                         command_rx,
                         ready_tx,
@@ -8194,6 +8199,7 @@ impl AccountManager {
                             shutdown: shutdown_tx,
                             unit,
                             read_state,
+                            relay_checks,
                         },
                     );
                     ready_receivers.push((account_id, Instant::now(), ready_rx, startup_progress));

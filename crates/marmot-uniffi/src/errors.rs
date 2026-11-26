@@ -592,6 +592,10 @@ pub enum MarmotKitError {
     /// Ask the recipient to update their client and publish a compatible KeyPackage.
     #[error("incompatible KeyPackage")]
     IncompatibleKeyPackage,
+    /// A relay check of the account is running; nothing more was checked.
+    /// Ask again once its rows stop saying `checking`.
+    #[error("a relay check of this account is already running")]
+    RelayCheckRunning,
 }
 
 impl From<AppError> for MarmotKitError {
@@ -640,6 +644,7 @@ impl From<&AppError> for MarmotKitError {
             AppError::ModerationReportRateLimited => Self::ModerationReportRateLimited,
             AppError::InvalidEditTarget => Self::InvalidEditTarget,
             AppError::ReactionNotFound => Self::ReactionNotFound,
+            AppError::RelayCheckRunning => Self::RelayCheckRunning,
             AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::ConsentRequired) => {
                 Self::ConsentRequired
             }
@@ -1291,6 +1296,16 @@ mod tests {
         assert!(matches!(
             MarmotKitError::from(AppError::InvalidEditTarget),
             MarmotKitError::InvalidEditTarget
+        ));
+    }
+
+    /// A refused overlapping relay check reaches hosts as its own error, so
+    /// a host can tell "ask again later" from a failed check.
+    #[test]
+    fn a_refused_relay_check_stays_typed() {
+        assert!(matches!(
+            MarmotKitError::from(AppError::RelayCheckRunning),
+            MarmotKitError::RelayCheckRunning
         ));
     }
 

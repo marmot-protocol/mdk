@@ -4,6 +4,7 @@
 mod attachments;
 mod read_queue;
 pub(crate) mod recovery_credits;
+mod relay_checks;
 mod schedule;
 mod sign_in_reads;
 mod welcome_route_lookups;
@@ -78,6 +79,8 @@ pub(crate) struct ManagedAccountWorker {
     /// The worker's published read state, A, which the account reads
     /// answer from (mdk#3273).
     pub(crate) read_state: ReadStateReader,
+    /// The worker's inbox checks' state, which `account_relay_health` reads.
+    pub(crate) relay_checks: watch::Receiver<crate::relay_health::CheckSnapshot>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -358,6 +361,9 @@ pub(crate) struct AccountWorkerRuntime {
     pub(crate) unit: Arc<WorkerUnitGauge>,
     /// The sending half of A, which the client's publisher takes.
     pub(crate) read_state: ReadStateSender,
+    /// Where the worker publishes its inbox checks' state for
+    /// `account_relay_health`.
+    pub(crate) relay_checks: watch::Sender<crate::relay_health::CheckSnapshot>,
 }
 
 pub(crate) enum GroupCreationRequest {
@@ -566,6 +572,11 @@ pub(crate) enum AccountWorkerCommand {
     },
     CheckSignIns {
         respond: oneshot::Sender<Result<Vec<crate::UnrecognizedSignIn>, AppError>>,
+    },
+    /// Check the account's inbox relays (relay health); refused with
+    /// `RelayCheckRunning` while a check runs.
+    CheckRelays {
+        respond: oneshot::Sender<Result<(), AppError>>,
     },
     StartFresh {
         respond: oneshot::Sender<Result<(), AppError>>,
@@ -1204,6 +1215,7 @@ async fn run_app_runtime_account_worker(
         unlinked,
         unit,
         read_state,
+        relay_checks: relay_check_state,
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut relay_config_updates = app.presentation_signals.profile_updates.subscribe();
@@ -1677,6 +1689,8 @@ async fn run_app_runtime_account_worker(
     // its place while it waits (mdk#3466).
     client.detach_sign_in_reads();
     let mut sign_in_reads = sign_in_reads::SignInReads::default();
+    // The account's inbox relay check, beside the writer too.
+    let mut relay_checks = relay_checks::RelayChecks::default();
     let mut pending = deferred
         .into_iter()
         .map(|deferred_command| match deferred_command {
@@ -1713,6 +1727,16 @@ async fn run_app_runtime_account_worker(
                     },
                 )
                 .await;
+            }
+            AccountWorkerCommand::CheckRelays { respond } => {
+                wait.take_up();
+                take_relay_check_request(
+                    &mut relay_checks,
+                    &client,
+                    &account_label,
+                    respond,
+                    &relay_check_state,
+                );
             }
             AccountWorkerCommand::CheckSignIns { respond } => {
                 wait.take_up();
@@ -1794,6 +1818,8 @@ async fn run_app_runtime_account_worker(
     let mut relay_config_work = RelayConfigWork::Ready;
     // The relay health hosts last heard of; `None` until the first answer.
     let mut announced_relay_health = None;
+    // This client's own inbox check has started, or never will.
+    let mut inbox_check_started = false;
     let mut account_wakeups = app
         .presentation_signals
         .subscribe_account_work(&account_label);
@@ -2156,8 +2182,15 @@ async fn run_app_runtime_account_worker(
                     &events,
                     &account_id_hex,
                     &account_label,
+                    &relay_check_state.borrow().clone(),
                     &mut announced_relay_health,
                 );
+                // Once per client, beside it: the first configuration with
+                // an allowed inbox relay starts the inbox check.
+                if health_read && !inbox_check_started {
+                    inbox_check_started = relay_checks.start_own(&client, &account_label);
+                    publish_relay_check_state(&relay_check_state, &client, &relay_checks);
+                }
                 relay_config_work = match client.sync_relay_liveness().await {
                     // A failed health read still owes hosts its answer.
                     Ok(_) if health_read => RelayConfigWork::Idle,
@@ -2217,6 +2250,26 @@ async fn run_app_runtime_account_worker(
                         }
                         Err(broadcast::error::RecvError::Closed) => break 'worker,
                     }
+                }
+            }
+            // An inbox check ended: keep what it established, announce the
+            // answer if it changed (or retry the read with the configuration
+            // work), then answer the host that asked.
+            outcome = relay_checks.next(), if relay_checks.is_running() => {
+                let answered = relay_checks.settle(&mut client, outcome);
+                publish_relay_check_state(&relay_check_state, &client, &relay_checks);
+                if !publish_relay_health_change(
+                    &client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    &relay_check_state.borrow().clone(),
+                    &mut announced_relay_health,
+                ) {
+                    relay_config_work = RelayConfigWork::Ready;
+                }
+                if let Some((respond, result)) = answered {
+                    let _ = reply(respond, result, &client);
                 }
             }
             result = relay_config_updates.recv() => {
@@ -2379,6 +2432,11 @@ async fn run_app_runtime_account_worker(
                             continue;
                         }
                         let command = match command {
+                            AccountWorkerCommand::CheckRelays { respond } => {
+                                wait.take_up();
+                                take_relay_check_request(&mut relay_checks, &client, &account_label, respond, &relay_check_state);
+                                continue;
+                            }
                             AccountWorkerCommand::CheckSignIns { respond } => {
                                 wait.take_up();
                                 if let Some(settled) = sign_in_reads.check_now(&mut client, respond) {
@@ -2866,6 +2924,12 @@ async fn run_app_runtime_account_worker(
                         // So does each inbox lookup; the new client's
                         // session owes its own.
                         welcome_route_lookups.replace();
+                        // So does an inbox check, and what checks
+                        // established: the new client starts unchecked and
+                        // runs its own check.
+                        relay_checks.replace();
+                        inbox_check_started = false;
+                        relay_check_state.send_replace(Default::default());
                         // A outlives the client: its successor continues
                         // the versions (mdk#3273).
                         let mut read_state = client.take_read_state();
@@ -3513,6 +3577,8 @@ async fn run_app_runtime_account_worker(
     sign_in_reads.end().await;
     // No inbox lookup outlives the worker either.
     welcome_route_lookups.end().await;
+    // No inbox check outlives the worker either.
+    relay_checks.end().await;
     // Each exit that still held the client stopped the runner on it; any
     // other exit's drop aborts the task and refunds the attempts it left
     // open. What a quantum staged stays durable.
@@ -6016,6 +6082,13 @@ fn account_worker_command_future<'a>(
     } = context;
     let storage_permit = shared.observer.product().permit();
     match command {
+        // The worker takes a host inbox check before it dispatches a command
+        // (`relay_checks`), so no worker path reaches this arm; one that
+        // would checks nothing and says so.
+        AccountWorkerCommand::CheckRelays { respond } => Box::pin(async move {
+            let _ = reply(respond, Err(AppError::RelayCheckRunning), client);
+            true
+        }),
         AccountWorkerCommand::ConnectivityRestored { respond } => Box::pin(async move {
             let result = client.note_connectivity_restored().map(|_| ());
             scheduled_convergence.wake_after_connectivity_restored();
@@ -9775,21 +9848,24 @@ pub(crate) fn publish_device_group_changes(
 }
 
 /// One `RelayHealthChanged` when the account's relay health differs from the
-/// answer hosts last heard of, or on the first answer. The relay lists and the
-/// relay policy alone decide that answer, so a relay connecting or
-/// disconnecting never announces one. Runs wherever the worker reconciles its
-/// relay configuration: at start, on each change to the account's directory
-/// entry and on each activation. False when the answer could not be read, so
-/// the caller retries the reconciliation rather than lose the announcement.
+/// answer hosts last heard of, or on the first answer. The relay lists, the
+/// relay policy and the states inbox checks established decide that answer,
+/// so a relay connecting or disconnecting, or a check confirming a state,
+/// never announces one. Runs wherever the worker reconciles its relay
+/// configuration (at start, on each change to the account's directory entry
+/// and on each activation) and when an inbox check establishes a result.
+/// False when the answer could not be read, so the caller retries the
+/// reconciliation rather than lose the announcement.
 fn publish_relay_health_change(
     client: &AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
+    checks: &crate::relay_health::CheckSnapshot,
     announced: &mut Option<crate::AccountRelayHealth>,
 ) -> bool {
-    let health = match client.app.account_relay_health(account_label) {
-        Ok(health) => health,
+    let health = match client.app.account_relay_health(account_label, checks) {
+        Ok(health) => health.announced(),
         Err(error) => {
             tracing::debug!(
                 target: "marmot_app::relay_health",
@@ -9820,6 +9896,36 @@ fn publish_relay_health_change(
         },
     );
     true
+}
+
+/// A host asks for an inbox check: answer now when it is refused or has
+/// nothing to dial, else publish that a check runs; it answers when it ends.
+fn take_relay_check_request(
+    relay_checks: &mut relay_checks::RelayChecks,
+    client: &AppClient,
+    account_label: &str,
+    respond: oneshot::Sender<Result<(), AppError>>,
+    state: &watch::Sender<crate::relay_health::CheckSnapshot>,
+) {
+    match relay_checks.request(client, account_label, respond) {
+        Some((respond, result)) => {
+            let _ = reply(respond, result, client);
+        }
+        None => publish_relay_check_state(state, client, relay_checks),
+    }
+}
+
+/// Publish what the client's inbox checks established and which relays the
+/// running one dials, for `account_relay_health`.
+fn publish_relay_check_state(
+    state: &watch::Sender<crate::relay_health::CheckSnapshot>,
+    client: &AppClient,
+    relay_checks: &relay_checks::RelayChecks,
+) {
+    state.send_replace(crate::relay_health::CheckSnapshot {
+        results: client.inbox_relay_checks.clone(),
+        checking: relay_checks.checking(),
+    });
 }
 
 /// One `UnrecognizedSignInsChanged` for a check or answer that changed the
@@ -11258,6 +11364,7 @@ mod tests {
                 unlinked: oneshot::channel().0,
                 unit: Arc::default(),
                 read_state: read_state_tx,
+                relay_checks: tokio::sync::watch::channel(Default::default()).0,
             },
             receiver,
             ready,
@@ -11276,6 +11383,7 @@ mod tests {
                 media_admission: admission.clone(),
                 unit: Default::default(),
                 read_state,
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
             },
         );
         timeout(Duration::from_secs(5), readiness)
