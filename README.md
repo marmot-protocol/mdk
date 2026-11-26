@@ -253,15 +253,14 @@ and test-duration skew within each layout. Compare paired runs; do not add
 medians from unrelated jobs. Main CI defaults stay unchanged until measurements show an
 improvement without worse tail latency or lost coverage.
 
-Add `ci:full` and re-run all jobs to run the full matrix on a pull request,
-along with complete Android/Apple candidate packaging. `ci:apple` adds the iOS
-clippy lane and Apple packaging, and `ci:android` adds Android packaging; for
-packaging, re-run all candidate-workflow jobs or push a new commit. Ordinary PRs
-skip complete native candidate packaging, including Android target compilation
-and linking; use the opt-in when a change needs that signal before merging.
-Candidate packaging also runs on master when its inputs change, and the
+Add `ci:full` and re-run all jobs to run the full `ci.yml` matrix on a pull
+request; `ci:apple` adds the iOS clippy and MarmotKit native host checks in
+`ci.yml`. Complete Android and Apple candidate packaging does not run
+automatically on pull requests or `master` pushes; run
+`gh workflow run bindings-profile.yml --ref <branch>` when a change needs
+packaged candidate validation before merging, and the
 [nightly release](release.md#nightly-builds) builds and validates the same
-packages on nights it does not skip.
+packages from `master` on nights it does not skip.
 Existing nightly and weekly campaigns retain their wider coverage.
 
 Common targeted runs:

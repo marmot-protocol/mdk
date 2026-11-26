@@ -202,13 +202,7 @@ class SignaturePolicyTests(unittest.TestCase):
                     return bool(needs) and any(gated(parent, visited | {job}) for parent in
                         re.findall(r"[a-z0-9][a-z0-9-]*", needs[1]))
                 for job, body in jobs.items():
-                    if (path.name, job) == ("bindings-profile.yml", "report-master-failure"):
-                        # It must run after a failure, so it may use always(), but only on master.
-                        self.assertTrue(gated(job))
-                        self.assertIn("    if: always() && github.event_name != 'pull_request' && "
-                                      "github.ref == 'refs/heads/master' && "
-                                      "needs.candidate-validation.result == 'failure'", body.splitlines())
-                    elif job not in {"required-ci", "candidate-validation", "merge-group-fail-fast"}:
+                    if job not in {"required-ci", "merge-group-fail-fast"}:
                         self.assertTrue(gated(job), f"{path.name}:{job} can run before signatures")
                         self.assertNotRegex(body, r"(?m)^    if:.*(?:always|failure|cancelled)\(")
 
@@ -227,55 +221,54 @@ class SignaturePolicyTests(unittest.TestCase):
 
 
 class PackagingPolicyTests(unittest.TestCase):
-    def test_label_events_cannot_replace_candidate_check_results(self):
-        workflow = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
-        self.assertIn("types: [opened, synchronize, reopened]", workflow)
-        self.assertNotIn("labeled", workflow)
+    def test_packaging_workflows_do_not_trigger_on_master_push_or_core_crate_prs(self):
+        bindings_profile = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
+        bp_trigger = bindings_profile.split("\npermissions:\n", 1)[0]
+        self.assertIn("  workflow_dispatch:", bp_trigger)
+        self.assertNotIn("  pull_request:", bp_trigger)
+        self.assertNotIn("  push:", bp_trigger)
+        self.assertNotIn("issues: write", bindings_profile)
 
-    def test_label_lookup_failure_cannot_silently_skip_requested_coverage(self):
-        script = workflow_step("bindings-profile.yml", "Select candidate packaging lanes")
-        result = subprocess.run(
-            ["bash", "-c", "gh() { return 1; }\n" + script],
-            env={**os.environ, "EVENT_NAME": "pull_request", "PR_NUMBER": "123",
-                 "REPO": "example/repo"}, capture_output=True, timeout=10,
+        wn_agent = (ROOT / ".github/workflows/wn-agent-binaries.yml").read_text()
+        wn_trigger = wn_agent.split("\npermissions:\n", 1)[0]
+        self.assertIn("  workflow_dispatch:", wn_trigger)
+        self.assertIn("  workflow_call:", wn_trigger)
+        push_block = wn_trigger.split("\n  push:\n", 1)[1].split("\n  workflow_dispatch:\n", 1)[0]
+        push_lines = [line.strip() for line in push_block.splitlines()
+                      if line.strip() and not line.strip().startswith("#")]
+        self.assertEqual(push_lines, ["tags:", "- wn-agent-v*", '- "!wn-agent-v*-nightly.*"'])
+        pr_block = wn_trigger.split("\n  pull_request:\n", 1)[1].split("\n  push:\n", 1)[0]
+        for expected_path in (
+            "crates/agent-control/**",
+            "crates/agent-connector/**",
+            "fixtures/agent-control-*.json",
+            "Cargo.lock",
+            "integrations/hermes/marmot/**",
+            "integrations/openclaw/marmot/**",
+        ):
+            self.assertIn(f"- {expected_path}", pr_block)
+        for excluded_crate in ("crates/cgka-engine/**", "crates/marmot-app/**", "crates/storage-sqlite/**"):
+            self.assertNotIn(excluded_crate, pr_block)
+        self.assertIn(
+            "if: needs.changes.outputs.run_binaries == 'true' && github.event_name != 'pull_request'",
+            wn_agent,
         )
-        self.assertNotEqual(result.returncode, 0)
 
-    def test_live_labels_select_only_requested_platforms_and_master_is_full(self):
-        script = workflow_step("bindings-profile.yml", "Select candidate packaging lanes")
-        for event, labels, expected in [
-            ("pull_request", [], (False, False)),
-            ("pull_request", ["unrelated"], (False, False)),
-            ("pull_request", ["ci:android"], (True, False)),
-            ("pull_request", ["ci:apple"], (False, True)),
-            ("pull_request", ["ci:full"], (True, True)),
-            ("push", [], (True, True)),
-            ("schedule", [], (True, True)),
-            ("workflow_dispatch", [], (True, True)),
-        ]:
-            with self.subTest(event=event, labels=labels), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                output = root / "output"
-                env = {**os.environ, "PATH": f"{root}:{os.environ['PATH']}",
-                       "EVENT_NAME": event, "PR_NUMBER": "123" if event == "pull_request" else "",
-                       "REPO": "example/repo", "TEST_LABELS": json.dumps(labels),
-                       "GITHUB_OUTPUT": str(output)}
-                subprocess.run(["bash", "-c", 'gh() { printf "%s\\n" "$TEST_LABELS"; }\n' + script],
-                               env=env, check=True, capture_output=True, timeout=10)
-                values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-                self.assertEqual((values["run_android"] == "true", values["run_apple"] == "true"), expected)
-
-    def test_gate_rejects_failed_or_unexpectedly_skipped_selected_packages(self):
+    def test_gate_requires_every_candidate_package(self):
         script = workflow_step("bindings-profile.yml", "Require every candidate package")
-        base = {**os.environ, "IDENTITY_RESULT": "success", "RUN_ANDROID": "false",
-                "RUN_APPLE": "false", "ANDROID_RESULT": "skipped", "IOS_RESULT": "skipped",
-                "MACOS_RESULT": "skipped", "SOURCE_SHA": "candidate"}
-        cases = [({}, True), ({"IDENTITY_RESULT": "failure"}, False),
-                 ({"RUN_ANDROID": "true"}, False),
-                 ({"RUN_ANDROID": "true", "ANDROID_RESULT": "failure"}, False),
-                 ({"RUN_ANDROID": "true", "ANDROID_RESULT": "success"}, True),
-                 ({"RUN_APPLE": "true", "IOS_RESULT": "success"}, False),
-                 ({"RUN_APPLE": "true", "IOS_RESULT": "success", "MACOS_RESULT": "success"}, True)]
+        base = {**os.environ, "IDENTITY_RESULT": "success", "ANDROID_RESULT": "success",
+                "IOS_RESULT": "success", "MACOS_RESULT": "success", "SOURCE_SHA": "candidate"}
+        cases = [
+            ({}, True),
+            ({"IDENTITY_RESULT": "failure"}, False),
+            ({"ANDROID_RESULT": "skipped"}, False),
+            ({"ANDROID_RESULT": "failure"}, False),
+            ({"IOS_RESULT": "skipped"}, False),
+            ({"IOS_RESULT": "failure"}, False),
+            ({"MACOS_RESULT": "skipped"}, False),
+            ({"MACOS_RESULT": "failure"}, False),
+            ({"ANDROID_RESULT": "", "IOS_RESULT": "", "MACOS_RESULT": ""}, False),
+        ]
         for overrides, expected in cases:
             with self.subTest(overrides=overrides):
                 result = subprocess.run(["bash", "-c", script], env={**base, **overrides}, capture_output=True)

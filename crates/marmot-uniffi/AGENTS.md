@@ -41,7 +41,7 @@ Expose `marmot-app` behavior through bindings, following [MDK's host boundary](.
 - Own `release-profile-json.py`, `release-profile-archive.py`, `test-release-profile.py`, and
   `measure-release-profile.py` for provenance JSON, native-archive bitcode checks, and controlled
   baseline/candidate measurements.
-- Keep automatic exact-head packaging in `bindings-profile.yml`; comparative
+- Keep exact-head candidate packaging in `bindings-profile.yml` (`workflow_dispatch`); comparative
   measurements belong in the explicit full-SHA `bindings-profile-measurement.yml`
   dispatch and must retain host, Android, Apple, CPU and failure evidence. Changes
   to the release profile, Rust toolchain or measurement methodology must dispatch

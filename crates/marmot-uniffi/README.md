@@ -2435,21 +2435,13 @@ Changing crate types to enable effective LTO also requires revisiting the
 incompatible `embed-bitcode=no` flag and revalidating native Apple artifacts.
 The latest recorded comparison is in [release-profile-measurements.md](release-profile-measurements.md).
 
-The automatic `MarmotKit Release Profile` workflow (`bindings-profile.yml`) is an exact-head packaging
-check, not a comparison benchmark. It builds Kotlin/Swift generation and every
+The `MarmotKit Release Profile` workflow (`bindings-profile.yml`) is an on-demand (`workflow_dispatch`)
+exact-head packaging check, not a comparison benchmark. It builds Kotlin/Swift generation and every
 Android or Apple native target once in parallel, transfers those inputs only
 within the current workflow run, verifies their source, builder, toolchain,
 profile, feature and run provenance, then assembles and validates the Android,
-iOS and macOS candidate packages. Full packaging is opt-in on pull requests:
-`ci:android` selects Kotlin generation and all four Android ABIs, `ci:apple`
-selects the Apple inputs and packages, and `ci:full` selects both platforms.
-After adding a packaging label, re-run all candidate-workflow jobs or push a
-new commit; the workflow reads the current labels. Ordinary PRs retain Rust compilation/API and
-packaging-contract checks without building complete candidate bundles.
-Android target compilation, NDK checks and native linking are deferred unless
-explicitly selected, including for changes to the UniFFI crate.
-Matching `master` pushes always build the complete matrix and open an issue
-when it fails; later pushes do not cancel running or queued candidate builds.
+iOS and macOS candidate packages. It does not trigger automatically on pull requests or `master` pushes;
+run `gh workflow run bindings-profile.yml --ref <branch>` to validate a branch's full candidate bundles.
 Candidate builds use no Cargo cache, so
 every run compiles from a clean target directory.
 The workflow has no schedule of its own. The
@@ -2457,8 +2449,7 @@ The workflow has no schedule of its own. The
 same Android and Apple packages from `master`, but only on nights it does not
 skip: it skips when master has no new green commit or is not on an
 `X.Y.Z-dev` version, and when releases or snapshots keep the macOS runners busy
-for three hours. It does not run `test-native-archive.py`; matching `master`
-pushes do.
+for three hours. It does not run `test-native-archive.py`; `bindings-profile.yml` runs do.
 
 Baseline-versus-candidate measurements are intentionally manual. Run the
 `MarmotKit Release Profile Measurements` workflow from `master` with the full
