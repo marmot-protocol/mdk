@@ -111,7 +111,7 @@ jobs:
             # binding proc-macro, Cargo config, or packaging-toolchain inputs
             # change. Upstream core crates are still cross-checked every Canary
             # via rust-android-check, ios-account-clippy, and
-            # marmotkit-native-host, and packaged daily by nightly-releases.yml.
+            # marmotkit-native-host, and packaged daily by rc-releases.yml.
             while IFS= read -r -d '' changed; do
               case "$changed" in
                 crates/marmot-uniffi/*|crates/marmot-uniffi-macros/*|Cargo.toml|Cargo.lock|.cargo/config.toml|.cargo/config|rust-toolchain.toml|.github/workflows/bindings.yaml|.github/workflows/bindings-profile.yml|.github/actions/setup-odin/*|scripts/install-odin.sh)

@@ -355,6 +355,9 @@ jobs:
       - name: Bisect agent contract
         run: python3 scripts/test_bisect_agent.py
 
+      - name: SemVer RC and promotion contract
+        run: python3 scripts/test_rc_release.py
+
       - name: Binding build phase contracts
         run: |
           python3 crates/marmot-uniffi/test-build-phases.py

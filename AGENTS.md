@@ -87,7 +87,7 @@ no merge queue. The shipping flow is:
    `tree-fix` or `revert`, confirm `origin/tree-state:state.json` is `"green"` right before merging, confirm
    `headRefOid` matches the reviewed head, and run `gh pr merge <pr> --squash --match-head-commit <sha>`; never
    `--auto`, `--admin`, or a direct push.
-4. **Post-merge `Canary`, Bisect Agent & daily releases:** Bare-metal Linux Canary on `mdk-ci-1` verifies `master`
+4. **Post-merge `Canary`, Bisect Agent & daily SemVer RCs:** Bare-metal Linux Canary on `mdk-ci-1` verifies `master`
    every 30 minutes (`fast-ci`, `cargo-audit`, `wasm-check`, `android-check`, `workspace-nextest`, `simulator-smoke`)
    and advances the protected `canary` branch; hourly `.github/workflows/canary.yml` runs the full cross-platform
    matrix (de-sharded to 6 workspace shards plus Android, WASM, C bindings, macOS, Windows, Tamarin, and conditional
@@ -95,8 +95,10 @@ no merge queue. The shipping flow is:
    (`scripts/bisect_agent/`) classifies failures into 5 buckets (infra, known flake, new intermittent, unreproducible,
    deterministic regression), bisects deterministic failures to open clean signed `revert` PRs, and freezes
    `tree-state` (`red`) on tangled/failed reverts, unisolatable failures, or 2 consecutive unreproducible reds
-   (auto-clearing to `green` on recovery). Daily
-   `.github/workflows/nightly-releases.yml` builds from the verified `canary` branch tip.
+   (auto-clearing to `green` on recovery). Daily `.github/workflows/rc-releases.yml` builds SemVer Release Candidates
+   (`0.X.(Y+1)-rc.N` / `0.(X+1).0-rc.N`) strictly from the verified `canary` branch tip, gated on `simulator-nightly` +
+   `convergence-hardening` + all three tracks, and publishes `rc/latest.json` + `rc/signature_delta.json` on `rc-meta`.
+   Promote a verified RC to a formal Stable cohort with `just promote-rc <rc>` (`.github/workflows/promote-release.yml`).
 
 ## Documentation
 

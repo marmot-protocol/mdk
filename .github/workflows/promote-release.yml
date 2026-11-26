@@ -1,0 +1,358 @@
+name: Promote RC to Stable
+
+# One-click promotion of a verified SemVer RC (`X.Y.Z-rc.N`) to a formal MDK
+# Stable cohort release (`vX.Y.Z`, `marmotkit-vX.Y.Z`, `marmotc-vX.Y.Z`,
+# `wn-agent-vX.Y.Z`). Stamps ONLY release metadata onto the RC's exact verified
+# `source_sha`, enforces a fail-closed metadata-only diff guard, skips all
+# test/simulator/hardening re-runs, builds final Stable bundles in parallel,
+# publishes the cohort, updates `rc-meta:stable/latest.json`, and opens a
+# signed docs/next-dev sync PR back to `master`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_version:
+        description: Verified RC version to promote (e.g. 0.20.0-rc.1)
+        required: true
+        type: string
+      override_version:
+        description: Optional Stable SemVer X.Y.Z override (e.g. 0.19.1 or 0.20.0)
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: Verify RC evidence, stamp metadata locally, and run metadata gates without pushing or publishing
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Verify RC and stamp release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      rc_version: ${{ steps.plan.outputs.rc_version }}
+      stable_version: ${{ steps.plan.outputs.stable_version }}
+      rc_source_sha: ${{ steps.plan.outputs.source_sha }}
+      baseline_tag: ${{ steps.plan.outputs.baseline_tag }}
+      next_dev_version: ${{ steps.plan.outputs.next_dev_version }}
+      release_branch: ${{ steps.plan.outputs.release_branch }}
+      release_commit_sha: ${{ steps.commit.outputs.release_commit_sha }}
+
+    steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Require master for live promotion
+        if: ${{ !inputs.dry_run }}
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "error: live Stable promotions must run the workflow from refs/heads/master" >&2
+            exit 1
+          fi
+
+      - name: Preflight release credentials
+        if: ${{ !inputs.dry_run }}
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [[ -z "${RELEASE_TOKEN:-}" ]]; then
+            echo "error: live Stable promotion requires secrets.RELEASE_TOKEN (for ruleset-protected formal tags and triggering Required CI on the sync PR)" >&2
+            exit 1
+          fi
+
+      - name: Verify RC evidence and plan promotion
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RC_VERSION: ${{ inputs.rc_version }}
+          OVERRIDE_VERSION: ${{ inputs.override_version }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master 'refs/tags/v*:refs/tags/v*'
+          python3 scripts/promote_release.py plan \
+            --master-ref origin/master \
+            --rc-version "$RC_VERSION" \
+            --override-version "$OVERRIDE_VERSION"
+
+      - name: Wait for any building RC to leave macOS runners
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/rc_release.py wait-lane --rc --timeout-minutes 180 --fail-on-timeout
+
+      - name: Check out exact verified RC source commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ steps.plan.outputs.source_sha }}
+          path: release-source
+
+      - name: Stamp release metadata and run zero-compile metadata gates
+        env:
+          STABLE_VERSION: ${{ steps.plan.outputs.stable_version }}
+          BASELINE_TAG: ${{ steps.plan.outputs.baseline_tag }}
+        run: |
+          set -euo pipefail
+          git -C release-source fetch --no-tags origin 'refs/tags/v*:refs/tags/v*'
+          python3 scripts/promote_release.py stamp \
+            --root release-source \
+            --version "$STABLE_VERSION" \
+            --baseline-ref "$BASELINE_TAG"
+          python3 scripts/promote_release.py verify-metadata-diff \
+            --root release-source \
+            --base HEAD
+          (
+            cd release-source
+            git diff --check
+            python3 scripts/check_binding_docs.py --release-version "$STABLE_VERSION"
+            python3 scripts/changelog.py check --none-pending
+            ./scripts/check_agent_install_docs.sh
+            python3 scripts/check_install_example_sha256.py
+          )
+          cp "release-source/docs/release/${STABLE_VERSION}.md" "$RUNNER_TEMP/release-notes.md"
+
+      - name: Upload stamped release notes
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: promote-notes-${{ steps.plan.outputs.stable_version }}
+          path: ${{ runner.temp }}/release-notes.md
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Push GitHub-signed release commit to release branch
+        id: commit
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RC_VERSION: ${{ steps.plan.outputs.rc_version }}
+          STABLE_VERSION: ${{ steps.plan.outputs.stable_version }}
+          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
+          RELEASE_BRANCH: ${{ steps.plan.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          python3 scripts/promote_release.py commit-branch \
+            --root release-source \
+            --parent-sha "$SOURCE_SHA" \
+            --branch "$RELEASE_BRANCH" \
+            --message "Release MDK ${STABLE_VERSION} (promoted from ${RC_VERSION})"
+
+  marmotkit:
+    name: Build Stable MarmotKit
+    needs: prepare
+    if: success() && !inputs.dry_run
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bindings.yaml
+    with:
+      source_sha: ${{ needs.prepare.outputs.release_commit_sha }}
+      build_only: false
+      release_version: ${{ needs.prepare.outputs.stable_version }}
+
+  marmotc:
+    name: Build Stable Marmot C
+    needs: prepare
+    if: success() && !inputs.dry_run
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/c-bindings.yml
+    with:
+      source_sha: ${{ needs.prepare.outputs.release_commit_sha }}
+      build_only: false
+      release_version: ${{ needs.prepare.outputs.stable_version }}
+
+  wn-agent:
+    name: Build Stable wn-agent
+    needs: prepare
+    if: success() && !inputs.dry_run
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/wn-agent-binaries.yml
+    with:
+      source_sha: ${{ needs.prepare.outputs.release_commit_sha }}
+      build_only: false
+      release_version: ${{ needs.prepare.outputs.stable_version }}
+
+  publish:
+    name: Publish Stable cohort
+    needs: [prepare, marmotkit, marmotc, wn-agent]
+    if: success() && !inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Download stamped release notes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: promote-notes-${{ needs.prepare.outputs.stable_version }}
+          path: ${{ runner.temp }}/promote-notes
+
+      - name: Publish Stable releases and update stable/latest.json
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          META_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STABLE_VERSION: ${{ needs.prepare.outputs.stable_version }}
+          RC_VERSION: ${{ needs.prepare.outputs.rc_version }}
+          RC_SOURCE_SHA: ${{ needs.prepare.outputs.rc_source_sha }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_commit_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/promote_release.py publish-stable \
+            --version "$STABLE_VERSION" \
+            --rc-version "$RC_VERSION" \
+            --rc-source-sha "$RC_SOURCE_SHA" \
+            --release-sha "$RELEASE_SHA" \
+            --notes-file "$RUNNER_TEMP/promote-notes/release-notes.md"
+
+  open-sync-pr:
+    name: Open signed docs and next-dev sync PR
+    needs: [prepare, publish]
+    if: success() && !inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Check out master for sync PR
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: master
+
+      - name: Open signed docs and next-dev sync PR back to master
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          STABLE_VERSION: ${{ needs.prepare.outputs.stable_version }}
+          RC_VERSION: ${{ needs.prepare.outputs.rc_version }}
+          RC_SOURCE_SHA: ${{ needs.prepare.outputs.rc_source_sha }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_commit_sha }}
+          NEXT_DEV: ${{ needs.prepare.outputs.next_dev_version }}
+          RELEASE_BRANCH: ${{ needs.prepare.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master "$RELEASE_BRANCH"
+          python3 scripts/promote_release.py open-sync-pr \
+            --master-ref origin/master \
+            --version "$STABLE_VERSION" \
+            --rc-version "$RC_VERSION" \
+            --rc-source-sha "$RC_SOURCE_SHA" \
+            --release-sha "$RELEASE_SHA" \
+            --next-dev-version "$NEXT_DEV"
+
+  validate-published-ios:
+    name: Validate published iOS SwiftPM consumer
+    needs: [prepare, publish]
+    if: success() && !inputs.dry_run
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out promoted release source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.release_commit_sha }}
+
+      - name: Download matching source and checksum
+        shell: bash
+        env:
+          RELEASE_TAG: marmotkit-v${{ needs.prepare.outputs.stable_version }}
+          BINARY_NAME: MarmotKitFFI-${{ needs.prepare.outputs.stable_version }}.xcframework.zip
+          SWIFT_NAME: MarmotKit-${{ needs.prepare.outputs.stable_version }}.swift
+        run: |
+          set -euo pipefail
+          base_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
+          for attempt in 1 2 3 4 5; do
+            if curl -fL --retry 3 --retry-delay 2 \
+              "$base_url/$SWIFT_NAME" -o "$RUNNER_TEMP/MarmotKit.swift" && \
+              curl -fL --retry 3 --retry-delay 2 \
+              "$base_url/$BINARY_NAME.swiftpm-checksum" -o "$RUNNER_TEMP/swiftpm-checksum"; then
+              break
+            fi
+            if [[ $attempt -eq 5 ]]; then
+              echo "error: published MarmotKit assets did not become available" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          checksum="$(tr -d '[:space:]' < "$RUNNER_TEMP/swiftpm-checksum")"
+          ./crates/marmot-uniffi/validate-swift-package.sh \
+            "$base_url/$BINARY_NAME" \
+            "$checksum" \
+            "$RUNNER_TEMP/MarmotKit.swift" \
+            "$RUNNER_TEMP/marmotkit-remote-consumer"
+
+  validate-published-macos:
+    name: Validate published macOS SwiftPM consumer
+    needs: [prepare, publish]
+    if: success() && !inputs.dry_run
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out promoted release source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.release_commit_sha }}
+
+      - name: Download matching source and checksum
+        shell: bash
+        env:
+          RELEASE_TAG: marmotkit-v${{ needs.prepare.outputs.stable_version }}
+          MACOS_BINARY_NAME: MarmotKitFFI-macos-${{ needs.prepare.outputs.stable_version }}.xcframework.zip
+          SWIFT_NAME: MarmotKit-${{ needs.prepare.outputs.stable_version }}.swift
+        run: |
+          set -euo pipefail
+          base_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
+          for attempt in 1 2 3 4 5; do
+            if curl -fL --retry 3 --retry-delay 2 \
+              "$base_url/$SWIFT_NAME" -o "$RUNNER_TEMP/MarmotKit.swift" && \
+              curl -fL --retry 3 --retry-delay 2 \
+              "$base_url/$MACOS_BINARY_NAME.swiftpm-checksum" -o "$RUNNER_TEMP/swiftpm-checksum"; then
+              break
+            fi
+            if [[ $attempt -eq 5 ]]; then
+              echo "error: published MarmotKit macOS assets did not become available" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          checksum="$(tr -d '[:space:]' < "$RUNNER_TEMP/swiftpm-checksum")"
+          ./crates/marmot-uniffi/validate-swift-package-macos.sh \
+            "$base_url/$MACOS_BINARY_NAME" \
+            "$checksum" \
+            "$RUNNER_TEMP/MarmotKit.swift" \
+            "$RUNNER_TEMP/marmotkit-remote-macos-consumer"
