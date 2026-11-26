@@ -653,6 +653,82 @@ async fn live_kind_3_recency_guards_search_graph_and_survives_reopen() {
         Some(vec![bob.clone()])
     );
 
+    // Search-first / promoted lag repair: an equal-timestamp live event (200) must
+    // reconcile the lagging promoted row up to the graph's accepted timestamp (200),
+    // and once both tiers hold 200, another live event at 200 must be rejected.
+    directory
+        .ingest_directory_relay_event(kind3(&unknown_keys, 200, &bob))
+        .unwrap();
+    assert_eq!(
+        cache.entry(&unknown_author).unwrap().unwrap().follows,
+        vec![bob.clone()]
+    );
+    assert_eq!(
+        cache
+            .entry(&unknown_author)
+            .unwrap()
+            .unwrap()
+            .follows_created_at,
+        200
+    );
+    assert_eq!(
+        shared
+            .public_directory_user(&unknown_author)
+            .unwrap()
+            .unwrap()
+            .follows,
+        vec![bob.clone()]
+    );
+    directory
+        .ingest_directory_relay_event(kind3(&unknown_keys, 200, &carol))
+        .unwrap();
+    assert_eq!(
+        cache.entry(&unknown_author).unwrap().unwrap().follows,
+        vec![bob.clone()]
+    );
+
+    // A failed promoted write must not advance the search graph ahead of the promoted
+    // row, so retrying the same event at timestamp 300 still succeeds and updates both tiers.
+    let closed_shared = SqliteSharedStorage::in_memory().unwrap();
+    closed_shared.close().unwrap();
+    let failing_directory = Directory::new(
+        Resources {
+            shared: closed_shared,
+            ..resources.clone()
+        },
+        DirectoryConfig {
+            directory_relays: vec![],
+            default_relays: vec![],
+            max_future_skew: Duration::from_secs(60),
+            open_ranking: None,
+            fallback_seeds: vec![],
+            http_builder: Ok,
+            test_clock: None,
+        },
+        plane.clone(),
+        DirectoryState::default(),
+    );
+    assert!(
+        failing_directory
+            .ingest_directory_relay_event(kind3(&unknown_keys, 300, &dave))
+            .is_err()
+    );
+    assert_eq!(
+        cache.search_graph_follows(&unknown_author).unwrap(),
+        Some(vec![bob.clone()])
+    );
+    directory
+        .ingest_directory_relay_event(kind3(&unknown_keys, 300, &dave))
+        .unwrap();
+    assert_eq!(
+        cache.entry(&unknown_author).unwrap().unwrap().follows,
+        vec![dave.clone()]
+    );
+    assert_eq!(
+        cache.search_graph_follows(&unknown_author).unwrap(),
+        Some(vec![dave.clone()])
+    );
+
     // Reopen cache: durable follows_created_at still blocks older replays for both
     // known and promoted graph-only authors.
     cache.close().unwrap();
@@ -678,7 +754,7 @@ async fn live_kind_3_recency_guards_search_graph_and_survives_reopen() {
         .ingest_directory_relay_event(kind3(&local_keys, 180, &carol))
         .unwrap();
     reopened_directory
-        .ingest_directory_relay_event(kind3(&unknown_keys, 180, &carol))
+        .ingest_directory_relay_event(kind3(&unknown_keys, 250, &carol))
         .unwrap();
     reopened_directory
         .remember_directory_follow_list(
@@ -686,13 +762,13 @@ async fn live_kind_3_recency_guards_search_graph_and_survives_reopen() {
             &FetchedFollowList {
                 follows: vec![carol.clone()],
                 source_relays: vec!["wss://relay.example".into()],
-                created_at: 180,
+                created_at: 250,
             },
         )
         .unwrap();
     assert_eq!(
         reopened.entry(&local_author).unwrap().unwrap().follows,
-        vec![dave]
+        vec![dave.clone()]
     );
     assert_eq!(
         reopened
@@ -702,17 +778,13 @@ async fn live_kind_3_recency_guards_search_graph_and_survives_reopen() {
             .follows_created_at,
         200
     );
-    assert!(
-        reopened
-            .entry(&unknown_author)
-            .unwrap()
-            .unwrap()
-            .follows
-            .is_empty()
+    assert_eq!(
+        reopened.entry(&unknown_author).unwrap().unwrap().follows,
+        vec![dave.clone()]
     );
     assert_eq!(
         reopened.search_graph_follows(&unknown_author).unwrap(),
-        Some(vec![bob])
+        Some(vec![dave])
     );
 
     reopened.close().unwrap();
@@ -802,6 +874,22 @@ async fn key_package_recency_barriers_and_live_kind_5_deletion_invalidation() {
         .unwrap();
     directory
         .remember_directory_key_package(&kp_tie_higher_id)
+        .unwrap();
+    assert_eq!(
+        cache_a
+            .entry(&author)
+            .unwrap()
+            .unwrap()
+            .key_package
+            .as_ref()
+            .unwrap()
+            .key_package_event_id,
+        kp_newer.key_package_event_id
+    );
+
+    // Live relay ingest of an older different slot must NOT regress a newer cached slot.
+    directory
+        .remember_directory_key_package_inner(&kp_other_slot, false)
         .unwrap();
     assert_eq!(
         cache_a

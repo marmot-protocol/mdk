@@ -40,7 +40,7 @@ use super::records::{
 use super::resources::DirectoryResources;
 use crate::error::DirectoryError;
 use crate::error::blocking_directory_task;
-use crate::ids::{npub_for_account_id_lossy, parse_account_id_hex};
+use crate::ids::parse_account_id_hex;
 use crate::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, relay_list_state_from_event};
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 use transport_nostr_adapter::KIND_NIP65_RELAY_LIST;
@@ -1051,11 +1051,11 @@ async fn extend_with_follows<R: DirectoryResources + DirectoryObserver>(
     for batch in unknown.chunks(SEARCH_PUBKEY_BATCH_SIZE) {
         let fetched = fetch_follow_lists(directory, batch).await?;
         cache_resolved_follows(directory, &fetched).await?;
-        for (_, follows, _) in fetched {
+        for (_, follow_list) in fetched {
             if searcher.is_some() {
-                emitter.remember_follows(&follows);
+                emitter.remember_follows(&follow_list.follows);
             }
-            if !layer.admit(follows, seen) {
+            if !layer.admit(follow_list.follows, seen) {
                 return Ok(());
             }
         }
@@ -1182,7 +1182,7 @@ async fn partition_cached_follows<R: DirectoryResources + DirectoryObserver>(
 async fn fetch_follow_lists<R: DirectoryResources + DirectoryObserver>(
     directory: &Directory<R>,
     batch: &[String],
-) -> Result<Vec<(String, Vec<String>, u64)>, DirectoryError> {
+) -> Result<Vec<(String, crate::FetchedFollowList)>, DirectoryError> {
     let records = directory
         .fetch_events_for_account_ids(batch, KIND_NOSTR_CONTACT_LIST, &[])
         .await?;
@@ -1200,11 +1200,7 @@ async fn fetch_follow_lists<R: DirectoryResources + DirectoryObserver>(
             let records = by_author.remove(account_id_hex)?;
             let follow_list =
                 latest_follow_list_from_records(account_id_hex, records, freshness).value?;
-            Some((
-                account_id_hex.clone(),
-                follow_list.follows,
-                follow_list.created_at,
-            ))
+            Some((account_id_hex.clone(), follow_list))
         })
         .collect())
 }
@@ -1212,25 +1208,18 @@ async fn fetch_follow_lists<R: DirectoryResources + DirectoryObserver>(
 /// Keep the contact lists this layer fetched, so the next search expands from
 /// the device instead of the network.
 ///
-/// Un-promoted, exactly like [`cache_resolved_profiles`]: recording that
-/// somebody follows somebody is graph data, not a relationship of the user's.
+/// Routed through [`Directory::remember_directory_follow_edges_for_search`] so
+/// unknown authors stay un-promoted in the search graph while already-known
+/// authors update both tiers inside the serialized directory update lane.
 async fn cache_resolved_follows<R: DirectoryResources + DirectoryObserver>(
     directory: &Directory<R>,
-    fetched: &[(String, Vec<String>, u64)],
+    fetched: &[(String, crate::FetchedFollowList)],
 ) -> Result<(), DirectoryError> {
     let fetched = fetched.to_vec();
     let directory = directory.clone();
     blocking_directory_task(move || {
-        for cache in directory.resources.current_caches()? {
-            for (account_id_hex, follows, created_at) in &fetched {
-                cache.remember_search_graph_follows(
-                    account_id_hex,
-                    &npub_for_account_id_lossy(account_id_hex),
-                    follows,
-                    *created_at,
-                    false,
-                )?;
-            }
+        for (account_id_hex, follow_list) in &fetched {
+            directory.remember_directory_follow_edges_for_search(account_id_hex, follow_list)?;
         }
         Ok(())
     })

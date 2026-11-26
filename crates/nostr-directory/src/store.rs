@@ -351,6 +351,14 @@ impl<R: DirectoryResources> Directory<R> {
         &self,
         fetched: &FetchedKeyPackage,
     ) -> Result<(), DirectoryError> {
+        self.remember_directory_key_package_inner(fetched, true)
+    }
+
+    fn remember_directory_key_package_inner(
+        &self,
+        fetched: &FetchedKeyPackage,
+        replace_cross_slot: bool,
+    ) -> Result<(), DirectoryError> {
         let freshness = self.directory_freshness();
         self.resources
             .shared_storage()?
@@ -417,6 +425,12 @@ impl<R: DirectoryResources> Directory<R> {
                         );
                         mutated |= cached.source_relays.len() != before;
                     }
+                    // Live relay ingest receives arbitrary slots one event at a time;
+                    // keep the newer cached slot instead of letting an older-slot replay
+                    // regress the cache and churn writes/callbacks. Explicit selector
+                    // callers pass `replace_cross_slot = true` so their chosen slot wins.
+                    Some(cached)
+                        if !replace_cross_slot && cached.created_at >= fetched.created_at => {}
                     _ => {
                         entry.key_package = Some(DirectoryKeyPackage {
                             key_package_id: fetched.key_package_id.clone(),
@@ -557,14 +571,6 @@ impl<R: DirectoryResources> Directory<R> {
         self.remember_directory_follow_edges_for_search_inner(account_id_hex, follow_list, false)
     }
 
-    fn remember_directory_follow_edges_for_search_if_newer(
-        &self,
-        account_id_hex: &str,
-        follow_list: &FetchedFollowList,
-    ) -> Result<(), DirectoryError> {
-        self.remember_directory_follow_edges_for_search_inner(account_id_hex, follow_list, true)
-    }
-
     fn remember_directory_follow_edges_for_search_inner(
         &self,
         account_id_hex: &str,
@@ -573,6 +579,7 @@ impl<R: DirectoryResources> Directory<R> {
     ) -> Result<(), DirectoryError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
         let npub = npub_for_account_id(&account_id_hex)?;
+        let mut accepted = false;
         self.update_directory_entry_with_options(
             &account_id_hex,
             "directory",
@@ -583,26 +590,41 @@ impl<R: DirectoryResources> Directory<R> {
                 let graph_created_at =
                     max_search_graph_follows_created_at(caches, &account_id_hex)?;
                 let known_created_at = entry_created_at.max(graph_created_at);
-                if !follow_recency_accepts(
-                    known_created_at,
-                    follow_list.created_at,
-                    require_strictly_newer,
-                ) {
-                    return Ok(false);
-                }
-                for cache in caches {
-                    cache.remember_search_graph_follows(
-                        &account_id_hex,
-                        &npub,
-                        &follow_list.follows,
+                // Reconcile a lagging promoted row (e.g. promoted after graph-only
+                // caching or retrying after a partial write) when an equal-timestamp
+                // event matches the graph's accepted version, while still rejecting
+                // equal-timestamp live overwrites once both tiers hold that version.
+                let repairs_lagging_entry = entry.is_some()
+                    && follow_list.created_at > 0
+                    && follow_list.created_at == known_created_at
+                    && entry_created_at < known_created_at;
+                if !repairs_lagging_entry
+                    && !follow_recency_accepts(
+                        known_created_at,
                         follow_list.created_at,
                         require_strictly_newer,
-                    )?;
+                    )
+                {
+                    return Ok(false);
                 }
-                // Graph-only ingestion must not promote an unknown author.
+                accepted = true;
                 let Some(entry) = entry else {
+                    // Graph-only ingestion must not promote an unknown author.
+                    for cache in caches {
+                        cache.remember_search_graph_follows(
+                            &account_id_hex,
+                            &npub,
+                            &follow_list.follows,
+                            follow_list.created_at,
+                            require_strictly_newer,
+                        )?;
+                    }
                     return Ok(false);
                 };
+                // For known authors, `update_directory_entry_with_options` commits
+                // `shared_storage` first and then `cache.put_with_reason` updates both
+                // `directory_users` and `directory_search_graph_users` in one SQLite
+                // transaction, so a shared-storage write failure never advances the graph.
                 entry.follows = follow_list.follows.clone();
                 entry.follow_source_relays = follow_list.source_relays.clone();
                 if follow_list.created_at > 0 {
@@ -610,7 +632,26 @@ impl<R: DirectoryResources> Directory<R> {
                 }
                 Ok(true)
             },
-        )
+        )?;
+        // `put_search_graph_snapshot` skips untimestamped empty follow lists so bare
+        // promotion does not erase graph edges; record explicit empty lists here after
+        // the promoted write succeeds.
+        if accepted
+            && !require_strictly_newer
+            && follow_list.created_at == 0
+            && follow_list.follows.is_empty()
+        {
+            for cache in self.resources.current_caches()? {
+                cache.remember_search_graph_follows(
+                    &account_id_hex,
+                    &npub,
+                    &follow_list.follows,
+                    0,
+                    false,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub fn remember_directory_profile(
@@ -705,9 +746,10 @@ impl<R: DirectoryResources> Directory<R> {
             }
             KIND_NOSTR_CONTACT_LIST => {
                 let follow_list = follow_list_from_record(record);
-                self.remember_directory_follow_edges_for_search_if_newer(
+                self.remember_directory_follow_edges_for_search_inner(
                     &account_id_hex,
                     &follow_list,
+                    true,
                 )?;
             }
             KIND_NIP65_RELAY_LIST | KIND_MARMOT_INBOX_RELAY_LIST => {
@@ -745,7 +787,7 @@ impl<R: DirectoryResources> Directory<R> {
                 fetched.relay_lists = self
                     .cached_relay_list_status(&account_id_hex)
                     .unwrap_or_else(|_| AccountRelayListStatus::empty());
-                self.remember_directory_key_package(&fetched)?;
+                self.remember_directory_key_package_inner(&fetched, false)?;
             }
             5 => {
                 let observed_at = self.directory_freshness().now;
