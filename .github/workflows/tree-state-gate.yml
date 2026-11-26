@@ -1,0 +1,98 @@
+name: Tree state gate
+
+# Evaluates the signed `tree-state` orphan branch from trusted default-branch
+# workflow code (never checking out PR code) and publishes the commit status
+# context `tree-state`. Runs on PR events (`pull_request_target`), on explicit
+# dispatch (`workflow_dispatch`, triggered by Canary whenever `tree-state`
+# flips), and on a 15-minute reconciliation schedule so an already-green,
+# auto-merge-enabled PR is blocked at merge time when `tree-state` turns red.
+on:
+  pull_request_target:
+    branches:
+      - master
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+# Serialize all runs so a slower pre-flip PR event cannot overwrite a newer
+# green->red (or red->green) reconciliation status on the same commit.
+concurrency:
+  group: tree-state-gate
+  cancel-in-progress: false
+
+jobs:
+  tree-state:
+    name: Publish tree-state status
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate tree state and publish commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Read `state.json` from the signed `tree-state` branch (retry once on transient API error).
+          state=""
+          for attempt in 1 2; do
+            if raw="$(gh api "repos/$REPO/contents/state.json?ref=tree-state" --jq '.content' 2>/dev/null)" \
+              && decoded="$(tr -d '\n' <<<"$raw" | base64 -d 2>/dev/null)"; then
+              state="$(jq -r 'if type == "object" and (.state | type == "string") then .state else "" end' <<<"$decoded" 2>/dev/null || true)"
+              [[ -n "$state" ]] && break
+            fi
+            if (( attempt == 1 )); then sleep 2; fi
+          done
+
+          publish_pr() {
+            local pr_json="$1"
+            local sha head_repo head_fork assoc is_team has_bypass status desc
+            sha="$(jq -r '.head.sha // ""' <<<"$pr_json")"
+            [[ -n "$sha" ]] || return 0
+            head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$pr_json")"
+            head_fork="$(jq -r 'if .head.repo.fork == true then "true" else "false" end' <<<"$pr_json")"
+            assoc="$(jq -r '.author_association // ""' <<<"$pr_json")"
+            has_bypass="$(jq -r '([.labels[].name] | index("tree-fix") != null or index("revert") != null) | tostring' <<<"$pr_json")"
+
+            is_team=false
+            if [[ -n "$head_repo" && "$head_repo" == "$REPO" && "$head_fork" != "true" ]]; then
+              case "$assoc" in
+                OWNER|MEMBER|COLLABORATOR) is_team=true ;;
+              esac
+            fi
+
+            if [[ "$state" == "green" ]]; then
+              status=success
+              desc="tree-state is green"
+            elif [[ "$is_team" == "true" && "$has_bypass" == "true" ]]; then
+              status=success
+              desc="tree-state is ${state:-unknown}; bypassed by team tree-fix/revert label"
+            else
+              status=failure
+              desc="tree-state is ${state:-unknown}; only team PRs labeled tree-fix or revert may merge"
+            fi
+
+            gh api --method POST "repos/$REPO/statuses/$sha" \
+              -f state="$status" \
+              -f context="tree-state" \
+              -f description="$desc" >/dev/null
+            echo "PR #$(jq -r '.number' <<<"$pr_json") (${sha:0:9}): tree-state=$status ($desc)"
+          }
+
+          if [[ "$EVENT_NAME" == "pull_request_target" && -n "$PR_NUMBER" ]]; then
+            pr_json="$(gh api "repos/$REPO/pulls/$PR_NUMBER")"
+            publish_pr "$pr_json"
+          else
+            while IFS= read -r pr_json; do
+              [[ -n "$pr_json" ]] || continue
+              publish_pr "$pr_json"
+            done < <(gh api --paginate "repos/$REPO/pulls?state=open&base=master&per_page=100" --jq '.[] | @json')
+          fi

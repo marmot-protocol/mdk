@@ -309,45 +309,147 @@ class MergeGatePolicyTests(unittest.TestCase):
                 )
                 self.assertEqual(output.read_text(), f"is_team_pr={expected}\n")
 
-    def test_tree_state_fails_closed_unless_green_or_team_bypass_label(self):
-        script = workflow_step("ci.yml", "Check tree state")
+    def test_tree_state_gate_is_trusted_and_reconciles_open_prs_on_flip(self):
+        workflow = (ROOT / ".github/workflows/tree-state-gate.yml").read_text()
+        self.assertIn("  pull_request_target:", workflow)
+        self.assertIn("  workflow_dispatch:", workflow)
+        self.assertIn("  schedule:", workflow)
+        self.assertIn("  group: tree-state-gate\n  cancel-in-progress: false", workflow)
+        self.assertNotIn("actions/checkout", workflow)
+        self.assertNotIn("github.event.pull_request.head", workflow)
+        self.assertNotIn("secrets.", workflow)
+
+        script = workflow_step("tree-state-gate.yml", "Evaluate tree state and publish commit status")
+        self.assertNotIn("${{", script)
+
         import base64
         green_b64 = base64.b64encode(b'{"state":"green"}').decode()
         red_b64 = base64.b64encode(b'{"state":"red","reason":"canary failed"}').decode()
         bad_b64 = base64.b64encode(b'{"state":true}').decode()
-        cases = [
-            ("push", "true", "false", "error", True),
-            ("pull_request", "true", "false", green_b64, True),
-            ("pull_request", "false", "false", green_b64, True),
-            ("pull_request", "true", "false", red_b64, False),
-            ("pull_request", "true", "true", red_b64, True),
-            ("pull_request", "false", "true", red_b64, False),
-            ("pull_request", "true", "false", bad_b64, False),
-            ("pull_request", "true", "false", "error", False),
-            ("pull_request", "true", "true", "error", True),
-        ]
-        for event, is_team, bypass, response, expected in cases:
-            with self.subTest(event=event, is_team=is_team, bypass=bypass, response=response[:8]):
-                fake = textwrap.dedent("""\
-                    gh() {
-                      if [[ "$FAKE_RESP" == "error" ]]; then return 1; fi
-                      printf '%s\\n' "$FAKE_RESP"
-                    }
-                """)
+
+        team_pr = {
+            "number": 101,
+            "head": {"sha": "1111111111111111111111111111111111111111",
+                     "repo": {"full_name": "marmot-protocol/mdk", "fork": False}},
+            "author_association": "MEMBER",
+            "labels": [],
+        }
+        team_fix_pr = {
+            "number": 102,
+            "head": {"sha": "2222222222222222222222222222222222222222",
+                     "repo": {"full_name": "marmot-protocol/mdk", "fork": False}},
+            "author_association": "MEMBER",
+            "labels": [{"name": "revert"}],
+        }
+        fork_pr_with_label = {
+            "number": 103,
+            "head": {"sha": "3333333333333333333333333333333333333333",
+                     "repo": {"full_name": "external/mdk", "fork": True}},
+            "author_association": "CONTRIBUTOR",
+            "labels": [{"name": "tree-fix"}],
+        }
+
+        fake = textwrap.dedent("""\
+            sleep() { :; }
+            gh() {
+              if [[ "$1" == "api" && "$2" == "--method" ]]; then
+                local path="$4" state="" context=""
+                shift 4
+                while (( $# )); do
+                  if [[ "$1" == "-f" ]]; then
+                    case "$2" in
+                      state=*) state="${2#state=}" ;;
+                      context=*) context="${2#context=}" ;;
+                    esac
+                    shift 2
+                  else
+                    shift
+                  fi
+                done
+                printf '%s %s %s\\n' "${path##*/}" "$context" "$state" >> "$POSTED"
+                return 0
+              fi
+              if [[ "$*" == *"contents/state.json?ref=tree-state"* ]]; then
+                if [[ "$FAKE_STATE" == "error" ]]; then return 1; fi
+                printf '%s\\n' "$FAKE_STATE"
+                return 0
+              fi
+              if [[ "$*" == *"pulls?state=open"* ]]; then
+                printf '%s' "$FAKE_OPEN_PRS" | jq -r '.[] | @json'
+                return 0
+              fi
+              if [[ "$*" == *"pulls/"* ]]; then
+                printf '%s\\n' "$FAKE_PR"
+                return 0
+              fi
+              return 1
+            }
+        """)
+
+        def run_gate(event, fake_state, pr=None, open_prs=None):
+            with tempfile.TemporaryDirectory() as tmp:
+                posted = Path(tmp) / "posted"
                 result = subprocess.run(
                     ["bash", "-c", fake + script],
                     capture_output=True,
+                    text=True,
                     timeout=10,
                     env={
                         **os.environ,
                         "EVENT_NAME": event,
                         "REPO": "marmot-protocol/mdk",
-                        "IS_TEAM_PR": is_team,
-                        "TREE_BYPASS": bypass,
-                        "FAKE_RESP": response,
+                        "PR_NUMBER": str(pr["number"]) if pr else "",
+                        "FAKE_STATE": fake_state,
+                        "FAKE_PR": json.dumps(pr) if pr else "",
+                        "FAKE_OPEN_PRS": json.dumps(open_prs or []),
+                        "POSTED": str(posted),
                     },
                 )
-                self.assertEqual(result.returncode == 0, expected, result.stderr.decode())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return posted.read_text().splitlines() if posted.exists() else []
+
+        # Single PR events: green passes; red/invalid/error fail closed unless team revert/tree-fix.
+        self.assertEqual(
+            run_gate("pull_request_target", green_b64, pr=team_pr),
+            [f"{team_pr['head']['sha']} tree-state success"],
+        )
+        self.assertEqual(
+            run_gate("pull_request_target", red_b64, pr=team_pr),
+            [f"{team_pr['head']['sha']} tree-state failure"],
+        )
+        self.assertEqual(
+            run_gate("pull_request_target", red_b64, pr=team_fix_pr),
+            [f"{team_fix_pr['head']['sha']} tree-state success"],
+        )
+        self.assertEqual(
+            run_gate("pull_request_target", red_b64, pr=fork_pr_with_label),
+            [f"{fork_pr_with_label['head']['sha']} tree-state failure"],
+        )
+        self.assertEqual(
+            run_gate("pull_request_target", bad_b64, pr=team_pr),
+            [f"{team_pr['head']['sha']} tree-state failure"],
+        )
+        self.assertEqual(
+            run_gate("pull_request_target", "error", pr=team_pr),
+            [f"{team_pr['head']['sha']} tree-state failure"],
+        )
+
+        # Green->red reconciliation updates EVERY already-green open PR without a new PR commit.
+        self.assertEqual(
+            run_gate("workflow_dispatch", red_b64, open_prs=[team_pr, team_fix_pr, fork_pr_with_label]),
+            [
+                f"{team_pr['head']['sha']} tree-state failure",
+                f"{team_fix_pr['head']['sha']} tree-state success",
+                f"{fork_pr_with_label['head']['sha']} tree-state failure",
+            ],
+        )
+        self.assertEqual(
+            run_gate("workflow_dispatch", green_b64, open_prs=[team_pr, fork_pr_with_label]),
+            [
+                f"{team_pr['head']['sha']} tree-state success",
+                f"{fork_pr_with_label['head']['sha']} tree-state success",
+            ],
+        )
 
     def test_team_prs_select_fast_mode_while_external_prs_and_opt_ins_select_full(self):
         script = workflow_step("ci.yml", "Select CI mode")
@@ -383,6 +485,7 @@ class MergeGatePolicyTests(unittest.TestCase):
             "signatures": {"result": "success"},
             "changes": {"result": "success"},
             "rust-format": {"result": "success"},
+            "rust-audit": {"result": "success"},
             "rust-test": {"result": "success"},
         }
         skipped = {**passed, "rust-test": {"result": "skipped"}}
@@ -394,6 +497,8 @@ class MergeGatePolicyTests(unittest.TestCase):
             ("pull_request", "fast", "true", {**skipped, "signatures": {"result": "skipped"}}, False),
             ("pull_request", "fast", "true", {**skipped, "changes": {"result": "skipped"}}, False),
             ("pull_request", "fast", "true", {**skipped, "rust-format": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", {**skipped, "rust-audit": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", {**skipped, "rust-audit": {"result": "failure"}}, False),
             ("pull_request", "fast", "true", {**skipped, "rust-format": {"result": "failure"}}, False),
             ("pull_request", "fast", "true", cancelled, False),
             ("pull_request", "fast", "false", skipped, False),
@@ -423,16 +528,25 @@ class MergeGatePolicyTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode == 0, expected)
 
-    def test_fast_team_gate_skips_heavy_compile_and_audit_jobs(self):
+    def test_fast_team_gate_skips_heavy_compile_jobs_and_honors_ci_apple(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         jobs = workflow.split("\njobs:\n", 1)[1]
-        for job_name in ("rust-audit", "rust-wasm-check", "rust-clippy", "rust-test-build"):
+        blocks = {
+            block.split(":\n", 1)[0]: block
+            for block in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs)
+            if ":\n" in block
+        }
+        for job_name in ("rust-wasm-check", "rust-clippy", "rust-test-build"):
             with self.subTest(job=job_name):
-                block = next(
-                    b for b in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs)
-                    if b.startswith(f"{job_name}:\n")
+                self.assertIn("needs.changes.outputs.ci_mode != 'fast'", blocks[job_name])
+        # `ci:apple` must trigger both macOS jobs even when changed paths leave run_ios=false.
+        for job_name in ("ios-account-clippy", "marmotkit-native-host"):
+            with self.subTest(job=job_name):
+                self.assertIn(
+                    "needs.changes.outputs.apple_opt_in == 'true'\n"
+                    "      || (needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_ios == 'true')",
+                    blocks[job_name],
                 )
-                self.assertIn("needs.changes.outputs.ci_mode != 'fast'", block)
 
     def test_required_ci_needs_every_gating_job(self):
         # Required CI is the only required check, so a job missing from its

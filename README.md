@@ -220,18 +220,20 @@ cargo test -p <crate>        # targeted tests for the crate you changed
 just ci                      # full local parity with GitHub CI (slow)
 ```
 
-Team pull requests run a ~1-minute static gate: verified commit signatures, the
-signed `tree-state` check (which pauses merges while `master` is red unless
-labeled `tree-fix` or `revert`), formatting, static/contract gates (the tracing
-audit among them), and advisory commit-trailer checks. External/fork pull
-requests and `ci:full` / manual runs execute the full `ci.yml` matrix on
-GitHub-hosted runners: dependency audit, workspace clippy, WASM build, every
+Team pull requests run a ~1-minute static gate: verified commit signatures,
+formatting, static/contract gates (the tracing audit among them), `cargo-audit`,
+and advisory commit-trailer checks, alongside the trusted `tree-state` status
+check (`.github/workflows/tree-state-gate.yml`, which blocks merges on all open
+PRs while `master` is red unless a team PR is labeled `tree-fix` or `revert`).
+External/fork pull requests and `ci:full` / manual runs execute the full
+`ci.yml` matrix on GitHub-hosted runners: workspace clippy, WASM build, every
 workspace test with the `ci` nextest profile, the CLI and relay end-to-end
 suites, simulator lanes, C bindings, iOS clippy, Windows filesystem contracts,
-Tamarin, Hermes and installer checks. `Required CI` must pass before a change
-lands, and post-merge `Canary` runs continuously verify `master`. Master pushes
-run CI only to refresh the Rust dependency caches when `Cargo.lock`, a
-`Cargo.toml`, the toolchain pin, Cargo config or `ci.yml` changes.
+Tamarin, Hermes and installer checks. `Required CI` and `tree-state` must pass
+before a change lands, and post-merge `Canary` runs continuously verify
+`master`. Master pushes run CI only to refresh the Rust dependency caches when
+`Cargo.lock`, a `Cargo.toml`, the toolchain pin, Cargo config or `ci.yml`
+changes.
 
 Workspace test shards keep the runner's unused SDKs when at least 32 GiB is
 free; below that budget they reclaim SDK space before downloading the test

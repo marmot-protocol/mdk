@@ -1,13 +1,14 @@
 name: CI
 
 # Team pull requests run a fast static gate (~1 minute, zero Rust compile):
-# verified commit signatures, tree-state check (fail closed when `tree-state`
-# is red unless labeled `tree-fix`/`revert`), formatting, static/contract
-# gates, and advisory commit-trailer checks. External/fork pull requests,
-# `ci:full` pull requests, `workflow_dispatch`, and `merge_group` runs execute
-# the full CI matrix. Post-merge verification runs continuously on `master`
-# (advancing `canary`). Master pushes refresh Rust caches only when a
-# rust-cache input changes.
+# verified commit signatures, formatting, static/contract gates, cargo-audit,
+# and advisory commit-trailer checks. External/fork pull requests, `ci:full`
+# pull requests, `workflow_dispatch`, and `merge_group` runs execute the full
+# CI matrix (`.github/CODEOWNERS` protects `.github/` so fork PRs cannot edit
+# this workflow without owner review). Live `tree-state` enforcement runs in
+# `.github/workflows/tree-state-gate.yml` from the trusted default branch.
+# Post-merge verification runs continuously on `master` (advancing `canary`).
+# Master pushes refresh Rust caches only when a rust-cache input changes.
 #
 # GitHub evicts the least recently used caches once a repository passes 10 GB,
 # so that budget holds only the caches saved here and the wn-agent darwin
@@ -97,8 +98,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Read labels live so adding ci:full, ci:apple, tree-fix, or revert
-      # followed by "Re-run all jobs" takes effect without a new source commit.
+      # Read labels live so adding ci:full or ci:apple followed by "Re-run all
+      # jobs" takes effect without a new source commit.
       - name: Check CI opt-in labels
         id: labels
         env:
@@ -113,11 +114,11 @@ jobs:
           fi
           echo "full_ci=$(jq 'index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
           echo "apple_opt_in=$(jq 'index("ci:apple") != null or index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
-          echo "tree_bypass=$(jq 'index("tree-fix") != null or index("revert") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
 
       # Only branches pushed directly to this repository (non-fork) by a repo
       # OWNER, MEMBER, or COLLABORATOR qualify for the fast static PR gate.
-      # External/fork PRs always fail closed into full CI on GitHub runners.
+      # External/fork PRs always fail closed into full CI on GitHub runners;
+      # `.github/CODEOWNERS` requires owner review for any change to `.github/`.
       - name: Classify PR trust
         id: trust
         env:
@@ -136,39 +137,8 @@ jobs:
           fi
           echo "is_team_pr=$is_team_pr" >> "$GITHUB_OUTPUT"
 
-      # Fail closed when the signed `tree-state` orphan branch reports non-green,
-      # allowing only team PRs labeled `tree-fix` or `revert` to land fixes.
-      - name: Check tree state
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          IS_TEAM_PR: ${{ steps.trust.outputs.is_team_pr }}
-          TREE_BYPASS: ${{ steps.labels.outputs.tree_bypass }}
-        run: |
-          set -euo pipefail
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            echo "tree-state: skipped for $EVENT_NAME"
-            exit 0
-          fi
-          state=""
-          if raw="$(gh api "repos/$REPO/contents/state.json?ref=tree-state" --jq '.content' 2>/dev/null)" \
-            && decoded="$(tr -d '\n' <<<"$raw" | base64 -d 2>/dev/null)"; then
-            state="$(jq -r 'if type == "object" and (.state | type == "string") then .state else "" end' <<<"$decoded" 2>/dev/null || true)"
-          fi
-          if [[ "$state" == "green" ]]; then
-            echo "tree-state: green"
-            exit 0
-          fi
-          if [[ "$IS_TEAM_PR" == "true" && "$TREE_BYPASS" == "true" ]]; then
-            echo "tree-state: '${state:-unknown}' bypassed by team PR tree-fix/revert label"
-            exit 0
-          fi
-          echo "error: tree-state is '${state:-unknown}' (expected 'green'); only team PRs labeled 'tree-fix' or 'revert' may merge while master is red" >&2
-          exit 1
-
-      # fast: team pull requests without `ci:full` run signatures, tree-state,
-      # formatting, static gates, and advisory trailer checks (zero compile).
+      # fast: team pull requests without `ci:full` run signatures, formatting,
+      # static gates, cargo-audit, and advisory trailer checks (zero compile).
       # full: external/fork PRs, `ci:full` PRs, merge groups, and manual runs
       # execute every CI job.
       # warm: master pushes run only the jobs that save a Rust cache.
@@ -319,8 +289,7 @@ jobs:
 
   rust-audit:
     name: Rust audit
-    needs: changes
-    if: needs.changes.outputs.ci_mode != 'fast'
+    needs: signatures
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -551,8 +520,8 @@ jobs:
     name: iOS keychain and Swift cancellation
     needs: changes
     if: >-
-      needs.changes.outputs.run_ios == 'true'
-      && (needs.changes.outputs.ci_mode != 'fast' || needs.changes.outputs.apple_opt_in == 'true')
+      needs.changes.outputs.apple_opt_in == 'true'
+      || (needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_ios == 'true')
     runs-on: macos-latest
     # The cancellation smoke builds the shipped release profile (thin LTO, one
     # codegen unit), which grows with marmot-app. Queue runs took 16-27
@@ -602,8 +571,8 @@ jobs:
     name: MarmotKit native host lifecycle
     needs: changes
     if: >-
-      needs.changes.outputs.run_ios == 'true'
-      && (needs.changes.outputs.ci_mode != 'fast' || needs.changes.outputs.apple_opt_in == 'true')
+      needs.changes.outputs.apple_opt_in == 'true'
+      || (needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_ios == 'true')
     runs-on: macos-latest
     # The smoke took 6-9 minutes as a step of ios-account-clippy.
     timeout-minutes: 20
@@ -962,7 +931,6 @@ jobs:
         run: python3 scripts/ci_runner.py run cli-e2e-build -- cargo nextest archive -p wn-cli --test cli --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
 
       - name: Verify and describe test archive
-        if: needs.changes.outputs.ci_mode != 'fast'
         run: python3 scripts/ci_runner.py manifest tests.tar.zst
 
       - name: Upload test archive
@@ -1104,7 +1072,6 @@ jobs:
         run: python3 scripts/ci_runner.py run relay-runtime-build -- cargo nextest archive -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
 
       - name: Verify and describe test archive
-        if: needs.changes.outputs.ci_mode != 'fast'
         run: python3 scripts/ci_runner.py manifest tests.tar.zst
 
       - name: Upload test archive
@@ -1337,7 +1304,6 @@ jobs:
         run: python3 scripts/ci_runner.py run conformance-build -- cargo nextest archive -p cgka-conformance-simulator --locked --profile ci --archive-file simulator.tar.zst
 
       - name: Verify and describe test archive
-        if: needs.changes.outputs.ci_mode != 'fast'
         run: python3 scripts/ci_runner.py manifest simulator.tar.zst
 
       - name: Upload simulator test archive
@@ -1946,6 +1912,7 @@ jobs:
                 .signatures.result == "success"
                 and .changes.result == "success"
                 and .["rust-format"].result == "success"
+                and .["rust-audit"].result == "success"
                 and all(.[]; .result | IN("success", "skipped"))
               ' <<<"$NEEDS"
               ;;

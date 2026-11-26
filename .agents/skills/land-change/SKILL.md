@@ -248,9 +248,9 @@ Merge only when the user asks, and only the head that was verified and
 reviewed: confirm `headRefOid` is still the reviewed head and `Required CI` is
 green.
 
-If `Check tree state` failed because the signed `tree-state` branch is `red`
-(Meltdown Mode), do not bypass it on unrelated changes; only team PRs labeled
-`tree-fix` or `revert` may merge while `master` is red.
+If the `tree-state` status check is failing because the signed `tree-state`
+branch is `red` (Meltdown Mode), do not bypass it on unrelated changes; only
+team PRs labeled `tree-fix` or `revert` pass `tree-state` while `master` is red.
 
 Squash-merge the reviewed head (with `--match-head-commit` so the merge fails
 if the branch moved):
