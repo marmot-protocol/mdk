@@ -253,11 +253,13 @@ impl InboxSealer for MockSealer {
 }
 
 /// [`MockSealer`] whose Welcome sealing fails while `fail` is set and never
-/// finishes while `park` is set, as a remote signer left waiting.
+/// finishes while `park` is set, as a remote signer left waiting; `parked`
+/// is notified when a seal parks.
 #[derive(Default)]
 struct SwitchableSealer {
     fail: AtomicBool,
     park: AtomicBool,
+    parked: tokio::sync::Notify,
 }
 
 #[async_trait]
@@ -271,6 +273,7 @@ impl InboxSealer for SwitchableSealer {
         welcome: &OutboundWelcome,
     ) -> Result<TransportMessage, PeelerError> {
         if self.park.load(Ordering::SeqCst) {
+            self.parked.notify_one();
             std::future::pending::<()>().await;
         }
         if self.fail.load(Ordering::SeqCst) {
@@ -1310,9 +1313,11 @@ async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
         initial_admins: Vec::new(),
     };
     sealer.park.store(true, Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_millis(200), runtime.send(invite.clone()))
-        .await
-        .expect_err("the parked seal holds the send until it is dropped");
+    // Drop the send once its seal parks.
+    tokio::select! {
+        _ = runtime.send(invite.clone()) => panic!("the parked seal holds the send"),
+        () = sealer.parked.notified() => {}
+    }
     assert!(adapter.inner.commit_publishes.lock().unwrap().is_empty());
     assert!(runtime.maintenance_due(&[]).unwrap().retry_while_owed);
 
