@@ -158,19 +158,28 @@ jobs:
           stage = Path(sys.argv[1])
           repo = f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}'
           sha = os.environ["SOURCE_SHA"]
+          readme = stage / "README.md"
+          sources = {readme: "crates/marmot-c"}
           for reference in sorted((stage / "references").glob("*/API-REFERENCE.md")):
-              crate = reference.parent.name
+              sources[reference] = f"crates/{reference.parent.name}"
+          readme_references = {
+              "API-GUIDE.md": "references/marmot-c/API-REFERENCE.md",
+              "../marmot-uniffi/API-GUIDE.md": "references/marmot-uniffi/API-REFERENCE.md",
+          }
 
+          for document, source_dir in sources.items():
               def rebase(match):
                   path, anchor = match[1], match[2] or ""
-                  if path.startswith("/") or (reference.parent / path).is_file():
+                  if document == readme and path in readme_references:
+                      return f"]({readme_references[path]}{anchor})"
+                  if path.startswith("/") or (document.parent / path).is_file():
                       return match[0]
-                  source = posixpath.normpath(f"crates/{crate}/{path}")
+                  source = posixpath.normpath(f"{source_dir}/{path}")
                   kind = "tree" if path.endswith("/") else "blob"
                   return f"]({repo}/{kind}/{sha}/{source}{anchor})"
 
-              text = reference.read_text()
-              reference.write_text(re.sub(r"\]\(([^)#:\s]+)(#[^)\s]*)?\)", rebase, text))
+              text = document.read_text()
+              document.write_text(re.sub(r"\]\(([^)#:\s]+)(#[^)\s]*)?\)", rebase, text))
           PY
 
           cat > "$stage/manifest.json" <<EOF
