@@ -1955,18 +1955,7 @@ where
                 .pending_replacement
                 .as_ref()
                 .expect("unsigned pending replacement exists");
-            let active_endpoints: Vec<_> = pending
-                .targets
-                .iter()
-                .filter(|target| target.state != TransportFanoutAttemptState::PolicyProhibited)
-                .map(|target| target.endpoint.clone())
-                .collect();
-            if active_endpoints.is_empty() {
-                return Err(crate::key_package::KeyPackagePublishError::unexposed(
-                    "no KeyPackage publication endpoints are configured",
-                )
-                .into());
-            }
+            let active_endpoints = active_pending_endpoints(&pending.targets)?;
             let publication = KeyPackagePublication {
                 account_id: self.session.self_id().clone(),
                 key_package: pending.key_package.clone(),
@@ -2031,18 +2020,7 @@ where
                 .as_ref()
                 .expect("prepared replacement has an exact signed event")
                 .clone();
-            let attempt_endpoints: Vec<_> = pending
-                .targets
-                .iter()
-                .filter(|target| target.state != TransportFanoutAttemptState::PolicyProhibited)
-                .map(|target| target.endpoint.clone())
-                .collect();
-            if attempt_endpoints.is_empty() {
-                return Err(crate::key_package::KeyPackagePublishError::unexposed(
-                    "no KeyPackage publication endpoints are configured",
-                )
-                .into());
-            }
+            let attempt_endpoints = active_pending_endpoints(&pending.targets)?;
             let publication = KeyPackagePublication {
                 account_id: self.session.self_id().clone(),
                 key_package: pending.key_package.clone(),
@@ -2343,11 +2321,7 @@ where
                     && lifecycle.authored_signed_event.is_some()
                     && lifecycle.publication_targets.iter().any(|target| {
                         current_endpoints.contains(&target.endpoint)
-                            && matches!(
-                                target.state,
-                                TransportFanoutAttemptState::Unattempted
-                                    | TransportFanoutAttemptState::AttemptedFailed
-                            )
+                            && target.state != TransportFanoutAttemptState::Accepted
                     })
             }))
     }
@@ -2462,19 +2436,6 @@ where
         let Some(artifact) = lifecycle.authored_signed_event.clone() else {
             return Ok(());
         };
-        let current_endpoints = self.routing.key_package_endpoints();
-        if prohibit_removed_fanout_targets(&mut lifecycle.publication_targets, &current_endpoints) {
-            if lifecycle.publication_targets.iter().all(|target| {
-                matches!(
-                    target.state,
-                    TransportFanoutAttemptState::Accepted
-                        | TransportFanoutAttemptState::PolicyProhibited
-                )
-            }) {
-                lifecycle.phase = cgka_traits::MaintenancePhase::Complete;
-            }
-            self.session.put_key_package_lifecycle(&lifecycle)?;
-        }
         let now = self.wall_clock.now();
         if lifecycle
             .current_not_after
@@ -2482,10 +2443,24 @@ where
         {
             return Ok(());
         }
+        let current_endpoints = self.routing.key_package_endpoints();
+        for target in &mut lifecycle.publication_targets {
+            if target.state == TransportFanoutAttemptState::PolicyProhibited
+                && current_endpoints.contains(&target.endpoint)
+            {
+                target.state = TransportFanoutAttemptState::Unattempted;
+                target.attempt_count = 0;
+                target.last_attempt_at = None;
+                target.failure_code = None;
+            }
+        }
         let endpoints = lifecycle
             .publication_targets
             .iter()
-            .filter(|target| key_package_target_retry_due(target, now))
+            .filter(|target| {
+                current_endpoints.contains(&target.endpoint)
+                    && key_package_target_retry_due(target, now)
+            })
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
         if endpoints.is_empty() {
@@ -2526,11 +2501,12 @@ where
                     self.wall_clock.now(),
                 );
                 lifecycle.phase = if lifecycle.publication_targets.iter().all(|target| {
-                    matches!(
-                        target.state,
-                        TransportFanoutAttemptState::Accepted
-                            | TransportFanoutAttemptState::PolicyProhibited
-                    )
+                    !current_endpoints.contains(&target.endpoint)
+                        || matches!(
+                            target.state,
+                            TransportFanoutAttemptState::Accepted
+                                | TransportFanoutAttemptState::PolicyProhibited
+                        )
                 }) {
                     cgka_traits::MaintenancePhase::Complete
                 } else {
@@ -8615,26 +8591,33 @@ fn merge_republish_publication_targets(
     changed
 }
 
-fn prohibit_removed_fanout_targets(
-    targets: &mut [TransportFanoutTarget],
+fn active_pending_endpoints(
+    targets: &[TransportFanoutTarget],
+) -> AccountResult<Vec<TransportEndpoint>> {
+    let endpoints: Vec<_> = targets
+        .iter()
+        .filter(|target| target.state != TransportFanoutAttemptState::PolicyProhibited)
+        .map(|target| target.endpoint.clone())
+        .collect();
+    if endpoints.is_empty() {
+        return Err(crate::key_package::KeyPackagePublishError::unexposed(
+            "no KeyPackage publication endpoints are configured",
+        )
+        .into());
+    }
+    Ok(endpoints)
+}
+
+fn has_newly_authorized_pending_target(
+    targets: &[TransportFanoutTarget],
     current_endpoints: &[TransportEndpoint],
 ) -> bool {
-    let mut changed = false;
-    for target in targets {
-        if current_endpoints.contains(&target.endpoint)
-            || matches!(
-                target.state,
-                TransportFanoutAttemptState::Accepted
-                    | TransportFanoutAttemptState::PolicyProhibited
-            )
-        {
-            continue;
-        }
-        target.state = TransportFanoutAttemptState::PolicyProhibited;
-        target.failure_code = Some("endpoint_removed_from_policy".into());
-        changed = true;
-    }
-    changed
+    current_endpoints.iter().any(|endpoint| {
+        targets
+            .iter()
+            .find(|target| target.endpoint == *endpoint)
+            .is_none_or(|target| target.state == TransportFanoutAttemptState::PolicyProhibited)
+    })
 }
 
 fn pending_targets_need_publish(
@@ -8642,15 +8625,11 @@ fn pending_targets_need_publish(
     current_endpoints: &[TransportEndpoint],
     now: Timestamp,
 ) -> bool {
-    current_endpoints.iter().any(|endpoint| {
-        targets
-            .iter()
-            .find(|target| target.endpoint == *endpoint)
-            .is_none_or(|target| {
-                target.state == TransportFanoutAttemptState::PolicyProhibited
-                    || key_package_target_retry_due(target, now)
-            })
-    })
+    has_newly_authorized_pending_target(targets, current_endpoints)
+        || targets.iter().any(|target| {
+            current_endpoints.contains(&target.endpoint)
+                && key_package_target_retry_due(target, now)
+        })
 }
 
 fn note_key_package_attempt(

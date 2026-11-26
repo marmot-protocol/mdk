@@ -233,7 +233,12 @@ where
         // The current publication's unacknowledged relays, at their backoff.
         if self.key_package_has_pending_fanout()? {
             for target in &lifecycle.publication_targets {
-                if current_endpoints.contains(&target.endpoint) {
+                if !current_endpoints.contains(&target.endpoint) {
+                    continue;
+                }
+                if target.state == TransportFanoutAttemptState::PolicyProhibited {
+                    due.owed();
+                } else {
                     due.at_opt(target_retry_at(target));
                 }
             }
@@ -250,15 +255,7 @@ where
                 }
             }
             Some(pending) => {
-                if current_endpoints.iter().any(|endpoint| {
-                    pending
-                        .targets
-                        .iter()
-                        .find(|target| target.endpoint == *endpoint)
-                        .is_none_or(|target| {
-                            target.state == TransportFanoutAttemptState::PolicyProhibited
-                        })
-                }) {
+                if has_newly_authorized_pending_target(&pending.targets, &current_endpoints) {
                     due.owed();
                 } else {
                     for target in &pending.targets {

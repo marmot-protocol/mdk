@@ -1150,15 +1150,51 @@ async fn persisted_pending_and_fanout_retries_respect_removed_or_read_only_relay
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].endpoints, vec![TransportEndpoint(writable.into())]);
     let promoted = slot_lifecycle(&switched);
-    assert_eq!(promoted.authored_signed_event, Some(signed_event));
+    assert_eq!(promoted.authored_signed_event, Some(signed_event.clone()));
     assert!(promoted.publication_targets.iter().any(|target| {
         target.endpoint == TransportEndpoint(read_only.into())
             && target.state == TransportFanoutAttemptState::PolicyProhibited
     }));
     drop(switched);
 
-    // Part 2: Current publication fanout with one accepted relay and one failed
-    // relay that later becomes read-only (removed from routing).
+    // Restoring that previously PolicyProhibited relay to writable routing
+    // makes fanout immediately owed and delivers the exact same signed artifact.
+    let mut restored_pending_target = slot_runtime(
+        current_session(database, &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[writable, read_only],
+    );
+    assert!(
+        restored_pending_target
+            .key_package_has_pending_fanout()
+            .unwrap()
+    );
+    assert!(
+        restored_pending_target
+            .maintenance_due(&[])
+            .unwrap()
+            .retry_while_owed
+    );
+    restored_pending_target.run_due_maintenance().await.unwrap();
+    let calls = publisher.publications();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[1].endpoints,
+        vec![TransportEndpoint(read_only.into())]
+    );
+    let restored_lifecycle = slot_lifecycle(&restored_pending_target);
+    assert_eq!(restored_lifecycle.authored_signed_event, Some(signed_event));
+    assert!(restored_lifecycle.publication_targets.iter().all(|target| {
+        target.state == TransportFanoutAttemptState::Accepted
+    }));
+    drop(restored_pending_target);
+
+    // Part 2: Current publication fanout with one accepted relay (A) and two
+    // failed relays (B = read_only, C = writable). Removing B while C remains
+    // writable retries only C; later restoring B delivers the exact same artifact
+    // to B without waiting for rotation.
     let partial_db = dir.path().join("bob.sqlite");
     let partial = PartialFanoutKeyPackages::default();
     let mut fanout_runtime = slot_runtime(
@@ -1166,27 +1202,48 @@ async fn persisted_pending_and_fanout_retries_respect_removed_or_read_only_relay
         partial.clone(),
         &wall,
         0,
-        &[accepted, read_only],
+        &[accepted, read_only, writable],
     );
     fanout_runtime.publish_fresh_key_package().await.unwrap();
+    let initial_artifact = slot_lifecycle(&fanout_runtime)
+        .authored_signed_event
+        .unwrap();
     assert!(fanout_runtime.key_package_has_pending_fanout().unwrap());
     drop(fanout_runtime);
 
-    // Removing the read-only relay from routing stops fanout scheduling and
-    // prevents any retry from contacting it.
-    let mut after_role_change = slot_runtime(
+    // With B removed from routing and C still writable, fanout retries only C.
+    let mut c_only = slot_runtime(
+        current_session(partial_db.clone(), &key, b"bob"),
+        partial.clone(),
+        &wall,
+        0,
+        &[accepted, writable],
+    );
+    wall.set(now + 120);
+    assert!(c_only.key_package_has_pending_fanout().unwrap());
+    c_only.run_due_maintenance().await.unwrap();
+    assert!(!c_only.key_package_has_pending_fanout().unwrap());
+    let calls = partial.publications();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0.endpoints, vec![TransportEndpoint(writable.into())]);
+    assert_eq!(calls[1].1, initial_artifact);
+    drop(c_only);
+
+    // Restoring B to writable routing resumes fanout to B with the exact same
+    // signed artifact.
+    let mut b_restored = slot_runtime(
         current_session(partial_db, &key, b"bob"),
         partial.clone(),
         &wall,
         0,
-        &[accepted],
+        &[accepted, writable, read_only],
     );
-    wall.set(now + 120);
-    assert!(!after_role_change.key_package_has_pending_fanout().unwrap());
-    after_role_change.run_due_maintenance().await.unwrap();
-    assert_eq!(
-        partial.publications().len(),
-        1,
-        "fanout retry must not resend to a relay removed from routing"
-    );
+    wall.set(now + 240);
+    assert!(b_restored.key_package_has_pending_fanout().unwrap());
+    b_restored.run_due_maintenance().await.unwrap();
+    let calls = partial.publications();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[2].0.endpoints, vec![TransportEndpoint(read_only.into())]);
+    assert_eq!(calls[2].1, initial_artifact);
+    assert!(!b_restored.key_package_has_pending_fanout().unwrap());
 }
