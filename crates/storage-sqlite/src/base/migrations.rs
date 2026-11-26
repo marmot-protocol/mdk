@@ -1,6 +1,12 @@
+#[path = "migrations/baseline.rs"]
+mod baseline;
 #[cfg(test)]
 #[path = "migrations/media_open_upgrade_tests.rs"]
 mod media_open_upgrade_tests;
+#[cfg(test)]
+pub(crate) use baseline::BASELINE_VERSION;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use baseline::RENEWED_PER_DATABASE;
 #[path = "migrations/0001_initial_schema.rs"]
 mod migration_0001_initial_schema;
 #[path = "migrations/0002_account_device_signers.rs"]
@@ -350,6 +356,7 @@ mod migration_0087_attachment_automatic_history;
 #[path = "migrations/0088_draft_attachment_descriptors.rs"]
 mod migration_0088_draft_attachment_descriptors;
 
+#[derive(Clone, Copy)]
 pub(crate) struct Migration {
     pub(crate) version: i64,
     pub(crate) name: &'static str,
@@ -1697,7 +1704,7 @@ pub(crate) fn run_through(connection: &mut Connection, version: i64) -> StorageR
 /// Run a registry with the same validation and transaction rules but no progress callback.
 #[cfg(test)]
 fn run_with_summary(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<usize> {
-    run_with_summary_observed(connection, migrations, None)
+    run_with_summary_observed(connection, migrations, false, None)
 }
 
 /// Observe inspection and pending migration boundaries; already-recorded versions emit no apply events.
@@ -1705,13 +1712,15 @@ pub(crate) fn run_all_observed(
     connection: &mut Connection,
     observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
 ) -> StorageResult<usize> {
-    run_with_summary_observed(connection, MIGRATIONS, observer)
+    run_with_summary_observed(connection, MIGRATIONS, true, observer)
 }
 /// Validate ledger history before any body runs, then report each migration's returned outcome.
 /// Observation faults cannot replace a storage error or allow a failed ledger entry to commit.
+/// `use_baseline` lets an empty database start from [`baseline`] instead of replaying the covered migrations.
 fn run_with_summary_observed(
     connection: &mut Connection,
     migrations: &[Migration],
+    use_baseline: bool,
     observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
 ) -> StorageResult<usize> {
     crate::base::open_progress::observe(
@@ -1724,7 +1733,11 @@ fn run_with_summary_observed(
     reject_unknown_future_migrations(connection, migrations)?;
     record_empty_creation(connection)?;
 
-    let mut applied = 0;
+    let mut applied = if use_baseline {
+        baseline::apply(connection, migrations, observer)?
+    } else {
+        0
+    };
     for migration in migrations {
         match applied_name(connection, migration.version)? {
             Some(name) if name == migration.name => continue,
@@ -1924,6 +1937,19 @@ fn applied_name(connection: &Connection, version: i64) -> StorageResult<Option<S
         .storage()
 }
 
+/// Record `migration` in the ledger as applied now, inside the caller's transaction.
+fn record_applied(connection: &Connection, migration: &Migration) -> StorageResult<()> {
+    connection
+        .prepare_cached(
+            "INSERT INTO cgka_schema_migrations (version, name, applied_at_unix_seconds)
+             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER))",
+        )
+        .storage()?
+        .execute(params![migration.version, migration.name])
+        .storage()?;
+    Ok(())
+}
+
 /// Honor each migration's declared connection-local FK scope before BEGIN and validate it before ledger commit.
 fn apply_migration(connection: &mut Connection, migration: &Migration) -> StorageResult<()> {
     let mut mode =
@@ -1945,12 +1971,7 @@ fn apply_migration(connection: &mut Connection, migration: &Migration) -> Storag
                 ));
             }
         }
-        tx.execute(
-            "INSERT INTO cgka_schema_migrations (version, name, applied_at_unix_seconds)
-             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER))",
-            params![migration.version, migration.name],
-        )
-        .storage()?;
+        record_applied(&tx, migration)?;
         #[cfg(test)]
         migration_crash_pause(migration.version);
         tx.commit().storage()

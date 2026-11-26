@@ -16,6 +16,7 @@ use crate::base::connection::{
     OpenedAccount, SqliteStorageOptions, apply_cipher_pragmas, ensure_private_db_files,
     finish_account_open, open_account_in_memory,
 };
+use crate::base::migrations::RENEWED_PER_DATABASE;
 use cgka_traits::storage::StorageResult;
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags};
@@ -23,24 +24,6 @@ use std::ffi::c_int;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
-
-/// The values a fresh database draws for itself while migrating, as
-/// (table, column, the statement that draws a new one). A migration that adds
-/// one needs a line here; `two_fresh_databases_differ_only_in_renewed_values`
-/// finds it, including values drawn from the clock.
-const RENEWED_PER_DATABASE: &[(&str, &str, &str)] = &[
-    (
-        "chat_presentation_meta",
-        "store_epoch",
-        "UPDATE chat_presentation_meta SET store_epoch = randomblob(16)",
-    ),
-    (
-        "cgka_schema_migrations",
-        "applied_at_unix_seconds",
-        "UPDATE cgka_schema_migrations \
-         SET applied_at_unix_seconds = CAST(strftime('%s', 'now') AS INTEGER)",
-    ),
-];
 
 const TEMPLATE_INFIX: &str = ".migrated-template-";
 
@@ -169,8 +152,13 @@ fn copy(template: &Path, options: &SqliteStorageOptions) -> StorageResult<Connec
         .run_to_completion(c_int::MAX, Duration::ZERO, None)
         .storage()?;
     drop(source);
-    for (_, _, renew) in RENEWED_PER_DATABASE {
-        connection.execute_batch(renew).storage()?;
+    for renewed in RENEWED_PER_DATABASE {
+        connection
+            .execute_batch(&format!(
+                "UPDATE \"{}\" SET \"{}\" = {}",
+                renewed.table, renewed.column, renewed.expression
+            ))
+            .storage()?;
     }
     Ok(connection)
 }
@@ -206,14 +194,18 @@ mod tests {
         (template, copy)
     }
 
-    fn query<T: rusqlite::types::FromSql>(store: &SqliteAccountStorage, sql: &str) -> Vec<T> {
-        let conn = store.lock().unwrap();
+    fn query_conn<T: rusqlite::types::FromSql>(conn: &Connection, sql: &str) -> Vec<T> {
         let mut statement = conn.prepare(sql).unwrap();
         statement
             .query_map([], |row| row.get(0))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    fn query<T: rusqlite::types::FromSql>(store: &SqliteAccountStorage, sql: &str) -> Vec<T> {
+        let conn = store.lock().unwrap();
+        query_conn(&conn, sql)
     }
 
     fn schema(store: &SqliteAccountStorage) -> Vec<String> {
@@ -231,19 +223,16 @@ mod tests {
     }
 
     /// Every (table, column) whose values differ between the two databases.
-    fn differing_columns(
-        left: &SqliteAccountStorage,
-        right: &SqliteAccountStorage,
-    ) -> BTreeSet<(String, String)> {
-        let columns: Vec<String> = query(
+    fn differing_columns_conn(left: &Connection, right: &Connection) -> BTreeSet<(String, String)> {
+        let columns: Vec<String> = query_conn(
             left,
             "SELECT m.name || char(31) || p.name \
              FROM sqlite_master AS m, pragma_table_info(m.name) AS p \
-             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'",
+             WHERE m.type = 'table' AND m.name NOT GLOB 'sqlite_*'",
         );
-        let values = |store: &SqliteAccountStorage, table: &str, column: &str| {
-            let mut values: Vec<String> = query::<rusqlite::types::Value>(
-                store,
+        let values = |conn: &Connection, table: &str, column: &str| {
+            let mut values: Vec<String> = query_conn::<rusqlite::types::Value>(
+                conn,
                 &format!("SELECT \"{column}\" FROM \"{table}\""),
             )
             .into_iter()
@@ -260,10 +249,28 @@ mod tests {
             .collect()
     }
 
+    fn differing_columns(
+        left: &SqliteAccountStorage,
+        right: &SqliteAccountStorage,
+    ) -> BTreeSet<(String, String)> {
+        let left = left.lock().unwrap();
+        let right = right.lock().unwrap();
+        differing_columns_conn(&left, &right)
+    }
+
+    /// Replay every registered migration without the baseline so renewal
+    /// detection inspects the real migration history, not baseline.sql.
+    fn full_replay() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        crate::base::migrations::run_through(&mut conn, i64::MAX).unwrap();
+        conn
+    }
+
     fn renewed() -> BTreeSet<(String, String)> {
         RENEWED_PER_DATABASE
             .iter()
-            .map(|(table, column, _)| (table.to_string(), column.to_string()))
+            .map(|entry| (entry.table.to_string(), entry.column.to_string()))
             .collect()
     }
 
@@ -281,11 +288,11 @@ mod tests {
 
     #[test]
     fn two_fresh_databases_differ_only_in_renewed_values() {
-        let first = replayed();
+        let first = full_replay();
         wait_for_the_next_second();
-        let second = replayed();
+        let second = full_replay();
         assert_eq!(
-            differing_columns(&first, &second),
+            differing_columns_conn(&first, &second),
             renewed(),
             "every value a fresh database draws, and only those, belongs in RENEWED_PER_DATABASE"
         );

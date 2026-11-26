@@ -9,10 +9,20 @@ pub enum StorageOpenPhase {
 }
 /// Numeric schema progress is available before and after each migration transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StorageOpenProgress {
     Phase(StorageOpenPhase),
     MigrationStarted(u32),
-    MigrationFinished { version: u32, success: bool },
+    MigrationFinished {
+        version: u32,
+        success: bool,
+    },
+    /// A baseline transaction can commit several ledger entries at once.
+    MigrationBatchFinished {
+        version: u32,
+        success: bool,
+        migrations_completed: u32,
+    },
 }
 /// Observation failures must never become storage failures or bypass migration rollback.
 pub(crate) fn observe(

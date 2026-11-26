@@ -7615,31 +7615,42 @@ impl MarmotApp {
         let account_open = self.account_open_progress(label);
         let observer = |progress| {
             use storage_sqlite::{StorageOpenPhase as Phase, StorageOpenProgress as Progress};
-            match progress {
-                Progress::Phase(phase) => probe.phase(match phase {
-                    Phase::CipherConfiguration => NativeStartupStage::CipherConfiguration,
-                    Phase::CipherKeyApplication => NativeStartupStage::CipherKeyApplication,
-                    Phase::OperationalPragmas => NativeStartupStage::OperationalPragmas,
-                    Phase::MigrationInspection => NativeStartupStage::MigrationInspection,
-                }),
+            let (version, success, completed) = match progress {
+                Progress::Phase(phase) => {
+                    probe.phase(match phase {
+                        Phase::CipherConfiguration => NativeStartupStage::CipherConfiguration,
+                        Phase::CipherKeyApplication => NativeStartupStage::CipherKeyApplication,
+                        Phase::OperationalPragmas => NativeStartupStage::OperationalPragmas,
+                        Phase::MigrationInspection => NativeStartupStage::MigrationInspection,
+                    });
+                    return;
+                }
                 Progress::MigrationStarted(version) => {
-                    probe.progress(NativeStartupStage::MigrationApply, Some(version), false)
+                    probe.progress(NativeStartupStage::MigrationApply, Some(version), 0);
+                    return;
                 }
                 Progress::MigrationFinished { version, success } => {
-                    if success {
-                        account_open.migration_applied();
-                    }
-                    probe.progress(
-                        if success {
-                            NativeStartupStage::MigrationInspection
-                        } else {
-                            NativeStartupStage::MigrationApply
-                        },
-                        Some(version),
-                        success,
-                    )
+                    (version, success, u32::from(success))
                 }
+                Progress::MigrationBatchFinished {
+                    version,
+                    success,
+                    migrations_completed,
+                } => (version, success, migrations_completed),
+                _ => return,
+            };
+            if completed > 0 {
+                account_open.migration_applied();
             }
+            probe.progress(
+                if success {
+                    NativeStartupStage::MigrationInspection
+                } else {
+                    NativeStartupStage::MigrationApply
+                },
+                Some(version),
+                completed,
+            );
         };
         let opened = SqliteAccountStorage::open_encrypted_observed(&path, &key, &observer);
         if let Some(observation) = migration_observation {
