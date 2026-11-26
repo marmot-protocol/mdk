@@ -312,13 +312,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   remembers (`roster_tag_keys`), read by every such key. A slot with a `Moved` departure and no `removed` record is
   never gone, whichever keys it had: its device's leaves elsewhere still carry this group's tags. Never this device's
   own slot, and never discard private KeyPackages for a slot the roster lists. Leaves are found with
-  `own_account_leaves_tagged_by`, never by an absent claim, under the slot's keys, or with
-  `own_account_self_signed_tags`, a tag that names the slot and verifies under the key that leaf itself signs with, never
-  another leaf's (mdk#3679): an untagged leaf stays (D55). Every key a roster names is writable by any device of the
-  account, so none is evidence that an untagged leaf is a device's. Removal finds the device-group leaf the same way,
-  by its tag under the roster, else by a tag the leaf signed itself for the slot, both only for a leaf that has
-  committed since its Add, and the record then keeps that leaf's key. A listed device whose entry has no key is refused
-  as `device_link_pending` unless it has such a leaf, which a pending link never does. Each cleanup pass renews,
+  `own_account_leaves_tagged_by`, never by an absent claim, under the slot's keys: an untagged leaf stays (D55).
+  Removal finds the device-group leaf by its entry's key, which the Add that linked the device bound and no Commit
+  changes (marmot#521, "Key binding"), removes it with the entry, and the record keeps that key. A listed device whose
+  entry has no key, or whose leaf is still its Add's KeyPackage leaf, is refused as `device_link_pending`. Each cleanup pass renews,
   through `renew_roster_tag_keys`, every kept key of a slot with a `held_as_removed` key whose leaf a scanned chat
   still holds, in one step that moves only their sighting time and keeps their order, so a leftover outlives the
   30-day retention and no prune drops the key that reads it. The deciding device commits a lone `removed` record after a
@@ -745,6 +742,19 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
     `shutdown` tears the relay plane down only once none counts or the bound passes. The close never waits for a wave:
     one that settles after `shutdown_and_close` closed storage leaves its Welcome owed, and the next start sends the
     same event once more.
+- Look up an invited recipient's inbox list beside the account worker (mdk#2261, `client/welcome_route_lookups.rs`,
+  `runtime/account_worker/welcome_route_lookups.rs`) only when the session's plan starts it
+  (`plan_welcome_route_lookups`: a paced Welcome attempt found no route and an owed Welcome is still addressed to
+  them), never for a Welcome that is withdrawn, expired, delivered or staged; the worker drops (aborts) a running one
+  the plan stops at each loop turn. At most `LOOKUPS_PER_ACCOUNT` at once, one per recipient, each bounded by
+  `LOOKUP_TIMEOUT`; none starts while maintenance is paused or cursors are frozen. The task keeps T1 and T2 (the
+  directory's `resolve_account_relay_list_status_for_account_id`, from the configured directory relays, which writes
+  only the directory cache). Its continuation runs on the writer: it reads the route from the cache again, installs
+  it with `replace_inbox_route`, and reports the outcome to the session (`finish_welcome_route_lookup`), which keeps a
+  failed lookup's cause in its pacing; only a route releases the retry and wakes maintenance. It never touches a
+  Welcome's stored retry record. L1 and L2 as for the sign-in read, except that
+  cancellation stops waiting at once (shutdown gives the account's work only `WELCOME_WAVE_SHUTDOWN_WAIT`); the
+  next client's session owes its own lookups.
 - Send every host group-change command through the runtime's host-change entry points
   (`send_host_change_with_audit_context`, or `confirm_host_change_without_publish_with_audit_context` for an invite),
   never `send_with_audit_context` (mdk#2332). The commit's fanout then names the change, so a rollback after the
@@ -1458,7 +1468,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   worker's running Welcome waves and the `Drain`s and pending-deliveries reads that wait for them, mdk#3466; `account_worker/tests/welcome_wave_tests.rs`
   owns what the worker decides of a wave), `account_worker/sign_in_reads.rs` (the worker's sign-in slot read and the
   host check that keeps its place behind it, mdk#3466; `account_worker/tests/sign_in_read_tests.rs` owns what the
-  worker decides of a read), `conversation_window.rs`, `chat_list_window.rs`,
+  worker decides of a read), `account_worker/welcome_route_lookups.rs` (the worker's inbox lookups of route-less
+  invitees, mdk#2261; `account_worker/tests/welcome_route_lookup_tests.rs`), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
   attention), `chat_list_selection.rs` (select-all IDs and revalidation), `user_blocks.rs`, `moderation.rs` (reports, admin labels and operator moderation reports),
   `local_submissions.rs`,
@@ -1477,7 +1488,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   epoch-gap evidence: feeding the detector, arming and escalating backfill, retiring a terminal group's recovery)
   and `history_recovery/history_notices.rs`),
   `invite_recovery.rs` (durable invitation recovery), `welcome_waves.rs` (Welcome waves: prepare on the writer, run
-  beside it, settle back on it, mdk#3466), `delivery_spill.rs` (worker side of the durable delivery spill),
+  beside it, settle back on it, mdk#3466), `welcome_route_lookups.rs` (a route-less invitee's inbox lookup, begun and
+  finished on the writer and run beside it, mdk#2261), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/native_ingress.rs` (ordered native replay
   admission).
 - The shared relay plane is the [`transport-nostr`](../transport-nostr/AGENTS.md) crate; name its items as

@@ -61,6 +61,7 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
+use openmls::credentials::NewSignerBundle;
 use openmls::extensions::{
     AppDataDictionary, AppDataDictionaryExtension, Extension, ExtensionValidator, Extensions,
 };
@@ -923,6 +924,9 @@ struct Parts {
     /// place of its update's bytes, as a client that resolves the update its
     /// own way would.
     app_data_state: Vec<(u16, Vec<u8>)>,
+    /// A new signature key for the committer's leaf, carried in its update
+    /// path with `leaf_extensions`, as [`rotated_leaf`] builds them.
+    new_signer: Option<SignatureKeyPair>,
 }
 
 /// A Commit `sender` builds with raw OpenMLS, bypassing the engine's send
@@ -1071,16 +1075,24 @@ fn craft_bundle(
         updater.set(ComponentData::from_parts(component_id, state.into()));
     }
     builder.with_app_data_dictionary_updates(updater.changes());
-    let bundle = builder
-        .build(
+    let bundle = match &parts.new_signer {
+        None => builder.build(
             provider.rand(),
             provider.crypto(),
             &device_signer(sender),
             |_| true,
-        )
-        .expect("raw OpenMLS builds the commit")
-        .stage_commit(&provider)
-        .expect("raw OpenMLS stages the commit");
+        ),
+        Some(new_signer) => builder.build_with_new_signer(
+            provider.rand(),
+            provider.crypto(),
+            &device_signer(sender),
+            new_signer_bundle(sender, gid, new_signer),
+            |_| true,
+        ),
+    }
+    .expect("raw OpenMLS builds the commit")
+    .stage_commit(&provider)
+    .expect("raw OpenMLS stages the commit");
     let verdict = authorize_staged_commit(
         &group,
         gid,
@@ -1136,6 +1148,24 @@ fn standalone_app_data_update(
         .propose_app_data_update(&provider, &device_signer(sender), component_id, operation)
         .expect("raw OpenMLS builds the proposal");
     group_transport(message, gid, "standalone-app-data-update")
+}
+
+fn new_signer_bundle<'a>(
+    sender: &Device,
+    gid: &GroupId,
+    signer: &'a SignatureKeyPair,
+) -> NewSignerBundle<'a, SignatureKeyPair> {
+    NewSignerBundle {
+        signer,
+        credential_with_key: CredentialWithKey {
+            credential: load_group(sender, gid)
+                .own_leaf_node()
+                .unwrap()
+                .credential()
+                .clone(),
+            signature_key: signer.public().into(),
+        },
+    }
 }
 
 /// A standalone GroupContextExtensions proposal that keeps every extension

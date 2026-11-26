@@ -198,21 +198,62 @@ where
     }
 
     /// Count a publish of the Welcome `welcome_id` that found no route to the
-    /// recipient's inbox relays on its record. It stores no retry record, so
-    /// this is the attempt's only write. A Welcome with no record is left
-    /// without one.
-    pub(super) fn record_welcome_route_failure(&self, welcome_id: &cgka_traits::MessageId) {
+    /// recipient's inbox relays on its record: `InboxLookupFailed` when the
+    /// last lookup of the recipient's list failed (`lookup_failed`), else
+    /// `NoInboxRelays`. It stores no retry record, so this is the attempt's
+    /// only write. A Welcome with no record is left without one.
+    pub(super) fn record_welcome_route_failure(
+        &self,
+        welcome_id: &cgka_traits::MessageId,
+        lookup_failed: bool,
+    ) {
+        let problem = route_less_problem(lookup_failed);
         let recorded = match self.session.welcome_delivery_record(welcome_id) {
             Ok(Some(mut record)) => {
                 record.attempts = record.attempts.saturating_add(1);
                 record.last_attempt_at = Some(self.wall_clock.now());
-                record.last_problem = Some(WelcomeDeliveryProblem::NoInboxRelays);
+                record.last_problem = Some(problem);
                 record.relays = WelcomeRelayCounts::default();
                 self.session
                     .put_welcome_delivery_record(&record)
                     .map(|()| Some(record))
             }
             Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        };
+        match recorded {
+            Ok(Some(record)) => self.queue_welcome_delivery_change(&record),
+            Ok(None) => {}
+            Err(error) => log_unrecorded_welcome_delivery(&error.into()),
+        }
+    }
+
+    /// A lookup of the recipient's inbox list ended with no route: make
+    /// `InboxLookupFailed` (it `failed`) or `NoInboxRelays` (it answered) the
+    /// problem of the Welcome `welcome_id`, when its latest attempt found no
+    /// route. It is no publish attempt, so nothing else changes.
+    pub(super) fn record_welcome_route_lookup(
+        &self,
+        welcome_id: &cgka_traits::MessageId,
+        failed: bool,
+    ) {
+        let problem = route_less_problem(failed);
+        let recorded = match self.session.welcome_delivery_record(welcome_id) {
+            Ok(Some(mut record))
+                if matches!(
+                    record.last_problem,
+                    Some(
+                        WelcomeDeliveryProblem::NoInboxRelays
+                            | WelcomeDeliveryProblem::InboxLookupFailed
+                    )
+                ) && record.last_problem != Some(problem) =>
+            {
+                record.last_problem = Some(problem);
+                self.session
+                    .put_welcome_delivery_record(&record)
+                    .map(|()| Some(record))
+            }
+            Ok(_) => Ok(None),
             Err(error) => Err(error),
         };
         match recorded {
@@ -275,6 +316,16 @@ where
             relays: WelcomeRelayCounts::default(),
             last_problem: None,
         }))
+    }
+}
+
+/// A route-less Welcome's problem: `InboxLookupFailed` once a lookup of its
+/// recipient's list `failed`, else `NoInboxRelays`.
+fn route_less_problem(lookup_failed: bool) -> WelcomeDeliveryProblem {
+    if lookup_failed {
+        WelcomeDeliveryProblem::InboxLookupFailed
+    } else {
+        WelcomeDeliveryProblem::NoInboxRelays
     }
 }
 

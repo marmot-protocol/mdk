@@ -7,8 +7,8 @@
 //! outlives the branch that made it, and a candidate probe records nothing.
 
 use super::device_roster::{
-    entry, found_device_group, phone_and_laptop, roster, roster_device, roster_of, roster_update,
-    slot,
+    NO_WELCOME_DEADLINE, entry, found_device_group, key_package_ref, leaf_signature_key, roster,
+    roster_device, roster_of, roster_update, slot, update_bytes,
 };
 use super::*;
 use cgka_traits::app_components::{
@@ -33,36 +33,86 @@ fn removed_key(n: u8, key: u8) -> RosterTagKey {
     }
 }
 
-/// Set the entry of slot `n`, labelled `label`, to carry tag signature key
-/// `key`.
-fn set_key_op(n: u8, label: &str, key: u8) -> DeviceRosterOperationV1 {
-    DeviceRosterOperationV1::SetDevice(
+/// The laptop's slot: after every planted one, so the laptop is the device
+/// that joins the founding.
+const LAPTOP: u8 = 9;
+
+/// A fresh phone founds a device group at slot 1, which the laptop joins at
+/// [`LAPTOP`], with an entry at each of `planted`, carrying the key given,
+/// whose device never joins. The founding state's keys are taken as the
+/// creating device wrote them ("Key binding"), so this is how a test lists a
+/// key no leaf signs with.
+async fn found_with(planted: &[(u8, &str, u8)]) -> (Device, Device, GroupId) {
+    let mut phone = roster_device(b"alice");
+    let mut laptop = roster_device(b"alice");
+    let mut initial = roster(&[(1, "Phone"), (LAPTOP, "Laptop")]);
+    for (n, label, key) in planted {
+        initial.devices.insert(
+            slot(*n),
+            DeviceEntryV1 {
+                tag_signature_key: Some(vec![*key; 32]),
+                ..entry(label)
+            },
+        );
+    }
+    let gid = found_device_group(&mut phone, &initial, &mut [&mut laptop]).await;
+    (phone, laptop, gid)
+}
+
+/// The phone's Commit linking a fresh device of the account at slot `n`,
+/// whose Add binds that device's leaf key to its new entry. The device never
+/// joins. Returns the Commit, unconfirmed by anyone else, and the key.
+async fn link_at(phone: &mut Device, gid: &GroupId, n: u8) -> (TransportMessage, Vec<u8>) {
+    let mut device = roster_device(b"alice");
+    let key_package = device.engine.fresh_key_package().await.unwrap();
+    let key = leaf_signature_key(&key_package);
+    let roster_update = update_bytes(vec![DeviceRosterOperationV1::SetDevice(
         slot(n),
         DeviceEntryV1 {
-            tag_signature_key: Some(vec![key; 32]),
-            ..entry(label)
+            announced_key_package: Some(key_package_ref(&key_package)),
+            tag_signature_key: Some(key.clone()),
+            ..entry("Tablet")
         },
+    )]);
+    let commit = send_commit(
+        phone,
+        SendIntent::LinkDevice {
+            group_id: gid.clone(),
+            key_package,
+            roster_update,
+            deliver_until: NO_WELCOME_DEADLINE,
+        },
+        gid,
+    )
+    .await;
+    (commit, key)
+}
+
+/// Remove slot `n`'s entry, whose key no leaf signs with, and record the
+/// slot as `removed`, keeping `key`.
+fn remove_and_record(gid: &GroupId, n: u8, key: Option<u8>) -> SendIntent {
+    roster_update(
+        gid,
+        vec![
+            DeviceRosterOperationV1::RemoveDevice(slot(n)),
+            DeviceRosterOperationV1::SetRejectedSlot(
+                slot(n),
+                RejectedSlotV1 {
+                    reason: RejectedSlotReasonV1::Removed,
+                    rejected_at: 1,
+                    tag_signature_key: key.map(|key| vec![key; 32]),
+                },
+            ),
+        ],
     )
 }
 
-fn set_key(gid: &GroupId, n: u8, label: &str, key: u8) -> SendIntent {
-    roster_update(gid, vec![set_key_op(n, label, key)])
-}
-
-/// Record slot `n`, which holds no device, as `removed` with key `key`.
-fn record_removed_op(n: u8, key: u8) -> DeviceRosterOperationV1 {
-    DeviceRosterOperationV1::SetRejectedSlot(
-        slot(n),
-        RejectedSlotV1 {
-            reason: RejectedSlotReasonV1::Removed,
-            rejected_at: 1,
-            tag_signature_key: Some(vec![key; 32]),
-        },
-    )
-}
-
-fn record_removed(gid: &GroupId, n: u8, key: u8) -> SendIntent {
-    roster_update(gid, vec![record_removed_op(n, key)])
+fn key_of(n: u8, key: &[u8]) -> RosterTagKey {
+    RosterTagKey {
+        slot: slot(n),
+        tag_signature_key: key.to_vec(),
+        held_as_removed: false,
+    }
 }
 
 fn recorded(device: &Device, gid: &GroupId) -> BTreeSet<RosterTagKey> {
@@ -76,74 +126,72 @@ fn recorded(device: &Device, gid: &GroupId) -> BTreeSet<RosterTagKey> {
 
 #[tokio::test]
 async fn every_roster_state_a_device_applies_records_its_tag_keys() {
-    let mut phone = roster_device(b"alice");
-    let mut laptop = roster_device(b"alice");
-    let mut initial = roster(&[(1, "Phone"), (2, "Laptop")]);
-    initial.devices.get_mut(&slot(1)).unwrap().tag_signature_key = Some(vec![0xa1; 32]);
-    let gid = found_device_group(&mut phone, &initial, &mut [&mut laptop]).await;
+    let (mut phone, mut laptop, gid) = found_with(&[(4, "Watch", 0xb4)]).await;
     // The founding create and the Welcome join record the roster they start
-    // from, with the key the Add bound to the laptop's entry.
-    let laptop_key = RosterTagKey {
-        slot: slot(2),
-        tag_signature_key: laptop.engine.own_signature_key(),
-        held_as_removed: false,
-    };
+    // from: the founder's key, the key the Add bound to the laptop's entry,
+    // and the planted one.
+    let founded = BTreeSet::from([
+        key_of(1, &phone.engine.own_signature_key()),
+        key_of(LAPTOP, &laptop.engine.own_signature_key()),
+        tag_key(4, 0xb4),
+    ]);
     for device in [&phone, &laptop] {
-        assert_eq!(
-            recorded(device, &gid),
-            BTreeSet::from([tag_key(1, 0xa1), laptop_key.clone()])
-        );
+        assert_eq!(recorded(device, &gid), founded);
     }
 
     // The committer records when its Commit is confirmed, a receiver when it
     // applies it: a device entry's key and a `removed` record's alike.
-    for intent in [
-        set_key(&gid, 3, "Tablet", 0xb3),
-        record_removed(&gid, 4, 0xb4),
-    ] {
-        let commit = send_commit(&mut phone, intent, &gid).await;
-        assert_accepted(&mut laptop, &commit, &gid).await;
-    }
-    let expected = BTreeSet::from([
-        tag_key(1, 0xa1),
-        laptop_key,
-        tag_key(3, 0xb3),
-        removed_key(4, 0xb4),
-    ]);
+    let (linked, tablet_key) = link_at(&mut phone, &gid, 3).await;
+    assert_accepted(&mut laptop, &linked, &gid).await;
+    let removed = send_commit(&mut phone, remove_and_record(&gid, 4, Some(0xb4)), &gid).await;
+    assert_accepted(&mut laptop, &removed, &gid).await;
+    // The record holds the key the entry listed as removed.
+    let mut expected = founded;
+    expected.remove(&tag_key(4, 0xb4));
+    expected.extend([key_of(3, &tablet_key), removed_key(4, 0xb4)]);
     for device in [&phone, &laptop] {
         assert_eq!(recorded(device, &gid), expected);
     }
 }
 
-/// One pass applies two commits: the first records slot 3 as `removed`, the
-/// second drops that record, as an expiry pass does. The roster at the end
-/// of the pass never held the record, yet its key is recorded, held as
-/// removed. Slot 4's key changes in each, and the one the later commit
-/// listed reads as its newest.
+/// One pass applies three commits: the first records slot 3 as `removed`
+/// and takes slot 4's entry, the second drops slot 3's record, as an expiry
+/// pass does, and the third links a new device at slot 4. The roster at the
+/// end of the pass never held the record, yet its key is recorded, held as
+/// removed, and slot 4's newest key is the one the pass listed last.
 #[tokio::test]
 async fn a_removed_record_dropped_within_one_pass_is_recorded() {
-    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
-    // Slot 4 lists key 0xd1 before the pass, then 0xd2 and 0xd1 again within
-    // it. 0xd1 is the newest, though its row is the older one, the pass
-    // gives both keys one time, and it sorts first.
-    let commit = send_commit(&mut phone, set_key(&gid, 4, "Tablet", 0xd1), &gid).await;
-    assert_accepted(&mut laptop, &commit, &gid).await;
+    let (mut phone, mut laptop, gid) = found_with(&[(3, "Watch", 0xc3), (4, "Tablet", 0xd1)]).await;
     let before_pass = recorded(&laptop, &gid);
-    let first = roster_update(
-        &gid,
-        vec![record_removed_op(3, 0xc3), set_key_op(4, "Tablet", 0xd2)],
-    );
-    let second = roster_update(
-        &gid,
-        vec![
-            DeviceRosterOperationV1::RemoveRejectedSlot(slot(3)),
-            set_key_op(4, "Tablet", 0xd1),
-        ],
-    );
+    let mut first = remove_and_record(&gid, 3, Some(0xc3));
+    let SendIntent::UpdateAppComponents { updates, .. } = &mut first else {
+        unreachable!()
+    };
+    updates[0].data = update_bytes(vec![
+        DeviceRosterOperationV1::RemoveDevice(slot(3)),
+        DeviceRosterOperationV1::SetRejectedSlot(
+            slot(3),
+            RejectedSlotV1 {
+                reason: RejectedSlotReasonV1::Removed,
+                rejected_at: 1,
+                tag_signature_key: Some(vec![0xc3; 32]),
+            },
+        ),
+        DeviceRosterOperationV1::RemoveDevice(slot(4)),
+    ]);
     let first = send_commit(&mut phone, first, &gid).await;
-    let second = send_commit(&mut phone, second, &gid).await;
+    let second = send_commit(
+        &mut phone,
+        roster_update(
+            &gid,
+            vec![DeviceRosterOperationV1::RemoveRejectedSlot(slot(3))],
+        ),
+        &gid,
+    )
+    .await;
+    let (third, relinked) = link_at(&mut phone, &gid, 4).await;
     let before = laptop.engine.epoch(&gid).unwrap().0;
-    for commit in [&first, &second] {
+    for commit in [&first, &second, &third] {
         laptop
             .engine
             .buffer_openmls_convergence_message_at(&gid, commit.clone(), 500)
@@ -153,15 +201,16 @@ async fn a_removed_record_dropped_within_one_pass_is_recorded() {
         .engine
         .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .unwrap();
-    assert_eq!(result.accepted_commits.len(), 2, "{result:?}");
-    assert_eq!(laptop.engine.epoch(&gid).unwrap().0, before + 2);
+    assert_eq!(result.accepted_commits.len(), 3, "{result:?}");
+    assert_eq!(laptop.engine.epoch(&gid).unwrap().0, before + 3);
     assert!(
         !roster_of(&laptop, &gid)
             .rejected_slots
             .contains_key(&slot(3))
     );
     let mut expected = before_pass;
-    expected.extend([removed_key(3, 0xc3), tag_key(4, 0xd2)]);
+    expected.remove(&tag_key(3, 0xc3));
+    expected.extend([removed_key(3, 0xc3), key_of(4, &relinked)]);
     assert_eq!(recorded(&laptop, &gid), expected);
     let slot_4_newest_first = laptop
         .storage
@@ -170,46 +219,32 @@ async fn a_removed_record_dropped_within_one_pass_is_recorded() {
         .into_iter()
         .filter(|key| key.slot == slot(4))
         .collect::<Vec<_>>();
-    assert_eq!(slot_4_newest_first, [tag_key(4, 0xd1), tag_key(4, 0xd2)]);
+    assert_eq!(
+        slot_4_newest_first,
+        [key_of(4, &relinked), tag_key(4, 0xd1)]
+    );
 }
 
 /// A `removed` record that keeps no key (marmot#520) holds the keys a
 /// device keeps for its slot as removed, on the device whose own Commits
-/// list the key and make the record, and on one that applies the listing,
-/// the record and its drop within one pass. A key the slot is listed with
-/// after the drop, and another slot's key, are not held.
+/// make the record, and on one that applies the record, its drop and a new
+/// link at the slot within one pass. The key the slot is listed with after
+/// the drop, and another slot's key, are not held.
 #[tokio::test]
 async fn a_removed_record_without_a_key_holds_the_slots_keys() {
-    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
-    let listed = roster_update(
+    let (mut phone, mut laptop, gid) = found_with(&[(4, "Tablet", 0xd4), (5, "Watch", 0xd5)]).await;
+    let first = send_commit(&mut phone, remove_and_record(&gid, 4, None), &gid).await;
+    let second = send_commit(
+        &mut phone,
+        roster_update(
+            &gid,
+            vec![DeviceRosterOperationV1::RemoveRejectedSlot(slot(4))],
+        ),
         &gid,
-        vec![set_key_op(4, "Tablet", 0xd4), set_key_op(5, "Watch", 0xd5)],
-    );
-    let first = roster_update(
-        &gid,
-        vec![
-            DeviceRosterOperationV1::RemoveDevice(slot(4)),
-            DeviceRosterOperationV1::SetRejectedSlot(
-                slot(4),
-                RejectedSlotV1 {
-                    reason: RejectedSlotReasonV1::Removed,
-                    rejected_at: 1,
-                    tag_signature_key: None,
-                },
-            ),
-        ],
-    );
-    let second = roster_update(
-        &gid,
-        vec![
-            DeviceRosterOperationV1::RemoveRejectedSlot(slot(4)),
-            set_key_op(4, "Tablet", 0xe4),
-        ],
-    );
-    let listed = send_commit(&mut phone, listed, &gid).await;
-    let first = send_commit(&mut phone, first, &gid).await;
-    let second = send_commit(&mut phone, second, &gid).await;
-    for commit in [&listed, &first, &second] {
+    )
+    .await;
+    let (third, relinked) = link_at(&mut phone, &gid, 4).await;
+    for commit in [&first, &second, &third] {
         laptop
             .engine
             .buffer_openmls_convergence_message_at(&gid, commit.clone(), 500)
@@ -224,28 +259,21 @@ async fn a_removed_record_without_a_key_holds_the_slots_keys() {
         let keys = recorded(device, &gid);
         assert!(keys.contains(&removed_key(4, 0xd4)), "{keys:?}");
         assert!(!keys.contains(&tag_key(4, 0xd4)), "{keys:?}");
-        assert!(keys.contains(&tag_key(4, 0xe4)), "{keys:?}");
+        assert!(keys.contains(&key_of(4, &relinked)), "{keys:?}");
         assert!(keys.contains(&tag_key(5, 0xd5)), "{keys:?}");
     }
 }
 
-/// The phone and the laptop each set a key from the same epoch, then
+/// The phone and the laptop each link a device from the same epoch, then
 /// adjudicate the other's commit. The device whose commit loses rewinds past
-/// its own key, which stays recorded. The winner only probed the losing
-/// commit, so it never records that key.
+/// the key its Add listed, which stays recorded. The winner only probed the
+/// losing commit, so it never records that key.
 #[tokio::test]
 async fn a_rewind_keeps_the_keys_the_dropped_branch_listed() {
-    let mut phone = roster_device(b"alice");
-    let mut laptop = roster_device(b"alice");
-    let gid = found_device_group(
-        &mut phone,
-        &roster(&[(1, "Phone"), (2, "Laptop")]),
-        &mut [&mut laptop],
-    )
-    .await;
+    let (mut phone, mut laptop, gid) = found_with(&[]).await;
     let founded = recorded(&phone, &gid);
-    let phone_commit = send_commit(&mut phone, set_key(&gid, 1, "Phone", 0xe1), &gid).await;
-    let laptop_commit = send_commit(&mut laptop, set_key(&gid, 2, "Laptop", 0xe2), &gid).await;
+    let (phone_commit, phone_key) = link_at(&mut phone, &gid, 3).await;
+    let (laptop_commit, laptop_key) = link_at(&mut laptop, &gid, 4).await;
     for (device, rival) in [(&mut phone, &laptop_commit), (&mut laptop, &phone_commit)] {
         device
             .engine
@@ -259,16 +287,25 @@ async fn a_rewind_keeps_the_keys_the_dropped_branch_listed() {
 
     let winning = roster_of(&phone, &gid);
     assert_eq!(roster_of(&laptop, &gid), winning, "both devices converge");
-    let phone_won = winning.devices[&slot(1)].tag_signature_key == Some(vec![0xe1; 32]);
+    let phone_won = winning.devices.contains_key(&slot(3));
     let (loser, winner, kept, dropped) = if phone_won {
-        (&laptop, &phone, tag_key(1, 0xe1), tag_key(2, 0xe2))
+        (
+            &laptop,
+            &phone,
+            key_of(3, &phone_key),
+            key_of(4, &laptop_key),
+        )
     } else {
-        (&phone, &laptop, tag_key(2, 0xe2), tag_key(1, 0xe1))
+        (
+            &phone,
+            &laptop,
+            key_of(4, &laptop_key),
+            key_of(3, &phone_key),
+        )
     };
-    assert_ne!(
-        winning.devices[&dropped.slot].tag_signature_key,
-        Some(dropped.tag_signature_key.clone()),
-        "the losing branch's key is gone from the roster"
+    assert!(
+        !winning.devices.contains_key(&dropped.slot),
+        "the losing branch's entry is gone from the roster"
     );
     let mut won = founded;
     won.insert(kept);

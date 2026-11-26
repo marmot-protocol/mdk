@@ -184,9 +184,14 @@ async fn recovery_announced_key() {
     };
     roster.devices.insert(
         slot,
+        // The entry carries the device's key, as the Add that linked it
+        // bound it ("Key binding"), and names another device as its
+        // approver, so its link is made only by its own first Commit.
         DeviceEntryV1 {
             linked_at: peers.wall.now().0,
+            linked_by: Some([0x77; 32]),
             announced_key_package: lifecycle.current_key_package_ref,
+            tag_signature_key: Some(session.own_signature_key()),
             ..DeviceEntryV1::default()
         },
     );
@@ -288,7 +293,7 @@ async fn recovery_announced_key() {
         .unwrap();
     assert!(
         waiting.pending_replacement.is_none(),
-        "a held tag key must prevent staging"
+        "a link not made yet must prevent staging"
     );
     let store = SqliteAccountStorage::open_encrypted(
         peers._dir.path().join("bob.sqlite"),
@@ -307,6 +312,14 @@ async fn recovery_announced_key() {
     assert_eq!(waiting.phase, storage_sqlite::GroupRecoveryPhase::Challenge);
     peers.wall.set(waiting.retry_at);
     drop(store);
+    // Released, the device makes its first Commit in its device group, as
+    // maintenance does, which makes its link.
+    let first = peers
+        .recipient
+        .set_device_tag_key_holding(&[])
+        .await
+        .unwrap();
+    assert!(first.failures.is_empty(), "{:?}", first.failures);
     peers.recipient.prepare_group_recovery().unwrap();
     peers
         .bob_adapter
@@ -314,13 +327,17 @@ async fn recovery_announced_key() {
             "wss://recovery-inbox.example".into(),
         )]);
     let mut effects = AccountDeviceEffects::default();
-    assert!(matches!(
-        peers
-            .recipient
-            .advance_group_recovery(&[], &mut effects)
-            .await,
-        Err(AccountError::Transport(TransportAdapterError::Publish(_)))
-    ));
+    let advanced = peers
+        .recipient
+        .advance_group_recovery(&[], &mut effects)
+        .await;
+    assert!(
+        matches!(
+            advanced,
+            Err(AccountError::Transport(TransportAdapterError::Publish(_)))
+        ),
+        "{advanced:?}"
+    );
     let store = SqliteAccountStorage::open_encrypted(
         peers._dir.path().join("bob.sqlite"),
         &SqlCipherKey::new("live recovery cancellation key").unwrap(),

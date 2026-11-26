@@ -48,7 +48,8 @@ use marmot_session::{
     KeyPackageSlotWithdrawal, MaintenanceTiming, MonotonicClock, NoopKeyPackagePublisher,
     PendingCommit, PendingCommitState, PendingResolution, PublishWork, PublishedApplicationMessage,
     SessionConfig, SessionError, StaticTransportRouting, TransportRoutingError,
-    TransportRoutingPolicy, WallClock, WelcomeWithdrawal,
+    TransportRoutingPolicy, WallClock, WelcomeRouteLookup, WelcomeRouteLookupPlan,
+    WelcomeWithdrawal,
 };
 use nostr::prelude::FinalizeEvent;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};

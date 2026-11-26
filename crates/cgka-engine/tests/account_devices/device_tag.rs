@@ -24,7 +24,7 @@ use super::tagged_siblings::{found_routed_group, handed};
 use super::*;
 use cgka_engine::device_tag::{DeviceTagClaim, device_tag_claim, seal_device_tag};
 use cgka_traits::app_components::{
-    DEVICE_TAG_COMPONENT_ID, DeviceRosterOperationV1, DeviceRosterV1, DeviceSlotId,
+    DEVICE_TAG_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterV1, DeviceSlotId,
     decode_components_list,
 };
 use cgka_traits::maintenance::KeyPackageLifecycleState;
@@ -425,20 +425,24 @@ pub(super) fn hold_slot(device: &Device, slot: DeviceSlotId) {
         .unwrap();
 }
 
-/// `device` sets its own `tag_signature_key` in its entry at `own_slot` in
-/// the device group `gid`, and `others` apply the roster update.
+/// `device` makes its first own Commit in the device group `gid`, whose
+/// entry at `own_slot` already carries its key from its Add or the founding
+/// roster ("Key binding"): a self-update, which tags its leaf. `others`
+/// apply it.
 pub(super) async fn set_own_key(
     device: &mut Device,
     own_slot: DeviceSlotId,
     gid: &GroupId,
     others: &mut [&mut Device],
 ) {
-    let mut own_entry = roster_of(device, gid).devices[&own_slot].clone();
-    own_entry.tag_signature_key = Some(device.engine.own_signature_key());
-    let update = roster_update(
-        gid,
-        vec![DeviceRosterOperationV1::SetDevice(own_slot, own_entry)],
+    assert_eq!(
+        roster_of(device, gid).devices[&own_slot].tag_signature_key,
+        Some(device.engine.own_signature_key()),
+        "the entry carries the device's key before its first Commit"
     );
+    let update = SendIntent::SelfUpdate {
+        group_id: gid.clone(),
+    };
     let commit = send_commit(device, update, gid).await;
     for other in others.iter_mut() {
         assert_accepted(other, &commit, gid).await;
@@ -582,10 +586,10 @@ async fn a_joined_device_tags_from_its_first_device_group_commit() {
     assert!(!tag_is_due(&laptop, &gid));
 }
 
-/// The laptop tags only from its own entry, the one at its slot. While
-/// another entry carries its key and its own entry does not, it tags nothing.
-/// Once its own entry carries the key it tags, and when that entry moves to
-/// another slot its tags are stale and it builds untagged again.
+/// The laptop tags only from its own entry, the one at the slot it holds.
+/// Holding the phone's slot, whose entry carries another key, it tags
+/// nothing, and its KeyPackage tagged for its own slot no longer counts as
+/// current.
 #[tokio::test]
 async fn only_the_entry_at_its_own_slot_tags() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
@@ -594,33 +598,6 @@ async fn only_the_entry_at_its_own_slot_tags() {
         .engine
         .set_device_tag_group(Some(gid.clone()))
         .unwrap();
-    // The key the Add bound moves to another entry.
-    let mut keyless = roster_of(&phone, &gid).devices[&slot(2)].clone();
-    keyless.tag_signature_key = None;
-    let mut elsewhere = entry("Tablet");
-    elsewhere.tag_signature_key = Some(laptop.engine.own_signature_key());
-    let update = roster_update(
-        &gid,
-        vec![
-            DeviceRosterOperationV1::SetDevice(slot(2), keyless),
-            DeviceRosterOperationV1::SetDevice(slot(3), elsewhere),
-        ],
-    );
-    let commit = send_commit(&mut phone, update, &gid).await;
-    assert_accepted(&mut laptop, &commit, &gid).await;
-    let untagged = laptop.engine.fresh_key_package().await.unwrap();
-    assert_eq!(key_package_tag(&untagged), (None, false));
-    assert!(
-        laptop
-            .engine
-            .key_package_advertises_current_capabilities(&untagged)
-            .unwrap()
-    );
-    assert!(!tag_is_due(&laptop, &gid));
-
-    let remove = roster_update(&gid, vec![DeviceRosterOperationV1::RemoveDevice(slot(3))]);
-    let commit = send_commit(&mut phone, remove, &gid).await;
-    assert_accepted(&mut laptop, &commit, &gid).await;
     set_own_key(&mut laptop, slot(2), &gid, &mut [&mut phone]).await;
     let tagged = laptop.engine.fresh_key_package().await.unwrap();
     assert_eq!(
@@ -628,18 +605,7 @@ async fn only_the_entry_at_its_own_slot_tags() {
         DeviceTagClaim::Device(slot(2))
     );
 
-    // A tag that no longer reads as the laptop's is stale even though its
-    // KeyPackage advertises 0x800f.
-    let own_entry = roster_of(&phone, &gid).devices[&slot(2)].clone();
-    let moved = roster_update(
-        &gid,
-        vec![
-            DeviceRosterOperationV1::RemoveDevice(slot(2)),
-            DeviceRosterOperationV1::SetDevice(slot(3), own_entry),
-        ],
-    );
-    let commit = send_commit(&mut phone, moved, &gid).await;
-    assert_accepted(&mut laptop, &commit, &gid).await;
+    hold_slot(&laptop, slot(1));
     assert!(
         !laptop
             .engine
@@ -836,7 +802,10 @@ async fn a_leaf_whose_tag_reads_as_its_own_keeps_it() {
         &gid,
         vec![DeviceRosterOperationV1::SetDevice(
             slot(2),
-            entry("Work laptop"),
+            DeviceEntryV1 {
+                tag_signature_key: Some(laptop.engine.own_signature_key()),
+                ..entry("Work laptop")
+            },
         )],
     );
     let commit = send_commit(&mut phone, rename, &gid).await;

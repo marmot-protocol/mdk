@@ -308,6 +308,7 @@ const _: () = assert!(
 );
 const ONBOARDING_CANCELLATION_WAIT: Duration = Duration::from_secs(15);
 const CHECK_MAX_AGE: u64 = 300;
+const REPAIR_SIGN_WAIT: Duration = Duration::from_secs(60);
 const FUTURE_CLOCK_SKEW: u64 = 300;
 const DISCOVERY_PAGE_LIMIT: usize = 32;
 const MAX_FOLLOWS: usize = 10_000;
@@ -2458,22 +2459,87 @@ fn set_operation_error(c: &mut OnboardingCheckpoint, step: OnboardingStep, error
     c.set(step, status, vec![failure]);
 }
 
+type OnboardingInspection = (
+    Vec<NostrTransportEvent>,
+    Vec<OnboardingFinding>,
+    HashMap<String, String>,
+);
+
 impl AccountSetup<'_> {
     async fn inspect_onboarding_relays(
         &self,
         account_id: &str,
         kind: u64,
         endpoints: Vec<String>,
-    ) -> (
-        Vec<NostrTransportEvent>,
-        Vec<OnboardingFinding>,
-        HashMap<String, String>,
-    ) {
-        let account_signer = self
+    ) -> OnboardingInspection {
+        let local_signer = self
             .records()
             .resolve(account_id)
             .ok()
+            .filter(|account| account.local_signing)
             .and_then(|account| self.app().account_signer_for_summary(&account).ok());
+        self.inspect_onboarding_relays_with_signer(account_id, kind, endpoints, local_signer)
+            .await
+    }
+
+    async fn inspect_onboarding_inbox(
+        &self,
+        account_id: &str,
+        endpoints: Vec<String>,
+    ) -> OnboardingInspection {
+        let (records, mut failures, mut completed) = self
+            .inspect_onboarding_relays(account_id, 1059, endpoints)
+            .await;
+        if !completed.is_empty() {
+            return (records, failures, completed);
+        }
+        let Ok(account) = self.records().resolve(account_id) else {
+            return (records, failures, completed);
+        };
+        if account.local_signing || !account.external_signing {
+            return (records, failures, completed);
+        }
+        // A single external AUTH request is enough to check an inbox route.
+        // Choose a route only after it actually refused the anonymous read.
+        let Some(index) = failures
+            .iter()
+            .enumerate()
+            .filter(|(_, failure)| failure.issue == OnboardingIssue::AuthenticationRequired)
+            .min_by_key(|(_, failure)| failure.endpoint.as_deref())
+            .map(|(index, _)| index)
+        else {
+            return (records, failures, completed);
+        };
+        let Some(endpoint) = failures[index].endpoint.clone() else {
+            return (records, failures, completed);
+        };
+        let Ok(signer) = self.app().account_signer_for_summary(&account) else {
+            failures[index] = OnboardingFinding {
+                endpoint: Some(endpoint),
+                ..finding(OnboardingIssue::SignerUnavailable)
+            };
+            return (records, failures, completed);
+        };
+        failures.swap_remove(index);
+        let (_, signed_failures, signed_completed) = self
+            .inspect_onboarding_relays_with_signer(account_id, 1059, vec![endpoint], Some(signer))
+            .await;
+        failures.extend(signed_failures);
+        completed.extend(signed_completed);
+        (records, failures, completed)
+    }
+
+    async fn inspect_onboarding_relays_with_signer(
+        &self,
+        account_id: &str,
+        kind: u64,
+        endpoints: Vec<String>,
+        account_signer: Option<crate::external_signer::AccountSigner>,
+    ) -> OnboardingInspection {
+        let external_signer = matches!(
+            account_signer,
+            Some(crate::external_signer::AccountSigner::External(_))
+        );
         // Only the local key always answers a NIP-42 challenge; see
         // `OnboardingFinding::local_key_held`.
         let local_key_held = matches!(
@@ -2574,7 +2640,10 @@ impl AccountSetup<'_> {
                 Ok((endpoint, Err(error))) => {
                     use transport_nostr::DirectoryInspectionError::*;
                     let issue = match error {
-                        TimedOut => OnboardingIssue::TimedOut,
+                        AuthenticationTimedOut if external_signer => {
+                            OnboardingIssue::SignerUnavailable
+                        }
+                        AuthenticationTimedOut | TimedOut => OnboardingIssue::TimedOut,
                         AuthenticationRequired => OnboardingIssue::AuthenticationRequired,
                         PaymentRequired => OnboardingIssue::PaymentRequired,
                         Restricted => OnboardingIssue::AccessRestricted,
@@ -2719,24 +2788,6 @@ impl AccountSetup<'_> {
         Vec<OnboardingFinding>,
         Option<NostrTransportEvent>,
     ) {
-        if step == OnboardingStep::InboxRelays
-            && self
-                .records()
-                .resolve(&c.snapshot.account_id_hex)
-                .is_ok_and(|account| {
-                    account.external_signing
-                        && !self.app().has_external_signer(&account.account_id_hex)
-                })
-        {
-            return (
-                OnboardingStatus::WaitingForSigner,
-                vec![finding(OnboardingIssue::SignerUnavailable).in_context(
-                    OnboardingFindingContext::RecordDiscovery,
-                    OnboardingCheckPurpose::RecordLookup,
-                )],
-                c.records[step.index()].clone(),
-            );
-        }
         let sources = self.onboarding_sources(c, step).await;
         let (records, mut failures, completed) = self
             .inspect_onboarding_relays(&c.snapshot.account_id_hex, step.kind(), sources.clone())
@@ -2891,17 +2942,16 @@ impl AccountSetup<'_> {
                     // connection. The declaration supplies read/write roles;
                     // one completed check on an allowed declared route proves
                     // the minimum local-use capability without editing it.
-                    let (_, failures, completed) = self
-                        .inspect_onboarding_relays(
-                            &c.snapshot.account_id_hex,
-                            if step == OnboardingStep::InboxRelays {
-                                1059
-                            } else {
-                                10002
-                            },
-                            endpoints,
-                        )
-                        .await;
+                    let account_id = &c.snapshot.account_id_hex;
+                    let (_, failures, completed) = if step == OnboardingStep::InboxRelays {
+                        self.inspect_onboarding_inbox(account_id, endpoints).await
+                    } else {
+                        self.inspect_onboarding_relays(account_id, 10002, endpoints)
+                            .await
+                    };
+                    let waiting_for_signer = failures
+                        .iter()
+                        .any(|failure| failure.issue == OnboardingIssue::SignerUnavailable);
                     findings.extend(failures.into_iter().map(|failure| {
                         let mut failure = failure.in_context(
                             OnboardingFindingContext::DeclaredRoute,
@@ -2916,7 +2966,9 @@ impl AccountSetup<'_> {
                         failure
                     }));
                     // Inspection only dials allowed routes from this declaration.
-                    if completed.is_empty() {
+                    if completed.is_empty() && waiting_for_signer {
+                        relay_status = Some(OnboardingStatus::WaitingForSigner);
+                    } else if completed.is_empty() {
                         let mut failure = finding(OnboardingIssue::NoUsableRoute).in_context(
                             OnboardingFindingContext::DeclaredRoute,
                             OnboardingCheckPurpose::DirectoryQuery,
@@ -3496,28 +3548,24 @@ impl AccountSetup<'_> {
                         .map_err(|_| AppError::InvalidPublicKey)?,
                 );
             unsigned.ensure_id();
-            let signed = match self
-                .await_while_onboarding_live(
-                    &c.snapshot.account_id_hex,
-                    c.attempt(),
-                    signer.sign_event(unsigned),
-                )
-                .await
-            {
-                Ok(Ok(event)) => event,
-                Ok(Err(error)) => {
-                    if self.require_live_onboarding_attempt(c).is_err() {
-                        return Err(onboarding_error());
-                    }
-                    set_operation_error(
-                        c,
-                        proposal.step,
-                        &crate::external_signer_error(error, "onboarding repair"),
-                    );
+            let signed = self
+                .await_while_onboarding_live(&c.snapshot.account_id_hex, c.attempt(), async {
+                    timeout(REPAIR_SIGN_WAIT, signer.sign_event(unsigned))
+                        .await
+                        .map_err(|_| {
+                            AppError::ExternalSignerUnavailable(account.account_id_hex.clone())
+                        })?
+                        .map_err(|error| crate::external_signer_error(error, "onboarding repair"))
+                })
+                .await?;
+            let signed = match signed {
+                Ok(event) => event,
+                Err(error) => {
+                    self.require_live_onboarding_attempt(c)?;
+                    set_operation_error(c, proposal.step, &error);
                     self.save_onboarding(c)?;
                     return Ok(false);
                 }
-                Err(_) => return Err(onboarding_error()),
             };
             self.require_live_onboarding_attempt(c)?;
             c.signed_repair = Some(

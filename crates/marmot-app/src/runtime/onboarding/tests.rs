@@ -19,6 +19,8 @@ struct Network {
     fail_index_only: AtomicBool,
     inspection_errors: FixtureMutex<HashMap<String, transport_nostr::DirectoryInspectionError>>,
     inspected_endpoints: FixtureMutex<Vec<String>>,
+    inspection_signers: FixtureMutex<Vec<(u64, bool)>>,
+    inbox_authentication_times_out: AtomicBool,
     zero_acks: AtomicBool,
     block_publish: AtomicBool,
     publishing: Notify,
@@ -91,8 +93,19 @@ impl DirectoryRelayFetcher for Network {
     async fn inspect_directory_events(
         &self,
         request: DirectoryFetchRequest,
-        _signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
+        signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
     ) -> Result<Vec<DirectoryRelayEventRecord>, transport_nostr::DirectoryInspectionError> {
+        let kind = request.queries[0].kind;
+        self.inspection_signers
+            .lock()
+            .push((kind, signer.is_some()));
+        if kind == 1059 && self.inbox_authentication_times_out.load(Ordering::SeqCst) {
+            return Err(if signer.is_some() {
+                transport_nostr::DirectoryInspectionError::AuthenticationTimedOut
+            } else {
+                transport_nostr::DirectoryInspectionError::AuthenticationRequired
+            });
+        }
         self.inspected_endpoints
             .lock()
             .extend(request.endpoints.iter().map(|endpoint| endpoint.0.clone()));
@@ -5907,104 +5920,155 @@ impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for Blockin
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn repair_signature_timeout_preserves_approval_for_retry_after_reconnect() {
+    let directory = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = runtime(directory.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    let block = Arc::new(AtomicBool::new(true));
+    let signer = BlockingSigner {
+        keys,
+        block: block.clone(),
+        started: Arc::new(Notify::new()),
+    };
+    let setup = runtime.account_setup();
+    setup
+        .begin_external_signer_onboarding(id.clone(), signer.clone(), options())
+        .await
+        .unwrap();
+    missing_relays(&runtime, &id).await;
+    let preview = setup
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    let snapshot = timeout(
+        REPAIR_SIGN_WAIT + Duration::from_secs(1),
+        setup.approve_onboarding_repair(&id, preview.revision),
+    )
+    .await
+    .expect("repair signing is bounded")
+    .unwrap();
+    let state = &snapshot.steps[OnboardingStep::Relays.index()];
+    assert_eq!(state.status, OnboardingStatus::WaitingForSigner);
+    let finding = &state.findings[0];
+    assert_eq!(finding.issue, OnboardingIssue::SignerUnavailable);
+    assert_eq!(finding.context, OnboardingFindingContext::RepairPublication);
+    assert_eq!(finding.purpose, OnboardingCheckPurpose::EventPublication);
+    assert_eq!(finding.outcome, OnboardingCheckOutcome::Unknown);
+    assert!(finding.actions.contains(&OnboardingAction::ReconnectSigner));
+    assert!(finding.actions.contains(&OnboardingAction::Retry));
+    assert_eq!(finding.observed_revision, Some(snapshot.revision));
+    let checkpoint = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert!(checkpoint.approved);
+    assert!(checkpoint.signed_repair.is_none());
+    assert!(network.attempts.lock().is_empty());
+    block.store(false, Ordering::SeqCst);
+    runtime.register_external_signer(&id, signer).await.unwrap();
+    setup
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let attempts = network.attempts.lock().clone();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].kind, 10002);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn signer_diagnostic_recovery() {
-    for approved in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let network = Arc::new(Network::default());
-        let first = runtime(directory.path(), network.clone());
-        let keys = nostr::prelude::Keys::generate();
-        let id = keys.public_key().to_hex();
-        let block = Arc::new(AtomicBool::new(false));
-        let started = Arc::new(Notify::new());
-        first
-            .account_setup()
-            .begin_external_signer_onboarding(
-                id.clone(),
-                BlockingSigner {
-                    keys: keys.clone(),
-                    block: block.clone(),
-                    started: started.clone(),
-                },
-                options(),
-            )
-            .await
-            .unwrap();
-        missing_relays(&first, &id).await;
-        let (step, context, purpose) = if approved {
-            let preview = first
-                .account_setup()
-                .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
-                .await
-                .unwrap();
-            block.store(true, Ordering::SeqCst);
-            let task = tokio::spawn({
-                let manager = first.accounts();
-                let id = id.clone();
-                async move {
-                    manager
-                        .account_setup()
-                        .approve_onboarding_repair(&id, preview.revision)
-                        .await
-                }
-            });
-            timeout(Duration::from_secs(2), started.notified())
-                .await
-                .unwrap();
-            task.abort();
-            assert!(task.await.unwrap_err().is_cancelled());
-            (
-                OnboardingStep::Relays,
-                OnboardingFindingContext::RepairPublication,
-                OnboardingCheckPurpose::EventPublication,
-            )
-        } else {
-            let manager = first.accounts();
-            let mut checkpoint = manager
-                .setup_records()
-                .onboarding_checkpoint(&id)
-                .unwrap()
-                .unwrap();
-            checkpoint.set(OnboardingStep::Relays, OnboardingStatus::Passed, vec![]);
-            checkpoint.records[OnboardingStep::Relays.index()] = Some(signed(
-                &keys,
-                10002,
-                vec![vec!["r".into(), "wss://healthy.example".into()]],
-                "",
-                unix_now_seconds(),
-            ));
-            manager
-                .account_setup()
-                .save_onboarding(&mut checkpoint)
-                .unwrap();
-            (
-                OnboardingStep::InboxRelays,
-                OnboardingFindingContext::RecordDiscovery,
-                OnboardingCheckPurpose::RecordLookup,
-            )
-        };
-        first.shutdown_and_close().await.unwrap();
-        let reopened = runtime(directory.path(), network.clone());
-        let snapshot = reopened.account_setup().run_onboarding(&id).await.unwrap();
-        let state = &snapshot.steps[step.index()];
+async fn external_inbox_lookup_precedes_signer_availability_and_auth_probe() {
+    let directory = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let first = runtime(directory.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    let signer = BlockingSigner {
+        keys: keys.clone(),
+        block: Arc::new(AtomicBool::new(false)),
+        started: Arc::new(Notify::new()),
+    };
+    first
+        .account_setup()
+        .begin_external_signer_onboarding(id.clone(), signer.clone(), options())
+        .await
+        .unwrap();
+    let now = unix_now_seconds();
+    network.events.lock().extend([
+        signed(&keys, 0, vec![], "{}", now),
+        signed(&keys, 3, vec![], "", now),
+        signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), "wss://healthy.example".into()]],
+            "",
+            now,
+        ),
+    ]);
+    first.shutdown_and_close().await.unwrap();
+    let reopened = runtime(directory.path(), network.clone());
+    let setup = reopened.account_setup();
+    let inbox = OnboardingStep::InboxRelays;
+    let snapshot = setup.run_onboarding(&id).await.unwrap();
+    let state = &snapshot.steps[inbox.index()];
+    assert_eq!(state.status, OnboardingStatus::NeedsInput);
+    assert_eq!(state.findings[0].issue, OnboardingIssue::Missing);
+    network.events.lock().push(signed(
+        &keys,
+        10050,
+        vec![
+            vec!["relay".into(), "wss://inbox-one.example".into()],
+            vec!["relay".into(), "wss://inbox-two.example".into()],
+        ],
+        "",
+        now,
+    ));
+    network
+        .inbox_authentication_times_out
+        .store(true, Ordering::SeqCst);
+    let check_waiting = |snapshot: OnboardingSnapshot| {
+        let state = &snapshot.steps[inbox.index()];
         assert_eq!(state.status, OnboardingStatus::WaitingForSigner);
-        let finding = &state.findings[0];
-        assert_eq!(finding.issue, OnboardingIssue::SignerUnavailable);
-        assert_eq!(finding.context, context);
-        assert_eq!(finding.purpose, purpose);
-        assert_eq!(finding.outcome, OnboardingCheckOutcome::Unknown);
-        assert!(finding.actions.contains(&OnboardingAction::ReconnectSigner));
-        assert!(finding.actions.contains(&OnboardingAction::Retry));
+        assert!(state.actions.contains(&OnboardingAction::ReconnectSigner));
+        assert!(state.actions.contains(&OnboardingAction::Retry));
+        assert!(!state.actions.contains(&OnboardingAction::EditRelays));
         assert!(
-            finding
+            !state
                 .actions
-                .iter()
-                .all(|action| state.actions.contains(action))
+                .contains(&OnboardingAction::UseRecommendedRelays)
         );
-        assert_eq!(finding.observed_revision, Some(snapshot.revision));
-        assert!(network.attempts.lock().is_empty());
-        reopened.shutdown_and_close().await.unwrap();
-    }
+        assert!(state.findings.iter().any(|finding| {
+            finding.issue == OnboardingIssue::SignerUnavailable
+                && finding.context == OnboardingFindingContext::DeclaredRoute
+                && finding.actions.contains(&OnboardingAction::ReconnectSigner)
+        }));
+    };
+    check_waiting(setup.retry_onboarding_step(&id, inbox).await.unwrap());
+    reopened
+        .register_external_signer(&id, signer)
+        .await
+        .unwrap();
+    check_waiting(setup.retry_onboarding_step(&id, inbox).await.unwrap());
+    let signers = network.inspection_signers.lock().clone();
+    assert!(
+        signers
+            .iter()
+            .any(|&(kind, signed)| kind == 10050 && !signed)
+    );
+    assert_eq!(
+        signers
+            .into_iter()
+            .filter(|&(_, signed)| signed)
+            .collect::<Vec<_>>(),
+        vec![(1059, true)]
+    );
+    assert!(network.attempts.lock().is_empty());
+    reopened.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

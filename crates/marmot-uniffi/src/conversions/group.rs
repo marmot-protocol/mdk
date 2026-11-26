@@ -142,6 +142,10 @@ pub enum InviteDeliveryProblemFfi {
     /// The recipient no longer holds the KeyPackage it answers. Not yet
     /// produced.
     KeyPackageRetired,
+    /// No usable inbox relay is known for the recipient, and MDK's latest
+    /// lookup of their inbox relay list failed (no relay answered in full or
+    /// in time). MDK looks it up again at its next retry.
+    InboxLookupFailed,
 }
 
 /// Why an invite is no longer owed.
@@ -219,6 +223,7 @@ impl From<marmot_app::WelcomeDeliveryProblem> for InviteDeliveryProblemFfi {
             Problem::Mixed => Self::Mixed,
             Problem::TooLarge => Self::TooLarge,
             Problem::KeyPackageRetired => Self::KeyPackageRetired,
+            Problem::InboxLookupFailed => Self::InboxLookupFailed,
         }
     }
 }

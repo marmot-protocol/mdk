@@ -1,11 +1,15 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
 use nostr::nips::nip67::EoseHint;
+use nostr_sdk::authenticator::{Authenticator, SignerAuthenticator};
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, Event, EventId, Filter, Kind, PublicKey, RelayMessage,
     RelayNotification, RelayStatus, RelayUrl, SingleLetterTag, SubscribeAutoCloseOptions,
@@ -65,6 +69,8 @@ pub enum DirectoryInspectionError {
     Unreachable,
     TimedOut,
     AuthenticationRequired,
+    /// A requested NIP-42 signature was still pending when the read expired.
+    AuthenticationTimedOut,
     PaymentRequired,
     Restricted,
     InvalidRequest,
@@ -1081,6 +1087,33 @@ pub async fn fetch_public_events(
     result
 }
 
+#[derive(Debug)]
+struct InspectionAuthenticator {
+    signer: SignerAuthenticator<SdkSigner>,
+    pending: Arc<AtomicBool>,
+}
+
+impl Authenticator for InspectionAuthenticator {
+    fn make_auth_event<'a>(
+        &'a self,
+        relay_url: &'a RelayUrl,
+        challenge: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Event, nostr_sdk::prelude::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            struct PendingSignature<'a>(&'a AtomicBool);
+            impl Drop for PendingSignature<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Relaxed);
+                }
+            }
+
+            self.pending.store(true, Ordering::Relaxed);
+            let _pending = PendingSignature(&self.pending);
+            self.signer.make_auth_event(relay_url, challenge).await
+        })
+    }
+}
+
 #[async_trait]
 impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
     async fn inspect_directory_events(
@@ -1091,10 +1124,12 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         use DirectoryInspectionError::*;
         // The signer belongs to this request only, never to a shared mutable
         // directory client that could authenticate as another account.
+        let signing_pending = Arc::new(AtomicBool::new(false));
         let builder = match signer {
-            Some(signer) => super::nostr_builder().authenticator(
-                nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(signer)),
-            ),
+            Some(signer) => super::nostr_builder().authenticator(InspectionAuthenticator {
+                signer: SignerAuthenticator::new(SdkSigner(signer)),
+                pending: signing_pending.clone(),
+            }),
             None => super::nostr_builder(),
         };
         let (builder, finite) = FiniteRequests::install(builder);
@@ -1166,6 +1201,9 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 }
                 FiniteEnd::Eose => {}
                 FiniteEnd::Closed(reason) => return Err(directory_closed_reason(reason)),
+                FiniteEnd::TimedOut if signing_pending.load(Ordering::Relaxed) => {
+                    return Err(AuthenticationTimedOut);
+                }
                 FiniteEnd::TimedOut => return Err(TimedOut),
                 FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => return Err(Restricted),
                 _ => return Err(Unreachable),

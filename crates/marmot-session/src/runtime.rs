@@ -96,6 +96,7 @@ pub use welcome_outcomes::{INVITE_DELIVERY_RETENTION_SECS, WelcomeDeliveryOutcom
 use welcome_relays::{
     RelayPublish, RemainingPass, RemainingWelcomeSends, join_relay_answers, relay_sends, until_met,
 };
+pub use welcome_routes::{WelcomeRouteLookup, WelcomeRouteLookupPlan};
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
@@ -1169,20 +1170,6 @@ where
         Ok(self
             .session
             .own_device_leaves(group_id, roster, slot, tag_signature_key)?)
-    }
-
-    /// This account's other leaves in `group_id`, by signature key, whose
-    /// device tag verifies under the leaf's own key, each with the slot the
-    /// tag names. See
-    /// [`cgka_engine::engine::Engine::own_account_self_signed_tags`].
-    pub fn own_account_self_signed_tags(
-        &self,
-        group_id: &GroupId,
-        leaf_tag_key: &[u8; 32],
-    ) -> AccountResult<Vec<(Vec<u8>, cgka_traits::app_components::DeviceSlotId)>> {
-        Ok(self
-            .session
-            .own_account_self_signed_tags(group_id, leaf_tag_key)?)
     }
 
     /// This account's other leaves in `group_id`, by signature key with the
@@ -7483,12 +7470,13 @@ where
             match routed {
                 Ok(target) => target,
                 Err(e) => {
+                    let lookup_failed = self.welcome_route_lookup_failed(&message);
                     self.record_v5_welcome_not_started(
                         welcome_facts.clone(),
-                        welcome_routes::route_not_started_reason(&e),
+                        welcome_routes::route_not_started_reason(&e, lookup_failed),
                     );
                     if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
-                        self.record_welcome_route_failure(&message.id);
+                        self.record_welcome_route_failure(&message.id, lookup_failed);
                     }
                     self.record_audit_event(
                         welcome_facts.as_ref().map(|facts| &facts.group_id),

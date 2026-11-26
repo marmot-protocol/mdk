@@ -689,6 +689,10 @@ fn authorize_proposal(
                     .map_err(|_| {
                         StandaloneProposalRejection::invalid("device_roster_update_invalid")
                     })?;
+                    crate::roster_key_binding::validate_standalone_update(mls_group, update)
+                        .map_err(|_| {
+                            StandaloneProposalRejection::invalid("device_roster_key_binding")
+                        })?;
                 }
             }
         }
@@ -736,7 +740,7 @@ fn authorize_proposal(
             }
             validate_membership_proposal(mls_group, proposal)?;
         }
-        Proposal::Update(_) => {
+        Proposal::Update(update) => {
             // The current profile's only non-admin standalone proposal is
             // SelfRemove. Deployed legacy groups retain the ordinary MLS
             // member self-update proposal flow.
@@ -746,6 +750,14 @@ fn authorize_proposal(
                 ));
             }
             validate_membership_proposal(mls_group, proposal)?;
+            if standalone {
+                crate::roster_key_binding::validate_standalone_leaf_update(
+                    mls_group,
+                    *sender_index,
+                    update.leaf_node(),
+                )
+                .map_err(|_| StandaloneProposalRejection::invalid("device_roster_key_binding"))?;
+            }
         }
         Proposal::PreSharedKey(_)
         | Proposal::ReInit(_)
@@ -1122,6 +1134,7 @@ pub(crate) fn validate_current_profile_invariants_for_staged_commit(
     validate_account_devices_transition(group, staged, &required_components)?;
     validate_account_devices_state(extensions, &required_components, &leaves)?;
     validate_device_roster_transition(group, &required_components)?;
+    crate::roster_key_binding::validate_commit(group, staged, committer_index, &leaves)?;
     validate_device_roster_state(extensions, &required_components, &leaves)?;
     validate_group_lifecycle_transition(group, staged, committer_index)
 }
