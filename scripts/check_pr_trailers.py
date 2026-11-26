@@ -49,7 +49,10 @@ HUMAN_REVIEW = re.compile(r"^human(?:\s+\S.*)?$")
 EXEMPT_REVIEW = re.compile(r"^exempt\s*\((?P<reason>[^()]+)\)$")
 FRAGMENT_PATH = re.compile(r"(?:^|/)changelog\.d/[^/]+\.md$")
 GITHUB_SQUASH_SEPARATOR = "---------"
-GITHUB_SQUASH_FOOTER_KEYS = frozenset({"co-authored-by", "signed-off-by", "on-behalf-of"})
+GITHUB_SQUASH_FOOTER_LINE = re.compile(
+    r"^(?:Co-authored-by|Signed-off-by|On-behalf-of):[ \t]+(?:\S[^\r\n]*[ \t]+)?<[^<>\s]+>$",
+    re.IGNORECASE,
+)
 
 
 def git(root: Path, *args: str) -> str:
@@ -125,13 +128,7 @@ def strip_github_squash_footer(message: str) -> str | None:
     footer_slice = lines[sep_idx + 1 :]
     while footer_slice and not footer_slice[0].strip():
         footer_slice.pop(0)
-    if not footer_slice or any(not line.strip() for line in footer_slice):
-        return None
-    if not all(line.startswith((" ", "\t")) or ":" in line for line in footer_slice):
-        return None
-
-    footer_trailers, _ = parse_trailers("footer\n\n" + "\n".join(footer_slice) + "\n")
-    if not footer_trailers or not set(footer_trailers).issubset(GITHUB_SQUASH_FOOTER_KEYS):
+    if not footer_slice or any(not GITHUB_SQUASH_FOOTER_LINE.match(line) for line in footer_slice):
         return None
     return "\n".join(lines[:sep_idx]).rstrip() + "\n"
 
