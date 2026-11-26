@@ -748,8 +748,8 @@ not see began after that look's mark, and any loss imported after it, other than
 second, breaks the routes it names on every generation that carries them, and every route of every
 generation when it names none. Loss that names its routes lost nothing a batched REQ carried for
 another route, so that route keeps its boundary and tail.
-It reads the log again after the look, so loss imported while it looked also ends the tails of
-the generations it saw. It also looks at the adapter again after the write, and a generation the
+It reads the log again after the look, so loss imported while it looked also breaks, by the same
+rule, the routes it reached on the generations it saw. It also looks at the adapter again after the write, and a generation the
 adapter ended meanwhile (a `CLOSED` or reconnect it processed) gets no tail. The first mark is read when the client opens; the relay plane's shared adapter can still report
 REQs an earlier session of the account opened, and those never prove for the new session.
 
