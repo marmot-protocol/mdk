@@ -6,6 +6,7 @@ remain the authority for generated ABI and platform compatibility.
 """
 
 import hashlib
+from itertools import takewhile
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,14 @@ PAGE_POLICY_RUSTC_ARGS = [
     "-C", "link-arg=-Wl,-z,max-page-size=16384",
     "-C", "link-arg=-Wl,-z,common-page-size=16384",
 ]
+
+
+def release_identity_script():
+    workflow = (TOOLS.parents[1] / ".github/workflows/bindings.yaml").read_text()
+    step = workflow.split("      - name: Resolve release identity\n", 1)[1]
+    body = step.split("        run: |\n", 1)[1]
+    lines = takewhile(lambda line: not line.strip() or line.startswith("          "), body.splitlines())
+    return textwrap.dedent("\n".join(lines))
 
 
 def page_policy_args(args):
@@ -410,10 +419,7 @@ class BuildPhases(unittest.TestCase):
         # source, even though branch rehearsals are allowed.
         self.shim(self.bin / "git")
         (self.root / "Cargo.toml").write_text('version = "0.10.3"\n')
-        workflow = (TOOLS.parents[1] / ".github/workflows/bindings.yaml").read_text()
-        block = workflow.split("      - name: Resolve release identity\n", 1)[1]
-        block = block.split("        run: |\n", 1)[1].split("\n  apple-build:", 1)[0]
-        script = textwrap.dedent(block)
+        script = release_identity_script()
         cases = [
             ("refs/heads/master", "true", "1", False),
             ("refs/heads/master", "true", "0", True),
@@ -434,10 +440,7 @@ class BuildPhases(unittest.TestCase):
     def test_nightly_identity_requires_a_dev_source_on_master(self):
         # The same identity script, as nightly-releases.yml calls it.
         self.shim(self.bin / "git")
-        workflow = (TOOLS.parents[1] / ".github/workflows/bindings.yaml").read_text()
-        block = workflow.split("      - name: Resolve release identity\n", 1)[1]
-        block = block.split("        run: |\n", 1)[1].split("\n  apple-build:", 1)[0]
-        script = textwrap.dedent(block)
+        script = release_identity_script()
         version = "0.14.0-nightly.20261020"
         cases = [
             ("0.14.0-dev", version, "refs/heads/master", "false", "0", True),
