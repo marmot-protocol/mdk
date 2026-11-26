@@ -41,7 +41,8 @@ pub use runtime::{
     OversizedEvent, PendingCommit, PendingCommitState, PendingResolution, PreparedSessionCommit,
     PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage,
     UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
-    WallClockWindow, WelcomeDeliveryFailure, WelcomeDeliveryOutcome,
+    WallClockWindow, WelcomeDeliveryFailure, WelcomeDeliveryOutcome, WelcomeRouteLookup,
+    WelcomeRouteLookupPlan,
 };
 pub use session::{
     CreateGroupEffects, GroupAuthorityView, HydrationProgress, PublishWork, QueuedIntentRef,

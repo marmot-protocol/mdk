@@ -746,14 +746,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
     one that settles after `shutdown_and_close` closed storage leaves its Welcome owed, and the next start sends the
     same event once more.
 - Look up an invited recipient's inbox list beside the account worker (mdk#2261, `client/welcome_route_lookups.rs`,
-  `runtime/account_worker/welcome_route_lookups.rs`) only when the session owes it (`take_due_welcome_route_lookups`:
-  a paced Welcome attempt found no route and an owed Welcome is still addressed to them), never for a Welcome that is
-  withdrawn, expired, delivered or staged. At most `LOOKUPS_PER_ACCOUNT` at once, one per recipient, each bounded by
-  `LOOKUP_TIMEOUT`; none while maintenance is paused or cursors are frozen. The task keeps T1 and T2 (the directory's
-  `resolve_account_relay_list_status_for_account_id`, which writes only the directory cache). Its continuation runs
-  on the writer: it reads the route from the cache again and installs it with `replace_inbox_route` (a failed lookup
-  with no usable cached list installs `LookupFailed`), and only a route releases the session's retry and wakes
-  maintenance. It never touches a Welcome's stored retry record. L1 and L2 as for the sign-in read, except that
+  `runtime/account_worker/welcome_route_lookups.rs`) only when the session's plan starts it
+  (`plan_welcome_route_lookups`: a paced Welcome attempt found no route and an owed Welcome is still addressed to
+  them), never for a Welcome that is withdrawn, expired, delivered or staged; the worker drops (aborts) a running one
+  the plan stops at each loop turn. At most `LOOKUPS_PER_ACCOUNT` at once, one per recipient, each bounded by
+  `LOOKUP_TIMEOUT`; none starts while maintenance is paused or cursors are frozen. The task keeps T1 and T2 (the
+  directory's `resolve_account_relay_list_status_for_account_id`, from the configured directory relays, which writes
+  only the directory cache). Its continuation runs on the writer: it reads the route from the cache again, installs
+  it with `replace_inbox_route`, and reports the outcome to the session (`finish_welcome_route_lookup`), which keeps a
+  failed lookup's cause in its pacing; only a route releases the retry and wakes maintenance. It never touches a
+  Welcome's stored retry record. L1 and L2 as for the sign-in read, except that
   cancellation stops waiting at once (shutdown gives the account's work only `WELCOME_WAVE_SHUTDOWN_WAIT`); the
   next client's session owes its own lookups.
 - Send every host group-change command through the runtime's host-change entry points

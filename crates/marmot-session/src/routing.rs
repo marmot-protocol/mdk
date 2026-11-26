@@ -41,11 +41,6 @@ pub enum MissingInboxRouteCause {
     /// every one of them.
     #[error("none usable")]
     NoneUsable,
-    /// The host's last lookup of the recipient's inbox list failed (no
-    /// answer, an incomplete read, or no reply in time), and no list it holds
-    /// gives a usable endpoint.
-    #[error("lookup failed")]
-    LookupFailed,
 }
 
 #[derive(Clone, Debug)]

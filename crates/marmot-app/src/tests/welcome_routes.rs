@@ -249,7 +249,7 @@ async fn a_route_less_welcome_is_classified_and_paced() {
 /// them beside its writer; each one's answer, in order.
 async fn run_owed_lookups(alice: &AppClient) -> Vec<bool> {
     let mut answers = Vec::new();
-    for start in alice.begin_welcome_route_lookups(4, |_| false) {
+    for start in alice.plan_welcome_route_lookups(4, &[]).start {
         let mut lookup = start.spawn(tokio_util::sync::CancellationToken::new());
         let answered = lookup.result().await;
         alice
@@ -260,11 +260,12 @@ async fn run_owed_lookups(alice: &AppClient) -> Vec<bool> {
     answers
 }
 
-/// mdk#2261: a lookup of a route-less recipient's inbox list that fails is
-/// the "lookup failed" cause, which the next paced attempt records: on the
-/// invite, and as the v5 `route_resolution_failed` reason. It keeps the
-/// pacing: a pass inside the wait looks nobody up, and the attempt after it
-/// owes the next lookup.
+/// mdk#2261: a failed lookup of a route-less recipient's inbox list is
+/// recorded on the invite at once, as `InboxLookupFailed`, and announced. It
+/// keeps the pacing: a pass inside the wait looks nobody up. The attempt
+/// after the wait records it too, as the v5 `route_resolution_failed`
+/// reason, even though a routing rebuild happened since and the cached list
+/// is known empty; that attempt owes the next lookup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_inbox_lookup_is_recorded_and_keeps_the_pacing() {
     let invite = route_less_invite().await;
@@ -277,21 +278,23 @@ async fn a_failed_inbox_lookup_is_recorded_and_keeps_the_pacing() {
         expired,
         ..
     } = invite;
-    fetcher.fail_all_fetches();
-    let fetches = || fetcher.requests.lock().unwrap().len();
-    let before = fetches();
-    assert_eq!(run_owed_lookups(&alice).await, [false]);
-    assert!(fetches() > before, "the lookup asked the relays");
     let problem = |alice: &AppClient| match alice.invite_deliveries(Some(&group)).unwrap()[0].state
     {
         WelcomeDeliveryState::Sending { last_problem } => last_problem,
         other => panic!("the Welcome is still owed: {other:?}"),
     };
+    assert_eq!(problem(&alice), Some(WelcomeDeliveryProblem::NoInboxRelays));
+    alice.take_invite_delivery_changes();
+    fetcher.fail_all_fetches();
+    let fetches = || fetcher.requests.lock().unwrap().len();
+    let before = fetches();
+    assert_eq!(run_owed_lookups(&alice).await, [false]);
+    assert!(fetches() > before, "the lookup asked the relays");
     assert_eq!(
         problem(&alice),
-        Some(WelcomeDeliveryProblem::NoInboxRelays),
-        "no attempt has found the failed lookup yet"
+        Some(WelcomeDeliveryProblem::InboxLookupFailed)
     );
+    assert_eq!(alice.take_invite_delivery_changes().len(), 1, "announced");
 
     clock.0.store(expired + 599, Ordering::SeqCst);
     alice.run_due_maintenance().await.unwrap();
@@ -299,6 +302,7 @@ async fn a_failed_inbox_lookup_is_recorded_and_keeps_the_pacing() {
     assert!(run_owed_lookups(&alice).await.is_empty());
     assert_eq!(fetches(), before, "a pass inside the wait looks nobody up");
 
+    alice.refresh_routing().unwrap();
     clock.0.store(expired + 600, Ordering::SeqCst);
     alice.run_due_maintenance().await.unwrap();
     assert_eq!(

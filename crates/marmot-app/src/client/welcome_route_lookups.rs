@@ -5,16 +5,17 @@
 //! doubling, at most 6 hours. Each paced attempt that finds no route owes one
 //! lookup of the recipient's kind-10050 list. The account worker runs it
 //! beside the writer, through the directory's relay-list resolution (the one
-//! invite recovery uses), which writes what it observes to the directory
-//! cache. Its continuation runs on the writer: it reads the route from the
-//! cache again, installs it in the routing table, and, when it gives a
-//! route, releases the recipient's retry so the next maintenance pass sends
-//! the Welcome. A lookup that fails installs `LookupFailed` unless the cache
-//! still gives a route; a lookup that confirms there is no usable list
-//! installs the cause the cache gives. Either way the pacing stays.
+//! invite recovery uses, from the configured directory relays), which writes
+//! what it observes to the directory cache. Its continuation runs on the
+//! writer: it reads the route from the cache again, installs it in the
+//! routing table, and tells the session what it found. A route releases the
+//! recipient's retry so the next maintenance pass sends the Welcome; a failed
+//! lookup, or one that confirms there is no usable list, leaves the pacing,
+//! and the session records which on the invite. The worker stops a running
+//! lookup once no owed Welcome is addressed to its recipient.
 //!
-//! A lookup task holds the directory's handle, the discovery relays and the
-//! recipient's id, and nothing of the client (mdk#3466 T1); it reaches relays
+//! A lookup task holds the directory's handle and the recipient's id, and
+//! nothing of the client (mdk#3466 T1); it reaches relays
 //! only through the directory's public resolution, which writes only through
 //! the directory's own store (T2). It belongs to the client that started it:
 //! the worker cancels it before replacing that client, and cancels and waits
@@ -27,8 +28,8 @@
 
 use std::time::Duration;
 
-use cgka_traits::{MemberId, TransportEndpoint};
-use marmot_session::MissingInboxRouteCause;
+use cgka_traits::MemberId;
+use marmot_session::WelcomeRouteLookup;
 use nostr_directory::Directory;
 use nostr_directory::error::DirectoryError;
 use tokio::task::JoinHandle;
@@ -45,7 +46,6 @@ pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct RouteLookupStart {
     recipient: MemberId,
     directory: Directory<MarmotApp>,
-    discovery_relays: Vec<TransportEndpoint>,
 }
 
 impl RouteLookupStart {
@@ -55,16 +55,15 @@ impl RouteLookupStart {
         let RouteLookupStart {
             recipient,
             directory,
-            discovery_relays,
         } = self;
         let account_id_hex = hex::encode(recipient.as_slice());
         let task = tokio::spawn(async move {
             let resolve = tokio::time::timeout(
                 LOOKUP_TIMEOUT,
-                directory.resolve_account_relay_list_status_for_account_id(
-                    &account_id_hex,
-                    discovery_relays,
-                ),
+                // No relays named: the directory reads its configured
+                // directory relays, else the operational ones.
+                directory
+                    .resolve_account_relay_list_status_for_account_id(&account_id_hex, Vec::new()),
             );
             tokio::select! {
                 biased;
@@ -125,72 +124,77 @@ impl RunningRouteLookup {
     }
 }
 
+/// The lookups a worker should start and stop now.
+pub(crate) struct RouteLookupPlan {
+    pub(crate) start: Vec<RouteLookupStart>,
+    pub(crate) stop: Vec<MemberId>,
+}
+
 impl AppClient {
-    /// The lookups owed now: at most `limit` recipients, skipping those
-    /// `running` names. None while maintenance is paused or cursors are
-    /// frozen, as for invite recovery: the owed lookups wait for a client
-    /// that runs maintenance.
-    pub(crate) fn begin_welcome_route_lookups(
+    /// The lookups to start and stop, given the recipients of those
+    /// `running`: at most `limit` running in all. Nothing starts while
+    /// maintenance is paused or cursors are frozen, as for invite recovery:
+    /// the owed lookups wait for a client that runs maintenance. A running
+    /// lookup whose recipient no owed Welcome is addressed to any more stops.
+    pub(crate) fn plan_welcome_route_lookups(
         &self,
         limit: usize,
-        running: impl Fn(&MemberId) -> bool,
-    ) -> Vec<RouteLookupStart> {
-        if limit == 0
-            || self.runtime.maintenance_is_paused()
+        running: &[MemberId],
+    ) -> RouteLookupPlan {
+        let limit = if self.runtime.maintenance_is_paused()
             || self.app.cursor_persistence() == CursorPersistence::Frozen
         {
-            return Vec::new();
-        }
-        let recipients = match self
-            .runtime
-            .take_due_welcome_route_lookups(limit, |recipient| !running(recipient))
-        {
-            Ok(recipients) => recipients,
+            0
+        } else {
+            limit
+        };
+        let plan = match self.runtime.plan_welcome_route_lookups(limit, running) {
+            Ok(plan) => plan,
             Err(error) => {
                 tracing::warn!(
                     target: "marmot_app::client",
-                    method = "begin_welcome_route_lookups",
+                    method = "plan_welcome_route_lookups",
                     error_kind = AppError::from(error).privacy_safe_kind(),
                     "owed inbox lookups unreadable; retried on a later turn"
                 );
-                return Vec::new();
+                return RouteLookupPlan {
+                    start: Vec::new(),
+                    stop: Vec::new(),
+                };
             }
         };
-        if recipients.is_empty() {
-            return Vec::new();
+        RouteLookupPlan {
+            start: plan
+                .start
+                .into_iter()
+                .map(|recipient| RouteLookupStart {
+                    recipient,
+                    directory: self.app.directory(),
+                })
+                .collect(),
+            stop: plan.stop,
         }
-        let directory = self.app.directory();
-        let discovery_relays = self.app.relay_endpoints();
-        recipients
-            .into_iter()
-            .map(|recipient| RouteLookupStart {
-                recipient,
-                directory: directory.clone(),
-                discovery_relays: discovery_relays.clone(),
-            })
-            .collect()
     }
 
     /// A lookup of `recipient`'s inbox list ended, answered or not: install
     /// the route the directory cache now gives, or why there is none, and
-    /// release the recipient's retry when there is one. Returns whether it
-    /// released it, so the caller runs maintenance soon.
+    /// tell the session what it found. Returns whether it found a route,
+    /// which releases the recipient's retry, so the caller runs maintenance.
     pub(crate) fn finish_welcome_route_lookup(
         &self,
         recipient: &MemberId,
         answered: bool,
     ) -> Result<bool, AppError> {
-        let mut route = self
+        let route = self
             .app
             .member_inbox_route(&hex::encode(recipient.as_slice()))?;
-        if !answered && route.is_err() {
-            route = Err(MissingInboxRouteCause::LookupFailed);
-        }
-        let routed = route.is_ok();
+        let outcome = match (&route, answered) {
+            (Ok(_), _) => WelcomeRouteLookup::Routed,
+            (Err(_), true) => WelcomeRouteLookup::NoRoute,
+            (Err(_), false) => WelcomeRouteLookup::Failed,
+        };
         self.routing.replace_inbox_route(recipient.clone(), route);
-        if routed {
-            self.runtime.release_welcome_route_retry(recipient);
-        }
-        Ok(routed)
+        self.runtime.finish_welcome_route_lookup(recipient, outcome);
+        Ok(outcome == WelcomeRouteLookup::Routed)
     }
 }

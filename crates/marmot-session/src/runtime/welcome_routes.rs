@@ -11,13 +11,16 @@
 //! attempt.
 //!
 //! Each paced attempt that finds no route also owes the host one lookup of
-//! the recipient's inbox list ([`AccountDeviceRuntime::take_due_welcome_route_lookups`]).
-//! The host runs it, installs what it found in its routing policy, and, when
-//! that gives a route, releases the recipient's retry
-//! ([`AccountDeviceRuntime::release_welcome_route_retry`]), so the next pass
-//! sends the Welcome. A lookup that finds nothing usable leaves the pacing as
-//! it was. Route discovery stays with the host: the runtime only says whom to
-//! look up.
+//! the recipient's inbox list ([`AccountDeviceRuntime::plan_welcome_route_lookups`]),
+//! which also names the lookups the host should stop because no owed Welcome
+//! is addressed to their recipient any more. The host runs each lookup,
+//! installs what it found in its routing policy, and reports the outcome
+//! ([`AccountDeviceRuntime::finish_welcome_route_lookup`]). A route releases
+//! the recipient's retry, so the next pass sends the Welcome. A lookup that
+//! finds nothing usable leaves the pacing as it was, and its outcome is the
+//! route-less Welcomes' delivery problem at once: `InboxLookupFailed` after a
+//! failed lookup, until a later lookup answers. Route discovery stays with the
+//! host: the runtime only says whom to look up.
 
 use super::*;
 use crate::routing::{MissingInboxRouteCause, TransportRoutingError};
@@ -40,6 +43,8 @@ struct RouteRetry {
     /// The host owes a lookup of the recipient's inbox list, for the paced
     /// attempt that last failed.
     lookup_due: bool,
+    /// The host's last lookup of the recipient's inbox list failed.
+    lookup_failed: bool,
 }
 
 impl WelcomeRouteRetries {
@@ -51,6 +56,7 @@ impl WelcomeRouteRetries {
             failures: 0,
             retry_at: now,
             lookup_due: false,
+            lookup_failed: false,
         });
         if retry.retry_at > now {
             return;
@@ -65,18 +71,14 @@ impl WelcomeRouteRetries {
         self.0.values().any(|retry| retry.lookup_due)
     }
 
-    /// Take up to `limit` owed lookups of recipients `take` accepts.
-    fn take_lookups(
-        &mut self,
-        limit: usize,
-        mut take: impl FnMut(&MemberId) -> bool,
-    ) -> Vec<MemberId> {
+    /// Take up to `limit` owed lookups of recipients not in `running`.
+    fn take_lookups(&mut self, limit: usize, running: &[MemberId]) -> Vec<MemberId> {
         let mut taken = Vec::new();
         for (recipient, retry) in &mut self.0 {
             if taken.len() == limit {
                 break;
             }
-            if retry.lookup_due && take(recipient) {
+            if retry.lookup_due && !running.contains(recipient) {
                 retry.lookup_due = false;
                 taken.push(recipient.clone());
             }
@@ -87,6 +89,22 @@ impl WelcomeRouteRetries {
     /// A publish to `recipient` found a route.
     fn routed(&mut self, recipient: &MemberId) {
         self.0.remove(recipient);
+    }
+
+    /// A lookup of `recipient`'s list ended without a route; it `failed`, or
+    /// answered. Whether the recipient is still paced.
+    fn looked_up(&mut self, recipient: &MemberId, failed: bool) -> bool {
+        self.0
+            .get_mut(recipient)
+            .map(|retry| retry.lookup_failed = failed)
+            .is_some()
+    }
+
+    /// Whether the last lookup of `recipient`'s list failed.
+    fn lookup_failed(&self, recipient: &MemberId) -> bool {
+        self.0
+            .get(recipient)
+            .is_some_and(|retry| retry.lookup_failed)
     }
 
     /// Whether maintenance leaves `recipient`'s owed Welcomes alone at `now`.
@@ -113,22 +131,43 @@ fn route_retry_delay_secs(failures: u32) -> u64 {
 
 /// The v5 `welcome_publish_not_started` reason for a routing failure: a
 /// recipient whose list is known and gives nothing to send to has no
-/// eligible route; one whose list is unknown, or could not be looked up,
-/// could not be resolved.
+/// eligible route; one whose list is unknown, or whose last lookup failed
+/// (`lookup_failed`), could not be resolved.
 pub(super) fn route_not_started_reason(
     error: &TransportRoutingError,
+    lookup_failed: bool,
 ) -> audit_v5::NotStartedReason {
     match error {
+        TransportRoutingError::MissingInboxRoute(_) if lookup_failed => {
+            audit_v5::NotStartedReason::RouteResolutionFailed
+        }
         TransportRoutingError::MissingInboxRoute(
             MissingInboxRouteCause::EmptyList | MissingInboxRouteCause::NoneUsable,
         ) => audit_v5::NotStartedReason::NoEligibleRoute,
-        TransportRoutingError::MissingInboxRoute(
-            MissingInboxRouteCause::NoList | MissingInboxRouteCause::LookupFailed,
-        )
+        TransportRoutingError::MissingInboxRoute(MissingInboxRouteCause::NoList)
         | TransportRoutingError::MissingGroupRoute => {
             audit_v5::NotStartedReason::RouteResolutionFailed
         }
     }
+}
+
+/// What a host's lookup of a recipient's inbox list found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WelcomeRouteLookup {
+    /// A list that gives a route, now in the routing policy.
+    Routed,
+    /// An answer that gives no route: no list, an empty one, or none usable.
+    NoRoute,
+    /// No answer: no relay answered in full or in time.
+    Failed,
+}
+
+/// The lookups a host should start and stop now
+/// ([`AccountDeviceRuntime::plan_welcome_route_lookups`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct WelcomeRouteLookupPlan {
+    pub start: Vec<MemberId>,
+    pub stop: Vec<MemberId>,
 }
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
@@ -171,40 +210,95 @@ where
             .retain(owed);
     }
 
-    /// The recipients whose inbox list the host should look up now: at most
-    /// `limit` of those whose last paced Welcome publish found no route, that
-    /// `take` accepts (a host skips one it is already looking up), and that
-    /// an owed Welcome is still addressed to. Each is taken once per paced
-    /// attempt; one `take` refuses stays owed. A Welcome that is withdrawn,
-    /// expired, delivered or still staged with its commit is not owed, so
-    /// nobody is looked up for it.
-    pub fn take_due_welcome_route_lookups(
+    /// The lookups of recipients' inbox lists a host should start and stop,
+    /// given the ones it is `running`. It starts the lookups owed by a paced
+    /// Welcome publish that found no route, each once, for a recipient an
+    /// owed Welcome is still addressed to and with no lookup running, up to
+    /// `limit` running in all; one left out stays owed. It stops each running
+    /// lookup whose recipient no owed Welcome is addressed to any more. A
+    /// Welcome that is withdrawn, expired, delivered or still staged with its
+    /// commit is not owed, so nobody is looked up for it.
+    pub fn plan_welcome_route_lookups(
         &self,
         limit: usize,
-        take: impl FnMut(&MemberId) -> bool,
-    ) -> AccountResult<Vec<MemberId>> {
-        if limit == 0 || !self.lock_welcome_route_retries().lookup_owed() {
-            return Ok(Vec::new());
+        running: &[MemberId],
+    ) -> AccountResult<WelcomeRouteLookupPlan> {
+        if running.is_empty() && !self.lock_welcome_route_retries().lookup_owed() {
+            return Ok(WelcomeRouteLookupPlan::default());
         }
+        let owed = self
+            .owed_welcomes()?
+            .into_iter()
+            .map(|(_, recipient)| recipient)
+            .collect::<HashSet<_>>();
+        let stop = running
+            .iter()
+            .filter(|recipient| !owed.contains(*recipient))
+            .cloned()
+            .collect::<Vec<_>>();
+        let free = limit.saturating_sub(running.len() - stop.len());
+        let mut retries = self.lock_welcome_route_retries();
+        retries.retain(&owed);
+        let start = retries.take_lookups(free, running);
+        Ok(WelcomeRouteLookupPlan { start, stop })
+    }
+
+    /// The host's lookup of `recipient`'s inbox list ended with `outcome`,
+    /// which the host has installed in its routing policy. A route ends the
+    /// recipient's pacing, so the next maintenance pass sends its owed
+    /// Welcomes. Otherwise the pacing stays, and the outcome becomes the
+    /// delivery problem of each owed Welcome to the recipient that found no
+    /// route: `InboxLookupFailed` after a failed lookup, else `NoInboxRelays`.
+    pub fn finish_welcome_route_lookup(&self, recipient: &MemberId, outcome: WelcomeRouteLookup) {
+        let failed = match outcome {
+            WelcomeRouteLookup::Routed => {
+                self.lock_welcome_route_retries().routed(recipient);
+                return;
+            }
+            WelcomeRouteLookup::NoRoute => false,
+            WelcomeRouteLookup::Failed => true,
+        };
+        if !self
+            .lock_welcome_route_retries()
+            .looked_up(recipient, failed)
+        {
+            return;
+        }
+        let owed = match self.owed_welcomes() {
+            Ok(owed) => owed,
+            Err(_) => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "finish_welcome_route_lookup",
+                    "owed Welcomes unreadable; the next attempt records the lookup"
+                );
+                return;
+            }
+        };
+        for (welcome_id, _) in owed.iter().filter(|(_, owed_to)| owed_to == recipient) {
+            self.record_welcome_route_lookup(welcome_id, failed);
+        }
+    }
+
+    /// Whether the last lookup of `message`'s recipient's inbox list failed.
+    pub(super) fn welcome_route_lookup_failed(&self, message: &TransportMessage) -> bool {
+        welcome_recipient(message)
+            .is_some_and(|recipient| self.lock_welcome_route_retries().lookup_failed(&recipient))
+    }
+
+    /// Every owed Welcome this runtime watches, with its recipient.
+    fn owed_welcomes(&self) -> AccountResult<Vec<(cgka_traits::MessageId, MemberId)>> {
         let now = self.wall_clock.now();
-        let mut owed = HashSet::new();
+        let mut owed = Vec::new();
         for id in &self.watched_welcomes {
             if let OutboundWelcomeStatus::Owed { message, .. } =
                 self.session.outbound_welcome_status(id, now)?
                 && let Some(recipient) = welcome_recipient(&message)
             {
-                owed.insert(recipient);
+                owed.push((id.clone(), recipient));
             }
         }
-        let mut retries = self.lock_welcome_route_retries();
-        retries.retain(&owed);
-        Ok(retries.take_lookups(limit, take))
-    }
-
-    /// The host installed a route to `recipient` in its routing policy: end
-    /// its pacing, so the next maintenance pass sends its owed Welcomes.
-    pub fn release_welcome_route_retry(&self, recipient: &MemberId) {
-        self.lock_welcome_route_retries().routed(recipient);
+        Ok(owed)
     }
 
     fn lock_welcome_route_retries(&self) -> std::sync::MutexGuard<'_, WelcomeRouteRetries> {
@@ -247,19 +341,29 @@ mod tests {
     #[test]
     fn route_causes_map_to_the_existing_not_started_reasons() {
         use MissingInboxRouteCause::*;
-        let reason =
-            |cause| route_not_started_reason(&TransportRoutingError::MissingInboxRoute(cause));
+        let reason = |lookup_failed| {
+            move |cause| {
+                route_not_started_reason(
+                    &TransportRoutingError::MissingInboxRoute(cause),
+                    lookup_failed,
+                )
+            }
+        };
         assert_eq!(
-            [NoList, EmptyList, NoneUsable, LookupFailed].map(reason),
+            [NoList, EmptyList, NoneUsable].map(reason(false)),
             [
                 audit_v5::NotStartedReason::RouteResolutionFailed,
                 audit_v5::NotStartedReason::NoEligibleRoute,
                 audit_v5::NotStartedReason::NoEligibleRoute,
-                audit_v5::NotStartedReason::RouteResolutionFailed,
             ]
         );
+        // A failed lookup could not resolve the route, whatever was cached.
         assert_eq!(
-            route_not_started_reason(&TransportRoutingError::MissingGroupRoute),
+            [NoList, EmptyList, NoneUsable].map(reason(true)),
+            [audit_v5::NotStartedReason::RouteResolutionFailed; 3]
+        );
+        assert_eq!(
+            route_not_started_reason(&TransportRoutingError::MissingGroupRoute, false),
             audit_v5::NotStartedReason::RouteResolutionFailed
         );
     }

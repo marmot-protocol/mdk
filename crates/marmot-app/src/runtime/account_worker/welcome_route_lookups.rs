@@ -3,7 +3,10 @@
 //!
 //! At each loop turn the worker starts the lookups the session owes, at most
 //! [`LOOKUPS_PER_ACCOUNT`] at once and one per recipient, each beside the
-//! writer. Each continuation runs on the writer as one unit. A lookup
+//! writer, and stops each running one whose recipient no owed Welcome is
+//! addressed to any more: its task is aborted at its next wait, so a relay
+//! read it has not started never starts. Each continuation runs on the
+//! writer as one unit. A lookup
 //! belongs to the client that started it: before the worker replaces its
 //! client it cancels them ([`WelcomeRouteLookups::replace`]), and the next
 //! client's session owes its own; before the worker returns it cancels them
@@ -36,14 +39,19 @@ pub(super) struct Ended {
 }
 
 impl WelcomeRouteLookups {
-    /// Start the lookups `client`'s session owes, up to the bound.
+    /// Stop the lookups no owed Welcome needs any more, and start the ones
+    /// `client`'s session owes, up to the bound.
     pub(super) fn adopt(&mut self, client: &AppClient) {
-        let free = LOOKUPS_PER_ACCOUNT.saturating_sub(self.running.len());
-        let running = &self.running;
-        let starts = client.begin_welcome_route_lookups(free, |recipient| {
-            running.iter().any(|lookup| lookup.recipient() == recipient)
-        });
-        for start in starts {
+        let running = self
+            .running
+            .iter()
+            .map(|lookup| lookup.recipient().clone())
+            .collect::<Vec<_>>();
+        let plan = client.plan_welcome_route_lookups(LOOKUPS_PER_ACCOUNT, &running);
+        // Dropped, a lookup aborts its task.
+        self.running
+            .retain(|lookup| !plan.stop.contains(lookup.recipient()));
+        for start in plan.start {
             self.running.push(start.spawn(self.cancel.clone()));
         }
     }

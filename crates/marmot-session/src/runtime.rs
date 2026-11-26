@@ -96,6 +96,7 @@ pub use welcome_outcomes::{INVITE_DELIVERY_RETENTION_SECS, WelcomeDeliveryOutcom
 use welcome_relays::{
     RelayPublish, RemainingPass, RemainingWelcomeSends, join_relay_answers, relay_sends, until_met,
 };
+pub use welcome_routes::{WelcomeRouteLookup, WelcomeRouteLookupPlan};
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
@@ -7483,12 +7484,13 @@ where
             match routed {
                 Ok(target) => target,
                 Err(e) => {
+                    let lookup_failed = self.welcome_route_lookup_failed(&message);
                     self.record_v5_welcome_not_started(
                         welcome_facts.clone(),
-                        welcome_routes::route_not_started_reason(&e),
+                        welcome_routes::route_not_started_reason(&e, lookup_failed),
                     );
                     if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
-                        self.record_welcome_route_failure(&message.id, &e);
+                        self.record_welcome_route_failure(&message.id, lookup_failed);
                     }
                     self.record_audit_event(
                         welcome_facts.as_ref().map(|facts| &facts.group_id),

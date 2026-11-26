@@ -586,20 +586,21 @@ async fn a_route_less_welcome_owes_one_lookup_per_paced_attempt() {
     let take = |invite: &RetainedInvite| {
         invite
             .runtime
-            .take_due_welcome_route_lookups(4, |_| true)
+            .plan_welcome_route_lookups(4, &[])
             .unwrap()
+            .start
     };
     invite.route_carol(false);
     invite.confirm_commit().await;
     assert!(take(&invite).is_empty(), "no attempt has found no route yet");
 
     invite.runtime.run_due_maintenance().await.unwrap();
-    assert!(
+    assert_eq!(
         invite
             .runtime
-            .take_due_welcome_route_lookups(4, |_| false)
-            .unwrap()
-            .is_empty(),
+            .plan_welcome_route_lookups(4, &carol)
+            .unwrap(),
+        WelcomeRouteLookupPlan::default(),
         "a recipient the host is already looking up is left owed"
     );
     assert_eq!(take(&invite), carol);
@@ -612,11 +613,11 @@ async fn a_route_less_welcome_owes_one_lookup_per_paced_attempt() {
     invite.runtime.run_due_maintenance().await.unwrap();
     assert_eq!(take(&invite), carol);
 
-    // The lookup found a list: the host installs it and releases the retry.
+    // The lookup found a list: the host installs it and says so.
     invite.route_carol(true);
     invite
         .runtime
-        .release_welcome_route_retry(&invite.carol_id);
+        .finish_welcome_route_lookup(&invite.carol_id, WelcomeRouteLookup::Routed);
     invite.wall.set(300_100 + 601);
     invite.runtime.run_due_maintenance().await.unwrap();
     let sent = staged_welcome_publishes(&invite.adapter);
@@ -634,7 +635,7 @@ async fn a_route_less_welcome_owes_one_lookup_per_paced_attempt() {
 
 /// mdk#2261: nobody is looked up for a Welcome that is no longer owed. A
 /// lookup owed when the Welcome is withdrawn, or when it passes its delivery
-/// deadline, is never taken.
+/// deadline, is never started, and a running one is stopped.
 #[tokio::test]
 async fn no_lookup_is_taken_for_a_withdrawn_or_expired_welcome() {
     for withdraw in [true, false] {
@@ -657,12 +658,20 @@ async fn no_lookup_is_taken_for_a_withdrawn_or_expired_welcome() {
                 .expect("an invite's Welcome has a delivery deadline");
             invite.wall.set(deadline.0);
         }
-        assert!(
+        assert_eq!(
+            invite.runtime.plan_welcome_route_lookups(4, &[]).unwrap(),
+            WelcomeRouteLookupPlan::default(),
+            "withdrawn: {withdraw}"
+        );
+        assert_eq!(
             invite
                 .runtime
-                .take_due_welcome_route_lookups(4, |_| true)
-                .unwrap()
-                .is_empty(),
+                .plan_welcome_route_lookups(4, std::slice::from_ref(&invite.carol_id))
+                .unwrap(),
+            WelcomeRouteLookupPlan {
+                start: Vec::new(),
+                stop: vec![invite.carol_id.clone()],
+            },
             "withdrawn: {withdraw}"
         );
     }
