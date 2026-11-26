@@ -55,6 +55,8 @@
   "packageManager": "pnpm@10.13.1",
   "pnpm": {
     "overrides": {
+      "@hono/node-server": "2.1.11",
+      "hono": "4.13.22",
       "minimatch": "11.0.1",
       "zod": "4.6.6"
     }
