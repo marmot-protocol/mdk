@@ -127,6 +127,7 @@ fn issue_label(issue: OnboardingIssue) -> &'static str {
         OnboardingIssue::DiscoveryIncomplete => "discovery_incomplete",
         // A completed check, never a pause's issue; the collector rejects it.
         OnboardingIssue::InspectionCompleted => "inspection_completed",
+        OnboardingIssue::RateLimited => "rate_limited",
     }
 }
 
@@ -324,5 +325,24 @@ mod tests {
             ),
             ("waiting_for_signer", "signer_unavailable", "unknown", 0)
         );
+        let (_, rate_limited) = onboarding_pause(&state(
+            OnboardingStatus::RetryableFailure,
+            vec![
+                finding(OnboardingIssue::PublicationFailed).in_context(
+                    OnboardingFindingContext::RepairPublication,
+                    OnboardingCheckPurpose::EventPublication,
+                ),
+                at(
+                    OnboardingIssue::RateLimited,
+                    "wss://rl.example",
+                    OnboardingFindingContext::RepairPublication,
+                ),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(rate_limited.issue, "publication_failed");
+        assert_eq!(rate_limited.source_issue, "rate_limited");
+        assert_eq!(rate_limited.context, "repair_publication");
+        assert_eq!(rate_limited.failing_sources, 1);
     }
 }

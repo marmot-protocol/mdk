@@ -18,9 +18,12 @@ struct Network {
     return_off_filter_events: AtomicBool,
     fail_index_only: AtomicBool,
     inspection_errors: FixtureMutex<HashMap<String, transport_nostr::DirectoryInspectionError>>,
+    scripted_inspection_errors:
+        FixtureMutex<HashMap<String, Vec<Option<transport_nostr::DirectoryInspectionError>>>>,
     inspected_endpoints: FixtureMutex<Vec<String>>,
     inspection_signers: FixtureMutex<Vec<(u64, bool)>>,
     inbox_authentication_times_out: AtomicBool,
+    publish_failures: FixtureMutex<HashMap<String, cgka_traits::TransportEndpointFailure>>,
     zero_acks: AtomicBool,
     block_publish: AtomicBool,
     publishing: Notify,
@@ -109,11 +112,25 @@ impl DirectoryRelayFetcher for Network {
         self.inspected_endpoints
             .lock()
             .extend(request.endpoints.iter().map(|endpoint| endpoint.0.clone()));
+        if let Some(next) = request.endpoints.iter().find_map(|endpoint| {
+            let mut scripted = self.scripted_inspection_errors.lock();
+            scripted.iter_mut().find_map(|(needle, queue)| {
+                (endpoint.0.contains(needle) && !queue.is_empty()).then(|| queue.remove(0))
+            })
+        }) {
+            if let Some(error) = next {
+                return Err(error);
+            }
+            return self
+                .fetch_directory_events(request)
+                .await
+                .map_err(|_| transport_nostr::DirectoryInspectionError::TimedOut);
+        }
         if let Some(error) = request.endpoints.iter().find_map(|endpoint| {
             self.inspection_errors
                 .lock()
                 .iter()
-                .find_map(|(needle, error)| endpoint.0.contains(needle).then_some(*error))
+                .find_map(|(needle, error)| endpoint.0.contains(needle).then(|| error.clone()))
         }) {
             return Err(error);
         }
@@ -829,7 +846,7 @@ async fn transient_endpoint_failures_are_warnings_when_another_declared_route_co
         network
             .inspection_errors
             .lock()
-            .insert("degraded.example".into(), error);
+            .insert("degraded.example".into(), error.clone());
         let (status, findings, _) = manager
             .account_setup()
             .check_onboarding_step(&c, OnboardingStep::Relays)
@@ -1458,6 +1475,36 @@ impl NostrRelayClient for Network {
         } else {
             self.publishing.notify_one();
         }
+        let scripted_failures = self.publish_failures.lock().clone();
+        if !scripted_failures.is_empty() {
+            let mut accepted = Vec::new();
+            let mut failed = Vec::new();
+            for endpoint in endpoints {
+                if let Some(failure) = scripted_failures.iter().find_map(|(needle, failure)| {
+                    endpoint.0.contains(needle).then(|| {
+                        let mut failure = failure.clone();
+                        failure.endpoint = endpoint.clone();
+                        failure
+                    })
+                }) {
+                    failed.push(failure);
+                } else {
+                    accepted.push(endpoint.clone());
+                }
+            }
+            if accepted.is_empty() {
+                return Err(TransportAdapterError::PublishEndpoints(
+                    cgka_traits::TransportPublishFailure::with_endpoint_failures(
+                        "publish refused",
+                        failed,
+                    ),
+                ));
+            }
+            self.events.lock().push(event.clone());
+            let mut outcome = NostrPublishOutcome::accepted(accepted);
+            outcome.failed = failed;
+            return Ok(outcome);
+        }
         if self.zero_acks.load(Ordering::SeqCst) {
             return Ok(NostrPublishOutcome::default());
         }
@@ -1738,20 +1785,20 @@ async fn minimal_relay_repair_adds_only_missing_role_and_preserves_unmarked_dupl
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
-    let malformed = signed(
+    let future_dated = signed(
         &keys,
         10002,
         vec![vec![
             "r".into(),
             "wss://custom.example".into(),
-            "unsupported".into(),
+            "read".into(),
         ]],
         "opaque",
-        unix_now_seconds() - 1,
+        unix_now_seconds() + FUTURE_CLOCK_SKEW + 60,
     );
     let (repair, _, _) = runtime.accounts().account_setup().minimal_relay_repair(
         OnboardingStep::Relays,
-        Some(&malformed),
+        Some(&future_dated),
         &["wss://default.example".into()],
         &BTreeMap::new(),
         false,
@@ -1771,7 +1818,7 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
         .unwrap()
         .unwrap();
     checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
-    checkpoint.records[OnboardingStep::Relays.index()] = Some(malformed);
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(future_dated);
     checkpoint.append_relays = true;
     runtime
         .accounts()
@@ -3366,12 +3413,18 @@ async fn defaults_preserve_relay_tags() {
             .await
             .unwrap();
         if step == OnboardingStep::Relays {
-            // Unreachable and capped declared sources cannot authorize replacement.
+            // Unreachable and capped declared sources cannot authorize replacement
+            // without confirming the renewed inconclusive warning (mdk#3722).
             assert_eq!(
                 result.steps[step.index()].status,
                 OnboardingStatus::RetryableFailure
             );
-            assert!(result.proposal.is_none());
+            let renewed = result
+                .proposal
+                .as_ref()
+                .expect("capped approval preserves proposal as inconclusive");
+            assert!(renewed.inconclusive);
+            assert!(renewed.revision > revision);
             assert!(network.attempts.lock().is_empty());
             let c = manager
                 .setup_records()
@@ -3711,7 +3764,19 @@ async fn partial_lookup_is_not_fresh() {
                 .unwrap();
             let state = &result.steps[step.index()];
             assert_eq!(state.status, OnboardingStatus::RetryableFailure);
-            assert!(result.proposal.is_none());
+            if fail_index {
+                let renewed = result
+                    .proposal
+                    .as_ref()
+                    .expect("partial Save failure renews the proposal as inconclusive");
+                assert!(renewed.inconclusive);
+                assert!(renewed.revision > proposal.revision);
+                assert_eq!(renewed.revision, result.revision);
+                assert!(state.actions.contains(&OnboardingAction::ApproveRepair));
+                assert!(state.actions.contains(&OnboardingAction::CancelRepair));
+            } else {
+                assert!(result.proposal.is_none());
+            }
             assert!(network.attempts.lock().is_empty());
             let issue = if fail_index {
                 OnboardingIssue::TimedOut
@@ -3827,7 +3892,19 @@ async fn declared_lookup_is_not_fresh() {
                 .unwrap();
             let state = &result.steps[step.index()];
             assert_eq!(state.status, OnboardingStatus::RetryableFailure);
-            assert!(result.proposal.is_none());
+            if fail_index {
+                let renewed = result
+                    .proposal
+                    .as_ref()
+                    .expect("partial Save failure renews the proposal as inconclusive");
+                assert!(renewed.inconclusive);
+                assert!(renewed.revision > proposal.revision);
+                assert_eq!(renewed.revision, result.revision);
+                assert!(state.actions.contains(&OnboardingAction::ApproveRepair));
+                assert!(state.actions.contains(&OnboardingAction::CancelRepair));
+            } else {
+                assert!(result.proposal.is_none());
+            }
             assert!(network.attempts.lock().is_empty());
             let issue = if fail_index {
                 OnboardingIssue::TimedOut
@@ -10320,7 +10397,7 @@ async fn a_passed_step_offers_removing_a_relay_that_refused_the_local_key() {
         network
             .inspection_errors
             .lock()
-            .insert("members.example".into(), error);
+            .insert("members.example".into(), error.clone());
         let checked = checked_relay_step(&runtime, &id, OnboardingStep::InboxRelays).await;
         assert_eq!(
             checked.steps[OnboardingStep::InboxRelays.index()].status,
@@ -10440,7 +10517,7 @@ async fn only_a_policy_refusal_of_the_local_key_nominates_a_route_for_removal() 
         network
             .inspection_errors
             .lock()
-            .insert("flaky.example".into(), error);
+            .insert("flaky.example".into(), error.clone());
         let checked = checked_relay_step(&runtime, &id, OnboardingStep::InboxRelays).await;
         assert_eq!(
             checked.steps[OnboardingStep::InboxRelays.index()].status,
@@ -10625,6 +10702,687 @@ async fn a_removal_only_cleanup_keeps_the_last_route_of_each_role() {
             .map(|t| &t.fields)
             .collect::<Vec<_>>(),
         vec![&spare_read.tags[0], &spare_read.tags[2]]
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn minimal_relay_repair_preserves_invalid_unknown_long_nip65_and_r_tag_inbox() {
+    let (_dir, runtime, _network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let setup = manager.account_setup();
+    let defaults = vec!["wss://default.example".to_owned()];
+
+    // 1. Unknown marker on kind 10002 with write-only relays: Additive, preserves unknown tag.
+    let unknown_marker = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://ok.example".into(), "unsupported".into()],
+            vec!["r".into(), "wss://write.example".into(), "write".into()],
+        ],
+        "opaque",
+        unix_now_seconds() - 1,
+    );
+    let (repair, read, write) = setup.minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&unknown_marker),
+        &defaults,
+        &BTreeMap::new(),
+        false,
+    );
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::Additive);
+    assert_eq!(repair.after_tags[0].fields, unknown_marker.tags[0]);
+    assert_eq!(repair.after_tags[1].fields, unknown_marker.tags[1]);
+    assert_eq!(
+        repair.after_tags[2].fields,
+        vec!["r", "wss://default.example", "read"]
+    );
+    assert_eq!(read, vec!["wss://default.example"]);
+    assert_eq!(write, vec!["wss://write.example"]);
+
+    // 2. Kind 10050 whose only tag is an invalid URL: Additive, preserves invalid tag.
+    let invalid_inbox = signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "not a url".into()]],
+        "",
+        unix_now_seconds() - 1,
+    );
+    let (repair, read, _) = setup.minimal_relay_repair(
+        OnboardingStep::InboxRelays,
+        Some(&invalid_inbox),
+        &defaults,
+        &BTreeMap::new(),
+        false,
+    );
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::Additive);
+    assert_eq!(repair.after_tags[0].fields, invalid_inbox.tags[0]);
+    assert_eq!(
+        repair.after_tags[1].fields,
+        vec!["relay", "wss://default.example"]
+    );
+    assert_eq!(read, vec!["wss://default.example"]);
+
+    // 3. Kind 10050 written with `r` tags instead of `relay` tags: copies allowed URLs into `relay`.
+    let r_tag_inbox = signed(
+        &keys,
+        10050,
+        vec![
+            vec!["r".into(), "wss://inbox-a.example".into()],
+            vec!["r".into(), "not a url".into()],
+            vec!["r".into(), "wss://inbox-b.example".into(), "read".into()],
+        ],
+        "",
+        unix_now_seconds() - 1,
+    );
+    let (repair, read, _) = setup.minimal_relay_repair(
+        OnboardingStep::InboxRelays,
+        Some(&r_tag_inbox),
+        &defaults,
+        &BTreeMap::new(),
+        false,
+    );
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::Additive);
+    assert_eq!(repair.after_tags[..3].len(), 3);
+    assert_eq!(
+        repair.after_tags[3].fields,
+        vec!["relay", "wss://inbox-a.example"]
+    );
+    assert_eq!(
+        repair.after_tags[4].fields,
+        vec!["relay", "wss://inbox-b.example"]
+    );
+    assert_eq!(read, vec!["wss://inbox-a.example", "wss://inbox-b.example"]);
+
+    // 4. Kind 10002 with 20 read-only safe relays: Additive, and preview marked inconclusive.
+    let long_nip65 = signed(
+        &keys,
+        10002,
+        (0..20)
+            .map(|n| vec!["r".into(), format!("wss://read{n}.example"), "read".into()])
+            .collect(),
+        "",
+        unix_now_seconds() - 1,
+    );
+    let (repair, _, write) = setup.minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&long_nip65),
+        &defaults,
+        &BTreeMap::new(),
+        false,
+    );
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::Additive);
+    assert_eq!(repair.after_tags.len(), 21);
+    assert_eq!(write, vec!["wss://default.example"]);
+
+    let mut c = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    c.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
+    c.records[OnboardingStep::Relays.index()] = Some(long_nip65);
+    setup.save_onboarding(&mut c).unwrap();
+    let proposed = setup
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    assert!(proposed.proposal.as_ref().unwrap().inconclusive);
+
+    // 5. Kind 10050 with 17 allowed relays: still ManualReview.
+    let long_inbox = signed(
+        &keys,
+        10050,
+        (0..17)
+            .map(|n| vec!["relay".into(), format!("wss://inbox{n}.example")])
+            .collect(),
+        "",
+        unix_now_seconds() - 1,
+    );
+    let (repair, _, _) = setup.minimal_relay_repair(
+        OnboardingStep::InboxRelays,
+        Some(&long_inbox),
+        &defaults,
+        &BTreeMap::new(),
+        false,
+    );
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::ManualReview);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_preserves_proposal_as_inconclusive_when_one_source_fails() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    // Healthy check finds no kind 10050: NeedsInput [Missing], proposal is NOT inconclusive.
+    let snapshot = inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![
+            vec!["r".into(), "wss://healthy.example".into()],
+            vec!["r".into(), "wss://flaky.example".into()],
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(
+        snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    let setup = runtime.account_setup();
+    let proposed = setup
+        .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    assert!(!proposed.proposal.as_ref().unwrap().inconclusive);
+
+    // During Save, one declared relay fails while authoritative sources still confirm absence.
+    network.inspection_errors.lock().insert(
+        "flaky.example".into(),
+        DirectoryInspectionError::Unreachable,
+    );
+    let renewed = setup
+        .approve_onboarding_repair(&id, proposed.revision)
+        .await
+        .unwrap();
+    assert!(network.attempts.lock().is_empty(), "nothing signed yet");
+    let kept = renewed
+        .proposal
+        .as_ref()
+        .expect("proposal must be preserved on partial Save failure");
+    assert!(kept.inconclusive);
+    assert!(kept.revision > proposed.revision);
+    assert_eq!(kept.revision, renewed.revision);
+    let state = &renewed.steps[OnboardingStep::InboxRelays.index()];
+    assert!(state.actions.contains(&OnboardingAction::ApproveRepair));
+    assert!(state.actions.contains(&OnboardingAction::CancelRepair));
+    assert!(state.findings.iter().any(|f| {
+        f.issue == OnboardingIssue::Unreachable
+            && f.context == OnboardingFindingContext::RepairApproval
+            && f.endpoint.as_deref() == Some("wss://flaky.example")
+    }));
+
+    // Second explicit approval of the now-inconclusive proposal publishes.
+    let approved = setup
+        .approve_onboarding_repair(&id, kept.revision)
+        .await
+        .unwrap();
+    assert_eq!(network.attempts.lock().len(), 1);
+    assert_eq!(
+        approved.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::Passed
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relays_step_reuses_discovery_eose_without_redialing() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let declaration = signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://index.example".into()]],
+        "",
+        unix_now_seconds(),
+    );
+    network.events.lock().push(declaration);
+    let c = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    network.inspected_endpoints.lock().clear();
+    let (status, findings, _) = runtime
+        .accounts()
+        .account_setup()
+        .check_onboarding_step(&c, OnboardingStep::Relays)
+        .await;
+    assert_eq!(status, OnboardingStatus::Passed);
+    assert!(findings.iter().any(|f| {
+        f.issue == OnboardingIssue::InspectionCompleted
+            && f.context == OnboardingFindingContext::DeclaredRoute
+            && f.endpoint.as_deref() == Some("wss://index.example")
+    }));
+    let index_dials = network
+        .inspected_endpoints
+        .lock()
+        .iter()
+        .filter(|ep| ep.contains("index.example"))
+        .count();
+    assert_eq!(
+        index_dials, 1,
+        "declared relay that answered EOSE in discovery must not be redialed"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_lookup_preserves_newer_checkpointed_relay_list() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let older = signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://older.example".into()]],
+        "",
+        unix_now_seconds() - 60,
+    );
+    let newer = signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://index.example".into()]],
+        "",
+        unix_now_seconds() - 10,
+    );
+    let mut c = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    c.set(OnboardingStep::Profile, OnboardingStatus::Passed, vec![]);
+    c.set(OnboardingStep::Follows, OnboardingStatus::Passed, vec![]);
+    c.records[OnboardingStep::Relays.index()] = Some(newer.clone());
+    runtime
+        .accounts()
+        .account_setup()
+        .save_onboarding(&mut c)
+        .unwrap();
+
+    // Source holding `newer` fails; indexer only holds `older`.
+    network.public_indexer_events.lock().push(older);
+    network.inspection_errors.lock().insert(
+        "index.example".into(),
+        DirectoryInspectionError::Unreachable,
+    );
+    let _ = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    let after = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.records[OnboardingStep::Relays.index()]
+            .as_ref()
+            .map(|e| &e.id),
+        Some(&newer.id),
+        "incomplete lookup must not overwrite newer checkpointed relay list with an older copy"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_relay_list_lookup_failure_retries_once_and_preserves_partial_records() {
+    use transport_nostr::DirectoryInspectionError;
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    // 1. Transient failure on first attempt succeeds on the 500ms retry -> clean Missing.
+    network.scripted_inspection_errors.lock().insert(
+        "index.example".into(),
+        vec![Some(DirectoryInspectionError::Unreachable), None],
+    );
+    let snapshot = inbox_step(
+        &runtime,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), "wss://index.example".into()]],
+        None,
+    )
+    .await;
+    let state = &snapshot.steps[OnboardingStep::InboxRelays.index()];
+    assert_eq!(state.status, OnboardingStatus::NeedsInput);
+    assert!(
+        state
+            .findings
+            .iter()
+            .all(|f| f.issue == OnboardingIssue::Missing),
+        "{:?}",
+        state.findings
+    );
+
+    // 2. Persistent `RateLimited` maps to `OnboardingIssue::RateLimited`, and
+    //    `Partial { records, cause }` preserves verified records returned before failure.
+    let inbox_event = signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://healthy.example".into()]],
+        "",
+        unix_now_seconds(),
+    );
+    network.inspection_errors.lock().insert(
+        "index.example".into(),
+        DirectoryInspectionError::Partial {
+            records: vec![DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://index.example".into())],
+                event: inbox_event.clone(),
+            }],
+            cause: Box::new(DirectoryInspectionError::RateLimited),
+        },
+    );
+    let retried = runtime
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    let state = &retried.steps[OnboardingStep::InboxRelays.index()];
+    assert_eq!(state.status, OnboardingStatus::Passed);
+    assert!(state.findings.iter().any(|f| {
+        f.issue == OnboardingIssue::RateLimited
+            && f.context == OnboardingFindingContext::RecordDiscovery
+            && f.endpoint.as_deref() == Some("wss://index.example")
+    }));
+    let checkpoint = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        checkpoint.records[OnboardingStep::InboxRelays.index()]
+            .as_ref()
+            .map(|e| &e.id),
+        Some(&inbox_event.id)
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn definitive_repair_refusal_surfaces_findings_and_offers_escape_hatch() {
+    use cgka_traits::{
+        TransportEndpointFailure, TransportEndpointFailureKind as Kind,
+        TransportEndpointRejectionCategory as Cat,
+    };
+
+    let (_dir, runtime, network, _keys, id) = fixture().await;
+    missing_relays(&runtime, &id).await;
+    let setup = runtime.account_setup();
+    let proposed = setup
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+
+    // Every targeted relay definitively refuses (blocked + rate-limited).
+    network.publish_failures.lock().insert(
+        "index.example".into(),
+        TransportEndpointFailure {
+            endpoint: TransportEndpoint("wss://index.example".into()),
+            reason: "relay rejected event (blocked)".into(),
+            kind: Kind::TerminalRejected,
+            rejection_category: Some(Cat::Blocked),
+            size_class: None,
+            pre_send: false,
+        },
+    );
+    network.publish_failures.lock().insert(
+        "default.example".into(),
+        TransportEndpointFailure {
+            endpoint: TransportEndpoint("wss://default.example".into()),
+            reason: "relay rejected event (rate-limited)".into(),
+            kind: Kind::RetryableUnavailable,
+            rejection_category: Some(Cat::RateLimited),
+            size_class: None,
+            pre_send: false,
+        },
+    );
+    let refused = setup
+        .approve_onboarding_repair(&id, proposed.revision)
+        .await
+        .unwrap();
+    let state = &refused.steps[OnboardingStep::Relays.index()];
+    assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+    assert!(state.actions.contains(&OnboardingAction::Retry));
+    assert!(state.actions.contains(&OnboardingAction::CancelRepair));
+    assert!(state.actions.contains(&OnboardingAction::EditRelays));
+    assert!(state.findings.iter().any(|f| {
+        f.issue == OnboardingIssue::AccessRestricted
+            && f.context == OnboardingFindingContext::RepairPublication
+            && f.endpoint.as_deref() == Some("wss://index.example")
+    }));
+    assert!(state.findings.iter().any(|f| {
+        f.issue == OnboardingIssue::RateLimited
+            && f.context == OnboardingFindingContext::RepairPublication
+            && f.endpoint.as_deref() == Some("wss://default.example")
+    }));
+
+    // Direct EditRelays from the definitively refused repair clears approval
+    // without signing until the user approves the replacement proposal.
+    let edited = setup
+        .propose_onboarding_relays(
+            &id,
+            OnboardingStep::Relays,
+            Some((
+                vec!["wss://writable.example".into()],
+                vec!["wss://writable.example".into()],
+            )),
+        )
+        .await
+        .unwrap();
+    assert_eq!(network.attempts.lock().len(), 1);
+    assert!(edited.proposal.is_some());
+    assert!(
+        edited.steps[OnboardingStep::Relays.index()]
+            .actions
+            .contains(&OnboardingAction::ApproveRepair)
+    );
+
+    // An ambiguous timeout keeps `repair_may_have_published = Some(true)` and
+    // never offers CancelRepair or EditRelays, even if a later retry gets
+    // definitive rejections.
+    network.publish_failures.lock().clear();
+    network.publish_failures.lock().insert(
+        "index.example".into(),
+        TransportEndpointFailure {
+            endpoint: TransportEndpoint("wss://index.example".into()),
+            reason: "send event timed out".into(),
+            kind: Kind::PossiblyExposed,
+            rejection_category: None,
+            size_class: None,
+            pre_send: false,
+        },
+    );
+    network.publish_failures.lock().insert(
+        "writable.example".into(),
+        TransportEndpointFailure {
+            endpoint: TransportEndpoint("wss://writable.example".into()),
+            reason: "send event timed out".into(),
+            kind: Kind::PossiblyExposed,
+            rejection_category: None,
+            size_class: None,
+            pre_send: false,
+        },
+    );
+    let timed_out = setup
+        .approve_onboarding_repair(&id, edited.revision)
+        .await
+        .unwrap();
+    let state = &timed_out.steps[OnboardingStep::Relays.index()];
+    assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+    assert!(!state.actions.contains(&OnboardingAction::CancelRepair));
+    assert!(!state.actions.contains(&OnboardingAction::EditRelays));
+    assert!(state.findings.iter().any(|f| {
+        f.issue == OnboardingIssue::TimedOut
+            && f.context == OnboardingFindingContext::RepairPublication
+            && f.endpoint.as_deref() == Some("wss://writable.example")
+    }));
+    assert!(setup.cancel_onboarding_repair(&id).await.is_err());
+
+    // Even if a later retry gets all-definitive rejections, prior possible exposure sticks.
+    for target in ["index.example", "writable.example"] {
+        network.publish_failures.lock().insert(
+            target.into(),
+            TransportEndpointFailure {
+                endpoint: TransportEndpoint(format!("wss://{target}")),
+                reason: "relay rejected event (blocked)".into(),
+                kind: Kind::TerminalRejected,
+                rejection_category: Some(Cat::Blocked),
+                size_class: None,
+                pre_send: false,
+            },
+        );
+    }
+    let retried = setup
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let state = &retried.steps[OnboardingStep::Relays.index()];
+    assert!(!state.actions.contains(&OnboardingAction::CancelRepair));
+    assert!(!state.actions.contains(&OnboardingAction::EditRelays));
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_refused_key_package_surfaces_findings_and_recovers_after_relay_edit() {
+    use cgka_traits::{
+        TransportEndpointFailure, TransportEndpointFailureKind as Kind,
+        TransportEndpointRejectionCategory as Cat,
+    };
+
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let now = unix_now_seconds();
+    *network.events.lock() = vec![
+        signed(&keys, 0, vec![], r#"{"name":"Alice"}"#, now),
+        signed(&keys, 3, vec![], "", now),
+        signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), "wss://readonly.example".into()]],
+            "",
+            now,
+        ),
+        signed(
+            &keys,
+            10050,
+            vec![vec!["relay".into(), "wss://index.example".into()]],
+            "",
+            now,
+        ),
+    ];
+    network.publish_failures.lock().insert(
+        "readonly.example".into(),
+        TransportEndpointFailure {
+            endpoint: TransportEndpoint("wss://readonly.example".into()),
+            reason: "relay rejected event (blocked)".into(),
+            kind: Kind::TerminalRejected,
+            rejection_category: Some(Cat::Blocked),
+            size_class: None,
+            pre_send: false,
+        },
+    );
+
+    let setup = runtime.account_setup();
+    let noticed = setup.run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        noticed.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::Passed
+    );
+    assert_eq!(
+        noticed.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+
+    // Acknowledge single-device notice -> initial KeyPackage publish hits the refusing write relay.
+    let refused = setup
+        .acknowledge_onboarding_single_device(&id, noticed.revision)
+        .await
+        .unwrap();
+    assert!(!refused.ready);
+    let kp_state = &refused.steps[OnboardingStep::KeyPackage.index()];
+    assert_eq!(kp_state.status, OnboardingStatus::RetryableFailure);
+    assert!(kp_state.actions.contains(&OnboardingAction::EditRelays));
+    let refusal = kp_state
+        .findings
+        .iter()
+        .find(|f| {
+            f.issue == OnboardingIssue::AccessRestricted
+                && f.endpoint.as_deref() == Some("wss://readonly.example")
+        })
+        .expect("typed per-relay refusal finding on KeyPackage");
+    assert_eq!(refusal.context, OnboardingFindingContext::DeclaredRoute);
+    assert_eq!(refusal.purpose, OnboardingCheckPurpose::EventPublication);
+    assert_eq!(
+        refusal.declared_capability,
+        OnboardingRelayCapability::ReadAndWrite
+    );
+    assert!(refusal.actions.contains(&OnboardingAction::EditRelays));
+    assert!(
+        refused.steps[OnboardingStep::Relays.index()]
+            .actions
+            .contains(&OnboardingAction::EditRelays)
+    );
+    let first_kp_event_id = network
+        .attempts
+        .lock()
+        .iter()
+        .find(|event| event.kind == 30443)
+        .expect("initial KeyPackage attempt recorded")
+        .id
+        .clone();
+
+    // User edits their NIP-65 write relays to a writable relay and approves.
+    let proposed = setup
+        .propose_onboarding_relays(
+            &id,
+            OnboardingStep::Relays,
+            Some((
+                vec!["wss://writable.example".into()],
+                vec!["wss://writable.example".into()],
+            )),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        proposed.proposal.as_ref().unwrap().step,
+        OnboardingStep::Relays
+    );
+    let after_edit = setup
+        .approve_onboarding_repair(&id, proposed.revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_edit.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::Passed
+    );
+    assert_eq!(
+        after_edit.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+
+    // Re-acknowledge single-device notice -> retries the EXACT durable signed KeyPackage on the new write relay.
+    let ready = setup
+        .acknowledge_onboarding_single_device(&id, after_edit.revision)
+        .await
+        .unwrap();
+    assert!(ready.ready);
+    let kp_attempts: Vec<_> = network
+        .attempts
+        .lock()
+        .iter()
+        .filter(|event| event.kind == 30443)
+        .cloned()
+        .collect();
+    assert!(kp_attempts.len() >= 2);
+    assert!(
+        kp_attempts
+            .iter()
+            .all(|event| event.id == first_kp_event_id),
+        "recovery after write-relay edit must reuse the exact durable signed KeyPackage"
+    );
+    assert!(
+        network
+            .events
+            .lock()
+            .iter()
+            .any(|event| event.id == first_kp_event_id),
+        "KeyPackage event must be accepted on the edited writable relay"
     );
     runtime.shutdown_and_close().await.unwrap();
 }

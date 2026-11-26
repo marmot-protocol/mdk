@@ -17,7 +17,7 @@ impl MarmotOnboardingStep {
     }
 }
 c_enum! { MarmotOnboardingStatus from OnboardingStatusFfi {  Pending, Checking, Passed, NeedsInput, RetryableFailure, WaitingForSigner, Skipped  } }
-c_enum! { MarmotOnboardingIssue from OnboardingIssueFfi {  Missing, Malformed, FutureDated, InvalidRelay, RetiredRelay, UnsafeRelay, Unreachable, TimedOut, AuthenticationRequired, PaymentRequired, AccessRestricted, NoUsableRoute, PublicationFailed, SignerUnavailable, SignerRejected, RecordChanged, Interrupted, TooManyRelays, MultiDeviceUnsupported, OtherInstallationPossible, DiscoveryIncomplete, InspectionCompleted  } }
+c_enum! { MarmotOnboardingIssue from OnboardingIssueFfi {  Missing, Malformed, FutureDated, InvalidRelay, RetiredRelay, UnsafeRelay, Unreachable, TimedOut, AuthenticationRequired, PaymentRequired, AccessRestricted, NoUsableRoute, PublicationFailed, SignerUnavailable, SignerRejected, RecordChanged, Interrupted, TooManyRelays, MultiDeviceUnsupported, OtherInstallationPossible, DiscoveryIncomplete, InspectionCompleted, RateLimited  } }
 c_enum! { MarmotOnboardingAction from OnboardingActionFfi {  Retry, ContinueWithout, UseRecommendedRelays, EditRelays, EditProfile, EditFollows, ApproveRepair, CancelRepair, ReconnectSigner, EditDiscoveryRelays, ContinueAnyway, CancelOnboarding, RemoveUnusableRelays  } }
 c_enum! { MarmotOnboardingFindingContext from OnboardingFindingContextFfi { Unknown, RecordDiscovery, PublishedDeclaration, DeclaredRoute, RepairApproval, RepairPublication } }
 c_enum! { MarmotOnboardingCheckPurpose from OnboardingCheckPurposeFfi { Unknown, RecordLookup, DeclarationValidation, DirectoryQuery, SourceFreshness, EventPublication } }
@@ -226,6 +226,7 @@ mod tests {
     fn onboarding_step_input_rejects_invalid_discriminants() {
         assert_eq!(MarmotOnboardingIssue::DiscoveryIncomplete as u32, 20);
         assert_eq!(MarmotOnboardingIssue::InspectionCompleted as u32, 21);
+        assert_eq!(MarmotOnboardingIssue::RateLimited as u32, 22);
         assert!(MarmotOnboardingStep::from_c(u32::MAX).is_err());
         assert_eq!(
             MarmotOnboardingStep::from_c(4).unwrap().to_ffi(),
