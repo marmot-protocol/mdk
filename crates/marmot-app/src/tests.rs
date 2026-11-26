@@ -7513,6 +7513,153 @@ fn key_package_fallback_routing_excludes_nip65_read_only_relays() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_worker_refreshes_key_package_routing_when_nip65_roles_change() {
+    use cgka_traits::{MaintenancePhase, Timestamp, TransportFanoutAttemptState};
+
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    let relay_a = "wss://relay-a.example";
+    let relay_b = "wss://relay-b.example";
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays(directory.path(), vec![relay_a.into(), relay_b.into()])
+        .with_test_relay_client(relay.clone());
+
+    let make_status = |created_at: u64, write_relays: &[&str], read_relays: &[&str]| {
+        let mut status = app.account_relay_list_status(&account.label).unwrap();
+        status.nip65.created_at = created_at;
+        status.nip65.relays = write_relays.iter().map(|r| (*r).to_owned()).collect();
+        status.nip65.write_relays = status.nip65.relays.clone();
+        status.nip65.read_relays = read_relays.iter().map(|r| (*r).to_owned()).collect();
+        status.inbox.created_at = created_at;
+        status.inbox.relays = vec![relay_a.into()];
+        status.refresh();
+        status
+    };
+    app.directory()
+        .remember_directory_relay_lists(
+            &account.account_id_hex,
+            &make_status(100, &[relay_a, relay_b], &[relay_a, relay_b]),
+        )
+        .unwrap();
+
+    relay.accept_first_endpoint_only();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.publish_key_package(&account.label).await.unwrap();
+
+    let initial = runtime
+        .key_package_maintenance_status(&account.label)
+        .await
+        .unwrap()
+        .expect("published key package lifecycle");
+    let original_event_id = initial
+        .authored_signed_event
+        .as_ref()
+        .expect("signed key package event")
+        .id
+        .clone();
+    assert!(initial.publication_targets.iter().any(|target| {
+        target.endpoint.0 == relay_a && target.state == TransportFanoutAttemptState::Accepted
+    }));
+    assert!(initial.publication_targets.iter().any(|target| {
+        target.endpoint.0 == relay_b && target.state == TransportFanoutAttemptState::AttemptedFailed
+    }));
+    let kp_attempts_to_b = || {
+        relay
+            .attempted_routes()
+            .into_iter()
+            .filter(|(kind, endpoints)| {
+                *kind == KIND_MARMOT_KEY_PACKAGE
+                    && endpoints.iter().any(|endpoint| endpoint.0 == relay_b)
+            })
+            .count()
+    };
+    let attempts_before_demotion = kp_attempts_to_b();
+    assert!(
+        attempts_before_demotion >= 1,
+        "initial publication must have attempted relay B"
+    );
+
+    // Demote relay B to read-only while the worker stays running, then make B
+    // reachable and past its retry backoff. Maintenance must not retry B.
+    app.directory()
+        .remember_directory_relay_lists(
+            &account.account_id_hex,
+            &make_status(200, &[relay_a], &[relay_a, relay_b]),
+        )
+        .unwrap();
+    runtime.run_due_maintenance(&account.label).await.unwrap();
+    {
+        let storage = app.account_storage(&account.label).unwrap();
+        let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+        let target_b = lifecycle
+            .publication_targets
+            .iter_mut()
+            .find(|target| target.endpoint.0 == relay_b)
+            .expect("relay B target");
+        target_b.last_attempt_at = Some(Timestamp(1));
+        storage.put_key_package_lifecycle(&lifecycle).unwrap();
+    }
+    runtime.run_due_maintenance(&account.label).await.unwrap();
+    assert_eq!(
+        kp_attempts_to_b(),
+        attempts_before_demotion,
+        "live worker must not retry KeyPackage fanout to a relay now declared read-only"
+    );
+
+    // Restore relay B to writable without restarting the worker or manually
+    // calling run_due_maintenance: relay-config reconciliation must refresh
+    // live KeyPackage routing, re-evaluate maintenance due, and deliver the
+    // exact same signed KeyPackage event to B.
+    app.directory()
+        .remember_directory_relay_lists(
+            &account.account_id_hex,
+            &make_status(300, &[relay_a, relay_b], &[relay_a, relay_b]),
+        )
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let restored = loop {
+        let lifecycle = runtime
+            .key_package_maintenance_status(&account.label)
+            .await
+            .unwrap()
+            .expect("key package lifecycle");
+        let b_accepted = lifecycle.publication_targets.iter().any(|target| {
+            target.endpoint.0 == relay_b && target.state == TransportFanoutAttemptState::Accepted
+        });
+        if b_accepted && lifecycle.phase == MaintenancePhase::Complete {
+            break lifecycle;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "live worker should automatically retry and deliver KeyPackage to restored writable relay B"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(
+        restored
+            .authored_signed_event
+            .as_ref()
+            .expect("signed key package event")
+            .id,
+        original_event_id
+    );
+    assert_eq!(kp_attempts_to_b(), attempts_before_demotion + 1);
+    assert!(
+        relay
+            .accepted_routes()
+            .into_iter()
+            .any(|(kind, endpoints)| {
+                kind == KIND_MARMOT_KEY_PACKAGE
+                    && endpoints.iter().any(|endpoint| endpoint.0 == relay_b)
+            }),
+        "restored writable relay B must accept the retried KeyPackage"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_generation_upgrade_runs_once_per_account_on_activation() {
     use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
     let directory = tempfile::tempdir().unwrap();

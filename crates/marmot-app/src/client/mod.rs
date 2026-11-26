@@ -1688,6 +1688,7 @@ impl AppClient {
         boxed(|| self.device_rename_upkeep()).await;
         boxed(|| self.drive_history_deliveries()).await;
         let prepared = self.epoch_gap_held_groups().and_then(|held| {
+            self.refresh_key_package_routing()?;
             self.sync_key_package_announcement_group()?;
             self.sync_device_tag_group()?;
             Ok(held)
@@ -7551,6 +7552,17 @@ impl AppClient {
             .retain(|route| !group_is_terminal(&self.runtime, &route.group_id));
         self.routing.replace(snapshot);
         Ok(())
+    }
+
+    /// Refresh only the account's KeyPackage publication endpoints from the
+    /// latest directory relay lists so a live worker or maintenance pass picks
+    /// up NIP-65 read/write changes without rebuilding group subscriptions.
+    pub(crate) fn refresh_key_package_routing(&self) -> Result<bool, AppError> {
+        let relay_lists = self.app.account_relay_list_status(&self.state.label)?;
+        let endpoints = self
+            .app
+            .key_package_endpoints(&self.state.label, &relay_lists)?;
+        Ok(self.routing.replace_key_package_endpoints(endpoints))
     }
 
     /// Install the inbox routes of the given members, which a Welcome publish

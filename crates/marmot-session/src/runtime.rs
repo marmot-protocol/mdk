@@ -2445,13 +2445,8 @@ where
         }
         let current_endpoints = self.routing.key_package_endpoints();
         for target in &mut lifecycle.publication_targets {
-            if target.state == TransportFanoutAttemptState::PolicyProhibited
-                && current_endpoints.contains(&target.endpoint)
-            {
-                target.state = TransportFanoutAttemptState::Unattempted;
-                target.attempt_count = 0;
-                target.last_attempt_at = None;
-                target.failure_code = None;
+            if current_endpoints.contains(&target.endpoint) {
+                reauthorize_fanout_target(target);
             }
         }
         let endpoints = lifecycle
@@ -2502,11 +2497,7 @@ where
                 );
                 lifecycle.phase = if lifecycle.publication_targets.iter().all(|target| {
                     !current_endpoints.contains(&target.endpoint)
-                        || matches!(
-                            target.state,
-                            TransportFanoutAttemptState::Accepted
-                                | TransportFanoutAttemptState::PolicyProhibited
-                        )
+                        || target.state == TransportFanoutAttemptState::Accepted
                 }) {
                     cgka_traits::MaintenancePhase::Complete
                 } else {
@@ -8549,6 +8540,17 @@ fn current_key_package_republish_blocker(
     }
 }
 
+fn reauthorize_fanout_target(target: &mut TransportFanoutTarget) -> bool {
+    if target.state != TransportFanoutAttemptState::PolicyProhibited {
+        return false;
+    }
+    target.state = TransportFanoutAttemptState::Unattempted;
+    target.attempt_count = 0;
+    target.last_attempt_at = None;
+    target.failure_code = None;
+    true
+}
+
 fn merge_republish_publication_targets(
     targets: &mut Vec<TransportFanoutTarget>,
     current_endpoints: &[TransportEndpoint],
@@ -8559,13 +8561,7 @@ fn merge_republish_publication_targets(
             .iter_mut()
             .find(|target| target.endpoint == *endpoint)
         {
-            if target.state == TransportFanoutAttemptState::PolicyProhibited {
-                target.state = TransportFanoutAttemptState::Unattempted;
-                target.attempt_count = 0;
-                target.last_attempt_at = None;
-                target.failure_code = None;
-                changed = true;
-            }
+            changed |= reauthorize_fanout_target(target);
             continue;
         }
         targets.push(TransportFanoutTarget {

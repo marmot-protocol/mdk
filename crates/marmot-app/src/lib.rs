@@ -9036,6 +9036,16 @@ impl AppTransportRouting {
         self.write().inbox_routes.insert(member, route);
     }
 
+    /// Replace the account's KeyPackage publication endpoints when they changed.
+    fn replace_key_package_endpoints(&self, endpoints: Vec<TransportEndpoint>) -> bool {
+        let mut state = self.write();
+        if state.key_package_endpoints == endpoints {
+            return false;
+        }
+        state.key_package_endpoints = endpoints;
+        true
+    }
+
     fn replace(&self, state: AppRoutingState) {
         let mut installed = self.write();
         let routes_changed = installed.local_inbox_endpoints != state.local_inbox_endpoints
