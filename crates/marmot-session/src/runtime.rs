@@ -2218,26 +2218,54 @@ where
             }))
     }
 
+    fn lifecycle_needs_key_package_preparation(
+        &self,
+        lifecycle: Option<&KeyPackageLifecycleState>,
+        now: Timestamp,
+    ) -> bool {
+        match lifecycle {
+            None => true,
+            Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
+                Some(pending) => {
+                    self.pending_replacement_obsolete(lifecycle, pending, now)
+                        || pending.signed_event.is_none()
+                }
+                None => {
+                    lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref
+                        || self.current_key_package_replacement_due(lifecycle, now)
+                }
+            },
+        }
+    }
+
+    /// Whether the KeyPackage slot needs a fresh replacement staged or an
+    /// unsigned pending replacement signed before it can be announced or
+    /// published, regardless of whether writable routes are currently
+    /// configured.
+    pub(super) fn key_package_preparation_due(&self) -> AccountResult<bool> {
+        let now = self.wall_clock.now();
+        let lifecycle = self.session.key_package_lifecycle()?;
+        Ok(self.lifecycle_needs_key_package_preparation(lifecycle.as_ref(), now))
+    }
+
     pub fn key_package_network_maintenance_due(&self) -> AccountResult<bool> {
         if self.key_package_slot_withdrawn {
             return Ok(false);
         }
-        let now = self.wall_clock.now();
         let current_endpoints = self.routing.key_package_endpoints();
-        Ok(match self.session.key_package_lifecycle()? {
-            None => true,
-            Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
-                Some(pending) => {
-                    self.pending_replacement_obsolete(&lifecycle, pending, now)
-                        || pending.signed_event.is_none()
-                        || pending_targets_need_publish(&pending.targets, &current_endpoints, now)
-                }
-                None => {
-                    lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref
-                        || self.current_key_package_replacement_due(&lifecycle, now)
-                }
-            },
-        })
+        if current_endpoints.is_empty() {
+            return Ok(false);
+        }
+        let now = self.wall_clock.now();
+        let lifecycle = self.session.key_package_lifecycle()?;
+        Ok(
+            self.lifecycle_needs_key_package_preparation(lifecycle.as_ref(), now)
+                || lifecycle
+                    .and_then(|lifecycle| lifecycle.pending_replacement)
+                    .is_some_and(|pending| {
+                        pending_targets_need_publish(&pending.targets, &current_endpoints, now)
+                    }),
+        )
     }
 
     /// Whether the current KeyPackage is due for replacement for any reason

@@ -1005,7 +1005,8 @@ async fn empty_routing_does_not_strand_key_package_publication_once_a_writable_r
     let publisher = RecordingKeyPackages::default();
 
     // Staging or publishing with zero endpoints refuses without persisting a
-    // zero-target pending replacement.
+    // zero-target pending replacement, and maintenance does not spin retrying
+    // a KeyPackage publish until at least one writable endpoint is configured.
     let mut empty_runtime = slot_runtime(
         current_session(database.clone(), &key, b"alice"),
         publisher.clone(),
@@ -1013,6 +1014,8 @@ async fn empty_routing_does_not_strand_key_package_publication_once_a_writable_r
         0,
         &[],
     );
+    assert!(!empty_runtime.key_package_network_maintenance_due().unwrap());
+    assert!(!empty_runtime.maintenance_due(&[]).unwrap().retry_while_owed);
     let err = empty_runtime
         .publish_fresh_key_package()
         .await
@@ -1040,6 +1043,8 @@ async fn empty_routing_does_not_strand_key_package_publication_once_a_writable_r
         0,
         &[KEY_ENDPOINT],
     );
+    assert!(seeded.key_package_network_maintenance_due().unwrap());
+    assert!(seeded.maintenance_due(&[]).unwrap().retry_while_owed);
     seeded
         .prepare_fresh_key_package(vec![TransportEndpoint(KEY_ENDPOINT.into())])
         .await
@@ -1246,4 +1251,252 @@ async fn persisted_pending_and_fanout_retries_respect_removed_or_read_only_relay
     assert_eq!(calls[2].0.endpoints, vec![TransportEndpoint(read_only.into())]);
     assert_eq!(calls[2].1, initial_artifact);
     assert!(!b_restored.key_package_has_pending_fanout().unwrap());
+}
+
+#[derive(Clone, Default)]
+struct FailSigningKeyPackages {
+    fail_signing: Arc<std::sync::atomic::AtomicBool>,
+    inner: RecordingKeyPackages,
+}
+
+#[async_trait]
+impl KeyPackagePublisher for FailSigningKeyPackages {
+    fn legacy_slot_id(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<Option<String>, KeyPackagePublishError> {
+        self.inner.legacy_slot_id(account_id)
+    }
+
+    async fn prepare_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<cgka_traits::SignedPublicationArtifact, KeyPackagePublishError> {
+        if self.fail_signing.load(Ordering::Relaxed) {
+            return Err(KeyPackagePublishError::unexposed("signing unavailable"));
+        }
+        self.inner.prepare_key_package(publication).await
+    }
+
+    async fn publish_prepared_key_package(
+        &self,
+        publication: &KeyPackagePublication,
+        artifact: &cgka_traits::SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        self.inner
+            .publish_prepared_key_package(publication, artifact)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn empty_routes_do_not_announce_unsigned_or_stale_pending_replacement() {
+    use cgka_traits::app_components::{
+        DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterV1, DeviceSlotId,
+        NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_device_roster_v1,
+        encode_device_roster_v1, encode_nostr_routing_v1,
+    };
+
+    let dir = relaxed_storage_dir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key_phrase = "kp slot empty routes unsigned pending";
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let device_group_relay = "wss://device-group.example";
+    let device_group_route = [0x6b; 32];
+    let slot: DeviceSlotId = [0x42; 32];
+
+    let mut supported = default_group_components();
+    supported.extend([DEVICE_ROSTER_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID]);
+    let open_session = || {
+        AccountDeviceSession::open(
+            SessionConfig::new(
+                database.clone(),
+                SqlCipherKey::new(key_phrase).unwrap(),
+                pad32(b"alice"),
+                Box::new(nostr_peeler(b"alice")),
+            )
+            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+                keys: deterministic_nostr_keys(b"alice"),
+            }))
+            .protocol_profile(ProtocolProfile::Current)
+            .supported_app_components(supported.clone()),
+        )
+        .unwrap()
+    };
+
+    let mut session = open_session();
+    session
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            hex::encode(slot),
+        ))
+        .unwrap();
+    let mut roster = DeviceRosterV1 {
+        leaf_tag_key: [0x31; 32],
+        ..DeviceRosterV1::default()
+    };
+    roster.devices.insert(
+        slot,
+        DeviceEntryV1 {
+            linked_at: now,
+            announced_key_package: None,
+            tag_signature_key: Some(session.own_signature_key()),
+            ..DeviceEntryV1::default()
+        },
+    );
+    let created = session
+        .create_group(CreateGroupRequest {
+            name: "device group".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: vec![
+                AppComponentData {
+                    component_id: DEVICE_ROSTER_COMPONENT_ID,
+                    data: encode_device_roster_v1(&roster).unwrap(),
+                },
+                AppComponentData {
+                    component_id: NOSTR_ROUTING_COMPONENT_ID,
+                    data: encode_nostr_routing_v1(
+                        &NostrRoutingV1::new(device_group_route, vec![device_group_relay.into()])
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                },
+            ],
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    match &created.effects.publish[..] {
+        [PublishWork::FoundingGroupCreated { .. }] => {}
+        [PublishWork::GroupCreated { pending, .. }] => {
+            session.confirm_published(*pending).await.unwrap();
+        }
+        _ => panic!("expected group creation publication"),
+    }
+    let device_group = created.group_id;
+    drop(session);
+
+    let announced_ref = |runtime: &mut AccountDeviceRuntime<
+        RecordingAdapter,
+        StaticTransportRouting,
+        FailSigningKeyPackages,
+    >| {
+        let roster_data = runtime
+            .session_mut()
+            .app_component(&device_group, DEVICE_ROSTER_COMPONENT_ID)
+            .unwrap()
+            .unwrap();
+        let merged = decode_device_roster_v1(&roster_data).unwrap();
+        merged.devices.get(&slot).unwrap().announced_key_package.clone()
+    };
+
+    let build_runtime = |publisher: FailSigningKeyPackages, kp_endpoints: &[&str]| {
+        let adapter = RecordingAdapter::default();
+        let routing = StaticTransportRouting::new(vec![])
+            .key_package_endpoints(
+                kp_endpoints
+                    .iter()
+                    .map(|endpoint| TransportEndpoint((*endpoint).into()))
+                    .collect(),
+            )
+            .with_group_route(
+                device_group.clone(),
+                device_group_route.to_vec(),
+                vec![TransportEndpoint(device_group_relay.into())],
+            );
+        let mut runtime =
+            AccountDeviceRuntime::new(open_session(), adapter.clone(), routing, publisher)
+                .with_maintenance_sources(
+                    wall.clone(),
+                    Arc::new(TestMonotonicClock::default()),
+                    Arc::new(TestRandom::new(0)),
+                );
+        runtime.set_key_package_announcement_group(Some(device_group.clone()));
+        runtime
+            .set_device_tag_group(Some(device_group.clone()))
+            .unwrap();
+        (runtime, adapter)
+    };
+
+    // 1. Stage a replacement whose signing fails, leaving a durable unsigned
+    // pending replacement in the lifecycle record.
+    let publisher = FailSigningKeyPackages::default();
+    publisher.fail_signing.store(true, Ordering::Relaxed);
+    let (mut staging, _) = build_runtime(publisher.clone(), &[KEY_ENDPOINT]);
+    staging
+        .prepare_fresh_key_package(vec![TransportEndpoint(KEY_ENDPOINT.into())])
+        .await
+        .expect_err("signing failure must fail preparation");
+    let unsigned_pending = slot_lifecycle(&staging)
+        .pending_replacement
+        .expect("staging leaves durable unsigned pending replacement");
+    assert!(unsigned_pending.signed_event.is_none());
+    drop(staging);
+
+    // 2. Remove all writable KeyPackage routes. Maintenance with a settled
+    // device group must not announce the unsigned pending replacement or emit
+    // any roster commit, and idle maintenance_due stays non-owed afterwards.
+    let (mut no_routes, adapter) = build_runtime(publisher.clone(), &[]);
+    assert!(!no_routes.key_package_network_maintenance_due().unwrap());
+    no_routes.run_due_maintenance().await.unwrap();
+    assert!(
+        adapter.publishes().is_empty(),
+        "maintenance must not commit an unsigned pending replacement when routes are empty"
+    );
+    assert_eq!(announced_ref(&mut no_routes), None);
+    let due = no_routes.maintenance_due(&[]).unwrap();
+    assert!(!due.retry_while_owed);
+    assert!(due.at.is_some());
+
+    // Direct announcement calls also refuse an unsigned pending replacement.
+    no_routes.announce_key_package_holding(&[]).await.unwrap();
+    assert!(adapter.publishes().is_empty());
+    assert_eq!(announced_ref(&mut no_routes), None);
+    drop(no_routes);
+
+    // 3. Restoring a writable route and working signer signs, announces, and
+    // publishes the pending replacement in the settled device group.
+    publisher.fail_signing.store(false, Ordering::Relaxed);
+    let (mut recovered, recovered_adapter) = build_runtime(publisher.clone(), &[KEY_ENDPOINT]);
+    assert!(recovered.key_package_network_maintenance_due().unwrap());
+    recovered.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        announced_ref(&mut recovered),
+        Some(unsigned_pending.key_package_ref.clone())
+    );
+    assert_eq!(recovered_adapter.publishes().len(), 1);
+    assert!(slot_lifecycle(&recovered).pending_replacement.is_none());
+    drop(recovered);
+
+    // 4. Stage and sign a second pending replacement (without announcing it
+    // yet), then expire it and remove writable routes: maintenance must not
+    // announce the obsolete pending replacement either.
+    let (mut pre_expire, _) = build_runtime(publisher.clone(), &[KEY_ENDPOINT]);
+    pre_expire.set_key_package_announcement_group(None);
+    pre_expire
+        .prepare_fresh_key_package(vec![TransportEndpoint(KEY_ENDPOINT.into())])
+        .await
+        .unwrap();
+    let expired_pending = slot_lifecycle(&pre_expire).pending_replacement.unwrap();
+    assert!(expired_pending.signed_event.is_some());
+    assert_ne!(
+        expired_pending.key_package_ref,
+        unsigned_pending.key_package_ref
+    );
+    drop(pre_expire);
+
+    wall.set(expired_pending.not_after.0);
+    let (mut expired_no_routes, expired_adapter) = build_runtime(publisher, &[]);
+    assert!(!expired_no_routes.key_package_network_maintenance_due().unwrap());
+    expired_no_routes.run_due_maintenance().await.unwrap();
+    assert!(
+        expired_adapter.publishes().is_empty(),
+        "maintenance must not announce an expired pending replacement when routes are empty"
+    );
+    assert_eq!(
+        announced_ref(&mut expired_no_routes),
+        Some(unsigned_pending.key_package_ref)
+    );
 }

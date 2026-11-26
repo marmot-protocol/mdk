@@ -96,6 +96,12 @@ where
                 );
                 return Ok(AccountDeviceEffects::default());
             }
+        } else if self.key_package_preparation_due()? {
+            // Preparation is owed (for example an unsigned or obsolete pending
+            // replacement, or a current KeyPackage due for replacement) but no
+            // writable KeyPackage route is configured to prepare it yet. Do not
+            // fall through and announce an unpublishable reference.
+            return Ok(AccountDeviceEffects::default());
         }
         match self.announce_key_package_holding(held).await {
             Ok(effects) => Ok(effects),
@@ -118,9 +124,10 @@ where
     /// returned effects carry the roster commit.
     ///
     /// Does nothing when no device group is set, the entry already reads so,
-    /// or the device group cannot take a commit from this device now: it is
-    /// in `held`, quarantined, or settling, or an earlier change of this
-    /// device's there is still queued or unconfirmed. A later call retries.
+    /// the pending replacement is still unsigned or already obsolete, or the
+    /// device group cannot take a commit from this device now: it is in
+    /// `held`, quarantined, or settling, or an earlier change of this device's
+    /// there is still queued or unconfirmed. A later call retries.
     pub async fn announce_key_package_holding(
         &mut self,
         held: &[GroupId],
@@ -131,12 +138,17 @@ where
         let Some(lifecycle) = self.session.key_package_lifecycle()? else {
             return Ok(AccountDeviceEffects::default());
         };
-        let Some(key_package_ref) = lifecycle
-            .pending_replacement
-            .as_ref()
-            .map(|pending| pending.key_package_ref.clone())
-            .or(lifecycle.current_key_package_ref)
-        else {
+        let now = self.wall_clock.now();
+        let Some(key_package_ref) = (match lifecycle.pending_replacement.as_ref() {
+            Some(pending)
+                if pending.signed_event.is_none()
+                    || self.pending_replacement_obsolete(&lifecycle, pending, now) =>
+            {
+                return Ok(AccountDeviceEffects::default());
+            }
+            Some(pending) => Some(pending.key_package_ref.clone()),
+            None => lifecycle.current_key_package_ref,
+        }) else {
             return Ok(AccountDeviceEffects::default());
         };
         let Some(slot) = self.own_device_slot()? else {
