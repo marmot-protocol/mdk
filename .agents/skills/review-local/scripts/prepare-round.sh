@@ -174,7 +174,7 @@ surrounding code you need. Do not edit files, commit, push or post anything.
    problems. Also check release-impact classification in the commit or context:
    flag as should-fix if a breaking public API, binding, storage-migration, or
    protocol change is labeled none/patch instead of minor, lacks a matching
-   changelog.d/ fragment with a `### Breaking changes` heading, or omits a
+   changelog.d/ fragment with a \`### Breaking changes\` heading, or omits a
    changelog.d/ fragment when user-facing. Also flag as should-fix a change to
    behavior a formal model under formal/ makes claims about (convergence
    lifecycle, fairness, freeze/settle, restart rehydration, device linking,
