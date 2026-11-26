@@ -2539,12 +2539,17 @@ fn set_operation_error(c: &mut OnboardingCheckpoint, step: OnboardingStep, error
     c.set(step, status, vec![failure]);
 }
 
+#[derive(Clone)]
+struct CompletedInspectionSource {
+    endpoint: String,
+    /// Verified event IDs returned by this relay's completed EOSE reply.
+    event_ids: Vec<String>,
+}
+
 struct OnboardingInspection {
     records: Vec<NostrTransportEvent>,
-    /// Verified records returned by each relay that completed EOSE, keyed by `relay_key`.
-    completed_records: HashMap<String, Vec<NostrTransportEvent>>,
     failures: Vec<OnboardingFinding>,
-    completed: HashMap<String, String>,
+    completed: HashMap<String, CompletedInspectionSource>,
 }
 
 fn publish_endpoint_failure_issue(
@@ -2768,7 +2773,7 @@ impl AccountSetup<'_> {
         account_id: &str,
         kind: u64,
         endpoints: Vec<String>,
-        reuse_completed: Option<&HashMap<String, String>>,
+        reuse_completed: Option<&HashMap<String, CompletedInspectionSource>>,
     ) -> OnboardingInspection {
         let local_signer = self
             .records()
@@ -2838,9 +2843,6 @@ impl AccountSetup<'_> {
         inspection.failures.extend(signed.failures);
         inspection.completed.extend(signed.completed);
         inspection
-            .completed_records
-            .extend(signed.completed_records);
-        inspection
     }
 
     async fn inspect_onboarding_relays_with_signer(
@@ -2849,7 +2851,7 @@ impl AccountSetup<'_> {
         kind: u64,
         endpoints: Vec<String>,
         account_signer: Option<crate::external_signer::AccountSigner>,
-        reuse_completed: Option<&HashMap<String, String>>,
+        reuse_completed: Option<&HashMap<String, CompletedInspectionSource>>,
     ) -> OnboardingInspection {
         let external_signer = matches!(
             account_signer,
@@ -2930,7 +2932,6 @@ impl AccountSetup<'_> {
             });
         }
         let mut records = Vec::new();
-        let mut completed_records: HashMap<String, Vec<NostrTransportEvent>> = HashMap::new();
         let admit = |record: DirectoryRelayEventRecord, failures: &mut Vec<OnboardingFinding>| {
             let event = record.event;
             let valid = event.kind == kind
@@ -2952,8 +2953,6 @@ impl AccountSetup<'_> {
                             records.push(event);
                         }
                     }
-                    let key = relay_key(&endpoint);
-                    completed.insert(key.clone(), endpoint);
                     // A full bounded page may omit another installation's slot.
                     if kind == 30443
                         && events
@@ -2964,14 +2963,20 @@ impl AccountSetup<'_> {
                     {
                         failures.push(finding(OnboardingIssue::DiscoveryIncomplete));
                     }
-                    let mut source_verified = Vec::new();
+                    let mut event_ids = Vec::new();
                     for record in events {
                         if let Some(event) = admit(record, &mut failures) {
-                            source_verified.push(event.clone());
+                            event_ids.push(event.id.clone());
                             records.push(event);
                         }
                     }
-                    completed_records.insert(key, source_verified);
+                    completed.insert(
+                        relay_key(&endpoint),
+                        CompletedInspectionSource {
+                            endpoint,
+                            event_ids,
+                        },
+                    );
                 }
                 Ok((endpoint, prior_partial, Err(error))) => {
                     use transport_nostr::DirectoryInspectionError::*;
@@ -3021,7 +3026,6 @@ impl AccountSetup<'_> {
             .collect();
         OnboardingInspection {
             records,
-            completed_records,
             failures,
             completed,
         }
@@ -3036,7 +3040,7 @@ impl AccountSetup<'_> {
         &self,
         c: &OnboardingCheckpoint,
         sources: &[String],
-        completed: &'a HashMap<String, String>,
+        completed: &'a HashMap<String, CompletedInspectionSource>,
     ) -> Vec<&'a String> {
         let indexers: HashSet<String> = self
             .app()
@@ -3072,7 +3076,7 @@ impl AccountSetup<'_> {
         &self,
         c: &OnboardingCheckpoint,
         sources: &[String],
-        completed: &HashMap<String, String>,
+        completed: &HashMap<String, CompletedInspectionSource>,
     ) -> bool {
         !self
             .authoritative_completed_keys(c, sources, completed)
@@ -3395,13 +3399,13 @@ impl AccountSetup<'_> {
                         // proves a read query, never acceptance of a future write.
                         let mut completed: Vec<_> = route_completed.into_iter().collect();
                         completed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                        findings.extend(completed.into_iter().map(|(key, endpoint)| {
+                        findings.extend(completed.into_iter().map(|(key, source)| {
                             OnboardingFinding {
                                 declared_capability: capabilities
                                     .get(&key)
                                     .copied()
                                     .unwrap_or_default(),
-                                endpoint: Some(endpoint),
+                                endpoint: Some(source.endpoint),
                                 ..finding(OnboardingIssue::InspectionCompleted).in_context(
                                     OnboardingFindingContext::DeclaredRoute,
                                     OnboardingCheckPurpose::DirectoryQuery,
@@ -3453,6 +3457,7 @@ impl AccountSetup<'_> {
         self.require_captured_attempt(&c, attempt)?;
         let status = c.snapshot.steps[step.index()].status;
         let replacing_refused_repair = c.approved
+            && status == OnboardingStatus::RetryableFailure
             && c.repair_may_have_published == Some(false)
             && c.snapshot
                 .proposal
@@ -3690,7 +3695,16 @@ impl AccountSetup<'_> {
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;
-        if c.approved && c.repair_may_have_published != Some(false) {
+        let step = c
+            .snapshot
+            .proposal
+            .as_ref()
+            .ok_or_else(onboarding_error)?
+            .step;
+        if c.approved
+            && (c.repair_may_have_published != Some(false)
+                || c.snapshot.steps[step.index()].status != OnboardingStatus::RetryableFailure)
+        {
             return Err(onboarding_error());
         }
         let proposal = c.snapshot.proposal.take().ok_or_else(onboarding_error)?;
@@ -3765,7 +3779,6 @@ impl AccountSetup<'_> {
         self.require_live_onboarding_attempt(&c)?;
         let OnboardingInspection {
             records,
-            completed_records,
             failures,
             completed,
         } = self
@@ -3796,16 +3809,16 @@ impl AccountSetup<'_> {
         let auth_keys = self.authoritative_completed_keys(&c, &sources, &completed);
         let authoritative = !auth_keys.is_empty();
         let completed_corroborates_basis = match proposal.previous_event_id.as_ref() {
-            Some(expected_id) => completed_records
+            Some(expected_id) => completed
                 .values()
-                .any(|events| events.iter().any(|event| &event.id == expected_id)),
+                .any(|source| source.event_ids.contains(expected_id)),
             None => !completed.is_empty() && records.is_empty(),
         };
         let authoritative_corroborates_basis = match proposal.previous_event_id.as_ref() {
             Some(expected_id) => auth_keys.iter().any(|key| {
-                completed_records
+                completed
                     .get(*key)
-                    .is_some_and(|events| events.iter().any(|event| &event.id == expected_id))
+                    .is_some_and(|source| source.event_ids.contains(expected_id))
             }),
             None => authoritative && records.is_empty(),
         };
@@ -4070,6 +4083,10 @@ impl AccountSetup<'_> {
             c.signed_repair = Some(
                 NostrTransportEvent::from_nostr_event(&signed).map_err(|_| onboarding_error())?,
             );
+            // Record explicit `Some(false)` atomically with the freshly signed
+            // event so any already-signed checkpoint with `None` is known to be
+            // a legacy pre-upgrade checkpoint and stays conservatively exposed.
+            c.repair_may_have_published = Some(false);
             c.set(proposal.step, OnboardingStatus::Checking, Vec::new());
             self.save_onboarding(c)?;
         }
@@ -4101,13 +4118,10 @@ impl AccountSetup<'_> {
         self.require_live_onboarding_attempt(c)?;
         // Persist in-flight exposure BEFORE sending so a crash or interruption
         // mid-publish leaves `Some(true)` on disk and a later retry with only
-        // definitive refusals can never erase that earlier exposure. Legacy
-        // checkpoints that already failed publish (`RetryableFailure` with
-        // `None`) also stay conservative.
-        let prior_exposed = c.repair_may_have_published == Some(true)
-            || (c.repair_may_have_published.is_none()
-                && c.snapshot.steps[proposal.step.index()].status
-                    == OnboardingStatus::RetryableFailure);
+        // definitive refusals can never erase that earlier exposure. Any
+        // already-signed checkpoint without explicit `Some(false)` (including
+        // legacy pre-upgrade `None` in any status) stays conservatively exposed.
+        let prior_exposed = c.repair_may_have_published != Some(false);
         if c.repair_may_have_published != Some(true) {
             c.repair_may_have_published = Some(true);
             self.save_onboarding(c)?;

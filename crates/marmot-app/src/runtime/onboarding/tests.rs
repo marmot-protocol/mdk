@@ -11590,6 +11590,7 @@ async fn approval_does_not_combine_partial_basis_with_empty_authoritative_eose()
         .await
         .unwrap();
     network.events.lock().clear();
+    network.inspected_endpoints.lock().clear();
     network.scripted_inspection_errors.lock().insert(
         "partial.example".into(),
         vec![
@@ -11608,13 +11609,135 @@ async fn approval_does_not_combine_partial_basis_with_empty_authoritative_eose()
         .await
         .unwrap();
     assert_eq!(
-        after_retry.steps[OnboardingStep::Relays.index()].status,
-        OnboardingStatus::RetryableFailure
+        network
+            .inspected_endpoints
+            .lock()
+            .iter()
+            .filter(|endpoint| endpoint.contains("partial.example"))
+            .count(),
+        2,
+        "partial.example must be inspected twice (initial partial + empty EOSE retry)"
+    );
+    let retry_step = &after_retry.steps[OnboardingStep::Relays.index()];
+    assert_eq!(retry_step.status, OnboardingStatus::RetryableFailure);
+    assert!(
+        retry_step
+            .findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::DiscoveryIncomplete),
+        "retained partial basis without completed corroboration must report DiscoveryIncomplete (not RecordChanged): {:?}",
+        retry_step.findings
     );
     assert!(
         after_retry.proposal.is_none(),
         "partial first attempt + empty EOSE retry must not satisfy approval"
     );
     assert!(network.attempts.lock().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_signed_checking_repair_stays_exposed_on_blocked_retry() {
+    use cgka_traits::{
+        TransportEndpointFailure, TransportEndpointFailureKind as Kind,
+        TransportEndpointRejectionCategory as Cat,
+    };
+
+    let (dir, runtime, network, keys, id) = fixture().await;
+    let relays = signed(
+        &keys,
+        10002,
+        vec![vec![
+            "r".into(),
+            "wss://read-only.example".into(),
+            "read".into(),
+        ]],
+        "",
+        unix_now_seconds() - 10,
+    );
+    *network.events.lock() = vec![
+        signed(
+            &keys,
+            0,
+            Vec::new(),
+            r#"{"name":"alice"}"#,
+            unix_now_seconds() - 10,
+        ),
+        signed(&keys, 3, Vec::new(), "", unix_now_seconds() - 10),
+        relays,
+    ];
+
+    let paused = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        paused.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    let _proposed = runtime
+        .account_setup()
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+
+    // Simulate a legacy pre-upgrade checkpoint saved after signing and before
+    // publish settled: `approved = true`, `signed_repair = Some(...)`,
+    // `status = Checking`, and `repair_may_have_published = None` (absent field).
+    {
+        let manager = runtime.accounts();
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        let signed_repair = signed(
+            &keys,
+            10002,
+            vec![
+                vec!["r".into(), "wss://read-only.example".into(), "read".into()],
+                vec!["r".into(), "wss://default.example".into(), "write".into()],
+            ],
+            "",
+            unix_now_seconds(),
+        );
+        c.approved = true;
+        c.signed_repair = Some(signed_repair);
+        c.repair_may_have_published = None;
+        c.set(
+            OnboardingStep::Relays,
+            OnboardingStatus::Checking,
+            Vec::new(),
+        );
+        manager.account_setup().save_onboarding(&mut c).unwrap();
+    }
+    runtime.shutdown_and_close().await.unwrap();
+
+    // Restart on the upgraded build while every target definitively blocks writes.
+    network.publish_failures.lock().insert(
+        "wss://".into(),
+        TransportEndpointFailure {
+            endpoint: TransportEndpoint("wss://blocked.example".into()),
+            kind: Kind::TerminalRejected,
+            rejection_category: Some(Cat::Blocked),
+            reason: "blocked: no".into(),
+            size_class: None,
+            pre_send: false,
+        },
+    );
+    let runtime = super::tests::runtime(dir.path(), network.clone());
+    let resumed = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    let step = &resumed.steps[OnboardingStep::Relays.index()];
+    assert_eq!(step.status, OnboardingStatus::RetryableFailure);
+    assert!(step.actions.contains(&OnboardingAction::Retry));
+    assert!(
+        !step.actions.contains(&OnboardingAction::CancelRepair),
+        "legacy signed Checking checkpoint must stay conservatively exposed"
+    );
+    assert!(!step.actions.contains(&OnboardingAction::EditRelays));
+    assert!(
+        runtime
+            .account_setup()
+            .cancel_onboarding_repair(&id)
+            .await
+            .is_err()
+    );
     runtime.shutdown_and_close().await.unwrap();
 }
