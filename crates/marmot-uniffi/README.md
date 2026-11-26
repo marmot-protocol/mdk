@@ -687,8 +687,20 @@ Imported identities can use the durable preflight API instead of `login`:
    not answer, and the declared relays may work for other clients. Its approval goes
    past failed sources, but at least one source that counts must answer, and the
    proposal's record must still be the newest any answering source holds. Otherwise it
-   fails with `RecordChanged` or the source failures, as before. Cancelling a relay
+   fails with `RecordChanged` or the source failures, as before. When a non-inconclusive
+   relay proposal hits a partial lookup failure during approval while an authoritative
+   source still confirms its basis is newest, MDK renews the proposal in place with
+   `inconclusive` set and a bumped snapshot revision without signing so the host can
+   show the confirmation instead of discarding the edit. If publishing an approved
+   repair fails because every target definitively refused the event (`RateLimited`,
+   `AuthenticationRequired`, `AccessRestricted`, or other non-ambiguous refusals),
+   MDK records per-relay refusal findings and offers `CancelRepair` (and `EditRelays`
+   on relay steps) alongside `Retry`. Cancelling a relay
    proposal keeps the step's status.
+   When initial `KeyPackage` publication fails because the declared write relays
+   refused the write, `KeyPackage` surfaces per-relay refusal findings and offers
+   `EditRelays` so the host can open the general-relay editor (`OnboardingStep::Relays`)
+   and retry once the write relays are updated.
    Profile fields left unset preserve their current values; an
    explicit empty string clears a field. Display the proposed edits, then pass the returned
    snapshot revision to `approve_onboarding_repair`. For an inbox proposal use

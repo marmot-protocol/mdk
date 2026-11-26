@@ -64,7 +64,7 @@ const DIRECTORY_MAX_FILTERS_PER_REQ: usize = 3;
 const ADDRESSABLE_KINDS: std::ops::Range<u64> = 30_000..40_000;
 
 /// Stable errors for a bounded, isolated relay inspection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirectoryInspectionError {
     Unreachable,
     TimedOut,
@@ -72,10 +72,40 @@ pub enum DirectoryInspectionError {
     /// A requested NIP-42 signature was still pending when the read expired.
     AuthenticationTimedOut,
     PaymentRequired,
+    RateLimited,
     Restricted,
     InvalidRequest,
     /// The relay answered but said it holds more than it sent.
     Incomplete,
+    /// The relay returned one or more verified records before failing or ending
+    /// incompletely.
+    Partial {
+        records: Vec<DirectoryRelayEventRecord>,
+        cause: Box<DirectoryInspectionError>,
+    },
+}
+
+impl DirectoryInspectionError {
+    /// Wrap `cause` with any verified records returned before it failed.
+    pub fn partial(records: Vec<DirectoryRelayEventRecord>, cause: Self) -> Self {
+        if records.is_empty() {
+            cause
+        } else {
+            Self::Partial {
+                records,
+                cause: Box::new(cause),
+            }
+        }
+    }
+
+    /// Unpack a partial inspection failure into any verified records it
+    /// returned before failing and its underlying cause.
+    pub fn into_parts(self) -> (Vec<DirectoryRelayEventRecord>, Self) {
+        match self {
+            Self::Partial { records, cause } => (records, *cause),
+            cause => (Vec::new(), cause),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +195,10 @@ impl DirectorySubscriptionFilter {
 pub struct DirectoryFetchRequest {
     pub endpoints: Vec<TransportEndpoint>,
     pub queries: Vec<DirectoryEventQuery>,
+    /// Optional total deadline for one-shot `inspect_directory_events`, so a
+    /// caller with a shorter remaining budget gets `Partial { records, TimedOut }`
+    /// from the collector instead of cancelling it from outside.
+    pub(crate) inspection_budget: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -417,7 +451,18 @@ impl DirectoryFetchRequest {
                 return Err("directory fetch: query limit must be greater than zero".to_owned());
             }
         }
-        Ok(Self { endpoints, queries })
+        Ok(Self {
+            endpoints,
+            queries,
+            inspection_budget: None,
+        })
+    }
+
+    /// Bound one-shot `inspect_directory_events` to at most `budget` across
+    /// connect and EOSE so the collector returns any verified prefix on expiry.
+    pub fn with_inspection_budget(mut self, budget: Duration) -> Self {
+        self.inspection_budget = Some(budget);
+        self
     }
 
     fn key(&self) -> DirectoryFetchKey {
@@ -1150,16 +1195,30 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .map_err(|_| Unreachable)?
             .ok_or(Unreachable)?;
         // Watched before the dial, so an authentication a challenge on
-        // connect starts is seen however early it ends. One retry per
-        // inspection: the watch goes with it.
-        let mut auth = finite.watch_auth(&relay);
+        // connect starts is seen however early it ends. Opt into the short
+        // challenge grace so a bare `auth-required:` CLOSED with no AUTH
+        // challenge ends as `AuthenticationRequired` rather than waiting out
+        // the whole EOSE window (mdk#3724). One retry per inspection: the watch
+        // goes with it.
+        let mut auth = finite
+            .watch_auth(&relay)
+            .map(|watch| watch.with_challenge_wait(transport_nostr_adapter::AUTH_CHALLENGE_WAIT));
         // `connect_relay` only queues the dial. Await the handshake, so the
         // EOSE window below is the relay's answer time alone.
+        let started = tokio::time::Instant::now();
+        let overall_deadline = request.inspection_budget.map(|budget| started + budget);
+        let connect_wait = match overall_deadline {
+            Some(overall) => {
+                DIRECTORY_RELAY_CONNECT_WAIT.min(overall.saturating_duration_since(started))
+            }
+            None => DIRECTORY_RELAY_CONNECT_WAIT,
+        };
+        if connect_wait.is_zero() {
+            return Err(TimedOut);
+        }
         match timeout(
-            DIRECTORY_RELAY_CONNECT_WAIT,
-            client
-                .try_connect_relay(url.clone())
-                .timeout(DIRECTORY_RELAY_CONNECT_WAIT),
+            connect_wait,
+            client.try_connect_relay(url.clone()).timeout(connect_wait),
         )
         .await
         {
@@ -1170,7 +1229,11 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             Ok(Err(_)) => return Err(Unreachable),
             Err(_) => return Err(TimedOut),
         }
-        let deadline = tokio::time::Instant::now() + DIRECTORY_INSPECTION_EOSE_WAIT;
+        let eose_deadline = tokio::time::Instant::now() + DIRECTORY_INSPECTION_EOSE_WAIT;
+        let deadline = match overall_deadline {
+            Some(overall) => eose_deadline.min(overall),
+            None => eose_deadline,
+        };
         let cancel = CancellationToken::new();
         let mut records = Vec::new();
         for query in request.queries {
@@ -1178,7 +1241,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 directory_query_filter(&query, query.kind == 1059).map_err(|_| InvalidRequest)?;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(TimedOut);
+                return Err(DirectoryInspectionError::partial(records, TimedOut));
             }
             // A successful empty read can hide a CLOSED terminal; the finite
             // reply keeps its wire reason. With a signer, a relay that
@@ -1192,31 +1255,49 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             let result = finite
                 .fetch_watching(&relay, vec![filter], limits, &cancel, &mut auth)
                 .await;
+            let preserve_partial = matches!(query.kind, 10002 | 10050);
+            let collect_verified = |target: &mut Vec<DirectoryRelayEventRecord>| {
+                if query.kind == 1059 {
+                    return;
+                }
+                for event in &result.events {
+                    if let Some(event) = validated_directory_event(event, &query) {
+                        target.push(DirectoryRelayEventRecord {
+                            endpoints: request.endpoints.clone(),
+                            event,
+                        });
+                    }
+                }
+            };
             match &result.end {
-                // NIP-67 `more` or `auth`: the relay cut its answer or holds
-                // events back until authentication, so a newer event
-                // may be unread. The inbox probe needs only an answer.
-                FiniteEnd::Eose if (result.more || result.auth) && query.kind != 1059 => {
-                    return Err(Incomplete);
+                FiniteEnd::Eose if !result.auth && !result.more => {
+                    collect_verified(&mut records);
                 }
-                FiniteEnd::Eose => {}
-                FiniteEnd::Closed(reason) => return Err(directory_closed_reason(reason)),
-                FiniteEnd::TimedOut if signing_pending.load(Ordering::Relaxed) => {
-                    return Err(AuthenticationTimedOut);
-                }
-                FiniteEnd::TimedOut => return Err(TimedOut),
-                FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => return Err(Restricted),
-                _ => return Err(Unreachable),
-            }
-            if query.kind == 1059 {
-                continue;
-            } // Read probe only; do not retain inbox payloads.
-            for event in &result.events {
-                if let Some(event) = validated_directory_event(event, &query) {
-                    records.push(DirectoryRelayEventRecord {
-                        endpoints: request.endpoints.clone(),
-                        event,
-                    });
+                end => {
+                    // NIP-67 `auth`: `FiniteRequests` already retried once after
+                    // authenticating when a signer was available; a persistent
+                    // `auth` hint means the relay still withholds events behind
+                    // authentication. NIP-67 `more`: the relay cut its answer.
+                    // The inbox probe (`kind == 1059`) needs only an EOSE answer.
+                    let cause = match end {
+                        FiniteEnd::Eose if result.auth && query.kind != 1059 => {
+                            AuthenticationRequired
+                        }
+                        FiniteEnd::Eose if result.more && query.kind != 1059 => Incomplete,
+                        FiniteEnd::Eose => continue,
+                        FiniteEnd::Closed(reason) => directory_closed_reason(reason),
+                        FiniteEnd::TimedOut if signing_pending.load(Ordering::Relaxed) => {
+                            AuthenticationTimedOut
+                        }
+                        FiniteEnd::TimedOut => TimedOut,
+                        FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => Restricted,
+                        _ => Unreachable,
+                    };
+                    if preserve_partial {
+                        collect_verified(&mut records);
+                        return Err(DirectoryInspectionError::partial(records, cause));
+                    }
+                    return Err(cause);
                 }
             }
         }
@@ -1273,16 +1354,31 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
 /// Classifies a relay's CLOSED reason by its NIP-01 machine-readable prefix.
 /// Some relays put that prefix behind one `error:` wrapper (`ERROR:
 /// auth-required: ...`, mdk#3439); that wrapper alone is looked through.
+/// `rate-limited:` and bare `error: <other>` are transient (`RateLimited` and
+/// `Unreachable`); permanent policy prefixes stay `Restricted`.
 fn directory_closed_reason(reason: &str) -> DirectoryInspectionError {
     use DirectoryInspectionError::*;
-    let reason = reason
+    let wrapped = reason
         .get(..6)
         .filter(|wrapper| wrapper.eq_ignore_ascii_case("error:"))
-        .map_or(reason, |_| reason[6..].trim_start());
-    if reason.starts_with("auth-required:") {
+        .map(|_| reason[6..].trim_start());
+    let unwrapped = wrapped.unwrap_or(reason);
+    if unwrapped.starts_with("auth-required:") {
         AuthenticationRequired
-    } else if reason.starts_with("payment-required:") {
+    } else if unwrapped.starts_with("payment-required:") {
         PaymentRequired
+    } else if unwrapped.starts_with("rate-limited:") {
+        RateLimited
+    } else if wrapped.is_some()
+        && !unwrapped.starts_with("blocked:")
+        && !unwrapped.starts_with("restricted:")
+        && !unwrapped.starts_with("invalid:")
+        && !unwrapped.starts_with("bad req:")
+        && !unwrapped
+            .get(..6)
+            .is_some_and(|nested| nested.eq_ignore_ascii_case("error:"))
+    {
+        Unreachable
     } else {
         Restricted
     }
@@ -2002,15 +2098,42 @@ mod tests {
                 "error: payment-required: pay",
                 DirectoryInspectionError::PaymentRequired,
             ),
-            // Only that one wrapper is looked through.
+            (
+                "rate-limited: slow down",
+                DirectoryInspectionError::RateLimited,
+            ),
+            (
+                "error: rate-limited: slow down",
+                DirectoryInspectionError::RateLimited,
+            ),
+            // Unwrapped permanent prefixes stay Restricted; bare `error: <other>`
+            // is a transient relay error, while `error:` wrapping a permanent
+            // prefix keeps that classification.
+            (
+                "error: shutting down",
+                DirectoryInspectionError::Unreachable,
+            ),
             (
                 "error: internal failure",
-                DirectoryInspectionError::Restricted,
+                DirectoryInspectionError::Unreachable,
             ),
             (
                 "blocked: auth-required: sign in",
                 DirectoryInspectionError::Restricted,
             ),
+            (
+                "restricted: members only",
+                DirectoryInspectionError::Restricted,
+            ),
+            (
+                "bad req: kind not allowed: 10050",
+                DirectoryInspectionError::Restricted,
+            ),
+            (
+                "invalid: filter rejected",
+                DirectoryInspectionError::Restricted,
+            ),
+            ("error: blocked: no", DirectoryInspectionError::Restricted),
             (
                 "error: error: auth-required: sign in",
                 DirectoryInspectionError::Restricted,
@@ -2223,27 +2346,133 @@ mod tests {
         assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    // An authentication still outstanding when the window ends leaves the
-    // route undecided, not refused. Real time, as for the slow-EOSE test.
+    // mdk#3724: a bare `auth-required:` CLOSED without any AUTH challenge
+    // ends as `AuthenticationRequired` after the short challenge grace instead
+    // of waiting out the whole EOSE window as `TimedOut`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn signed_inspection_times_out_when_authentication_never_completes() {
+    async fn signed_inspection_refuses_quickly_when_no_auth_challenge_arrives() {
         let (endpoint, reqs, server) =
             spawn_inspection_relay(InspectionRelay::WrappedAuthRequired { challenge: false }).await;
         let signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner> =
             Arc::new(nostr::prelude::Keys::generate());
+        let started = tokio::time::Instant::now();
         let result = inspect_inbox(endpoint, Some(signer)).await;
         server.abort();
-        assert_eq!(result, Err(DirectoryInspectionError::TimedOut));
+        assert_eq!(
+            result,
+            Err(DirectoryInspectionError::AuthenticationRequired)
+        );
         assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            started.elapsed() < DIRECTORY_INSPECTION_EOSE_WAIT / 2,
+            "no-challenge auth-required waited {:?}",
+            started.elapsed()
+        );
     }
 
-    // A relay that says it holds more, or holds events back until the client
-    // authenticates, may hold a newer declaration than it sent: the source is
-    // not complete. The inbox probe needs only an answer.
+    // Verified kind-10002 / kind-10050 records returned before an incomplete
+    // NIP-67 hint or CLOSED end are preserved in `Partial { records, cause }`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inspection_preserves_verified_records_returned_before_incomplete_or_closed_end() {
+        use futures::{SinkExt, StreamExt};
+        use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let keys = Keys::generate();
+        let author = keys.public_key().to_hex();
+        let event = EventBuilder::new(Kind::from(10002u16), "")
+            .tags([Tag::parse(["r", "wss://relay.example"]).unwrap()])
+            .finalize(&keys)
+            .unwrap();
+        let event_id = event.id.to_hex();
+
+        for (end_frame, budget, expected_cause) in [
+            (
+                Some(serde_json::json!(["EOSE", "SUB", ["more"]])),
+                None,
+                DirectoryInspectionError::Incomplete,
+            ),
+            (
+                Some(serde_json::json!(["EOSE", "SUB", ["auth"]])),
+                None,
+                DirectoryInspectionError::AuthenticationRequired,
+            ),
+            (
+                Some(serde_json::json!([
+                    "CLOSED",
+                    "SUB",
+                    "rate-limited: slow down"
+                ])),
+                None,
+                DirectoryInspectionError::RateLimited,
+            ),
+            (
+                None,
+                Some(Duration::from_millis(250)),
+                DirectoryInspectionError::TimedOut,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+            let event_json = serde_json::to_value(&event).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Message::Text(text) = message else {
+                        continue;
+                    };
+                    let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if request[0] == "REQ" {
+                        let sub_id = request[1].clone();
+                        let ev = serde_json::json!(["EVENT", sub_id, event_json]);
+                        socket
+                            .send(Message::Text(ev.to_string().into()))
+                            .await
+                            .unwrap();
+                        if let Some(mut end) = end_frame.clone() {
+                            end[1] = sub_id;
+                            socket
+                                .send(Message::Text(end.to_string().into()))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+            });
+            let mut request = DirectoryFetchRequest::new(
+                vec![endpoint],
+                vec![DirectoryEventQuery::new(10002, vec![author.clone()], 4)],
+            )
+            .unwrap();
+            if let Some(budget) = budget {
+                request = request.with_inspection_budget(budget);
+            }
+            let result = timeout(
+                Duration::from_secs(5),
+                NostrSdkDirectoryRelayFetcher::standalone().inspect_directory_events(request, None),
+            )
+            .await
+            .expect("inspection completes");
+            server.abort();
+            let (records, cause) = result.unwrap_err().into_parts();
+            assert_eq!(cause, expected_cause);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].event.id, event_id);
+        }
+    }
+
+    // A relay that says it holds more may hold a newer declaration than it sent:
+    // `more` is incomplete, while a persistent NIP-67 `auth` hint is an
+    // authentication refusal. The inbox probe needs only an answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inspection_of_a_relay_that_withholds_events_is_incomplete() {
         let author = nostr::prelude::Keys::generate().public_key().to_hex();
-        for hint in ["more", "auth"] {
+        for (hint, expected) in [
+            ("more", DirectoryInspectionError::Incomplete),
+            ("auth", DirectoryInspectionError::AuthenticationRequired),
+        ] {
             let (endpoint, _, server) =
                 spawn_inspection_relay(InspectionRelay::SaysHint(hint)).await;
             let request = DirectoryFetchRequest::new(
@@ -2258,7 +2487,7 @@ mod tests {
             .await
             .expect("inspection completes");
             server.abort();
-            assert_eq!(result, Err(DirectoryInspectionError::Incomplete), "{hint}");
+            assert_eq!(result, Err(expected), "{hint}");
 
             let (endpoint, _, server) =
                 spawn_inspection_relay(InspectionRelay::SaysHint(hint)).await;

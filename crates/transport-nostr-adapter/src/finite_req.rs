@@ -81,6 +81,11 @@ const VERIFIED_CAPACITY: usize = 8_192;
 /// The SDK's filter matching, which leaves NIP-50 search to the relay.
 const MATCH: MatchEventOptions = MatchEventOptions::new().nip50(false);
 
+/// How long an inspection waits after an `auth-required:` refusal or NIP-67
+/// `auth` hint for a relay to send a NIP-42 `AUTH` challenge before treating
+/// the refusal as final (mdk#3724).
+pub const AUTH_CHALLENGE_WAIT: Duration = Duration::from_secs(1);
+
 /// What one request may take from its relay.
 #[derive(Clone, Copy, Debug)]
 pub struct FiniteLimits {
@@ -398,9 +403,10 @@ impl FiniteRequests {
     /// `relay`'s authentication outcomes from now on, for [`Self::fetch_watching`];
     /// `None` when this client cannot authenticate.
     pub fn watch_auth(&self, relay: &Relay) -> Option<AuthWatch> {
-        self.0
-            .can_authenticate
-            .then(|| AuthWatch(Box::pin(crate::with_gaps(relay.notifications()))))
+        self.0.can_authenticate.then(|| AuthWatch {
+            notifications: Box::pin(crate::with_gaps(relay.notifications())),
+            challenge_wait: None,
+        })
     }
 
     /// Ask `relay` for `filter`'s events until its EOSE, within `limits`. A
@@ -446,7 +452,14 @@ impl FiniteRequests {
         let Some(mut watch) = auth.take_if(|_| auth_required && self.0.can_authenticate) else {
             return first;
         };
-        match authenticated(&mut watch.0, deadline, cancel).await {
+        match authenticated(
+            &mut watch.notifications,
+            deadline,
+            watch.challenge_wait,
+            cancel,
+        )
+        .await
+        {
             Ok(()) => {}
             // The refusal stands.
             Err(None) => return first,
@@ -568,36 +581,64 @@ pub(crate) fn is_auth_required(reason: &str) -> bool {
 
 /// Wait until `deadline` for the SDK to authenticate to the relay whose
 /// notifications these are. Ok when it did, or when lost notifications may
-/// have hidden it; `Err(None)` when it failed or no longer can, and the
-/// request's end when the wait was cut first.
+/// have hidden it; `Err(None)` when it failed, no longer can, or (with
+/// `challenge_wait` set) no `AUTH` challenge arrived within the grace period;
+/// and the request's end when the wait was cut first.
 async fn authenticated(
     notifications: &mut (impl Stream<Item = NotificationUpdate<RelayNotification>> + Unpin),
     deadline: Instant,
+    challenge_wait: Option<Duration>,
     cancel: &CancellationToken,
 ) -> Result<(), Option<FiniteEnd>> {
-    let wait = async {
-        while let Some(update) = notifications.next().await {
-            match update {
-                NotificationUpdate::Notification(RelayNotification::Authenticated)
-                | NotificationUpdate::Lagged { .. } => return Ok(()),
-                NotificationUpdate::Notification(RelayNotification::AuthenticationFailed) => {
-                    return Err(None);
+    let mut challenge_seen = false;
+    let challenge_deadline = challenge_wait.map(|wait| Instant::now() + wait);
+    let mut deadline_sleep = std::pin::pin!(tokio::time::sleep_until(deadline));
+    let mut challenge_sleep = std::pin::pin!(tokio::time::sleep_until(
+        challenge_deadline.unwrap_or(deadline)
+    ));
+    loop {
+        let wait_for_challenge =
+            !challenge_seen && challenge_deadline.is_some_and(|at| at < deadline);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(Some(FiniteEnd::Cancelled)),
+            () = &mut deadline_sleep => return Err(Some(FiniteEnd::TimedOut)),
+            () = &mut challenge_sleep, if wait_for_challenge => return Err(None),
+            update = notifications.next() => match update {
+                Some(
+                    NotificationUpdate::Notification(RelayNotification::Authenticated)
+                    | NotificationUpdate::Lagged { .. },
+                ) => return Ok(()),
+                Some(NotificationUpdate::Notification(
+                    RelayNotification::AuthenticationFailed,
+                )) => return Err(None),
+                Some(NotificationUpdate::Notification(RelayNotification::Message {
+                    message,
+                })) if matches!(message.as_ref(), RelayMessage::Auth { .. }) => {
+                    challenge_seen = true;
                 }
-                NotificationUpdate::Notification(_) => {}
+                Some(NotificationUpdate::Notification(_)) => {}
+                None => return Err(None),
             }
         }
-        Err(None)
-    };
-    tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(Some(FiniteEnd::Cancelled)),
-        () = tokio::time::sleep_until(deadline) => Err(Some(FiniteEnd::TimedOut)),
-        authenticated = wait => authenticated,
     }
 }
 
 /// A relay's authentication outcomes, from [`FiniteRequests::watch_auth`].
-pub struct AuthWatch(Pin<Box<dyn Stream<Item = NotificationUpdate<RelayNotification>> + Send>>);
+pub struct AuthWatch {
+    notifications: Pin<Box<dyn Stream<Item = NotificationUpdate<RelayNotification>> + Send>>,
+    challenge_wait: Option<Duration>,
+}
+
+impl AuthWatch {
+    /// End the wait as refused if no NIP-42 `AUTH` challenge arrives within
+    /// `wait` of the refusal. Once a challenge arrives, the wait continues
+    /// until the request's deadline (mdk#3724).
+    pub fn with_challenge_wait(mut self, wait: Duration) -> Self {
+        self.challenge_wait = Some(wait);
+        self
+    }
+}
 
 impl fmt::Debug for AuthWatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2128,5 +2169,119 @@ mod tests {
         assert!(matches!(&reply.end, FiniteEnd::Closed(reason) if is_auth_required(reason)));
         assert!(started.elapsed() < Duration::from_secs(5));
         client.shutdown().await;
+    }
+
+    /// mdk#3724: opting into `with_challenge_wait` ends a bare `auth-required:`
+    /// CLOSED with no `AUTH` challenge as the refusal after the grace period,
+    /// while a real `AUTH` challenge still waits until the request deadline,
+    /// and default `fetch` (used by history sweeps) keeps its existing timeout
+    /// contract.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn challenge_wait_refuses_bare_auth_required_but_waits_after_challenge() {
+        use tokio_tungstenite::tungstenite::Message as Ws;
+
+        async fn spawn_auth_stall_relay(
+            send_challenge: bool,
+        ) -> (RelayUrl, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Ws::Text(text) = message else {
+                        continue;
+                    };
+                    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if let (Some("REQ"), Some(id)) = (frame[0].as_str(), frame[1].as_str()) {
+                        let _ = socket
+                            .send(Ws::Text(
+                                serde_json::json!(["CLOSED", id, "auth-required: sign in"])
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await;
+                        if send_challenge {
+                            let _ = socket
+                                .send(Ws::Text(
+                                    serde_json::json!(["AUTH", "stalled-challenge"])
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await;
+                        }
+                    }
+                    // Intentionally never answer `AUTH` with `OK`.
+                }
+            });
+            (url, server)
+        }
+
+        let filter = Filter::new().kind(Kind::TextNote);
+        let cancel = CancellationToken::new();
+        let long_limits = FiniteLimits {
+            max_items: 10,
+            max_event_bytes: 1 << 20,
+            timeout: Duration::from_secs(3),
+        };
+        let grace = Duration::from_millis(200);
+
+        // 1. Bare CLOSED with no challenge + opt-in challenge_wait -> refused quickly.
+        let (url, server) = spawn_auth_stall_relay(false).await;
+        let (finite, client) = client_on(Some(Keys::generate()), &url).await;
+        let relay = client.relay(&url).await.unwrap().unwrap();
+        let mut auth = finite
+            .watch_auth(&relay)
+            .map(|watch| watch.with_challenge_wait(grace));
+        let started = Instant::now();
+        let reply = finite
+            .fetch_watching(
+                &relay,
+                vec![filter.clone()],
+                long_limits,
+                &cancel,
+                &mut auth,
+            )
+            .await;
+        assert!(matches!(&reply.end, FiniteEnd::Closed(reason) if is_auth_required(reason)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        client.shutdown().await;
+        server.abort();
+
+        // 2. Real AUTH challenge sent + stalled OK -> still waits until deadline (TimedOut).
+        let (url, server) = spawn_auth_stall_relay(true).await;
+        let (finite, client) = client_on(Some(Keys::generate()), &url).await;
+        let relay = client.relay(&url).await.unwrap().unwrap();
+        let mut auth = finite
+            .watch_auth(&relay)
+            .map(|watch| watch.with_challenge_wait(grace));
+        let short_limits = FiniteLimits {
+            max_items: 10,
+            max_event_bytes: 1 << 20,
+            timeout: Duration::from_millis(600),
+        };
+        let reply = finite
+            .fetch_watching(
+                &relay,
+                vec![filter.clone()],
+                short_limits,
+                &cancel,
+                &mut auth,
+            )
+            .await;
+        assert_eq!(reply.end, FiniteEnd::TimedOut);
+        client.shutdown().await;
+        server.abort();
+
+        // 3. Default `fetch` (no challenge_wait) keeps the #3667 TimedOut contract.
+        let (url, server) = spawn_auth_stall_relay(false).await;
+        let (finite, client) = client_on(Some(Keys::generate()), &url).await;
+        let relay = client.relay(&url).await.unwrap().unwrap();
+        let reply = finite
+            .fetch(&relay, vec![filter], short_limits, &cancel)
+            .await;
+        assert_eq!(reply.end, FiniteEnd::TimedOut);
+        client.shutdown().await;
+        server.abort();
     }
 }

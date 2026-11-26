@@ -1920,6 +1920,16 @@ where
                     })
                     .collect(),
             )?;
+        } else if let Some(pending) = lifecycle.pending_replacement.as_mut()
+            && !endpoints.is_empty()
+        {
+            // Keep the exact durable signed KeyPackage and private material
+            // when the account's write relays change before promotion (mdk#3747).
+            let before = pending.targets.clone();
+            merge_republish_publication_targets(&mut pending.targets, &endpoints);
+            if pending.targets != before {
+                self.session.put_key_package_lifecycle(&lifecycle)?;
+            }
         }
 
         if lifecycle
@@ -1939,6 +1949,7 @@ where
                 endpoints: pending
                     .targets
                     .iter()
+                    .filter(|target| target.state != TransportFanoutAttemptState::PolicyProhibited)
                     .map(|target| target.endpoint.clone())
                     .collect(),
             };
@@ -1999,6 +2010,7 @@ where
                 endpoints: pending
                     .targets
                     .iter()
+                    .filter(|target| target.state != TransportFanoutAttemptState::PolicyProhibited)
                     .map(|target| target.endpoint.clone())
                     .collect(),
             };

@@ -273,7 +273,9 @@ for reconnect/backoff and relay status mechanics.
   authenticates; the retry spends what the first attempt left of the budget, and the reply keeps both attempts' events and counts. Authentication still
   under way at the deadline ends the request `TimedOut` (undecided), never as the refusal. The relay plane's own
   one-shot clients get finite requests through `FiniteRequests::install`; keep that surface to `install`, `fetch`,
-  `fetch_watching` with `watch_auth` (an authentication watch started before the dial), `sharing` (one byte budget
+  `fetch_watching` with `watch_auth` (an authentication watch started before the dial, with opt-in
+  `AuthWatch::with_challenge_wait(AUTH_CHALLENGE_WAIT)` for one-shot directory inspection only so history sweeps keep
+  their full timeout contract), `sharing` (one byte budget
   for a read's relays, charged per kept event) and their types.
 - The client's wire tap (`src/sweep/hint_tap.rs`) counts, per REQ, the EVENT frames its relay sends before that
   REQ's EOSE, valid or not, on the connection the REQ went out on (`ReplyCounts`). `dispatch_sdk_notification` asks

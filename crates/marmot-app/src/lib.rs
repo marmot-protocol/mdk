@@ -9296,11 +9296,19 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             .publish_prepared_key_package(&nostr_publication, &event)
             .await
             .map_err(|error| {
+                let endpoint_failures = match &error {
+                    cgka_traits::TransportAdapterError::PublishEndpoints(failure) => {
+                        failure.endpoint_failures.clone()
+                    }
+                    _ => Vec::new(),
+                };
                 // A size refusal by every relay reaches the caller typed
                 // (mdk#2334); the lifecycle sees the failure as before.
-                KeyPackagePublishError::exposed(error.to_string()).with_event_size_class(
-                    error::publish_size_refusal(&error).map(|cause| cause.size_class),
-                )
+                KeyPackagePublishError::exposed(error.to_string())
+                    .with_event_size_class(
+                        error::publish_size_refusal(&error).map(|cause| cause.size_class),
+                    )
+                    .with_endpoint_failures(endpoint_failures)
             })?;
         let accepted = outcome
             .accepted

@@ -26,8 +26,12 @@ impl AccountSetup<'_> {
         let sources = self
             .onboarding_sources(checkpoint, OnboardingStep::SingleDevice)
             .await;
-        let (events, mut findings, completed) =
-            self.inspect_onboarding_relays(id, 30443, sources).await;
+        let OnboardingInspection {
+            records: events,
+            failures: mut findings,
+            completed,
+            ..
+        } = self.inspect_onboarding_relays(id, 30443, sources).await;
         let now = unix_now_seconds();
         let mut packages = Vec::new();
         let mut seen_slots = HashSet::new();

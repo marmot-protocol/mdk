@@ -56,9 +56,13 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   relay's REQ as one of the adapter's finite requests, on an owned client built with `FiniteRequests::install`: each
   relay's reply keeps its own end (EOSE, CLOSED reason, cut, deadline), and a relay that requires NIP-42 is asked once
   more after the signer authenticates. A pending signer callback at the inspection deadline is
-  `AuthenticationTimedOut`. Other deadlines are `TimedOut`. The inspection watches authentication from before the
-  dial, so a refusal on connect still decides a later close, and an
-  EOSE with NIP-67 `more` or `auth` is `Incomplete` (not for the inbox probe). Each query's relays share one byte budget
+  `AuthenticationTimedOut`; other deadlines are `TimedOut`. Inspection watches authentication from before the dial with
+  `AUTH_CHALLENGE_WAIT` (so a bare `auth-required:` CLOSED with no `AUTH` challenge ends as `AuthenticationRequired`
+  instead of waiting out the EOSE window, while an `AUTH` challenge still waits until the deadline), so a refusal on
+  connect still decides a later close; a persistent NIP-67 `auth` EOSE hint is `AuthenticationRequired` and `more` is
+  `Incomplete` (not for the inbox probe). `CLOSED` `rate-limited:` is `RateLimited` and bare `error: <other>` is
+  `Unreachable`, while permanent prefixes stay `Restricted`; verified kind 10002/10050 records returned before an incomplete or closed
+  end are kept in `Partial { records, cause }`. Each query's relays share one byte budget
   (`FiniteRequests::sharing`); directory and public reads set no item cap, since a relay's every EVENT frame would count,
   matching or not. Frames not yet read are bounded per relay request, not per query: a queue of the budget plus one
   frame, and the batch its collector is reading, so up to twice that. A public read past `max_events`, cut, or ending

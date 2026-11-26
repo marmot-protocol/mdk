@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::maintenance::SignedPublicationArtifact;
-use cgka_traits::{EventSizeClass, MemberId, MessageId, Timestamp, TransportEndpoint};
+use cgka_traits::{
+    EventSizeClass, MemberId, MessageId, Timestamp, TransportEndpoint, TransportEndpointFailure,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyPackagePublication {
@@ -72,6 +74,9 @@ pub struct KeyPackagePublishError {
     pub externally_exposed: bool,
     pub artifact_unusable: bool,
     pub event_size_class: Option<EventSizeClass>,
+    /// Per-endpoint transport failures from the publication attempt, when the
+    /// publisher preserved them (mdk#3747).
+    pub endpoint_failures: Vec<TransportEndpointFailure>,
 }
 
 impl KeyPackagePublishError {
@@ -82,6 +87,7 @@ impl KeyPackagePublishError {
             externally_exposed: false,
             artifact_unusable: false,
             event_size_class: None,
+            endpoint_failures: Vec::new(),
         }
     }
 
@@ -93,6 +99,7 @@ impl KeyPackagePublishError {
             externally_exposed: true,
             artifact_unusable: false,
             event_size_class: None,
+            endpoint_failures: Vec::new(),
         }
     }
 
@@ -104,6 +111,7 @@ impl KeyPackagePublishError {
             externally_exposed: false,
             artifact_unusable: true,
             event_size_class: None,
+            endpoint_failures: Vec::new(),
         }
     }
 
@@ -111,6 +119,16 @@ impl KeyPackagePublishError {
     #[must_use]
     pub fn with_event_size_class(mut self, size_class: Option<EventSizeClass>) -> Self {
         self.event_size_class = size_class;
+        self
+    }
+
+    /// Attach typed per-endpoint failures from the underlying publish attempt.
+    #[must_use]
+    pub fn with_endpoint_failures(
+        mut self,
+        endpoint_failures: Vec<TransportEndpointFailure>,
+    ) -> Self {
+        self.endpoint_failures = endpoint_failures;
         self
     }
 }
