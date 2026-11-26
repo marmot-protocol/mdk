@@ -135,22 +135,13 @@ impl AppClient {
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Err(AppError::DeviceGroupRefused("no_device_group"));
         };
-        let Some(entry) = roster.devices.get(&slot) else {
+        if !roster.devices.contains_key(&slot) {
             return Err(AppError::DeviceGroupRefused("unknown_device"));
-        };
+        }
         if slot == self.own_slot()? {
             return Err(AppError::DeviceGroupRefused("this_device"));
         }
-        // A device sets its tag signature key with its first commit in the
-        // device group; until then the link may still fail and be undone.
-        // One that cleared the key since is removed by its committed leaf
-        // whose tag it signed with that leaf's own key for the slot
-        // (mdk#3679); a pending link's leaf is still its KeyPackage leaf.
-        if entry.tag_signature_key.is_none()
-            && self
-                .device_group_leaf_of(&group_id, &roster, &slot)?
-                .is_none()
-        {
+        if self.device_link_pending(&group_id, &roster, &slot)? {
             return Err(AppError::DeviceGroupRefused("device_link_pending"));
         }
         self.app
@@ -458,11 +449,11 @@ impl AppClient {
                 Some(DeviceGroupLeaf::SelfSigned(leaf)) => (leaf.clone(), Some(leaf)),
                 None => (Vec::new(), entry.tag_signature_key.clone()),
             };
-        // Branch selection can drop the commit that set the device's tag
-        // signature key after the user decided. Until the key is back, or
-        // the device's leaf carries a tag it signed for the slot, the link
-        // may still fail, and a failed link's undo ends the decision.
-        if tag_signature_key.is_none() {
+        // Branch selection can drop the device's first commit after the
+        // user decided. Until its link is made again, or its leaf carries a
+        // tag it signed for the slot, the link may still fail, and a failed
+        // link's undo ends the decision.
+        if tag_signature_key.is_none() || self.device_link_pending(group_id, roster, slot)? {
             return Ok(());
         }
         let operations = vec![
@@ -499,6 +490,39 @@ impl AppClient {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Whether the link of the device in `slot` may still fail and be undone
+    /// (marmot#521, mdk#3679): it is not made, no leaf of it has committed
+    /// since its Add, and either its entry has no key, from an Add that set
+    /// none, or a leaf still built from its Add's KeyPackage signs with the
+    /// entry's key. A device that cleared or moved its key since is found by
+    /// its committed leaf.
+    fn device_link_pending(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+        slot: &DeviceSlotId,
+    ) -> Result<bool, AppError> {
+        if self
+            .runtime
+            .made_device_links(group_id, roster)?
+            .contains(slot)
+            || self.device_group_leaf_of(group_id, roster, slot)?.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(entry) = roster.devices.get(slot) else {
+            return Ok(false);
+        };
+        Ok(match entry.tag_signature_key.as_deref() {
+            None => true,
+            Some(key) => self
+                .runtime
+                .own_device_leaves(group_id, roster, slot, Some(key))?
+                .iter()
+                .any(|leaf| leaf.signature_key == key && leaf.add_not_after.is_some()),
+        })
     }
 
     /// The device-group leaf of the device in `slot` (mdk#3679): the one

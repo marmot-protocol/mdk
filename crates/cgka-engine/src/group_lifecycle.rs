@@ -1931,6 +1931,37 @@ impl<S: StorageProvider> Engine<S> {
                 None if roster_required => return Err(EngineError::UnexpectedDeviceGroupWelcome),
                 None => None,
             };
+            // The Add that links this device writes its entry, announcing
+            // the confirmed KeyPackage, with the signature key of the leaf it
+            // adds (marmot#521, "Joining"), at the slot this device holds. A
+            // roster that binds that entry to another key, or puts it at
+            // another slot, leaves a copy this device can never tag in. An
+            // entry with no key is an earlier approver's, from before the Add
+            // set it; this device then sets its key with its first Commit.
+            if accepted_device_group.is_some() {
+                let own_slot = own_device_slot(storage)?;
+                let own_key = mls_group
+                    .own_leaf_node()
+                    .map(|leaf| leaf.signature_key().as_slice().to_vec());
+                let bound = crate::app_components::app_component_data_of_group(
+                    &mls_group,
+                    DEVICE_ROSTER_COMPONENT_ID,
+                )
+                .and_then(|bytes| decode_device_roster_v1(&bytes).ok())
+                .is_some_and(|roster| {
+                    roster.devices.iter().any(|(slot, entry)| {
+                        entry.announced_key_package.as_deref()
+                            == Some(consumed_key_package_ref.as_slice())
+                            && own_key.is_some()
+                            && (entry.tag_signature_key.is_none()
+                                || entry.tag_signature_key == own_key)
+                            && own_slot.is_none_or(|own| own == *slot)
+                    })
+                });
+                if !bound {
+                    return Err(EngineError::UnexpectedDeviceGroupWelcome);
+                }
+            }
             // While a link waits, the KeyPackage it confirmed is reserved for
             // it: no Welcome into another group, a chat included, consumes
             // it (D41).

@@ -146,9 +146,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   announcement does. Naming hydrates it, so never name it at a deferred open's end: the post-hydration reconcile
   does, as do settling a join, creating a group, maintenance and every KeyPackage publication. Name it before reading
   whether the current KeyPackage still serves (`key_package_republish_falls_back`), since an untagged one is stale once
-  this device tags. The founder's founding entry carries its own tag signature key; every other device sets its own
-  in maintenance or, before a host KeyPackage publication, through `set_device_tag_key`, once per call, since the
-  runtime stages no KeyPackage while the key is due.
+  this device tags. The founder's founding entry carries its own tag signature key; the Add that links every other
+  device sets its key (marmot#521), and that device makes its first commit there in maintenance or, before a host
+  KeyPackage publication, through `set_device_tag_key`, once per call, since the runtime stages no KeyPackage while
+  that commit is due. Read a link as made from `runtime.made_device_links` (the leaf signing with the slot's key has
+  committed since its Add, or founded the group), never from a key in its entry alone.
 - The overdue-refresh warning (`key_package_refresh_overdue`) asks the runtime's announcement gate, never a copy of
   the roster. The client recomputes it after each maintenance pass; a change sets
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
@@ -544,8 +546,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `SendIntent::LinkDevice` commit, sent through `runtime.send_with_audit_context` so the runtime releases its Welcome
   only once the commit is confirmed (never split the Welcome off for app delivery). On both paths the prompt stays
   `Linking` after the commit: `decide_device_links` is the one gate for every link in `device_links`, prompt or not
-  (D40). A link is `Linked` once the new device's first commit, which sets its roster entry's `tag_signature_key` to
-  the leaf key the link added (`leaf_signature_key_hex`), is on the selected branch: the device group is `Stable` with
+  (D40). The link's Add sets the new device's `tag_signature_key` to the leaf key it adds (`leaf_signature_key_hex`,
+  marmot#521). A link is `Linked` once the new device's first commit from that leaf is on the selected branch
+  (`made_device_links` lists its slot): the device group is `Stable` with
   no pending convergence input. It fails when its group was never made, when the quiet roster has not listed it as
   this device's link for a whole settlement window (`MarmotApp::settlement_quiescence_ms`, in milliseconds, whose
   override only test-policy builds read), or when that commit is still absent `LINK_DEADLINE_SECS` after the entry's

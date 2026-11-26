@@ -82,21 +82,34 @@ async fn every_roster_state_a_device_applies_records_its_tag_keys() {
     initial.devices.get_mut(&slot(1)).unwrap().tag_signature_key = Some(vec![0xa1; 32]);
     let gid = found_device_group(&mut phone, &initial, &mut [&mut laptop]).await;
     // The founding create and the Welcome join record the roster they start
-    // from. The laptop has set no key yet.
+    // from, with the key the Add bound to the laptop's entry.
+    let laptop_key = RosterTagKey {
+        slot: slot(2),
+        tag_signature_key: laptop.engine.own_signature_key(),
+        held_as_removed: false,
+    };
     for device in [&phone, &laptop] {
-        assert_eq!(recorded(device, &gid), BTreeSet::from([tag_key(1, 0xa1)]));
+        assert_eq!(
+            recorded(device, &gid),
+            BTreeSet::from([tag_key(1, 0xa1), laptop_key.clone()])
+        );
     }
 
     // The committer records when its Commit is confirmed, a receiver when it
     // applies it: a device entry's key and a `removed` record's alike.
     for intent in [
-        set_key(&gid, 2, "Laptop", 0xb2),
-        record_removed(&gid, 3, 0xb3),
+        set_key(&gid, 3, "Tablet", 0xb3),
+        record_removed(&gid, 4, 0xb4),
     ] {
         let commit = send_commit(&mut phone, intent, &gid).await;
         assert_accepted(&mut laptop, &commit, &gid).await;
     }
-    let expected = BTreeSet::from([tag_key(1, 0xa1), tag_key(2, 0xb2), removed_key(3, 0xb3)]);
+    let expected = BTreeSet::from([
+        tag_key(1, 0xa1),
+        laptop_key,
+        tag_key(3, 0xb3),
+        removed_key(4, 0xb4),
+    ]);
     for device in [&phone, &laptop] {
         assert_eq!(recorded(device, &gid), expected);
     }

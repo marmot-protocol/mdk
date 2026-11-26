@@ -1310,6 +1310,15 @@ impl AccountDeviceSession {
         Ok(self.engine.own_account_leaf_claims(group_id, roster)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::made_device_links`].
+    pub fn made_device_links(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<std::collections::BTreeSet<cgka_traits::app_components::DeviceSlotId>> {
+        Ok(self.engine.made_device_links(group_id, roster)?)
+    }
+
     /// See [`cgka_engine::engine::Engine::own_device_leaves`].
     pub fn own_device_leaves(
         &self,

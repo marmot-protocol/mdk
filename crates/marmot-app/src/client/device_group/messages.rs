@@ -34,6 +34,8 @@
 //!   or past 4,096, so a feature also says what a withdrawn message of no
 //!   recorded kind owes it.
 
+use std::collections::BTreeSet;
+
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
 use cgka_traits::app_event::MarmotAppEvent;
 use cgka_traits::engine::{GroupEvent, SendIntent};
@@ -78,16 +80,17 @@ pub(crate) fn is_device_group_kind(kind: u64) -> bool {
 }
 
 /// The trusted device group this device talks to its siblings in, its
-/// roster, this device's slot there, and whether this device's own leaf
-/// carries a device tag that reads as that slot at `pin`, the group's epoch
-/// and branch when it was read. Siblings read nothing this device sends
-/// until it does.
+/// roster, this device's slot there, whether this device's own leaf carries
+/// a device tag that reads as that slot at `pin`, the group's epoch and
+/// branch when it was read, and the slots whose link the group's tree shows
+/// made. Siblings read nothing this device sends until it is tagged.
 pub(crate) struct Exchange {
     pub(crate) group_id: GroupId,
     pub(crate) roster: DeviceRosterV1,
     pub(crate) own_slot: DeviceSlotId,
     pub(crate) tagged: bool,
     pub(crate) pin: EpochPin,
+    made: BTreeSet<DeviceSlotId>,
 }
 
 impl Exchange {
@@ -103,6 +106,15 @@ impl Exchange {
 
     pub(crate) fn is_sibling(&self, slot: &DeviceSlotId) -> bool {
         *slot != self.own_slot && self.roster.devices.contains_key(slot)
+    }
+
+    /// Whether the link of the device in `slot` is made, as the engine's
+    /// `made_device_links` reports it: the leaf signing with the entry's key
+    /// has committed in the device group since its Add, or founded it
+    /// (marmot#521). The Add sets an entry's key, so a key alone says
+    /// nothing about the link.
+    pub(crate) fn link_made(&self, slot: &DeviceSlotId) -> bool {
+        self.made.contains(slot)
     }
 }
 
@@ -138,12 +150,14 @@ impl AppClient {
             .runtime
             .member_device_tag_claim(&group_id, epoch, own_leaf, &roster)?
             == Some(DeviceTagClaim::Device(own_slot));
+        let made = self.runtime.made_device_links(&group_id, &roster)?;
         Ok(Some(Exchange {
             group_id,
             roster,
             own_slot,
             tagged,
             pin,
+            made,
         }))
     }
 

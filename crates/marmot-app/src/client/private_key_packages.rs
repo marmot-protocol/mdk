@@ -1216,8 +1216,9 @@ impl AppClient {
                             entry.status,
                             cgka_traits::app_components::DeviceStatusV1::Active
                                 | cgka_traits::app_components::DeviceStatusV1::Inactive
-                        ) && entry.tag_signature_key.is_some()
+                        )
                     })
+                || !exchange.link_made(&welcome.to)
             {
                 continue;
             }

@@ -13,7 +13,10 @@ use super::device_roster::{
 };
 use super::*;
 use cgka_engine::engine::OutboundWelcomeStatus;
-use cgka_traits::app_components::DeviceRosterOperationV1;
+use cgka_traits::app_components::{
+    DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceSlotId,
+    encode_device_roster_v1,
+};
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _};
 
 /// The id the existing device's confirmation named.
@@ -123,6 +126,88 @@ async fn a_welcome_by_another_key_package_of_the_device_is_refused() {
     );
     assert!(!holds(&laptop, &chosen()));
     assert!(expectation_of(&laptop).is_some(), "the expectation stays");
+}
+
+/// A fresh phone's Welcome into its device group under [`chosen`], which it
+/// founded alone, adding `key_package` with `entry` at `joiner_slot`. Raw
+/// OpenMLS builds the Commit, so the sender rule that every Add binds its
+/// leaf's key does not apply. `joiner` expects that phone's Welcome.
+async fn welcome_with_entry(
+    joiner: &mut Device,
+    key_package: &KeyPackage,
+    joiner_slot: DeviceSlotId,
+    entry: DeviceEntryV1,
+) -> TransportMessage {
+    let mut phone = roster_device(b"alice");
+    create_under(&mut phone, &roster(&[(1, "Phone")]), vec![], &chosen())
+        .await
+        .unwrap();
+    expect_link_welcome(joiner, &chosen(), &phone, key_package);
+    let mut resulting = super::device_roster::roster_of(&phone, &chosen());
+    resulting.devices.insert(joiner_slot, entry.clone());
+    let update = AppDataUpdateProposal::update(
+        DEVICE_ROSTER_COMPONENT_ID,
+        update_bytes(vec![DeviceRosterOperationV1::SetDevice(joiner_slot, entry)]),
+    );
+    crafted_welcome_of(
+        &phone,
+        &chosen(),
+        Parts {
+            adds: vec![key_package.clone()],
+            app_data: vec![update],
+            app_data_state: vec![(
+                DEVICE_ROSTER_COMPONENT_ID,
+                encode_device_roster_v1(&resulting).unwrap(),
+            )],
+            ..Parts::default()
+        },
+        joiner,
+    )
+}
+
+/// The Add that links the new device binds the signature key of the leaf it
+/// adds to the entry announcing the confirmed KeyPackage, at the slot the
+/// device holds (marmot#521, "Joining"). A Welcome from the confirmed leaf
+/// whose roster binds that entry to another key, or puts it at another slot,
+/// is refused and the expectation stays. An entry with no key is an earlier
+/// approver's, from before the Add set it, and still joins.
+#[tokio::test]
+async fn a_welcome_whose_roster_binds_the_new_device_elsewhere_is_refused() {
+    let mut laptop = roster_device(b"alice");
+    super::device_tag::hold_slot(&laptop, slot(2));
+    let key_package = laptop.engine.fresh_key_package().await.unwrap();
+    let bound = announced_entry(&roster(&[(2, "Laptop")]), &slot(2), &key_package);
+    let refused_cases = [
+        (
+            slot(2),
+            DeviceEntryV1 {
+                tag_signature_key: Some(vec![0x55; 32]),
+                ..bound.clone()
+            },
+        ),
+        (slot(3), bound.clone()),
+    ];
+    for (n, (joiner_slot, entry)) in refused_cases.into_iter().enumerate() {
+        let welcome = welcome_with_entry(&mut laptop, &key_package, joiner_slot, entry).await;
+        assert_eq!(
+            join_outcome(&mut laptop, &welcome).await,
+            refused(InputRejectionCategory::AuthorizationFailed),
+            "case {n}"
+        );
+        assert!(!holds(&laptop, &chosen()));
+        assert!(expectation_of(&laptop).is_some(), "the expectation stays");
+    }
+
+    let keyless = DeviceEntryV1 {
+        tag_signature_key: None,
+        ..bound
+    };
+    let welcome = welcome_with_entry(&mut laptop, &key_package, slot(2), keyless).await;
+    assert_eq!(
+        join_outcome(&mut laptop, &welcome).await,
+        IngestOutcome::Processed
+    );
+    assert!(holds(&laptop, &chosen()));
 }
 
 /// While a link waits, the KeyPackage it confirmed joins no other group
@@ -654,6 +739,14 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
             .own_device_tag_commit_landed(&chosen(), &destination_roster, &slot(2))
             .unwrap(),
         "a later authenticated own Commit does not undo first-Commit participation"
+    );
+    assert!(
+        destination_creator
+            .engine
+            .made_device_links(&chosen(), &destination_roster)
+            .unwrap()
+            .contains(&slot(2)),
+        "the approver still reads the link as made after the leaf's tag follows original trust"
     );
     let mut mismatching = destination_roster.clone();
     mismatching
