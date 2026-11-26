@@ -6799,11 +6799,12 @@ where
     /// [`Self::seal_commit_welcomes`]. A commit the engine no longer holds is
     /// settled: a rollback that failed after taking it left nothing to retry.
     /// Any other failure keeps the commit for the next pass, which
-    /// [`Self::maintenance_due`] reports as owed.
+    /// [`Self::maintenance_due`] reports as owed. Each note stays until its
+    /// rollback settles, so a pass dropped mid-rollback loses none.
     async fn settle_dropped_seals(&mut self) -> AccountResult<AccountDeviceEffects> {
         let mut output = AccountDeviceEffects::default();
         let mut queue = VecDeque::new();
-        for pending in std::mem::take(&mut self.sealing_commits) {
+        for pending in self.sealing_commits.clone() {
             match self.session.publish_failed(pending).await {
                 Ok(effects) => {
                     output
@@ -6819,9 +6820,10 @@ where
                         error_kind = error.as_engine_error().privacy_safe_kind(),
                         "dropped-seal rollback failed; retried next pass"
                     );
-                    self.sealing_commits.push(pending);
+                    continue;
                 }
             }
+            self.sealing_commits.retain(|noted| *noted != pending);
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
         Ok(output)
