@@ -472,8 +472,13 @@ async fn assert_rotated_setup_fallback_withdrawal(
     assert_ne!(rotated.authored_event_id, initial.authored_event_id);
     assert_eq!(rotated.stable_slot_id, initial.stable_slot_id);
     let publications = publisher.publications.publications();
-    assert_eq!(publications[0].endpoints, [fallback.clone()]);
-    assert!(publications[1..].iter().all(|publication| publication.endpoints == [declared.clone()]));
+    assert_eq!(
+        publications[0].endpoints.as_slice(),
+        std::slice::from_ref(&fallback),
+    );
+    assert!(publications[1..].iter().all(|publication| {
+        publication.endpoints.as_slice() == std::slice::from_ref(&declared)
+    }));
     drop(runtime);
 
     let mut runtime = open();
