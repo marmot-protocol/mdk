@@ -1431,6 +1431,7 @@ impl MarmotCreateGroupOptions {
             description: unsafe { optional_str(self.description) }?,
             initial_image,
             disappearing_message_secs: self.disappearing_message_secs,
+            initial_admins: Vec::new(),
         })
     }
 }

@@ -25,6 +25,8 @@ esac
 smoke_dir="$(mktemp -d)"
 trap 'rm -rf "$smoke_dir"' EXIT
 "$smoke_target/uniffi-bindgen" generate --library "$smoke_library" --language "$smoke_language" --out-dir "$smoke_dir"
+# Match the workspace stack setting for the Rust runtime started by the host.
+export RUST_MIN_STACK="${RUST_MIN_STACK:-4194304}"
 if [[ "$smoke_language" == swift ]]; then
   cat "$smoke_dir/marmot_uniffi.swift" crates/marmot-uniffi/tests/options_smoke.swift > "$smoke_dir/CombinedSmoke.swift"
   swiftc -parse-as-library -I "$smoke_dir" -Xcc "-fmodule-map-file=$smoke_dir/marmot_uniffiFFI.modulemap" \

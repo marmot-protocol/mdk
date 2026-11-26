@@ -1,11 +1,29 @@
 import Foundation
 
 private final class OptionsStore: SecretStore, @unchecked Sendable {
-    func hasSecretForLabel(label: String) throws -> Bool { label == "probe" }
-    func hasSecretForAccountId(accountIdHex: String) throws -> Bool { false }
-    func writeSecret(label: String, accountIdHex: String, secretKeyHex: String) throws {}
-    func loadSecret(label: String, accountIdHex: String) throws -> String { "callback-probe" }
-    func removeSecret(label: String, accountIdHex: String) throws {}
+    private let lock = NSLock()
+    private var secrets: [String: (label: String, key: String)] = [:]
+
+    func hasSecretForLabel(label: String) throws -> Bool {
+        lock.withLock { label == "probe" || secrets.values.contains { $0.label == label } }
+    }
+    func hasSecretForAccountId(accountIdHex: String) throws -> Bool {
+        lock.withLock { secrets[accountIdHex] != nil }
+    }
+    func writeSecret(label: String, accountIdHex: String, secretKeyHex: String) throws {
+        lock.withLock { secrets[accountIdHex] = (label, secretKeyHex) }
+    }
+    func loadSecret(label: String, accountIdHex: String) throws -> String {
+        try lock.withLock {
+            guard let secret = secrets[accountIdHex], secret.label == label else {
+                throw MarmotKitError.SecretNotFound(details: "Missing smoke credential")
+            }
+            return secret.key
+        }
+    }
+    func removeSecret(label: String, accountIdHex: String) throws {
+        lock.withLock { secrets[accountIdHex] = nil }
+    }
 }
 
 @main
@@ -78,6 +96,32 @@ struct OptionsSmoke {
         )
         let experimentalAccounts = try experimental.listAccounts()
         precondition(experimentalAccounts.isEmpty)
+
+        let relay = "ws://127.0.0.1:1"
+        try await kit.start()
+        let account = try await kit.createIdentityWithProfile(
+            defaultRelays: [relay], bootstrapRelays: [relay]
+        ).account
+        let groupOptions = CreateGroupOptionsFfi(
+            description: nil, initialImage: nil, disappearingMessageSecs: 0)
+        let creation = try await kit.createGroupWithOptions(
+            accountRef: account.label, name: "Founding admins smoke", memberRefs: [], options: groupOptions)
+        guard let group = creation.groupIdHex else {
+            preconditionFailure("creator-only group was not created")
+        }
+        let members = try await kit.groupDetails(accountRef: account.label, groupIdHex: group).members
+        precondition(members.count == 1 && members[0].isSelf && members[0].isAdmin)
+
+        var invalidOptions = groupOptions
+        invalidOptions.initialAdmins = ["79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"]
+        do {
+            _ = try await kit.createGroupWithOptions(
+                accountRef: account.label, name: "Invalid admin smoke", memberRefs: [], options: invalidOptions)
+            preconditionFailure("native group creation accepted a nonmember admin")
+        } catch MarmotKitError.Runtime(let details) {
+            precondition(details == "initial admins must be founding members")
+        }
+        try await kit.shutdownAndClose()
         print("Swift onboarding diagnostics, runtime options and host-store construction passed")
     }
 }
