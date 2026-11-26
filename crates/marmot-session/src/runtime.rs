@@ -2222,8 +2222,11 @@ where
         if self.key_package_slot_withdrawn {
             return Ok(false);
         }
-        let now = self.wall_clock.now();
         let current_endpoints = self.routing.key_package_endpoints();
+        if current_endpoints.is_empty() {
+            return Ok(false);
+        }
+        let now = self.wall_clock.now();
         Ok(match self.session.key_package_lifecycle()? {
             None => true,
             Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {

@@ -1005,7 +1005,8 @@ async fn empty_routing_does_not_strand_key_package_publication_once_a_writable_r
     let publisher = RecordingKeyPackages::default();
 
     // Staging or publishing with zero endpoints refuses without persisting a
-    // zero-target pending replacement.
+    // zero-target pending replacement, and maintenance does not spin retrying
+    // a KeyPackage publish until at least one writable endpoint is configured.
     let mut empty_runtime = slot_runtime(
         current_session(database.clone(), &key, b"alice"),
         publisher.clone(),
@@ -1013,6 +1014,8 @@ async fn empty_routing_does_not_strand_key_package_publication_once_a_writable_r
         0,
         &[],
     );
+    assert!(!empty_runtime.key_package_network_maintenance_due().unwrap());
+    assert!(!empty_runtime.maintenance_due(&[]).unwrap().retry_while_owed);
     let err = empty_runtime
         .publish_fresh_key_package()
         .await
@@ -1040,6 +1043,8 @@ async fn empty_routing_does_not_strand_key_package_publication_once_a_writable_r
         0,
         &[KEY_ENDPOINT],
     );
+    assert!(seeded.key_package_network_maintenance_due().unwrap());
+    assert!(seeded.maintenance_due(&[]).unwrap().retry_while_owed);
     seeded
         .prepare_fresh_key_package(vec![TransportEndpoint(KEY_ENDPOINT.into())])
         .await

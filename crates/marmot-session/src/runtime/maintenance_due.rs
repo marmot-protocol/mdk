@@ -208,14 +208,19 @@ where
     }
 
     fn key_package_due(&self, now: Timestamp, due: &mut MaintenanceDue) -> AccountResult<()> {
+        let current_endpoints = self.routing.key_package_endpoints();
         let Some(lifecycle) = self.session.key_package_lifecycle()? else {
-            // Paused maintenance prepares no new KeyPackage.
-            if !self.key_package_slot_withdrawn && !self.maintenance_paused {
+            // Paused maintenance prepares no new KeyPackage, and no KeyPackage
+            // can be staged or published while zero publication endpoints are configured.
+            if !self.key_package_slot_withdrawn
+                && !self.maintenance_paused
+                && !current_endpoints.is_empty()
+            {
                 due.owed();
             }
             return Ok(());
         };
-        // Private material expires whether or not maintenance is paused.
+        // Private material expires whether or not maintenance is paused or routes exist.
         due.at_opt(lifecycle.current_not_after);
         due.at_opt(
             lifecycle
@@ -226,10 +231,9 @@ where
         for material in &lifecycle.retained_private_material {
             due.at(material.delete_at());
         }
-        if self.key_package_slot_withdrawn {
+        if self.key_package_slot_withdrawn || current_endpoints.is_empty() {
             return Ok(());
         }
-        let current_endpoints = self.routing.key_package_endpoints();
         // The current publication's unacknowledged relays, at their backoff.
         if self.key_package_has_pending_fanout()? {
             for target in &lifecycle.publication_targets {
