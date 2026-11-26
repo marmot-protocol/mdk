@@ -26,6 +26,8 @@ pub(crate) enum ChatCommand {
     GoalClear,
     /// Replace the stored standing goal.
     GoalSet { text: String },
+    /// Show or switch the agent that answers in this group.
+    Agent { name: Option<String> },
 }
 
 /// How one inbound message body is routed before backend invocation.
@@ -67,6 +69,10 @@ const RESERVED: &[(&str, &str)] = &[
     (
         "goal",
         "`/goal <text>` sets a standing instruction, `/goal` shows it, `/goal clear` removes it",
+    ),
+    (
+        "agent",
+        "`/agent` shows which agent answers in this chat, `/agent <name>` switches to another",
     ),
 ];
 
@@ -129,6 +135,7 @@ pub(crate) fn route(text: &str) -> Routed {
         ),
         "cd" => route_cd(args),
         "goal" => route_goal(args),
+        "agent" => route_agent(args),
         _ => Routed::Prompt(text.to_owned()),
     }
 }
@@ -159,6 +166,21 @@ fn route_goal(args: &str) -> Routed {
     Routed::Command(ChatCommand::GoalSet {
         text: text.to_owned(),
     })
+}
+
+fn route_agent(args: &str) -> Routed {
+    let mut words = args.split_whitespace();
+    let name = words.next().map(str::to_ascii_lowercase);
+    if words.next().is_some()
+        || name
+            .as_deref()
+            .is_some_and(|name| !crate::routing::is_valid_agent_name(name))
+    {
+        return Routed::Usage(
+            "Use `/agent` to show the active agent or `/agent <name>` to switch.",
+        );
+    }
+    Routed::Command(ChatCommand::Agent { name })
 }
 
 fn bare(command: ChatCommand, args: &str, usage: &'static str) -> Routed {
@@ -342,6 +364,22 @@ mod tests {
             );
         }
         assert!(!is_reserved("whitenoise"));
+    }
+
+    #[test]
+    fn agent_shows_or_switches_by_one_lowercase_name() {
+        assert_eq!(
+            route("/agent"),
+            Routed::Command(ChatCommand::Agent { name: None })
+        );
+        assert_eq!(
+            route("/agent Codex"),
+            Routed::Command(ChatCommand::Agent {
+                name: Some("codex".to_owned())
+            })
+        );
+        assert!(matches!(route("/agent codex now"), Routed::Usage(_)));
+        assert!(matches!(route("/agent c@dex"), Routed::Usage(_)));
     }
 
     #[test]

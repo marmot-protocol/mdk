@@ -9,6 +9,7 @@ mod error;
 mod group_profile;
 pub mod process;
 mod repo_picker;
+mod routing;
 mod store;
 #[cfg(all(feature = "test-support", unix))]
 pub mod test_support;
@@ -31,6 +32,7 @@ pub use config::{ConfigSpec, ExecutionProfile, LoadedConfig, load_config_with};
 pub use error::{HarnessError, Result};
 pub use group_profile::{GroupProfileContext, with_group_profile_context};
 pub use process::{ParsedEvent, PromptTransport};
+pub use routing::RoutingConfig;
 
 /// Default maximum byte length for one Marmot reply chunk.
 pub const DEFAULT_MAX_REPLY_BYTES: usize = 30_000;
@@ -80,6 +82,8 @@ pub struct Config {
     pub execution_profile: ExecutionProfile,
     /// Explicitly authorized outbound artifact export policy.
     pub artifact_exports: ArtifactExportConfig,
+    /// Optional per-group routing shared with co-resident harnesses.
+    pub routing: Option<RoutingConfig>,
     /// Connector identity and naming.
     pub spec: ConfigSpec,
 }
@@ -100,6 +104,7 @@ impl fmt::Debug for Config {
             .field("backend_idle_timeout", &self.backend_idle_timeout)
             .field("execution_profile", &self.execution_profile)
             .field("artifact_exports_enabled", &self.artifact_exports.enabled())
+            .field("routing_enabled", &self.routing.is_some())
             .field("spec", &self.spec)
             .finish_non_exhaustive()
     }

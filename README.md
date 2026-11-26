@@ -54,6 +54,8 @@ you allowlist can invite or message it.
 | Goose | Terminal harness | [integrations/goose](integrations/goose/marmot/README.md) |
 | Your own client | `wn-agent` only | [Build your own client](integrations/custom-client.md) |
 
+Use [`/agent` routing](integrations/terminal-harness/README.md#agent-routing) to select one terminal harness per shared chat.
+
 The [quickstart](integrations/README.md) installs a checksum-verified release on macOS or Linux and gets you to a first
 encrypted chat. For how connectors share one machine, identities, and allowlists, see
 [How the connectors fit together](integrations/README.md#how-the-connectors-fit-together). The connector daemon itself is documented in

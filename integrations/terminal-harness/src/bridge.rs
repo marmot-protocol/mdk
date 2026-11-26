@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use agent_control::{
     AgentControlAccount, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
+    AgentControlTimelineCursor,
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::AbortHandle;
@@ -23,9 +24,13 @@ use crate::commands::{self, ChatCommand, Routed};
 use crate::control::{ControlClient, DownloadedMedia};
 use crate::error::{HarnessError, Result};
 use crate::repo_picker::{RepoPicker, parse_repo_picker, resolve_repo, validate_session_cwd};
+use crate::routing::{
+    AgentCommandAction, AgentCommandPlan, CommandRef, Gate, Router, Takeover, TakeoverConfirmation,
+    TakeoverOrigin, TranscriptLine, handoff_preamble, speaker_label,
+};
 use crate::store::{
-    FinalDeliveryRecord, FinalDeliveryStore, RecoveryKind, RecoveryRecord, RecoveryStatus,
-    RecoveryStore, SessionRecord, SessionStore,
+    FinalDeliveryRecord, FinalDeliveryStore, RecoveryHandoff, RecoveryKind, RecoveryRecord,
+    RecoveryStatus, RecoveryStore, SessionRecord, SessionStore,
 };
 use crate::{
     ArtifactOutput, ArtifactOutputRequest, ArtifactSupport, Attachment, Backend, Config,
@@ -117,6 +122,10 @@ pub async fn run<B: Backend>(mut config: Config, backend: B) -> Result<()> {
     )?);
     reconcile_pending_deliveries(&client, &deliveries).await;
     let queues = Arc::new(GroupQueues::new(config.max_pending_per_group));
+    let router = config
+        .routing
+        .clone()
+        .map(|routing| Arc::new(Router::new(routing)));
     let ctx = Arc::new(BridgeContext {
         cfg: Arc::new(config),
         client,
@@ -130,6 +139,7 @@ pub async fn run<B: Backend>(mut config: Config, backend: B) -> Result<()> {
         backend: Arc::new(backend),
         outbox,
         home,
+        router,
     });
 
     if ctx.cfg.artifact_exports.enabled() {
@@ -175,6 +185,7 @@ struct BridgeContext {
     backend: Arc<dyn Backend>,
     outbox: Arc<Mutex<ArtifactOutbox>>,
     home: PathBuf,
+    router: Option<Arc<Router>>,
 }
 
 struct ReconciliationSlot {
@@ -358,6 +369,32 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 );
                 return DispatchOutcome::Continue;
             }
+            let mut agent_action = None;
+            if let Some(router) = &ctx.router {
+                let group_key = group_id_hex.to_ascii_lowercase();
+                let position = CommandRef {
+                    at: message.recorded_at,
+                    message: message.message_id_hex.to_ascii_lowercase(),
+                };
+                if let Routed::Command(ChatCommand::Agent { name }) = commands::route(&message.text)
+                {
+                    match router
+                        .apply_agent_command(&group_key, name.as_deref(), position)
+                        .await
+                    {
+                        AgentCommandPlan::Silent => return DispatchOutcome::Continue,
+                        AgentCommandPlan::Handle(action) => agent_action = Some(action),
+                    }
+                } else if router.gate(&group_key, &position).await == Gate::Ignore {
+                    debug!(
+                        target: TRACE_TARGET,
+                        method = "dispatch_event",
+                        event = "routed_elsewhere",
+                        "ignoring inbound event routed to another agent"
+                    );
+                    return DispatchOutcome::Continue;
+                }
+            }
             let disposition = classify_prompt(&message.text);
             let permit = acquire_dispatch_permit(&ctx.queues, &group_id_hex, &disposition).await;
             let Some(permit) = permit else {
@@ -405,6 +442,8 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 message_ref: message.message_id_hex,
                 text: message.text,
                 media: message.media,
+                recorded_at: message.recorded_at,
+                agent_action,
             };
             tokio::spawn(handle_message(ctx, inbound, permit));
             DispatchOutcome::Continue
@@ -446,6 +485,10 @@ struct InboundPrompt {
     message_ref: String,
     text: String,
     media: Vec<AgentControlMediaRef>,
+    /// Sender-authenticated message time, used to bound a handoff transcript.
+    recorded_at: u64,
+    /// Routing decision for an `/agent` command, planned at dispatch time.
+    agent_action: Option<AgentCommandAction>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -494,9 +537,13 @@ async fn acquire_dispatch_permit(
     group_ref: &str,
     disposition: &PromptDisposition,
 ) -> Option<GroupPermit> {
+    // `/agent` must not be refused for a full queue: the switch is already
+    // saved, and the target has to reset and announce it.
     if matches!(
         disposition,
-        PromptDisposition::RetryLast | PromptDisposition::DiscardLast
+        PromptDisposition::RetryLast
+            | PromptDisposition::DiscardLast
+            | PromptDisposition::HarnessCommand(ChatCommand::Agent { .. })
     ) || is_inspect_disposition(disposition)
     {
         queues.enter_without_waiter_quota(group_ref).await
@@ -534,7 +581,13 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         PromptDisposition::RetryLast | PromptDisposition::DiscardLast
     );
 
-    let _serial = if recovery_command {
+    let routing_command = matches!(
+        disposition,
+        PromptDisposition::HarnessCommand(ChatCommand::Agent { .. })
+    );
+    let _serial = if routing_command {
+        permit.serial.lock().await
+    } else if recovery_command {
         match permit.serial.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
@@ -599,7 +652,47 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         }
     };
 
+    let mut handoff_origin = None;
+    if let Some(router) = &ctx.router
+        && !routing_command
+    {
+        let group_key = inbound.group_ref.to_ascii_lowercase();
+        // A routing file that became readable or was edited while this prompt
+        // waited may assign it elsewhere; the message's own time decides.
+        let position = CommandRef {
+            at: inbound.recorded_at,
+            message: inbound.message_ref.to_ascii_lowercase(),
+        };
+        let (gate, origin, confirm) = router.prompt_route(&group_key, &position).await;
+        if gate == Gate::Ignore {
+            debug!(
+                target: TRACE_TARGET,
+                method = "handle_message",
+                event = "routed_elsewhere",
+                "dropping queued prompt routed to another agent"
+            );
+            return;
+        }
+        if !recovery_command {
+            match adopt_prompt_route(&ctx, router, &inbound, &position, &origin, confirm).await {
+                Ok(Gate::Respond) => handoff_origin = origin,
+                Ok(Gate::Ignore) => return,
+                Err(err) => {
+                    warn!(target: TRACE_TARGET, method = "routing_adopt", error_kind = err.privacy_safe_kind(), "failed to adopt a saved agent switch");
+                    send_command_reply(
+                        &ctx,
+                        &inbound,
+                        "Failed to start a fresh session for the saved agent switch.",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+
     let mut retrying = false;
+    let mut retry_handoff = None;
     let forced_run = match disposition {
         PromptDisposition::ResetSession => {
             handle_command(&ctx, &inbound, ChatCommand::NewSession).await;
@@ -696,6 +789,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 }
             };
             retrying = true;
+            retry_handoff = record.handoff;
             inbound.media = record.media.clone();
             add_control_instructions = !record.omit_control_instructions;
             Some((record.cwd, Some(record.session_id), record.prompt))
@@ -751,10 +845,6 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         .as_ref()
         .and_then(|record| record.goal.as_deref());
     let (recovery_prompt, prompt) = prepare_prompt(goal, prompt);
-    let recovery_prompt = RecoveryPrompt {
-        text: recovery_prompt,
-        omit_control_instructions: !add_control_instructions,
-    };
 
     info!(
         target: TRACE_TARGET,
@@ -800,6 +890,47 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     let attachments = attachment_batch
         .as_ref()
         .map_or_else(Vec::new, |batch| batch.attachments.clone());
+    let handoff = if retrying {
+        retry_handoff
+    } else {
+        handoff_origin.map(|origin| RecoveryHandoff {
+            switch_id: origin.command,
+            previous_agent: origin.previous,
+            before: AgentControlTimelineCursor {
+                recorded_at: inbound.recorded_at,
+                message_id_hex: inbound.message_ref.clone(),
+            },
+        })
+    };
+    let mut handoff = handoff.filter(|handoff| {
+        add_control_instructions
+            && known_session
+                .as_ref()
+                .and_then(|record| record.takeover.as_ref())
+                .is_some_and(|saved| saved.command == handoff.switch_id && saved.handoff_pending)
+    });
+    if retrying
+        && let (Some(router), Some(handoff)) = (&ctx.router, &mut handoff)
+        && handoff.previous_agent.is_none()
+    {
+        handoff.previous_agent = router
+            .saved_takeover_origin(&inbound.group_ref.to_ascii_lowercase(), &handoff.switch_id)
+            .await
+            .and_then(|origin| origin.previous);
+    }
+    let (prompt, session_id) = if let (Some(router), Some(handoff)) = (&ctx.router, &handoff) {
+        (
+            with_pending_handoff(&ctx, router, &inbound, handoff, prompt).await,
+            if retrying { session_id } else { None },
+        )
+    } else {
+        (prompt, session_id)
+    };
+    let recovery_prompt = RecoveryPrompt {
+        text: recovery_prompt,
+        omit_control_instructions: !add_control_instructions,
+        handoff: handoff.clone(),
+    };
     let (artifact_authorization, artifact_setup_failed) = match ctx
         .cfg
         .artifact_exports
@@ -994,6 +1125,20 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     };
     match run_result {
         Ok(Ok(outcome)) => {
+            if outcome.exit_code == Some(0)
+                && let Some(handoff) = &handoff
+                && let Err(err) = ctx
+                    .sessions
+                    .complete_handoff(
+                        &inbound.group_ref,
+                        &handoff.switch_id,
+                        outcome.observed_session.clone(),
+                        cwd.clone(),
+                    )
+                    .await
+            {
+                warn!(target: TRACE_TARGET, method = "routing_handoff", error_kind = err.privacy_safe_kind(), "failed to record delivery of the agent handoff");
+            }
             let artifact_delivery_attempted = artifact_setup_failed
                 || artifact_declaration_failed
                 || !artifact_outputs.is_empty();
@@ -1755,6 +1900,12 @@ fn attachment_failure_reply(config: &Config, error: &HarnessError) -> String {
 }
 
 async fn handle_command(ctx: &BridgeContext, inbound: &InboundPrompt, command: ChatCommand) {
+    if let ChatCommand::Agent { .. } = command {
+        if let Some(body) = agent_command_body(ctx, inbound).await {
+            send_command_reply(ctx, inbound, &body).await;
+        }
+        return;
+    }
     let record = ctx.sessions.get(&inbound.group_ref).await;
     let body =
         match command {
@@ -1787,6 +1938,7 @@ async fn handle_command(ctx: &BridgeContext, inbound: &InboundPrompt, command: C
                     Err(()) => "Failed to set the standing goal.".to_owned(),
                 }
             }
+            ChatCommand::Agent { .. } => unreachable!("agent commands are handled above"),
             ChatCommand::RetryLast | ChatCommand::DiscardLast => {
                 unreachable!("recovery commands are handled before generic command dispatch")
             }
@@ -1830,6 +1982,248 @@ async fn new_session_body(ctx: &BridgeContext, inbound: &InboundPrompt) -> Strin
             format!("Failed to reset the {} session.", ctx.cfg.spec.display_name)
         }
     }
+}
+
+/// Replies to an `/agent` command, or returns `None` when this harness must
+/// stay silent because a newer switch replaced the planned takeover.
+async fn agent_command_body(ctx: &BridgeContext, inbound: &InboundPrompt) -> Option<String> {
+    let Some(router) = &ctx.router else {
+        return Some("Agent routing is not configured for this harness.".to_owned());
+    };
+    let group_key = inbound.group_ref.to_ascii_lowercase();
+    let display = ctx.cfg.spec.display_name;
+    let body = match &inbound.agent_action {
+        None | Some(AgentCommandAction::Status) => router.status_text(&group_key).await,
+        Some(AgentCommandAction::Unknown { requested }) => format!(
+            "There is no agent named `{requested}`.\n{}",
+            router.status_text(&group_key).await
+        ),
+        Some(AgentCommandAction::Pinned) => format!(
+            "This chat is pinned in the routing file and cannot be switched from chat.\n{}",
+            router.status_text(&group_key).await
+        ),
+        Some(AgentCommandAction::Unavailable) => {
+            "Agent routing is configured, but the routing file is missing or invalid.".to_owned()
+        }
+        Some(AgentCommandAction::FutureTimestamp) => format!(
+            "This switch was ignored because its timestamp is ahead of this machine's clock.\n{}",
+            router.status_text(&group_key).await
+        ),
+        Some(AgentCommandAction::SaveFailed) => format!(
+            "{display} could not save the switch to the routing file, so the previous routing stays in effect."
+        ),
+        Some(AgentCommandAction::TakeOver { command, .. }) => {
+            let takeover = match router.takeover_state(&group_key).await {
+                Ok(Some(takeover)) if takeover.command == *command => takeover,
+                Ok(_) => return None,
+                Err(err) => {
+                    warn!(target: TRACE_TARGET, method = "routing_takeover", error_kind = err.privacy_safe_kind(), "failed to read the saved agent switch");
+                    return Some("Failed to read the saved agent switch.".to_owned());
+                }
+            };
+            if !takeover.confirmed && fifo_is_blocked(ctx, &inbound.group_ref).await {
+                return Some(format!(
+                    "This chat now routes to {display}. Resolve the saved recovery before starting its fresh session."
+                ));
+            }
+            match start_takeover(ctx, router, &inbound.group_ref, &takeover).await {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(err) => {
+                    warn!(target: TRACE_TARGET, method = "routing_takeover", error_kind = err.privacy_safe_kind(), "failed to adopt the saved agent switch");
+                    return Some(format!(
+                        "Failed to start a fresh {display} session for the saved agent switch."
+                    ));
+                }
+            }
+            match takeover.origin {
+                Some(origin) => {
+                    let from = origin
+                        .previous
+                        .map(|name| format!(" from {name}"))
+                        .unwrap_or_default();
+                    format!(
+                        "{display} took over this chat{from}. The first prompt starts a fresh session with a short handoff."
+                    )
+                }
+                None => format!("{display} already answers in this chat."),
+            }
+        }
+    };
+    Some(body)
+}
+
+/// Persist the fresh-session boundary before acknowledging a pending takeover.
+async fn start_takeover(
+    ctx: &BridgeContext,
+    router: &Router,
+    group_ref: &str,
+    takeover: &Takeover,
+) -> Result<bool> {
+    if takeover.confirmed {
+        return Ok(true);
+    }
+    if let Some(origin) = &takeover.origin
+        && !ctx
+            .sessions
+            .adopt_takeover(group_ref, &origin.command, origin.at)
+            .await?
+    {
+        return Ok(false);
+    }
+    router
+        .confirm_takeover(&group_ref.to_ascii_lowercase(), &takeover.command)
+        .await
+}
+
+async fn adopt_prompt_route(
+    ctx: &BridgeContext,
+    router: &Router,
+    inbound: &InboundPrompt,
+    position: &CommandRef,
+    origin: &Option<TakeoverOrigin>,
+    confirmation: Option<TakeoverConfirmation>,
+) -> Result<Gate> {
+    let group_key = inbound.group_ref.to_ascii_lowercase();
+    let mut saved = ctx.sessions.get(&inbound.group_ref).await;
+    if let Some(takeover) = saved.as_mut().and_then(|record| record.takeover.as_mut())
+        && takeover.at == 0
+    {
+        let Some(boundary) = router
+            .saved_takeover_origin(&group_key, &takeover.command)
+            .await
+        else {
+            send_command_reply(
+                ctx,
+                inbound,
+                "The saved agent switch is outside the routing history. Switch agents again to choose a new session.",
+            )
+            .await;
+            return Ok(Gate::Ignore);
+        };
+        ctx.sessions
+            .adopt_takeover(&inbound.group_ref, &takeover.command, boundary.at)
+            .await?;
+        takeover.at = boundary.at;
+    }
+    let legacy_confirmed_session = confirmation == Some(TakeoverConfirmation::Confirmed)
+        && saved
+            .as_ref()
+            .is_some_and(|record| record.takeover.is_none() && !record.session_id.is_empty());
+    let current = match origin {
+        Some(_) if legacy_confirmed_session => true,
+        Some(origin) => {
+            ctx.sessions
+                .adopt_takeover(&inbound.group_ref, &origin.command, origin.at)
+                .await?
+        }
+        None => saved
+            .and_then(|record| record.takeover)
+            .is_none_or(|takeover| takeover.at <= position.at),
+    };
+    if !current {
+        send_command_reply(
+            ctx,
+            inbound,
+            "This prompt arrived after its agent session ended. Send it again to use the current session.",
+        )
+        .await;
+        return Ok(Gate::Ignore);
+    }
+    if let Some(TakeoverConfirmation::Pending(command)) = confirmation
+        && !router.confirm_takeover(&group_key, &command).await?
+    {
+        let (gate, latest_origin, _) = router.prompt_route(&group_key, position).await;
+        if gate == Gate::Ignore {
+            return Ok(gate);
+        }
+        if &latest_origin != origin {
+            send_command_reply(
+                ctx,
+                inbound,
+                "The chat route changed while preparing this prompt. Send it again to use the current session.",
+            )
+            .await;
+            return Ok(Gate::Ignore);
+        }
+    }
+    Ok(Gate::Respond)
+}
+
+/// Number of recent messages included in a takeover handoff.
+const HANDOFF_TRANSCRIPT_MESSAGES: u32 = 20;
+
+async fn with_pending_handoff(
+    ctx: &BridgeContext,
+    router: &Router,
+    inbound: &InboundPrompt,
+    handoff: &RecoveryHandoff,
+    prompt: String,
+) -> String {
+    let transcript = match ctx
+        .client
+        .recent_timeline(
+            &inbound.account_ref,
+            &inbound.group_ref,
+            handoff.before.clone(),
+            HANDOFF_TRANSCRIPT_MESSAGES,
+        )
+        .await
+    {
+        Ok(messages) => handoff_transcript(messages, &ctx.cfg.allowed_senders, router.name()),
+        Err(err) => {
+            warn!(
+                target: TRACE_TARGET,
+                method = "handoff_timeline",
+                error_kind = err.privacy_safe_kind(),
+                "failed to read recent messages for handoff"
+            );
+            Vec::new()
+        }
+    };
+    let template = router.handoff_template().await;
+    let preamble = handoff_preamble(
+        template.as_deref(),
+        router.name(),
+        handoff.previous_agent.as_deref(),
+        &transcript,
+    );
+    format!("{preamble}{prompt}")
+}
+
+fn handoff_transcript(
+    mut messages: Vec<agent_control::AgentControlTimelineMessage>,
+    allowed_senders: &HashSet<String>,
+    own_name: &str,
+) -> Vec<TranscriptLine> {
+    messages.sort_by(|a, b| {
+        (a.recorded_at, &a.message_id_hex).cmp(&(b.recorded_at, &b.message_id_hex))
+    });
+    messages
+        .into_iter()
+        .filter_map(|message| {
+            let text = message.text?;
+            let sender = &message.sender;
+            let id = sender.account_id_hex.to_ascii_lowercase();
+            let short = &id[..id.len().min(8)];
+            let name = sender.display_name.as_deref().map(speaker_label);
+            let speaker = if sender.is_self {
+                own_name.to_owned()
+            } else if allowed_senders.contains(&id) {
+                format!(
+                    "{} (allowed sender)",
+                    name.unwrap_or_else(|| short.to_owned())
+                )
+            } else {
+                // Other members, including other agents, are context only.
+                format!(
+                    "{} (member {short})",
+                    name.unwrap_or_else(|| "member".to_owned())
+                )
+            };
+            Some(TranscriptLine { speaker, text })
+        })
+        .collect()
 }
 
 async fn change_workdir_body(
@@ -1899,6 +2293,7 @@ fn status_text(ctx: &BridgeContext, record: Option<&SessionRecord>) -> String {
 struct RecoveryPrompt {
     text: String,
     omit_control_instructions: bool,
+    handoff: Option<RecoveryHandoff>,
 }
 
 fn prepare_prompt(goal: Option<&str>, prompt: String) -> (String, String) {
@@ -2166,6 +2561,7 @@ async fn persist_recovery_record(
             RecoveryRecord {
                 prompt: prompt.text,
                 omit_control_instructions: prompt.omit_control_instructions,
+                handoff: prompt.handoff,
                 media,
                 cwd,
                 session_id,
@@ -2224,6 +2620,7 @@ async fn handle_backend_run_failure(
                 let record = RecoveryRecord {
                     prompt: prompt.text,
                     omit_control_instructions: prompt.omit_control_instructions,
+                    handoff: prompt.handoff,
                     media,
                     cwd,
                     session_id,
@@ -3014,6 +3411,7 @@ mod tests {
             backend_idle_timeout: Duration::from_secs(45),
             execution_profile: crate::ExecutionProfile::Inherit,
             artifact_exports: crate::ArtifactExportConfig::default(),
+            routing: None,
             spec: crate::ConfigSpec {
                 env_prefix: "WN_OPENCODE",
                 default_home_name: "harnesses",
@@ -3431,6 +3829,7 @@ mod tests {
                 ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
             )),
             home: root.path().to_path_buf(),
+            router: None,
         });
         let permit = ctx.queues.try_enter_waiter("group").await.unwrap();
         handle_message(
@@ -3441,6 +3840,8 @@ mod tests {
                 message_ref: "message".to_owned(),
                 text: "create artifacts".to_owned(),
                 media: Vec::new(),
+                recorded_at: 0,
+                agent_action: None,
             },
             permit,
         )
@@ -3457,17 +3858,25 @@ mod tests {
                 let mut reader = BufReader::new(read_half);
                 let request: AgentControlEnvelope<AgentControlRequest> =
                     read_envelope(&mut reader).await.unwrap().unwrap();
-                assert!(matches!(
-                    request.payload,
-                    AgentControlRequest::SendFinal { .. }
-                ));
-                let response = AgentControlEnvelope::request(
-                    request.id,
-                    AgentControlResponse::FinalSent {
+                let response = match request.payload {
+                    AgentControlRequest::SendFinal { .. } => AgentControlResponse::FinalSent {
                         message_ids_hex: vec!["reply".to_owned()],
                         maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
                     },
-                );
+                    AgentControlRequest::TimelineList {
+                        account_id_hex,
+                        group_id_hex,
+                        ..
+                    } => AgentControlResponse::TimelinePage {
+                        account_id_hex,
+                        group_id_hex,
+                        messages: Vec::new(),
+                        has_more_before: false,
+                        has_more_after: false,
+                    },
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                let response = AgentControlEnvelope::request(request.id, response);
                 write_frame(&mut write_half, &response).await.unwrap();
             }
         })
@@ -3571,6 +3980,7 @@ mod tests {
                 ArtifactOutbox::load(root.join("outbox.json")).unwrap(),
             )),
             home: home.to_path_buf(),
+            router: None,
         })
     }
 
@@ -3596,6 +4006,8 @@ mod tests {
                 message_ref: message_ref.to_owned(),
                 text: text.to_owned(),
                 media,
+                recorded_at: 0,
+                agent_action: None,
             },
             permit,
         )
@@ -3709,6 +4121,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_legacy_switch_keeps_its_existing_session() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let backend = Arc::new(RecordingBackend::default());
+        let (ctx, server) = test_context(root.path(), &home, backend);
+        ctx.sessions
+            .record_session("group", "legacy-session".to_owned(), home)
+            .await
+            .unwrap();
+        let routing = root.path().join("routing.json");
+        fs::write(
+            &routing,
+            r#"{
+                "schema": 1,
+                "agents": ["claude", "codex"],
+                "groups": { "group": "codex" },
+                "switches": {
+                    "group": {
+                        "agent": "codex", "at": 30, "message": "repeat",
+                        "previous": "codex", "confirmed": true,
+                        "earlier": [
+                            { "at": 20, "message": "confirmed-switch", "previous": "claude" }
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let router = Router::new(crate::routing::RoutingConfig {
+            file: routing,
+            name: "codex".to_owned(),
+            handoff_prompt_file: None,
+        });
+        let inbound = InboundPrompt {
+            account_ref: "account".to_owned(),
+            group_ref: "group".to_owned(),
+            message_ref: "prompt".to_owned(),
+            text: "continue the work".to_owned(),
+            media: Vec::new(),
+            recorded_at: 25,
+            agent_action: None,
+        };
+        let position = CommandRef {
+            at: inbound.recorded_at,
+            message: inbound.message_ref.clone(),
+        };
+        let (gate, origin, confirmation) = router.prompt_route("group", &position).await;
+        assert_eq!(gate, Gate::Respond);
+        assert_eq!(origin.as_ref().unwrap().command, "confirmed-switch");
+        assert_eq!(confirmation, Some(TakeoverConfirmation::Confirmed));
+        assert_eq!(
+            adopt_prompt_route(&ctx, &router, &inbound, &position, &origin, confirmation,)
+                .await
+                .unwrap(),
+            Gate::Respond
+        );
+        let saved = ctx.sessions.get("group").await.unwrap();
+        assert_eq!(saved.session_id, "legacy-session");
+        assert!(saved.takeover.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_settles_its_saved_takeover_while_a_new_takeover_is_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let backend = Arc::new(RecordingBackend::default());
+        let (mut ctx, server) = test_context(root.path(), &home, backend.clone());
+        let routing = root.path().join("routing.json");
+        fs::write(
+            &routing,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "agents": ["claude", "codex"],
+                "groups": { "group": "codex" },
+                "switches": {
+                    "group": {
+                        "agent": "codex",
+                        "at": 40,
+                        "message": "fourth",
+                        "previous": "claude",
+                        "confirmed": false,
+                        "earlier": [
+                            { "at": 10, "message": "first", "previous": "codex" },
+                            { "at": 20, "message": "second", "previous": "claude" },
+                            { "at": 30, "message": "third", "previous": "codex" }
+                        ]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut ctx).unwrap().router =
+            Some(Arc::new(Router::new(crate::routing::RoutingConfig {
+                file: routing,
+                name: "codex".to_owned(),
+                handoff_prompt_file: None,
+            })));
+        ctx.sessions
+            .adopt_takeover("group", "second", 20)
+            .await
+            .unwrap();
+        ctx.recovery
+            .set(
+                "group",
+                RecoveryRecord {
+                    prompt: "saved prompt".to_owned(),
+                    omit_control_instructions: false,
+                    handoff: Some(RecoveryHandoff {
+                        switch_id: "second".to_owned(),
+                        previous_agent: Some("claude".to_owned()),
+                        before: AgentControlTimelineCursor {
+                            recorded_at: 21,
+                            message_id_hex: "original".to_owned(),
+                        },
+                    }),
+                    media: Vec::new(),
+                    cwd: home,
+                    session_id: "saved-session".to_owned(),
+                    kind: RecoveryKind::UncertainOutcome,
+                    status: RecoveryStatus::Pending,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(dispatch_test_message(ctx.clone(), "retry", "/retry-last").await);
+        let invocations = backend.invocations.lock().await;
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].session_id.as_deref(), Some("saved-session"));
+        assert!(invocations[0].prompt.contains("from `claude`"));
+        assert!(
+            !ctx.sessions
+                .get("group")
+                .await
+                .unwrap()
+                .takeover
+                .unwrap()
+                .handoff_pending
+        );
+        let latest = ctx
+            .router
+            .as_ref()
+            .unwrap()
+            .takeover_state("group")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.command, "fourth");
+        assert!(!latest.confirmed);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn inspect_commands_reply_while_recovery_fifo_is_blocked() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
@@ -3722,6 +4289,7 @@ mod tests {
                 RecoveryRecord {
                     prompt: "private prompt".to_owned(),
                     omit_control_instructions: false,
+                    handoff: None,
                     cwd: repo.clone(),
                     session_id: "session".to_owned(),
                     media: Vec::new(),
@@ -4053,6 +4621,7 @@ mod tests {
                 ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
             )),
             home: home.clone(),
+            router: None,
         });
         let media = AgentControlMediaRef {
             media_type: "image/png".to_owned(),
@@ -4073,6 +4642,7 @@ mod tests {
                 RecoveryRecord {
                     prompt: "private prompt".to_owned(),
                     omit_control_instructions: false,
+                    handoff: None,
                     media: vec![media],
                     cwd: repo,
                     session_id: "session".to_owned(),
@@ -4404,6 +4974,7 @@ mod tests {
                 ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
             )),
             home: root.path().to_path_buf(),
+            router: None,
         });
         let permit = ctx.queues.try_enter_waiter("group").await.unwrap();
         handle_message(
@@ -4414,6 +4985,8 @@ mod tests {
                 message_ref: "message".to_owned(),
                 text: "complete then fail".to_owned(),
                 media: Vec::new(),
+                recorded_at: 0,
+                agent_action: None,
             },
             permit,
         )
@@ -4858,6 +5431,7 @@ mod tests {
                 ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
             )),
             home: root.path().to_path_buf(),
+            router: None,
         });
         let permit = ctx.queues.try_enter_waiter("group").await.unwrap();
         handle_message(
@@ -4868,6 +5442,8 @@ mod tests {
                 message_ref: "message".to_owned(),
                 text: "create artifact".to_owned(),
                 media: Vec::new(),
+                recorded_at: 0,
+                agent_action: None,
             },
             permit,
         )
@@ -5010,6 +5586,7 @@ mod tests {
             }),
             outbox: Arc::new(Mutex::new(ArtifactOutbox::load(outbox_path).unwrap())),
             home: root.path().to_path_buf(),
+            router: None,
         });
         let permit = ctx.queues.try_enter_waiter("group").await.unwrap();
         handle_message(
@@ -5020,6 +5597,8 @@ mod tests {
                 message_ref: "message".to_owned(),
                 text: "create artifact".to_owned(),
                 media: Vec::new(),
+                recorded_at: 0,
+                agent_action: None,
             },
             permit,
         )
@@ -5127,6 +5706,7 @@ mod tests {
                 ArtifactOutbox::load(outbox_path.clone()).unwrap(),
             )),
             home: root.path().to_path_buf(),
+            router: None,
         });
 
         tokio::time::timeout(Duration::from_secs(3), retry_pending_artifacts(&ctx))
@@ -5323,6 +5903,7 @@ mod tests {
             RecoveryPrompt {
                 text: "private prompt".to_owned(),
                 omit_control_instructions: false,
+                handoff: None,
             },
             Vec::new(),
             dir.path().join("repo"),
@@ -5473,6 +6054,7 @@ mod tests {
         let record = RecoveryRecord {
             prompt: "private prompt".to_owned(),
             omit_control_instructions: false,
+            handoff: None,
             media: Vec::new(),
             cwd: home.join("repo").join("..").join("repo"),
             session_id: "session".to_owned(),
@@ -5533,6 +6115,7 @@ mod tests {
             RecoveryPrompt {
                 text: "prompt".to_owned(),
                 omit_control_instructions: false,
+                handoff: None,
             },
             Vec::new(),
             &RunFailure {
@@ -5570,6 +6153,7 @@ mod tests {
             RecoveryPrompt {
                 text: "private prompt".to_owned(),
                 omit_control_instructions: false,
+                handoff: None,
             },
             Vec::new(),
             &failure,
@@ -5657,7 +6241,122 @@ mod tests {
                 root.join("outbox.json"),
             ))),
             home: root.to_path_buf(),
+            router: None,
         }
+    }
+
+    fn routed_inbound(group: &str, id: &str, text: &str) -> AgentControlEvent {
+        AgentControlEvent::InboundMessage {
+            account_id_hex: "account".to_owned(),
+            group_id_hex: group.to_owned(),
+            message: agent_control::AgentControlMessage {
+                message_id_hex: id.to_owned(),
+                sender: agent_control::AgentControlActor {
+                    account_id_hex: "owner".to_owned(),
+                    display_name: None,
+                    is_self: false,
+                },
+                text: text.to_owned(),
+                recorded_at: 1,
+                media: Vec::new(),
+            },
+            mentions_self: false,
+            reply_to: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_drops_messages_routed_to_another_agent_before_dedupe() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("routing.json");
+        fs::write(
+            &file,
+            r#"{"schema":1,"agents":["claude","opencode"],"groups":{"g1":"claude"}}"#,
+        )
+        .unwrap();
+        let mut ctx = test_bridge_context(root.path());
+        let mut cfg = (*ctx.cfg).clone();
+        cfg.allowed_senders.insert("owner".to_owned());
+        ctx.cfg = Arc::new(cfg);
+        ctx.router = Some(Arc::new(Router::new(crate::RoutingConfig {
+            file,
+            name: "opencode".to_owned(),
+            handoff_prompt_file: None,
+        })));
+        let ctx = Arc::new(ctx);
+
+        let outcome = dispatch_event(ctx.clone(), routed_inbound("g1", "m1", "hello")).await;
+        assert!(matches!(outcome, DispatchOutcome::Continue));
+        assert!(ctx.dedupe.insert("m1".to_owned()).await);
+
+        let outcome =
+            dispatch_event(ctx.clone(), routed_inbound("g1", "m2", "/agent claude")).await;
+        assert!(matches!(outcome, DispatchOutcome::Continue));
+        assert!(ctx.dedupe.insert("m2".to_owned()).await);
+        // The non-target still saved the switch for the offline target.
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.path().join("routing.json")).unwrap()).unwrap();
+        assert_eq!(saved["groups"]["g1"], "claude");
+        assert_eq!(saved["switches"]["g1"]["message"], "m2");
+        assert_eq!(saved["switches"]["g1"]["confirmed"], false);
+    }
+
+    #[tokio::test]
+    async fn takeover_reply_follows_the_saved_switch_state() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("routing.json");
+        fs::write(
+            &file,
+            r#"{"schema":1,"agents":["claude","opencode"],"groups":{"g1":"claude"}}"#,
+        )
+        .unwrap();
+        let mut ctx = test_bridge_context(root.path());
+        let router = Arc::new(Router::new(crate::RoutingConfig {
+            file: file.clone(),
+            name: "opencode".to_owned(),
+            handoff_prompt_file: None,
+        }));
+        ctx.router = Some(router.clone());
+        let plan = router
+            .apply_agent_command(
+                "g1",
+                Some("opencode"),
+                CommandRef {
+                    at: 10,
+                    message: "m1".to_owned(),
+                },
+            )
+            .await;
+        let AgentCommandPlan::Handle(action) = plan else {
+            panic!("target must handle its takeover");
+        };
+        let inbound = InboundPrompt {
+            account_ref: "account".to_owned(),
+            group_ref: "g1".to_owned(),
+            message_ref: "m1".to_owned(),
+            text: "/agent opencode".to_owned(),
+            media: Vec::new(),
+            recorded_at: 10,
+            agent_action: Some(action),
+        };
+        // A prompt that ran first adopted the switch; the reply still
+        // announces it without resetting the new session again.
+        assert!(router.confirm_takeover("g1", "m1").await.unwrap());
+        let body = agent_command_body(&ctx, &inbound).await.unwrap();
+        assert!(body.contains("took over this chat from claude"));
+        assert!(ctx.sessions.get("g1").await.is_none());
+        // A newer switch away replaces the takeover; the reply is dropped.
+        router
+            .apply_agent_command(
+                "g1",
+                Some("claude"),
+                CommandRef {
+                    at: 20,
+                    message: "m2".to_owned(),
+                },
+            )
+            .await;
+        assert_eq!(agent_command_body(&ctx, &inbound).await, None);
     }
 
     #[tokio::test]
@@ -5789,6 +6488,7 @@ mod tests {
             RecoveryPrompt {
                 text: "private prompt".to_owned(),
                 omit_control_instructions: false,
+                handoff: None,
             },
             media.clone(),
             &failure,
@@ -5826,6 +6526,7 @@ mod tests {
             RecoveryPrompt {
                 text: "private prompt".to_owned(),
                 omit_control_instructions: false,
+                handoff: None,
             },
             Vec::new(),
             &RunFailure {
@@ -5848,6 +6549,7 @@ mod tests {
                 RecoveryRecord {
                     prompt: "private prompt".to_owned(),
                     omit_control_instructions: false,
+                    handoff: None,
                     media: Vec::new(),
                     cwd: dir.path().join("repo"),
                     session_id: "session".to_owned(),

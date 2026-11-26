@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agent_control::AgentControlMediaRef;
+use agent_control::{AgentControlMediaRef, AgentControlTimelineCursor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, watch};
@@ -28,6 +28,16 @@ pub(crate) struct SessionRecord {
     /// command reset a newer session after restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) reset_receipts: Vec<ResetReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) takeover: Option<SessionTakeover>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionTakeover {
+    pub(crate) command: String,
+    #[serde(default)]
+    pub(crate) at: u64,
+    pub(crate) handoff_pending: bool,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -70,12 +80,22 @@ pub(crate) struct RecoveryRecord {
     /// Preserve literal forwarding on retry; old records retain ordinary behavior.
     #[serde(default)]
     pub(crate) omit_control_instructions: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) handoff: Option<RecoveryHandoff>,
     #[serde(default)]
     pub(crate) media: Vec<AgentControlMediaRef>,
     pub(crate) cwd: PathBuf,
     pub(crate) session_id: String,
     pub(crate) kind: RecoveryKind,
     pub(crate) status: RecoveryStatus,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryHandoff {
+    pub(crate) switch_id: String,
+    #[serde(default)]
+    pub(crate) previous_agent: Option<String>,
+    pub(crate) before: AgentControlTimelineCursor,
 }
 
 /// Durable acknowledgement reconciliation for text-only `SendFinal` chunks.
@@ -103,6 +123,8 @@ enum RawRecord {
         generation: u64,
         #[serde(default)]
         reset_receipts: Vec<ResetReceipt>,
+        #[serde(default)]
+        takeover: Option<SessionTakeover>,
     },
 }
 
@@ -115,6 +137,7 @@ impl RawRecord {
                 goal: None,
                 generation: 0,
                 reset_receipts: Vec::new(),
+                takeover: None,
             },
             Self::Full {
                 session_id,
@@ -122,12 +145,14 @@ impl RawRecord {
                 goal,
                 generation,
                 reset_receipts,
+                takeover,
             } => SessionRecord {
                 session_id,
                 cwd,
                 goal,
                 generation,
                 reset_receipts,
+                takeover,
             },
         }
     }
@@ -215,6 +240,69 @@ impl SessionStore {
     /// Replaces the standing goal, retaining the session and working directory.
     pub(crate) async fn set_goal(&self, group_key: &str, goal: Option<String>) -> Result<()> {
         self.update(group_key, |record| record.goal = goal).await
+    }
+
+    /// Reset the session and record the outstanding handoff in one write.
+    pub(crate) async fn adopt_takeover(
+        &self,
+        group_key: &str,
+        command: &str,
+        at: u64,
+    ) -> Result<bool> {
+        let mut map = self.map.lock().await;
+        if let Some(takeover) = map
+            .get(group_key)
+            .and_then(|record| record.takeover.as_ref())
+        {
+            if takeover.command == command {
+                if takeover.at == 0 && at != 0 {
+                    let mut next = map.clone();
+                    if let Some(saved) = next
+                        .get_mut(group_key)
+                        .and_then(|record| record.takeover.as_mut())
+                    {
+                        saved.at = at;
+                    }
+                    persist(&self.path, &mut map, next).await?;
+                }
+                return Ok(true);
+            }
+            if (at, command) < (takeover.at, takeover.command.as_str()) {
+                return Ok(false);
+            }
+        }
+        let mut next = map.clone();
+        let record = next.entry(group_key.to_owned()).or_default();
+        record.session_id.clear();
+        record.generation = record.generation.saturating_add(1);
+        record.takeover = Some(SessionTakeover {
+            command: command.to_owned(),
+            at,
+            handoff_pending: true,
+        });
+        persist(&self.path, &mut map, next).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn complete_handoff(
+        &self,
+        group_key: &str,
+        command: &str,
+        session_id: Option<String>,
+        cwd: PathBuf,
+    ) -> Result<()> {
+        self.update(group_key, |record| {
+            if let Some(takeover) = &mut record.takeover
+                && takeover.command == command
+            {
+                takeover.handoff_pending = false;
+                if let Some(session_id) = session_id {
+                    record.session_id = session_id;
+                    record.cwd = Some(cwd);
+                }
+            }
+        })
+        .await
     }
 
     pub(crate) async fn reset_session(
@@ -637,6 +725,67 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn takeover_and_handoff_survive_restart_together() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sessions.json");
+        let cwd = root.path().to_path_buf();
+        let store = SessionStore::load(path.clone(), &cwd).unwrap();
+        store
+            .record_session("group", "old".to_owned(), cwd.clone())
+            .await
+            .unwrap();
+        assert!(store.adopt_takeover("group", "switch", 20).await.unwrap());
+        drop(store);
+
+        let store = SessionStore::load(path.clone(), &cwd).unwrap();
+        let pending = store.get("group").await.unwrap();
+        assert!(pending.session_id.is_empty());
+        assert!(pending.takeover.as_ref().unwrap().handoff_pending);
+        assert!(store.adopt_takeover("group", "switch", 20).await.unwrap());
+        assert!(!store.adopt_takeover("group", "older", 10).await.unwrap());
+        assert_eq!(store.get("group").await.unwrap(), pending);
+        store
+            .complete_handoff("group", "switch", Some("new".to_owned()), cwd.clone())
+            .await
+            .unwrap();
+        drop(store);
+
+        let completed = SessionStore::load(path, &cwd)
+            .unwrap()
+            .get("group")
+            .await
+            .unwrap();
+        assert_eq!(completed.session_id, "new");
+        assert!(!completed.takeover.unwrap().handoff_pending);
+    }
+
+    #[tokio::test]
+    async fn recovering_a_saved_takeover_timestamp_keeps_the_session_and_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sessions.json");
+        let cwd = root.path().to_path_buf();
+        let store = SessionStore::load(path.clone(), &cwd).unwrap();
+        assert!(store.adopt_takeover("group", "current", 0).await.unwrap());
+        store
+            .complete_handoff("group", "current", Some("saved".to_owned()), cwd.clone())
+            .await
+            .unwrap();
+        let previous = store.get("group").await.unwrap();
+        assert!(store.adopt_takeover("group", "current", 20).await.unwrap());
+        assert!(!store.adopt_takeover("group", "older", 10).await.unwrap());
+        drop(store);
+
+        let saved = SessionStore::load(path, &cwd)
+            .unwrap()
+            .get("group")
+            .await
+            .unwrap();
+        assert_eq!(saved.session_id, previous.session_id);
+        assert_eq!(saved.generation, previous.generation);
+        assert_eq!(saved.takeover.unwrap().at, 20);
+    }
+
+    #[tokio::test]
     async fn session_store_persists_and_reloads_records() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state").join("sessions.json");
@@ -971,6 +1120,14 @@ mod tests {
         let record = RecoveryRecord {
             prompt: "private prompt".to_owned(),
             omit_control_instructions: false,
+            handoff: Some(RecoveryHandoff {
+                switch_id: "switch".to_owned(),
+                previous_agent: Some("claude".to_owned()),
+                before: AgentControlTimelineCursor {
+                    recorded_at: 7,
+                    message_id_hex: "first".to_owned(),
+                },
+            }),
             media: Vec::new(),
             cwd: dir.path().join("repo"),
             session_id: "session".to_owned(),
@@ -987,6 +1144,7 @@ mod tests {
         assert!(store.get("group").await == Some(record));
         let first = store.begin_retry("group").await.unwrap().unwrap();
         assert_eq!(first.status, RecoveryStatus::Retrying);
+        assert_eq!(first.handoff.unwrap().before.message_id_hex, "first");
         assert!(store.begin_retry("group").await.unwrap().is_none());
         assert!(store.reset_retry("group").await.unwrap());
         assert_eq!(

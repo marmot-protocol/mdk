@@ -162,6 +162,37 @@ impl ControlClient {
         }
     }
 
+    /// Returns up to `limit` of the newest timeline messages before `before`.
+    pub(crate) async fn recent_timeline(
+        &self,
+        account_ref: &str,
+        group_ref: &str,
+        before: agent_control::AgentControlTimelineCursor,
+        limit: u32,
+    ) -> Result<Vec<agent_control::AgentControlTimelineMessage>> {
+        match self
+            .call(
+                "timeline_list",
+                AgentControlRequest::TimelineList {
+                    account_id_hex: account_ref.to_owned(),
+                    group_id_hex: group_ref.to_owned(),
+                    before: Some(before),
+                    after: None,
+                    before_inclusive: false,
+                    limit: Some(limit),
+                },
+            )
+            .await?
+        {
+            AgentControlResponse::TimelinePage { messages, .. } => Ok(messages),
+            AgentControlResponse::Error { code, .. } => Err(HarnessError::ControlRejected {
+                method: "timeline_list",
+                code,
+            }),
+            other => Err(unexpected_response("timeline_list", &other)),
+        }
+    }
+
     pub(crate) async fn download_media(
         &self,
         account_ref: &str,
