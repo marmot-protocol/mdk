@@ -14,9 +14,8 @@ use crate::{
     DeviceLinkSnapshot, NewDeviceLinkState, SignInResponse,
 };
 use cgka_traits::app_components::{
-    DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
-    DeviceRosterV1, MAX_LEAVES_PER_ACCOUNT, decode_device_roster_v1,
-    encode_device_roster_update_v1,
+    DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterV1,
+    MAX_LEAVES_PER_ACCOUNT, decode_device_roster_v1,
 };
 use cgka_traits::engine::SendIntent;
 use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome};
@@ -1075,30 +1074,21 @@ async fn a_twenty_first_device_is_refused() {
     let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     phone.step(&relay).await;
-    let fillers = (0..MAX_LEAVES_PER_ACCOUNT - 2)
-        .map(|index| {
-            DeviceRosterOperationV1::SetDevice([index as u8 + 0xa0; 32], DeviceEntryV1::default())
-        })
-        .collect();
-    let update =
-        encode_device_roster_update_v1(&DeviceRosterUpdateV1::new(fillers).unwrap()).unwrap();
-    let effects = phone
-        .client
-        .runtime
-        .send(SendIntent::UpdateAppComponents {
-            group_id: group.clone(),
-            updates: vec![cgka_traits::app_components::AppComponentData {
-                component_id: DEVICE_ROSTER_COMPONENT_ID,
-                data: update,
-            }],
-        })
-        .await
-        .unwrap();
-    phone
-        .client
-        .observe_drained_session_events(&effects)
-        .await
-        .unwrap();
+    // Real devices fill the account's leaves: each roster entry is bound to
+    // the leaf its Add brought (marmot#521).
+    let mut fillers = Vec::new();
+    for index in 0..MAX_LEAVES_PER_ACCOUNT - 2 {
+        fillers.push(
+            crate::tests::device_group::link_fresh_device(
+                &mut phone.client,
+                &relay,
+                &group,
+                [index as u8 + 0xa0; 32],
+                DeviceEntryV1::default(),
+            )
+            .await,
+        );
+    }
     assert_eq!(phone.roster(&group).devices.len(), MAX_LEAVES_PER_ACCOUNT);
 
     tablet.op(DeviceLinkOp::Start).await;

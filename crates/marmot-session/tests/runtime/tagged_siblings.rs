@@ -153,9 +153,14 @@ mod tagged_siblings {
         let mut phone = roster_device(dir, "alice-phone", b"alice", [1; 32]).await;
         let mut laptop = roster_device(dir, "alice-laptop", b"alice", [2; 32]).await;
         let device_group = GroupId::new(vec![0xd6; 16]);
+        // The founder writes its own key into its entry ("Key binding").
+        let phone_entry = DeviceEntryV1 {
+            tag_signature_key: Some(phone.runtime.own_signature_key()),
+            ..entry("Phone")
+        };
         let founding = DeviceRosterV1 {
             leaf_tag_key: [0x33; 32],
-            devices: [(own_slot(&phone), entry("Phone"))].into_iter().collect(),
+            devices: [(own_slot(&phone), phone_entry)].into_iter().collect(),
             ..DeviceRosterV1::default()
         };
         // The Add binds the laptop's leaf key to its entry (marmot#521).
@@ -231,7 +236,8 @@ mod tagged_siblings {
                 .set_device_tag_group(Some(device_group.clone()))
                 .unwrap();
         }
-        set_own_key(&mut phone, &mut laptop, &device_group).await;
+        // The founder's link is made at creation; the laptop's by its first
+        // Commit.
         set_own_key(&mut laptop, &mut phone, &device_group).await;
         (phone, laptop, device_group)
     }

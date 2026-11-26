@@ -10,8 +10,8 @@
 //! and its leaves elsewhere only from then on. Maintenance and every host
 //! KeyPackage publication make that Commit first, through the roster write
 //! path ([`AccountDeviceRuntime::edit_device_roster_entry`]); the host names
-//! the group. A device added by an Add that set no key, as an earlier
-//! approver's, sets its own key in that same Commit.
+//! the group. No Commit changes an entry's key ("Key binding"), so a device
+//! whose entry carries no key or another key never tags from that roster.
 //!
 //! No KeyPackage is staged while that Commit is due: it would be built
 //! untagged and published after the device started tagging.
@@ -33,10 +33,10 @@ enum TagKey {
     /// The entry of this device's slot lacks the key, or its leaf does not
     /// show its link made yet: its first own Commit is due.
     Due(DeviceSlotId),
-    /// It cannot be set now: the device group is unreadable, holds no entry
-    /// for this device's slot, or another device's entry or a removed slot
-    /// keeps the key. The engine tags only from this device's own entry, so a
-    /// KeyPackage staged meanwhile is untagged.
+    /// It cannot be set: the device group is unreadable, holds no entry for
+    /// this device's slot, or that entry carries no key or another key,
+    /// which no Commit can change. The engine tags only from this device's
+    /// own entry, so a KeyPackage staged meanwhile is untagged.
     Blocked(&'static str),
 }
 
@@ -99,7 +99,7 @@ where
     }
 
     /// Make this device's first own Commit in its device group when it is
-    /// due, setting its tag signature key if the entry lacks it. The returned
+    /// due. The returned
     /// effects carry the commit. The host calls this before it publishes a
     /// KeyPackage, which is refused until that Commit has made this device's
     /// link (`made_device_links` lists its slot).
@@ -147,13 +147,11 @@ where
                 return Ok(AccountDeviceEffects::default());
             }
         };
-        let own_key = self.session.own_signature_key();
-        // The same commit carries this device's history key (4.1), when it
-        // can be read; the tag signature key never waits for it.
+        // The commit carries this device's history key (4.1), when it can be
+        // read; the first Commit never waits for it.
         let history_key = self.own_history_key("set_device_tag_key");
         match self
             .edit_device_roster_entry(group_id, &slot, held, |entry| {
-                entry.tag_signature_key = Some(own_key);
                 if let Some(history_key) = history_key {
                     entry.history_key = Some(history_key);
                 }
@@ -205,30 +203,16 @@ where
         let Some(entry) = roster.devices.get(&slot) else {
             return Ok(TagKey::Blocked("no_roster_entry"));
         };
-        if entry.tag_signature_key.as_deref() == Some(own_key.as_slice()) {
-            let Ok(made) = self.session.made_device_links(group_id, &roster) else {
-                return Ok(TagKey::Blocked("device_group_unreadable"));
-            };
-            return Ok(if made.contains(&slot) {
-                TagKey::Set
-            } else {
-                TagKey::Due(slot)
-            });
+        if entry.tag_signature_key.as_deref() != Some(own_key.as_slice()) {
+            return Ok(TagKey::Blocked("entry_key_not_own"));
         }
-        // A roster gives each key one device, and a removed slot keeps the
-        // key its tags read as.
-        if roster.devices.iter().any(|(other, entry)| {
-            *other != slot && entry.tag_signature_key.as_deref() == Some(own_key.as_slice())
-        }) {
-            return Ok(TagKey::Blocked("key_held_by_another_device"));
-        }
-        if roster
-            .rejected_slots
-            .values()
-            .any(|rejected| rejected.tag_signature_key.as_deref() == Some(own_key.as_slice()))
-        {
-            return Ok(TagKey::Blocked("key_held_by_removed_slot"));
-        }
-        Ok(TagKey::Due(slot))
+        let Ok(made) = self.session.made_device_links(group_id, &roster) else {
+            return Ok(TagKey::Blocked("device_group_unreadable"));
+        };
+        Ok(if made.contains(&slot) {
+            TagKey::Set
+        } else {
+            TagKey::Due(slot)
+        })
     }
 }

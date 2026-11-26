@@ -1171,20 +1171,6 @@ where
             .own_device_leaves(group_id, roster, slot, tag_signature_key)?)
     }
 
-    /// This account's other leaves in `group_id`, by signature key, whose
-    /// device tag verifies under the leaf's own key, each with the slot the
-    /// tag names. See
-    /// [`cgka_engine::engine::Engine::own_account_self_signed_tags`].
-    pub fn own_account_self_signed_tags(
-        &self,
-        group_id: &GroupId,
-        leaf_tag_key: &[u8; 32],
-    ) -> AccountResult<Vec<(Vec<u8>, cgka_traits::app_components::DeviceSlotId)>> {
-        Ok(self
-            .session
-            .own_account_self_signed_tags(group_id, leaf_tag_key)?)
-    }
-
     /// This account's other leaves in `group_id`, by signature key with the
     /// slot their device tag reads as under `leaf_tag_key`, verified by one
     /// of `keys`: tag signature keys this device remembers a roster listing.

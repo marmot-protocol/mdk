@@ -168,9 +168,9 @@ async fn welcome_with_entry(
 /// The Add that links the new device binds the signature key of the leaf it
 /// adds to the entry announcing the confirmed KeyPackage, at the slot the
 /// device holds (marmot#521, "Joining"). A Welcome from the confirmed leaf
-/// whose roster binds that entry to another key, or puts it at another slot,
-/// is refused and the expectation stays. An entry with no key is an earlier
-/// approver's, from before the Add set it, and still joins.
+/// whose roster leaves that entry without the key, binds it to another key,
+/// or puts it at another slot, is refused and the expectation stays. The
+/// Welcome whose roster binds it joins.
 #[tokio::test]
 async fn a_welcome_whose_roster_binds_the_new_device_elsewhere_is_refused() {
     let mut laptop = roster_device(b"alice");
@@ -178,6 +178,13 @@ async fn a_welcome_whose_roster_binds_the_new_device_elsewhere_is_refused() {
     let key_package = laptop.engine.fresh_key_package().await.unwrap();
     let bound = announced_entry(&roster(&[(2, "Laptop")]), &slot(2), &key_package);
     let refused_cases = [
+        (
+            slot(2),
+            DeviceEntryV1 {
+                tag_signature_key: None,
+                ..bound.clone()
+            },
+        ),
         (
             slot(2),
             DeviceEntryV1 {
@@ -198,11 +205,7 @@ async fn a_welcome_whose_roster_binds_the_new_device_elsewhere_is_refused() {
         assert!(expectation_of(&laptop).is_some(), "the expectation stays");
     }
 
-    let keyless = DeviceEntryV1 {
-        tag_signature_key: None,
-        ..bound
-    };
-    let welcome = welcome_with_entry(&mut laptop, &key_package, slot(2), keyless).await;
+    let welcome = welcome_with_entry(&mut laptop, &key_package, slot(2), bound).await;
     assert_eq!(
         join_outcome(&mut laptop, &welcome).await,
         IngestOutcome::Processed

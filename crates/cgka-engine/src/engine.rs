@@ -5269,23 +5269,6 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
-    /// Every other leaf of this device's account in `group_id`'s current
-    /// tree whose device tag, opened under `leaf_tag_key`, verifies under
-    /// that leaf's own signature key, as its signature key with the slot the
-    /// tag names (mdk#3679). Only the holder of a leaf's key can make such a
-    /// tag, so it says which slot the leaf's device claims, whatever any
-    /// roster lists. This device's own leaf is left out. The read is advisory
-    /// and authorizes no commit.
-    pub fn own_account_self_signed_tags(
-        &self,
-        group_id: &GroupId,
-        leaf_tag_key: &[u8; 32],
-    ) -> Result<Vec<(Vec<u8>, cgka_traits::app_components::DeviceSlotId)>, EngineError> {
-        self.read_other_own_account_leaves(group_id, |leaf| {
-            crate::device_tag::self_signed_device_tag_slot(leaf, leaf_tag_key)
-        })
-    }
-
     /// `read` of each leaf of this device's account in `group_id` other than
     /// its own, by signature key, where `read` gives a value.
     fn read_other_own_account_leaves<T>(

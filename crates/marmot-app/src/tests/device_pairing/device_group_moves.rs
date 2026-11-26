@@ -132,7 +132,7 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
             .observe_drained_session_events(&effects)
             .await
             .unwrap();
-        // A removal Commit's record keeps a key the old group can check.
+        // A lone `removed` record keeps no key (marmot#521).
         let removed = |tag_signature_key| RejectedSlotV1 {
             reason: RejectedSlotReasonV1::Removed,
             rejected_at,
@@ -143,7 +143,7 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
             &old,
             vec![DeviceRosterOperationV1::SetRejectedSlot(
                 removed_slot,
-                removed(Some(vec![0x94; 32])),
+                removed(None),
             )],
         )
         .await;
@@ -609,7 +609,7 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
         assert_eq!(
             target_roster.rejected_slots[&removed_slot],
             removed(None),
-            "a carried `removed` record keeps no key from the old group"
+            "a carried `removed` record keeps its reason and age"
         );
         // The next pass finds the carried records in place and settles them,
         // with no second import.
