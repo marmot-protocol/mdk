@@ -596,6 +596,11 @@ async fn a_route_less_welcome_owes_one_lookup_per_paced_attempt() {
 
     invite.runtime.run_due_maintenance().await.unwrap();
     assert_eq!(
+        invite.runtime.plan_welcome_route_lookups(0, &[]).unwrap(),
+        WelcomeRouteLookupPlan::default(),
+        "a host that starts none, as while maintenance is paused, leaves it owed"
+    );
+    assert_eq!(
         invite
             .runtime
             .plan_welcome_route_lookups(4, &carol)

@@ -223,7 +223,9 @@ where
         limit: usize,
         running: &[MemberId],
     ) -> AccountResult<WelcomeRouteLookupPlan> {
-        if running.is_empty() && !self.lock_welcome_route_retries().lookup_owed() {
+        // With nothing running, the owed Welcomes are read only when a lookup
+        // may start: not while the host starts none (`limit` 0).
+        if running.is_empty() && (limit == 0 || !self.lock_welcome_route_retries().lookup_owed()) {
             return Ok(WelcomeRouteLookupPlan::default());
         }
         let owed = self
