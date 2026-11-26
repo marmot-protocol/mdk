@@ -202,7 +202,12 @@ requires acknowledgements from its operational relays.
 Interactive sign-in keeps a notice before initial KeyPackage publication: signing
 in alone does not restore existing chats or messages. The historical `SingleDevice`
 step and acknowledgment APIs retain their names and consent rules, but current
-findings no longer declare all multi-device use unsupported. See the shared
+findings no longer declare all multi-device use unsupported. Hosts may opt in via
+`OnboardingOptions::pass_device_notice_when_none_found` to pass `SingleDevice`
+automatically after complete empty discovery (while keeping `single_device_notice`
+populated) and `OnboardingOptions::create_missing_inbox_list` to publish the
+recommended kind `10050` inbox list automatically after complete discovery confirms
+none exists (reported in `OnboardingSnapshot::created_inbox_list`). See the shared
 [notice copy and advisory discovery limits](../marmot-uniffi/README.md#single-device-notice).
 Hosts adopt that presentation through localization; MDK owns the pause, discovery
 and publication gate.

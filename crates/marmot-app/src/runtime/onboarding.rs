@@ -9,6 +9,7 @@ use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord, RelayEndpo
 use transport_nostr_peeler::NostrTransportEvent;
 
 mod analytics;
+mod auto_inbox;
 mod cancellation;
 mod client_label;
 mod generated_setup;
@@ -296,6 +297,8 @@ const APPEND_ONBOARDING_VERSION: u32 = 5;
 const LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION: u32 = 6;
 // Earlier readers recompute all typed previews as automatic repairs.
 const MANUAL_RELAY_EDIT_ONBOARDING_VERSION: u32 = 7;
+// Earlier readers ignore in-flight automatic missing-inbox creation state.
+const AUTO_INBOX_ONBOARDING_VERSION: u32 = 8;
 const ONBOARDING_V2: u32 = 2;
 const STEP_COUNT: usize = 6;
 const MAX_RELAYS: usize = 16;
@@ -608,6 +611,14 @@ pub struct OnboardingRepairProposal {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     unusable_routes: BTreeMap<String, OnboardingRelayRemovalReason>,
 }
+/// Kind-10050 inbox relay list created automatically during onboarding after
+/// complete discovery confirmed none existed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnboardingCreatedInboxList {
+    pub relays: Vec<String>,
+    pub event_id: String,
+    pub published_at: u64,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingSnapshot {
     pub account_id_hex: String,
@@ -621,6 +632,8 @@ pub struct OnboardingSnapshot {
     pub proposal: Option<OnboardingRepairProposal>,
     #[serde(default)]
     pub single_device_notice: Option<OnboardingSingleDeviceNotice>,
+    #[serde(default)]
+    pub created_inbox_list: Option<OnboardingCreatedInboxList>,
     #[serde(default)]
     pub cancellation_pending: bool,
 }
@@ -636,6 +649,15 @@ pub struct OnboardingOptions {
     /// `default_relays`, which otherwise serve both relay-list steps.
     #[serde(default)]
     pub inbox_relays: Vec<String>,
+    /// Automatically publish a kind-10050 inbox list using the recommended
+    /// default relay when complete discovery confirms none exists.
+    #[serde(default)]
+    pub create_missing_inbox_list: bool,
+    /// Automatically pass the `SingleDevice` step when complete discovery finds
+    /// no other installation (`OnboardingDeviceDiscovery::NoneFound`), while
+    /// keeping `single_device_notice` in the snapshot for display.
+    #[serde(default)]
+    pub pass_device_notice_when_none_found: bool,
 }
 impl OnboardingOptions {
     /// The recommended relays for a relay-list step.
@@ -663,6 +685,18 @@ struct OnboardingCheckpoint {
     // (old checkpoints, or mid-attempt) and `Some(true)` stay conservative.
     #[serde(default)]
     repair_may_have_published: Option<bool>,
+    /// In-flight automatic creation of a missing kind-10050 inbox list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_inbox: Option<auto_inbox::PendingAutoInbox>,
+    /// True once any verified signed kind-10050 (including future-dated) has
+    /// been observed during this attempt; prevents later empty retries from
+    /// overwriting it automatically.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    seen_signed_inbox_list: bool,
+    /// True after the user rejects signing an automatic kind-10050 in this
+    /// attempt; falls back to manual selection instead of re-prompting.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    auto_inbox_declined: bool,
     #[serde(default)]
     append_relays: bool,
     #[serde(default)]
@@ -795,6 +829,7 @@ impl OnboardingCheckpoint {
                 steps,
                 proposal: None,
                 single_device_notice: None,
+                created_inbox_list: None,
                 cancellation_pending: false,
             },
             options,
@@ -802,6 +837,9 @@ impl OnboardingCheckpoint {
             approved: false,
             signed_repair: None,
             repair_may_have_published: None,
+            auto_inbox: None,
+            seen_signed_inbox_list: false,
+            auto_inbox_declined: false,
             append_relays: false,
             manual_relay_edit: false,
             single_device_acknowledged: false,
@@ -999,6 +1037,28 @@ impl OnboardingCheckpoint {
             )
         });
     }
+
+    fn sync_finished_step_retry_actions(&mut self) {
+        if self.snapshot.cancellation_pending {
+            return;
+        }
+        let sending_auto_inbox = self
+            .auto_inbox
+            .as_ref()
+            .is_some_and(auto_inbox::PendingAutoInbox::send_started);
+        for step in &mut self.snapshot.steps {
+            if sending_auto_inbox && step.step != OnboardingStep::InboxRelays {
+                step.actions
+                    .retain(|action| *action != OnboardingAction::Retry);
+            } else if matches!(
+                step.status,
+                OnboardingStatus::Passed | OnboardingStatus::Skipped
+            ) && !step.actions.contains(&OnboardingAction::Retry)
+            {
+                step.actions.insert(0, OnboardingAction::Retry);
+            }
+        }
+    }
 }
 fn finding(issue: OnboardingIssue) -> OnboardingFinding {
     OnboardingFinding {
@@ -1012,6 +1072,13 @@ fn finding(issue: OnboardingIssue) -> OnboardingFinding {
         observed_revision: None,
         local_key_held: false,
     }
+}
+
+fn missing_record_finding() -> OnboardingFinding {
+    finding(OnboardingIssue::Missing).in_context(
+        OnboardingFindingContext::RecordDiscovery,
+        OnboardingCheckPurpose::RecordLookup,
+    )
 }
 
 impl OnboardingFinding {
@@ -1307,6 +1374,7 @@ fn decode_onboarding_checkpoint(
             | (APPEND_ONBOARDING_VERSION, _)
             | (LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION, _)
             | (MANUAL_RELAY_EDIT_ONBOARDING_VERSION, _)
+            | (AUTO_INBOX_ONBOARDING_VERSION, _)
     ) || checkpoint
         .snapshot
         .recovery_epoch
@@ -1316,7 +1384,8 @@ fn decode_onboarding_checkpoint(
         || checkpoint.snapshot.steps.len() != STEP_COUNT
         || checkpoint.records.len() != STEP_COUNT
         || (checkpoint.manual_relay_edit
-            && checkpoint.version != MANUAL_RELAY_EDIT_ONBOARDING_VERSION)
+            && checkpoint.version < MANUAL_RELAY_EDIT_ONBOARDING_VERSION)
+        || (checkpoint.auto_inbox.is_some() && checkpoint.version < AUTO_INBOX_ONBOARDING_VERSION)
     {
         return Err(onboarding_error());
     }
@@ -1405,18 +1474,9 @@ impl<'a> SetupRecords<'a> {
             .retain(|finding| finding.issue != OnboardingIssue::MultiDeviceUnsupported);
         // Older checkpoints did not offer rechecks of finished steps. Refresh
         // these derived hints before exposing or validating the snapshot, while
-        // retaining the offered-action contract and cancellation's sole exit.
-        if !checkpoint.snapshot.cancellation_pending {
-            for step in &mut checkpoint.snapshot.steps {
-                if matches!(
-                    step.status,
-                    OnboardingStatus::Passed | OnboardingStatus::Skipped
-                ) && !step.actions.contains(&OnboardingAction::Retry)
-                {
-                    step.actions.push(OnboardingAction::Retry);
-                }
-            }
-        }
+        // retaining the offered-action contract, cancellation's sole exit, and
+        // pending auto-inbox publication locks.
+        checkpoint.sync_finished_step_retry_actions();
         refresh_finding_actions(&mut checkpoint.snapshot);
         Ok(Some(checkpoint))
     }
@@ -1823,6 +1883,7 @@ impl AccountSetup<'_> {
                 state.actions = vec![OnboardingAction::CancelOnboarding];
             }
         } else {
+            checkpoint.sync_finished_step_retry_actions();
             for state in &mut checkpoint.snapshot.steps {
                 if !state.actions.contains(&OnboardingAction::CancelOnboarding) {
                     state.actions.push(OnboardingAction::CancelOnboarding);
@@ -1849,6 +1910,31 @@ impl AccountSetup<'_> {
                         actions.push(OnboardingAction::CancelOnboarding);
                         actions
                     }
+                    _ => vec![OnboardingAction::CancelOnboarding],
+                };
+            } else if let Some(pending) = &checkpoint.auto_inbox {
+                let state = &mut checkpoint.snapshot.steps[OnboardingStep::InboxRelays.index()];
+                state.actions = match state.status {
+                    OnboardingStatus::WaitingForSigner => vec![
+                        OnboardingAction::ReconnectSigner,
+                        OnboardingAction::Retry,
+                        OnboardingAction::CancelOnboarding,
+                    ],
+                    OnboardingStatus::RetryableFailure if pending.send_started() => {
+                        let mut actions = vec![OnboardingAction::Retry];
+                        if pending.unexposed_sending_refusal(state.status) {
+                            actions.push(OnboardingAction::CancelRepair);
+                            actions.push(OnboardingAction::EditRelays);
+                            actions.push(OnboardingAction::EditDiscoveryRelays);
+                        }
+                        actions.push(OnboardingAction::CancelOnboarding);
+                        actions
+                    }
+                    OnboardingStatus::RetryableFailure => vec![
+                        OnboardingAction::Retry,
+                        OnboardingAction::EditDiscoveryRelays,
+                        OnboardingAction::CancelOnboarding,
+                    ],
                     _ => vec![OnboardingAction::CancelOnboarding],
                 };
             } else if checkpoint.snapshot.proposal.is_none() {
@@ -1883,7 +1969,9 @@ impl AccountSetup<'_> {
                 }
             }
         }
-        if checkpoint.manual_relay_edit
+        if checkpoint.auto_inbox.is_some() || checkpoint.version == AUTO_INBOX_ONBOARDING_VERSION {
+            checkpoint.version = AUTO_INBOX_ONBOARDING_VERSION;
+        } else if checkpoint.manual_relay_edit
             || checkpoint.version == MANUAL_RELAY_EDIT_ONBOARDING_VERSION
         {
             checkpoint.version = MANUAL_RELAY_EDIT_ONBOARDING_VERSION;
@@ -2036,15 +2124,24 @@ impl AccountSetup<'_> {
                 // A completed checkpoint can carry an optional unsigned cleanup.
                 // Fresh checks must not stop at its now-stale preview revision.
                 // Never discard an approved or signed publication on this path.
-                if existing.approved || existing.signed_repair.is_some() {
+                if existing.approved
+                    || existing.signed_repair.is_some()
+                    || existing.auto_inbox.is_some()
+                {
                     return Err(onboarding_error());
                 }
+                existing.options.create_missing_inbox_list = options.create_missing_inbox_list;
+                existing.options.pass_device_notice_when_none_found =
+                    options.pass_device_notice_when_none_found;
                 existing.snapshot.proposal = None;
                 existing.append_relays = false;
                 existing.manual_relay_edit = false;
                 existing.single_device_acknowledged = false;
                 existing.stale_device_acknowledgment = None;
                 existing.snapshot.single_device_notice = None;
+                existing.snapshot.created_inbox_list = None;
+                existing.seen_signed_inbox_list = false;
+                existing.auto_inbox_declined = false;
                 for index in 0..STEP_COUNT {
                     let step = existing.snapshot.steps[index].step;
                     existing.set(step, OnboardingStatus::Pending, Vec::new());
@@ -2210,6 +2307,86 @@ impl AccountSetup<'_> {
         self.app().register_external_signer(&id, signer).await?;
         Ok(snapshot)
     }
+    fn refresh_stale_prerequisites(
+        &self,
+        c: &mut OnboardingCheckpoint,
+        always_save: bool,
+    ) -> Result<(), AppError> {
+        // A long pause cannot turn a historical reachability check into
+        // evidence for today's publication route. It does not withdraw the
+        // user's device acknowledgment: discovery reruns, and asks again
+        // only if it shows something the user has not acknowledged.
+        let acknowledged = match &c.snapshot.single_device_notice {
+            Some(notice) if c.single_device_acknowledged => Some(AcknowledgedDeviceNotice {
+                notice: notice.clone(),
+                findings: c.snapshot.steps[OnboardingStep::SingleDevice.index()]
+                    .findings
+                    .clone(),
+            }),
+            _ => c.stale_device_acknowledgment.clone(),
+        };
+        let mut rechecked = false;
+        for index in 0..OnboardingStep::SingleDevice.index() {
+            if c.snapshot.steps[index].status == OnboardingStatus::Passed
+                && c.snapshot.steps[index]
+                    .checked_at
+                    .is_none_or(|at| unix_now_seconds().saturating_sub(at) > CHECK_MAX_AGE)
+            {
+                let step = c.snapshot.steps[index].step;
+                c.reset_step(step);
+                c.reset_step(OnboardingStep::SingleDevice);
+                c.reset_step(OnboardingStep::KeyPackage);
+                rechecked = true;
+            }
+        }
+        if rechecked {
+            c.stale_device_acknowledgment = acknowledged;
+        }
+        if always_save || rechecked {
+            self.save_onboarding(c)?;
+        }
+        Ok(())
+    }
+    fn apply_checked_step(
+        &self,
+        c: &mut OnboardingCheckpoint,
+        step: OnboardingStep,
+        status: OnboardingStatus,
+        findings: Vec<OnboardingFinding>,
+        event: Option<NostrTransportEvent>,
+    ) -> Result<(), AppError> {
+        if step == OnboardingStep::InboxRelays {
+            if event.is_some() {
+                c.seen_signed_inbox_list = true;
+            }
+            if c.snapshot
+                .created_inbox_list
+                .as_ref()
+                .is_some_and(|created| event.as_ref().is_some_and(|e| e.id != created.event_id))
+            {
+                c.snapshot.created_inbox_list = None;
+            }
+        }
+        c.records[step.index()] = event.clone();
+        // Cache even imperfect signed data for settings visibility;
+        // routing still filters it through the relay safety chokepoint.
+        if let Some(event) = event {
+            self.app()
+                .directory()
+                .ingest_directory_relay_event(DirectoryRelayEventRecord {
+                    endpoints: c
+                        .options
+                        .discovery_relays
+                        .iter()
+                        .cloned()
+                        .map(TransportEndpoint)
+                        .collect(),
+                    event,
+                })?;
+        }
+        c.set(step, status, findings);
+        Ok(())
+    }
     /// Run pending checks until a decision or retry is needed. Cancelling this
     /// future is safe: the next call retries its last checkpointed operation.
     pub async fn run_onboarding(&self, account_ref: &str) -> Result<OnboardingSnapshot, AppError> {
@@ -2237,44 +2414,22 @@ impl AccountSetup<'_> {
             }
             return Ok(());
         }
-        if !c.approved && c.snapshot.proposal.is_none() {
-            // A long pause cannot turn a historical reachability check into
-            // evidence for today's publication route. It does not withdraw the
-            // user's device acknowledgment: discovery reruns, and asks again
-            // only if it shows something the user has not acknowledged.
-            let acknowledged = match &c.snapshot.single_device_notice {
-                Some(notice) if c.single_device_acknowledged => Some(AcknowledgedDeviceNotice {
-                    notice: notice.clone(),
-                    findings: c.snapshot.steps[OnboardingStep::SingleDevice.index()]
-                        .findings
-                        .clone(),
-                }),
-                _ => c.stale_device_acknowledgment.clone(),
-            };
-            let mut rechecked = false;
-            for index in 0..OnboardingStep::SingleDevice.index() {
-                if c.snapshot.steps[index].status == OnboardingStatus::Passed
-                    && c.snapshot.steps[index]
-                        .checked_at
-                        .is_none_or(|at| unix_now_seconds().saturating_sub(at) > CHECK_MAX_AGE)
-                {
-                    let step = c.snapshot.steps[index].step;
-                    c.reset_step(step);
-                    c.reset_step(OnboardingStep::SingleDevice);
-                    c.reset_step(OnboardingStep::KeyPackage);
-                    rechecked = true;
-                }
-            }
-            if rechecked {
-                c.stale_device_acknowledgment = acknowledged;
-            }
-            self.save_onboarding(c)?;
+        if !c.approved && c.snapshot.proposal.is_none() && c.auto_inbox.is_none() {
+            self.refresh_stale_prerequisites(c, true)?;
         }
         if c.approved {
             self.require_live_onboarding_attempt(c)?;
             if !self.publish_onboarding_repair(c).await? {
                 return Ok(());
             }
+        } else if c.auto_inbox.is_some() {
+            self.require_live_onboarding_attempt(c)?;
+            if !self.drive_pending_auto_inbox(c, false).await? {
+                return Ok(());
+            }
+            // A paused auto-inbox retry may succeed after earlier prerequisites
+            // expired; refresh them before advancing to SingleDevice/KeyPackage.
+            self.refresh_stale_prerequisites(c, false)?;
         } else if c.snapshot.proposal.is_some() {
             return Ok(());
         }
@@ -2376,32 +2531,34 @@ impl AccountSetup<'_> {
             } else {
                 let account_id = c.snapshot.account_id_hex.clone();
                 let attempt = c.attempt();
-                let (status, findings, event) = self
+                let outcome = self
                     .await_while_onboarding_live(
                         &account_id,
                         attempt,
-                        self.check_onboarding_step(c, step),
+                        self.check_onboarding_step_outcome(c, step),
                     )
-                    .await?;
+                    .await??;
                 self.require_live_onboarding_attempt(c)?;
-                c.records[index] = event.clone();
-                // Cache even imperfect signed data for settings visibility;
-                // routing still filters it through the relay safety chokepoint.
-                if let Some(event) = event {
-                    self.app().directory().ingest_directory_relay_event(
-                        DirectoryRelayEventRecord {
-                            endpoints: c
-                                .options
-                                .discovery_relays
-                                .iter()
-                                .cloned()
-                                .map(TransportEndpoint)
-                                .collect(),
-                            event,
-                        },
-                    )?;
+                match outcome {
+                    StepCheckOutcome::Checked {
+                        status,
+                        findings,
+                        event,
+                    } => {
+                        self.apply_checked_step(c, step, status, findings, event)?;
+                    }
+                    StepCheckOutcome::CreateMissingInbox(candidate) => {
+                        if !self.begin_auto_inbox_creation(c, candidate).await? {
+                            if self.require_live_onboarding_attempt(c).is_ok() {
+                                self.manager
+                                    .reconcile_for_account(&c.snapshot.account_id_hex)
+                                    .await?;
+                            }
+                            return Ok(());
+                        }
+                        continue;
+                    }
                 }
-                c.set(step, status, findings);
             }
             self.require_live_onboarding_attempt(c)?;
             if c.snapshot.ready {
@@ -2442,10 +2599,17 @@ impl AccountSetup<'_> {
         {
             return Err(onboarding_error());
         }
-        if c.approved {
+        if c.approved || (c.auto_inbox.is_some() && step == OnboardingStep::InboxRelays) {
             self.manager.reset_startup_retry(&account_id).await;
             self.run_onboarding_locked(&mut c).await?;
         } else {
+            if c.auto_inbox
+                .as_ref()
+                .is_some_and(auto_inbox::PendingAutoInbox::send_started)
+            {
+                return Err(onboarding_error());
+            }
+            c.auto_inbox = None;
             c.snapshot.proposal = None;
             // Rechecking earlier prerequisites invalidates publication readiness.
             // Only explicitly retrying a skipped step revokes that skip.
@@ -2464,7 +2628,10 @@ impl AccountSetup<'_> {
         Ok(c.snapshot)
     }
     /// Retry discovery through an explicitly selected source set. This never
-    /// changes published relay declarations or publishes defaults.
+    /// changes existing published relay declarations; when
+    /// `create_missing_inbox_list` is enabled, a complete lookup that confirms
+    /// no kind-10050 inbox list exists can trigger automatic creation of the
+    /// recommended inbox list.
     pub async fn set_onboarding_discovery_relays(
         &self,
         account_ref: &str,
@@ -2478,18 +2645,25 @@ impl AccountSetup<'_> {
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;
-        if c.approved {
+        let inbox_status = c.snapshot.steps[OnboardingStep::InboxRelays.index()].status;
+        if c.approved
+            || c.auto_inbox
+                .as_ref()
+                .is_some_and(|p| p.send_started() && !p.unexposed_sending_refusal(inbox_status))
+        {
             return Err(onboarding_error());
         }
         let options = OnboardingOptions {
-            default_relays: c.options.default_relays.clone(),
             discovery_relays,
-            inbox_relays: c.options.inbox_relays.clone(),
+            ..c.options.clone()
         };
         self.validate_onboarding_options(&options)?;
         c.options = options;
         c.explicit_discovery = true;
+        c.auto_inbox = None;
+        c.auto_inbox_declined = false;
         c.snapshot.proposal = None;
+        c.snapshot.created_inbox_list = None;
         for index in 0..STEP_COUNT {
             if c.snapshot.steps[index].status != OnboardingStatus::Skipped {
                 let step = c.snapshot.steps[index].step;
@@ -2517,6 +2691,7 @@ impl AccountSetup<'_> {
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;
         if c.approved
+            || c.auto_inbox.is_some()
             || !step.optional()
             || !c.snapshot.steps[step.index()]
                 .actions
@@ -2547,7 +2722,7 @@ fn set_operation_error(c: &mut OnboardingCheckpoint, step: OnboardingStep, error
             OnboardingIssue::PublicationFailed,
         ),
     };
-    let failure = if c.approved {
+    let failure = if c.approved || c.auto_inbox.is_some() {
         finding(issue).in_context(
             OnboardingFindingContext::RepairPublication,
             OnboardingCheckPurpose::EventPublication,
@@ -2713,6 +2888,15 @@ fn retryable_inspection_error(error: &transport_nostr::DirectoryInspectionError)
         // Only relay health's inbox check produces these.
         Unexplained | AuthenticationRateLimited | AuthenticationUnconfirmed => false,
     }
+}
+
+enum StepCheckOutcome {
+    Checked {
+        status: OnboardingStatus,
+        findings: Vec<OnboardingFinding>,
+        event: Option<NostrTransportEvent>,
+    },
+    CreateMissingInbox(auto_inbox::AutoInboxCandidate),
 }
 
 impl AccountSetup<'_> {
@@ -3179,16 +3363,23 @@ impl AccountSetup<'_> {
             .iter()
             .any(|f| f.issue == OnboardingIssue::TooManyRelays)
     }
-    async fn check_onboarding_step(
+    async fn check_onboarding_step_outcome(
         &self,
-        c: &OnboardingCheckpoint,
+        c: &mut OnboardingCheckpoint,
         step: OnboardingStep,
-    ) -> (
-        OnboardingStatus,
-        Vec<OnboardingFinding>,
-        Option<NostrTransportEvent>,
-    ) {
-        let sources = self.onboarding_sources(c, step).await;
+    ) -> Result<StepCheckOutcome, AppError> {
+        let auto_inbox_enabled = step == OnboardingStep::InboxRelays
+            && c.options.create_missing_inbox_list
+            && !c.auto_inbox_declined;
+        let recommended_inbox = auto_inbox_enabled
+            .then(|| self.recommended_inbox_relay(c))
+            .flatten();
+        let (sources, non_indexer_sources) = if auto_inbox_enabled {
+            self.inbox_discovery_sources(c, recommended_inbox.as_deref())
+                .await
+        } else {
+            (self.onboarding_sources(c, step).await, Vec::new())
+        };
         let OnboardingInspection {
             records,
             mut failures,
@@ -3206,9 +3397,9 @@ impl AccountSetup<'_> {
         let found = records.into_iter().next();
         let event = match (found, prior_relay_record) {
             (None, Some(prior)) if discovery_completed.is_empty() => {
-                return (
-                    OnboardingStatus::RetryableFailure,
-                    if failures.is_empty() {
+                return Ok(StepCheckOutcome::Checked {
+                    status: OnboardingStatus::RetryableFailure,
+                    findings: if failures.is_empty() {
                         vec![finding(OnboardingIssue::Unreachable).in_context(
                             OnboardingFindingContext::RecordDiscovery,
                             OnboardingCheckPurpose::RecordLookup,
@@ -3216,15 +3407,15 @@ impl AccountSetup<'_> {
                     } else {
                         failures
                     },
-                    Some(prior.clone()),
-                );
+                    event: Some(prior.clone()),
+                });
             }
             (None, Some(prior)) => Some(prior.clone()),
             (Some(found), Some(prior)) if is_newer_event(prior, &found) => Some(prior.clone()),
             (found, _) => found,
         };
         let Some(event) = event else {
-            return if lookup_incomplete {
+            if lookup_incomplete {
                 if !failures.is_empty()
                     && self.authoritative_answered(c, &sources, &discovery_completed)
                 {
@@ -3237,9 +3428,9 @@ impl AccountSetup<'_> {
                         ),
                     );
                 }
-                (
-                    OnboardingStatus::RetryableFailure,
-                    if failures.is_empty() {
+                return Ok(StepCheckOutcome::Checked {
+                    status: OnboardingStatus::RetryableFailure,
+                    findings: if failures.is_empty() {
                         vec![finding(OnboardingIssue::Unreachable).in_context(
                             OnboardingFindingContext::RecordDiscovery,
                             OnboardingCheckPurpose::RecordLookup,
@@ -3247,19 +3438,317 @@ impl AccountSetup<'_> {
                     } else {
                         failures
                     },
-                    None,
+                    event: None,
+                });
+            }
+            if let Some(recommended) = recommended_inbox
+                && !c.seen_signed_inbox_list
+                && c.records[OnboardingStep::InboxRelays.index()].is_none()
+                && !self.has_cached_inbox_list(&c.snapshot.account_id_hex)
+                && auto_inbox::auto_inbox_discovery_complete(
+                    &sources,
+                    &discovery_completed,
+                    &recommended,
                 )
-            } else {
-                (
-                    OnboardingStatus::NeedsInput,
-                    vec![finding(OnboardingIssue::Missing).in_context(
-                        OnboardingFindingContext::RecordDiscovery,
-                        OnboardingCheckPurpose::RecordLookup,
-                    )],
-                    None,
-                )
-            };
+            {
+                let targets = self.checked_auto_inbox_targets(
+                    non_indexer_sources,
+                    &recommended,
+                    &discovery_completed,
+                );
+                if !targets.is_empty() {
+                    return Ok(StepCheckOutcome::CreateMissingInbox(
+                        auto_inbox::AutoInboxCandidate {
+                            relays: vec![recommended],
+                            targets,
+                        },
+                    ));
+                }
+            }
+            return Ok(StepCheckOutcome::Checked {
+                status: OnboardingStatus::NeedsInput,
+                findings: vec![missing_record_finding()],
+                event: None,
+            });
         };
+        if step == OnboardingStep::InboxRelays
+            && let Some(effective_inbox) =
+                self.cached_effective_inbox_supersedes(&c.snapshot.account_id_hex, &event)?
+        {
+            if c.options.create_missing_inbox_list {
+                c.seen_signed_inbox_list = true;
+                if c.auto_inbox
+                    .as_ref()
+                    .is_some_and(|pending| !pending.send_started())
+                {
+                    c.auto_inbox = None;
+                    c.set(
+                        OnboardingStep::InboxRelays,
+                        OnboardingStatus::Checking,
+                        Vec::new(),
+                    );
+                }
+                c.snapshot.created_inbox_list = None;
+                self.save_onboarding(c)?;
+            }
+            let (status, findings) = self
+                .evaluate_cached_inbox_routes(c, effective_inbox, failures)
+                .await;
+            return Ok(StepCheckOutcome::Checked {
+                status,
+                findings,
+                event: None,
+            });
+        }
+        if step == OnboardingStep::InboxRelays && c.options.create_missing_inbox_list {
+            // Persist discovery evidence before awaiting the kind-1059 route
+            // check so cancellation or restart during verification can never
+            // treat this account as missing a kind-10050 and auto-create one.
+            c.seen_signed_inbox_list = true;
+            c.records[OnboardingStep::InboxRelays.index()] = Some(event.clone());
+            if c.auto_inbox
+                .as_ref()
+                .is_some_and(|pending| !pending.send_started())
+            {
+                c.auto_inbox = None;
+                c.set(
+                    OnboardingStep::InboxRelays,
+                    OnboardingStatus::Checking,
+                    Vec::new(),
+                );
+            }
+            if c.snapshot
+                .created_inbox_list
+                .as_ref()
+                .is_some_and(|created| event.id != created.event_id)
+            {
+                c.snapshot.created_inbox_list = None;
+            }
+            self.save_onboarding(c)?;
+        }
+        let (status, findings, event) = self
+            .evaluate_onboarding_record(c, step, event, failures, Some(&discovery_completed))
+            .await;
+        Ok(StepCheckOutcome::Checked {
+            status,
+            findings,
+            event,
+        })
+    }
+    async fn evaluate_cached_inbox_routes(
+        &self,
+        c: &OnboardingCheckpoint,
+        cached_inbox: crate::AccountRelayListState,
+        failures: Vec<OnboardingFinding>,
+    ) -> (OnboardingStatus, Vec<OnboardingFinding>) {
+        let mut findings = Vec::new();
+        let capabilities: HashMap<String, OnboardingRelayCapability> = cached_inbox
+            .relays
+            .iter()
+            .map(|endpoint| (relay_key(endpoint), OnboardingRelayCapability::Inbox))
+            .collect();
+        let raw = cached_inbox.relays.clone();
+        let relay_status = self
+            .evaluate_onboarding_relay_routes(
+                c,
+                OnboardingStep::InboxRelays,
+                raw,
+                &capabilities,
+                Some(cached_inbox),
+                None,
+                &mut findings,
+            )
+            .await;
+        let status = evaluated_onboarding_status(&findings, relay_status);
+        if !failures.is_empty() {
+            findings.push(finding(OnboardingIssue::DiscoveryIncomplete).in_context(
+                OnboardingFindingContext::RecordDiscovery,
+                OnboardingCheckPurpose::RecordLookup,
+            ));
+            findings.extend(failures);
+        }
+        (status, findings)
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_onboarding_relay_routes(
+        &self,
+        c: &OnboardingCheckpoint,
+        step: OnboardingStep,
+        raw: Vec<String>,
+        capabilities: &HashMap<String, OnboardingRelayCapability>,
+        state: Option<crate::AccountRelayListState>,
+        discovery_completed: Option<&HashMap<String, CompletedInspectionSource>>,
+        findings: &mut Vec<OnboardingFinding>,
+    ) -> Option<OnboardingStatus> {
+        let classifications = self.app().relay_plane.classify_relay_endpoints(raw);
+        let allowed: HashSet<String> = classifications
+            .iter()
+            .filter(|classified| {
+                classified.policy == RelayEndpointPolicy::Allowed
+                    && !is_onion_relay(&classified.endpoint)
+            })
+            .map(|classified| {
+                relay_key(
+                    classified
+                        .normalized_endpoint
+                        .as_deref()
+                        .unwrap_or(&classified.endpoint),
+                )
+            })
+            .collect();
+        for classified in classifications {
+            if is_onion_relay(&classified.endpoint) {
+                continue;
+            }
+            let issue = match classified.policy {
+                RelayEndpointPolicy::Allowed => continue,
+                RelayEndpointPolicy::Invalid => OnboardingIssue::InvalidRelay,
+                RelayEndpointPolicy::Retired => OnboardingIssue::RetiredRelay,
+                RelayEndpointPolicy::Unsafe => OnboardingIssue::UnsafeRelay,
+            };
+            findings.push(OnboardingFinding {
+                declared_capability: capabilities
+                    .get(&relay_key(&classified.endpoint))
+                    .copied()
+                    .unwrap_or_default(),
+                endpoint: Some(classified.endpoint),
+                ..finding(issue).in_context(
+                    OnboardingFindingContext::PublishedDeclaration,
+                    OnboardingCheckPurpose::DeclarationValidation,
+                )
+            });
+        }
+        if let Some(state) = state {
+            let has_read_route = step == OnboardingStep::InboxRelays
+                || state
+                    .read_relays
+                    .iter()
+                    .any(|endpoint| allowed.contains(&relay_key(endpoint)));
+            // NIP-65 needs an allowed outbox; a read-only route cannot satisfy it.
+            let has_write_or_inbox_route = state
+                .relays
+                .iter()
+                .any(|endpoint| allowed.contains(&relay_key(endpoint)));
+            if !has_read_route || !has_write_or_inbox_route {
+                findings.push(finding(OnboardingIssue::NoUsableRoute).in_context(
+                    OnboardingFindingContext::PublishedDeclaration,
+                    OnboardingCheckPurpose::DeclarationValidation,
+                ));
+                Some(OnboardingStatus::NeedsInput)
+            } else {
+                let mut endpoints = state.relays;
+                if step == OnboardingStep::Relays {
+                    // A declared read route can complete the bounded check
+                    // when an allowed write route is temporarily unreachable.
+                    for endpoint in state.read_relays {
+                        if !endpoints.contains(&endpoint) {
+                            endpoints.push(endpoint);
+                        }
+                    }
+                }
+                // Policy rejections already have declaration-validation
+                // findings; they are not attempted directory queries.
+                endpoints.retain(|endpoint| allowed.contains(&relay_key(endpoint)));
+                let defaults = c
+                    .options
+                    .defaults_for(step)
+                    .iter()
+                    .map(|relay| relay_key(relay))
+                    .collect::<HashSet<_>>();
+                // Keep the dial cap from hiding appended defaults behind an old long list.
+                endpoints.sort_by_cached_key(|relay| !defaults.contains(&relay_key(relay)));
+                // EOSE proves an actual query completed, not merely a TCP
+                // connection. The declaration supplies read/write roles;
+                // one completed check on an allowed declared route proves
+                // the minimum local-use capability without editing it.
+                // On `Relays`, discovery already ran the exact same kind
+                // 10002 query: reuse EOSE answers and skip redialing them.
+                let OnboardingInspection {
+                    failures: route_failures,
+                    completed: route_completed,
+                    ..
+                } = if step == OnboardingStep::Relays {
+                    self.inspect_onboarding_relays_reusing(
+                        &c.snapshot.account_id_hex,
+                        10002,
+                        endpoints,
+                        discovery_completed,
+                    )
+                    .await
+                } else {
+                    self.inspect_onboarding_inbox(&c.snapshot.account_id_hex, endpoints)
+                        .await
+                };
+                let waiting_for_signer = route_failures
+                    .iter()
+                    .any(|failure| failure.issue == OnboardingIssue::SignerUnavailable);
+                findings.extend(route_failures.into_iter().map(|failure| {
+                    let mut failure = failure.in_context(
+                        OnboardingFindingContext::DeclaredRoute,
+                        OnboardingCheckPurpose::DirectoryQuery,
+                    );
+                    failure.declared_capability = failure
+                        .endpoint
+                        .as_deref()
+                        .and_then(|endpoint| capabilities.get(&relay_key(endpoint)))
+                        .copied()
+                        .unwrap_or_default();
+                    failure
+                }));
+                // Inspection only dials allowed routes from this declaration.
+                if route_completed.is_empty() && waiting_for_signer {
+                    Some(OnboardingStatus::WaitingForSigner)
+                } else if route_completed.is_empty() {
+                    let mut failure = finding(OnboardingIssue::NoUsableRoute).in_context(
+                        OnboardingFindingContext::DeclaredRoute,
+                        OnboardingCheckPurpose::DirectoryQuery,
+                    );
+                    failure.outcome = OnboardingCheckOutcome::Unknown;
+                    findings.push(failure);
+                    Some(OnboardingStatus::RetryableFailure)
+                } else {
+                    // The declared role is not the checked capability: EOSE
+                    // proves a read query, never acceptance of a future write.
+                    let mut completed: Vec<_> = route_completed.into_iter().collect();
+                    completed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    findings.extend(
+                        completed
+                            .into_iter()
+                            .map(|(key, source)| OnboardingFinding {
+                                declared_capability: capabilities
+                                    .get(&key)
+                                    .copied()
+                                    .unwrap_or_default(),
+                                endpoint: Some(source.endpoint),
+                                ..finding(OnboardingIssue::InspectionCompleted).in_context(
+                                    OnboardingFindingContext::DeclaredRoute,
+                                    OnboardingCheckPurpose::DirectoryQuery,
+                                )
+                            }),
+                    );
+                    Some(OnboardingStatus::Passed)
+                }
+            }
+        } else {
+            findings.push(finding(OnboardingIssue::Malformed).in_context(
+                OnboardingFindingContext::PublishedDeclaration,
+                OnboardingCheckPurpose::DeclarationValidation,
+            ));
+            Some(OnboardingStatus::NeedsInput)
+        }
+    }
+    async fn evaluate_onboarding_record(
+        &self,
+        c: &OnboardingCheckpoint,
+        step: OnboardingStep,
+        event: NostrTransportEvent,
+        failures: Vec<OnboardingFinding>,
+        discovery_completed: Option<&HashMap<String, CompletedInspectionSource>>,
+    ) -> (
+        OnboardingStatus,
+        Vec<OnboardingFinding>,
+        Option<NostrTransportEvent>,
+    ) {
         if event.created_at > unix_now_seconds() + FUTURE_CLOCK_SKEW {
             return (
                 OnboardingStatus::RetryableFailure,
@@ -3293,161 +3782,18 @@ impl AccountSetup<'_> {
                 .filter(|t| t.first().is_some_and(|v| v == name))
                 .filter_map(|t| t.get(1).cloned())
                 .collect();
-            let classifications = self.app().relay_plane.classify_relay_endpoints(raw);
-            let allowed: HashSet<String> = classifications
-                .iter()
-                .filter(|classified| {
-                    classified.policy == RelayEndpointPolicy::Allowed
-                        && !is_onion_relay(&classified.endpoint)
-                })
-                .map(|classified| {
-                    relay_key(
-                        classified
-                            .normalized_endpoint
-                            .as_deref()
-                            .unwrap_or(&classified.endpoint),
-                    )
-                })
-                .collect();
-            for classified in classifications {
-                if is_onion_relay(&classified.endpoint) {
-                    continue;
-                }
-                let issue = match classified.policy {
-                    RelayEndpointPolicy::Allowed => continue,
-                    RelayEndpointPolicy::Invalid => OnboardingIssue::InvalidRelay,
-                    RelayEndpointPolicy::Retired => OnboardingIssue::RetiredRelay,
-                    RelayEndpointPolicy::Unsafe => OnboardingIssue::UnsafeRelay,
-                };
-                findings.push(OnboardingFinding {
-                    declared_capability: capabilities
-                        .get(&relay_key(&classified.endpoint))
-                        .copied()
-                        .unwrap_or_default(),
-                    endpoint: Some(classified.endpoint),
-                    ..finding(issue).in_context(
-                        OnboardingFindingContext::PublishedDeclaration,
-                        OnboardingCheckPurpose::DeclarationValidation,
-                    )
-                });
-            }
             let state = crate::relay_list_state_from_event(&event);
-            if let Some(state) = state {
-                let has_read_route = step == OnboardingStep::InboxRelays
-                    || state
-                        .read_relays
-                        .iter()
-                        .any(|endpoint| allowed.contains(&relay_key(endpoint)));
-                // NIP-65 needs an allowed outbox; a read-only route cannot satisfy it.
-                let has_write_or_inbox_route = state
-                    .relays
-                    .iter()
-                    .any(|endpoint| allowed.contains(&relay_key(endpoint)));
-                if !has_read_route || !has_write_or_inbox_route {
-                    findings.push(finding(OnboardingIssue::NoUsableRoute).in_context(
-                        OnboardingFindingContext::PublishedDeclaration,
-                        OnboardingCheckPurpose::DeclarationValidation,
-                    ));
-                    relay_status = Some(OnboardingStatus::NeedsInput);
-                } else {
-                    let mut endpoints = state.relays;
-                    if step == OnboardingStep::Relays {
-                        // A declared read route can complete the bounded check
-                        // when an allowed write route is temporarily unreachable.
-                        for endpoint in state.read_relays {
-                            if !endpoints.contains(&endpoint) {
-                                endpoints.push(endpoint);
-                            }
-                        }
-                    }
-                    // Policy rejections already have declaration-validation
-                    // findings; they are not attempted directory queries.
-                    endpoints.retain(|endpoint| allowed.contains(&relay_key(endpoint)));
-                    let defaults = c
-                        .options
-                        .defaults_for(step)
-                        .iter()
-                        .map(|relay| relay_key(relay))
-                        .collect::<HashSet<_>>();
-                    // Keep the dial cap from hiding appended defaults behind an old long list.
-                    endpoints.sort_by_cached_key(|relay| !defaults.contains(&relay_key(relay)));
-                    // EOSE proves an actual query completed, not merely a TCP
-                    // connection. The declaration supplies read/write roles;
-                    // one completed check on an allowed declared route proves
-                    // the minimum local-use capability without editing it.
-                    // On `Relays`, discovery already ran the exact same kind
-                    // 10002 query: reuse EOSE answers and skip redialing them.
-                    let OnboardingInspection {
-                        failures: route_failures,
-                        completed: route_completed,
-                        ..
-                    } = if step == OnboardingStep::Relays {
-                        self.inspect_onboarding_relays_reusing(
-                            &c.snapshot.account_id_hex,
-                            10002,
-                            endpoints,
-                            Some(&discovery_completed),
-                        )
-                        .await
-                    } else {
-                        self.inspect_onboarding_inbox(&c.snapshot.account_id_hex, endpoints)
-                            .await
-                    };
-                    let waiting_for_signer = route_failures
-                        .iter()
-                        .any(|failure| failure.issue == OnboardingIssue::SignerUnavailable);
-                    findings.extend(route_failures.into_iter().map(|failure| {
-                        let mut failure = failure.in_context(
-                            OnboardingFindingContext::DeclaredRoute,
-                            OnboardingCheckPurpose::DirectoryQuery,
-                        );
-                        failure.declared_capability = failure
-                            .endpoint
-                            .as_deref()
-                            .and_then(|endpoint| capabilities.get(&relay_key(endpoint)))
-                            .copied()
-                            .unwrap_or_default();
-                        failure
-                    }));
-                    // Inspection only dials allowed routes from this declaration.
-                    if route_completed.is_empty() && waiting_for_signer {
-                        relay_status = Some(OnboardingStatus::WaitingForSigner);
-                    } else if route_completed.is_empty() {
-                        let mut failure = finding(OnboardingIssue::NoUsableRoute).in_context(
-                            OnboardingFindingContext::DeclaredRoute,
-                            OnboardingCheckPurpose::DirectoryQuery,
-                        );
-                        failure.outcome = OnboardingCheckOutcome::Unknown;
-                        findings.push(failure);
-                        relay_status = Some(OnboardingStatus::RetryableFailure);
-                    } else {
-                        // The declared role is not the checked capability: EOSE
-                        // proves a read query, never acceptance of a future write.
-                        let mut completed: Vec<_> = route_completed.into_iter().collect();
-                        completed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                        findings.extend(completed.into_iter().map(|(key, source)| {
-                            OnboardingFinding {
-                                declared_capability: capabilities
-                                    .get(&key)
-                                    .copied()
-                                    .unwrap_or_default(),
-                                endpoint: Some(source.endpoint),
-                                ..finding(OnboardingIssue::InspectionCompleted).in_context(
-                                    OnboardingFindingContext::DeclaredRoute,
-                                    OnboardingCheckPurpose::DirectoryQuery,
-                                )
-                            }
-                        }));
-                        relay_status = Some(OnboardingStatus::Passed);
-                    }
-                }
-            } else {
-                findings.push(finding(OnboardingIssue::Malformed).in_context(
-                    OnboardingFindingContext::PublishedDeclaration,
-                    OnboardingCheckPurpose::DeclarationValidation,
-                ));
-                relay_status = Some(OnboardingStatus::NeedsInput);
-            }
+            relay_status = self
+                .evaluate_onboarding_relay_routes(
+                    c,
+                    step,
+                    raw,
+                    &capabilities,
+                    state,
+                    discovery_completed,
+                    &mut findings,
+                )
+                .await;
         }
         let status = evaluated_onboarding_status(&findings, relay_status);
         if !failures.is_empty() {
@@ -3489,10 +3835,18 @@ impl AccountSetup<'_> {
                 .proposal
                 .as_ref()
                 .is_some_and(|proposal| proposal.step == step);
+        let replacing_refused_auto_inbox = step == OnboardingStep::InboxRelays
+            && c.auto_inbox
+                .as_ref()
+                .is_some_and(|pending| pending.unexposed_sending_refusal(status));
         if (c.approved && !replacing_refused_repair)
-            || (!c.relay_step_editable(step) && !replacing_refused_repair)
+            || (c.auto_inbox.is_some() && !replacing_refused_auto_inbox)
+            || (!c.relay_step_editable(step)
+                && !replacing_refused_repair
+                && !replacing_refused_auto_inbox)
             || (selection.is_none()
                 && (replacing_refused_repair
+                    || replacing_refused_auto_inbox
                     || (status != OnboardingStatus::NeedsInput
                         && !c.recommended_relays_apply(step, status))))
         {
@@ -3553,6 +3907,10 @@ impl AccountSetup<'_> {
             c.approved = false;
             c.signed_repair = None;
             c.repair_may_have_published = None;
+        }
+        if replacing_refused_auto_inbox {
+            c.auto_inbox = None;
+            c.auto_inbox_declined = true;
         }
         c.append_relays = append_relays;
         c.manual_relay_edit = manual_relay_edit;
@@ -3682,7 +4040,10 @@ impl AccountSetup<'_> {
         } else {
             OnboardingStep::Follows
         };
-        if c.approved || c.snapshot.steps[step.index()].status != OnboardingStatus::NeedsInput {
+        if c.approved
+            || c.auto_inbox.is_some()
+            || c.snapshot.steps[step.index()].status != OnboardingStatus::NeedsInput
+        {
             return Err(onboarding_error());
         }
         c.manual_relay_edit = false;
@@ -3721,6 +4082,23 @@ impl AccountSetup<'_> {
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;
+        if c.snapshot.proposal.is_none() {
+            let status = c.snapshot.steps[OnboardingStep::InboxRelays.index()].status;
+            if c.auto_inbox
+                .as_ref()
+                .is_some_and(|pending| pending.unexposed_sending_refusal(status))
+            {
+                c.auto_inbox = None;
+                c.auto_inbox_declined = true;
+                let findings = c.snapshot.steps[OnboardingStep::InboxRelays.index()]
+                    .findings
+                    .clone();
+                c.set(OnboardingStep::InboxRelays, status, findings);
+                self.save_onboarding(&mut c)?;
+                return Ok(c.snapshot);
+            }
+            return Err(onboarding_error());
+        }
         let step = c
             .snapshot
             .proposal
@@ -4020,6 +4398,89 @@ impl AccountSetup<'_> {
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
+    async fn sign_onboarding_event(
+        &self,
+        c: &OnboardingCheckpoint,
+        step: OnboardingStep,
+        account: &AccountSummary,
+        signer: &Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+        tags: Vec<Vec<String>>,
+        content: String,
+        created_at: u64,
+        context: &'static str,
+    ) -> Result<Result<NostrTransportEvent, AppError>, AppError> {
+        let tags = tags
+            .into_iter()
+            .map(Tag::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| onboarding_error())?;
+        let mut unsigned = EventBuilder::new(Kind::from(step.kind() as u16), content)
+            .tags(tags)
+            .custom_created_at(Timestamp::from(created_at))
+            .finalize_unsigned(
+                PublicKey::parse(&account.account_id_hex)
+                    .map_err(|_| AppError::InvalidPublicKey)?,
+            );
+        unsigned.ensure_id();
+        let signed = self
+            .await_while_onboarding_live(&c.snapshot.account_id_hex, c.attempt(), async {
+                timeout(REPAIR_SIGN_WAIT, signer.sign_event(unsigned))
+                    .await
+                    .map_err(|_| {
+                        AppError::ExternalSignerUnavailable(account.account_id_hex.clone())
+                    })?
+                    .map_err(|error| crate::external_signer_error(error, context))
+            })
+            .await?;
+        self.require_live_onboarding_attempt(c)?;
+        match signed {
+            Ok(event) => {
+                Ok(Ok(NostrTransportEvent::from_nostr_event(&event)
+                    .map_err(|_| onboarding_error())?))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    async fn publish_onboarding_event(
+        &self,
+        c: &OnboardingCheckpoint,
+        account: &AccountSummary,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+    ) -> Result<
+        Option<Result<transport_nostr_adapter::NostrPublishOutcome, TransportAdapterError>>,
+        AppError,
+    > {
+        if self.require_live_onboarding_attempt(c).is_err() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        self.await_onboarding_test_hold(&self.state.onboarding_test_holds.publication)
+            .await;
+        if self.require_live_under_state_lock(c).is_err() {
+            return Ok(None);
+        }
+        let outcome = self
+            .await_while_onboarding_live(
+                &c.snapshot.account_id_hex,
+                c.attempt(),
+                self.app()
+                    .relay_client_for_account_id(&account.account_id_hex, signer)
+                    .publish_event(endpoints, event, 1),
+            )
+            .await;
+        let Ok(outcome) = outcome else {
+            return Ok(None);
+        };
+        if self.require_live_onboarding_attempt(c).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(outcome))
+    }
+
     async fn publish_onboarding_repair(
         &self,
         c: &mut OnboardingCheckpoint,
@@ -4073,42 +4534,27 @@ impl AccountSetup<'_> {
                 self.save_onboarding(c)?;
             }
             let (tags, content, created_at) = relay_repair_event(c, &proposal);
-            let tags = tags
-                .into_iter()
-                .map(Tag::parse)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| onboarding_error())?;
-            let mut unsigned = EventBuilder::new(Kind::from(proposal.step.kind() as u16), content)
-                .tags(tags)
-                .custom_created_at(Timestamp::from(created_at))
-                .finalize_unsigned(
-                    PublicKey::parse(&account.account_id_hex)
-                        .map_err(|_| AppError::InvalidPublicKey)?,
-                );
-            unsigned.ensure_id();
-            let signed = self
-                .await_while_onboarding_live(&c.snapshot.account_id_hex, c.attempt(), async {
-                    timeout(REPAIR_SIGN_WAIT, signer.sign_event(unsigned))
-                        .await
-                        .map_err(|_| {
-                            AppError::ExternalSignerUnavailable(account.account_id_hex.clone())
-                        })?
-                        .map_err(|error| crate::external_signer_error(error, "onboarding repair"))
-                })
-                .await?;
-            let signed = match signed {
+            let signed = match self
+                .sign_onboarding_event(
+                    c,
+                    proposal.step,
+                    &account,
+                    &signer,
+                    tags,
+                    content,
+                    created_at,
+                    "onboarding repair",
+                )
+                .await?
+            {
                 Ok(event) => event,
                 Err(error) => {
-                    self.require_live_onboarding_attempt(c)?;
                     set_operation_error(c, proposal.step, &error);
                     self.save_onboarding(c)?;
                     return Ok(false);
                 }
             };
-            self.require_live_onboarding_attempt(c)?;
-            c.signed_repair = Some(
-                NostrTransportEvent::from_nostr_event(&signed).map_err(|_| onboarding_error())?,
-            );
+            c.signed_repair = Some(signed);
             // Record explicit `Some(false)` atomically with the freshly signed
             // event so any already-signed checkpoint with `None` is known to be
             // a legacy pre-upgrade checkpoint and stays conservatively exposed.
@@ -4152,28 +4598,12 @@ impl AccountSetup<'_> {
             c.repair_may_have_published = Some(true);
             self.save_onboarding(c)?;
         }
-        #[cfg(test)]
-        self.await_onboarding_test_hold(&self.state.onboarding_test_holds.publication)
-            .await;
-        if self.require_live_under_state_lock(c).is_err() {
+        let Some(outcome) = self
+            .publish_onboarding_event(c, &account, signer, &endpoints, &event)
+            .await?
+        else {
             return Ok(false);
-        }
-        let outcome = self
-            .await_while_onboarding_live(
-                &c.snapshot.account_id_hex,
-                c.attempt(),
-                self.app()
-                    .relay_client_for_account_id(&account.account_id_hex, signer)
-                    .publish_event(&endpoints, &event, 1),
-            )
-            .await;
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(_) => return Ok(false),
         };
-        if self.require_live_onboarding_attempt(c).is_err() {
-            return Ok(false);
-        }
         match outcome {
             Ok(outcome) if !outcome.accepted.is_empty() => {
                 self.app()
@@ -4183,6 +4613,10 @@ impl AccountSetup<'_> {
                         event: event.clone(),
                     })?;
                 c.records[proposal.step.index()] = Some(event);
+                if proposal.step == OnboardingStep::InboxRelays {
+                    c.seen_signed_inbox_list = true;
+                    c.snapshot.created_inbox_list = None;
+                }
                 c.approved = false;
                 c.signed_repair = None;
                 c.repair_may_have_published = None;

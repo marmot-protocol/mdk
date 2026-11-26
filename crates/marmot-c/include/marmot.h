@@ -34,6 +34,21 @@
 #include <stdlib.h>
 
 /**
+ * Bitmask flag for `marmot_begin_onboarding_with_options`: automatically
+ * publish a kind-10050 inbox list from recommended defaults when complete
+ * discovery confirms none exists.
+ */
+#define MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST 1
+
+/**
+ * Bitmask flag for `marmot_begin_onboarding_with_options`: pass the
+ * `SingleDevice` step automatically when complete discovery finds
+ * `MARMOT_ONBOARDING_DEVICE_DISCOVERY_NONE_FOUND`, while keeping
+ * `single_device_notice` in the snapshot.
+ */
+#define MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND 2
+
+/**
  * Status code returned by every fallible `marmot_*` function.
  *
  * `MARMOT_STATUS_OK` (0) means success. Codes 1-9 are binding-level
@@ -2997,6 +3012,13 @@ typedef struct MarmotOnboardingSingleDeviceNotice {
   uint64_t acknowledged_at;
 } MarmotOnboardingSingleDeviceNotice;
 
+typedef struct MarmotOnboardingCreatedInboxList {
+  char **relays;
+  uintptr_t relays_len;
+  char *event_id;
+  uint64_t published_at;
+} MarmotOnboardingCreatedInboxList;
+
 typedef struct MarmotOnboardingSnapshot {
   char *account_id_hex;
   char *recovery_epoch;
@@ -3007,6 +3029,7 @@ typedef struct MarmotOnboardingSnapshot {
   struct MarmotOnboardingRepairProposal *proposal;
   struct MarmotOnboardingSingleDeviceNotice *single_device_notice;
   bool cancellation_pending;
+  struct MarmotOnboardingCreatedInboxList *created_inbox_list;
 } MarmotOnboardingSnapshot;
 
 /**
@@ -13287,7 +13310,29 @@ MarmotStatus marmot_update_app_component(const struct MarmotClient *client,
                                          struct MarmotSendSummary **out);
 
 /**
- * Import an identity and persist its onboarding gate without publishing. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Import an identity and persist its onboarding gate without publishing,
+ * configured by bitmask `flags` (`MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST`,
+ * `MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND`, or `0`). Unknown flag
+ * bits return `MARMOT_STATUS_INVALID_ARGUMENT`. Free the returned snapshot with
+ * `marmot_onboarding_snapshot_free`.
+ *
+ * # Safety
+ * The client must be live, input pointers valid and borrowed, and out writable.
+ */
+MarmotStatus marmot_begin_onboarding_with_options(const struct MarmotClient *client,
+                                                  const char *nsec,
+                                                  const char *const *default_relays,
+                                                  uintptr_t default_relays_len,
+                                                  const char *const *discovery_relays,
+                                                  uintptr_t discovery_relays_len,
+                                                  const char *const *inbox_relays,
+                                                  uintptr_t inbox_relays_len,
+                                                  uint32_t flags,
+                                                  struct MarmotOnboardingSnapshot **out);
+
+/**
+ * Import an identity and persist its onboarding gate without publishing
+ * (`flags = 0`). Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.

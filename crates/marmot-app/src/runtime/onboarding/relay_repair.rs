@@ -459,6 +459,7 @@ impl AccountSetup<'_> {
                     .any(|finding| finding.issue == OnboardingIssue::RetiredRelay));
         if !step.relay()
             || c.approved
+            || c.auto_inbox.is_some()
             || c.snapshot
                 .proposal
                 .as_ref()
@@ -506,6 +507,7 @@ impl AccountSetup<'_> {
         step: OnboardingStep,
     ) -> bool {
         step.relay()
+            && c.auto_inbox.is_none()
             && c.snapshot.proposal.is_none()
             && !c.snapshot.cancellation_pending
             && self.relay_repair_preview(c, step).is_ok_and(|preview| {

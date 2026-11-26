@@ -54,6 +54,8 @@ include = [
     "MarmotModerationReportOrigin",
     "MarmotSignInResponse",
     "MarmotCompromiseWarningReason",
+    "MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST",
+    "MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND",
 ]
 
 [enum]

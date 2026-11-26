@@ -3610,8 +3610,65 @@ where
     Ok(out)
 }
 
-use crate::types::onboarding::{MarmotOnboardingSnapshot, MarmotOnboardingStep};
-/// Import an identity and persist its onboarding gate without publishing. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+use crate::types::onboarding::{
+    MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST,
+    MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND, MarmotOnboardingSnapshot,
+    MarmotOnboardingStep,
+};
+/// Import an identity and persist its onboarding gate without publishing,
+/// configured by bitmask `flags` (`MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST`,
+/// `MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND`, or `0`). Unknown flag
+/// bits return `MARMOT_STATUS_INVALID_ARGUMENT`. Free the returned snapshot with
+/// `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_begin_onboarding_with_options(
+    client: *const MarmotClient,
+    nsec: *const c_char,
+    default_relays: *const *const c_char,
+    default_relays_len: usize,
+    discovery_relays: *const *const c_char,
+    discovery_relays_len: usize,
+    inbox_relays: *const *const c_char,
+    inbox_relays_len: usize,
+    flags: u32,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        const ALLOWED_FLAGS: u32 = MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST
+            | MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND;
+        if flags & !ALLOWED_FLAGS != 0 {
+            crate::status::set_last_error("unknown onboarding option flags");
+            return MarmotStatus::InvalidArgument;
+        }
+        let client = try_arg!(unsafe { client_ref(client) });
+        let nsec = try_arg!(unsafe { required_str(nsec) });
+        let default_relays = try_arg!(unsafe { str_array(default_relays, default_relays_len) });
+        let discovery_relays =
+            try_arg!(unsafe { str_array(discovery_relays, discovery_relays_len) });
+        let inbox_relays = try_arg!(unsafe { str_array(inbox_relays, inbox_relays_len) });
+        let options = marmot_uniffi::OnboardingOptionsFfi {
+            default_relays,
+            discovery_relays,
+            inbox_relays,
+            create_missing_inbox_list: flags & MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST != 0,
+            pass_device_notice_when_none_found: flags
+                & MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND
+                != 0,
+        };
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.begin_onboarding(nsec, options)),
+                out,
+            )
+        }
+    })
+}
+/// Import an identity and persist its onboarding gate without publishing
+/// (`flags = 0`). Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -3627,26 +3684,20 @@ pub unsafe extern "C" fn marmot_begin_onboarding(
     inbox_relays_len: usize,
     out: *mut *mut MarmotOnboardingSnapshot,
 ) -> MarmotStatus {
-    ffi_guard(|| {
-        try_arg!(unsafe { crate::preflight_out_ptr(out) });
-        let client = try_arg!(unsafe { client_ref(client) });
-        let nsec = try_arg!(unsafe { required_str(nsec) });
-        let default_relays = try_arg!(unsafe { str_array(default_relays, default_relays_len) });
-        let discovery_relays =
-            try_arg!(unsafe { str_array(discovery_relays, discovery_relays_len) });
-        let inbox_relays = try_arg!(unsafe { str_array(inbox_relays, inbox_relays_len) });
-        let options = marmot_uniffi::OnboardingOptionsFfi {
+    unsafe {
+        marmot_begin_onboarding_with_options(
+            client,
+            nsec,
             default_relays,
+            default_relays_len,
             discovery_relays,
+            discovery_relays_len,
             inbox_relays,
-        };
-        unsafe {
-            deliver(
-                client.block_on(client.marmot.begin_onboarding(nsec, options)),
-                out,
-            )
-        }
-    })
+            inbox_relays_len,
+            0,
+            out,
+        )
+    }
 }
 /// Read the persisted onboarding snapshot. Writes NULL with MARMOT_STATUS_OK when no checkpoint exists.
 /// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
