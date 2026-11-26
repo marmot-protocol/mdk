@@ -2970,6 +2970,62 @@ async fn disband_publish_failure_reconciliation_is_atomic_and_retryable() {
 }
 
 #[test]
+fn lifecycle_retirement_deletes_an_expired_wire_bundle() {
+    use openmls::prelude::{
+        BasicCredential, CredentialWithKey, KeyPackage as MlsKeyPackage, Lifetime, MlsMessageOut,
+    };
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_traits::OpenMlsProvider as _;
+    use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+    use openmls_traits::types::Ciphersuite;
+    use tls_codec::Serialize as _;
+
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut engine = current_client(
+        b"key-package-retirement",
+        storage.clone(),
+        &ManualConvergenceClock::new(1_000, 10_000),
+    );
+    let mut state = KeyPackageLifecycleState::slot_only("stable-slot".into());
+    engine
+        .stage_key_package_replacement(&mut state, Timestamp(10_000), 60, Vec::new())
+        .unwrap();
+    let keep = storage.stored_key_package_bundles().unwrap();
+
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let bundle = MlsKeyPackage::builder()
+        .key_package_lifetime(Lifetime::init(1_000, 2_000))
+        .build(
+            ciphersuite,
+            &provider,
+            &signer,
+            CredentialWithKey {
+                credential: BasicCredential::new(engine.self_id().as_slice().to_vec()).into(),
+                signature_key: signer.public().into(),
+            },
+        )
+        .unwrap();
+    let expired = bundle.key_package();
+    let reference = expired.hash_ref(provider.crypto()).unwrap();
+    OpenMlsStorageProvider::write_key_package(storage.mls_storage(), &reference, &bundle).unwrap();
+    assert_eq!(storage.stored_key_package_bundles().unwrap().len(), 2);
+    let message: MlsMessageOut = expired.clone().into();
+    let retired = cgka_traits::engine::KeyPackage::new(message.tls_serialize_detached().unwrap());
+    assert!(matches!(
+        cgka_engine::key_package::key_package_metadata(&retired),
+        Err(EngineError::InvalidKeyPackageLifetime { .. })
+    ));
+
+    engine
+        .promote_key_package_lifecycle(&[retired], &state)
+        .unwrap();
+    assert_eq!(storage.stored_key_package_bundles().unwrap(), keep);
+    assert_eq!(storage.key_package_lifecycle().unwrap(), Some(state));
+}
+
+#[test]
 fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
     let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();

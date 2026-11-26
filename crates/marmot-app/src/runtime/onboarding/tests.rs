@@ -4216,6 +4216,108 @@ async fn explicit_discovery_relays_bypass_unreachable_public_indexers() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_interactive_onboarding_defers_startup_and_worker_key_package_maintenance() {
+    let (dir, publisher, network, keys, id) = fixture().await;
+    let preflight = inbox_step(
+        &publisher,
+        &network,
+        &keys,
+        &id,
+        vec![vec!["r".into(), "wss://declared.example".into()]],
+        Some(vec![vec!["relay".into(), "wss://default.example".into()]]),
+    )
+    .await;
+    let hold = publisher
+        .account_setup()
+        .install_onboarding_activation_hold();
+    let task = tokio::spawn({
+        let manager = publisher.accounts().clone();
+        let id = id.clone();
+        async move {
+            manager
+                .account_setup()
+                .acknowledge_onboarding_single_device(&id, preflight.revision)
+                .await
+        }
+    });
+    hold.wait_until_entered().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    // Provision a stable slot and mark a strict cutover replacement pending
+    // before restart so both startup open-time maintenance and worker
+    // maintenance would publish unless onboarding defers them.
+    let account = publisher
+        .accounts()
+        .app
+        .account_home()
+        .account(&id)
+        .unwrap();
+    publisher
+        .accounts()
+        .app
+        .account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            "onboarding-slot".into(),
+        ))
+        .unwrap();
+    assert!(
+        publisher
+            .accounts()
+            .app
+            .mark_key_package_cutover_replacement_pending(&account.label)
+    );
+    publisher.shutdown_and_close().await.unwrap();
+
+    let restarted = runtime(dir.path(), network.clone());
+    restarted.start().await.unwrap();
+    let snapshot = restarted
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.steps[OnboardingStep::KeyPackage.index()].status,
+        OnboardingStatus::Checking,
+    );
+    let lane = restarted
+        .accounts()
+        .existing_worker_commands(&id)
+        .await
+        .unwrap()
+        .expect("the persisted publication step admits a worker");
+    // Run the same maintenance pass as the scheduler and await its completion.
+    let (respond, response) = tokio::sync::oneshot::channel();
+    lane.commands
+        .send(crate::runtime::account_worker::AccountWorkerCommand::RunDueMaintenance { respond })
+        .await
+        .unwrap();
+    crate::runtime::account_worker_response(response)
+        .await
+        .unwrap();
+    let key_package_writes = || {
+        network
+            .attempts
+            .lock()
+            .iter()
+            .filter(|event| event.kind == transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE)
+            .count()
+    };
+    assert_eq!(key_package_writes(), 0);
+    assert!(
+        restarted
+            .accounts()
+            .app
+            .key_package_cutover_replacement_pending(&account.label)
+    );
+
+    let completed = restarted.account_setup().run_onboarding(&id).await.unwrap();
+    assert!(completed.ready);
+    assert_eq!(key_package_writes(), 1);
+    restarted.shutdown_and_close().await.unwrap();
+}
+
 /// Drive onboarding to the inbox step over the account's published lists.
 async fn inbox_step(
     runtime: &MarmotAppRuntime,

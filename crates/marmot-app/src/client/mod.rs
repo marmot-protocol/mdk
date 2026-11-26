@@ -1374,6 +1374,9 @@ pub(crate) enum MaintenancePasses {
     /// A wake-collection runtime (`CursorPersistence::Frozen`) leaves the
     /// passes to an advancing one.
     Frozen,
+    /// Interactive onboarding has not completed yet: setup owns the first
+    /// KeyPackage publication and background maintenance waits for it.
+    Onboarding,
 }
 
 impl AppClient {
@@ -1597,6 +1600,11 @@ impl AppClient {
             MaintenancePasses::SignOutHeld
         } else if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
             MaintenancePasses::Frozen
+        } else if crate::runtime::onboarding_defers_key_package_maintenance(
+            &self.app,
+            &self.state.label,
+        ) {
+            MaintenancePasses::Onboarding
         } else {
             MaintenancePasses::Run
         })
@@ -1619,7 +1627,7 @@ impl AppClient {
                     .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
                 return Ok(maintenance_run_summary_from_account(summary));
             }
-            MaintenancePasses::Frozen => {
+            MaintenancePasses::Frozen | MaintenancePasses::Onboarding => {
                 self.runtime.sweep_expired_key_package_private_material()?;
                 self.discard_expired_sibling_key_packages();
                 let summary = self
@@ -1898,7 +1906,7 @@ impl AppClient {
     }
 
     pub(crate) fn key_package_maintenance_requires_catch_up(&self) -> bool {
-        self.app.cursor_persistence() == crate::CursorPersistence::Advance
+        matches!(self.maintenance_passes(), Ok(MaintenancePasses::Run))
             && self
                 .runtime
                 .key_package_maintenance_requires_catch_up()

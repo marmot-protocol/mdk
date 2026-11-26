@@ -406,8 +406,10 @@ impl<S: StorageProvider> Engine<S> {
                     }
                 };
                 let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
-                let key_package =
-                    crate::key_package::validate_key_package(key_package, provider.crypto())?;
+                let key_package = crate::key_package::validate_key_package_for_retirement(
+                    key_package,
+                    provider.crypto(),
+                )?;
                 let reference = key_package
                     .hash_ref(provider.crypto())
                     .map_err(|error| EngineError::Backend(format!("key_package ref: {error:?}")))?;

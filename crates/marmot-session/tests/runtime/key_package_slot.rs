@@ -812,3 +812,185 @@ async fn a_current_key_package_the_publisher_can_no_longer_send_is_replaced() {
         Some(first_event)
     );
 }
+
+#[tokio::test]
+async fn an_expired_pending_replacement_is_not_published_and_is_replaced_on_next_publish() {
+    #[derive(Clone)]
+    struct ClockSteppingPublisher {
+        inner: RecordingKeyPackages,
+        wall: Arc<TestWallClock>,
+        advance_on_prepare: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl KeyPackagePublisher for ClockSteppingPublisher {
+        fn legacy_slot_id(
+            &self,
+            account_id: &cgka_traits::MemberId,
+        ) -> Result<Option<String>, marmot_session::KeyPackagePublishError> {
+            self.inner.legacy_slot_id(account_id)
+        }
+
+        async fn prepare_key_package(
+            &self,
+            publication: marmot_session::KeyPackagePublication,
+        ) -> Result<cgka_traits::SignedPublicationArtifact, marmot_session::KeyPackagePublishError>
+        {
+            let artifact = self.inner.prepare_key_package(publication).await?;
+            let step = self
+                .advance_on_prepare
+                .swap(0, std::sync::atomic::Ordering::SeqCst);
+            if step > 0 {
+                self.wall.set(self.wall.now().0.saturating_add(step));
+            }
+            Ok(artifact)
+        }
+
+        async fn publish_prepared_key_package(
+            &self,
+            publication: &marmot_session::KeyPackagePublication,
+            artifact: &cgka_traits::SignedPublicationArtifact,
+        ) -> Result<marmot_session::KeyPackagePublishReceipt, marmot_session::KeyPackagePublishError>
+        {
+            self.inner
+                .publish_prepared_key_package(publication, artifact)
+                .await
+        }
+    }
+
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("kp slot expired pending").unwrap();
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let inner = RecordingKeyPackages::default();
+    let advance_on_prepare = Arc::new(std::sync::atomic::AtomicU64::new(31 * DAY));
+    let publisher = ClockSteppingPublisher {
+        inner: inner.clone(),
+        wall: wall.clone(),
+        advance_on_prepare: advance_on_prepare.clone(),
+    };
+    let mut runtime = slot_runtime(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        publisher,
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+
+    // The signer returned after the staged pending replacement already expired:
+    // publish_fresh_key_package must refuse without publishing it.
+    let error = runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("expired prepared replacement must not publish");
+    assert!(
+        matches!(
+            error,
+            marmot_session::AccountError::KeyPackage(ref err) if !err.externally_exposed
+        ),
+        "expected unexposed KeyPackage error, got {error:?}"
+    );
+    assert!(inner.publications().is_empty());
+
+    // Bring the test clock back to real time and mark the staged replacement as
+    // expired at `now` (simulating a replacement staged 30 days earlier) so a
+    // freshly generated OpenMLS replacement has a valid future `not_after`.
+    wall.set(now);
+    let mut lifecycle = slot_lifecycle(&runtime);
+    lifecycle.pending_replacement.as_mut().unwrap().not_after = Timestamp(now);
+    runtime
+        .session()
+        .put_key_package_lifecycle(&lifecycle)
+        .unwrap();
+    let expired_pending = lifecycle.pending_replacement.unwrap();
+
+    // While paused, maintenance does not schedule or retry an expired pending
+    // replacement (it is obsolete, not publishable prepared work).
+    runtime.pause_maintenance();
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(expired_pending.not_after));
+    assert!(!due.retry_while_owed);
+
+    // Unpausing and publishing replaces the expired pending artifact with a fresh
+    // package and retires the expired retained private material during promotion.
+    runtime.resume_maintenance();
+    assert!(runtime.key_package_network_maintenance_due().unwrap());
+    let fresh = runtime.publish_fresh_key_package().await.unwrap();
+    assert_ne!(fresh, expired_pending.key_package);
+    assert_eq!(inner.publications().len(), 1);
+    assert_eq!(inner.publications()[0].key_package, fresh);
+    let promoted = slot_lifecycle(&runtime);
+    assert!(promoted.pending_replacement.is_none());
+    assert!(
+        promoted.retained_private_material.is_empty(),
+        "expired superseded pending material must be retired on promotion"
+    );
+    assert!(
+        !runtime
+            .durably_owned_key_packages()
+            .unwrap()
+            .contains(&expired_pending.key_package)
+    );
+}
+
+#[tokio::test]
+async fn an_expired_current_key_package_is_not_republished_or_fanned_out() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("kp slot expired current fanout").unwrap();
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let publisher = RefusingKeyPackages::default();
+    publisher
+        .partial
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut runtime = slot_runtime(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT, "wss://keys-2.example"],
+    );
+    let first = runtime.publish_fresh_key_package().await.unwrap();
+    let mut published = slot_lifecycle(&runtime);
+    let first_event = published.authored_event_id.clone().unwrap();
+    assert!(runtime.key_package_has_pending_fanout().unwrap());
+
+    // Once current_not_after elapses (at real time `now` so a fresh replacement
+    // is valid), the expired current event is no longer eligible for fanout
+    // retry or republication.
+    published.current_not_after = Some(Timestamp(now));
+    runtime
+        .session()
+        .put_key_package_lifecycle(&published)
+        .unwrap();
+    assert!(
+        !runtime.key_package_has_pending_fanout().unwrap(),
+        "expired current KeyPackage must not advertise pending fanout"
+    );
+
+    // Republishing an expired current KeyPackage falls back to a fresh one and
+    // retires the expired current bundle during promotion rather than retaining it.
+    publisher
+        .partial
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let replacement = runtime.republish_key_package().await.unwrap();
+    assert_ne!(replacement, first);
+    let after = slot_lifecycle(&runtime);
+    assert!(
+        after.retained_private_material.is_empty(),
+        "expired current KeyPackage must be retired on promotion, not retained"
+    );
+    assert!(
+        !runtime
+            .durably_owned_key_packages()
+            .unwrap()
+            .contains(&first)
+    );
+    assert_eq!(
+        publisher.attempts(),
+        vec![
+            (first_event, true),
+            (after.authored_event_id.unwrap(), true),
+        ]
+    );
+}

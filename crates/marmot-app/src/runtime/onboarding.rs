@@ -1333,6 +1333,15 @@ fn decode_onboarding_checkpoint(
     Ok(checkpoint)
 }
 
+pub(crate) fn onboarding_defers_key_package_maintenance(
+    app: &MarmotApp,
+    account_ref: &str,
+) -> bool {
+    SetupRecords::new(app)
+        .require_onboarding_complete(account_ref)
+        .is_err()
+}
+
 impl<'a> SetupRecords<'a> {
     pub(super) fn new(app: &'a MarmotApp) -> Self {
         Self { app }

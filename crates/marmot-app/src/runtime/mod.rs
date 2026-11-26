@@ -163,6 +163,7 @@ pub(crate) use account_worker::{TestWorkerReceiver, test_worker_channel};
 pub(crate) use audit_tracker::{
     AuditLogTrackerUploader, post_audit_log_tracker_update_for_runtime,
 };
+pub(crate) use onboarding::onboarding_defers_key_package_maintenance;
 
 // Surface the split-out `pub(crate)` items the test modules reach for: the
 // crate-root `src/tests.rs` via `crate::runtime::Item`, and `runtime/tests.rs`

@@ -7475,6 +7475,43 @@ async fn key_package_routing_sees_lists_a_setup_projected_after_the_routing_read
     );
 }
 
+#[test]
+fn key_package_fallback_routing_excludes_nip65_read_only_relays() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relays(
+        directory.path(),
+        vec![
+            "wss://read-only.example/".into(),
+            "wss://fallback.example".into(),
+        ],
+    );
+
+    // Empty write relays with a NIP-65 read-only relay matching one configured default.
+    let mut empty_writes = app.account_relay_list_status(&account.label).unwrap();
+    empty_writes.nip65.relays.clear();
+    empty_writes.nip65.write_relays.clear();
+    empty_writes.nip65.read_relays = vec!["wss://READ-ONLY.example".into()];
+    assert_eq!(
+        app.key_package_endpoints(&account.label, &empty_writes)
+            .unwrap(),
+        vec![TransportEndpoint("wss://fallback.example".into())]
+    );
+
+    // Unsafe write relays (cleartext ws:// on a public host, filtered out by
+    // host safety) also fall back without writing to relays explicitly declared
+    // read-only in NIP-65.
+    let mut unsafe_writes = empty_writes;
+    unsafe_writes.nip65.relays = vec!["ws://plain.example".into()];
+    unsafe_writes.nip65.write_relays = unsafe_writes.nip65.relays.clone();
+    assert_eq!(
+        app.key_package_endpoints(&account.label, &unsafe_writes)
+            .unwrap(),
+        vec![TransportEndpoint("wss://fallback.example".into())]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_generation_upgrade_runs_once_per_account_on_activation() {
     use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
