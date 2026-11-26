@@ -291,7 +291,7 @@ fn engine_keeps(record: &MessageRecord, filter: OpenMlsContentFilter) -> bool {
         return true;
     };
     let Some(message) = payload.as_openmls_wire() else {
-        return false;
+        return filter == OpenMlsContentFilter::NoOpenMlsMessage;
     };
     let Ok(projection) = project_mls_message(&message.payload) else {
         return true;
@@ -320,6 +320,7 @@ fn engine_keeps(record: &MessageRecord, filter: OpenMlsContentFilter) -> bool {
                     | cgka_engine::openmls_projection::OpenMlsContentKind::Proposal
             ) && (from.0..=through.0).contains(&epoch)
         }
+        OpenMlsContentFilter::NoOpenMlsMessage => false,
     }
 }
 
@@ -432,6 +433,7 @@ async fn sqlite_content_listing_matches_the_engines_projection() {
             from: EpochId(0),
             through: EpochId(tip.0 - 1),
         },
+        OpenMlsContentFilter::NoOpenMlsMessage,
     ] {
         let expected: Vec<_> = all
             .iter()

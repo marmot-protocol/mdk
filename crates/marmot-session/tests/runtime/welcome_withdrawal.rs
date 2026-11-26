@@ -754,8 +754,16 @@ async fn legacy_create_welcome_cannot_be_withdrawn() {
 
 /// Withdrawal needs no hydration: a restart can stop a Welcome before its
 /// group is hydrated, and nothing publishes it afterwards, hydrated or not.
+/// One withdrawn past its delivery deadline ends expired, read from its
+/// stored rows, not withdrawn (mdk#3589).
 #[tokio::test]
 async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
+    for past_deadline in [false, true] {
+        withdraw_before_hydration(past_deadline).await;
+    }
+}
+
+async fn withdraw_before_hydration(past_deadline: bool) {
     let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot unhydrated withdrawal key").unwrap();
@@ -800,7 +808,15 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
     let welcome = welcome_publishes(&adapter)
         .pop()
         .expect("creation tried Bob's Welcome");
+    let deadline = runtime
+        .session()
+        .sent_welcome_deliver_until(&welcome.id)
+        .unwrap()
+        .unwrap();
     drop(runtime);
+    if past_deadline {
+        wall.set(deadline.0 + 60);
+    }
 
     adapter.accept_only_endpoints(vec![bob_inbox]);
     let mut runtime = open(deferred_current_nostr_welcome_session(
@@ -826,6 +842,13 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
             .transport_fanout(&welcome.id)
             .unwrap()
             .is_none()
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .expire_sent_welcome(&welcome.id, Timestamp(0))
+            .unwrap(),
+        past_deadline.then_some(cgka_traits::message::WelcomeExpiry::Recorded)
     );
     runtime
         .publish_welcome_messages_with_audit_context(
@@ -870,7 +893,10 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
         .filter(|row| row["event"]["type"] == "welcome_withdrawn")
         .collect::<Vec<_>>();
     assert_eq!(withdrawals.len(), 1, "{withdrawals:?}");
-    assert_eq!(withdrawals[0]["event"]["reason"], "withdrawn");
+    assert_eq!(
+        withdrawals[0]["event"]["reason"],
+        if past_deadline { "expired" } else { "withdrawn" }
+    );
 }
 
 /// mdk#2628 D40: a device link's Welcome is never published from its delivery
@@ -981,8 +1007,9 @@ async fn a_link_welcome_is_never_published_from_its_deadline_on() {
 
 /// A device link's Welcome that expires while this process watches it is
 /// audited once, as `expired`. A later start that reads it from the store,
-/// already expired, adds no row: it settled before that process watched it.
-/// Nor does the link's cleanup withdrawing it after its expiry was recorded.
+/// already expired, adds no row, nor does the link's cleanup withdrawing it
+/// after its expiry was recorded. The expiry is durable: a start with its
+/// clock set back before the deadline does not send it.
 #[tokio::test]
 async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     let dir = relaxed_storage_dir().unwrap();
@@ -1034,12 +1061,12 @@ async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     };
 
     // Owed and watched, unreachable until its deadline passes.
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_endpoints(Vec::new());
     let start = |at: u64, audit: &std::path::Path| {
-        let adapter = RecordingAdapter::default();
-        adapter.accept_only_endpoints(Vec::new());
         let runtime = AccountDeviceRuntime::new(
             current_nostr_welcome_session(&alice_path, &key, b"alice-expired-link"),
-            adapter,
+            adapter.clone(),
             policy.clone(),
             RecordingKeyPackages::default(),
         )
@@ -1080,6 +1107,19 @@ async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     let mut second = start(300_300, &second_audit);
     second.run_due_maintenance().await.unwrap();
     assert!(withdrawn(&second_audit).is_empty(), "already settled at start");
+    drop(second);
+
+    // Its expiry is durable: a clock set back before the deadline sends it
+    // no more and records nothing.
+    let tried = welcome_publishes(&adapter).len();
+    let set_back_audit = dir.path().join("set-back-audit-v5.jsonl");
+    let mut set_back = start(300_000, &set_back_audit);
+    set_back.run_due_maintenance().await.unwrap();
+    assert_eq!(welcome_publishes(&adapter).len(), tried);
+    let redelivered = set_back.redeliver_welcome(&welcome.id).await.unwrap();
+    assert!(redelivered.welcome_failures.is_empty());
+    assert_eq!(welcome_publishes(&adapter).len(), tried);
+    assert!(withdrawn(&set_back_audit).is_empty());
 }
 
 /// A device link's Welcome, owed to bob until its deadline at 300_100, and
@@ -1174,7 +1214,8 @@ async fn a_pass_that_fails_after_the_link_deadline_does_not_report_the_welcome_p
     wall.set(300_050);
     let completed = task.run().await;
     wall.set(300_200);
-    runtime.finish_welcome_publish_task(completed).await.unwrap();
+    let finished = runtime.finish_welcome_publish_task(completed).await.unwrap();
+    assert!(finished.welcome_failures.is_empty(), "never pending");
 
     let finished = v5_audit_rows(&audit_path)
         .into_iter()
@@ -1320,4 +1361,58 @@ async fn a_link_welcome_withdrawn_after_its_deadline_is_audited_as_expired() {
             assert_eq!(rows[0]["event"]["reason"], "expired");
         }
     }
+}
+
+/// A device link's Welcome withdrawn after its deadline while a detached
+/// wave still holds it ends expired, its row and its audit row agreeing: the
+/// withdrawal stops the wave either way, and the deadline is why it was never
+/// delivered. The wave then finishes without sending it or reporting it
+/// pending.
+#[tokio::test]
+async fn a_link_welcome_withdrawn_past_its_deadline_while_a_wave_holds_it_ends_expired() {
+    let dir = relaxed_storage_dir().unwrap();
+    let LinkWelcome {
+        mut runtime,
+        wall,
+        welcome,
+        audit_path,
+    } = link_welcome(dir.path(), false).await;
+    let task = runtime
+        .prepare_welcome_retry_task_with_audit_context(vec![welcome.clone()], Default::default())
+        .unwrap();
+    assert_eq!(task.message_ids(), std::slice::from_ref(&welcome.id));
+
+    wall.set(300_200);
+    assert_eq!(
+        runtime.withdraw_welcome(&welcome.id).unwrap(),
+        WelcomeWithdrawal::Withdrawn
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .expire_sent_welcome(&welcome.id, Timestamp(0))
+            .unwrap(),
+        Some(cgka_traits::message::WelcomeExpiry::Recorded)
+    );
+    // With the clock set back before the deadline, only the wave's hold,
+    // which the mark updated, keeps it from asking a relay.
+    wall.set(300_000);
+    let finished = runtime
+        .finish_welcome_publish_task(task.run().await)
+        .await
+        .unwrap();
+    assert!(finished.welcome_failures.is_empty());
+    runtime.run_due_maintenance().await.unwrap();
+    let rows = v5_audit_rows(&audit_path);
+    assert!(
+        rows.iter()
+            .all(|row| row["event"]["type"] != "welcome_publish_started"),
+        "the wave asks no relay: {rows:?}"
+    );
+    let rows = rows
+        .into_iter()
+        .filter(|row| row["event"]["type"] == "welcome_withdrawn")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["event"]["reason"], "expired");
 }

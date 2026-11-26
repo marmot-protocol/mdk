@@ -280,6 +280,18 @@ fn openmls_listing_leaves_out_only_rows_the_filter_excludes() {
         ["proposal@3", "app@3", "app@4"]
     );
     assert!(listed(&store, &labels, &[], 0, OpenMlsContentFilter::Commits).is_empty());
+    // Rows with no OpenMLS message, as retained outbound Welcomes are, and
+    // the rows only the engine can judge.
+    assert_eq!(
+        listed(
+            &store,
+            &labels,
+            &GRAPH_STATES,
+            0,
+            OpenMlsContentFilter::NoOpenMlsMessage,
+        ),
+        ["own-echo marker", "unreadable", "pending app@1"]
+    );
     assert_eq!(
         listed(
             &store,

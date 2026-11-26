@@ -30,9 +30,11 @@ use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::group_context::GroupContext;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::{EntropySource, MonotonicClock, WallClock};
-use cgka_traits::message::{MessageState, StoredMessagePayload};
+use cgka_traits::message::{MessageState, StoredMessagePayload, WelcomeExpiry};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{LeaveRequest, RosterTagKey, StorageError, StorageProvider};
+use cgka_traits::storage::{
+    LeaveRequest, OpenMlsContentFilter, RosterTagKey, StorageError, StorageProvider,
+};
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
@@ -70,6 +72,14 @@ pub struct WelcomeDeliveryIndex {
     pub tracked_ids: Vec<MessageId>,
 }
 
+/// The Welcomes [`Engine::unrecorded_welcome_expiries`] found, and the groups
+/// it could not read now.
+#[derive(Debug, Default)]
+pub struct UnrecordedWelcomeExpiries {
+    pub ids: Vec<MessageId>,
+    pub unread_groups: Vec<GroupId>,
+}
+
 /// Owed Welcomes and staged Welcome ids from one pass over the message store.
 #[derive(Debug, Default)]
 pub struct OutboundWelcomeWork {
@@ -96,6 +106,11 @@ pub enum OutboundWelcomeStatus {
         group_id: GroupId,
         message: TransportMessage,
     },
+    /// Its delivery deadline has passed undelivered, so nothing may publish
+    /// it, but it is not marked expired yet ([`Engine::expire_sent_welcome`]):
+    /// an acknowledgement already received may still deliver it. A clock set
+    /// back before the deadline reads it as before.
+    PastDeadline,
     /// Nothing is left to send, for the reason given.
     Settled(WelcomeSettlement),
 }
@@ -111,8 +126,9 @@ pub enum WelcomeSettlement {
     /// Its commit lost to another branch, whether or not convergence has
     /// retired its row yet.
     CommitSuperseded,
-    /// Its delivery deadline passed while its commit was canonical or still
-    /// pending.
+    /// It was marked expired ([`Engine::expire_sent_welcome`]): its delivery
+    /// deadline passed undelivered while its commit was canonical or still
+    /// pending. No clock value changes that.
     Expired,
     /// No retained delivery-aware Welcome has this id.
     Untracked,
@@ -4508,11 +4524,12 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Where the retained outbound Welcome `id` stands for delivery at `now`.
     /// A missing row is settled: there is nothing this engine owes under it.
-    /// So is one whose delivery deadline ([`Self::sent_welcome_deliver_until`])
-    /// is not after `now`: it is never published again (mdk#2628 D40,
-    /// mdk#3589). A Welcome whose commit lost reads as
-    /// superseded, before and after convergence retires its row, and ahead
-    /// of its deadline.
+    /// One whose delivery deadline ([`Self::sent_welcome_deliver_until`]) is
+    /// not after `now` is never published again (mdk#2628 D40, mdk#3589): it
+    /// reads `PastDeadline` until it is marked, then settled as expired. A
+    /// Welcome whose commit lost reads as superseded, before and after
+    /// convergence retires its row, and ahead of its deadline, unless it was
+    /// marked expired first.
     pub fn outbound_welcome_status(
         &self,
         id: &MessageId,
@@ -4553,21 +4570,22 @@ impl<S: StorageProvider> Engine<S> {
                 return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Delivered));
             }
             MessageState::Failed => {
-                // Convergence retires an undelivered Welcome with its commit
-                // when that commit loses; any other retirement is a withdrawal.
-                // An origin that cannot be read now is not guessed at.
-                let superseded = match StoredMessagePayload::decode(&record.payload) {
-                    Ok(payload) => {
-                        self.welcome_origin_state(&record.group_id, &payload)?
-                            == MessageState::EpochInvalidated
+                // An expiry mark settles it for good, whatever happens to its
+                // commit later. Otherwise convergence retires an undelivered
+                // Welcome with its commit when that commit loses; any other
+                // retirement is a withdrawal. An origin that cannot be read
+                // now is not guessed at.
+                let settlement = match StoredMessagePayload::decode(&record.payload) {
+                    Ok(payload) if payload.welcome_expiry().is_some() => WelcomeSettlement::Expired,
+                    Ok(payload)
+                        if self.welcome_origin_state(&record.group_id, &payload)?
+                            == MessageState::EpochInvalidated =>
+                    {
+                        WelcomeSettlement::CommitSuperseded
                     }
-                    Err(_) => false,
+                    _ => WelcomeSettlement::Withdrawn,
                 };
-                return Ok(OutboundWelcomeStatus::Settled(if superseded {
-                    WelcomeSettlement::CommitSuperseded
-                } else {
-                    WelcomeSettlement::Withdrawn
-                }));
+                return Ok(OutboundWelcomeStatus::Settled(settlement));
             }
             _ => return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Untracked)),
         }
@@ -4596,7 +4614,7 @@ impl<S: StorageProvider> Engine<S> {
         if crate::welcome_deadline::stored_welcome_deliver_until(&payload)
             .is_some_and(|deliver_until| now >= deliver_until)
         {
-            return Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired));
+            return Ok(OutboundWelcomeStatus::PastDeadline);
         }
         if origin != MessageState::Processed {
             return Ok(OutboundWelcomeStatus::Waiting);
@@ -4754,6 +4772,142 @@ impl<S: StorageProvider> Engine<S> {
                 "stored message is not an outbound sent record".into(),
             )),
         }
+    }
+
+    /// Mark the retained outbound Welcome `id` expired, if it is owed for
+    /// delivery (an `OutboundWelcome` whose commit is canonical, or a founding
+    /// one) and its delivery deadline has passed at `now` undelivered
+    /// (mdk#3589). A Welcome still staged with its unconfirmed commit is never
+    /// marked: that commit's resumption counts its staged Welcomes, so it
+    /// stays as it is, read by the clock, until the commit confirms and
+    /// promotes it (then it can be marked) or loses (then it is superseded).
+    /// These are the rows withdrawal turns `Failed` too. One write turns its row
+    /// `Failed` and gives its payload the [`WelcomeExpiry::Unrecorded`] mark,
+    /// so it is settled as expired from then on whatever the clock reads:
+    /// nothing publishes it again, a later delivered mark is refused, and
+    /// promotion never re-owes it. A host's explicit reopening, not built
+    /// yet, is the one way back: the row to `Sent` with a new deadline and no
+    /// mark.
+    ///
+    /// Returns the Welcome's mark after the call: `None` when it was not
+    /// marked (not owed, not past its deadline, delivered, withdrawn, its
+    /// commit lost or pending, or no such Welcome). The caller reconciles any acknowledgement it holds
+    /// first, then records the expiry once and says so with
+    /// [`Self::record_sent_welcome_expiry`]. Like withdrawal, this touches
+    /// only the Welcome's own row, so it works before hydration.
+    pub fn expire_sent_welcome(
+        &self,
+        id: &MessageId,
+        now: Timestamp,
+    ) -> Result<Option<WelcomeExpiry>, EngineError> {
+        let mut record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(None),
+            Err(error) => return Err(EngineError::Storage(error)),
+        };
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
+        if record.state == MessageState::Failed {
+            return Ok(payload.welcome_expiry());
+        }
+        let owed = matches!(
+            &payload,
+            StoredMessagePayload::OutboundWelcome { message, .. }
+                if matches!(message.envelope, TransportEnvelope::Welcome { .. })
+        );
+        if record.state != MessageState::Sent
+            || !owed
+            || self.welcome_origin_state(&record.group_id, &payload)? != MessageState::Processed
+            || !crate::welcome_deadline::stored_welcome_deliver_until(&payload)
+                .is_some_and(|deliver_until| now >= deliver_until)
+        {
+            return Ok(None);
+        }
+        let mark = WelcomeExpiry::Unrecorded;
+        record.payload = payload
+            .with_welcome_expiry(Some(mark))
+            .encode()
+            .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        record.state = MessageState::Failed;
+        self.storage.put_message(&record)?;
+        self.audit_group(
+            &record.group_id,
+            crate::audit_helpers::message_state_transition_event(
+                hex::encode(id.as_slice()),
+                Some(MessageState::Sent),
+                MessageState::Failed,
+                Some(record.epoch),
+                "state_update",
+            ),
+        );
+        Ok(Some(mark))
+    }
+
+    /// Note that the expiry of `id` ([`Self::expire_sent_welcome`]) has been
+    /// recorded: its mark becomes [`WelcomeExpiry::Recorded`], so a later
+    /// start records it no more. Any other row is left alone.
+    pub fn record_sent_welcome_expiry(&self, id: &MessageId) -> Result<(), EngineError> {
+        let mut record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(()),
+            Err(error) => return Err(EngineError::Storage(error)),
+        };
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
+        if record.state != MessageState::Failed
+            || payload.welcome_expiry() != Some(WelcomeExpiry::Unrecorded)
+        {
+            return Ok(());
+        }
+        record.payload = payload
+            .with_welcome_expiry(Some(WelcomeExpiry::Recorded))
+            .encode()
+            .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        Ok(self.storage.put_message(&record)?)
+    }
+
+    /// The Welcomes marked expired whose expiry is not recorded yet
+    /// ([`WelcomeExpiry::Unrecorded`]): a stop came between the mark and its
+    /// record. Read from every group's rows, live or not, with
+    /// [`Self::unrecorded_welcome_expiries_in`]. A group whose rows cannot be
+    /// read now is left out and named in `unread_groups`, so one unreadable
+    /// row never hides another group's.
+    pub fn unrecorded_welcome_expiries(&self) -> Result<UnrecordedWelcomeExpiries, EngineError> {
+        let mut found = UnrecordedWelcomeExpiries::default();
+        for group_id in self.storage.list_groups()? {
+            match self.unrecorded_welcome_expiries_in(&group_id) {
+                Ok(ids) => found.ids.extend(ids),
+                Err(_) => found.unread_groups.push(group_id),
+            }
+        }
+        Ok(found)
+    }
+
+    /// [`Self::unrecorded_welcome_expiries`] for one group. Only its `Failed`
+    /// rows that carry no OpenMLS message are read
+    /// ([`OpenMlsContentFilter::NoOpenMlsMessage`]): the mark is only ever
+    /// written on an outbound Welcome's row, never on a failed commit,
+    /// proposal or application.
+    pub fn unrecorded_welcome_expiries_in(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<MessageId>, EngineError> {
+        Ok(self
+            .storage
+            .list_openmls_messages_in_states(
+                group_id,
+                &[MessageState::Failed],
+                EpochId(0),
+                OpenMlsContentFilter::NoOpenMlsMessage,
+            )?
+            .into_iter()
+            .filter(|record| {
+                StoredMessagePayload::decode(&record.payload).is_ok_and(|payload| {
+                    payload.welcome_expiry() == Some(WelcomeExpiry::Unrecorded)
+                })
+            })
+            .map(|record| record.id)
+            .collect())
     }
 
     /// The retained outbound Welcomes of `group_id` that answer the

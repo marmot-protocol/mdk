@@ -100,6 +100,36 @@ pub(in crate::runtime::account_worker) async fn held_after_settle(account_id_hex
     }
 }
 
+static HOLD_AFTER_NOTICE_DRAIN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, SettleHold>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Hold the worker of the account `account_id_hex` at the next top of its
+/// loop, right after it announced the delivery notices queued so far and
+/// before it takes its next command or turn. The first such hold after a
+/// start comes after the startup pass and before any wave or maintenance.
+fn hold_after_notice_drain(account_id_hex: &str) -> (Arc<Notify>, Arc<Notify>) {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    HOLD_AFTER_NOTICE_DRAIN.lock().unwrap().insert(
+        account_id_hex.to_owned(),
+        (entered.clone(), release.clone()),
+    );
+    (entered, release)
+}
+
+/// The worker's side of [`hold_after_notice_drain`].
+pub(in crate::runtime::account_worker) async fn held_after_notice_drain(account_id_hex: &str) {
+    let held = HOLD_AFTER_NOTICE_DRAIN
+        .lock()
+        .unwrap()
+        .remove(account_id_hex);
+    if let Some((entered, release)) = held {
+        entered.notify_one();
+        release.notified().await;
+    }
+}
+
 /// Send a pending-deliveries read to alice's worker, answered once every
 /// wave it started before has settled (W8).
 pub(super) async fn read_pending(
@@ -146,6 +176,34 @@ fn age_welcome_attempts(dir: &tempfile::TempDir) {
             at.0 = at.0.saturating_sub(60 * 60);
         }
         storage.put_transport_fanout(&fanout).unwrap();
+    }
+}
+
+/// Move the delivery deadline of every Welcome alice still owes into the
+/// past, as if the app had stayed closed past it (mdk#3589).
+fn pass_welcome_deadlines(dir: &tempfile::TempDir) {
+    use cgka_traits::storage::{MaintenanceStorage as _, MessageStorage as _};
+    let storage = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .account_storage("alice")
+        .unwrap();
+    for fanout in storage.list_transport_fanouts().unwrap() {
+        if !matches!(
+            fanout.exact_message.envelope,
+            cgka_traits::TransportEnvelope::Welcome { .. }
+        ) {
+            continue;
+        }
+        let mut record = storage.get_message(&fanout.exact_message.id).unwrap();
+        let mut payload =
+            cgka_traits::message::StoredMessagePayload::decode(&record.payload).unwrap();
+        let cgka_traits::message::StoredMessagePayload::OutboundWelcome { deliver_until, .. } =
+            &mut payload
+        else {
+            panic!("an owed Welcome")
+        };
+        *deliver_until = Some(cgka_traits::transport::Timestamp(1));
+        record.payload = payload.encode().unwrap();
+        storage.put_message(&record).unwrap();
     }
 }
 
@@ -1393,5 +1451,138 @@ async fn an_invite_from_before_the_upgrade_is_delivered_but_not_listed() {
         announced |= matches!(event, MarmotAppEvent::InviteDeliveryChanged { .. });
     }
     assert!(announced, "the re-invite is announced");
+    close(&runtime).await;
+}
+
+/// A Welcome whose deadline passed while the app was closed, with nothing
+/// else owed, is announced as soon as the worker starts: the startup pass
+/// records the expiry and the worker publishes its `InviteDeliveryChanged`
+/// with no startup wave to settle. A later start reads it recorded and
+/// queues no notice, so one held back until some later turn would be lost
+/// to a stop before that turn (mdk#3589).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expiry_recorded_at_startup_is_announced_with_no_wave() {
+    let dir = tempfile::tempdir().unwrap();
+    let bob = AccountHome::open(dir.path()).create_account("bob").unwrap();
+    let Alice {
+        app,
+        account,
+        relay,
+        runtime,
+        ..
+    } = alice_with_groups(&dir, []).await;
+    crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    runtime.publish_key_package("bob").await.unwrap();
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    let group = runtime
+        .create_group(
+            "alice",
+            "expired while closed",
+            std::slice::from_ref(&bob.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
+    close(&runtime).await;
+    pass_welcome_deadlines(&dir);
+
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = crate::MarmotAppRuntime::new(app);
+    let mut events = runtime.subscribe();
+    let sent_before = gift_wraps_published(&relay);
+    let (entered, release) = hold_after_notice_drain(&account.account_id_hex);
+    let reconciled = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.reconcile_accounts().await }
+    });
+    timeout(SETTLE, entered.notified())
+        .await
+        .expect("the worker runs its startup pass");
+    let mut announced = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let MarmotAppEvent::InviteDeliveryChanged { delivery, .. } = event
+            && delivery.group_id_hex == hex::encode(group.as_slice())
+        {
+            announced.push(delivery.state);
+        }
+    }
+    release.notify_one();
+    reconciled.await.unwrap().unwrap();
+    assert!(
+        matches!(
+            announced.as_slice(),
+            [cgka_traits::maintenance::WelcomeDeliveryState::Undeliverable { .. }]
+        ),
+        "announced before the worker's first turn: {announced:?}"
+    );
+    assert_eq!(gift_wraps_published(&relay), sent_before);
+    close(&runtime).await;
+}
+
+/// A host's redelivery whose attempt changes the invite's delivery queues a
+/// notice inside the command, which replies without announcing it. The
+/// worker announces it at the top of its loop, as it does every notice a
+/// command or turn queued, before it takes its next command or turn: none
+/// waits for another path to drain it, so a stop right after the reply
+/// cannot lose it (mdk#3589).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redeliverys_notice_is_announced_before_the_workers_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let bob = AccountHome::open(dir.path()).create_account("bob").unwrap();
+    let Alice {
+        app,
+        account,
+        relay,
+        runtime,
+        ..
+    } = alice_with_groups(&dir, []).await;
+    crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    runtime.publish_key_package("bob").await.unwrap();
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    let group = runtime
+        .create_group(
+            "alice",
+            "redelivered",
+            std::slice::from_ref(&bob.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    timeout(SETTLE, drain(&runtime).await)
+        .await
+        .unwrap()
+        .unwrap();
+    let pending = pending_of(&runtime, &group).await;
+    let message_id_hex = pending[0].message_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let _ = runtime.redeliver_welcome("alice", &message_id_hex).await;
+    // Held at the next top of the loop the worker reaches: the one right
+    // after the command, or the one before the next command.
+    let (entered, release) = hold_after_notice_drain(&account.account_id_hex);
+    let drained = drain(&runtime).await;
+    timeout(SETTLE, entered.notified())
+        .await
+        .expect("the worker returns to the top of its loop");
+    let mut announced = 0;
+    while let Ok(event) = events.try_recv() {
+        if let MarmotAppEvent::InviteDeliveryChanged { delivery, .. } = event
+            && delivery.group_id_hex == hex::encode(group.as_slice())
+        {
+            announced += 1;
+        }
+    }
+    release.notify_one();
+    timeout(SETTLE, drained).await.unwrap().unwrap();
+    assert_eq!(announced, 1, "announced before the next turn");
     close(&runtime).await;
 }

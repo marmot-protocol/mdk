@@ -1835,6 +1835,18 @@ async fn run_app_runtime_account_worker(
     'worker: loop {
         // The previous unit has ended: publish what it wrote (mdk#3273).
         client.publish_read_state();
+        // And announce every Welcome delivery notice it queued, whichever
+        // path queued it: the startup pass, a command, a settled wave,
+        // maintenance. A notice is held only in memory, and a later start
+        // queues none for an expiry already recorded (mdk#3589).
+        publish_pending_welcome_delivery_events(
+            &events,
+            &account_id_hex,
+            &account_label,
+            &mut client,
+        );
+        #[cfg(test)]
+        tests::welcome_wave_tests::held_after_notice_drain(&account_id_hex).await;
         // And run beside the writer the Welcome waves it started.
         welcome_runs.adopt(&mut client);
         // An unlinked device stops: no sends, commits, publications or
@@ -1845,6 +1857,13 @@ async fn run_app_runtime_account_worker(
             stop_recovery_runner(&mut recovery_runner, &mut client).await;
             // Its waves stop before its audit recording closes.
             welcome_runs.stop(&mut client).await;
+            // Leaving the loop, announce what the stop settled.
+            publish_pending_welcome_delivery_events(
+                &events,
+                &account_id_hex,
+                &account_label,
+                &mut client,
+            );
             stop_unlinked_worker(&mut client, unlinked).await;
             break 'worker;
         }
@@ -2108,6 +2127,8 @@ async fn run_app_runtime_account_worker(
                 }
                 // The rest are cancelled and joined before the audit closes.
                 welcome_runs.cancel_and_join(Some(&mut client), false).await;
+                // Leaving the loop, announce what the stop settled.
+                publish_pending_welcome_delivery_events(&events, &account_id_hex, &account_label, &mut client);
                 client.finish_audit_recording();
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
@@ -2115,6 +2136,8 @@ async fn run_app_runtime_account_worker(
             stop = &mut shutdown => {
                 if stop.is_ok() {
                     welcome_runs.stop(&mut client).await;
+                    // Leaving the loop, announce what the stop settled.
+                    publish_pending_welcome_delivery_events(&events, &account_id_hex, &account_label, &mut client);
                     client.finish_audit_recording();
                 }
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
@@ -2826,6 +2849,8 @@ async fn run_app_runtime_account_worker(
                         // A outlives the client: its successor continues
                         // the versions (mdk#3273).
                         let mut read_state = client.take_read_state();
+                        // The replacement starts with empty notice queues.
+                        publish_pending_welcome_delivery_events(&events, &account_id_hex, &account_label, &mut client);
                         drop(client);
                         client = loop {
                             let reconnect_wait = shared.observer.performance().observe(RuntimeOp::WorkerReconnectWait);
