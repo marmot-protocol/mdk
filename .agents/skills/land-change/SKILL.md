@@ -250,19 +250,18 @@ Nothing else: no finding lists, no round-by-round history, no diff tour.
 ## 7. Merge (only when asked)
 
 Merge only when the user asks, and only the head that was verified and
-reviewed: confirm `headRefOid` is still the reviewed head and `Required CI` is
-green.
+reviewed: wait until `Required CI` is green and any required approvals
+(including CODEOWNERS) are present, then re-confirm `headRefOid` is still the
+reviewed head.
 
-Squash-merge the reviewed head (with `--match-head-commit` so the merge fails
-if the branch moved):
+Squash-merge the reviewed head immediately (with `--match-head-commit` so the
+merge fails if the branch moved; avoid `--auto` while checks or approvals are
+still pending, since `--match-head-commit` is verified when auto-merge is
+enabled rather than when GitHub later merges):
 
 ```sh
-gh pr merge <pr> --squash --auto --match-head-commit <sha>
+gh pr merge <pr> --squash --match-head-commit <sha>
 ```
-
-If `Required CI` is already green and no approvals are pending, GitHub merges
-immediately; otherwise auto-merge completes as soon as required checks and
-CODEOWNERS reviews clear.
 
 After the merge, confirm the squash commit on master (`gh pr view <pr> --json
 mergeCommit`), delete the branch and your worktree, and report the merged

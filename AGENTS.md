@@ -56,7 +56,7 @@ before adding behavior or bindings.
 | Restate the last response in plain language | `.agents/skills/bro/SKILL.md` |
 | Releases | `release.md` |
 | Writing, reviewing, or pruning tests | `.agents/skills/test-audit/SKILL.md` |
-| Landing a change (verify, review, PR, auto-merge) | `.agents/skills/land-change/SKILL.md` |
+| Landing a change (verify, review, PR, squash-merge) | `.agents/skills/land-change/SKILL.md` |
 | Writing a PR description | `.agents/skills/gh-create-pr/SKILL.md` |
 
 ## Landing changes
@@ -66,8 +66,8 @@ cross-model review happen locally, the team PR gate checks signatures, formattin
 and advisory commit trailers (~1 minute, zero Rust compile), and post-merge `Canary` runs continuously verify `master`.
 Follow `.agents/skills/land-change`: targeted tests plus the end-to-end smoke, two independent cross-model reviews of
 the local diff (`.agents/skills/review-local`) until both recommend merge, a short PR (`.agents/skills/gh-create-pr`)
-brought to green `Required CI` with no conflicts, then a report. Merge (`gh pr merge --auto --squash`) only when the
-user asks.
+brought to green `Required CI` with no conflicts, then a report. Merge (`gh pr merge --squash --match-head-commit <sha>`)
+only when the user asks.
 
 Record three commit trailers on the final signed commit (which GitHub preserves in squash commits under
 `COMMIT_MESSAGES`), and verify them locally with `just pr-trailers-check`:
