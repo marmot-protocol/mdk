@@ -625,8 +625,16 @@ Imported identities can use the durable preflight API instead of `login`:
 1. Call `begin_onboarding(nsec, options)` or
    `begin_external_signer_onboarding(public_key, signer, options)`. Supply the
    same `default_relays` (and optional `inbox_relays`) as new-account creation
-   and a separate set of trusted `discovery_relays`. These methods return a
-   persisted account and snapshot before fetching or publishing Nostr records.
+   and a separate set of trusted `discovery_relays`. Two opt-in flags on
+   `OnboardingOptionsFfi` default to `false`: `create_missing_inbox_list` lets
+   MDK automatically publish the recommended kind-10050 inbox list after
+   complete discovery (including the recommended inbox relay) confirms no
+   signed kind-10050 exists, reporting the accepted list in
+   `snapshot.created_inbox_list`; `pass_device_notice_when_none_found` lets
+   `SingleDevice` pass automatically when complete discovery returns
+   `NoneFound`, while still populating `snapshot.single_device_notice`. These
+   methods return a persisted account and snapshot before fetching or
+   publishing Nostr records.
 2. Display the snapshot steps in their returned order (profile, follows, general
    relays, inbox relays, sign-in chat/history notice (`SingleDevice`), KeyPackage). Use step identities,
    not enum discriminants, as positions. Subscribe with `subscribe_onboarding`, read its initial
@@ -707,7 +715,9 @@ Imported identities can use the durable preflight API instead of `login`:
    `read_relays` and an empty `write_relays`. `cancel_onboarding_repair` dismisses
    a proposal until approval has been recorded.
 5. `retry_onboarding_step` requires an offered `Retry` action; `set_onboarding_discovery_relays`
-   retries with explicitly chosen discovery sources without publishing them.
+   retries with explicitly chosen discovery sources without changing existing
+   published declarations (when `create_missing_inbox_list` is enabled, a
+   complete empty lookup can trigger automatic inbox creation).
    After process restart, read `onboarding_snapshot`, register the external
    signer again if applicable, and run/resume or retry the indicated step.
 6. Enter the normal app only when `snapshot.ready` is true. Normal worker
@@ -772,6 +782,8 @@ endpoint roles keep their original tag occurrences, order and extension fields,
 even when selected with equivalent URL spelling; unrelated tags and content remain unchanged. An unchanged selection returns
 `ManualReview` without an approval action. These manual previews use checkpoint
 version 7 because version 6 readers can only revalidate automatic minimal repairs.
+In-flight automatic missing-inbox creation uses checkpoint version 8 so earlier
+readers cannot discard persisted signed bytes or bypass pre-send freshness checks.
 No binding signature changes are required. Downgrading once any of these formats
 is used is unsupported; use a build that supports
 the checkpoint version. Do not relabel versions or delete checkpoints to
@@ -780,7 +792,12 @@ unsupported evidence with this API.
 
 ### Single-device notice
 
-The historical `SingleDevice` step still pauses before initial KeyPackage publication.
+The historical `SingleDevice` step pauses before initial KeyPackage publication
+by default. When `OnboardingOptionsFfi.pass_device_notice_when_none_found` is
+enabled and complete discovery returns `NoneFound`, the step passes
+automatically while keeping `snapshot.single_device_notice` populated so hosts
+can still display the notice; incomplete discovery, malformed packages, or
+`OtherInstallationPossible` still pause for explicit acknowledgment.
 It explains what signing in alone restores, rather than declaring all multi-device
 use unsupported. Suggested localized copy:
 

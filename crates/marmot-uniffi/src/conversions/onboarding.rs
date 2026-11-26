@@ -508,6 +508,21 @@ impl From<marmot_app::OnboardingRepairProposal> for OnboardingRepairProposalFfi 
         }
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct OnboardingCreatedInboxListFfi {
+    pub relays: Vec<String>,
+    pub event_id: String,
+    pub published_at: u64,
+}
+impl From<marmot_app::OnboardingCreatedInboxList> for OnboardingCreatedInboxListFfi {
+    fn from(value: marmot_app::OnboardingCreatedInboxList) -> Self {
+        Self {
+            relays: value.relays,
+            event_id: value.event_id,
+            published_at: value.published_at,
+        }
+    }
+}
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct OnboardingSnapshotFfi {
     pub account_id_hex: String,
@@ -518,6 +533,8 @@ pub struct OnboardingSnapshotFfi {
     pub proposal: Option<OnboardingRepairProposalFfi>,
     pub single_device_notice: Option<OnboardingSingleDeviceNoticeFfi>,
     pub cancellation_pending: bool,
+    #[uniffi(default = None)]
+    pub created_inbox_list: Option<OnboardingCreatedInboxListFfi>,
 }
 impl From<marmot_app::OnboardingSnapshot> for OnboardingSnapshotFfi {
     fn from(value: marmot_app::OnboardingSnapshot) -> Self {
@@ -528,6 +545,7 @@ impl From<marmot_app::OnboardingSnapshot> for OnboardingSnapshotFfi {
             ready: value.ready,
             steps: value.steps.into_iter().map(Into::into).collect(),
             single_device_notice: value.single_device_notice.map(Into::into),
+            created_inbox_list: value.created_inbox_list.map(Into::into),
             cancellation_pending: value.cancellation_pending,
             proposal: value.proposal.map(Into::into),
         }
@@ -540,6 +558,14 @@ pub struct OnboardingOptionsFfi {
     /// Recommended kind-10050 inbox relays. Empty uses `default_relays`.
     #[uniffi(default = [])]
     pub inbox_relays: Vec<String>,
+    /// Automatically publish a kind-10050 inbox list using the recommended
+    /// default relay when complete discovery confirms none exists.
+    #[uniffi(default = false)]
+    pub create_missing_inbox_list: bool,
+    /// Pass `SingleDevice` automatically when complete discovery finds
+    /// `NoneFound`, while keeping `single_device_notice` in the snapshot.
+    #[uniffi(default = false)]
+    pub pass_device_notice_when_none_found: bool,
 }
 impl From<marmot_app::OnboardingOptions> for OnboardingOptionsFfi {
     fn from(value: marmot_app::OnboardingOptions) -> Self {
@@ -547,6 +573,8 @@ impl From<marmot_app::OnboardingOptions> for OnboardingOptionsFfi {
             default_relays: value.default_relays,
             discovery_relays: value.discovery_relays,
             inbox_relays: value.inbox_relays,
+            create_missing_inbox_list: value.create_missing_inbox_list,
+            pass_device_notice_when_none_found: value.pass_device_notice_when_none_found,
         }
     }
 }
@@ -556,6 +584,8 @@ impl From<OnboardingOptionsFfi> for marmot_app::OnboardingOptions {
             default_relays: value.default_relays,
             discovery_relays: value.discovery_relays,
             inbox_relays: value.inbox_relays,
+            create_missing_inbox_list: value.create_missing_inbox_list,
+            pass_device_notice_when_none_found: value.pass_device_notice_when_none_found,
         }
     }
 }
@@ -1042,5 +1072,25 @@ mod tests {
         ] {
             assert_eq!(OnboardingDeviceDiscoveryFfi::from(native), foreign);
         }
+        let native_opts = marmot_app::OnboardingOptions {
+            default_relays: vec!["wss://default.example".into()],
+            discovery_relays: vec!["wss://index.example".into()],
+            inbox_relays: vec!["wss://inbox.example".into()],
+            create_missing_inbox_list: true,
+            pass_device_notice_when_none_found: true,
+        };
+        let ffi_opts = OnboardingOptionsFfi::from(native_opts.clone());
+        assert!(ffi_opts.create_missing_inbox_list);
+        assert!(ffi_opts.pass_device_notice_when_none_found);
+        assert_eq!(marmot_app::OnboardingOptions::from(ffi_opts), native_opts);
+
+        let created = OnboardingCreatedInboxListFfi::from(marmot_app::OnboardingCreatedInboxList {
+            relays: vec!["wss://inbox.example".into()],
+            event_id: "event-10050".into(),
+            published_at: 1234,
+        });
+        assert_eq!(created.relays, vec!["wss://inbox.example"]);
+        assert_eq!(created.event_id, "event-10050");
+        assert_eq!(created.published_at, 1234);
     }
 }

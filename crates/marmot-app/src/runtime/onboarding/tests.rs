@@ -7,11 +7,40 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use transport_nostr::{DirectoryFetchRequest, DirectoryRelayFetcher};
 use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscription};
 
+impl AccountSetup<'_> {
+    async fn check_onboarding_step(
+        &self,
+        c: &OnboardingCheckpoint,
+        step: OnboardingStep,
+    ) -> (
+        OnboardingStatus,
+        Vec<OnboardingFinding>,
+        Option<NostrTransportEvent>,
+    ) {
+        let mut checkpoint = c.clone();
+        match self
+            .check_onboarding_step_outcome(&mut checkpoint, step)
+            .await
+            .unwrap()
+        {
+            StepCheckOutcome::Checked {
+                status,
+                findings,
+                event,
+            } => (status, findings, event),
+            StepCheckOutcome::CreateMissingInbox(_) => {
+                panic!("check_onboarding_step test helper expects Checked")
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Network {
     events: FixtureMutex<Vec<NostrTransportEvent>>,
     index_events: FixtureMutex<Vec<NostrTransportEvent>>,
     public_indexer_events: FixtureMutex<Vec<NostrTransportEvent>>,
+    endpoint_events: FixtureMutex<HashMap<String, Vec<NostrTransportEvent>>>,
     attempts: FixtureMutex<Vec<NostrTransportEvent>>,
     published_endpoints: FixtureMutex<Vec<Vec<String>>>,
     fail_reads: AtomicBool,
@@ -20,9 +49,13 @@ struct Network {
     inspection_errors: FixtureMutex<HashMap<String, transport_nostr::DirectoryInspectionError>>,
     scripted_inspection_errors:
         FixtureMutex<HashMap<String, Vec<Option<transport_nostr::DirectoryInspectionError>>>>,
+    kind_inspection_errors:
+        FixtureMutex<HashMap<(u64, String), transport_nostr::DirectoryInspectionError>>,
     inspected_endpoints: FixtureMutex<Vec<String>>,
     inspection_signers: FixtureMutex<Vec<(u64, bool)>>,
     inbox_authentication_times_out: AtomicBool,
+    block_inbox_route_check: AtomicBool,
+    inbox_route_checking: Notify,
     publish_failures: FixtureMutex<HashMap<String, cgka_traits::TransportEndpointFailure>>,
     zero_acks: AtomicBool,
     block_publish: AtomicBool,
@@ -75,6 +108,16 @@ impl DirectoryRelayFetcher for Network {
         {
             events.extend(self.public_indexer_events.lock().iter().cloned());
         }
+        {
+            let per_endpoint = self.endpoint_events.lock();
+            for endpoint in &request.endpoints {
+                for (needle, matched) in per_endpoint.iter() {
+                    if endpoint.0.contains(needle) {
+                        events.extend(matched.iter().cloned());
+                    }
+                }
+            }
+        }
         Ok(events
             .iter()
             .filter(|event| {
@@ -102,6 +145,10 @@ impl DirectoryRelayFetcher for Network {
         self.inspection_signers
             .lock()
             .push((kind, signer.is_some()));
+        if kind == 1059 && self.block_inbox_route_check.load(Ordering::SeqCst) {
+            self.inbox_route_checking.notify_waiters();
+            std::future::pending::<()>().await;
+        }
         if kind == 1059 && self.inbox_authentication_times_out.load(Ordering::SeqCst) {
             return Err(if signer.is_some() {
                 transport_nostr::DirectoryInspectionError::AuthenticationTimedOut
@@ -127,10 +174,21 @@ impl DirectoryRelayFetcher for Network {
                 .map_err(|_| transport_nostr::DirectoryInspectionError::TimedOut);
         }
         if let Some(error) = request.endpoints.iter().find_map(|endpoint| {
-            self.inspection_errors
-                .lock()
-                .iter()
-                .find_map(|(needle, error)| endpoint.0.contains(needle).then(|| error.clone()))
+            let by_kind =
+                self.kind_inspection_errors
+                    .lock()
+                    .iter()
+                    .find_map(|((kind, needle), error)| {
+                        (request.queries.iter().any(|query| query.kind == *kind)
+                            && endpoint.0.contains(needle))
+                        .then(|| error.clone())
+                    });
+            by_kind.or_else(|| {
+                self.inspection_errors
+                    .lock()
+                    .iter()
+                    .find_map(|(needle, error)| endpoint.0.contains(needle).then(|| error.clone()))
+            })
         }) {
             return Err(error);
         }
@@ -1527,6 +1585,8 @@ fn options() -> OnboardingOptions {
         default_relays: vec!["wss://default.example".into()],
         discovery_relays: vec!["wss://index.example".into()],
         inbox_relays: Vec::new(),
+        create_missing_inbox_list: false,
+        pass_device_notice_when_none_found: false,
     }
 }
 fn runtime(path: &std::path::Path, network: Arc<Network>) -> MarmotAppRuntime {
@@ -4820,7 +4880,7 @@ fn public_indexers_join_discovery_except_on_loopback_routes() {
         let local = OnboardingOptions {
             default_relays: vec![loopback.into()],
             discovery_relays: vec![loopback.into()],
-            inbox_relays: Vec::new(),
+            ..OnboardingOptions::default()
         };
         let mut sources = local.discovery_relays.clone();
         append_public_indexers(&mut sources, &local, &indexers);
@@ -11843,4 +11903,2572 @@ async fn legacy_signed_checking_repair_stays_exposed_on_blocked_retry() {
             .is_err()
     );
     runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pass_device_notice_when_none_found_passes_only_complete_empty_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = self::runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    let now = unix_now_seconds();
+    *network.events.lock() = vec![
+        signed(&keys, 0, vec![], "{}", now),
+        signed(&keys, 3, vec![], "", now),
+        signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), "wss://default.example".into()]],
+            "",
+            now,
+        ),
+        signed(
+            &keys,
+            10050,
+            vec![vec!["relay".into(), "wss://default.example".into()]],
+            "",
+            now,
+        ),
+    ];
+    runtime
+        .account_setup()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                pass_device_notice_when_none_found: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Complete empty discovery passes SingleDevice and reaches ready in one run_onboarding call.
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert!(snapshot.ready);
+    let device_step = &snapshot.steps[OnboardingStep::SingleDevice.index()];
+    assert_eq!(device_step.status, OnboardingStatus::Passed);
+    let notice = snapshot
+        .single_device_notice
+        .as_ref()
+        .expect("single_device_notice stays populated");
+    assert_eq!(notice.discovery, OnboardingDeviceDiscovery::NoneFound);
+    assert!(notice.discovery_complete);
+    assert_eq!(notice.acknowledged_at, None);
+
+    // Incomplete discovery, malformed packages (with or without d tag), and foreign slots still pause.
+    let manager = runtime.accounts();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    network.fail_reads.store(true, Ordering::SeqCst);
+    manager
+        .account_setup()
+        .check_onboarding_single_device(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(
+        c.snapshot.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    assert_eq!(
+        c.snapshot.single_device_notice.as_ref().unwrap().discovery,
+        OnboardingDeviceDiscovery::Unknown
+    );
+    network.fail_reads.store(false, Ordering::SeqCst);
+
+    // Malformed kind-30443 without a `d` tag: findings non-empty -> Unknown -> NeedsInput.
+    network
+        .events
+        .lock()
+        .push(signed(&keys, 30443, vec![], "missing-d", now));
+    manager
+        .account_setup()
+        .check_onboarding_single_device(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(
+        c.snapshot.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    assert_eq!(
+        c.snapshot.single_device_notice.as_ref().unwrap().discovery,
+        OnboardingDeviceDiscovery::Unknown
+    );
+    network.events.lock().pop();
+
+    // Foreign installation slot -> OtherInstallationPossible -> NeedsInput.
+    network.events.lock().push(signed(
+        &keys,
+        30443,
+        vec![vec!["d".into(), "other-device".into()]],
+        "malformed",
+        now,
+    ));
+    manager
+        .account_setup()
+        .check_onboarding_single_device(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(
+        c.snapshot.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    assert_eq!(
+        c.snapshot.single_device_notice.as_ref().unwrap().discovery,
+        OnboardingDeviceDiscovery::OtherInstallationPossible
+    );
+
+    // set_onboarding_discovery_relays preserves both opt-in flags.
+    let updated = runtime
+        .account_setup()
+        .set_onboarding_discovery_relays(&id, vec!["wss://custom-discovery.example".into()])
+        .await
+        .unwrap();
+    let _ = updated;
+    let reloaded = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert!(reloaded.options.pass_device_notice_when_none_found);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_create_missing_inbox_list_publishes_once_and_advances_smoothly() {
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = self::runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    let now = unix_now_seconds();
+    *network.events.lock() = vec![
+        signed(&keys, 0, vec![], "{}", now),
+        signed(&keys, 3, vec![], "", now),
+        signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), "wss://declared.example".into()]],
+            "",
+            now,
+        ),
+    ];
+    runtime
+        .account_setup()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                default_relays: vec!["wss://default.example".into()],
+                discovery_relays: vec!["wss://index.example".into()],
+                inbox_relays: vec![
+                    "wss://inbox-primary.example".into(),
+                    "wss://inbox-secondary.example".into(),
+                ],
+                create_missing_inbox_list: true,
+                pass_device_notice_when_none_found: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert!(snapshot.ready);
+    assert_eq!(
+        snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::Passed
+    );
+    assert_eq!(
+        snapshot.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::Passed
+    );
+    let created = snapshot
+        .created_inbox_list
+        .as_ref()
+        .expect("created_inbox_list reported on snapshot");
+    assert_eq!(created.relays, vec!["wss://inbox-primary.example"]);
+
+    // Exactly one kind-10050 event published, carrying only the first allowed inbox default.
+    let inbox_attempts: Vec<_> = network
+        .attempts
+        .lock()
+        .iter()
+        .filter(|event| event.kind == 10050)
+        .cloned()
+        .collect();
+    assert_eq!(inbox_attempts.len(), 1);
+    assert_eq!(inbox_attempts[0].id, created.event_id);
+    assert_eq!(inbox_attempts[0].created_at, created.published_at);
+    assert_eq!(
+        inbox_attempts[0].tags,
+        vec![vec![
+            "relay".to_string(),
+            "wss://inbox-primary.example".to_string()
+        ]]
+    );
+
+    // Every publish target was checked during complete discovery; secondary/unchecked relays and public indexers were not published to.
+    let inspected: HashSet<String> = network
+        .inspected_endpoints
+        .lock()
+        .iter()
+        .map(|e| relay_key(e))
+        .collect();
+    assert!(inspected.contains(&relay_key("wss://inbox-primary.example")));
+    let inbox_target_idx = network
+        .attempts
+        .lock()
+        .iter()
+        .position(|e| e.kind == 10050)
+        .unwrap();
+    let targets = network.published_endpoints.lock()[inbox_target_idx].clone();
+    assert!(!targets.is_empty());
+    for target in &targets {
+        assert!(
+            inspected.contains(&relay_key(target)),
+            "published to unchecked target {target}"
+        );
+        assert!(
+            !target.contains("inbox-secondary.example"),
+            "must not publish to unchecked fallback {target}"
+        );
+    }
+    assert!(
+        targets
+            .iter()
+            .any(|t| relay_key(t) == relay_key("wss://inbox-primary.example"))
+    );
+
+    // Directory cache was updated immediately with the created inbox list.
+    assert_eq!(
+        runtime.account_inbox_relays(&id).unwrap(),
+        vec!["wss://inbox-primary.example"]
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_create_missing_inbox_list_respects_existing_incomplete_and_future_records() {
+    let now = unix_now_seconds();
+    let base_events = |keys: &nostr::prelude::Keys| {
+        vec![
+            signed(keys, 0, vec![], "{}", now),
+            signed(keys, 3, vec![], "", now),
+            signed(
+                keys,
+                10002,
+                vec![vec!["r".into(), "wss://declared.example".into()]],
+                "",
+                now,
+            ),
+        ]
+    };
+
+    // 1. Existing kind-10050 sitting ONLY on the recommended inbox relay is discovered and never overwritten.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let runtime = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        *network.events.lock() = base_events(&keys);
+        network.endpoint_events.lock().insert(
+            "inbox-primary.example".into(),
+            vec![signed(
+                &keys,
+                10050,
+                vec![vec!["relay".into(), "wss://existing-inbox.example".into()]],
+                "",
+                now,
+            )],
+        );
+        runtime
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    default_relays: vec!["wss://default.example".into()],
+                    discovery_relays: vec!["wss://index.example".into()],
+                    inbox_relays: vec!["wss://inbox-primary.example".into()],
+                    create_missing_inbox_list: true,
+                    pass_device_notice_when_none_found: false,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
+        assert_eq!(
+            snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::Passed
+        );
+        assert_eq!(snapshot.created_inbox_list, None);
+        assert!(network.attempts.lock().is_empty());
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    // 2. Existing kind-10050 with no usable route (empty tags) pauses at NeedsInput and publishes nothing.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let runtime = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        let mut events = base_events(&keys);
+        events.push(signed(&keys, 10050, vec![], "", now));
+        *network.events.lock() = events;
+        runtime
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
+        assert_eq!(
+            snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::NeedsInput
+        );
+        assert_eq!(snapshot.created_inbox_list, None);
+        assert!(network.attempts.lock().is_empty());
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    // 3. Future-dated kind-10050 pauses at RetryableFailure and publishes nothing.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let runtime = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        let mut events = base_events(&keys);
+        events.push(signed(
+            &keys,
+            10050,
+            vec![vec!["relay".into(), "wss://future.example".into()]],
+            "",
+            now + FUTURE_CLOCK_SKEW + 120,
+        ));
+        *network.events.lock() = events;
+        runtime
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
+        assert_eq!(
+            snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::RetryableFailure
+        );
+        assert_eq!(snapshot.created_inbox_list, None);
+        assert!(network.attempts.lock().is_empty());
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    // 4. Recommended inbox relay fails during discovery -> incomplete -> never auto-creates.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let runtime = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        *network.events.lock() = base_events(&keys);
+        network.inspection_errors.lock().insert(
+            "inbox-primary.example".into(),
+            transport_nostr::DirectoryInspectionError::TimedOut,
+        );
+        runtime
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    default_relays: vec!["wss://default.example".into()],
+                    discovery_relays: vec!["wss://index.example".into()],
+                    inbox_relays: vec!["wss://inbox-primary.example".into()],
+                    create_missing_inbox_list: true,
+                    pass_device_notice_when_none_found: false,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
+        assert_eq!(
+            snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::RetryableFailure
+        );
+        assert_eq!(snapshot.created_inbox_list, None);
+        assert!(network.attempts.lock().is_empty());
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_create_missing_inbox_list_rechecks_after_delayed_external_signer_and_keeps_signed_bytes_on_retry()
+ {
+    let now = unix_now_seconds();
+
+    // Part A: Delayed external signer — a signed kind-10050 appears while waiting for signature.
+    // Freshness check before send detects it and aborts auto-creation without publishing.
+    {
+        #[derive(Clone)]
+        struct DelayedSigner {
+            keys: nostr::prelude::Keys,
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+        impl std::fmt::Debug for DelayedSigner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("DelayedSigner").finish_non_exhaustive()
+            }
+        }
+        impl transport_nostr_peeler::MarmotNostrSigner for DelayedSigner {
+            fn get_public_key(
+                &self,
+            ) -> transport_nostr_peeler::SignerFuture<
+                '_,
+                Result<nostr::prelude::PublicKey, transport_nostr_peeler::MarmotSignerError>,
+            > {
+                transport_nostr_peeler::MarmotNostrSigner::get_public_key(&self.keys)
+            }
+            fn sign_event(
+                &self,
+                unsigned: nostr::prelude::UnsignedEvent,
+            ) -> transport_nostr_peeler::SignerFuture<
+                '_,
+                Result<nostr::prelude::Event, transport_nostr_peeler::MarmotSignerError>,
+            > {
+                let keys = self.keys.clone();
+                let started = self.started.clone();
+                let release = self.release.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    transport_nostr_peeler::MarmotNostrSigner::sign_event(&keys, unsigned).await
+                })
+            }
+            fn nip04_encrypt<'a>(
+                &'a self,
+                public_key: &'a nostr::prelude::PublicKey,
+                content: &'a str,
+            ) -> transport_nostr_peeler::SignerFuture<
+                'a,
+                Result<String, transport_nostr_peeler::MarmotSignerError>,
+            > {
+                transport_nostr_peeler::MarmotNostrSigner::nip04_encrypt(
+                    &self.keys, public_key, content,
+                )
+            }
+            fn nip04_decrypt<'a>(
+                &'a self,
+                public_key: &'a nostr::prelude::PublicKey,
+                payload: &'a str,
+            ) -> transport_nostr_peeler::SignerFuture<
+                'a,
+                Result<String, transport_nostr_peeler::MarmotSignerError>,
+            > {
+                transport_nostr_peeler::MarmotNostrSigner::nip04_decrypt(
+                    &self.keys, public_key, payload,
+                )
+            }
+            fn nip44_encrypt<'a>(
+                &'a self,
+                public_key: &'a nostr::prelude::PublicKey,
+                content: &'a str,
+            ) -> transport_nostr_peeler::SignerFuture<
+                'a,
+                Result<String, transport_nostr_peeler::MarmotSignerError>,
+            > {
+                transport_nostr_peeler::MarmotNostrSigner::nip44_encrypt(
+                    &self.keys, public_key, content,
+                )
+            }
+            fn nip44_decrypt<'a>(
+                &'a self,
+                public_key: &'a nostr::prelude::PublicKey,
+                payload: &'a str,
+            ) -> transport_nostr_peeler::SignerFuture<
+                'a,
+                Result<String, transport_nostr_peeler::MarmotSignerError>,
+            > {
+                transport_nostr_peeler::MarmotNostrSigner::nip44_decrypt(
+                    &self.keys, public_key, payload,
+                )
+            }
+        }
+        impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for DelayedSigner {
+            fn sign_account_identity_proof(
+                &self,
+                request: &cgka_engine::account_identity_proof::AccountIdentityProofRequest,
+            ) -> Result<[u8; 64], String> {
+                let event = request
+                    .proof_event()
+                    .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
+                request.signature_from_signed_event(event)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let runtime = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        *network.events.lock() = vec![
+            signed(&keys, 0, vec![], "{}", now),
+            signed(&keys, 3, vec![], "", now),
+            signed(
+                &keys,
+                10002,
+                vec![vec!["r".into(), "wss://declared.example".into()]],
+                "",
+                now,
+            ),
+        ];
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        runtime
+            .account_setup()
+            .begin_external_signer_onboarding(
+                id.clone(),
+                DelayedSigner {
+                    keys: keys.clone(),
+                    started: started.clone(),
+                    release: release.clone(),
+                },
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+        let run_rt = runtime.clone();
+        let run_id = id.clone();
+        let task =
+            tokio::spawn(async move { run_rt.account_setup().run_onboarding(&run_id).await });
+        timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("external signer should be called for kind-10050");
+        // Another device publishes an inbox list while signing is in flight.
+        let concurrent = signed(
+            &keys,
+            10050,
+            vec![vec![
+                "relay".into(),
+                "wss://concurrent-inbox.example".into(),
+            ]],
+            "",
+            now,
+        );
+        network.events.lock().push(concurrent.clone());
+        release.notify_one();
+        let snapshot = task.await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::Passed
+        );
+        assert_eq!(snapshot.created_inbox_list, None);
+        assert!(
+            network.attempts.lock().is_empty(),
+            "existing 10050 found on pre-send freshness check must not be overwritten"
+        );
+        assert_eq!(
+            runtime.account_inbox_relays(&id).unwrap(),
+            vec!["wss://concurrent-inbox.example"]
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    // Part B: Publish fails (zero acks), process restarts, retry republishes the EXACT signed event bytes.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let first = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        *network.events.lock() = vec![
+            signed(&keys, 0, vec![], "{}", now),
+            signed(&keys, 3, vec![], "", now),
+            signed(
+                &keys,
+                10002,
+                vec![vec!["r".into(), "wss://declared.example".into()]],
+                "",
+                now,
+            ),
+        ];
+        network.zero_acks.store(true, Ordering::SeqCst);
+        first
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+        let failed = first.account_setup().run_onboarding(&id).await.unwrap();
+        assert_eq!(
+            failed.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::RetryableFailure
+        );
+        assert_eq!(failed.created_inbox_list, None);
+        let first_attempt = network
+            .attempts
+            .lock()
+            .iter()
+            .find(|e| e.kind == 10050)
+            .cloned()
+            .expect("first publish attempt recorded");
+        first.shutdown_and_close().await.unwrap();
+
+        // Restart runtime, allow relay ack, and retry.
+        network.zero_acks.store(false, Ordering::SeqCst);
+        let reopened = self::runtime(dir.path(), network.clone());
+        let retried = reopened
+            .account_setup()
+            .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+            .await
+            .unwrap();
+        assert_eq!(
+            retried.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::Passed
+        );
+        let created = retried
+            .created_inbox_list
+            .as_ref()
+            .expect("created_inbox_list set after accepted retry");
+        assert_eq!(created.event_id, first_attempt.id);
+        assert_eq!(created.published_at, first_attempt.created_at);
+        let inbox_attempts: Vec<_> = network
+            .attempts
+            .lock()
+            .iter()
+            .filter(|e| e.kind == 10050)
+            .cloned()
+            .collect();
+        assert_eq!(inbox_attempts.len(), 2);
+        assert_eq!(
+            inbox_attempts[0], inbox_attempts[1],
+            "retry after restart must republish the exact checkpointed signed bytes"
+        );
+        reopened.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_create_missing_inbox_list_restart_before_send_and_previously_seen_guards() {
+    let now = unix_now_seconds();
+    let base_events = |keys: &nostr::prelude::Keys| {
+        vec![
+            signed(keys, 0, vec![], "{}", now),
+            signed(keys, 3, vec![], "", now),
+            signed(
+                keys,
+                10002,
+                vec![vec!["r".into(), "wss://declared.example".into()]],
+                "",
+                now,
+            ),
+        ]
+    };
+
+    // 1. Resuming from a checkpointed `Signed` phase (crash before send started) runs a
+    //    freshness check: if a future-dated 10050 appeared while offline, it aborts without
+    //    sending; if empty and complete, it publishes the exact pre-signed bytes.
+    for future_appeared in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let first = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        *network.events.lock() = base_events(&keys);
+        first
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+        let presigned = signed(
+            &keys,
+            10050,
+            vec![vec!["relay".into(), "wss://default.example".into()]],
+            "",
+            now,
+        );
+        {
+            let manager = first.accounts();
+            let mut c = manager
+                .setup_records()
+                .onboarding_checkpoint(&id)
+                .unwrap()
+                .unwrap();
+            for step in [
+                OnboardingStep::Profile,
+                OnboardingStep::Follows,
+                OnboardingStep::Relays,
+            ] {
+                c.set(step, OnboardingStatus::Passed, Vec::new());
+            }
+            c.records[OnboardingStep::Relays.index()] = Some(base_events(&keys)[2].clone());
+            c.auto_inbox = Some(auto_inbox::PendingAutoInbox {
+                relays: vec!["wss://default.example".into()],
+                targets: vec![
+                    "wss://index.example".into(),
+                    "wss://declared.example".into(),
+                    "wss://default.example".into(),
+                ],
+                phase: auto_inbox::PendingAutoInboxPhase::Signed {
+                    event: presigned.clone(),
+                },
+                may_have_published: Some(false),
+            });
+            c.set(
+                OnboardingStep::InboxRelays,
+                OnboardingStatus::Checking,
+                Vec::new(),
+            );
+            manager.account_setup().save_onboarding(&mut c).unwrap();
+            assert_eq!(c.version, AUTO_INBOX_ONBOARDING_VERSION);
+        }
+        first.shutdown_and_close().await.unwrap();
+
+        if future_appeared {
+            network.events.lock().push(signed(
+                &keys,
+                10050,
+                vec![vec!["relay".into(), "wss://future.example".into()]],
+                "",
+                now + FUTURE_CLOCK_SKEW + 120,
+            ));
+        }
+
+        let reopened = self::runtime(dir.path(), network.clone());
+        let snapshot = reopened.account_setup().run_onboarding(&id).await.unwrap();
+        if future_appeared {
+            assert_eq!(
+                snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+                OnboardingStatus::RetryableFailure
+            );
+            assert_eq!(snapshot.created_inbox_list, None);
+            assert!(network.attempts.lock().is_empty());
+        } else {
+            assert_eq!(
+                snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+                OnboardingStatus::Passed
+            );
+            let created = snapshot.created_inbox_list.as_ref().unwrap();
+            assert_eq!(created.event_id, presigned.id);
+            assert_eq!(created.published_at, presigned.created_at);
+            let inbox_attempts: Vec<_> = network
+                .attempts
+                .lock()
+                .iter()
+                .filter(|e| e.kind == 10050)
+                .cloned()
+                .collect();
+            assert_eq!(inbox_attempts, vec![presigned]);
+        }
+        reopened.shutdown_and_close().await.unwrap();
+    }
+
+    // 2. Previously seen kind-10050 in checkpoint/directory is never overwritten even if a later
+    //    complete discovery returns empty.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let runtime = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        let mut events = base_events(&keys);
+        events.push(signed(&keys, 10050, vec![], "", now));
+        *network.events.lock() = events;
+        runtime
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+        let first_run = runtime.account_setup().run_onboarding(&id).await.unwrap();
+        assert_eq!(
+            first_run.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::NeedsInput
+        );
+        assert!(network.attempts.lock().is_empty());
+
+        // Now remove the kind-10050 from relays and retry InboxRelays: must NOT overwrite!
+        network.events.lock().retain(|e| e.kind != 10050);
+        let retried = runtime
+            .account_setup()
+            .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+            .await
+            .unwrap();
+        assert_eq!(
+            retried.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::NeedsInput
+        );
+        assert_eq!(retried.created_inbox_list, None);
+        assert!(network.attempts.lock().is_empty());
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    // 3. set_onboarding_discovery_relays preserves create_missing_inbox_list and triggers
+    //    automatic creation when the new discovery relays confirm absence.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let runtime = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        *network.events.lock() = base_events(&keys);
+        network.inspection_errors.lock().insert(
+            "index.example".into(),
+            transport_nostr::DirectoryInspectionError::TimedOut,
+        );
+        runtime
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    pass_device_notice_when_none_found: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+        let paused = runtime.account_setup().run_onboarding(&id).await.unwrap();
+        assert!(!paused.ready);
+        assert!(network.attempts.lock().is_empty());
+
+        let switched = runtime
+            .account_setup()
+            .set_onboarding_discovery_relays(&id, vec!["wss://healthy-discovery.example".into()])
+            .await
+            .unwrap();
+        assert!(switched.ready);
+        assert!(switched.created_inbox_list.is_some());
+        let reloaded = runtime
+            .accounts()
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        assert!(reloaded.options.create_missing_inbox_list);
+        assert!(reloaded.options.pass_device_notice_when_none_found);
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+fn auto_inbox_base_events(keys: &nostr::prelude::Keys, now: u64) -> Vec<NostrTransportEvent> {
+    vec![
+        signed(keys, 0, vec![], "{}", now),
+        signed(keys, 3, vec![], "", now),
+        signed(
+            keys,
+            10002,
+            vec![vec!["r".into(), "wss://declared.example".into()]],
+            "",
+            now,
+        ),
+    ]
+}
+
+#[derive(Clone)]
+struct CountingAutoInboxSigner {
+    keys: nostr::prelude::Keys,
+    reject: Arc<AtomicBool>,
+    sign_calls: Arc<std::sync::atomic::AtomicUsize>,
+    fail_discovery_on_sign: Option<Arc<Network>>,
+}
+
+impl std::fmt::Debug for CountingAutoInboxSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CountingAutoInboxSigner")
+            .finish_non_exhaustive()
+    }
+}
+
+impl transport_nostr_peeler::MarmotNostrSigner for CountingAutoInboxSigner {
+    fn get_public_key(
+        &self,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::PublicKey, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::get_public_key(&self.keys)
+    }
+    fn sign_event(
+        &self,
+        unsigned: nostr::prelude::UnsignedEvent,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::Event, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        let keys = self.keys.clone();
+        let reject = self.reject.clone();
+        let calls = self.sign_calls.clone();
+        let net = self.fail_discovery_on_sign.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if reject.load(Ordering::SeqCst) {
+                return Err(transport_nostr_peeler::MarmotSignerError::new(
+                    crate::EXTERNAL_SIGNER_REJECTED,
+                ));
+            }
+            if let Some(net) = net {
+                net.inspection_errors.lock().insert(
+                    "declared.example".into(),
+                    transport_nostr::DirectoryInspectionError::TimedOut,
+                );
+            }
+            transport_nostr_peeler::MarmotNostrSigner::sign_event(&keys, unsigned).await
+        })
+    }
+    fn nip04_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        content: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_encrypt(&self.keys, public_key, content)
+    }
+    fn nip04_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_decrypt(&self.keys, public_key, payload)
+    }
+    fn nip44_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        content: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_encrypt(&self.keys, public_key, content)
+    }
+    fn nip44_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_decrypt(&self.keys, public_key, payload)
+    }
+}
+
+impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for CountingAutoInboxSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &cgka_engine::account_identity_proof::AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        let event = request
+            .proof_event()
+            .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
+        request.signature_from_signed_event(event)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_unusable_newly_created_inbox_pauses_instead_of_passing() {
+    let now = unix_now_seconds();
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = self::runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    *network.events.lock() = auto_inbox_base_events(&keys, now);
+    network.kind_inspection_errors.lock().insert(
+        (1059, "inbox-primary.example".into()),
+        transport_nostr::DirectoryInspectionError::PaymentRequired,
+    );
+    runtime
+        .account_setup()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                default_relays: vec!["wss://default.example".into()],
+                discovery_relays: vec!["wss://index.example".into()],
+                inbox_relays: vec!["wss://inbox-primary.example".into()],
+                create_missing_inbox_list: true,
+                pass_device_notice_when_none_found: true,
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert!(!snapshot.ready);
+    assert_eq!(
+        snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::RetryableFailure
+    );
+    assert!(
+        snapshot.steps[OnboardingStep::InboxRelays.index()]
+            .findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::NoUsableRoute)
+    );
+    assert_eq!(
+        snapshot.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::Pending
+    );
+    assert!(snapshot.created_inbox_list.is_some());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_signed_resume_without_signer_keeps_freshness_check() {
+    let now = unix_now_seconds();
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let first = self::runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    *network.events.lock() = auto_inbox_base_events(&keys, now);
+    first
+        .account_setup()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            BlockingSigner {
+                keys: keys.clone(),
+                block: Arc::new(AtomicBool::new(false)),
+                started: Arc::new(Notify::new()),
+            },
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+    let presigned = signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://default.example".into()]],
+        "",
+        now,
+    );
+    {
+        let manager = first.accounts();
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        for step in [
+            OnboardingStep::Profile,
+            OnboardingStep::Follows,
+            OnboardingStep::Relays,
+        ] {
+            c.set(step, OnboardingStatus::Passed, Vec::new());
+        }
+        c.records[OnboardingStep::Relays.index()] =
+            Some(auto_inbox_base_events(&keys, now)[2].clone());
+        c.auto_inbox = Some(auto_inbox::PendingAutoInbox {
+            relays: vec!["wss://default.example".into()],
+            targets: vec!["wss://default.example".into()],
+            phase: auto_inbox::PendingAutoInboxPhase::Signed { event: presigned },
+            may_have_published: Some(false),
+        });
+        c.set(
+            OnboardingStep::InboxRelays,
+            OnboardingStatus::Checking,
+            Vec::new(),
+        );
+        manager.account_setup().save_onboarding(&mut c).unwrap();
+    }
+    first.shutdown_and_close().await.unwrap();
+
+    // Restart without registering the external signer yet.
+    let reopened = self::runtime(dir.path(), network.clone());
+    let waiting = reopened.account_setup().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        waiting.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::WaitingForSigner
+    );
+    let reloaded = reopened
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            reloaded.auto_inbox.as_ref().map(|p| &p.phase),
+            Some(auto_inbox::PendingAutoInboxPhase::Signed { .. })
+        ),
+        "missing signer must not promote Signed to Sending"
+    );
+
+    // An existing kind-10050 appears before reconnect; reconnecting and running adopts it.
+    network.events.lock().push(signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://appeared.example".into()]],
+        "",
+        now,
+    ));
+    reopened
+        .register_external_signer(
+            &id,
+            BlockingSigner {
+                keys: keys.clone(),
+                block: Arc::new(AtomicBool::new(false)),
+                started: Arc::new(Notify::new()),
+            },
+        )
+        .await
+        .unwrap();
+    let after = reopened.account_setup().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        after.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::Passed
+    );
+    assert_eq!(after.created_inbox_list, None);
+    assert!(network.attempts.lock().is_empty());
+    assert_eq!(
+        reopened.account_inbox_relays(&id).unwrap(),
+        vec!["wss://appeared.example"]
+    );
+    reopened.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_future_dated_record_survives_two_empty_retries() {
+    let now = unix_now_seconds();
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = self::runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    let mut events = auto_inbox_base_events(&keys, now);
+    events.push(signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://future.example".into()]],
+        "",
+        now + FUTURE_CLOCK_SKEW + 120,
+    ));
+    *network.events.lock() = events;
+    runtime
+        .account_setup()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+    let first_run = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        first_run.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::RetryableFailure
+    );
+    network.events.lock().retain(|e| e.kind != 10050);
+    for _ in 0..2 {
+        let retried = runtime
+            .account_setup()
+            .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+            .await
+            .unwrap();
+        assert_eq!(
+            retried.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::NeedsInput
+        );
+        assert_eq!(retried.created_inbox_list, None);
+        assert!(network.attempts.lock().is_empty());
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_refreshes_stale_prerequisites_and_locks_actions_while_sending() {
+    let now = unix_now_seconds();
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = self::runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    *network.events.lock() = auto_inbox_base_events(&keys, now);
+    network.zero_acks.store(true, Ordering::SeqCst);
+    runtime
+        .account_setup()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                pass_device_notice_when_none_found: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+    let paused = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        paused.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::RetryableFailure
+    );
+    // While Sending is persisted, earlier passed steps must not advertise Retry
+    // on either the returned snapshot or a freshly reloaded public snapshot.
+    let reloaded_snapshot = runtime
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
+    for step in [
+        OnboardingStep::Profile,
+        OnboardingStep::Follows,
+        OnboardingStep::Relays,
+    ] {
+        assert!(
+            !paused.steps[step.index()]
+                .actions
+                .contains(&OnboardingAction::Retry),
+            "{step:?} must not advertise Retry while auto-inbox Sending is pending"
+        );
+        assert!(
+            !reloaded_snapshot.steps[step.index()]
+                .actions
+                .contains(&OnboardingAction::Retry),
+            "reloaded {step:?} must not advertise Retry while auto-inbox Sending is pending"
+        );
+        assert!(
+            runtime
+                .account_setup()
+                .retry_onboarding_step(&id, step)
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        paused.steps[OnboardingStep::InboxRelays.index()]
+            .actions
+            .contains(&OnboardingAction::Retry)
+    );
+    // Once Sending started, changing discovery relays or opening manual proposals is refused.
+    assert!(
+        runtime
+            .account_setup()
+            .set_onboarding_discovery_relays(&id, vec!["wss://other.example".into()])
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .account_setup()
+            .propose_onboarding_relays(
+                &id,
+                OnboardingStep::InboxRelays,
+                Some((vec!["wss://other.example".into()], vec![]))
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .account_setup()
+            .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
+            .await
+            .is_err()
+    );
+    // Age Relays past CHECK_MAX_AGE and change kind-10002 on relays before retrying.
+    let stale = unix_now_seconds() - CHECK_MAX_AGE - 10;
+    {
+        let manager = runtime.accounts();
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        c.snapshot.steps[OnboardingStep::Relays.index()].checked_at = Some(stale);
+        manager.account_setup().save_onboarding(&mut c).unwrap();
+    }
+    network.events.lock().push(signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://fresh-declared.example".into()]],
+        "",
+        now + 5,
+    ));
+    network.zero_acks.store(false, Ordering::SeqCst);
+    let done = runtime
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    assert!(done.ready);
+    assert!(done.steps[OnboardingStep::Relays.index()].checked_at > Some(stale));
+    for step in [
+        OnboardingStep::Profile,
+        OnboardingStep::Follows,
+        OnboardingStep::Relays,
+    ] {
+        assert!(
+            done.steps[step.index()]
+                .actions
+                .contains(&OnboardingAction::Retry),
+            "{step:?} should advertise Retry again after Sending finishes"
+        );
+    }
+    assert!(
+        network
+            .inspected_endpoints
+            .lock()
+            .iter()
+            .any(|e| e.contains("fresh-declared.example")),
+        "stale Relays must refresh before SingleDevice runs"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_external_signer_rejection_falls_back_to_manual_selection() {
+    let now = unix_now_seconds();
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = self::runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    *network.events.lock() = auto_inbox_base_events(&keys, now);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    runtime
+        .account_setup()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            CountingAutoInboxSigner {
+                keys: keys.clone(),
+                reject: Arc::new(AtomicBool::new(true)),
+                sign_calls: calls.clone(),
+                fail_discovery_on_sign: None,
+            },
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+    let declined = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    let inbox = &declined.steps[OnboardingStep::InboxRelays.index()];
+    assert_eq!(inbox.status, OnboardingStatus::NeedsInput);
+    assert!(inbox.actions.contains(&OnboardingAction::EditRelays));
+    assert!(
+        inbox
+            .actions
+            .contains(&OnboardingAction::UseRecommendedRelays)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // Retrying InboxRelays does NOT re-prompt the external signer automatically.
+    let retried = runtime
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    assert_eq!(
+        retried.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let proposed = runtime
+        .account_setup()
+        .propose_onboarding_relays(
+            &id,
+            OnboardingStep::InboxRelays,
+            Some((vec!["wss://manual.example".into()], vec![])),
+        )
+        .await
+        .unwrap();
+    assert!(proposed.proposal.is_some());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_external_signer_incomplete_freshness_retries_exact_bytes() {
+    let now = unix_now_seconds();
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = self::runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    *network.events.lock() = auto_inbox_base_events(&keys, now);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    runtime
+        .account_setup()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            CountingAutoInboxSigner {
+                keys: keys.clone(),
+                reject: Arc::new(AtomicBool::new(false)),
+                sign_calls: calls.clone(),
+                fail_discovery_on_sign: Some(network.clone()),
+            },
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+    let incomplete = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        incomplete.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::RetryableFailure
+    );
+    assert!(network.attempts.lock().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    network.inspection_errors.lock().clear();
+    let recovered = runtime
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::Passed
+    );
+    assert!(recovered.created_inbox_list.is_some());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "retry after incomplete freshness must reuse pre-signed bytes without re-signing"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_interrupted_route_check_persists_seen_list_and_retires_signed_candidate() {
+    let now = unix_now_seconds();
+    for with_signed_candidate in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let first = Arc::new(self::runtime(dir.path(), network.clone()));
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        let mut events = auto_inbox_base_events(&keys, now);
+        events.push(signed(
+            &keys,
+            10050,
+            vec![vec!["relay".into(), "wss://existing.example".into()]],
+            "",
+            now,
+        ));
+        *network.events.lock() = events;
+        first
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+        if with_signed_candidate {
+            let presigned = signed(
+                &keys,
+                10050,
+                vec![vec!["relay".into(), "wss://default.example".into()]],
+                "",
+                now - 1,
+            );
+            let manager = first.accounts();
+            let mut c = manager
+                .setup_records()
+                .onboarding_checkpoint(&id)
+                .unwrap()
+                .unwrap();
+            for step in [
+                OnboardingStep::Profile,
+                OnboardingStep::Follows,
+                OnboardingStep::Relays,
+            ] {
+                c.set(step, OnboardingStatus::Passed, Vec::new());
+            }
+            c.records[OnboardingStep::Relays.index()] =
+                Some(auto_inbox_base_events(&keys, now)[2].clone());
+            c.auto_inbox = Some(auto_inbox::PendingAutoInbox {
+                relays: vec!["wss://default.example".into()],
+                targets: vec!["wss://default.example".into()],
+                phase: auto_inbox::PendingAutoInboxPhase::Signed { event: presigned },
+                may_have_published: Some(false),
+            });
+            c.set(
+                OnboardingStep::InboxRelays,
+                OnboardingStatus::Checking,
+                Vec::new(),
+            );
+            manager.account_setup().save_onboarding(&mut c).unwrap();
+        }
+        network
+            .block_inbox_route_check
+            .store(true, Ordering::SeqCst);
+        let entered = network.inbox_route_checking.notified();
+        let run_first = first.clone();
+        let run_id = id.clone();
+        let task =
+            tokio::spawn(async move { run_first.account_setup().run_onboarding(&run_id).await });
+        entered.await;
+        // Interrupt onboarding while awaiting the kind-1059 route check.
+        task.abort();
+        let _ = task.await;
+        let first = Arc::try_unwrap(first)
+            .ok()
+            .expect("only test holds runtime");
+        first.shutdown_and_close().await.unwrap();
+
+        // Resume after restart with complete empty kind-10050 discovery.
+        network
+            .block_inbox_route_check
+            .store(false, Ordering::SeqCst);
+        network.events.lock().retain(|e| e.kind != 10050);
+        let reopened = self::runtime(dir.path(), network.clone());
+        let checkpoint_before = reopened
+            .accounts()
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        assert!(checkpoint_before.seen_signed_inbox_list);
+        assert!(checkpoint_before.auto_inbox.is_none());
+
+        let resumed = reopened.account_setup().run_onboarding(&id).await.unwrap();
+        assert_eq!(
+            resumed.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::NeedsInput
+        );
+        assert_eq!(resumed.created_inbox_list, None);
+        assert!(
+            network.attempts.lock().is_empty(),
+            "interrupted kind-1059 route check must prevent auto-creating a replacement list"
+        );
+        reopened.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_out_reimport_applies_incoming_opt_in_flags_and_unfinished_preserves_them() {
+    let now = unix_now_seconds();
+    // 1. Completed signed-out re-import honors BOTH directions of flag changes
+    //    (true -> false, then false -> true).
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = self::runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    let nsec = Zeroizing::new(keys.secret_key().to_bech32().unwrap());
+    let mut events = auto_inbox_base_events(&keys, now);
+    events.push(signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://inbox.example".into()]],
+        "",
+        now,
+    ));
+    *network.events.lock() = events;
+
+    // First sign-in with BOTH opt-in flags enabled -> passes SingleDevice automatically.
+    runtime
+        .account_setup()
+        .begin_onboarding(
+            nsec.clone(),
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                pass_device_notice_when_none_found: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+    let initial = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert!(initial.ready);
+
+    // Sign out and re-import with flags = false (like legacy marmot_begin_onboarding).
+    runtime
+        .accounts()
+        .app
+        .account_home()
+        .set_account_signed_out(&id, true)
+        .unwrap();
+    network.events.lock().retain(|e| e.kind != 10050);
+    network.attempts.lock().clear();
+    let reset_off = runtime
+        .account_setup()
+        .begin_onboarding(
+            nsec.clone(),
+            OnboardingOptions {
+                create_missing_inbox_list: false,
+                pass_device_notice_when_none_found: false,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!reset_off.ready);
+    let checkpoint_off = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert!(!checkpoint_off.options.create_missing_inbox_list);
+    assert!(!checkpoint_off.options.pass_device_notice_when_none_found);
+
+    // Re-importing while still unfinished must preserve persisted flags (false), even if
+    // the caller passes true.
+    runtime
+        .account_setup()
+        .begin_onboarding(
+            nsec.clone(),
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                pass_device_notice_when_none_found: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+    let checkpoint_unfinished = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert!(!checkpoint_unfinished.options.create_missing_inbox_list);
+    assert!(
+        !checkpoint_unfinished
+            .options
+            .pass_device_notice_when_none_found
+    );
+    let paused_inbox = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        paused_inbox.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::NeedsInput,
+        "flags=false on fresh sign-in must NOT auto-create missing inbox list"
+    );
+    assert!(network.attempts.lock().is_empty());
+
+    // Restore kind-10050 so InboxRelays passes and verify SingleDevice also pauses (false).
+    network.events.lock().push(signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://inbox.example".into()]],
+        "",
+        now + 1,
+    ));
+    let paused_device = runtime
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    assert_eq!(
+        paused_device.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::NeedsInput,
+        "flags=false on fresh sign-in must NOT auto-pass SingleDevice"
+    );
+    assert!(!paused_device.ready);
+
+    // Finish onboarding manually, sign out again, and re-import with flags = true (false -> true).
+    let finished = runtime
+        .account_setup()
+        .acknowledge_onboarding_single_device(&id, paused_device.revision)
+        .await
+        .unwrap();
+    assert!(finished.ready);
+    runtime
+        .accounts()
+        .app
+        .account_home()
+        .set_account_signed_out(&id, true)
+        .unwrap();
+    network.attempts.lock().clear();
+    runtime
+        .account_setup()
+        .begin_onboarding(
+            nsec,
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                pass_device_notice_when_none_found: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+    let checkpoint_on = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert!(checkpoint_on.options.create_missing_inbox_list);
+    assert!(checkpoint_on.options.pass_device_notice_when_none_found);
+    let auto_done = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert!(
+        auto_done.ready,
+        "flags=true on fresh sign-in must re-enable auto-pass SingleDevice"
+    );
+    assert_eq!(
+        auto_done.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::Passed
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_resumes_route_check_from_accepted_event_without_republishing() {
+    let now = unix_now_seconds();
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let first = Arc::new(self::runtime(dir.path(), network.clone()));
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    *network.events.lock() = auto_inbox_base_events(&keys, now);
+    first
+        .account_setup()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                pass_device_notice_when_none_found: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Pause right when the post-acceptance kind-1059 route check begins.
+    network
+        .block_inbox_route_check
+        .store(true, Ordering::SeqCst);
+    let entered = network.inbox_route_checking.notified();
+    let run_first = first.clone();
+    let run_id = id.clone();
+    let task = tokio::spawn(async move { run_first.account_setup().run_onboarding(&run_id).await });
+    entered.await;
+    task.abort();
+    let _ = task.await;
+
+    assert_eq!(
+        network.attempts.lock().len(),
+        1,
+        "auto-inbox kind-10050 should have been published once before route check"
+    );
+    let published_id = network.attempts.lock()[0].id.clone();
+    let first = Arc::try_unwrap(first)
+        .ok()
+        .expect("only test holds runtime");
+    first.shutdown_and_close().await.unwrap();
+
+    // Reopen with kind-10050 discovery still returning empty, and unblock kind-1059.
+    network
+        .block_inbox_route_check
+        .store(false, Ordering::SeqCst);
+    network.events.lock().retain(|e| e.kind != 10050);
+    let reopened = self::runtime(dir.path(), network.clone());
+    let done = reopened.account_setup().run_onboarding(&id).await.unwrap();
+    assert!(done.ready);
+    assert_eq!(
+        done.created_inbox_list
+            .as_ref()
+            .map(|c| c.event_id.as_str()),
+        Some(published_id.as_str())
+    );
+    assert_eq!(
+        network
+            .attempts
+            .lock()
+            .iter()
+            .filter(|e| e.kind == 10050)
+            .count(),
+        1,
+        "resuming post-acceptance route check must not republish kind-10050"
+    );
+
+    // An empty retry keeps the receipt; discovering a newer verified kind-10050 clears it.
+    let after_empty_retry = reopened
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_empty_retry
+            .created_inbox_list
+            .as_ref()
+            .map(|c| c.event_id.as_str()),
+        Some(published_id.as_str()),
+        "empty lookup must keep the created_inbox_list receipt"
+    );
+    network.events.lock().push(signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://newer-inbox.example".into()]],
+        "",
+        now + 10,
+    ));
+    let after_newer = reopened
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_newer.created_inbox_list, None,
+        "a newer verified kind-10050 must clear created_inbox_list"
+    );
+    reopened.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_does_not_overwrite_legacy_cached_inbox_routes() {
+    let now = unix_now_seconds();
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = self::runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    *network.events.lock() = auto_inbox_base_events(&keys, now);
+    runtime
+        .account_setup()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Seed a legacy directory inbox cache entry with created_at == 0 and populated routes.
+    let mut legacy = crate::AccountRelayListStatus::empty();
+    legacy.inbox = crate::AccountRelayListState {
+        kind: crate::KIND_MARMOT_INBOX_RELAY_LIST,
+        created_at: 0,
+        relays: vec!["wss://legacy-inbox.example".into()],
+        read_relays: Vec::new(),
+        write_relays: Vec::new(),
+    };
+    legacy.refresh();
+    runtime
+        .accounts()
+        .app
+        .directory()
+        .remember_directory_relay_lists(&id, &legacy)
+        .unwrap();
+
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        snapshot.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    assert_eq!(snapshot.created_inbox_list, None);
+    assert!(
+        network.attempts.lock().is_empty(),
+        "legacy cached inbox routes must suppress automatic kind-10050 publication"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_definitive_publish_refusal_unlocks_relay_edit_while_uncertain_send_keeps_sending()
+ {
+    use cgka_traits::{
+        TransportEndpointFailure, TransportEndpointFailureKind as Kind,
+        TransportEndpointRejectionCategory as Cat,
+    };
+    let now = unix_now_seconds();
+
+    // 1. Definitive refusal on every target with no prior exposure retains the
+    //    original signed bytes in `auto_inbox` (`may_have_published == Some(false)`),
+    //    advertises Retry + EditRelays + CancelRepair + EditDiscoveryRelays, and
+    //    Retry after restart republishes the exact original bytes without
+    //    re-invoking the external signer.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let first = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        *network.events.lock() = auto_inbox_base_events(&keys, now);
+        network.publish_failures.lock().insert(
+            "wss://".into(),
+            TransportEndpointFailure {
+                endpoint: TransportEndpoint("wss://default.example".into()),
+                kind: Kind::TerminalRejected,
+                rejection_category: Some(Cat::Blocked),
+                reason: "blocked: policy".into(),
+                size_class: None,
+                pre_send: false,
+            },
+        );
+        let sign_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        first
+            .account_setup()
+            .begin_external_signer_onboarding(
+                id.clone(),
+                CountingAutoInboxSigner {
+                    keys: keys.clone(),
+                    reject: Arc::new(AtomicBool::new(false)),
+                    sign_calls: sign_calls.clone(),
+                    fail_discovery_on_sign: None,
+                },
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+
+        let refused = first.account_setup().run_onboarding(&id).await.unwrap();
+        let step = &refused.steps[OnboardingStep::InboxRelays.index()];
+        assert_eq!(step.status, OnboardingStatus::RetryableFailure);
+        assert!(
+            step.findings
+                .iter()
+                .any(|f| f.issue == OnboardingIssue::AccessRestricted),
+            "expected typed per-relay refusal finding: {:?}",
+            step.findings
+        );
+        assert!(step.actions.contains(&OnboardingAction::Retry));
+        assert!(step.actions.contains(&OnboardingAction::EditRelays));
+        assert!(step.actions.contains(&OnboardingAction::CancelRepair));
+        assert!(
+            step.actions
+                .contains(&OnboardingAction::EditDiscoveryRelays)
+        );
+        assert_eq!(sign_calls.load(Ordering::SeqCst), 1);
+
+        let checkpoint = first
+            .accounts()
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        let original_event = match checkpoint.auto_inbox.as_ref() {
+            Some(auto_inbox::PendingAutoInbox {
+                phase: auto_inbox::PendingAutoInboxPhase::Sending { event },
+                may_have_published: Some(false),
+                ..
+            }) => event.clone(),
+            other => panic!("expected unexposed Sending auto_inbox, got {other:?}"),
+        };
+
+        // Immediate in-process Retry while targets still definitively refuse:
+        // resends the exact original signed bytes without calling the external
+        // signer again and keeps `may_have_published == Some(false)` + edit actions.
+        let retried_in_process = first
+            .account_setup()
+            .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+            .await
+            .unwrap();
+        let step_after_retry = &retried_in_process.steps[OnboardingStep::InboxRelays.index()];
+        assert_eq!(step_after_retry.status, OnboardingStatus::RetryableFailure);
+        assert!(step_after_retry.actions.contains(&OnboardingAction::Retry));
+        assert!(
+            step_after_retry
+                .actions
+                .contains(&OnboardingAction::EditRelays)
+        );
+        assert!(
+            step_after_retry
+                .actions
+                .contains(&OnboardingAction::CancelRepair)
+        );
+        assert!(
+            step_after_retry
+                .actions
+                .contains(&OnboardingAction::EditDiscoveryRelays)
+        );
+        assert_eq!(
+            sign_calls.load(Ordering::SeqCst),
+            1,
+            "immediate in-process Retry must not re-invoke the external signer"
+        );
+        {
+            let published_so_far: Vec<_> = network
+                .attempts
+                .lock()
+                .iter()
+                .filter(|e| e.kind == 10050)
+                .cloned()
+                .collect();
+            assert_eq!(published_so_far.len(), 2);
+            assert_eq!(published_so_far[0], original_event);
+            assert_eq!(published_so_far[1], original_event);
+        }
+        first.shutdown_and_close().await.unwrap();
+
+        // Restart, unblock the relay, and Retry: must republish the exact
+        // original signed bytes without calling the external signer again.
+        network.publish_failures.lock().clear();
+        let reopened = self::runtime(dir.path(), network.clone());
+        reopened
+            .register_external_signer(
+                &id,
+                CountingAutoInboxSigner {
+                    keys: keys.clone(),
+                    reject: Arc::new(AtomicBool::new(false)),
+                    sign_calls: sign_calls.clone(),
+                    fail_discovery_on_sign: None,
+                },
+            )
+            .await
+            .unwrap();
+        let retried = reopened
+            .account_setup()
+            .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+            .await
+            .unwrap();
+        assert_eq!(
+            retried.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::Passed
+        );
+        assert_eq!(
+            sign_calls.load(Ordering::SeqCst),
+            1,
+            "Retry after restart on a definitively refused auto-inbox must not re-invoke the external signer"
+        );
+        let published_inbox: Vec<_> = network
+            .attempts
+            .lock()
+            .iter()
+            .filter(|e| e.kind == 10050)
+            .cloned()
+            .collect();
+        assert_eq!(published_inbox.len(), 3);
+        assert_eq!(published_inbox[0], original_event);
+        assert_eq!(published_inbox[1], original_event);
+        assert_eq!(published_inbox[2], original_event);
+        reopened.shutdown_and_close().await.unwrap();
+    }
+
+    // 2. Choosing EditRelays or CancelRepair after definitive refusal clears
+    //    the unexposed signed event so the user can proceed with updated relays.
+    for cancel_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let runtime = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        *network.events.lock() = auto_inbox_base_events(&keys, now);
+        network.publish_failures.lock().insert(
+            "wss://".into(),
+            TransportEndpointFailure {
+                endpoint: TransportEndpoint("wss://default.example".into()),
+                kind: Kind::TerminalRejected,
+                rejection_category: Some(Cat::Blocked),
+                reason: "blocked: policy".into(),
+                size_class: None,
+                pre_send: false,
+            },
+        );
+        runtime
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+
+        let refused = runtime.account_setup().run_onboarding(&id).await.unwrap();
+        assert_eq!(
+            refused.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::RetryableFailure
+        );
+        if cancel_first {
+            let cancelled = runtime
+                .account_setup()
+                .cancel_onboarding_repair(&id)
+                .await
+                .unwrap();
+            assert!(
+                cancelled.steps[OnboardingStep::InboxRelays.index()]
+                    .actions
+                    .contains(&OnboardingAction::EditRelays)
+            );
+            let checkpoint = runtime
+                .accounts()
+                .setup_records()
+                .onboarding_checkpoint(&id)
+                .unwrap()
+                .unwrap();
+            assert!(checkpoint.auto_inbox.is_none());
+            assert!(checkpoint.auto_inbox_declined);
+        }
+        let proposed = runtime
+            .account_setup()
+            .propose_onboarding_relays(
+                &id,
+                OnboardingStep::InboxRelays,
+                Some((vec!["wss://writable-inbox.example".into()], vec![])),
+            )
+            .await
+            .unwrap();
+        assert!(proposed.proposal.is_some());
+        let checkpoint = runtime
+            .accounts()
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        assert!(checkpoint.auto_inbox.is_none());
+        assert!(checkpoint.auto_inbox_declined);
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    // 3. An interrupted prior publish attempt stays conservatively exposed:
+    //    even if a restart sees only definitive refusals, `Sending` stays active
+    //    and EditRelays + CancelRepair remain blocked so Retry republishes exact signed bytes.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let first = Arc::new(self::runtime(dir.path(), network.clone()));
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        *network.events.lock() = auto_inbox_base_events(&keys, now);
+        first
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+
+        let hold = first
+            .accounts()
+            .account_setup()
+            .install_onboarding_publication_hold();
+        let run_first = first.clone();
+        let run_id = id.clone();
+        let task =
+            tokio::spawn(async move { run_first.account_setup().run_onboarding(&run_id).await });
+        hold.entered.notified().await;
+        task.abort();
+        let _ = task.await;
+        let first = Arc::try_unwrap(first)
+            .ok()
+            .expect("only test holds runtime");
+        first.shutdown_and_close().await.unwrap();
+
+        network.publish_failures.lock().insert(
+            "wss://".into(),
+            TransportEndpointFailure {
+                endpoint: TransportEndpoint("wss://default.example".into()),
+                kind: Kind::TerminalRejected,
+                rejection_category: Some(Cat::Blocked),
+                reason: "blocked: policy".into(),
+                size_class: None,
+                pre_send: false,
+            },
+        );
+        let reopened = self::runtime(dir.path(), network.clone());
+        let resumed = reopened.account_setup().run_onboarding(&id).await.unwrap();
+        let step = &resumed.steps[OnboardingStep::InboxRelays.index()];
+        assert_eq!(step.status, OnboardingStatus::RetryableFailure);
+        assert!(step.actions.contains(&OnboardingAction::Retry));
+        assert!(
+            !step.actions.contains(&OnboardingAction::EditRelays),
+            "interrupted prior publish must stay conservatively exposed and block EditRelays"
+        );
+        assert!(
+            !step.actions.contains(&OnboardingAction::CancelRepair),
+            "interrupted prior publish must stay conservatively exposed and block CancelRepair"
+        );
+        assert!(
+            reopened
+                .account_setup()
+                .propose_onboarding_relays(
+                    &id,
+                    OnboardingStep::InboxRelays,
+                    Some((vec!["wss://writable-inbox.example".into()], vec![])),
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            reopened
+                .account_setup()
+                .cancel_onboarding_repair(&id)
+                .await
+                .is_err()
+        );
+        assert!(
+            reopened
+                .account_setup()
+                .set_onboarding_discovery_relays(&id, vec!["wss://other-discovery.example".into()])
+                .await
+                .is_err()
+        );
+        reopened.shutdown_and_close().await.unwrap();
+    }
+
+    // 4. Editing discovery relays on a definitively refused auto-inbox is
+    //    allowed and clears the unexposed signed event.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let runtime = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        *network.events.lock() = auto_inbox_base_events(&keys, now);
+        network.publish_failures.lock().insert(
+            "wss://".into(),
+            TransportEndpointFailure {
+                endpoint: TransportEndpoint("wss://default.example".into()),
+                kind: Kind::TerminalRejected,
+                rejection_category: Some(Cat::Blocked),
+                reason: "blocked: policy".into(),
+                size_class: None,
+                pre_send: false,
+            },
+        );
+        runtime
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+        let refused = runtime.account_setup().run_onboarding(&id).await.unwrap();
+        assert_eq!(
+            refused.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::RetryableFailure
+        );
+        // Switching discovery relays clears the unexposed signed event and
+        // allows discovery to find a list on the new source set.
+        network.publish_failures.lock().clear();
+        network.events.lock().push(signed(
+            &keys,
+            10050,
+            vec![vec![
+                "relay".into(),
+                "wss://discovered-inbox.example".into(),
+            ]],
+            "",
+            now + 5,
+        ));
+        let updated = runtime
+            .account_setup()
+            .set_onboarding_discovery_relays(&id, vec!["wss://other-discovery.example".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.steps[OnboardingStep::InboxRelays.index()].status,
+            OnboardingStatus::Passed
+        );
+        assert_eq!(updated.created_inbox_list, None);
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_verifying_resume_ingests_into_directory_without_republishing() {
+    let now = unix_now_seconds();
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let first = self::runtime(dir.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    *network.events.lock() = auto_inbox_base_events(&keys, now);
+    first
+        .account_setup()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                create_missing_inbox_list: true,
+                pass_device_notice_when_none_found: true,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Simulate a crash right after `Verifying` was persisted and BEFORE
+    // `ingest_directory_relay_event` ran (directory cache has no inbox list yet).
+    let accepted_event = signed(
+        &keys,
+        10050,
+        vec![vec!["relay".into(), "wss://default.example".into()]],
+        "",
+        now,
+    );
+    {
+        let manager = first.accounts();
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        for step in [
+            OnboardingStep::Profile,
+            OnboardingStep::Follows,
+            OnboardingStep::Relays,
+        ] {
+            c.set(step, OnboardingStatus::Passed, Vec::new());
+        }
+        c.records[OnboardingStep::Relays.index()] =
+            Some(auto_inbox_base_events(&keys, now)[2].clone());
+        c.records[OnboardingStep::InboxRelays.index()] = Some(accepted_event.clone());
+        c.seen_signed_inbox_list = true;
+        c.snapshot.created_inbox_list = Some(OnboardingCreatedInboxList {
+            relays: vec!["wss://default.example".into()],
+            event_id: accepted_event.id.clone(),
+            published_at: accepted_event.created_at,
+        });
+        c.auto_inbox = Some(auto_inbox::PendingAutoInbox {
+            relays: vec!["wss://default.example".into()],
+            targets: vec!["wss://default.example".into()],
+            phase: auto_inbox::PendingAutoInboxPhase::Verifying {
+                event: accepted_event.clone(),
+                accepted_endpoints: vec!["wss://default.example".into()],
+            },
+            may_have_published: Some(true),
+        });
+        c.set(
+            OnboardingStep::InboxRelays,
+            OnboardingStatus::Checking,
+            Vec::new(),
+        );
+        manager.account_setup().save_onboarding(&mut c).unwrap();
+    }
+    assert!(first.account_inbox_relays(&id).unwrap().is_empty());
+    first.shutdown_and_close().await.unwrap();
+
+    let reopened = self::runtime(dir.path(), network.clone());
+    let done = reopened.account_setup().run_onboarding(&id).await.unwrap();
+    assert!(done.ready);
+    assert_eq!(
+        done.created_inbox_list
+            .as_ref()
+            .map(|c| c.event_id.as_str()),
+        Some(accepted_event.id.as_str())
+    );
+    assert_eq!(
+        reopened.account_inbox_relays(&id).unwrap(),
+        vec!["wss://default.example"]
+    );
+    assert_eq!(
+        network
+            .attempts
+            .lock()
+            .iter()
+            .filter(|e| e.kind == 10050)
+            .count(),
+        0,
+        "resuming Verifying must ingest and verify without republishing kind-10050"
+    );
+    reopened.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_inbox_superseded_by_newer_directory_declaration_verifies_effective_route() {
+    let now = unix_now_seconds();
+    // Cover both cases:
+    // - newer_on_network = true: newer list is present in both cache and network.
+    // - newer_on_network = false: newer list is ONLY in the local directory cache
+    //   while the lagging relay serves ONLY the older accepted event (whose
+    //   route `wss://default.example` would pass if mistakenly verified).
+    for newer_on_network in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let runtime = self::runtime(dir.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        let newer_inbox = signed(
+            &keys,
+            10050,
+            vec![vec!["relay".into(), "wss://newer-unusable.example".into()]],
+            "",
+            now + 10,
+        );
+        let older_accepted = signed(
+            &keys,
+            10050,
+            vec![vec!["relay".into(), "wss://default.example".into()]],
+            "",
+            now,
+        );
+        let mut events = auto_inbox_base_events(&keys, now);
+        if newer_on_network {
+            events.push(newer_inbox.clone());
+        } else {
+            events.push(older_accepted.clone());
+        }
+        *network.events.lock() = events;
+        // The newer effective inbox relay refuses kind-1059 reads while the
+        // older auto-created relay (`wss://default.example`) answers cleanly.
+        network.kind_inspection_errors.lock().insert(
+            (1059, "newer-unusable.example".into()),
+            transport_nostr::DirectoryInspectionError::PaymentRequired,
+        );
+        runtime
+            .account_setup()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    create_missing_inbox_list: true,
+                    pass_device_notice_when_none_found: true,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Directory already learned of the newer kind-10050 while an older
+        // auto-created event was accepted by a lagging relay (`Verifying`).
+        runtime
+            .accounts()
+            .app
+            .directory()
+            .ingest_directory_relay_event(DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://index.example".into())],
+                event: newer_inbox.clone(),
+            })
+            .unwrap();
+        {
+            let manager = runtime.accounts();
+            let mut c = manager
+                .setup_records()
+                .onboarding_checkpoint(&id)
+                .unwrap()
+                .unwrap();
+            for step in [
+                OnboardingStep::Profile,
+                OnboardingStep::Follows,
+                OnboardingStep::Relays,
+            ] {
+                c.set(step, OnboardingStatus::Passed, Vec::new());
+            }
+            c.records[OnboardingStep::Relays.index()] =
+                Some(auto_inbox_base_events(&keys, now)[2].clone());
+            c.records[OnboardingStep::InboxRelays.index()] = Some(older_accepted.clone());
+            c.seen_signed_inbox_list = true;
+            c.snapshot.created_inbox_list = Some(OnboardingCreatedInboxList {
+                relays: vec!["wss://default.example".into()],
+                event_id: older_accepted.id.clone(),
+                published_at: older_accepted.created_at,
+            });
+            c.auto_inbox = Some(auto_inbox::PendingAutoInbox {
+                relays: vec!["wss://default.example".into()],
+                targets: vec!["wss://default.example".into()],
+                phase: auto_inbox::PendingAutoInboxPhase::Verifying {
+                    event: older_accepted,
+                    accepted_endpoints: vec!["wss://default.example".into()],
+                },
+                may_have_published: Some(true),
+            });
+            c.set(
+                OnboardingStep::InboxRelays,
+                OnboardingStatus::Checking,
+                Vec::new(),
+            );
+            manager.account_setup().save_onboarding(&mut c).unwrap();
+        }
+
+        let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
+        assert!(
+            !snapshot.ready,
+            "newer_on_network={newer_on_network}: must not pass InboxRelays or publish KeyPackage when the effective newer inbox is unusable"
+        );
+        let inbox = &snapshot.steps[OnboardingStep::InboxRelays.index()];
+        assert_eq!(inbox.status, OnboardingStatus::RetryableFailure);
+        assert!(
+            inbox
+                .findings
+                .iter()
+                .any(|f| f.issue == OnboardingIssue::NoUsableRoute),
+            "expected NoUsableRoute finding: {:?}",
+            inbox.findings
+        );
+        assert!(
+            inbox.findings.iter().any(|f| {
+                f.issue == OnboardingIssue::PaymentRequired
+                    && f.endpoint
+                        .as_deref()
+                        .is_some_and(|e| e.contains("newer-unusable.example"))
+            }),
+            "must verify the newer effective route rather than the lagging old route: {:?}",
+            inbox.findings
+        );
+        assert_eq!(snapshot.created_inbox_list, None);
+        assert!(
+            network
+                .attempts
+                .lock()
+                .iter()
+                .all(|e| e.kind != 443 && e.kind != 10051),
+            "must not publish KeyPackage while the effective inbox is unusable"
+        );
+
+        // Retrying while the lagging relay still serves only the older record
+        // must continue verifying the newer effective cached route, never the old one.
+        if !newer_on_network {
+            let retried = runtime
+                .account_setup()
+                .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+                .await
+                .unwrap();
+            assert!(!retried.ready);
+            assert_eq!(
+                retried.steps[OnboardingStep::InboxRelays.index()].status,
+                OnboardingStatus::RetryableFailure
+            );
+            assert!(
+                network
+                    .attempts
+                    .lock()
+                    .iter()
+                    .all(|e| e.kind != 443 && e.kind != 10051)
+            );
+        }
+        runtime.shutdown_and_close().await.unwrap();
+    }
 }

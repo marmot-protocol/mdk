@@ -228,8 +228,14 @@ context retain nonblocking cleanup to avoid deadlock and are not a process-teard
 
 `MarmotOnboardingFinding` includes typed context, check purpose and outcome,
 declared capability, an owned `actions`/`actions_len` array, and optional
-`has_observed_revision`/`observed_revision`. Free all nested findings and actions
-through `marmot_onboarding_snapshot_free`; do not free the arrays separately.
+`has_observed_revision`/`observed_revision`. Free all nested findings, actions,
+and any `created_inbox_list` through `marmot_onboarding_snapshot_free`; do not
+free nested fields separately. Use `marmot_begin_onboarding_with_options` with
+`MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST` (`1`) and/or
+`MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND` (`2`) to opt in to
+automatic missing-inbox creation or passing the `SingleDevice` step on complete
+`NoneFound` discovery (`marmot_begin_onboarding` passes `0`, and unknown flag
+bits return `MARMOT_STATUS_INVALID_ARGUMENT`).
 See the shared [diagnostic evidence limits](../marmot-uniffi/README.md#interactive-account-onboarding)
 before interpreting query success as relay capability or publication evidence.
 
