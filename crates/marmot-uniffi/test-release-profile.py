@@ -752,9 +752,12 @@ class ReleaseProfileTests(unittest.TestCase):
             self.assertNotIn("embed-bitcode=no", row["darwin_rustflags"] or "")
         self.assertTrue((crate / extras["output"]).exists())
 
-    def test_automatic_profile_workflow_only_validates_candidate_packages(self):
+    def test_candidate_profile_workflow_only_validates_candidate_packages(self):
         text = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
-        self.assertIn("pull_request:", text)
+        trigger = text.split("permissions:", 1)[0]
+        self.assertIn("workflow_dispatch:", trigger)
+        self.assertNotIn("pull_request:", trigger)
+        self.assertNotIn("push:", trigger)
         self.assertNotIn("measure-release-profile.py", text)
         self.assertNotIn("release-profile-measurements", text)
         self.assertIn("./crates/marmot-uniffi/kotlin-bindings.sh generate", text)
@@ -768,11 +771,11 @@ class ReleaseProfileTests(unittest.TestCase):
         ):
             self.assertEqual(text.count(invocation), 1, invocation)
 
-    def test_automatic_profile_workflow_binds_same_run_inputs_to_exact_head(self):
+    def test_candidate_profile_workflow_binds_same_run_inputs_to_exact_head(self):
         text = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
-        self.assertIn("github.event.pull_request.number || github.run_id", text)
+        self.assertIn("group: marmotkit-profile-${{ github.ref }}", text)
         self.assertNotIn("group: marmotkit-profile-${{ github.event.pull_request.head.sha", text)
-        self.assertIn("github.event.pull_request.head.sha || github.sha", text)
+        self.assertIn("ref: ${{ github.sha }}", text)
         self.assertIn("actions/download-artifact@", text)
         self.assertIn("build-provenance.py verify android", text)
         self.assertIn("build-provenance.py verify ios", text)
@@ -781,37 +784,9 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertNotIn("run-id:", text)
         self.assertGreaterEqual(text.count("MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}"), 2)
 
-    def test_automatic_profile_workflow_limits_cost_and_preserves_diagnostics(self):
+    def test_candidate_profile_workflow_limits_cost_and_preserves_diagnostics(self):
         text = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
-        trigger = text.split("permissions:", 1)[0]
-        excluded = [
-            line.strip().removeprefix("- ").strip('"').strip("'")
-            for line in trigger.splitlines()
-            if line.strip().startswith(("- \"!crates/marmot-uniffi/", "- '!crates/marmot-uniffi/"))
-        ]
-
-        def github_glob_matches(path, pattern):
-            expression = ""
-            index = 0
-            while index < len(pattern):
-                if pattern.startswith("**", index):
-                    expression += ".*"
-                    index += 2
-                elif pattern[index] == "*":
-                    expression += "[^/]*"
-                    index += 1
-                else:
-                    expression += re.escape(pattern[index])
-                    index += 1
-            return re.fullmatch(expression, path) is not None
-
-        for document in HERE.rglob("*.md"):
-            relative = document.relative_to(ROOT).as_posix()
-            self.assertTrue(
-                any(github_glob_matches(relative, pattern.removeprefix("!")) for pattern in excluded),
-                f"Markdown-only change would still trigger packaging: {relative}",
-            )
-        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", text)
+        self.assertIn("cancel-in-progress: false", text)
         self.assertGreaterEqual(text.count("error: sdkmanager not found under $sdk_root"), 1)
         apple_build = text.split("  apple-build:", 1)[1].split("  android-build:", 1)[0]
         self.assertIn("if: matrix.part == 'swift'", apple_build)

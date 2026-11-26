@@ -202,13 +202,7 @@ class SignaturePolicyTests(unittest.TestCase):
                     return bool(needs) and any(gated(parent, visited | {job}) for parent in
                         re.findall(r"[a-z0-9][a-z0-9-]*", needs[1]))
                 for job, body in jobs.items():
-                    if (path.name, job) == ("bindings-profile.yml", "report-master-failure"):
-                        # It must run after a failure, so it may use always(), but only on master.
-                        self.assertTrue(gated(job))
-                        self.assertIn("    if: always() && github.event_name != 'pull_request' && "
-                                      "github.ref == 'refs/heads/master' && "
-                                      "needs.candidate-validation.result == 'failure'", body.splitlines())
-                    elif job not in {"required-ci", "candidate-validation", "merge-group-fail-fast"}:
+                    if job not in {"required-ci", "candidate-validation", "merge-group-fail-fast"}:
                         self.assertTrue(gated(job), f"{path.name}:{job} can run before signatures")
                         self.assertNotRegex(body, r"(?m)^    if:.*(?:always|failure|cancelled)\(")
 
@@ -227,43 +221,21 @@ class SignaturePolicyTests(unittest.TestCase):
 
 
 class PackagingPolicyTests(unittest.TestCase):
-    def test_label_events_cannot_replace_candidate_check_results(self):
-        workflow = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
-        self.assertIn("types: [opened, synchronize, reopened]", workflow)
-        self.assertNotIn("labeled", workflow)
+    def test_packaging_workflows_do_not_trigger_on_pr_or_master_push(self):
+        bindings_profile = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
+        bp_trigger = bindings_profile.split("\npermissions:\n", 1)[0]
+        self.assertIn("  workflow_dispatch:", bp_trigger)
+        self.assertNotIn("  pull_request:", bp_trigger)
+        self.assertNotIn("  push:", bp_trigger)
+        self.assertNotIn("issues: write", bindings_profile)
 
-    def test_label_lookup_failure_cannot_silently_skip_requested_coverage(self):
-        script = workflow_step("bindings-profile.yml", "Select candidate packaging lanes")
-        result = subprocess.run(
-            ["bash", "-c", "gh() { return 1; }\n" + script],
-            env={**os.environ, "EVENT_NAME": "pull_request", "PR_NUMBER": "123",
-                 "REPO": "example/repo"}, capture_output=True, timeout=10,
-        )
-        self.assertNotEqual(result.returncode, 0)
-
-    def test_live_labels_select_only_requested_platforms_and_master_is_full(self):
-        script = workflow_step("bindings-profile.yml", "Select candidate packaging lanes")
-        for event, labels, expected in [
-            ("pull_request", [], (False, False)),
-            ("pull_request", ["unrelated"], (False, False)),
-            ("pull_request", ["ci:android"], (True, False)),
-            ("pull_request", ["ci:apple"], (False, True)),
-            ("pull_request", ["ci:full"], (True, True)),
-            ("push", [], (True, True)),
-            ("schedule", [], (True, True)),
-            ("workflow_dispatch", [], (True, True)),
-        ]:
-            with self.subTest(event=event, labels=labels), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                output = root / "output"
-                env = {**os.environ, "PATH": f"{root}:{os.environ['PATH']}",
-                       "EVENT_NAME": event, "PR_NUMBER": "123" if event == "pull_request" else "",
-                       "REPO": "example/repo", "TEST_LABELS": json.dumps(labels),
-                       "GITHUB_OUTPUT": str(output)}
-                subprocess.run(["bash", "-c", 'gh() { printf "%s\\n" "$TEST_LABELS"; }\n' + script],
-                               env=env, check=True, capture_output=True, timeout=10)
-                values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-                self.assertEqual((values["run_android"] == "true", values["run_apple"] == "true"), expected)
+        wn_agent = (ROOT / ".github/workflows/wn-agent-binaries.yml").read_text()
+        wn_trigger = wn_agent.split("\npermissions:\n", 1)[0]
+        self.assertIn("  workflow_dispatch:", wn_trigger)
+        self.assertIn("  workflow_call:", wn_trigger)
+        self.assertIn("    tags:\n      - wn-agent-v*", wn_trigger)
+        self.assertNotIn("  pull_request:", wn_trigger)
+        self.assertNotIn("    branches:", wn_trigger)
 
     def test_gate_rejects_failed_or_unexpectedly_skipped_selected_packages(self):
         script = workflow_step("bindings-profile.yml", "Require every candidate package")
