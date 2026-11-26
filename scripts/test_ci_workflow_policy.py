@@ -444,10 +444,130 @@ class MergeGatePolicyTests(unittest.TestCase):
                         "CI_MODE": mode,
                         "IS_TEAM_PR": is_team,
                         "APPLE_OPT_IN": apple_opt_in,
+                        "TREE_STATE": "green",
+                        "TREE_STATE_REASON": "",
+                        "TREE_FIX_OPT_IN": "false",
                         "NEEDS": json.dumps(needs),
                     },
                 )
                 self.assertEqual(result.returncode == 0, expected)
+
+        # Meltdown freeze (tree_state=red) blocks PRs unless labelled `tree-fix` or `revert`.
+        for tree_state, tree_fix, expected in [
+            ("red", "false", False),
+            ("red", "", False),
+            ("red", "true", True),
+            ("green", "false", True),
+        ]:
+            with self.subTest(tree_state=tree_state, tree_fix=tree_fix):
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": "pull_request",
+                        "CI_MODE": "fast",
+                        "IS_TEAM_PR": "true",
+                        "APPLE_OPT_IN": "false",
+                        "TREE_STATE": tree_state,
+                        "TREE_STATE_REASON": "canary red",
+                        "TREE_FIX_OPT_IN": tree_fix,
+                        "NEEDS": json.dumps(skipped),
+                    },
+                )
+                self.assertEqual(result.returncode == 0, expected)
+
+    def test_read_tree_state_blocks_red_or_malformed_and_defaults_green_when_absent(self):
+        script = workflow_step("ci.yml", "Read tree state")
+        labels_script = workflow_step("ci.yml", "Check CI opt-in labels")
+        self.assertIn('index("tree-fix") != null or index("revert") != null', labels_script)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            origin = Path(tmp) / "origin.git"
+            work = Path(tmp) / "work"
+            subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+            subprocess.run(["git", "init", "-b", "master", str(work)], check=True, capture_output=True)
+            for args in (
+                ("config", "user.name", "Test"),
+                ("config", "user.email", "test@example.com"),
+                ("config", "commit.gpgsign", "false"),
+                ("remote", "add", "origin", str(origin)),
+            ):
+                subprocess.run(["git", "-C", str(work), *args], check=True, capture_output=True)
+            (work / "README.md").write_text("hi\n")
+            subprocess.run(["git", "-C", str(work), "add", "."], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "commit", "-m", "init"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "push", "origin", "master"], check=True, capture_output=True)
+
+            def run_read(event="pull_request", repo="marmot-protocol/mdk"):
+                out = Path(tmp) / "out"
+                out.unlink(missing_ok=True)
+                subprocess.run(
+                    ["bash", "-c", script],
+                    cwd=work,
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={**os.environ, "EVENT_NAME": event, "REPO": repo, "GITHUB_OUTPUT": str(out)},
+                )
+                return dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+
+            # Missing tree-state branch defaults to green ONLY on standalone forks;
+            # the canonical repository fails closed to red.
+            self.assertEqual(run_read("pull_request", repo="someone/mdk")["tree_state"], "green")
+            canonical_missing = run_read("pull_request", repo="marmot-protocol/mdk")
+            self.assertEqual(canonical_missing["tree_state"], "red")
+            self.assertIn("canonical origin/tree-state branch is missing", canonical_missing["tree_state_reason"])
+
+            # Push orphan tree-state branch with green, red, and malformed JSON.
+            ts = Path(tmp) / "ts"
+            subprocess.run(["git", "init", "-b", "tree-state", str(ts)], check=True, capture_output=True)
+            for args in (
+                ("config", "user.name", "Test"),
+                ("config", "user.email", "test@example.com"),
+                ("config", "commit.gpgsign", "false"),
+                ("remote", "add", "origin", str(origin)),
+            ):
+                subprocess.run(["git", "-C", str(ts), *args], check=True, capture_output=True)
+
+            for payload, expected_state in [
+                ('{"schema_version":1,"state":"green","reason":"ok"}\n', "green"),
+                ('{"schema_version":1,"state":"red","reason":"broken canary"}\n', "red"),
+                ('not-json\n', "red"),
+            ]:
+                (ts / "state.json").write_text(payload)
+                subprocess.run(["git", "-C", str(ts), "add", "state.json"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(ts), "commit", "-m", "update"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(ts), "push", "-f", "origin", "tree-state"], check=True, capture_output=True)
+                with self.subTest(payload=payload.strip()):
+                    self.assertEqual(run_read("pull_request")["tree_state"], expected_state)
+            # A colliding tag `refs/tags/tree-state` pointing to green must NOT shadow a red
+            # `refs/heads/tree-state` branch (fetch must name `refs/heads/tree-state` explicitly).
+            (ts / "state.json").write_text('{"schema_version":1,"state":"green","reason":"tag decoy"}\n')
+            subprocess.run(["git", "-C", str(ts), "add", "state.json"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "commit", "-m", "tag green decoy"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "tag", "tree-state"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "push", "origin", "refs/tags/tree-state"], check=True, capture_output=True)
+            (ts / "state.json").write_text('{"schema_version":1,"state":"red","reason":"real branch red"}\n')
+            subprocess.run(["git", "-C", str(ts), "add", "state.json"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "commit", "-m", "branch red"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "push", "-f", "origin", "refs/heads/tree-state"], check=True, capture_output=True)
+            colliding = run_read("pull_request")
+            self.assertEqual(colliding["tree_state"], "red")
+            self.assertEqual(colliding["tree_state_reason"].strip(), "real branch red")
+            # Non-PR events skip freeze check.
+            self.assertEqual(run_read("schedule")["tree_state"], "green")
+
+            # Broken/unreachable remote must fail closed to red (never silently default green).
+            subprocess.run(
+                ["git", "-C", str(work), "remote", "set-url", "origin", str(Path(tmp) / "missing.git")],
+                check=True,
+                capture_output=True,
+            )
+            broken = run_read("pull_request")
+            self.assertEqual(broken["tree_state"], "red")
+            self.assertIn("unable to verify origin/tree-state", broken["tree_state_reason"])
 
     def test_fast_team_gate_skips_heavy_compile_jobs_and_honors_ci_apple(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

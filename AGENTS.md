@@ -76,18 +76,27 @@ no merge queue. The shipping flow is:
    verified commit signatures, `cargo fmt --all --check`, all static/contract gates, `cargo --locked audit`, and
    advisory commit-trailer checks. External/fork PRs, read-only org members, and `ci:full` PRs fail closed into the full
    `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs (`ios-account-clippy`,
-   `marmotkit-native-host`) to a team PR regardless of changed paths.
+   `marmotkit-native-host`) to a team PR regardless of changed paths. When Meltdown Mode sets the `tree-state` branch
+   (`state.json` = `"red"`), `Required CI` fails at check time unless labelled `tree-fix` or `revert` (PRs whose
+   `Required CI` already passed before the freeze are not retroactively invalidated by GitHub, so step 3 /
+   `land-change` Step 7 also checks `origin/tree-state:state.json` before merging, and PRs blocked during a freeze
+   need `Re-run all jobs` once `tree-state` returns to `"green"`).
 3. **Squash-merge (only when told to land):** `master` requires `Required CI`, any `CODEOWNERS` approvals, and a branch
    up to date with `master`, so a ready PR can merge a minute after it opens: finish step 1 before opening it.
-   Agents stop at a green PR unless the user told them to land it (`.agents/skills/land-change`). To merge, confirm
-   `headRefOid` matches the reviewed head and run `gh pr merge <pr> --squash --match-head-commit <sha>`; never
+   Agents stop at a green PR unless the user told them to land it (`.agents/skills/land-change`). Unless labelled
+   `tree-fix` or `revert`, confirm `origin/tree-state:state.json` is `"green"` right before merging, confirm
+   `headRefOid` matches the reviewed head, and run `gh pr merge <pr> --squash --match-head-commit <sha>`; never
    `--auto`, `--admin`, or a direct push.
-4. **Post-merge `Canary` & daily releases:** Bare-metal Linux Canary on `mdk-ci-1` verifies `master` every 30 minutes
-   (`fast-ci`, `cargo-audit`, `wasm-check`, `android-check`, `workspace-nextest`, `simulator-smoke`) and advances the
-   protected `canary` branch; hourly `.github/workflows/canary.yml` runs the full cross-platform matrix (de-sharded to 6
-   workspace shards plus Android, WASM, C bindings, macOS, Windows, Tamarin, and conditional `bindings-profile.yml`
-   under `macos-packaging` concurrency) whenever `master` moves. Daily `.github/workflows/nightly-releases.yml` builds
-   from the verified `canary` branch tip.
+4. **Post-merge `Canary`, Bisect Agent & daily releases:** Bare-metal Linux Canary on `mdk-ci-1` verifies `master`
+   every 30 minutes (`fast-ci`, `cargo-audit`, `wasm-check`, `android-check`, `workspace-nextest`, `simulator-smoke`)
+   and advances the protected `canary` branch; hourly `.github/workflows/canary.yml` runs the full cross-platform
+   matrix (de-sharded to 6 workspace shards plus Android, WASM, C bindings, macOS, Windows, Tamarin, and conditional
+   `bindings-profile.yml` under `macos-packaging` concurrency) whenever `master` moves. The revert-only Bisect Agent
+   (`scripts/bisect_agent/`) classifies failures into 5 buckets (infra, known flake, new intermittent, unreproducible,
+   deterministic regression), bisects deterministic failures to open clean signed `revert` PRs, and freezes
+   `tree-state` (`red`) on tangled/failed reverts, unisolatable failures, or 2 consecutive unreproducible reds
+   (auto-clearing to `green` on recovery). Daily
+   `.github/workflows/nightly-releases.yml` builds from the verified `canary` branch tip.
 
 ## Documentation
 
