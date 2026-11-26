@@ -371,6 +371,7 @@ case it is:
 | Your bug | Fails on your branch, passes on `origin/master` | Fix it, redo steps 2 and 3, push |
 | Conflict with a change that landed ahead of you | Passes on your branch alone, fails once rebased onto `origin/master` | Rebase, fix the interaction, redo steps 2–3, push |
 | Flake | Intermittent, also fails on `origin/master`, or in code your change cannot reach | Leave the test alone. Open or update an issue for it (search the test name first), then rerun the job once |
+| Master is frozen (`tree-state=red`) | `Required CI` reports Meltdown Mode (`tree-state=red`) | Only `tree-fix` or `revert` PRs should merge until Canary turns green. If your PR fixes or reverts the broken commit, apply the `tree-fix` or `revert` label and re-run all jobs (not just `Required CI`, because `changes` recomputes labels and `tree-state`); otherwise wait for recovery, then re-run all jobs |
 | Master is broken | The same failure in master's own CI or Canary | Find the open PR fixing it and rebase once it lands. Do not fix it again in your PR |
 
 A flake already on the `just flake-report` leaderboard, or with an open
@@ -410,12 +411,22 @@ Merge only in land mode, and only the head that was verified and reviewed.
    step 2 passed on it (step 5). If a CODEOWNERS approval is
    required and missing, stop and report as in step 6, naming the approval;
    you cannot give it yourself.
-2. Re-read `gh pr view <pr> --json headRefOid,isDraft,mergeStateStatus`.
+2. Unless the PR carries the `tree-fix` or `revert` label, confirm `master`
+   is not in Meltdown Mode right before merging (`Required CI` is a check-time
+   gate and GitHub does not retroactively invalidate an older green check or
+   block a concurrent freeze at merge time):
+
+   ```sh
+   git fetch --no-tags --depth=1 origin tree-state && git show FETCH_HEAD:state.json
+   ```
+
+   Proceed only when `"state"` is `"green"`.
+3. Re-read `gh pr view <pr> --json headRefOid,isDraft,mergeStateStatus`.
    `headRefOid` must be the reviewed head, `isDraft` must be `false`, and
    `mergeStateStatus` must be
    `CLEAN` or `HAS_HOOKS`. `BEHIND` means another PR landed first: handle it
    with the step 5 table, then start this list again.
-3. Squash-merge right away, pinned to that head; any wait between green and
+4. Squash-merge right away, pinned to that head; any wait between green and
    the merge is time for another PR to land first:
 
    ```sh

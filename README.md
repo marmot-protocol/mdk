@@ -277,6 +277,7 @@ just flake-report                                                   # rank tests
 just flake-stress <package> '<filter>' [count]                      # rerun a filter with no retries to prove a flake fix
 just test-timing-ratchet                                            # fail when test files gain sleeps or sub-second timeouts
 just pr-trailers-check                                              # validate Local-Checks, Local-Review, and Release-Impact trailers
+just bisect-agent-contract                                          # run unit and synthetic-repo tests for the revert-only Bisect Agent
 ```
 
 The CLI's real-relay end-to-end tests need the local relay stack:

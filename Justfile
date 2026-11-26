@@ -716,6 +716,10 @@ changelog-gate:
 pr-trailers-contract:
     python3 scripts/test_check_pr_trailers.py
 
+# Unit and synthetic-repo tests for the revert-only Bisect Agent (`scripts/bisect_agent/`).
+bisect-agent-contract:
+    python3 scripts/test_bisect_agent.py
+
 # Validate Local-Checks, Local-Review, and Release-Impact trailers on a branch.
 pr-trailers-check base="origin/master" head="HEAD":
     python3 scripts/check_pr_trailers.py --base {{quote(base)}} --head {{quote(head)}}
@@ -759,6 +763,6 @@ release-profile-gate:
 # passes, and the release pin proof. Run it once for shared build-input or
 # workflow changes; ordinary pushes use the scoped checks in AGENTS.md.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate pr-trailers-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate pr-trailers-contract bisect-agent-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate pr-trailers-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate pr-trailers-contract bisect-agent-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test
