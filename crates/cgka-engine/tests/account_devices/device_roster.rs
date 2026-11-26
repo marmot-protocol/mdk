@@ -204,7 +204,14 @@ pub(super) async fn found_device_group(
     initial: &DeviceRosterV1,
     joiners: &mut [&mut Device],
 ) -> GroupId {
-    let (founding, joiner_slots) = founding_roster(initial, joiners.len());
+    let (mut founding, joiner_slots) = founding_roster(initial, joiners.len());
+    // The founder writes its own key into its entry, the first founding
+    // slot, as production founding does ("Key binding").
+    if let Some(entry) = founding.devices.values_mut().next()
+        && entry.tag_signature_key.is_none()
+    {
+        entry.tag_signature_key = Some(creator.engine.own_signature_key());
+    }
     let Some((first, rest)) = joiners.split_first_mut() else {
         let (gid, created) = creator
             .engine
@@ -427,10 +434,15 @@ fn test_policy_builds_may_advertise_the_device_roster() {
 #[tokio::test]
 async fn a_device_group_holds_its_roster_from_creation() {
     let (phone, laptop, gid) = phone_and_laptop().await;
-    // The founding Add set the laptop's entry, announcing the KeyPackage it
-    // joined with (D41) and binding the signature key of the leaf it added
-    // (marmot#521).
+    // The founder wrote its own key into its entry, and the founding Add set
+    // the laptop's, announcing the KeyPackage it joined with (D41) and
+    // binding the signature key of the leaf it added (marmot#521).
     let mut expected = roster(&[(1, "Phone"), (2, "Laptop")]);
+    expected
+        .devices
+        .get_mut(&slot(1))
+        .unwrap()
+        .tag_signature_key = Some(phone.engine.own_signature_key());
     let announced = roster_of(&phone, &gid).devices[&slot(2)]
         .announced_key_package
         .clone();
@@ -691,12 +703,17 @@ async fn a_roster_update_sets_and_removes_single_entries() {
         rejected_at: 1_700_000_000,
         tag_signature_key: None,
     };
+    // An edit keeps the entry's key, which no Commit changes.
+    let work_laptop = DeviceEntryV1 {
+        tag_signature_key: Some(laptop.engine.own_signature_key()),
+        ..entry("Work laptop")
+    };
     let operations = vec![
         DeviceRosterOperationV1::SetRejectedSlot(slot(9), rejected.clone()),
-        DeviceRosterOperationV1::SetDevice(slot(2), entry("Work laptop")),
+        DeviceRosterOperationV1::SetDevice(slot(2), work_laptop.clone()),
     ];
     let mut expected = roster_of(&phone, &gid);
-    expected.devices.insert(slot(2), entry("Work laptop"));
+    expected.devices.insert(slot(2), work_laptop.clone());
     expected.rejected_slots.insert(slot(9), rejected);
 
     let commit = send_commit(&mut phone, roster_update(&gid, operations), &gid).await;
@@ -704,13 +721,18 @@ async fn a_roster_update_sets_and_removes_single_entries() {
     assert_eq!(roster_of(&phone, &gid), expected);
     assert_eq!(roster_of(&laptop, &gid), expected);
 
-    // Any device edits any entry: the laptop removes what the phone wrote.
+    // Any device edits any entry: the laptop relabels the phone's and
+    // removes what the phone wrote.
+    let old_phone = DeviceEntryV1 {
+        tag_signature_key: Some(phone.engine.own_signature_key()),
+        ..entry("Old phone")
+    };
     let commit = send_commit(
         &mut laptop,
         roster_update(
             &gid,
             vec![
-                DeviceRosterOperationV1::RemoveDevice(slot(1)),
+                DeviceRosterOperationV1::SetDevice(slot(1), old_phone.clone()),
                 DeviceRosterOperationV1::RemoveRejectedSlot(slot(9)),
             ],
         ),
@@ -720,7 +742,9 @@ async fn a_roster_update_sets_and_removes_single_entries() {
     assert_accepted(&mut phone, &commit, &gid).await;
     // No update touches the leaf tag key.
     let expected = DeviceRosterV1 {
-        devices: [(slot(2), entry("Work laptop"))].into_iter().collect(),
+        devices: [(slot(1), old_phone), (slot(2), work_laptop)]
+            .into_iter()
+            .collect(),
         ..roster(&[])
     };
     assert_eq!(roster_of(&phone, &gid), expected);
@@ -809,7 +833,14 @@ async fn the_committer_refuses_a_roster_update_that_breaks_the_roster() {
 #[tokio::test]
 async fn receivers_apply_the_update_to_the_parents_roster() {
     let (phone, mut laptop, gid) = phone_and_laptop().await;
-    let operations = vec![DeviceRosterOperationV1::SetDevice(slot(3), entry("Tablet"))];
+    let relabelled = DeviceEntryV1 {
+        tag_signature_key: Some(laptop.engine.own_signature_key()),
+        ..entry("Work laptop")
+    };
+    let operations = vec![DeviceRosterOperationV1::SetDevice(
+        slot(2),
+        relabelled.clone(),
+    )];
     let update = update_bytes(operations.clone());
     let commit_with = |state: Vec<u8>| {
         craft(
@@ -831,7 +862,7 @@ async fn receivers_apply_the_update_to_the_parents_roster() {
     assert_rejected_on_replay(&mut laptop, &whole_replacement, &gid).await;
 
     let mut applied = roster_of(&phone, &gid);
-    applied.devices.insert(slot(3), entry("Tablet"));
+    applied.devices.insert(slot(2), relabelled);
     let diff = commit_with(encode_device_roster_v1(&applied).unwrap());
     assert_accepted(&mut laptop, &diff, &gid).await;
     assert_eq!(roster_of(&laptop, &gid), applied);
@@ -874,6 +905,251 @@ async fn receivers_reject_a_roster_update_that_breaks_the_roster() {
         DEVICE_ROSTER_COMPONENT_ID,
         AppDataUpdateOperation::Update(removes_absent.into()),
     );
+    assert_rejected_at_ingest(&mut laptop, &standalone).await;
+}
+
+/// Receivers hold every device-group Commit to "Key binding" (marmot#521),
+/// whoever made it: a Commit built with raw OpenMLS, whose resulting state is
+/// the update applied to the parent's roster, is refused when it adds a leaf
+/// without a new entry carrying that leaf's key, sets an entry for a new slot
+/// without adding its leaf, changes or clears a key, removes a keyed entry
+/// and keeps its leaf, or records a removed slot with a key its entry did
+/// not have. A standalone proposal that changes a key is refused at ingest.
+/// The Add that binds the added leaf's key is accepted.
+#[tokio::test]
+async fn receivers_hold_a_device_group_commit_to_key_binding() {
+    let (phone, mut laptop, gid) = phone_and_laptop().await;
+    let mut tablet = roster_device(b"alice");
+    let key_package = tablet.engine.fresh_key_package().await.unwrap();
+    let laptop_key = laptop.engine.own_signature_key();
+    let laptop_leaf = load_group(&phone, &gid)
+        .members()
+        .find(|member| member.signature_key == laptop_key)
+        .unwrap()
+        .index
+        .u32();
+    let laptop_entry = roster_of(&phone, &gid).devices[&slot(2)].clone();
+    let bound = announced_entry(&roster(&[(3, "Tablet")]), &slot(3), &key_package);
+    let other_key = Some(vec![0x55; 32]);
+    let commit =
+        |operations: Vec<DeviceRosterOperationV1>, adds: Vec<KeyPackage>, removes: Vec<u32>| {
+            let update = update_bytes(operations);
+            let state = cgka_traits::app_components::apply_device_roster_update_v1(
+                &roster_bytes_of(&phone, &gid).unwrap(),
+                &update,
+            )
+            .unwrap();
+            craft(
+                &phone,
+                &gid,
+                Parts {
+                    adds,
+                    removes,
+                    app_data: vec![AppDataUpdateProposal::update(
+                        DEVICE_ROSTER_COMPONENT_ID,
+                        update,
+                    )],
+                    app_data_state: vec![(DEVICE_ROSTER_COMPONENT_ID, state)],
+                    ..Parts::default()
+                },
+            )
+            .1
+        };
+    let set = |n: u8, entry: DeviceEntryV1| DeviceRosterOperationV1::SetDevice(slot(n), entry);
+    let removed = |key: Option<Vec<u8>>| {
+        DeviceRosterOperationV1::SetRejectedSlot(
+            slot(2),
+            RejectedSlotV1 {
+                reason: RejectedSlotReasonV1::Removed,
+                rejected_at: 1,
+                tag_signature_key: key,
+            },
+        )
+    };
+    let refused = [
+        commit(
+            vec![set(
+                3,
+                DeviceEntryV1 {
+                    tag_signature_key: None,
+                    ..bound.clone()
+                },
+            )],
+            vec![key_package.clone()],
+            vec![],
+        ),
+        commit(
+            vec![set(
+                3,
+                DeviceEntryV1 {
+                    tag_signature_key: other_key.clone(),
+                    ..bound.clone()
+                },
+            )],
+            vec![key_package.clone()],
+            vec![],
+        ),
+        commit(
+            vec![set(
+                3,
+                DeviceEntryV1 {
+                    tag_signature_key: other_key.clone(),
+                    ..entry("Watch")
+                },
+            )],
+            vec![],
+            vec![],
+        ),
+        commit(
+            vec![set(
+                2,
+                DeviceEntryV1 {
+                    tag_signature_key: other_key.clone(),
+                    ..laptop_entry.clone()
+                },
+            )],
+            vec![],
+            vec![],
+        ),
+        commit(
+            vec![set(
+                2,
+                DeviceEntryV1 {
+                    tag_signature_key: None,
+                    ..laptop_entry.clone()
+                },
+            )],
+            vec![],
+            vec![],
+        ),
+        commit(
+            vec![DeviceRosterOperationV1::RemoveDevice(slot(2))],
+            vec![],
+            vec![],
+        ),
+        commit(
+            vec![
+                DeviceRosterOperationV1::RemoveDevice(slot(2)),
+                removed(other_key.clone()),
+            ],
+            vec![],
+            vec![laptop_leaf],
+        ),
+    ];
+    for crafted in &refused {
+        assert_rejected_on_replay(&mut laptop, crafted, &gid).await;
+    }
+    let standalone = standalone_app_data_update(
+        &phone,
+        &gid,
+        DEVICE_ROSTER_COMPONENT_ID,
+        AppDataUpdateOperation::Update(
+            update_bytes(vec![set(
+                2,
+                DeviceEntryV1 {
+                    tag_signature_key: other_key,
+                    ..laptop_entry
+                },
+            )])
+            .into(),
+        ),
+    );
+    assert_rejected_at_ingest(&mut laptop, &standalone).await;
+
+    let linked = commit(vec![set(3, bound)], vec![key_package], vec![]);
+    assert_accepted(&mut laptop, &linked, &gid).await;
+    assert_eq!(
+        roster_of(&laptop, &gid).devices[&slot(3)].tag_signature_key,
+        Some(tablet.engine.own_signature_key())
+    );
+}
+
+/// A fresh signature key for `sender`'s leaf in `gid`, and that leaf's
+/// extensions with an account identity proof for the new key, so a leaf
+/// carrying both is valid except for changing its signature key.
+fn rotated_leaf(
+    sender: &Device,
+    gid: &GroupId,
+    account: &[u8],
+) -> (SignatureKeyPair, Extensions<LeafNode>) {
+    let group = load_group(sender, gid);
+    let leaf = group.own_leaf_node().unwrap();
+    let scheme = DEFAULT_CIPHERSUITE.signature_algorithm();
+    let signer = SignatureKeyPair::new(scheme).unwrap();
+    let mut dictionary = leaf
+        .extensions()
+        .app_data_dictionary()
+        .unwrap()
+        .dictionary()
+        .clone();
+    let current = dictionary
+        .get(&ACCOUNT_IDENTITY_PROOF_COMPONENT_ID)
+        .unwrap();
+    let created_at = u64::from_be_bytes(current[32..40].try_into().unwrap());
+    let proof = account_identity_proof_component(
+        &pad32(account),
+        signer.public(),
+        DEFAULT_CIPHERSUITE,
+        scheme,
+        created_at,
+        proof_signer(account).as_ref(),
+    )
+    .unwrap();
+    dictionary.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, proof);
+    let mut extensions = leaf.extensions().clone();
+    extensions
+        .add_or_replace(Extension::AppDataDictionary(
+            AppDataDictionaryExtension::new(dictionary),
+        ))
+        .unwrap();
+    (signer, extensions)
+}
+
+/// A standalone Update proposal from `sender` whose leaf, with `extensions`,
+/// signs with `signer` instead of the sender's key.
+fn standalone_rotating_update(
+    sender: &Device,
+    gid: &GroupId,
+    signer: &SignatureKeyPair,
+    extensions: Extensions<LeafNode>,
+) -> TransportMessage {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, sender.storage.mls_storage());
+    let (message, _) = load_group(sender, gid)
+        .propose_self_update_with_new_signer(
+            &provider,
+            &device_signer(sender),
+            new_signer_bundle(sender, gid, signer),
+            LeafNodeParameters::builder()
+                .with_extensions(extensions)
+                .build(),
+        )
+        .expect("raw OpenMLS builds the proposal");
+    group_transport(message, gid, "standalone-rotating-update")
+}
+
+/// A device-group leaf keeps its signature key ("Key binding", marmot#521):
+/// a Commit whose update path gives the committer's leaf a new key, and a
+/// standalone Update proposing one, are refused, though each leaf carries an
+/// account identity proof for its new key and changes nothing else.
+#[tokio::test]
+async fn receivers_refuse_a_device_group_leaf_that_changes_its_signature_key() {
+    let (phone, mut laptop, gid) = phone_and_laptop().await;
+    let (signer, extensions) = rotated_leaf(&phone, &gid, b"alice");
+    let (_, rotating) = craft(
+        &phone,
+        &gid,
+        Parts {
+            leaf_extensions: Some(extensions),
+            new_signer: Some(signer),
+            ..Parts::default()
+        },
+    );
+    assert_rejected_on_replay(&mut laptop, &rotating, &gid).await;
+
+    let (signer, extensions) = rotated_leaf(&phone, &gid, b"alice");
+    let standalone = standalone_rotating_update(&phone, &gid, &signer, extensions);
     assert_rejected_at_ingest(&mut laptop, &standalone).await;
 }
 

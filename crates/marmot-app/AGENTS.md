@@ -312,13 +312,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   remembers (`roster_tag_keys`), read by every such key. A slot with a `Moved` departure and no `removed` record is
   never gone, whichever keys it had: its device's leaves elsewhere still carry this group's tags. Never this device's
   own slot, and never discard private KeyPackages for a slot the roster lists. Leaves are found with
-  `own_account_leaves_tagged_by`, never by an absent claim, under the slot's keys, or with
-  `own_account_self_signed_tags`, a tag that names the slot and verifies under the key that leaf itself signs with, never
-  another leaf's (mdk#3679): an untagged leaf stays (D55). Every key a roster names is writable by any device of the
-  account, so none is evidence that an untagged leaf is a device's. Removal finds the device-group leaf the same way,
-  by its tag under the roster, else by a tag the leaf signed itself for the slot, both only for a leaf that has
-  committed since its Add, and the record then keeps that leaf's key. A listed device whose entry has no key is refused
-  as `device_link_pending` unless it has such a leaf, which a pending link never does. Each cleanup pass renews,
+  `own_account_leaves_tagged_by`, never by an absent claim, under the slot's keys: an untagged leaf stays (D55).
+  Removal finds the device-group leaf by its entry's key, which the Add that linked the device bound and no Commit
+  changes (marmot#521, "Key binding"), removes it with the entry, and the record keeps that key. A listed device whose
+  entry has no key, or whose leaf is still its Add's KeyPackage leaf, is refused as `device_link_pending`. Each cleanup pass renews,
   through `renew_roster_tag_keys`, every kept key of a slot with a `held_as_removed` key whose leaf a scanned chat
   still holds, in one step that moves only their sighting time and keeps their order, so a leftover outlives the
   30-day retention and no prune drops the key that reads it. The deciding device commits a lone `removed` record after a

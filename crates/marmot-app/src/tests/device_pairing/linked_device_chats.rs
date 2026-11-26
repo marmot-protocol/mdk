@@ -4049,7 +4049,7 @@ async fn the_direct_lookup_waits_for_a_created_direct_conversation() {
 
 /// Missing private stock never falls back to the sibling's public slot or
 /// blocks creation. Active and inactive linked entries qualify once stock
-/// exists; leaving and keyless entries do not consume it.
+/// exists; leaving entries do not consume it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn founding_sibling_selection_uses_private_stock_and_linked_status() {
     use cgka_traits::app_components::DeviceStatusV1;
@@ -4124,18 +4124,12 @@ async fn founding_sibling_selection_uses_private_stock_and_linked_status() {
         .expect("eligible fixture members");
     assert_eq!(leaves_of(&phone, &laptop, &closed, &group), 0);
     assert_eq!(taken_from(&phone, &laptop), before);
-    let key = laptop.client.runtime.own_signature_key();
-    for (status, tagged, expected) in [
-        (DeviceStatusV1::Inactive, true, 1),
-        (DeviceStatusV1::Leaving, true, 0),
-        (DeviceStatusV1::Active, false, 0),
-    ] {
+    for (status, expected) in [(DeviceStatusV1::Inactive, 1), (DeviceStatusV1::Leaving, 0)] {
         phone
             .client
             .runtime
             .edit_device_roster_entry(&group, &slot, &[], |entry| {
                 entry.status = status;
-                entry.tag_signature_key = tagged.then(|| key.clone());
             })
             .await
             .unwrap();
@@ -4155,7 +4149,6 @@ async fn founding_sibling_selection_uses_private_stock_and_linked_status() {
         .runtime
         .edit_device_roster_entry(&group, &slot, &[], |entry| {
             entry.status = DeviceStatusV1::Active;
-            entry.tag_signature_key = Some(key.clone());
         })
         .await
         .unwrap();

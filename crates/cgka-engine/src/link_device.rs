@@ -36,12 +36,12 @@
 //! engine reads its own tree for the leaf: the Commit removes it only if the
 //! tree still has it, and removes the roster entry either way. Removing a
 //! linked device (3.6b) is the same Commit, whose update also records the
-//! slot as `removed` with the tag signature key its entry had, or with the
-//! signature key of the leaf it removes once that leaf has committed: a
-//! device can rewrite or clear its own entry's key while its leaf keeps the
-//! key it tags with (mdk#3679). A leaf still built from its Add's KeyPackage
-//! is a pending link, never recorded as `removed`, whatever key the record
-//! keeps. Receivers check neither, so these rules bind only the sender.
+//! slot as `removed` with the tag signature key its entry had. That key is
+//! the one the Add bound and no Commit changes, so the leaf removed is the
+//! one signing with it ("Key binding", marmot#521). A leaf still built from
+//! its Add's KeyPackage is a pending link, never recorded as `removed`,
+//! unless its device founded the group (mdk#3679). Receivers hold every
+//! device-group Commit to the same key-binding rules.
 
 use crate::engine::Engine;
 use crate::message_processor::route_wrapped_group_message;
@@ -258,20 +258,16 @@ impl<S: StorageProvider> Engine<S> {
             Vec::new()
         };
         let removed_leaf = match removed.first() {
-            Some(index) => {
-                let leaf = mls_group
+            Some(index) => Some(
+                mls_group
                     .public_group()
                     .leaf(*index)
-                    .ok_or_else(|| EngineError::Other("removed leaf unavailable".into()))?;
-                if crate::engine::add_leaf_lifetime(leaf)?.is_some() {
-                    RemovedLeaf::FromKeyPackage
-                } else {
-                    RemovedLeaf::Committed(leaf_signature_key.as_slice())
-                }
-            }
-            None => RemovedLeaf::Gone,
+                    .ok_or_else(|| EngineError::Other("removed leaf unavailable".into()))?
+                    .clone(),
+            ),
+            None => None,
         };
-        validate_unlink_roster_update(&mls_group, &roster_update, removed_leaf)?;
+        validate_unlink_roster_update(&mls_group, &roster_update, removed_leaf.as_ref())?;
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         let pending_commit_guard =
@@ -467,31 +463,18 @@ pub(crate) fn validate_link_roster_update(roster_update: &[u8]) -> Result<(), En
     Ok(())
 }
 
-/// The leaf an unlink's Commit removes, as its roster update is checked.
-#[derive(Clone, Copy)]
-enum RemovedLeaf<'a> {
-    /// The tree no longer has it; the Commit removes the entry alone.
-    Gone,
-    /// Still the leaf its Add built from a KeyPackage: a link whose device
-    /// has not committed, which may still fail and be undone.
-    FromKeyPackage,
-    /// A leaf that has committed since its Add, by its signature key.
-    Committed(&'a [u8]),
-}
-
 /// The unlink's roster update removes exactly one device entry, of a slot the
 /// roster lists. A removal (3.6b) also records that slot as `removed`,
 /// keeping the `tag_signature_key` its entry had so the removed device's tags
-/// still read as its slot, or, when the Commit removes a leaf of the device
-/// that has committed, that leaf's signature key, which a device whose entry
-/// no longer carries its key still tags with (mdk#3679). A leaf still built
-/// from its Add's KeyPackage is a link not made yet, never recorded as
-/// `removed`, whatever key the record would keep; a failed link removes the
-/// entry alone.
+/// still read as its slot, and no other key ("Key binding"). `removed_leaf` is
+/// the leaf the Commit removes, if the tree still has it. A leaf still built
+/// from its Add's KeyPackage, other than the founder's, is a link not made
+/// yet, never recorded as `removed`, whatever key the record would keep; a
+/// failed link removes the entry alone.
 fn validate_unlink_roster_update(
     mls_group: &MlsGroup,
     roster_update: &[u8],
-    removed_leaf: RemovedLeaf<'_>,
+    removed_leaf: Option<&openmls::prelude::LeafNode>,
 ) -> Result<(), EngineError> {
     let update = decode_device_roster_update_v1(roster_update).map_err(|error| {
         EngineError::Serialize(format!("invalid device roster update: {error}"))
@@ -524,28 +507,25 @@ fn validate_unlink_roster_update(
             "invalid unlink roster update: the roster lists no such device".into(),
         ));
     };
-    // A removal names a device whose link is made: the record keeps a key
-    // the device's tags read by, its entry's tag signature key or the
-    // signature key of the committed leaf this Commit removes, and a leaf
-    // still built from its KeyPackage is never recorded. Undoing a failed
-    // link removes the entry alone.
+    // A removal names a device whose link is made: the record keeps the
+    // entry's tag signature key, which its tags read by, and a leaf still
+    // built from its KeyPackage is never recorded, unless it founded the
+    // group. Undoing a failed link removes the entry alone.
     if let Some(record) = record {
         let kept = record.tag_signature_key.as_deref();
-        let committed_leaf = match removed_leaf {
-            RemovedLeaf::Committed(key) => Some(key),
-            RemovedLeaf::Gone | RemovedLeaf::FromKeyPackage => None,
-        };
         if record.reason != RejectedSlotReasonV1::Removed
             || kept.is_none()
-            || (kept != entry.tag_signature_key.as_deref() && kept != committed_leaf)
+            || kept != entry.tag_signature_key.as_deref()
         {
             return Err(EngineError::Other(
                 "invalid unlink roster update: the slot's record has reason removed and keeps the \
-                 entry's tag signature key or the removed committed leaf's signature key"
+                 entry's tag signature key"
                     .into(),
             ));
         }
-        if matches!(removed_leaf, RemovedLeaf::FromKeyPackage) {
+        if removed_leaf
+            .is_some_and(|leaf| !crate::device_tag::committed_or_founded(leaf, &roster, slot))
+        {
             return Err(EngineError::Other(
                 "invalid unlink roster update: the removed leaf is still its link's KeyPackage \
                  leaf, so the slot is not recorded as removed"

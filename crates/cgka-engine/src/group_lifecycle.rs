@@ -1935,9 +1935,8 @@ impl<S: StorageProvider> Engine<S> {
             // the confirmed KeyPackage, with the signature key of the leaf it
             // adds (marmot#521, "Joining"), at the slot this device holds. A
             // roster that binds that entry to another key, or puts it at
-            // another slot, leaves a copy this device can never tag in. An
-            // entry with no key is an earlier approver's, from before the Add
-            // set it; this device then sets its key with its first Commit.
+            // another slot, leaves a copy this device can never tag in, and
+            // an entry with no key can never get one ("Key binding").
             if accepted_device_group.is_some() {
                 let own_slot = own_device_slot(storage)?;
                 let own_key = mls_group
@@ -1953,8 +1952,7 @@ impl<S: StorageProvider> Engine<S> {
                         entry.announced_key_package.as_deref()
                             == Some(consumed_key_package_ref.as_slice())
                             && own_key.is_some()
-                            && (entry.tag_signature_key.is_none()
-                                || entry.tag_signature_key == own_key)
+                            && entry.tag_signature_key == own_key
                             && own_slot.is_none_or(|own| own == *slot)
                     })
                 });
