@@ -42,13 +42,13 @@ use cgka_traits::{
     TransportPublishTarget, TransportReadBack,
 };
 use marmot_session::{
-    AccountDeviceEffects, AccountDeviceRuntime, AccountDeviceSession, AccountError,
+    AccountDeviceEffects, AccountDeviceRuntime, AccountDeviceSession, AccountError, EntropySource,
     ForeignSlotOutcome, ForeignSlotPublication, KeyPackageEventDeletion, KeyPackagePublication,
     KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
-    KeyPackageSlotWithdrawal, MaintenanceRandom, MaintenanceTiming, MonotonicClock,
-    NoopKeyPackagePublisher, PendingCommit, PendingCommitState, PendingResolution, PublishWork,
-    PublishedApplicationMessage, SessionConfig, SessionError, StaticTransportRouting,
-    TransportRoutingError, TransportRoutingPolicy, WallClock, WelcomeWithdrawal,
+    KeyPackageSlotWithdrawal, MaintenanceTiming, MonotonicClock, NoopKeyPackagePublisher,
+    PendingCommit, PendingCommitState, PendingResolution, PublishWork, PublishedApplicationMessage,
+    SessionConfig, SessionError, StaticTransportRouting, TransportRoutingError,
+    TransportRoutingPolicy, WallClock, WelcomeWithdrawal,
 };
 use nostr::prelude::FinalizeEvent;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
@@ -154,9 +154,12 @@ impl TestRandom {
     }
 }
 
-impl MaintenanceRandom for TestRandom {
-    fn next_u64(&self) -> u64 {
-        self.0.fetch_add(1, Ordering::Relaxed)
+impl EntropySource for TestRandom {
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        for chunk in dest.chunks_mut(8) {
+            let value = self.0.fetch_add(1, Ordering::Relaxed);
+            chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+        }
     }
 }
 

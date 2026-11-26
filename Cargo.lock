@@ -847,7 +847,6 @@ dependencies = [
  "chacha20poly1305 0.10.1",
  "criterion",
  "futures",
- "getrandom 0.2.17",
  "gloo-timers",
  "hex",
  "k256",
@@ -877,14 +876,17 @@ version = "0.20.0-dev"
 dependencies = [
  "async-trait",
  "criterion",
+ "getrandom 0.2.17",
  "hex",
  "insta",
  "openmls_traits",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "url",
+ "web-time",
  "zeroize",
 ]
 
@@ -5753,16 +5755,16 @@ dependencies = [
  "base64",
  "cgka-traits",
  "chacha20poly1305 0.10.1",
- "getrandom 0.2.17",
  "hex",
  "nostr 0.45.7",
  "rand 0.8.6",
+ "secp256k1 0.30.0",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
- "web-time",
+ "zeroize",
 ]
 
 [[package]]

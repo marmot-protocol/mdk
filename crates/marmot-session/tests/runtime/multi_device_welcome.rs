@@ -13,7 +13,7 @@ fn nostr_device_session(
 }
 
 fn nostr_peeler(account: &[u8]) -> transport_nostr_peeler::NostrMlsPeeler {
-    transport_nostr_peeler::NostrMlsPeeler::new()
+    transport_nostr_peeler::NostrMlsPeeler::default()
         .with_welcome_signer(deterministic_nostr_keys(account))
 }
 
@@ -241,7 +241,7 @@ fn joins(results: &[marmot_session::IngestEffects]) -> Vec<(GroupId, MessageId)>
 /// Peel `welcome` as a device of `account` would: the KeyPackage publication
 /// its rumor names, and the MLS Welcome it carries.
 async fn rumor(welcome: &TransportMessage, account: &[u8]) -> (MessageId, Vec<u8>) {
-    let (peeled, provenance) = transport_nostr_peeler::NostrMlsPeeler::new()
+    let (peeled, provenance) = transport_nostr_peeler::NostrMlsPeeler::default()
         .with_welcome_signer(deterministic_nostr_keys(account))
         .peel_welcome_with_provenance(welcome)
         .await
@@ -264,7 +264,7 @@ async fn rewrapped(
     welcome_bytes: Vec<u8>,
     key_package_event_id: MessageId,
 ) -> TransportMessage {
-    transport_nostr_peeler::NostrMlsPeeler::new()
+    transport_nostr_peeler::NostrMlsPeeler::default()
         .with_welcome_signer(deterministic_nostr_keys(inviter))
         .wrap_welcome_with_metadata(
             &EncryptedPayload {

@@ -34,7 +34,6 @@ serde_json.workspace = true
 hex.workspace = true
 marmot-forensics.workspace = true
 nostr.workspace = true
-rand.workspace = true
 sha2.workspace = true
 web-time.workspace = true
 # Pure-Rust secp256k1 used only to validate that a Marmot credential identity
@@ -48,11 +47,11 @@ tokio = { workspace = true, features = ["time"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 futures.workspace = true
-getrandom = { version = "0.2", features = ["js"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 openmls = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
+rand.workspace = true
 storage-sqlite = { workspace = true, features = ["storage-format-benchmarks", "test-support"] }
 rusqlite.workspace = true
 tokio = { workspace = true, features = ["macros"] }

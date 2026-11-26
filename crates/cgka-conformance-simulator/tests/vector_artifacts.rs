@@ -453,7 +453,7 @@ async fn open_extended_length_welcome(receiver: &Keys, gift_wrap: &Event) -> Nos
         .expect("gift wrap maps to a transport event")
         .to_transport_message()
         .expect("gift wrap id verifies");
-    let (peeled, provenance) = NostrMlsPeeler::new()
+    let (peeled, provenance) = NostrMlsPeeler::default()
         .with_welcome_signer(receiver.clone())
         .peel_welcome_with_provenance(&message)
         .await
@@ -485,7 +485,7 @@ async fn wrap_fixture_welcome(
     welcome_len: usize,
     relay_padding: usize,
 ) -> Event {
-    let wrapped = NostrMlsPeeler::new()
+    let wrapped = NostrMlsPeeler::default()
         .with_welcome_signer(sender.clone())
         .wrap_welcome_with_metadata(
             &EncryptedPayload {

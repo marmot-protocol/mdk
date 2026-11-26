@@ -740,9 +740,9 @@ impl cgka_traits::maintenance::WallClock for AtTime {
         self.0 * 1_000
     }
 }
-impl cgka_traits::maintenance::MaintenanceRandom for AtTime {
-    fn next_u64(&self) -> u64 {
-        0
+impl cgka_traits::EntropySource for AtTime {
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        dest.fill(0);
     }
 }
 

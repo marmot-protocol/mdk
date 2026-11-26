@@ -73,6 +73,7 @@ impl MarmotApp {
                 KIND_NOSTR_METADATA,
                 Vec::new(),
                 content,
+                &cgka_traits::SystemWallClock,
             );
             let indexers = self.public_indexer_publish_endpoints(
                 &indexer_relays,
@@ -249,6 +250,7 @@ impl MarmotApp {
                     KIND_NOSTR_CONTACT_LIST,
                     tags,
                     content,
+                    &cgka_traits::SystemWallClock,
                 ),
             )
             .await?;

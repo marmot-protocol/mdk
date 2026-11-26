@@ -939,6 +939,7 @@ mod tests {
                     KIND_NOSTR_METADATA,
                     Vec::new(),
                     malformed.to_owned(),
+                    &cgka_traits::SystemWallClock,
                 ),
             }];
 
@@ -1005,6 +1006,7 @@ mod tests {
             KIND_NOSTR_METADATA,
             Vec::new(),
             content.to_string(),
+            &cgka_traits::SystemWallClock,
         );
         event.created_at = 1_700_000_000;
         profile_from_record(RelayEventRecord {
@@ -1347,6 +1349,7 @@ mod tests {
             KIND_NOSTR_METADATA,
             Vec::new(),
             content,
+            &cgka_traits::SystemWallClock,
         );
         event.created_at = 1_700_000_000;
         assert!(

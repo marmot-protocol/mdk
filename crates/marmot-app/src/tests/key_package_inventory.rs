@@ -87,12 +87,14 @@ fn relay_list_events(account_id_hex: &str, relays: &[&str]) -> Vec<NostrTranspor
             KIND_NIP65_RELAY_LIST,
             nip65_tags,
             String::new(),
+            &cgka_traits::SystemWallClock,
         ),
         NostrTransportEvent::new_unsigned(
             account_id_hex.to_owned(),
             KIND_MARMOT_INBOX_RELAY_LIST,
             vec![vec!["relay".into(), relays[0].into()]],
             String::new(),
+            &cgka_traits::SystemWallClock,
         ),
     ]
 }

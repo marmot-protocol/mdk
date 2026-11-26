@@ -68,6 +68,5 @@ pub use session::{
     SiblingWelcome, private_key_package_stock, validate_received_private_key_package,
 };
 pub use time::{
-    MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
-    WallClock,
+    EntropySource, MonotonicClock, OsEntropy, SystemMonotonicClock, SystemWallClock, WallClock,
 };

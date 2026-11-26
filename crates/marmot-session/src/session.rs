@@ -50,9 +50,9 @@ use cgka_traits::error::{AccountDevicesActivationRefusal, EngineError};
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::{
-    DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
-    MaintenanceObligation, MaintenanceRandom, PeriodicMaintenancePolicy, TransportFanoutTarget,
-    WallClock,
+    DurableGroupEvolution, DurableTransportFanout, EntropySource, GroupMaintenanceState,
+    KeyPackageLifecycleState, MaintenanceObligation, PeriodicMaintenancePolicy,
+    TransportFanoutTarget, WallClock,
 };
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -142,7 +142,7 @@ pub struct SessionConfig {
     storage_options: SqliteStorageOptions,
     convergence_policy: CanonicalizationPolicy,
     recorder: Option<Box<dyn ForensicRecorder>>,
-    maintenance_sources: Option<(Arc<dyn WallClock>, Arc<dyn MaintenanceRandom>)>,
+    maintenance_sources: Option<(Arc<dyn WallClock>, Arc<dyn EntropySource>)>,
     defer_group_hydration: bool,
 }
 
@@ -298,9 +298,9 @@ impl SessionConfig {
     pub fn maintenance_sources(
         mut self,
         wall_clock: Arc<dyn WallClock>,
-        maintenance_random: Arc<dyn MaintenanceRandom>,
+        entropy: Arc<dyn EntropySource>,
     ) -> Self {
-        self.maintenance_sources = Some((wall_clock, maintenance_random));
+        self.maintenance_sources = Some((wall_clock, entropy));
         self
     }
 }
@@ -534,8 +534,8 @@ impl AccountDeviceSession {
             builder
         };
         let mut builder = builder.peeler(config.peeler);
-        if let Some((wall_clock, maintenance_random)) = config.maintenance_sources {
-            builder = builder.maintenance_sources(wall_clock, maintenance_random);
+        if let Some((wall_clock, entropy)) = config.maintenance_sources {
+            builder = builder.maintenance_sources(wall_clock, entropy);
         }
         let audit = config
             .recorder

@@ -2,13 +2,13 @@ use crate::{
     EXPIRATION_TAG, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE, KIND_NIP59_GIFT_WRAP, NOSTR_SOURCE,
     NostrPeelerError, RECIPIENT_TAG,
 };
+use cgka_traits::WallClock;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::types::{MemberId, MessageId};
 use nostr::prelude::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Nostr event shape consumed and produced at the peeler boundary.
 ///
@@ -239,15 +239,15 @@ impl NostrTransportEvent {
         )
     }
 
-    /// Build an unsigned local Nostr DTO and precompute the event id for the
-    /// supplied unsigned event core.
+    /// Build an unsigned local Nostr DTO and compute its id using the clock's timestamp.
     pub fn new_unsigned(
         pubkey: String,
         kind: u64,
         tags: Vec<Vec<String>>,
         content: String,
+        clock: &dyn WallClock,
     ) -> Self {
-        Self::new_unsigned_at(pubkey, kind, tags, content, now_unix_seconds())
+        Self::new_unsigned_at(pubkey, kind, tags, content, clock.now().0)
     }
 
     /// Build an unsigned DTO at an explicitly selected wall-clock timestamp.
@@ -296,13 +296,6 @@ fn pre_signing_id(
     hex::encode(Sha256::digest(bytes))
 }
 
-fn now_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 pub(crate) fn decode_hex(label: &str, value: &str) -> Result<Vec<u8>, NostrPeelerError> {
     hex::decode(value).map_err(|e| NostrPeelerError::Malformed(format!("invalid hex {label}: {e}")))
 }
@@ -326,7 +319,42 @@ pub(crate) fn decode_hex_exact(
 mod tests {
     use super::*;
     use nostr::nips::nip59::GiftWrapBuilder;
-    use nostr::prelude::{EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, Tag};
+    use nostr::prelude::{
+        EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, PublicKey, Tag,
+        Timestamp as NostrTimestamp,
+    };
+
+    #[test]
+    fn unsigned_event_uses_clock() {
+        struct FixedClock;
+
+        impl WallClock for FixedClock {
+            fn now(&self) -> Timestamp {
+                Timestamp(1_700_001_234)
+            }
+
+            fn now_ms(&self) -> u64 {
+                1_700_001_234_000
+            }
+        }
+
+        // X-only public key for secret scalar 1.
+        let pubkey =
+            PublicKey::from_hex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
+        let event = NostrTransportEvent::new_unsigned(
+            pubkey.to_hex(),
+            0,
+            vec![],
+            "profile".into(),
+            &FixedClock,
+        );
+        let expected = EventBuilder::new(Kind::Metadata, "profile")
+            .custom_created_at(NostrTimestamp::from_secs(1_700_001_234))
+            .finalize_unsigned(pubkey);
+        assert_eq!(event.created_at, 1_700_001_234);
+        assert_eq!(event.id, expected.compute_id().to_hex());
+    }
 
     #[test]
     fn kind_445_event_maps_to_group_transport_message() {

@@ -1558,8 +1558,13 @@ async fn publish_nostr_event_at(
     created_at: u64,
 ) {
     let keys = home.load_signing_keys(label).unwrap();
-    let mut event =
-        NostrTransportEvent::new_unsigned(keys.public_key().to_hex(), kind, tags, content);
+    let mut event = NostrTransportEvent::new_unsigned(
+        keys.public_key().to_hex(),
+        kind,
+        tags,
+        content,
+        &cgka_traits::SystemWallClock,
+    );
     event.created_at = created_at;
     let relay_client = signed_sdk_client(keys);
     relay_client
@@ -1787,6 +1792,7 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
             kind,
             vec![tag],
             String::new(),
+            &cgka_traits::SystemWallClock,
         );
         relay_client
             .publish_event(&[endpoint(&url)], &event, 1)
@@ -16785,6 +16791,7 @@ async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool)
                     vec!["r".into(), unavailable_url, "write".into()],
                 ],
                 String::new(),
+                &cgka_traits::SystemWallClock,
             ),
             1,
         )
@@ -16998,6 +17005,7 @@ async fn explicit_empty_outbox_metadata_never_publishes_defaults(external_signer
                         kind,
                         tags,
                         String::new(),
+                        &cgka_traits::SystemWallClock,
                     ),
                     1,
                 )
@@ -17113,6 +17121,7 @@ async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
                     KIND_NIP65_RELAY_LIST,
                     vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
                     String::new(),
+                    &cgka_traits::SystemWallClock,
                 ),
                 1,
             )
