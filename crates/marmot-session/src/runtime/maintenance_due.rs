@@ -65,7 +65,6 @@ where
         if !self.watched_welcomes.is_empty()
             || !self.pending_leaf_reconciliations.is_empty()
             || self.welcome_expiries_unfinished()
-            || self.session.founding_welcomes_unfinished()
             || !self.sealing_commits.is_empty()
         {
             due.owed();
@@ -82,9 +81,18 @@ where
                 MaintenancePhase::Complete | MaintenancePhase::Failed
             )
         };
+        let founding_welcomes_unfinished = self.session.founding_welcomes_unfinished();
+        let live_groups = if !self.maintenance_paused || founding_welcomes_unfinished {
+            self.session.live_group_ids()?
+        } else {
+            Vec::new()
+        };
+        if founding_welcomes_unfinished && !live_groups.is_empty() {
+            due.owed();
+        }
         if !self.maintenance_paused {
             let elapsed = self.monotonic_clock.elapsed();
-            for group_id in self.session.live_group_ids()? {
+            for group_id in live_groups {
                 let Some(state) = skips_group_this_tick(self.session.group_maintenance(&group_id))?
                 else {
                     continue;
