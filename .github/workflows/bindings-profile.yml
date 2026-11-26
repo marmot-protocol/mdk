@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: marmotkit-profile-${{ github.ref }}
+  group: marmotkit-profile-${{ github.sha }}
   cancel-in-progress: false
 
 env:
@@ -29,8 +29,6 @@ jobs:
     outputs:
       source_sha: ${{ steps.identity.outputs.source_sha }}
       builder_sha: ${{ steps.identity.outputs.builder_sha }}
-      run_apple: ${{ steps.lanes.outputs.run_apple }}
-      run_android: ${{ steps.lanes.outputs.run_android }}
     steps:
       - name: Check out exact candidate head
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -54,13 +52,6 @@ jobs:
             echo "source_sha=$source_sha"
             echo "builder_sha=$source_sha"
           } >> "$GITHUB_OUTPUT"
-      - name: Select candidate packaging lanes
-        id: lanes
-        run: |
-          {
-            echo "run_android=true"
-            echo "run_apple=true"
-          } >> "$GITHUB_OUTPUT"
       - name: Run inexpensive orchestration regressions
         run: |
           set -euo pipefail
@@ -73,7 +64,6 @@ jobs:
     name: Build Apple candidate input (${{ matrix.part }})
     runs-on: macos-latest
     needs: identity
-    if: needs.identity.outputs.run_apple == 'true'
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -158,7 +148,6 @@ jobs:
     name: Build Android candidate input (${{ matrix.part }})
     runs-on: ubuntu-latest
     needs: identity
-    if: needs.identity.outputs.run_android == 'true'
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -268,7 +257,6 @@ jobs:
     name: Validate Android candidate package
     runs-on: ubuntu-latest
     needs: [identity, android-build]
-    if: needs.identity.outputs.run_android == 'true'
     timeout-minutes: 15
     steps:
       - name: Check out exact candidate head
@@ -539,20 +527,10 @@ jobs:
           ANDROID_RESULT: ${{ needs.android-package.result }}
           IOS_RESULT: ${{ needs.ios-package.result }}
           MACOS_RESULT: ${{ needs.macos-package.result }}
-          RUN_APPLE: ${{ needs.identity.outputs.run_apple }}
-          RUN_ANDROID: ${{ needs.identity.outputs.run_android }}
           SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
         run: |
           set -euo pipefail
           [[ "$IDENTITY_RESULT" == success ]] || exit 1
-          if [[ "$RUN_ANDROID" == true ]]; then
-            [[ "$ANDROID_RESULT" == success ]] || exit 1
-          else
-            [[ "$ANDROID_RESULT" == skipped ]] || exit 1
-          fi
-          if [[ "$RUN_APPLE" == true ]]; then
-            [[ "$IOS_RESULT" == success && "$MACOS_RESULT" == success ]] || exit 1
-          else
-            [[ "$IOS_RESULT" == skipped && "$MACOS_RESULT" == skipped ]] || exit 1
-          fi
-          echo "Validated selected candidate packages for $SOURCE_SHA"
+          [[ "$ANDROID_RESULT" == success ]] || exit 1
+          [[ "$IOS_RESULT" == success && "$MACOS_RESULT" == success ]] || exit 1
+          echo "Validated all candidate packages for $SOURCE_SHA"

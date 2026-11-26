@@ -202,7 +202,7 @@ class SignaturePolicyTests(unittest.TestCase):
                     return bool(needs) and any(gated(parent, visited | {job}) for parent in
                         re.findall(r"[a-z0-9][a-z0-9-]*", needs[1]))
                 for job, body in jobs.items():
-                    if job not in {"required-ci", "candidate-validation", "merge-group-fail-fast"}:
+                    if job not in {"required-ci", "merge-group-fail-fast"}:
                         self.assertTrue(gated(job), f"{path.name}:{job} can run before signatures")
                         self.assertNotRegex(body, r"(?m)^    if:.*(?:always|failure|cancelled)\(")
 
@@ -221,7 +221,7 @@ class SignaturePolicyTests(unittest.TestCase):
 
 
 class PackagingPolicyTests(unittest.TestCase):
-    def test_packaging_workflows_do_not_trigger_on_pr_or_master_push(self):
+    def test_packaging_workflows_do_not_trigger_on_master_push_or_core_crate_prs(self):
         bindings_profile = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
         bp_trigger = bindings_profile.split("\npermissions:\n", 1)[0]
         self.assertIn("  workflow_dispatch:", bp_trigger)
@@ -233,21 +233,30 @@ class PackagingPolicyTests(unittest.TestCase):
         wn_trigger = wn_agent.split("\npermissions:\n", 1)[0]
         self.assertIn("  workflow_dispatch:", wn_trigger)
         self.assertIn("  workflow_call:", wn_trigger)
-        self.assertIn("    tags:\n      - wn-agent-v*", wn_trigger)
-        self.assertNotIn("  pull_request:", wn_trigger)
-        self.assertNotIn("    branches:", wn_trigger)
+        push_block = wn_trigger.split("\n  push:\n", 1)[1].split("\n  workflow_dispatch:\n", 1)[0]
+        push_lines = [line.strip() for line in push_block.splitlines()
+                      if line.strip() and not line.strip().startswith("#")]
+        self.assertEqual(push_lines, ["tags:", "- wn-agent-v*", '- "!wn-agent-v*-nightly.*"'])
+        pr_block = wn_trigger.split("\n  pull_request:\n", 1)[1].split("\n  push:\n", 1)[0]
+        self.assertNotIn("crates/", pr_block)
+        self.assertIn("integrations/hermes/marmot/**", pr_block)
+        self.assertIn("integrations/openclaw/marmot/**", pr_block)
 
-    def test_gate_rejects_failed_or_unexpectedly_skipped_selected_packages(self):
+    def test_gate_requires_every_candidate_package(self):
         script = workflow_step("bindings-profile.yml", "Require every candidate package")
-        base = {**os.environ, "IDENTITY_RESULT": "success", "RUN_ANDROID": "false",
-                "RUN_APPLE": "false", "ANDROID_RESULT": "skipped", "IOS_RESULT": "skipped",
-                "MACOS_RESULT": "skipped", "SOURCE_SHA": "candidate"}
-        cases = [({}, True), ({"IDENTITY_RESULT": "failure"}, False),
-                 ({"RUN_ANDROID": "true"}, False),
-                 ({"RUN_ANDROID": "true", "ANDROID_RESULT": "failure"}, False),
-                 ({"RUN_ANDROID": "true", "ANDROID_RESULT": "success"}, True),
-                 ({"RUN_APPLE": "true", "IOS_RESULT": "success"}, False),
-                 ({"RUN_APPLE": "true", "IOS_RESULT": "success", "MACOS_RESULT": "success"}, True)]
+        base = {**os.environ, "IDENTITY_RESULT": "success", "ANDROID_RESULT": "success",
+                "IOS_RESULT": "success", "MACOS_RESULT": "success", "SOURCE_SHA": "candidate"}
+        cases = [
+            ({}, True),
+            ({"IDENTITY_RESULT": "failure"}, False),
+            ({"ANDROID_RESULT": "skipped"}, False),
+            ({"ANDROID_RESULT": "failure"}, False),
+            ({"IOS_RESULT": "skipped"}, False),
+            ({"IOS_RESULT": "failure"}, False),
+            ({"MACOS_RESULT": "skipped"}, False),
+            ({"MACOS_RESULT": "failure"}, False),
+            ({"ANDROID_RESULT": "", "IOS_RESULT": "", "MACOS_RESULT": ""}, False),
+        ]
         for overrides, expected in cases:
             with self.subTest(overrides=overrides):
                 result = subprocess.run(["bash", "-c", script], env={**base, **overrides}, capture_output=True)

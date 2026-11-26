@@ -773,7 +773,7 @@ class ReleaseProfileTests(unittest.TestCase):
 
     def test_candidate_profile_workflow_binds_same_run_inputs_to_exact_head(self):
         text = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
-        self.assertIn("group: marmotkit-profile-${{ github.ref }}", text)
+        self.assertIn("group: marmotkit-profile-${{ github.sha }}", text)
         self.assertNotIn("group: marmotkit-profile-${{ github.event.pull_request.head.sha", text)
         self.assertIn("ref: ${{ github.sha }}", text)
         self.assertIn("actions/download-artifact@", text)
