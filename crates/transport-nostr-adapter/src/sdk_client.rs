@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::pin::Pin;
 #[cfg(test)]
@@ -22,7 +24,7 @@ use nostr_sdk::prelude::{
     Client, ClientBuilder, ClientNotification, ErrorKind as SdkErrorKind, Event, EventBuilder,
     EventId, Filter, FinalizeEventAsync, Kind, MachineReadablePrefix, PublicKey, Relay,
     RelayCapabilities, RelayMessage, RelayStatus, RelayUrl, ReqTarget, SingleLetterTag,
-    SubscriptionId, SyncDirection, SyncOptions, Tag, Timestamp as NostrTimestamp,
+    SubscriptionId, SyncOptions, Tag, Timestamp as NostrTimestamp,
 };
 use nostr_sdk::relay::{EventSendStatus, RelayNotification};
 use nostr_sdk::transport::websocket::{WebSocketSink, WebSocketStream, WebSocketTransport};
@@ -33,18 +35,19 @@ use transport_nostr_peeler::{
     KIND_MARMOT_GROUP_MESSAGE, MarmotNostrSigner, NostrTransportEvent, SdkSigner,
 };
 
+#[cfg(test)]
+use crate::NostrAcquisitionLimits;
 use crate::finite_req::{FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests, is_auth_required};
 use crate::network_proxy as process_proxy;
 use crate::sweep::hint_tap::{EoseHints, HintTransport};
 use crate::{
     DeliveryRoute, EoseReply, MAX_DELIVERY_LOSS_ROUTES, NostrAcquisitionCancellation,
-    NostrAcquisitionEnd, NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionLimits,
-    NostrAcquisitionRequest, NostrAcquisitionResult, NostrAcquisitionScope, NostrAcquisitionStats,
-    NostrEventPublishRequest, NostrNotificationLoss, NostrNotificationLossBounds,
-    NostrNotificationLossFloor, NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome,
-    NostrRelayClient, NostrRelayEvent, NostrSubscribeReport, NostrSubscription,
-    NostrTransportAdapter, RelayConnection, ReplayRestart, SubscriptionRefusal,
-    SubscriptionRefusalDisposition,
+    NostrAcquisitionEnd, NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionRequest,
+    NostrAcquisitionResult, NostrAcquisitionScope, NostrAcquisitionStats, NostrEventPublishRequest,
+    NostrNotificationLoss, NostrNotificationLossBounds, NostrNotificationLossFloor,
+    NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome, NostrRelayClient,
+    NostrRelayEvent, NostrSubscribeReport, NostrSubscription, NostrTransportAdapter,
+    RelayConnection, ReplayRestart, SubscriptionRefusal, SubscriptionRefusalDisposition,
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -81,407 +84,19 @@ const SDK_RELAY_BATCH_MAX_IN_FLIGHT: usize = 4;
 /// Only idle WRITE-only sockets count toward this per-client cache bound.
 const SDK_PUBLISH_RELAY_IDLE_LIMIT: usize = 16;
 const SDK_PUBLISH_RELAY_IDLE_WAIT: Duration = Duration::from_secs(60);
-/// One route gets a strict pass-wide budget, including set comparison, replay
-/// fetch, decoding, and materialization. The app can impose a shorter
-/// account-wide deadline for background work.
-const SDK_RECONCILIATION_WAIT: Duration = Duration::from_secs(20);
-/// Allow relay-side inventory work and a WAN round trip before the first reply.
-const SDK_RECONCILIATION_NEGOTIATION_WAIT: Duration = Duration::from_secs(5);
-/// Fetch a bounded rotating portion of the remote-only set. Durable admission
-/// removes accepted ids; rotation reaches dependencies beyond refused ids.
-const SDK_RECONCILIATION_REPLAY_BATCH: usize = 512;
-/// An exact-ID request may return a large event or duplicate copies. Spend a
-/// finite aggregate budget across all request-local acquisitions in one pass.
-const SDK_RECONCILIATION_MAX_ID_REQUESTS: usize = 16;
-/// IDs one exact-ID request names after a pass's first request. Each request
-/// is a round trip inside the route deadline, so batching is what lets a pass
-/// carry more than a handful of ordinary events (mdk#2086).
-const SDK_RECONCILIATION_MAX_IDS_PER_REQUEST: usize = 64;
-const SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT: usize = 256;
-const SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT: usize = 1024 * 1024;
-// A single supported event can exceed the ordinary pass allowance. The pinned
-// SDK's default normalized-message ceiling is 5 MiB; one otherwise-empty pass
-// may return one such object, then stops. This is an MDK acquisition ceiling,
-// not a Nostr protocol maximum or a bound for custom SDK clients.
-const SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES: usize = 5 * 1024 * 1024;
-/// One more than the storage inventory ceiling (16,384). The relay applies the
-/// same limit, bounding the dry-run result even on first boot with an empty
-/// inventory. A relay set that fills it may be truncated; a set within the
-/// ceiling, including one sitting exactly on it, is the whole window.
-const SDK_RECONCILIATION_SET_LIMIT: usize = 16_384 + 1;
-/// Rounds a group route's pass may spend finding the oldest window of a gap
-/// larger than one pass, within half of what is left of its deadline. Each
-/// round runs `SDK_RECONCILIATION_WINDOW_PROBES` dry-run comparisons over
-/// candidate window bounds at once. The previous pass's window, or a search it
-/// left unfinished, seeds the first round, so a backlog being worked through
-/// usually needs one.
-const SDK_RECONCILIATION_WINDOW_ROUNDS: usize = 6;
-const SDK_RECONCILIATION_WINDOW_PROBES: usize = 8;
-/// Routes whose advisory acquisition memory one client keeps.
-const SDK_RECONCILIATION_MEMORY_ROUTES: usize = 1024;
-/// IDs one route keeps set aside per relay it compares with, fetched, refused
-/// or withheld without admission: as many as one relay's comparison can name,
-/// so the list fills only past what every relay's inventory could hold.
-const SDK_RECONCILIATION_SET_ASIDE_IDS: usize = SDK_RECONCILIATION_SET_LIMIT;
-/// Set-aside IDs across all routes, and the most one route keeps; past it the
-/// least recently used route's memory is dropped, and that route sets its IDs
-/// aside again.
-const SDK_RECONCILIATION_SET_ASIDE_TOTAL: usize = 65_536;
+/// Concurrent NIP-77 comparisons allowed per canonical relay on one SDK pool.
+const SDK_NEG_CONCURRENT_SESSIONS: usize = 8;
 
-/// Memory-only hints for fetching one group route's gap oldest-first. Losing
-/// them costs at most extra narrowing or one more fetch of an event the
-/// account never admits; what is fetched and certified never depends on them.
-#[derive(Default)]
-struct AcquisitionRouteMemory {
-    /// The last bound a window search found to fit one pass. Admission and
-    /// setting aside only shrink a window, so it still fits on later passes.
-    window_until: Option<u64>,
-    /// How far past `window_until` the next window should reach: from the
-    /// density of the events the last window returned, or the distance to
-    /// the nearest bound found too large.
-    window_step: Option<u64>,
-    /// The upper bound of a search that did not finish: the next pass probes
-    /// between `window_until` and it first.
-    search_high: Option<u64>,
-    /// Passes in a row whose search did not finish.
-    unfinished_passes: u8,
-    /// When this route's memory was last used, for eviction.
-    last_used: u64,
-    /// The average event size this route returned last, so a window fits the
-    /// byte allowance as well as the item count.
-    event_bytes: Option<usize>,
-    /// IDs a pass fetched, or asked for and was answered without, that the
-    /// account has not admitted since, in the order they were set aside. They
-    /// yield to history not tried yet, so events that can never be admitted
-    /// cannot hold the oldest window.
-    set_aside: VecDeque<EventId>,
-}
-
-#[derive(Default)]
-struct AcquisitionMemory {
-    routes: HashMap<AcquisitionRouteKey, AcquisitionRouteMemory>,
-    tick: u64,
-}
-
-/// What a pass reads from its route's memory.
-#[derive(Default)]
-struct AcquisitionHints {
-    seed: Option<WindowSeed>,
-    event_bytes: Option<usize>,
-    unfinished_passes: u8,
-    set_aside: Vec<EventId>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct AcquisitionRouteKey {
-    account_id: MemberId,
-    transport_group_id: Vec<u8>,
-}
-
-/// What a window search found.
-enum WindowSearch {
-    /// A non-empty window of at most one pass: `[since, until]` holds `ids`.
-    Fits {
-        until: u64,
-        ids: HashSet<EventId>,
-        over_until: Option<u64>,
-    },
-    /// No such window in the rounds and time allowed. The window up to `low`
-    /// fits; the one up to `high` holds more than a pass, all of `over_ids`
-    /// when every relay asked answered that probe.
-    Unfinished {
-        low: u64,
-        high: u64,
-        over_ids: Option<HashSet<EventId>>,
-    },
-}
-
-/// Where an earlier pass left the window search: a bound whose window still
-/// fits one pass, how far past it to probe first, and the upper bound of a
-/// search it did not finish.
+/// Why a dry-run NIP-77 comparison failed at the SDK boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct WindowSeed {
-    low: u64,
-    step: Option<u64>,
-    high: Option<u64>,
-}
-
-/// How a pass leaves a route's window search.
-enum AcquisitionUpdate {
-    Fits {
-        until: u64,
-        step: Option<u64>,
-    },
-    /// `skipped`: the pass fetched nothing to let the next one resume.
-    Unfinished {
-        low: u64,
-        high: u64,
-        skipped: bool,
-    },
-    None,
-}
-
-/// IDs one pass can fetch when events average `event_bytes`.
-/// The most IDs a route compared with `relays` relays keeps set aside: the
-/// union of their inventories can name as many as each names alone, summed.
-fn set_aside_cap(relays: usize) -> usize {
-    SDK_RECONCILIATION_SET_ASIDE_IDS
-        .saturating_mul(relays.max(1))
-        .min(SDK_RECONCILIATION_SET_ASIDE_TOTAL)
-}
-
-/// Drop the least recently used route's memory.
-fn evict_least_recent(routes: &mut HashMap<AcquisitionRouteKey, AcquisitionRouteMemory>) {
-    if let Some(evicted) = routes
-        .iter()
-        .min_by_key(|(_, route)| route.last_used)
-        .map(|(key, _)| key.clone())
-    {
-        routes.remove(&evicted);
-    }
-}
-
-fn window_target(event_bytes: Option<usize>) -> usize {
-    event_bytes.map_or(SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT, |bytes| {
-        (SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT * 4 / 5 / bytes.max(1))
-            .clamp(1, SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT)
-    })
-}
-
-/// Candidate upper bounds for one round of the window search, within
-/// `(low, high)` where the window up to `low` holds `low_count` IDs and up to
-/// `high` holds `high_count`.
-///
-/// A first round seeded with a step probes around `low + step`. An unseeded
-/// first round starts at the recent end, where a catch-up gap sits, at
-/// distances shrinking by powers of two, so one round brackets the gap's
-/// oldest edge across many scales. Later rounds spread evenly within the
-/// bracket, plus one probe where `target` would fall if the IDs between the
-/// bounds were spread evenly in time.
-fn window_probes(
-    (low, low_count): (u64, usize),
-    (high, high_count): (u64, usize),
-    target: usize,
-    first_round_step: Option<Option<u64>>,
-) -> Vec<u64> {
-    // `Some(Some(step))`: seeded first round; `Some(None)`: unseeded first
-    // round; `None`: a later round, or a first round resuming a bracket.
-    let width = high.saturating_sub(low);
-    let probes_wanted = SDK_RECONCILIATION_WINDOW_PROBES as u64;
-    let mut probes = match first_round_step {
-        Some(Some(step)) => [0.25, 0.5, 0.75, 0.9, 1.0, 1.15, 2.0, 4.0]
-            .into_iter()
-            .map(|share| low.saturating_add(((step as f64 * share) as u64).max(1)))
-            .collect::<Vec<_>>(),
-        Some(None) => (1..=probes_wanted)
-            .map(|power| high - width / (1u64 << (power * 3 / 2).min(62)).max(1))
-            .collect(),
-        // A bracket narrower than a round probes every second in it.
-        None if width <= probes_wanted => (low + 1..high).collect(),
-        None => {
-            let wanted = target.saturating_sub(low_count) as f64;
-            let between = high_count.saturating_sub(low_count).max(1) as f64;
-            let fraction = (wanted / between).clamp(0.0, 1.0);
-            (1..probes_wanted)
-                .map(|index| low + width / probes_wanted * index)
-                .chain(std::iter::once(low + (width as f64 * fraction) as u64))
-                .collect()
-        }
-    };
-    probes.retain(|probe| *probe > low && *probe < high);
-    probes.sort_unstable();
-    probes.dedup();
-    probes
-}
-
-/// Account-owned advisory replay progress, independent of admitted event inventory.
-/// The host must preserve this across routine subscription rebuilds and serialize
-/// calls for one route. Saving each selected ID must complete before its fetch I/O starts.
-/// Implementations should return aggregate errors without route or event identifiers.
-pub trait NostrReconciliationProgress: Send + Sync {
-    fn load_cursor(&self) -> Result<Option<[u8; 32]>, TransportAdapterError>;
-    fn save_cursor(&self, cursor: Option<[u8; 32]>) -> Result<(), TransportAdapterError>;
-}
-
-/// Serialized JSON length of a returned event, as the SDK budgets count it.
-fn event_json_bytes(event: &NostrTransportEvent) -> usize {
-    serde_json::to_string(event).map_or(0, |json| json.len())
-}
-
-/// One oldest-first pass's selection: the window's IDs, then IDs set aside by
-/// earlier passes with whatever room is left. The window keeps the durable
-/// cursor's rotation, which matters only when it holds more than one pass.
-/// The rotation's first ID leads, whichever relays claim it: a budget cut
-/// leaves the cursor just before the ID it deferred, which must be the next
-/// pass's first request. The rest of each part is grouped, stably, by the
-/// relays that claimed its IDs, so exact-ID requests batch fully; the pass
-/// returns its events in time order whatever order it fetched them in.
-fn oldest_first_remote_ids(
-    window: &HashSet<EventId>,
-    set_aside: &[EventId],
-    claimants: impl Fn(&EventId) -> Vec<usize>,
-    progress: &dyn NostrReconciliationProgress,
-) -> Result<Vec<EventId>, TransportAdapterError> {
-    let after = progress.load_cursor()?.map(EventId::from_byte_array);
-    let mut fresh = bounded_reconciliation_remote_ids(window, after);
-    if let Some((_, rest)) = fresh.split_first_mut() {
-        rest.sort_by_cached_key(&claimants);
-    }
-    let mut retry = set_aside
-        .iter()
-        .filter(|id| !window.contains(id))
-        .copied()
-        .collect::<Vec<_>>();
-    retry.sort_by_cached_key(&claimants);
-    let mut ids = fresh.into_iter().chain(retry).collect::<Vec<_>>();
-    ids.truncate(SDK_RECONCILIATION_REPLAY_BATCH);
-    Ok(ids)
-}
-
-/// The cursor that makes `id` the first ID of the next pass's rotation: the
-/// ID just before it in `remote`'s ID order, wrapping. In ID-order selection
-/// that is the ID attempted before it; in oldest-first selection, which groups
-/// IDs by claimants, it may be one this pass never reached.
-fn cursor_before(remote: &HashSet<EventId>, id: &EventId) -> Option<[u8; 32]> {
-    remote
-        .iter()
-        .filter(|other| *other < id)
-        .max()
-        .or_else(|| remote.iter().filter(|other| *other != id).max())
-        .map(|before| before.to_bytes())
-}
-
-fn select_reconciliation_remote_ids(
-    remote: &HashSet<EventId>,
-    progress: &dyn NostrReconciliationProgress,
-) -> Result<Vec<EventId>, TransportAdapterError> {
-    let after = progress.load_cursor()?.map(EventId::from_byte_array);
-    // Empty comparisons can also mean every relay failed negotiation. Leave
-    // the cursor unchanged; only attempted IDs move it below.
-    Ok(bounded_reconciliation_remote_ids(remote, after))
-}
-
-fn bounded_reconciliation_remote_ids(
-    remote: &HashSet<EventId>,
-    after: Option<EventId>,
-) -> Vec<EventId> {
-    let mut ids = remote.iter().copied().collect::<Vec<_>>();
-    ids.sort_unstable();
-    if let Some(after) = after
-        && !ids.is_empty()
-    {
-        let start = ids.partition_point(|id| *id <= after) % ids.len();
-        ids.rotate_left(start);
-    }
-    ids.truncate(SDK_RECONCILIATION_REPLAY_BATCH);
-    ids
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NostrReconciliationItem {
-    pub event_id: [u8; 32],
-    pub created_at: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct NostrReconciliationSummary {
-    /// Endpoints whose comparison finished and whose every missing ID this
-    /// pass returned. This is not exhaustive history coverage.
-    pub relays_succeeded: usize,
-    /// Endpoints with comparison, acquisition, or selected-suffix gaps.
-    pub relays_failed: usize,
-    /// The endpoints counted in `relays_failed`, sorted. An endpoint's result
-    /// never depends on another endpoint's gaps, so callers can certify a
-    /// subset. Account-private: never log them.
-    pub failed_endpoints: Vec<TransportEndpoint>,
-    /// The subset of `failed_endpoints` that answered: it finished the
-    /// comparison and served its exact-ID requests, but this pass did not
-    /// return every ID it claimed, for example one over the single-event
-    /// ceiling or one it withholds. The rest timed out, errored or truncated.
-    pub incomplete_endpoints: Vec<TransportEndpoint>,
-    /// Why each endpoint in `failed_endpoints` failed, sorted by endpoint:
-    /// the first stage of the pass that failed it. Account-private like
-    /// `failed_endpoints`: never log the endpoints.
-    pub endpoint_failures: Vec<NostrReconciliationEndpointFailure>,
-    pub remote_items: usize,
-    pub received_items: usize,
-    /// This group pass returned nothing because no time order covered what it
-    /// was missing: no relay answered its window probes, its delivery boundary
-    /// was unknown or excluded everything it fetched, or more history was set
-    /// aside than its relays' comparisons name. A pass that waits one round
-    /// for an unfinished search does not count. Diagnostic only.
-    pub order_unproven: bool,
-}
-
-/// One failed endpoint of a reconciliation pass and why it failed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NostrReconciliationEndpointFailure {
-    pub endpoint: TransportEndpoint,
-    pub failure: NostrReconciliationFailure,
-}
-
-/// Why one endpoint failed a reconciliation pass. Each class names the stage
-/// that failed it, so an incident record can tell a relay-side refusal from a
-/// local or network fault. Relay reason text is never kept.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NostrReconciliationFailure {
-    /// The relay answered NEG-OPEN with NEG-ERR. The category is the reason's
-    /// NIP-01 machine-readable prefix, `None` when it has none or an unknown one.
+enum NegFailureKind {
     NegErr(Option<TransportEndpointRejectionCategory>),
-    /// The relay sent its concurrent-negentropy cap NOTICE (strfry: `ERROR:
-    /// too many concurrent NEG requests`) while this NEG-OPEN waited for its
-    /// first reply. The NOTICE names no session, but a session it refused never
-    /// gets a reply, so this pass's comparison was refused.
     NegCapNotice,
-    /// The relay said it does not support negentropy, or answered with a
-    /// negentropy protocol error.
     NegentropyUnsupported,
-    /// The relay sent no first negentropy reply in time.
     FirstReplyTimeout,
-    /// The pass's deadline ended this endpoint's comparison, a window
-    /// probe, or its fetches.
     RouteTimeout,
-    /// The account's relay pool does not hold this endpoint.
-    NotInPool,
-    /// The relay was not connected or not usable when the pass ran.
     NotOperational,
-    /// The relay's matching set filled the comparison limit, so it cannot vouch
-    /// for the whole window.
-    LimitReached,
-    /// The relay did not serve an exact-ID fetch for events it claimed.
-    IdFetchRefused,
-    /// The relay returned an event this pass did not ask for.
-    UnrequestedEvent,
-    /// The relay reached EOSE on an exact-ID fetch without an event it
-    /// claimed.
-    Withheld,
-    /// This pass's own item, byte, request or ordering limits left some of
-    /// the events the relay claimed for a later pass, without asking for them
-    /// or after cutting their fetch short. Not the relay's fault.
-    PassLimit,
-    /// A local fault, not attributable to the relay.
     LocalError,
-}
-
-impl NostrReconciliationFailure {
-    /// Stable snake_case name for diagnostics.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::NegErr(_) => "neg_err",
-            Self::NegCapNotice => "neg_cap_notice",
-            Self::NegentropyUnsupported => "negentropy_unsupported",
-            Self::FirstReplyTimeout => "first_reply_timeout",
-            Self::RouteTimeout => "route_timeout",
-            Self::NotInPool => "not_in_pool",
-            Self::NotOperational => "not_operational",
-            Self::LimitReached => "limit_reached",
-            Self::IdFetchRefused => "id_fetch_refused",
-            Self::UnrequestedEvent => "unrequested_event",
-            Self::Withheld => "withheld",
-            Self::PassLimit => "pass_limit",
-            Self::LocalError => "local_error",
-        }
-    }
 }
 
 /// Planned SDK subscription derived from a transport-adapter subscription.
@@ -1831,9 +1446,6 @@ pub struct NostrSdkRelayClient {
     /// the adapter drives during activation and the clone the app holds observe
     /// the same log.
     registration_log: Arc<Mutex<HashMap<MemberId, HashMap<RelayUrl, bool>>>>,
-    /// Advisory per-route hints for oldest-first acquisition. A std lock,
-    /// never held across an await.
-    acquisition_memory: Arc<StdMutex<AcquisitionMemory>>,
     /// Clones share a pool's per-canonical-relay NEG allowance. Independently
     /// built account pools get their own credits, just like their sockets.
     neg_credits: Arc<StdMutex<HashMap<RelayUrl, Arc<Semaphore>>>>,
@@ -1844,9 +1456,6 @@ pub struct NostrSdkRelayClient {
     /// History REQs whose replies skip the SDK's reader (#2885). Only clients
     /// built through [`Self::from_builder`] can make them.
     finite_requests: Option<FiniteRequests>,
-    /// Test-only: select every route in ID order, to exercise the cursor alone.
-    #[cfg(test)]
-    id_order_only: bool,
 }
 
 /// An aborted public forwarder must not detach a blocked delivery child. It
@@ -2354,12 +1963,9 @@ impl NostrSdkRelayClient {
             #[cfg(test)]
             relay_retry_interval: SDK_RELAY_RETRY_INTERVAL,
             registration_log: Arc::new(Mutex::new(HashMap::new())),
-            acquisition_memory: Arc::default(),
             neg_credits: Arc::default(),
             eose_hints: None,
             finite_requests: None,
-            #[cfg(test)]
-            id_order_only: false,
         }
     }
 
@@ -3073,1227 +2679,6 @@ impl NostrSdkRelayClient {
         }
     }
 
-    /// Reconcile one route's event set against durable account admission.
-    /// NIP-77 compares event ids, including SDK-seen events that the account
-    /// could not retain. Replay is bounded independently of the set difference.
-    /// `progress` belongs to this account and route and must survive rebuilds.
-    /// `deadline` leaves the caller time to admit partial results or recover
-    /// an epoch gap; the SDK's own route allowance can only shorten it.
-    pub async fn reconcile_subscription(
-        &self,
-        subscription: NostrSubscription,
-        local_items: &[NostrReconciliationItem],
-        reconcile_since: u64,
-        reconcile_until: u64,
-        progress: &dyn NostrReconciliationProgress,
-        deadline: tokio::time::Instant,
-    ) -> Result<(NostrReconciliationSummary, Vec<NostrRelayEvent>), TransportAdapterError> {
-        let deadline = deadline.min(tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT);
-        if let Some(account_client) = self.account_client(subscription.account_id()).await? {
-            return Box::pin(account_client.reconcile_subscription(
-                subscription,
-                local_items,
-                reconcile_since,
-                reconcile_until,
-                progress,
-                deadline,
-            ))
-            .await;
-        }
-        let mut plan = Self::plan_subscription(&subscription)?;
-        // Startup compares the gap below the subscription floor; explicit
-        // backfill also compares its current window so upstream SDK dedup
-        // cannot hide previously refused events from the account.
-        plan.filter = plan
-            .filter
-            .since(NostrTimestamp::from_secs(reconcile_since))
-            .until(NostrTimestamp::from_secs(reconcile_until))
-            .limit(SDK_RECONCILIATION_SET_LIMIT);
-        // Endpoint capability can change after reconnect. Re-probe each
-        // requested endpoint under this call's finite SDK deadline rather
-        // than carrying a stale process-lifetime rejection across sessions.
-        // The app recovery owner paces its calls; direct callers own their rate.
-        // Reconciliation counts physical relay obligations. Parse first, then
-        // keep each canonical endpoint once so a repeated route URL cannot
-        // make the exact-ID request invalid after cached events were gathered.
-        let mut seen_endpoints = HashSet::new();
-        let endpoints = plan
-            .endpoints
-            .into_iter()
-            .filter(|endpoint| seen_endpoints.insert(endpoint.clone()))
-            .collect::<Vec<_>>();
-        let Some(replay_endpoint) = endpoints.first().cloned() else {
-            // Preserve the public no-op result for an empty route set. It is
-            // neither relay coverage nor backend-wide incapability evidence.
-            return Ok((NostrReconciliationSummary::default(), Vec::new()));
-        };
-        // A comparison fetches what it finds missing with finite requests, so
-        // a client without them refuses before any relay I/O or cursor write.
-        if self.finite_requests.is_none() {
-            return Err(TransportAdapterError::Subscription(
-                "reconciliation requires a client built with from_builder".to_owned(),
-            ));
-        }
-        let subscription_id = plan.subscription_id.to_string();
-        let items = local_items
-            .iter()
-            .filter(|item| item.created_at >= reconcile_since && item.created_at <= reconcile_until)
-            .map(|item| {
-                (
-                    EventId::from_byte_array(item.event_id),
-                    NostrTimestamp::from_secs(item.created_at),
-                )
-            })
-            .collect::<Vec<_>>();
-        let options = SyncOptions::new()
-            .initial_timeout(SDK_RECONCILIATION_NEGOTIATION_WAIT)
-            // The route guard, not an indistinguishable SDK idle timeout,
-            // classifies a relay that answered once and then went silent.
-            .idle_timeout(SDK_RECONCILIATION_WAIT)
-            .direction(SyncDirection::Down)
-            .dry_run();
-        let syncs = endpoints.iter().cloned().map(|endpoint| {
-            let client = self.client.clone();
-            let credits = self.neg_credit(&endpoint);
-            let filter = plan.filter.clone();
-            let items = items.clone();
-            let options = options.clone();
-            async move {
-                // Each endpoint owns its deadline: one silent relay fails
-                // alone instead of failing its route's other endpoints.
-                let result = timeout_at(deadline, async {
-                    let relay = match client.relay(&endpoint).await {
-                        Ok(Some(relay)) => relay,
-                        Ok(None) => return Err(NostrReconciliationFailure::NotInPool),
-                        Err(_) => return Err(NostrReconciliationFailure::LocalError),
-                    };
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(NostrReconciliationFailure::RouteTimeout);
-                    }
-                    sync_watching_neg_cap(&relay, filter, items, options, credits, deadline).await
-                })
-                .await
-                .unwrap_or(Err(NostrReconciliationFailure::RouteTimeout));
-                (endpoint, result)
-            }
-        });
-        // Once one endpoint has compared, the rest get until half of what was
-        // left of the pass. A relay that answered once and then stalled must
-        // not hold the pass to its deadline and leave no time to fetch what
-        // the healthy endpoints claimed. Until an endpoint succeeds, a slow
-        // one keeps the whole deadline: there is nothing to fetch without it.
-        let started = tokio::time::Instant::now();
-        let compare_cutoff = started + deadline.saturating_duration_since(started) / 2;
-        let mut pending = syncs.collect::<futures::stream::FuturesUnordered<_>>();
-        let mut outcomes = Vec::with_capacity(endpoints.len());
-        let mut cutoff = None;
-        loop {
-            let next = match cutoff {
-                None => pending.next().await,
-                Some(cutoff) => timeout_at(cutoff, pending.next()).await.unwrap_or(None),
-            };
-            let Some((endpoint, result)) = next else {
-                break;
-            };
-            if result.is_ok() {
-                cutoff = Some(compare_cutoff);
-            }
-            outcomes.push((endpoint, result));
-        }
-        drop(pending);
-        for endpoint in &endpoints {
-            if !outcomes.iter().any(|(compared, _)| compared == endpoint) {
-                outcomes.push((
-                    endpoint.clone(),
-                    Err(NostrReconciliationFailure::RouteTimeout),
-                ));
-            }
-        }
-        let mut remote = HashSet::new();
-        let mut remote_by_endpoint = HashMap::new();
-        let mut failed_endpoints = HashSet::new();
-        let mut incomplete_endpoints = HashSet::new();
-        // The first stage that failed each endpoint outright.
-        let mut failure_of = HashMap::new();
-        // Endpoints that reached EOSE on an exact-ID fetch without an ID they
-        // claimed.
-        let mut withheld_by = HashSet::new();
-        // The first failure of each endpoint in a window or boundary probe.
-        let probe_failures = StdMutex::new(HashMap::new());
-        for (endpoint, result) in outcomes {
-            match result {
-                Ok(summary) => {
-                    // The relay compares at most the filter limit. A matching
-                    // set that fills it may hide older remote events, so the
-                    // endpoint cannot vouch for the whole window.
-                    let relay_set =
-                        items.len().saturating_sub(summary.local.len()) + summary.remote.len();
-                    if relay_set >= SDK_RECONCILIATION_SET_LIMIT {
-                        failure_of
-                            .entry(endpoint.clone())
-                            .or_insert(NostrReconciliationFailure::LimitReached);
-                        failed_endpoints.insert(endpoint.clone());
-                    }
-                    remote.extend(summary.remote.iter().copied());
-                    remote_by_endpoint.insert(endpoint, summary.remote);
-                }
-                Err(failure) => {
-                    failure_of.entry(endpoint.clone()).or_insert(failure);
-                    failed_endpoints.insert(endpoint);
-                }
-            }
-        }
-        // Compare without SDK-managed downloads. An exact-ID acquisition owns
-        // each partial result and has finite per-endpoint item/byte budgets.
-        // A pass's first request names one ID, so a lone event up to the
-        // single-object ceiling stays reachable. Later requests batch
-        // consecutive IDs the same endpoints claimed. When a budget cuts a
-        // batch short, the first ID it left unreturned leads the next pass, so
-        // a relay's fixed response order cannot keep returning the same
-        // affordable prefix. The durable cursor rotates refused and oversized
-        // IDs on later passes.
-        let remote_item_count = remote.len();
-        // A group route's gap larger than one pass is fetched from its oldest
-        // end. MLS applies commits in order, and IDs picked in ID order could
-        // let commits carry the epoch more than the retained-epoch window past
-        // older messages still missing, which can then never be read (#2086).
-        #[cfg(test)]
-        let id_order_only = self.id_order_only;
-        #[cfg(not(test))]
-        let id_order_only = false;
-        let route_key = match &subscription {
-            _ if id_order_only => None,
-            NostrSubscription::Group {
-                account_id,
-                transport_group_id,
-                ..
-            } => Some(AcquisitionRouteKey {
-                account_id: account_id.clone(),
-                transport_group_id: transport_group_id.clone(),
-            }),
-            _ => None,
-        };
-        let AcquisitionHints {
-            seed: window_seed,
-            event_bytes,
-            unfinished_passes,
-            set_aside,
-        } = route_key
-            .as_ref()
-            .map(|key| self.acquisition_memory_for(key, &remote))
-            .unwrap_or_default();
-        let skip = set_aside.iter().copied().collect::<HashSet<_>>();
-        let target = window_target(event_bytes);
-        let answering = remote_by_endpoint.keys().cloned().collect::<Vec<_>>();
-        let mut acquisition_update = AcquisitionUpdate::None;
-        let mut skip_pass = false;
-        // Why this pass returns nothing for want of a proven order, if it does.
-        let mut order_unproven: Option<&'static str> = None;
-        // The fresh IDs this pass fetches oldest-first, when it does.
-        let window: Option<HashSet<EventId>> = match &route_key {
-            // More never-admitted IDs than every relay's inventory could hold
-            // set aside: a window would keep finding the ones it could not
-            // record, and ID-order selection has no order to keep. The route
-            // stays quiet, and recovery parks it with its notice.
-            Some(_) if set_aside.len() >= set_aside_cap(answering.len()) => {
-                skip_pass = true;
-                order_unproven = Some("set_aside_full");
-                None
-            }
-            // A gap within one pass by count is still one window: its bytes
-            // may not fit, and then only a time prefix may be returned.
-            Some(_) if remote.len() - remote.intersection(&skip).count() <= target => {
-                Some(remote.difference(&skip).copied().collect())
-            }
-            Some(_) => {
-                // Narrowing may spend half of what is left; fetching keeps the rest.
-                let now = tokio::time::Instant::now();
-                let narrowing_deadline = now + deadline.saturating_duration_since(now) / 2;
-                match self
-                    .oldest_window(
-                        &plan.filter,
-                        &answering,
-                        &items,
-                        &options,
-                        (reconcile_since, reconcile_until),
-                        &remote,
-                        &set_aside,
-                        target,
-                        window_seed,
-                        narrowing_deadline,
-                        &probe_failures,
-                    )
-                    .await
-                {
-                    // No relay answered a probe: the gap's order is unknown,
-                    // so this pass fetches nothing rather than an ID-order
-                    // slice. Its IDs stay fetchable for the next.
-                    None => {
-                        skip_pass = true;
-                        order_unproven = Some("search_unanswered");
-                        None
-                    }
-                    Some(WindowSearch::Fits {
-                        until,
-                        ids,
-                        over_until,
-                    }) => {
-                        acquisition_update = AcquisitionUpdate::Fits {
-                            until,
-                            step: over_until.map(|over| over.saturating_sub(until)),
-                        };
-                        Some(ids)
-                    }
-                    // Fetching a window that holds more than a pass would
-                    // return part of it in ID order, the race of #2086. Wait
-                    // one pass for the search to finish from where it
-                    // stopped, unless its bracket can no longer shrink, or the
-                    // previous pass already waited.
-                    Some(WindowSearch::Unfinished {
-                        low,
-                        high,
-                        over_ids,
-                    }) => {
-                        let fetch_anyway = high.saturating_sub(low) <= 1 || unfinished_passes >= 1;
-                        acquisition_update = AcquisitionUpdate::Unfinished {
-                            low,
-                            high,
-                            skipped: !fetch_anyway,
-                        };
-                        skip_pass = !fetch_anyway;
-                        // Still an ordered pass: the narrowest window a
-                        // complete probe measured, or else the whole gap, with
-                        // its delivery held to a time prefix like any other.
-                        fetch_anyway.then(|| {
-                            over_ids
-                                .filter(|ids| !ids.is_empty())
-                                .unwrap_or_else(|| remote.difference(&skip).copied().collect())
-                        })
-                    }
-                }
-            }
-            None => None,
-        };
-        let remote_ids = match &window {
-            _ if skip_pass => Vec::new(),
-            Some(window) => oldest_first_remote_ids(
-                window,
-                &set_aside,
-                |id| {
-                    endpoints
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, endpoint)| {
-                            remote_by_endpoint
-                                .get(*endpoint)
-                                .is_some_and(|ids: &HashSet<EventId>| ids.contains(id))
-                        })
-                        .map(|(index, _)| index)
-                        .collect()
-                },
-                progress,
-            )?,
-            None => select_reconciliation_remote_ids(&remote, progress)?,
-        };
-        // An oldest-first pass keeps a little time to work out which part of
-        // a window cut short it may return.
-        let fetch_deadline = match &window {
-            Some(_) => {
-                let reserve = deadline
-                    .saturating_duration_since(tokio::time::Instant::now())
-                    .div_f32(5.0)
-                    .min(Duration::from_millis(400));
-                deadline.checked_sub(reserve).unwrap_or(deadline)
-            }
-            None => deadline,
-        };
-        // Requested IDs every claimant answered without.
-        let mut withheld = HashSet::new();
-        // IDs whose events can never fit the single-object ceiling.
-        let mut over_ceiling = HashSet::new();
-        let mut sdk_events = Vec::new();
-        let mut spent_items = 0usize;
-        let mut spent_bytes = 0usize;
-        // The distinct events this pass returns. With several IDs per request,
-        // different relays can each return a different event within their own
-        // limits, so the union is bounded by the same pass allowance.
-        let mut returned_items = 0usize;
-        let mut returned_bytes = 0usize;
-        let mut returned_ids = HashSet::new();
-        let mut requests = 0usize;
-        // The largest event JSON this pass has returned. A relay streams every
-        // event a request names before our byte limit can stop it, so batches
-        // are sized to the room left at this size.
-        let mut largest_event_bytes = 0usize;
-        // Until the pass has seen an event, batches start at one ID and double
-        // after each request that returned none, so IDs relays never serve
-        // cannot spend every request one at a time.
-        let mut unsized_batch = 1usize;
-        // A pass that stops early leaves the unreturned IDs' claimants
-        // incomplete, or failed when it ran out of time; an endpoint that
-        // claimed nothing left behind still succeeds.
-        let mut out_of_time = false;
-        let claimants_of = |event_id: &EventId| {
-            endpoints
-                .iter()
-                .filter(|endpoint| {
-                    remote_by_endpoint
-                        .get(*endpoint)
-                        .is_some_and(|ids: &HashSet<EventId>| ids.contains(event_id))
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        let mut remote_ids = remote_ids.into_iter().peekable();
-        while let Some(event_id) = remote_ids.next() {
-            if tokio::time::Instant::now() >= fetch_deadline {
-                out_of_time = true;
-                break;
-            }
-            if let Some(event) = self
-                .client
-                .database()
-                .event_by_id(&event_id)
-                .await
-                .map_err(|_| {
-                    TransportAdapterError::Subscription(
-                        "read reconciled event from SDK database failed".to_owned(),
-                    )
-                })?
-            {
-                let event_bytes = event.as_json().len();
-                let remaining_items =
-                    SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT.saturating_sub(spent_items);
-                let byte_allowance = if sdk_events.is_empty() && spent_bytes == 0 {
-                    SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
-                } else {
-                    SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
-                };
-                let remaining_bytes = byte_allowance.saturating_sub(spent_bytes);
-                if remaining_items == 0 || event_bytes > remaining_bytes {
-                    if event_bytes > SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES {
-                        // This object can never fit the pass allowance. Rotate
-                        // past it so smaller missing IDs remain reachable;
-                        // durable inventory still keeps it eligible on wrap.
-                        over_ceiling.insert(event_id);
-                        progress.save_cursor(Some(event_id.to_bytes()))?;
-                        continue;
-                    }
-                    // A fitting object deferred by earlier results must be
-                    // the first candidate on the next pass.
-                    progress.save_cursor(cursor_before(&remote, &event_id))?;
-                    break;
-                }
-                progress.save_cursor(Some(event_id.to_bytes()))?;
-                spent_items += 1;
-                spent_bytes += event_bytes;
-                returned_items += 1;
-                returned_bytes += event_bytes;
-                largest_event_bytes = largest_event_bytes.max(event_bytes);
-                returned_ids.insert(event_id.to_hex());
-                sdk_events.push((
-                    replay_endpoint.clone(),
-                    NostrTransportEvent::from_nostr_event(&event).map_err(|_| {
-                        TransportAdapterError::Subscription(
-                            "decode cached reconciled SDK event failed".to_owned(),
-                        )
-                    })?,
-                ));
-                if event_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
-                    // One large cached object is the entire returned batch.
-                    break;
-                }
-                continue;
-            }
-            if requests >= SDK_RECONCILIATION_MAX_ID_REQUESTS {
-                break;
-            }
-            let remaining_items =
-                SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT.saturating_sub(spent_items);
-            // The first request must offer enough room to discover the size of
-            // a single event before the SDK can accept or reject it. All later
-            // requests share the ordinary aggregate allowance, even when the
-            // first returned nothing: a lone large event they cut short leads
-            // the next pass, as its first request.
-            let byte_allowance = if requests == 0 && sdk_events.is_empty() && spent_bytes == 0 {
-                SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
-            } else {
-                SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
-            };
-            let remaining_bytes = byte_allowance.saturating_sub(spent_bytes);
-            let remaining_time =
-                fetch_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining_items == 0 || remaining_bytes == 0 || remaining_time.is_zero() {
-                out_of_time |= remaining_time.is_zero();
-                break;
-            }
-            // Do not advance past an ID merely because this pass ran out of
-            // capacity. A dispatched request saves progress before its I/O;
-            // only worker admission removes the ID from later comparisons.
-            let single_object_request = byte_allowance == SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES;
-            // Ask only the endpoints that claimed this ID. An endpoint that
-            // lacks it has nothing to return, and a silent one must not spend
-            // the budget of IDs it never claimed.
-            let claimants = claimants_of(&event_id);
-            if claimants.is_empty() {
-                continue;
-            }
-            let mut batch = vec![event_id];
-            if !single_object_request {
-                let sized = match largest_event_bytes {
-                    0 => unsized_batch,
-                    largest => (remaining_bytes / largest).max(1),
-                };
-                let room = SDK_RECONCILIATION_MAX_IDS_PER_REQUEST
-                    .min(remaining_items)
-                    .min(sized);
-                while batch.len() < room {
-                    let Some(next) = remote_ids.peek().copied() else {
-                        break;
-                    };
-                    // A cached event is returned from the SDK database on its
-                    // own turn, not requested again.
-                    let cached = self
-                        .client
-                        .database()
-                        .event_by_id(&next)
-                        .await
-                        .map_err(|_| {
-                            TransportAdapterError::Subscription(
-                                "read reconciled event from SDK database failed".to_owned(),
-                            )
-                        })?
-                        .is_some();
-                    if cached || claimants_of(&next) != claimants {
-                        break;
-                    }
-                    batch.push(next);
-                    remote_ids.next();
-                }
-            }
-            // Save only the first ID before I/O, as a one-ID request did; the
-            // response decides how far past it the cursor moves.
-            let remaining_time =
-                fetch_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining_time.is_zero() {
-                out_of_time = true;
-                break;
-            }
-            progress.save_cursor(Some(event_id.to_bytes()))?;
-            requests += 1;
-            let result = self
-                .acquire_history(
-                    NostrAcquisitionRequest {
-                        account_id: subscription.account_id().clone(),
-                        scope: NostrAcquisitionScope::KnownEventIds(
-                            batch.iter().map(|id| id.to_bytes()).collect(),
-                        ),
-                        endpoints: claimants
-                            .iter()
-                            .map(|endpoint| TransportEndpoint(endpoint.to_string()))
-                            .collect(),
-                        limits: NostrAcquisitionLimits {
-                            max_endpoints: claimants.len(),
-                            max_requested_event_ids: batch.len(),
-                            max_received_items_per_endpoint: remaining_items,
-                            max_serialized_event_bytes_per_endpoint: remaining_bytes,
-                            max_duration: remaining_time,
-                        },
-                    },
-                    NostrAcquisitionCancellation::new(),
-                )
-                .await
-                .map_err(|_| {
-                    TransportAdapterError::Subscription(
-                        "bounded reconciled event acquisition failed".to_owned(),
-                    )
-                })?;
-            // The SDK counts duplicate and rejected events at its boundary.
-            // Charge the largest endpoint cost against the next request's
-            // uniform limits, so neither endpoint can exceed the pass budget
-            // except for the one event observed at the rejection boundary.
-            let mut request_items = 0usize;
-            let mut request_bytes = 0usize;
-            let mut limited = false;
-            let mut answered_by_any = false;
-            let mut every_claimant_satisfied = true;
-            let wanted_ids = batch.iter().map(|id| id.to_hex()).collect::<HashSet<_>>();
-            for (endpoint, outcome) in claimants.iter().zip(result.endpoints) {
-                request_items = request_items.max(outcome.stats.received_items);
-                request_bytes = request_bytes.max(outcome.stats.serialized_event_bytes);
-                limited |= matches!(
-                    outcome.end,
-                    NostrAcquisitionEnd::ByteLimitReached | NostrAcquisitionEnd::ItemLimitReached
-                );
-                every_claimant_satisfied &=
-                    outcome.end == NostrAcquisitionEnd::RequestPolicySatisfied;
-                let claimed_id_missing = wanted_ids
-                    .iter()
-                    .any(|wanted| !outcome.events.iter().any(|event| &event.id == wanted));
-                // A relay that served the request to EOSE or to our limits
-                // answered. It stays incomplete unless it reached EOSE with
-                // every ID it claimed: a request our limits cut short proves
-                // nothing about what that relay still had to send.
-                let answered = matches!(
-                    outcome.end,
-                    NostrAcquisitionEnd::RequestPolicySatisfied
-                        | NostrAcquisitionEnd::ItemLimitReached
-                        | NostrAcquisitionEnd::ByteLimitReached
-                );
-                answered_by_any |= answered;
-                if !answered {
-                    failure_of
-                        .entry(endpoint.clone())
-                        .or_insert(acquisition_failure(outcome.end));
-                    failed_endpoints.insert(endpoint.clone());
-                } else if claimed_id_missing
-                    || outcome.end != NostrAcquisitionEnd::RequestPolicySatisfied
-                {
-                    // Only a relay that reached EOSE without an ID it
-                    // claimed withheld it; our own limits prove nothing.
-                    if claimed_id_missing
-                        && outcome.end == NostrAcquisitionEnd::RequestPolicySatisfied
-                    {
-                        withheld_by.insert(endpoint.clone());
-                    }
-                    incomplete_endpoints.insert(endpoint.clone());
-                }
-                for event in outcome.events {
-                    if !wanted_ids.contains(&event.id) {
-                        failure_of
-                            .entry(endpoint.clone())
-                            .or_insert(NostrReconciliationFailure::UnrequestedEvent);
-                        failed_endpoints.insert(endpoint.clone());
-                        continue;
-                    }
-                    if returned_ids.contains(&event.id) {
-                        continue;
-                    }
-                    // Each endpoint stayed within its own limits, but relays
-                    // can return different events; the union must fit the
-                    // pass allowance too. An event it cannot fit stays
-                    // unreturned and leads the next pass.
-                    let event_bytes = event_json_bytes(&event);
-                    if returned_items >= SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT
-                        || returned_bytes.saturating_add(event_bytes) > byte_allowance
-                    {
-                        limited = true;
-                        continue;
-                    }
-                    returned_items += 1;
-                    returned_bytes += event_bytes;
-                    largest_event_bytes = largest_event_bytes.max(event_bytes);
-                    returned_ids.insert(event.id.clone());
-                    sdk_events.push((endpoint.clone(), event));
-                }
-            }
-            spent_items = spent_items
-                .saturating_add(request_items)
-                .max(returned_items);
-            spent_bytes = spent_bytes
-                .saturating_add(request_bytes)
-                .max(returned_bytes);
-            if largest_event_bytes == 0 {
-                unsized_batch = (unsized_batch * 2).min(SDK_RECONCILIATION_MAX_IDS_PER_REQUEST);
-            }
-            // Withheld only when every relay answered without the ID and this
-            // pass's own allowance did not drop it from what a relay served.
-            if every_claimant_satisfied && !limited {
-                withheld.extend(
-                    batch
-                        .iter()
-                        .filter(|id| !returned_ids.contains(&id.to_hex()))
-                        .copied(),
-                );
-            }
-            if limited && single_object_request && !returned_ids.contains(&event_id.to_hex()) {
-                over_ceiling.insert(event_id);
-            }
-            let first_unreturned = batch
-                .iter()
-                .position(|id| !returned_ids.contains(&id.to_hex()));
-            match first_unreturned {
-                None => progress.save_cursor(batch.last().map(|id| id.to_bytes()))?,
-                // A budget cut this request short: the first ID it left
-                // unreturned leads the next pass, where it is the one-ID first
-                // request with the single-object allowance, even if an earlier
-                // result stays unadmitted. A one-ID first request that is cut
-                // short is over that ceiling and rotates.
-                Some(position) if limited && !single_object_request => {
-                    progress.save_cursor(cursor_before(&remote, &batch[position]))?;
-                    break;
-                }
-                // No relay answered: advance through what returned, at least
-                // the first ID, and leave the rest of the batch to the next
-                // pass, as one-ID requests did after a timeout.
-                Some(position) if !answered_by_any => {
-                    if position > 0 {
-                        progress.save_cursor(Some(batch[position - 1].to_bytes()))?;
-                    }
-                    break;
-                }
-                // Relays answered without some IDs: those rotate, as a withheld
-                // one-ID request did.
-                Some(_) => progress.save_cursor(batch.last().map(|id| id.to_bytes()))?,
-            }
-            if spent_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
-                // A first oversized result, or expensive duplicate/boundary
-                // traffic, consumes this pass. Failed endpoints remain marked
-                // while the unattempted suffix stays retryable.
-                break;
-            }
-        }
-        drop(remote);
-        // A window the budget or deadline cut short returns only a time
-        // prefix: no event newer than one it left behind, or the older one
-        // could arrive after commits that carry the epoch past it. Events held
-        // back are fetched again; the cursor already leads with what was left.
-        let fetched_event_bytes =
-            (!sdk_events.is_empty()).then(|| returned_bytes / sdk_events.len().max(1));
-        if let Some(window) = &window {
-            // Everything in the window not returned holds delivery back,
-            // including IDs a request timed out on or a relay failed to serve:
-            // they may still arrive. Only an event every claimant answered
-            // without, or one over the single-object ceiling, does not.
-            let left_behind = window
-                .iter()
-                .filter(|id| {
-                    !returned_ids.contains(&id.to_hex())
-                        && !withheld.contains(*id)
-                        && !over_ceiling.contains(*id)
-                })
-                .copied()
-                .collect::<HashSet<_>>();
-            if !left_behind.is_empty() && !sdk_events.is_empty() {
-                let boundary = self
-                    .delivery_boundary(
-                        &plan.filter,
-                        &answering,
-                        &items,
-                        &options,
-                        reconcile_since,
-                        sdk_events.iter().map(|(_, event)| event.created_at),
-                        &left_behind,
-                        deadline,
-                        &probe_failures,
-                    )
-                    .await;
-                // An unknown boundary is not permission. A route that cannot
-                // prove an order returns nothing; its events stay fetchable,
-                // and recovery parks it with its notice if that persists,
-                // rather than admit newer commits ahead of older messages.
-                let boundary_known = boundary.is_some();
-                let boundary = boundary.unwrap_or(0);
-                sdk_events.retain(|(_, event)| {
-                    let keep = event.created_at <= boundary;
-                    if !keep {
-                        returned_ids.remove(&event.id);
-                    }
-                    keep
-                });
-                if sdk_events.is_empty() {
-                    order_unproven = Some(if boundary_known {
-                        "boundary_excludes_fetched"
-                    } else {
-                        "boundary_unknown"
-                    });
-                }
-            }
-        }
-        // An ID an endpoint claimed but this pass did not return is still debt
-        // on that endpoint, even if its earlier exact-ID REQs reached EOSE.
-        // No partial pass is coverage for the endpoints it left behind.
-        let returned = returned_ids
-            .iter()
-            .filter_map(|id| EventId::from_hex(id).ok())
-            .collect::<HashSet<_>>();
-        for (endpoint, ids) in &remote_by_endpoint {
-            if ids.iter().any(|id| !returned.contains(id)) {
-                // A pass cut short by its deadline did not hear the endpoint
-                // out: that is a timeout, not an answer.
-                if out_of_time {
-                    failure_of
-                        .entry(endpoint.clone())
-                        .or_insert(NostrReconciliationFailure::RouteTimeout);
-                    failed_endpoints.insert(endpoint.clone());
-                } else {
-                    incomplete_endpoints.insert(endpoint.clone());
-                }
-            }
-        }
-        incomplete_endpoints.retain(|endpoint| !failed_endpoints.contains(endpoint));
-        failed_endpoints.extend(incomplete_endpoints.iter().cloned());
-        if let Some(key) = route_key {
-            // Whatever the account admits leaves the gap before the next pass;
-            // what it does not, and what relays withheld, yields next time.
-            let tried = returned_ids
-                .iter()
-                .filter_map(|id| EventId::from_hex(id).ok())
-                .chain(withheld)
-                .chain(over_ceiling)
-                .collect::<Vec<_>>();
-            // Step past this window by what reaches a pass at the density of
-            // the events it returned, or else by the distance to the nearest
-            // bound found too large.
-            let density_step = sdk_events
-                .iter()
-                .map(|(_, event)| event.created_at)
-                .min()
-                .zip(sdk_events.iter().map(|(_, event)| event.created_at).max())
-                .map(|(oldest, newest)| {
-                    ((newest - oldest).max(1) as f64 * target as f64 / sdk_events.len() as f64)
-                        as u64
-                });
-            let update = match acquisition_update {
-                AcquisitionUpdate::Fits { until, step } => AcquisitionUpdate::Fits {
-                    until,
-                    step: density_step.or(step),
-                },
-                other => other,
-            };
-            self.remember_acquisition(key, update, fetched_event_bytes, answering.len(), tried);
-        }
-        // Negentropy reports a set. MLS input is sequential, so replay the
-        // materialized difference in the same authored-time/id order used by
-        // stored-event catch-up instead of HashSet iteration order.
-        sdk_events.sort_unstable_by_key(|(_, event)| (event.created_at, event.id.clone()));
-        sdk_events.dedup_by(|a, b| a.1.id == b.1.id);
-        let mut remote_events = Vec::with_capacity(sdk_events.len());
-        // The network deadline bounds acquisition, not delivery of the
-        // already-owned bounded batch. Partial events still reach the owner.
-        for (endpoint, event) in sdk_events {
-            remote_events.push(NostrRelayEvent {
-                endpoint: TransportEndpoint(endpoint.to_string()),
-                subscription_id: Some(subscription_id.clone()),
-                event,
-            });
-        }
-        let sorted = |endpoints: &HashSet<RelayUrl>| {
-            let mut sorted = endpoints
-                .iter()
-                .map(|endpoint| TransportEndpoint(endpoint.to_string()))
-                .collect::<Vec<_>>();
-            sorted.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-            sorted
-        };
-        if let Some(reason) = order_unproven {
-            tracing::debug!(
-                target: "transport_nostr_adapter::sdk_client",
-                method = "reconcile_subscription",
-                reason,
-                remote_item_count,
-                "group reconciliation pass held back without a proven order"
-            );
-        }
-        let probe_failures = probe_failures
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut endpoint_failures = failed_endpoints
-            .iter()
-            .map(|endpoint| NostrReconciliationEndpointFailure {
-                endpoint: TransportEndpoint(endpoint.to_string()),
-                // One failed outright had its stage recorded where it failed.
-                // One left incomplete answered: it withheld an ID only if it
-                // reached EOSE without it. Otherwise a failed probe, or this
-                // pass's own budget or order, left its IDs for a later pass.
-                failure: if !incomplete_endpoints.contains(endpoint) {
-                    failure_of
-                        .get(endpoint)
-                        .or_else(|| probe_failures.get(endpoint))
-                        .copied()
-                        .unwrap_or(NostrReconciliationFailure::LocalError)
-                } else if withheld_by.contains(endpoint) {
-                    NostrReconciliationFailure::Withheld
-                } else {
-                    probe_failures
-                        .get(endpoint)
-                        .copied()
-                        .unwrap_or(NostrReconciliationFailure::PassLimit)
-                },
-            })
-            .collect::<Vec<_>>();
-        endpoint_failures
-            .sort_unstable_by(|left, right| left.endpoint.as_str().cmp(right.endpoint.as_str()));
-        let summary = NostrReconciliationSummary {
-            relays_succeeded: endpoints.len().saturating_sub(failed_endpoints.len()),
-            relays_failed: failed_endpoints.len(),
-            failed_endpoints: sorted(&failed_endpoints),
-            incomplete_endpoints: sorted(&incomplete_endpoints),
-            endpoint_failures,
-            remote_items: remote_item_count,
-            received_items: remote_events.len(),
-            order_unproven: order_unproven.is_some(),
-        };
-        Ok((summary, remote_events))
-    }
-
-    /// Where the route's window search left off, its typical event size, the
-    /// passes in a row its search did not finish or it returned nothing, and
-    /// the IDs still in `remote` that earlier passes set aside, pruning the
-    /// ones since admitted.
-    fn acquisition_memory_for(
-        &self,
-        key: &AcquisitionRouteKey,
-        remote: &HashSet<EventId>,
-    ) -> AcquisitionHints {
-        let mut memory = self
-            .acquisition_memory
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        memory.tick += 1;
-        let tick = memory.tick;
-        let Some(route) = memory.routes.get_mut(key) else {
-            return AcquisitionHints::default();
-        };
-        route.last_used = tick;
-        route.set_aside.retain(|id| remote.contains(id));
-        AcquisitionHints {
-            seed: route.window_until.map(|low| WindowSeed {
-                low,
-                step: route.window_step,
-                high: route.search_high,
-            }),
-            event_bytes: route.event_bytes,
-            unfinished_passes: route.unfinished_passes,
-            set_aside: route.set_aside.iter().copied().collect(),
-        }
-    }
-
-    fn remember_acquisition(
-        &self,
-        key: AcquisitionRouteKey,
-        update: AcquisitionUpdate,
-        event_bytes: Option<usize>,
-        relays: usize,
-        tried: Vec<EventId>,
-    ) {
-        let mut memory = self
-            .acquisition_memory
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        memory.tick += 1;
-        let tick = memory.tick;
-        if !memory.routes.contains_key(&key)
-            && memory.routes.len() >= SDK_RECONCILIATION_MEMORY_ROUTES
-        {
-            evict_least_recent(&mut memory.routes);
-        }
-        let route = memory.routes.entry(key.clone()).or_default();
-        route.last_used = tick;
-        match update {
-            AcquisitionUpdate::Fits { until, step } => {
-                route.window_until = Some(until);
-                route.window_step = step.or(route.window_step);
-                route.search_high = None;
-                route.unfinished_passes = 0;
-            }
-            AcquisitionUpdate::Unfinished { low, high, skipped } => {
-                route.window_until = Some(low);
-                route.search_high = Some(high);
-                route.unfinished_passes = if skipped {
-                    route.unfinished_passes.saturating_add(1)
-                } else {
-                    0
-                };
-            }
-            AcquisitionUpdate::None => {}
-        }
-        if event_bytes.is_some() {
-            route.event_bytes = event_bytes;
-        }
-        let cap = set_aside_cap(relays);
-        for id in tried {
-            if route.set_aside.len() < cap && !route.set_aside.contains(&id) {
-                route.set_aside.push_back(id);
-            }
-        }
-        // Bound memory across routes by dropping whole routes, least recently
-        // used first; a dropped route sets its IDs aside again as it meets them.
-        while memory
-            .routes
-            .values()
-            .map(|route| route.set_aside.len())
-            .sum::<usize>()
-            > SDK_RECONCILIATION_SET_ASIDE_TOTAL
-            && memory.routes.len() > 1
-        {
-            let Some(evicted) = memory
-                .routes
-                .iter()
-                .filter(|(other, _)| **other != key)
-                .min_by_key(|(_, route)| route.last_used)
-                .map(|(other, _)| other.clone())
-            else {
-                break;
-            };
-            memory.routes.remove(&evicted);
-        }
-    }
-
-    /// The newest second a pass may return up to when `left_behind` IDs of
-    /// its window were not fetched: the largest of the returned events'
-    /// timestamps with none of those IDs at or before it, or one second
-    /// before the oldest returned event when there is none. Returns `None`
-    /// when no probe gets a complete answer and the boundary is unknown.
-    #[allow(clippy::too_many_arguments)]
-    async fn delivery_boundary(
-        &self,
-        filter: &Filter,
-        endpoints: &[RelayUrl],
-        items: &[(EventId, NostrTimestamp)],
-        options: &SyncOptions,
-        since: u64,
-        returned_at: impl Iterator<Item = u64>,
-        left_behind: &HashSet<EventId>,
-        deadline: tokio::time::Instant,
-        probe_failures: &ProbeFailures,
-    ) -> Option<u64> {
-        let mut times = returned_at.collect::<Vec<_>>();
-        times.sort_unstable();
-        times.dedup();
-        let oldest = *times.first()?;
-        let probes = SDK_RECONCILIATION_WINDOW_PROBES;
-        let mut candidates = (0..probes)
-            .map(|index| times[index * (times.len() - 1) / (probes - 1).max(1)])
-            .collect::<Vec<_>>();
-        candidates.dedup();
-        let answers = futures::future::join_all(candidates.iter().map(|at| async move {
-            // Nothing in scope is older than the window's floor.
-            if *at < since {
-                return Some((HashSet::new(), true));
-            }
-            // Whole seconds: a left-behind event sharing a second with
-            // returned ones holds that second back too.
-            self.window_remote_ids(
-                filter,
-                endpoints,
-                items,
-                options,
-                (since, *at),
-                deadline,
-                probe_failures,
-            )
-            .await
-        }))
-        .await;
-        let mut answered = false;
-        let mut boundary = None;
-        for (at, answer) in candidates.into_iter().zip(answers) {
-            let Some((ids, complete)) = answer else {
-                continue;
-            };
-            answered |= complete;
-            if complete && ids.is_disjoint(left_behind) {
-                boundary = Some(at);
-            }
-        }
-        // Every complete probe saw something left behind at or before the
-        // oldest returned event: nothing is safe to return.
-        answered.then(|| boundary.unwrap_or(oldest.saturating_sub(1)))
-    }
-
-    /// Find the oldest window `[since, bound]` of a group route's gap that one
-    /// pass can fetch, `target` IDs at most, with dry-run comparisons over
-    /// candidate bounds. IDs set aside by earlier passes do not count toward
-    /// it. A probe counts as fitting only when every relay asked answered it:
-    /// a relay that missed a probe may hold older history the others lack.
-    /// Returns `None` when no relay answers at all.
-    #[allow(clippy::too_many_arguments)]
-    async fn oldest_window(
-        &self,
-        filter: &Filter,
-        endpoints: &[RelayUrl],
-        items: &[(EventId, NostrTimestamp)],
-        options: &SyncOptions,
-        (since, until): (u64, u64),
-        remote: &HashSet<EventId>,
-        set_aside: &[EventId],
-        target: usize,
-        seed: Option<WindowSeed>,
-        deadline: tokio::time::Instant,
-        probe_failures: &ProbeFailures,
-    ) -> Option<WindowSearch> {
-        let skip = set_aside.iter().copied().collect::<HashSet<_>>();
-        // The largest probed bound whose window fits a pass, and the smallest
-        // that does not. The whole comparison window is already known not to.
-        let mut fits: Option<(u64, HashSet<EventId>)> = None;
-        // The smallest bound found too large, its IDs, and whether every relay
-        // answered that probe.
-        let mut over: Option<(u64, HashSet<EventId>, bool)> = None;
-        // A relay rejects events dated far in the future, so a probe past
-        // shortly after now would only measure the whole remaining gap.
-        let until = until.min(crate::unix_now_seconds().saturating_add(15 * 60));
-        let gap = remote.iter().filter(|id| !skip.contains(id)).count();
-        let mut ever_answered = false;
-        let seed = seed.filter(|seed| since <= seed.low && seed.low < until);
-        let resume_high = seed
-            .and_then(|seed| seed.high)
-            .filter(|high| seed.is_some_and(|seed| seed.low < *high) && *high <= until);
-        // A resumed bracket spreads its first round within it; a seed without
-        // one steps past the previous window; no seed starts at the recent end.
-        let mut first_round_step = match (seed, resume_high) {
-            (_, Some(_)) => None,
-            (Some(seed), None) => Some(seed.step),
-            (None, None) => Some(None),
-        };
-        let (mut search_low, mut search_high) = (
-            seed.map_or(since, |seed| seed.low),
-            resume_high.unwrap_or(until),
-        );
-        for _ in 0..SDK_RECONCILIATION_WINDOW_ROUNDS {
-            let low = fits
-                .as_ref()
-                .map_or((search_low, 0), |(bound, ids)| (*bound, ids.len()));
-            let high = over
-                .as_ref()
-                .map_or((search_high, gap), |(bound, ids, _)| (*bound, ids.len()));
-            let probes = window_probes(low, high, target, first_round_step.take());
-            (search_low, search_high) = (low.0, high.0);
-            if probes.is_empty() {
-                // Nothing left to probe is a finished bracket, not a silence.
-                ever_answered = true;
-                break;
-            }
-            let rounds = futures::future::join_all(probes.iter().map(|probe| {
-                self.window_remote_ids(
-                    filter,
-                    endpoints,
-                    items,
-                    options,
-                    (since, *probe),
-                    deadline,
-                    probe_failures,
-                )
-            }))
-            .await;
-            let mut answered = false;
-            for (probe, result) in probes.into_iter().zip(rounds) {
-                let Some((ids, complete)) = result else {
-                    continue;
-                };
-                answered = true;
-                let ids = ids
-                    .into_iter()
-                    .filter(|id| remote.contains(id) && !skip.contains(id))
-                    .collect::<HashSet<_>>();
-                // A partial answer can show a window is too large, never
-                // that it fits.
-                if ids.len() > target {
-                    if over.as_ref().is_none_or(|(bound, _, _)| probe < *bound) {
-                        over = Some((probe, ids, complete));
-                    }
-                } else if complete && fits.as_ref().is_none_or(|(bound, _)| probe > *bound) {
-                    fits = Some((probe, ids));
-                }
-            }
-            if !answered {
-                // Out of time or no relay answered: keep what earlier rounds found.
-                break;
-            }
-            ever_answered = true;
-            // Older history can appear below the seed, for example from a relay
-            // that was down. If every probe above the seed already holds more
-            // than a pass, look below it too. Likewise, a resumed bracket's top
-            // may no longer hold too much once its history was admitted.
-            if fits.is_none() && search_low > since {
-                search_low = since;
-            }
-            if over.is_none() && search_high < until {
-                search_high = until;
-            }
-            // At least half a pass is enough.
-            if fits
-                .as_ref()
-                .is_some_and(|(_, ids)| ids.len() * 2 >= target)
-            {
-                break;
-            }
-        }
-        if !ever_answered {
-            return None;
-        }
-        let over_until = over.as_ref().map(|(bound, _, _)| *bound);
-        Some(match fits {
-            Some((until, ids)) if !ids.is_empty() => WindowSearch::Fits {
-                until,
-                ids,
-                over_until,
-            },
-            fits => WindowSearch::Unfinished {
-                low: fits.map_or(search_low, |(bound, _)| bound),
-                high: over_until.unwrap_or(until),
-                over_ids: over.and_then(|(_, ids, complete)| complete.then_some(ids)),
-            },
-        })
-    }
-
-    /// Remote-only IDs within `[since, until]` across the endpoints that
-    /// answer a dry-run comparison by `deadline`, and whether every endpoint
-    /// answered, or `None` if none does. Each endpoint's first probe failure
-    /// is kept in `probe_failures`.
-    #[allow(clippy::too_many_arguments)]
-    async fn window_remote_ids(
-        &self,
-        filter: &Filter,
-        endpoints: &[RelayUrl],
-        items: &[(EventId, NostrTimestamp)],
-        options: &SyncOptions,
-        (since, until): (u64, u64),
-        deadline: tokio::time::Instant,
-        probe_failures: &ProbeFailures,
-    ) -> Option<(HashSet<EventId>, bool)> {
-        if tokio::time::Instant::now() >= deadline {
-            return None;
-        }
-        let filter = filter
-            .clone()
-            .since(NostrTimestamp::from_secs(since))
-            .until(NostrTimestamp::from_secs(until));
-        let items = items
-            .iter()
-            .filter(|(_, at)| (since..=until).contains(&at.as_secs()))
-            .copied()
-            .collect::<Vec<_>>();
-        let syncs = endpoints.iter().cloned().map(|endpoint| {
-            let client = self.client.clone();
-            let credits = self.neg_credit(&endpoint);
-            let filter = filter.clone();
-            let items = items.clone();
-            let options = options.clone();
-            async move {
-                let result = timeout_at(deadline, async {
-                    let relay = match client.relay(&endpoint).await {
-                        Ok(Some(relay)) => relay,
-                        Ok(None) => return Err(NostrReconciliationFailure::NotInPool),
-                        Err(_) => return Err(NostrReconciliationFailure::LocalError),
-                    };
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(NostrReconciliationFailure::RouteTimeout);
-                    }
-                    sync_watching_neg_cap(&relay, filter, items, options, credits, deadline).await
-                })
-                .await
-                .unwrap_or(Err(NostrReconciliationFailure::RouteTimeout));
-                result
-                    .map_err(|failure| {
-                        probe_failures
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .entry(endpoint)
-                            .or_insert(failure);
-                    })
-                    .ok()
-            }
-        });
-        let mut answered = 0usize;
-        let mut ids = HashSet::new();
-        for summary in futures::future::join_all(syncs).await.into_iter().flatten() {
-            answered += 1;
-            ids.extend(summary.remote);
-        }
-        (answered > 0).then_some((ids, answered == endpoints.len()))
-    }
-
     fn neg_credit(&self, endpoint: &RelayUrl) -> Arc<Semaphore> {
         let mut credits = self
             .neg_credits
@@ -4302,7 +2687,7 @@ impl NostrSdkRelayClient {
         if let Some(credit) = credits.get(endpoint) {
             return credit.clone();
         }
-        let credit = Arc::new(Semaphore::new(SDK_RECONCILIATION_WINDOW_PROBES));
+        let credit = Arc::new(Semaphore::new(SDK_NEG_CONCURRENT_SESSIONS));
         credits.insert(endpoint.clone(), credit.clone());
         credit
     }
@@ -6544,37 +4929,16 @@ fn append_missing_publish_failures(
     }
 }
 
-/// Each endpoint's first failure in a pass's window or boundary probes.
-type ProbeFailures = StdMutex<HashMap<RelayUrl, NostrReconciliationFailure>>;
-
 /// strfry's answer to a NEG-OPEN past its per-connection session cap. It is a
 /// NOTICE, not NEG-ERR, and names no session.
 const NEG_CAP_NOTICE: &str = "too many concurrent neg requests";
 
-/// Run one endpoint's comparison, watching the relay for the negentropy-cap
-/// NOTICE. nostr-sdk ignores that NOTICE and waits out its first-reply
-/// timeout. The NOTICE carries no session id, so it only explains a sync that
-/// then fails for want of a first reply; a sync that succeeds was not the one
-/// refused.
-async fn sync_watching_neg_cap(
-    relay: &Relay,
-    filter: Filter,
-    items: Vec<(EventId, NostrTimestamp)>,
-    options: SyncOptions,
-    credits: Arc<Semaphore>,
-    deadline: tokio::time::Instant,
-) -> Result<nostr_sdk::relay::SyncSummary, NostrReconciliationFailure> {
-    sync_watching_neg_cap_detailed(relay, filter, items, options, credits, deadline)
-        .await
-        .map_err(|error| error.failure)
-}
-
-/// A failed NIP-77 sync: its reconciliation class, whether the SDK reported a
+/// A failed NIP-77 sync: its failure class, whether the SDK reported a
 /// protocol error, and whether the relay may have begun reconciling. A
 /// malformed exchange is not the relay saying it lacks NIP-77, and a later
 /// attempt may complete it.
 struct NegSyncError {
-    failure: NostrReconciliationFailure,
+    failure: NegFailureKind,
     malformed: bool,
     /// The relay sent a NEG-MSG, or notifications were missed, so its NEG-ERR
     /// may not refuse the NEG-OPEN. Another NEG session on the same relay may
@@ -6609,8 +4973,8 @@ impl NegWatch {
     }
 }
 
-impl From<NostrReconciliationFailure> for NegSyncError {
-    fn from(failure: NostrReconciliationFailure) -> Self {
+impl From<NegFailureKind> for NegSyncError {
+    fn from(failure: NegFailureKind) -> Self {
         Self {
             failure,
             malformed: false,
@@ -6619,7 +4983,11 @@ impl From<NostrReconciliationFailure> for NegSyncError {
     }
 }
 
-/// As [`sync_watching_neg_cap`], keeping a protocol error apart.
+/// Run one endpoint's comparison, watching the relay for the negentropy-cap
+/// NOTICE. nostr-sdk ignores that NOTICE and waits out its first-reply
+/// timeout. The NOTICE carries no session id, so it only explains a sync that
+/// then fails for want of a first reply; a sync that succeeds was not the one
+/// refused.
 async fn sync_watching_neg_cap_detailed(
     relay: &Relay,
     filter: Filter,
@@ -6630,10 +4998,10 @@ async fn sync_watching_neg_cap_detailed(
 ) -> Result<nostr_sdk::relay::SyncSummary, NegSyncError> {
     let _permit = timeout_at(deadline, credits.acquire_owned())
         .await
-        .map_err(|_| NostrReconciliationFailure::RouteTimeout)?
-        .map_err(|_| NostrReconciliationFailure::LocalError)?;
+        .map_err(|_| NegFailureKind::RouteTimeout)?
+        .map_err(|_| NegFailureKind::LocalError)?;
     if tokio::time::Instant::now() >= deadline {
-        return Err(NostrReconciliationFailure::RouteTimeout.into());
+        return Err(NegFailureKind::RouteTimeout.into());
     }
     // Declare the SDK future after the permit: on cancellation it drops first,
     // spawning SyncCleanup's async close task before releasing the credit.
@@ -6643,15 +5011,22 @@ async fn sync_watching_neg_cap_detailed(
     let mut notifications = crate::with_gaps(relay.notifications());
     let sync = relay.sync(filter).items(items).opts(options).into_future();
     tokio::pin!(sync);
+    // Bound the whole comparison by `deadline`, not just permit acquisition:
+    // a relay that keeps sending non-converging NEG-MSG frames resets the
+    // SDK's `idle_timeout` on every round and would otherwise hold the permit
+    // forever.
+    let deadline_sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline_sleep);
     let mut watch = NegWatch::default();
     let result = loop {
         tokio::select! {
-            result = &mut sync => break result,
+            result = &mut sync => break Ok(result),
+            () = &mut deadline_sleep => break Err(()),
             Some(update) = notifications.next(), if !watch.settled() => watch.observe(update),
         }
     };
     // The failure and a message already queued can be ready in the same wake.
-    if result.is_err() {
+    if !matches!(result, Ok(Ok(_))) {
         while !watch.settled() {
             match futures::FutureExt::now_or_never(notifications.next()) {
                 Some(Some(update)) => watch.observe(update),
@@ -6659,15 +5034,27 @@ async fn sync_watching_neg_cap_detailed(
             }
         }
     }
-    result.map_err(|error| NegSyncError {
-        failure: sync_failure(&error, watch.cap_notice),
-        malformed: matches!(error.kind(), SdkErrorKind::Protocol),
-        answered: watch.answered,
-    })
+    match result {
+        Ok(Ok(summary)) => Ok(summary),
+        Ok(Err(error)) => Err(NegSyncError {
+            failure: sync_failure(&error, watch.cap_notice),
+            malformed: matches!(error.kind(), SdkErrorKind::Protocol),
+            answered: watch.answered,
+        }),
+        Err(()) => Err(NegSyncError {
+            failure: if watch.cap_notice {
+                NegFailureKind::NegCapNotice
+            } else {
+                NegFailureKind::RouteTimeout
+            },
+            malformed: false,
+            answered: watch.answered,
+        }),
+    }
 }
 
-/// The time-sliced sweep's per-endpoint NEG credit: the same one
-/// reconciliation spends, so the two never exceed a relay's NEG cap together.
+/// The time-sliced sweep's and comparison driver's per-endpoint NEG credit, so
+/// concurrent comparisons never exceed a relay's NEG cap together.
 pub(crate) fn sweep_neg_credit(
     client: &NostrSdkRelayClient,
     endpoint: &RelayUrl,
@@ -6726,36 +5113,26 @@ pub(crate) async fn neg_sync_dry_run(
     };
     Err(match failure {
         // NEG-ERR before any NEG-MSG: the relay refused the NEG-OPEN.
-        NostrReconciliationFailure::NegErr(category) if !answered => {
+        NegFailureKind::NegErr(category) if !answered => {
             NegFailure::Declined(ClosedReason(category))
         }
-        NostrReconciliationFailure::NegErr(category) => NegFailure::Closed(ClosedReason(category)),
+        NegFailureKind::NegErr(category) => NegFailure::Closed(ClosedReason(category)),
         // The cap NOTICE is a transient refusal, waited out like a rate limit.
-        NostrReconciliationFailure::NegCapNotice => NegFailure::Closed(ClosedReason(Some(
+        NegFailureKind::NegCapNotice => NegFailure::Closed(ClosedReason(Some(
             TransportEndpointRejectionCategory::RateLimited,
         ))),
-        NostrReconciliationFailure::FirstReplyTimeout
-        | NostrReconciliationFailure::RouteTimeout => {
+        NegFailureKind::FirstReplyTimeout | NegFailureKind::RouteTimeout => {
             NegFailure::Unreachable(UnreachableKind::TimedOut)
         }
-        NostrReconciliationFailure::NotOperational | NostrReconciliationFailure::NotInPool => {
-            NegFailure::Unreachable(UnreachableKind::Disconnected)
-        }
-        NostrReconciliationFailure::LocalError => NegFailure::Local,
+        NegFailureKind::NotOperational => NegFailure::Unreachable(UnreachableKind::Disconnected),
+        NegFailureKind::LocalError => NegFailure::Local,
         // Only the relay's own word that it lacks NIP-77 leaves the second
         // unproven; with a protocol error kept apart above, that is what
         // remains of this class: the SDK's "negentropy not supported" NOTICE
         // (`bad msg` with `unknown cmd`, `negentropy` or `NEG-`). With no
         // document it releases a held group as well (mdk#3264): such a relay
         // can never prove the second.
-        NostrReconciliationFailure::NegentropyUnsupported => NegFailure::Unproven,
-        // No NIP-77 sync ends in these. Any that did proved nothing this
-        // time, and a later attempt may complete it.
-        NostrReconciliationFailure::LimitReached
-        | NostrReconciliationFailure::IdFetchRefused
-        | NostrReconciliationFailure::UnrequestedEvent
-        | NostrReconciliationFailure::Withheld
-        | NostrReconciliationFailure::PassLimit => NegFailure::Inconclusive,
+        NegFailureKind::NegentropyUnsupported => NegFailure::Unproven,
     })
 }
 
@@ -6772,39 +5149,17 @@ fn is_neg_cap_notice(notification: &nostr_sdk::relay::RelayNotification) -> bool
 }
 
 /// Classify a failed SDK negentropy sync. Only the reason's category is kept.
-fn sync_failure(error: &nostr_sdk::prelude::Error, cap_notice: bool) -> NostrReconciliationFailure {
+fn sync_failure(error: &nostr_sdk::prelude::Error, cap_notice: bool) -> NegFailureKind {
     match error.kind() {
-        // SyncOptions keeps the idle timer at the full route allowance.
-        // The outer route guard therefore wins after a first reply; an SDK
-        // Timeout here still means no first reply arrived in time.
-        SdkErrorKind::Timeout if cap_notice => NostrReconciliationFailure::NegCapNotice,
-        SdkErrorKind::Timeout => NostrReconciliationFailure::FirstReplyTimeout,
+        SdkErrorKind::Timeout if cap_notice => NegFailureKind::NegCapNotice,
+        SdkErrorKind::Timeout => NegFailureKind::FirstReplyTimeout,
         // NEG-ERR. A dry run downloads nothing, so no download CLOSED.
         SdkErrorKind::Rejected => {
-            NostrReconciliationFailure::NegErr(subscription_refusal_category(&error.to_string()))
+            NegFailureKind::NegErr(subscription_refusal_category(&error.to_string()))
         }
-        SdkErrorKind::Unsupported | SdkErrorKind::Protocol => {
-            NostrReconciliationFailure::NegentropyUnsupported
-        }
-        SdkErrorKind::State => NostrReconciliationFailure::NotOperational,
-        _ => NostrReconciliationFailure::LocalError,
-    }
-}
-
-/// Classify an exact-ID fetch a claimant did not answer.
-fn acquisition_failure(end: NostrAcquisitionEnd) -> NostrReconciliationFailure {
-    match end {
-        NostrAcquisitionEnd::Deadline => NostrReconciliationFailure::RouteTimeout,
-        NostrAcquisitionEnd::Disconnected => NostrReconciliationFailure::NotOperational,
-        NostrAcquisitionEnd::Rejected
-        | NostrAcquisitionEnd::RelayClosed
-        | NostrAcquisitionEnd::AuthenticationFailed => NostrReconciliationFailure::IdFetchRefused,
-        NostrAcquisitionEnd::RequestPolicySatisfied
-        | NostrAcquisitionEnd::ItemLimitReached
-        | NostrAcquisitionEnd::ByteLimitReached
-        | NostrAcquisitionEnd::Cancelled
-        | NostrAcquisitionEnd::InvalidMessage
-        | NostrAcquisitionEnd::SetupFailed => NostrReconciliationFailure::LocalError,
+        SdkErrorKind::Unsupported | SdkErrorKind::Protocol => NegFailureKind::NegentropyUnsupported,
+        SdkErrorKind::State => NegFailureKind::NotOperational,
+        _ => NegFailureKind::LocalError,
     }
 }
 
@@ -7014,37 +5369,6 @@ mod tests {
             Err(NostrAcquisitionError::Unsupported)
         );
         assert!(sdk.client.relays().await.is_empty());
-    }
-
-    /// A comparison on a client without finite requests could not fetch what
-    /// it finds missing, so it refuses before any relay I/O or cursor write.
-    #[tokio::test]
-    async fn an_opaque_client_cannot_reconcile() {
-        let sdk = NostrSdkRelayClient::new(Client::default());
-        let subscription = NostrSubscription::AccountInbox {
-            account_id: MemberId::new(vec![7; 32]),
-            endpoints: vec![TransportEndpoint("wss://ids.example".to_owned())],
-            since: None,
-            attempt: SubscriptionAttempt::INITIAL,
-        };
-        let progress = TestReconciliationProgress::default();
-        *progress.cursor.lock().unwrap() = Some([1; 32]);
-        let result = sdk
-            .reconcile_subscription(
-                subscription,
-                &[],
-                0,
-                1,
-                &progress,
-                tokio::time::Instant::now() + Duration::from_secs(5),
-            )
-            .await;
-        assert!(matches!(
-            result,
-            Err(TransportAdapterError::Subscription(_))
-        ));
-        assert!(sdk.client.relays().await.is_empty());
-        assert_eq!(*progress.cursor.lock().unwrap(), Some([1; 32]));
     }
 
     /// Two spellings of one relay share its pool entry, so they share one
@@ -10958,86 +9282,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct TestReconciliationProgress {
-        cursor: std::sync::Mutex<Option<[u8; 32]>>,
-        saved: tokio::sync::Notify,
-    }
-
-    impl NostrReconciliationProgress for TestReconciliationProgress {
-        fn load_cursor(&self) -> Result<Option<[u8; 32]>, TransportAdapterError> {
-            Ok(*self.cursor.lock().unwrap())
-        }
-        fn save_cursor(&self, cursor: Option<[u8; 32]>) -> Result<(), TransportAdapterError> {
-            *self.cursor.lock().unwrap() = cursor;
-            self.saved.notify_one();
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn reconciliation_reaches_tail_for_257_owned_routes_after_empty_comparisons() {
-        let remote = (0..SDK_RECONCILIATION_REPLAY_BATCH + 1)
-            .map(|index| {
-                let mut bytes = [0; 32];
-                bytes[24..].copy_from_slice(&(index as u64).to_be_bytes());
-                EventId::from_byte_array(bytes)
-            })
-            .collect::<HashSet<_>>();
-        let dependency = *remote.iter().max().unwrap();
-        // 257 tracks #1716's former shared-cache boundary. This tests selection;
-        // encrypted persistence and account isolation are storage-layer tests.
-        let routes = (0..257)
-            .map(|_| TestReconciliationProgress::default())
-            .collect::<Vec<_>>();
-        for route in &routes {
-            let selected = select_reconciliation_remote_ids(&remote, route).unwrap();
-            assert_eq!(selected.len(), SDK_RECONCILIATION_REPLAY_BATCH);
-            assert!(!selected.contains(&dependency));
-            // Simulate a pass that attempted its finite request allowance.
-            route
-                .save_cursor(Some(
-                    selected[SDK_RECONCILIATION_MAX_ID_REQUESTS - 1].to_bytes(),
-                ))
-                .unwrap();
-            let cursor = route.load_cursor().unwrap();
-            assert!(
-                select_reconciliation_remote_ids(&HashSet::new(), route)
-                    .unwrap()
-                    .is_empty()
-            );
-            assert_eq!(route.load_cursor().unwrap(), cursor);
-        }
-        // Every batch is refused; nothing shrinks the remote-only set. Routes
-        // above the former shared cache cap must nevertheless reach the tail.
-        for route in &routes {
-            let selected = select_reconciliation_remote_ids(&remote, route).unwrap();
-            assert_eq!(selected.len(), SDK_RECONCILIATION_REPLAY_BATCH);
-            assert!(selected.contains(&dependency));
-            route
-                .save_cursor(Some(
-                    selected[SDK_RECONCILIATION_MAX_ID_REQUESTS - 1].to_bytes(),
-                ))
-                .unwrap();
-        }
-        // A cursor beyond a changed remote set wraps; refused IDs remain in
-        // the remote-only set and recur when rotation reaches them again.
-        routes[0].save_cursor(Some([0xff; 32])).unwrap();
-        assert_eq!(
-            select_reconciliation_remote_ids(&remote, &routes[0]).unwrap()[0],
-            *remote.iter().min().unwrap()
-        );
-        // Even a saved cursor above a changed remote set wraps without clearing.
-        let lower = HashSet::from([*remote.iter().min().unwrap()]);
-        routes[0].save_cursor(Some([0xff; 32])).unwrap();
-        assert_eq!(
-            select_reconciliation_remote_ids(&lower, &routes[0])
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
     /// Build a kind-445 group event DTO pre-signed by a fresh ephemeral key,
     /// matching the production peeler wrap path (spec/transports/nostr.md:64-66).
     /// The publish path rejects unsigned 445s, so publish tests must pre-sign.
@@ -11459,344 +9703,6 @@ mod tests {
             sdk.client.shutdown().await;
             relay.shutdown();
         }
-    }
-
-    /// A fresh explicit fetch and the SDK notification can legitimately carry
-    /// the same id. Cache misses do not identify which path owns delivery.
-    #[tokio::test]
-    async fn reconciliation_first_sighting_overlap_has_the_fetched_event_id() {
-        use nostr_relay_builder::prelude::{MemoryDatabase, MemoryDatabaseOptions, NostrDatabase};
-        use nostr_relay_builder::{LocalRelay, RelayBuilder};
-        let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
-            events: true,
-            max_events: Some(16),
-        });
-        let event = EventBuilder::new(Kind::MlsGroupMessage, "below-floor probe")
-            .tags([Tag::custom("h", ["c3".repeat(32)])])
-            .finalize(&Keys::generate())
-            .unwrap();
-        database
-            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
-            .await
-            .unwrap();
-        let relay = LocalRelay::new(RelayBuilder::default().database(database));
-        relay.run().await.unwrap();
-        let endpoint = RelayUrl::parse(&relay.url().await.to_string()).unwrap();
-        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
-        let progress = TestReconciliationProgress::default();
-        let mut notifications = sdk.client.notifications();
-        sdk.client.add_relay(endpoint.clone()).await.unwrap();
-        sdk.client.connect().await;
-        let subscription = NostrSubscription::Group {
-            account_id: MemberId::new(vec![0xa1; 32]),
-            group_id: cgka_traits::GroupId::new(vec![0xb2; 16]),
-            transport_group_id: vec![0xc3; 32],
-            endpoints: vec![TransportEndpoint(endpoint.to_string())],
-            since: None,
-            attempt: SubscriptionAttempt::INITIAL,
-        };
-        let (_, fetched) = sdk
-            .reconcile_subscription(
-                subscription.clone(),
-                &[],
-                0,
-                u64::MAX,
-                &progress,
-                tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
-            )
-            .await
-            .unwrap();
-        assert_eq!(fetched.len(), 1);
-        assert_eq!(fetched[0].event.id, event.id.to_hex());
-        while let Ok(Some(notification)) =
-            tokio::time::timeout(Duration::from_millis(30), notifications.next()).await
-        {
-            assert!(
-                !matches!(notification, ClientNotification::Event { .. }),
-                "request-local acquisition must not emit ordinary Event notifications"
-            );
-        }
-        assert!(
-            sdk.client
-                .database()
-                .event_by_id(&event.id)
-                .await
-                .unwrap()
-                .is_none(),
-            "the default cache remembers the id without retaining its bytes"
-        );
-        let inventory = [NostrReconciliationItem {
-            event_id: event.id.to_bytes(),
-            created_at: event.created_at.as_secs(),
-        }];
-        let (_, after_admission) = sdk
-            .reconcile_subscription(
-                subscription,
-                &inventory,
-                0,
-                u64::MAX,
-                &progress,
-                tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
-            )
-            .await
-            .unwrap();
-        assert!(
-            after_admission.is_empty(),
-            "durable admission ends explicit redelivery"
-        );
-        sdk.client.shutdown().await;
-        relay.shutdown();
-    }
-
-    #[tokio::test]
-    async fn reconciliation_redelivers_seen_but_unretained_events_with_default_sdk_cache() {
-        use nostr_relay_builder::LocalRelay;
-
-        let database = nostr_relay_builder::prelude::MemoryDatabase::with_opts(
-            nostr_relay_builder::prelude::MemoryDatabaseOptions {
-                events: true,
-                max_events: Some(1024),
-            },
-        );
-        let mut published = Vec::new();
-        // One shared timestamp: no time window can split this set.
-        for index in 0..SDK_RECONCILIATION_REPLAY_BATCH + 9 {
-            let event = EventBuilder::new(Kind::MlsGroupMessage, format!("synthetic-{index}"))
-                .tags([Tag::custom("h", ["c3".repeat(32)])])
-                .custom_created_at(NostrTimestamp::from_secs(1_700_000_000))
-                .finalize(&Keys::generate())
-                .unwrap();
-            nostr_relay_builder::prelude::NostrDatabase::save_event(
-                &database,
-                &serde_json::from_str(event.as_json().as_str()).unwrap(),
-            )
-            .await
-            .unwrap();
-            published.push(event);
-        }
-        let unrelated = EventBuilder::new(Kind::MlsGroupMessage, "unrelated group")
-            .tags([Tag::custom("h", ["d4".repeat(32)])])
-            .finalize(&Keys::generate())
-            .unwrap();
-        nostr_relay_builder::prelude::NostrDatabase::save_event(
-            &database,
-            &serde_json::from_str(unrelated.as_json().as_str()).unwrap(),
-        )
-        .await
-        .unwrap();
-        let relay =
-            LocalRelay::new(nostr_relay_builder::RelayBuilder::default().database(database));
-        relay.run().await.unwrap();
-        let endpoint = RelayUrl::parse(&relay.url().await.to_string()).unwrap();
-        // This exercises the durable cursor's ID-order rotation, which
-        // oldest-first acquisition falls back to; the integration tests cover
-        // the ordering itself.
-        let mut sdk = NostrSdkRelayClient::from_builder(Client::builder());
-        sdk.id_order_only = true;
-        let progress = TestReconciliationProgress::default();
-        sdk.client.add_relay(endpoint.clone()).await.unwrap();
-        sdk.client.connect().await;
-        let subscription = NostrSubscription::Group {
-            account_id: MemberId::new(vec![0xa1; 32]),
-            group_id: cgka_traits::GroupId::new(vec![0xb2; 16]),
-            transport_group_id: vec![0xc3; 32],
-            endpoints: vec![TransportEndpoint(endpoint.to_string())],
-            since: None,
-            attempt: SubscriptionAttempt::INITIAL,
-        };
-        // First see every event, but acknowledge none to the account inventory.
-        let filter = NostrSdkRelayClient::plan_subscription(&subscription)
-            .unwrap()
-            .filter;
-        // Upstream deprecates `fetch_events` for `stream_events`; this test
-        // only needs the SDK to have seen every event once.
-        #[allow(deprecated)]
-        let seen = sdk
-            .client
-            .fetch_events(filter.limit(SDK_RECONCILIATION_SET_LIMIT))
-            .await
-            .unwrap();
-        assert_eq!(seen.len(), published.len());
-        assert!(
-            sdk.client
-                .database()
-                .event_by_id(&published[0].id)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        tokio::select! {
-            biased;
-            _ = progress.saved.notified() => {}
-            result = sdk.reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress, tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT) => {
-                panic!("reconciliation completed before cancellation: {result:?}");
-            }
-        }
-        let after_cancel = progress.load_cursor().unwrap().unwrap();
-        assert!(
-            published
-                .iter()
-                .any(|event| event.id.to_bytes() > after_cancel)
-        );
-        let (_, resumed) = sdk
-            .reconcile_subscription(
-                subscription.clone(),
-                &[],
-                0,
-                u64::MAX,
-                &progress,
-                tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
-            )
-            .await
-            .unwrap();
-        let resumed_ids = resumed
-            .iter()
-            .map(|event| EventId::from_hex(&event.event.id).unwrap())
-            .collect::<HashSet<_>>();
-        let mut expected_next = published.iter().map(|event| event.id).collect::<Vec<_>>();
-        expected_next.sort_unstable();
-        let expected_next = expected_next
-            .into_iter()
-            .filter(|id| id.to_bytes() > after_cancel)
-            .take(SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT)
-            .collect::<HashSet<_>>();
-        assert_eq!(resumed_ids, expected_next);
-        progress.save_cursor(None).unwrap();
-        let mut notifications = sdk.client.notifications();
-        let (_, first) = sdk
-            .reconcile_subscription(
-                subscription.clone(),
-                &[],
-                0,
-                u64::MAX,
-                &progress,
-                tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.len(), SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT);
-        while let Some(notification) =
-            tokio::time::timeout(Duration::from_millis(10), notifications.next())
-                .await
-                .ok()
-                .flatten()
-        {
-            assert!(
-                !matches!(notification, ClientNotification::Event { .. }),
-                "already-seen events must be owned by explicit replay, not first-seen notifications"
-            );
-        }
-        assert!(
-            first
-                .windows(2)
-                .all(|pair| (pair[0].event.created_at, &pair[0].event.id)
-                    <= (pair[1].event.created_at, &pair[1].event.id))
-        );
-        // Refusing every event must still rotate through the entire set,
-        // including dependencies beyond both the request and selection caps.
-        let mut reached = first
-            .iter()
-            .map(|event| event.event.id.clone())
-            .collect::<HashSet<_>>();
-        for _ in 0..9 {
-            let (_, rotated) = sdk
-                .reconcile_subscription(
-                    subscription.clone(),
-                    &[],
-                    0,
-                    u64::MAX,
-                    &progress,
-                    tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
-                )
-                .await
-                .unwrap();
-            reached.extend(rotated.into_iter().map(|event| event.event.id));
-            if reached.len() == published.len() {
-                break;
-            }
-        }
-        let expected = published
-            .iter()
-            .map(|event| event.id.to_hex())
-            .collect::<HashSet<_>>();
-        assert_eq!(reached, expected);
-        // Only durable account inventory removes an event from the difference.
-        let inventory = published[1..]
-            .iter()
-            .map(|event| NostrReconciliationItem {
-                event_id: event.id.to_bytes(),
-                created_at: event.created_at.as_secs(),
-            })
-            .collect::<Vec<_>>();
-        let (_, second) = sdk
-            .reconcile_subscription(
-                subscription,
-                &inventory,
-                0,
-                u64::MAX,
-                &progress,
-                tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
-            )
-            .await
-            .unwrap();
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].event.id, published[0].id.to_hex());
-        sdk.client.shutdown().await;
-        relay.shutdown();
-    }
-
-    #[test]
-    fn set_aside_cap_covers_the_union_of_relay_inventories() {
-        // Each relay's comparison names at most the set limit, but the union
-        // across relays can name that many per relay.
-        assert_eq!(set_aside_cap(0), SDK_RECONCILIATION_SET_ASIDE_IDS);
-        assert_eq!(set_aside_cap(1), SDK_RECONCILIATION_SET_ASIDE_IDS);
-        assert_eq!(set_aside_cap(2), 2 * SDK_RECONCILIATION_SET_ASIDE_IDS);
-        assert_eq!(set_aside_cap(8), SDK_RECONCILIATION_SET_ASIDE_TOTAL);
-        let client = NostrSdkRelayClient::new(Client::builder().build());
-        let key = AcquisitionRouteKey {
-            account_id: MemberId::new(vec![0xa1; 32]),
-            transport_group_id: vec![0xc3; 32],
-        };
-        let ids = (0..SDK_RECONCILIATION_SET_ASIDE_IDS + 1_000)
-            .map(|value| {
-                let mut bytes = [0u8; 32];
-                bytes[24..].copy_from_slice(&(value as u64).to_be_bytes());
-                EventId::from_byte_array(bytes)
-            })
-            .collect::<Vec<_>>();
-        client.remember_acquisition(key.clone(), AcquisitionUpdate::None, None, 2, ids.clone());
-        let remote = ids.iter().copied().collect::<HashSet<_>>();
-        assert_eq!(
-            client.acquisition_memory_for(&key, &remote).set_aside.len(),
-            ids.len(),
-            "two relays' inventories fit"
-        );
-    }
-
-    #[test]
-    fn reconciliation_remote_batch_is_bounded_and_deterministic() {
-        let remote = (0..SDK_RECONCILIATION_REPLAY_BATCH + 5)
-            .rev()
-            .map(|value| {
-                let mut bytes = [0u8; 32];
-                bytes[24..].copy_from_slice(&(value as u64).to_be_bytes());
-                EventId::from_byte_array(bytes)
-            })
-            .collect::<HashSet<_>>();
-
-        let selected = bounded_reconciliation_remote_ids(&remote, None);
-        assert_eq!(selected.len(), SDK_RECONCILIATION_REPLAY_BATCH);
-        assert!(selected.windows(2).all(|pair| pair[0] < pair[1]));
-        assert_eq!(
-            selected.last(),
-            Some(&EventId::from_byte_array({
-                let mut bytes = [0u8; 32];
-                bytes[24..]
-                    .copy_from_slice(&((SDK_RECONCILIATION_REPLAY_BATCH - 1) as u64).to_be_bytes());
-                bytes
-            }))
-        );
     }
 
     #[test]

@@ -3,28 +3,83 @@
 //! live delivery queue.
 
 use super::*;
-use cgka_traits::{TransportEndpoint, TransportGroupSubscription};
+use async_trait::async_trait;
+use cgka_traits::TransportEndpoint;
+use nostr::prelude::EventId;
 use nostr_relay_builder::MockRelay;
-use std::sync::Mutex;
-use transport_nostr_adapter::NostrReconciliationProgress;
+use nostr_sdk::prelude::{Event, RelayUrl};
+use tokio_util::sync::CancellationToken;
+use transport_nostr_adapter::compare::{
+    CompareEnd, ComparePolicy, CompareRequest, CompareSink, LocalItem, run_comparison,
+};
+use transport_nostr_adapter::sweep::{
+    RelayCaps, SdkSweepRelay, SweepRange, SweepRoute, SweepSinkError,
+};
+use transport_nostr_adapter::{NostrRelayEvent, NostrSdkRelayClient};
+use transport_nostr_peeler::NostrTransportEvent;
 
-const RECONCILIATION_CALLER_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
+const COMPARISON_CALLER_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Default)]
-struct ComparisonCursor(Mutex<Option<[u8; 32]>>);
+struct CollectedEvents(Vec<Event>);
 
-impl NostrReconciliationProgress for ComparisonCursor {
-    fn load_cursor(&self) -> Result<Option<[u8; 32]>, cgka_traits::TransportAdapterError> {
-        Ok(*self.0.lock().unwrap())
-    }
-
-    fn save_cursor(
-        &self,
-        cursor: Option<[u8; 32]>,
-    ) -> Result<(), cgka_traits::TransportAdapterError> {
-        *self.0.lock().unwrap() = cursor;
+#[async_trait]
+impl CompareSink for CollectedEvents {
+    async fn admit(
+        &mut self,
+        _window: SweepRange,
+        _certified: bool,
+        events: Vec<Event>,
+        _fetched_bytes: u64,
+    ) -> Result<(), SweepSinkError> {
+        self.0.extend(events);
         Ok(())
     }
+}
+
+async fn run_group_comparison(
+    sdk: &NostrSdkRelayClient,
+    url: &str,
+    route: [u8; 32],
+    local: &[LocalItem],
+    since: u64,
+    until: u64,
+) -> Vec<NostrRelayEvent> {
+    let relay_url = RelayUrl::parse(url).unwrap();
+    let relay = SdkSweepRelay::new(
+        sdk,
+        relay_url,
+        RelayCaps {
+            max_limit: Some(500),
+            negentropy: true,
+        },
+        COMPARISON_CALLER_ALLOWANCE,
+    );
+    let mut sink = CollectedEvents::default();
+    let report = run_comparison(
+        CompareRequest {
+            route: SweepRoute::Group {
+                nostr_group_id: route,
+            },
+            range: SweepRange { since, until },
+            local,
+            deadline: Some(tokio::time::Instant::now() + COMPARISON_CALLER_ALLOWANCE),
+            policy: ComparePolicy::new(256, 1024 * 1024),
+        },
+        &relay,
+        &mut sink,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.end, CompareEnd::Finished);
+    sink.0
+        .into_iter()
+        .map(|event| NostrRelayEvent {
+            endpoint: TransportEndpoint(url.to_owned()),
+            subscription_id: None,
+            event: NostrTransportEvent::from_nostr_event(&event).unwrap(),
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -91,7 +146,7 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
 
     let mut client = app.client(&alice.label).await.unwrap();
     // Wait for wire acquisition, not MDK admission: native input deliberately
-    // retains this ciphertext until the owner consumes it. Reconciliation must
+    // retains this ciphertext until the owner consumes it. Comparison must
     // still return bytes the SDK has seen but the account has not admitted.
     client.prepare_transport().await.unwrap();
     timeout(Duration::from_secs(10), async {
@@ -129,20 +184,21 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
             crate::unix_now_seconds(),
         )
         .unwrap();
-    let local_items = inventory
+    let mut local_items = inventory
         .items
         .iter()
-        .map(|item| transport_nostr_adapter::NostrReconciliationItem {
-            event_id: item.event_id,
+        .map(|item| LocalItem {
             created_at: item.created_at,
+            id: EventId::from_byte_array(item.event_id),
         })
         .collect::<Vec<_>>();
-    let subscription = TransportGroupSubscription {
-        group_id: group.clone(),
-        transport_group_id: route.to_vec(),
-        endpoints: vec![TransportEndpoint(url)],
-        retained_since: None,
-    };
+    local_items.sort();
+    let alice_id = cgka_traits::MemberId::new(hex::decode(&alice.account_id_hex).unwrap());
+    let sdk = app
+        .relay_plane
+        .account_history_relay_client(&alice_id)
+        .await
+        .expect("SDK account history client is configured");
     assert!(
         app.messages(&alice.label)
             .unwrap()
@@ -150,21 +206,15 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
             .all(|message| message.plaintext != body),
         "wire acquisition must not admit the missing plaintext"
     );
-    let (summary, events) = client
-        .adapter
-        .reconcile_group_history(
-            subscription.clone(),
-            &local_items,
-            inventory.since,
-            crate::unix_now_seconds(),
-            &ComparisonCursor::default(),
-            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
-        )
-        .await
-        .unwrap()
-        .expect("SDK reconciliation backend is configured");
-    assert_eq!(summary.relays_succeeded, 1);
-    assert_eq!(summary.relays_failed, 0);
+    let events = run_group_comparison(
+        &sdk,
+        &url,
+        route,
+        &local_items,
+        inventory.since,
+        crate::unix_now_seconds(),
+    )
+    .await;
     let returned = events
         .iter()
         .map(|event| event.event.id.clone())
@@ -175,23 +225,18 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
             .is_err(),
         "an owned comparison result must not enter the ordinary delivery queue"
     );
-    let (_, repeated) = client
-        .adapter
-        .reconcile_group_history(
-            subscription.clone(),
-            &local_items,
-            inventory.since,
-            crate::unix_now_seconds(),
-            &ComparisonCursor::default(),
-            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let repeated = repeated
-        .into_iter()
-        .map(|event| event.event.id)
-        .collect::<std::collections::HashSet<_>>();
+    let repeated = run_group_comparison(
+        &sdk,
+        &url,
+        route,
+        &local_items,
+        inventory.since,
+        crate::unix_now_seconds(),
+    )
+    .await
+    .into_iter()
+    .map(|event| event.event.id)
+    .collect::<std::collections::HashSet<_>>();
     assert!(
         returned.is_subset(&repeated),
         "a comparison result not admitted by the worker remains eligible"

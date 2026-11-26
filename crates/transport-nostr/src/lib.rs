@@ -29,11 +29,10 @@ use transport_nostr_adapter::NotificationUpdate;
 use transport_nostr_adapter::{
     AccountSubscriptionEose, AccountSubscriptionInput, NostrAcquisitionCancellation,
     NostrAcquisitionError, NostrAcquisitionRequest, NostrAcquisitionResult,
-    NostrNotificationLossBounds, NostrNotificationLossFloor, NostrPublishOutcome,
-    NostrReconciliationItem, NostrReconciliationSummary, NostrRelayClient,
+    NostrNotificationLossBounds, NostrNotificationLossFloor, NostrPublishOutcome, NostrRelayClient,
     NostrRelayNotificationSource, NostrSdkNotification, NostrSdkRelayClient, NostrSdkRelayHealth,
-    NostrSubscription, NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
-    RelayRegistrationOutcome, SubscriptionAttempt,
+    NostrTransportAdapter, RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome,
+    SubscriptionAttempt,
 };
 
 pub use transport_nostr_adapter::{
@@ -3873,132 +3872,6 @@ impl MarmotRelayPlaneAccountAdapter {
             .adapter
             .account_subscription_attempt(&self.account_id)
             .await
-    }
-
-    #[doc(hidden)]
-    pub async fn reconcile_inbox_history(
-        &self,
-        endpoints: Vec<TransportEndpoint>,
-        local_items: &[NostrReconciliationItem],
-        reconcile_since: u64,
-        reconcile_until: u64,
-        progress: &dyn transport_nostr_adapter::NostrReconciliationProgress,
-        deadline: tokio::time::Instant,
-    ) -> Result<
-        Option<(
-            NostrReconciliationSummary,
-            Vec<transport_nostr_adapter::NostrRelayEvent>,
-        )>,
-        TransportAdapterError,
-    > {
-        let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
-            return Ok(None);
-        };
-        let activation = self
-            .relay_plane
-            .inner
-            .relay_safety
-            .sanitize_activation(TransportAccountActivation {
-                account_id: self.account_id.clone(),
-                inbox_endpoints: endpoints,
-                group_subscriptions: Vec::new(),
-                since: None,
-            })
-            .map_err(TransportAdapterError::Subscription)?;
-        let result = client
-            .reconcile_subscription(
-                NostrSubscription::AccountInbox {
-                    account_id: self.account_id.clone(),
-                    endpoints: activation.inbox_endpoints,
-                    since: None,
-                    // A one-shot reconciliation REQ is not owned by an account
-                    // activation and never feeds the replay-coverage gate.
-                    attempt: SubscriptionAttempt::INITIAL,
-                },
-                local_items,
-                reconcile_since,
-                reconcile_until,
-                progress,
-                deadline,
-            )
-            .await;
-        let metric = result
-            .as_ref()
-            .map(|(summary, _)| summary.clone())
-            .unwrap_or_default();
-        self.relay_plane
-            .inner
-            .transport
-            .adapter
-            .record_reconciliation(&metric)
-            .await;
-        Ok(Some(result?))
-    }
-
-    #[doc(hidden)]
-    pub async fn reconcile_group_history(
-        &self,
-        group: TransportGroupSubscription,
-        local_items: &[NostrReconciliationItem],
-        reconcile_since: u64,
-        reconcile_until: u64,
-        progress: &dyn transport_nostr_adapter::NostrReconciliationProgress,
-        deadline: tokio::time::Instant,
-    ) -> Result<
-        Option<(
-            NostrReconciliationSummary,
-            Vec<transport_nostr_adapter::NostrRelayEvent>,
-        )>,
-        TransportAdapterError,
-    > {
-        let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
-            return Ok(None);
-        };
-        let sync = self
-            .relay_plane
-            .inner
-            .relay_safety
-            .sanitize_group_sync(TransportGroupSync {
-                account_id: self.account_id.clone(),
-                group_subscriptions: vec![group],
-                since: None,
-            })
-            .map_err(TransportAdapterError::Subscription)?;
-        let group = sync.group_subscriptions.into_iter().next().ok_or_else(|| {
-            TransportAdapterError::Subscription(
-                "reconciliation group subscription was empty".to_owned(),
-            )
-        })?;
-        let result = client
-            .reconcile_subscription(
-                NostrSubscription::Group {
-                    account_id: self.account_id.clone(),
-                    group_id: group.group_id,
-                    transport_group_id: group.transport_group_id,
-                    endpoints: group.endpoints,
-                    since: None,
-                    // A one-shot reconciliation REQ is not owned by an account
-                    // activation and never feeds the replay-coverage gate.
-                    attempt: SubscriptionAttempt::INITIAL,
-                },
-                local_items,
-                reconcile_since,
-                reconcile_until,
-                progress,
-                deadline,
-            )
-            .await;
-        let metric = result
-            .as_ref()
-            .map(|(summary, _)| summary.clone())
-            .unwrap_or_default();
-        self.relay_plane
-            .inner
-            .transport
-            .adapter
-            .record_reconciliation(&metric)
-            .await;
-        Ok(Some(result?))
     }
 
     /// This account's deliveries for one owned comparison event. The worker
