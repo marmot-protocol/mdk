@@ -23,7 +23,10 @@ jobs:
       - name: Update C ABI notice for the current PR revision
         env:
           GH_TOKEN: ${{ github.token }}
+          WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
           RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
           HEAD_REPO_ID: ${{ github.event.workflow_run.head_repository.id }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
@@ -35,24 +38,55 @@ jobs:
           marker='<!-- mdk-c-abi -->'
 
           # Never check out PR code or download artifacts with a write token.
-          artifacts="$(gh api --paginate "$repo/actions/runs/$RUN_ID/artifacts" \
-            --jq '.artifacts[] | select(.expired | not) | [.name, .id] | @tsv')"
+          list_results() {
+            gh api --paginate "$repo/actions/runs/$1/artifacts" \
+              --jq '.artifacts[] | select(.expired | not) | [.name, .id] | @tsv'
+          }
+
+          latest_result() {
+            # C smoke (or classification) need not rerun when another job does.
+            awk -F '[-\t]' -v prefix="$1" -v attempt="$2" '
+              index($0, prefix) == 1 && $6 ~ /^[1-9][0-9]*$/ && $6 <= attempt {
+                if ($6 > latest) { latest = $6; result = $0; count = 0 }
+                if ($6 == latest) { count++ }
+              }
+              END { if (count == 1) print result }
+            '
+          }
+
+          artifacts="$(list_results "$RUN_ID")"
           [[ -n "$artifacts" ]] || exit 0
           # workflow_run.pull_requests can be empty for fork PRs.
           pulls="$(gh api --paginate --method GET "$repo/pulls" -f state=open \
             -f head="$HEAD_OWNER:$HEAD_BRANCH" | jq -r --arg sha "$HEAD_SHA" --arg id "$HEAD_REPO_ID" \
             '.[] | select(.head.sha == $sha and (.head.repo.id | tostring) == $id) | [.number, .base.ref] | @tsv')"
+          [[ -n "$pulls" ]] || exit 0
+
+          # A rerun may finish last even though it tested an older merge revision.
+          newer_runs="$(gh api --paginate --method GET "$repo/actions/workflows/$WORKFLOW_ID/runs" \
+            -f event=pull_request -f head_sha="$HEAD_SHA" | jq -r \
+            --arg id "$HEAD_REPO_ID" --arg branch "$HEAD_BRANCH" --argjson run "$RUN_NUMBER" '
+              .workflow_runs[] | select(.run_number > $run and .head_branch == $branch and
+                (.head_repository.id | tostring) == $id and (.conclusion == "success" or .conclusion == "failure")) |
+              [.id, .run_attempt] | @tsv')"
 
           while IFS=$'\t' read -r number ref; do
-            [[ -n "$number" ]] || continue
             target="$(printf '%s' "$ref" | sha256sum | cut -d ' ' -f 1)"
             prefix="c-abi-$number-$target-"
-            result="$(awk -F '\t' -v prefix="$prefix" 'index($1, prefix) == 1' <<< "$artifacts")"
-            pattern="^${prefix}([0-9a-f]{40})-(changed|unchanged|skipped)"$'\t''([0-9]+)$'
+            result="$(latest_result "$prefix" "$RUN_ATTEMPT" <<< "$artifacts")"
+            pattern="^${prefix}([0-9a-f]{40})-[1-9][0-9]*-(changed|unchanged|skipped)"$'\t''([0-9]+)$'
             [[ "$result" =~ $pattern ]] || continue
             base="${BASH_REMATCH[1]}"
             state="${BASH_REMATCH[2]}"
             artifact="${BASH_REMATCH[3]}"
+            while IFS=$'\t' read -r newer_id newer_attempt; do
+              [[ -n "$newer_id" ]] || continue
+              newer_artifacts="$(list_results "$newer_id")"
+              newer_result="$(latest_result "$prefix" "$newer_attempt" <<< "$newer_artifacts")"
+              if [[ "$newer_result" =~ $pattern ]]; then
+                continue 2
+              fi
+            done <<< "$newer_runs"
 
             comments="$(gh api --paginate "$repo/issues/$number/comments" | jq -r --arg marker "$marker" \
               '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith($marker))) | .id')"
