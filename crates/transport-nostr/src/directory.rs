@@ -1356,6 +1356,13 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
 /// auth-required: ...`, mdk#3439); that wrapper alone is looked through.
 /// `rate-limited:` and bare `error: <other>` are transient (`RateLimited` and
 /// `Unreachable`); permanent policy prefixes stay `Restricted`.
+fn has_closed_prefix(reason: &str, prefix: &str) -> bool {
+    reason == prefix
+        || reason
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
 fn directory_closed_reason(reason: &str) -> DirectoryInspectionError {
     use DirectoryInspectionError::*;
     let wrapped = reason
@@ -1363,17 +1370,17 @@ fn directory_closed_reason(reason: &str) -> DirectoryInspectionError {
         .filter(|wrapper| wrapper.eq_ignore_ascii_case("error:"))
         .map(|_| reason[6..].trim_start());
     let unwrapped = wrapped.unwrap_or(reason);
-    if unwrapped.starts_with("auth-required:") {
+    if has_closed_prefix(unwrapped, "auth-required") {
         AuthenticationRequired
-    } else if unwrapped.starts_with("payment-required:") {
+    } else if has_closed_prefix(unwrapped, "payment-required") {
         PaymentRequired
-    } else if unwrapped.starts_with("rate-limited:") {
+    } else if has_closed_prefix(unwrapped, "rate-limited") {
         RateLimited
     } else if wrapped.is_some()
-        && !unwrapped.starts_with("blocked:")
-        && !unwrapped.starts_with("restricted:")
-        && !unwrapped.starts_with("invalid:")
-        && !unwrapped.starts_with("bad req:")
+        && !has_closed_prefix(unwrapped, "blocked")
+        && !has_closed_prefix(unwrapped, "restricted")
+        && !has_closed_prefix(unwrapped, "invalid")
+        && !has_closed_prefix(unwrapped, "bad req")
         && !unwrapped
             .get(..6)
             .is_some_and(|nested| nested.eq_ignore_ascii_case("error:"))
@@ -2134,6 +2141,8 @@ mod tests {
                 DirectoryInspectionError::Restricted,
             ),
             ("error: blocked: no", DirectoryInspectionError::Restricted),
+            ("error: restricted", DirectoryInspectionError::Restricted),
+            ("error: blocked", DirectoryInspectionError::Restricted),
             (
                 "error: error: auth-required: sign in",
                 DirectoryInspectionError::Restricted,
