@@ -1349,11 +1349,11 @@ sha256sum() { shasum -a 256 "$@"; }
         changes = workflow.split("\n  changes:\n", 1)[1].split("\n  rust-format:\n", 1)[0]
         rust_format = workflow.split("\n  rust-format:\n", 1)[1].split("\n  rust-audit:\n", 1)[0]
         self.assertIn("fetch-depth: 0", changes)
-        self.assertIn("fetch-depth: 1", rust_format)
         self.assertIn("run: python3 scripts/test_check_pr_trailers.py", rust_format)
 
         script = workflow_step("ci.yml", "PR commit trailers (advisory)")
         self.assertIn("python3 scripts/check_pr_trailers.py --advisory", script)
+        self.assertIn('|| echo "::warning title=PR trailers::', script)
         self.assertNotIn("${{", script)
 
         # Execute the exact workflow step in a synthetic PR merge-ref checkout

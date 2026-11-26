@@ -49,6 +49,7 @@ HUMAN_REVIEW = re.compile(r"^human(?:\s+\S.*)?$")
 EXEMPT_REVIEW = re.compile(r"^exempt\s*\((?P<reason>[^()]+)\)$")
 FRAGMENT_PATH = re.compile(r"(?:^|/)changelog\.d/[^/]+\.md$")
 GITHUB_SQUASH_SEPARATOR = "---------"
+GITHUB_SQUASH_FOOTER_KEYS = frozenset({"co-authored-by", "signed-off-by", "on-behalf-of"})
 
 
 def git(root: Path, *args: str) -> str:
@@ -58,23 +59,35 @@ def git(root: Path, *args: str) -> str:
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
     ).stdout
 
 
 def parse_trailers(message: str) -> tuple[dict[str, str], list[str]]:
     """Parse Git trailers from a commit message using `git interpret-trailers`.
 
-    Unfolds multi-line values via Git's parser, permits repeated standard
-    trailers (such as multiple `Co-authored-by:` lines), and rejects duplicate
-    MDK trailers (`Local-Checks`, `Local-Review`, `Release-Impact`).
+    Uses `--no-divider` so standalone `---` lines in commit bodies are never
+    treated as format-patch dividers, unfolds multi-line values via Git's
+    parser, permits repeated standard trailers (such as multiple
+    `Co-authored-by:` lines), and rejects duplicate MDK trailers
+    (`Local-Checks`, `Local-Review`, `Release-Impact`).
     """
     out = subprocess.run(
-        ["git", "-c", "trailer.separators=:", "interpret-trailers", "--parse", "--unfold"],
+        [
+            "git",
+            "-c",
+            "trailer.separators=:",
+            "interpret-trailers",
+            "--parse",
+            "--unfold",
+            "--no-divider",
+        ],
         input=message,
         check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
     ).stdout
 
     trailers: dict[str, str] = {}
@@ -118,7 +131,7 @@ def strip_github_squash_footer(message: str) -> str | None:
         return None
 
     footer_trailers, _ = parse_trailers("footer\n\n" + "\n".join(footer_slice) + "\n")
-    if not footer_trailers:
+    if not footer_trailers or not set(footer_trailers).issubset(GITHUB_SQUASH_FOOTER_KEYS):
         return None
     return "\n".join(lines[:sep_idx]).rstrip() + "\n"
 
