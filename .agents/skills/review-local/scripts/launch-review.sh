@@ -18,6 +18,13 @@
 #   refuses MCP tools that write.
 # - Codex without --ignore-user-config loaded MCP servers from
 #   ~/.codex/config.toml, which run outside its read-only sandbox.
+# - Antigravity (checked 2026-11-26): without --settings, agy defaults to auto
+#   mode (approving workspace edits and sandboxed commands) and uses the user's
+#   allow rules and MCP servers. A round-local --settings file sets default mode
+#   with request-review, disables non-workspace access, and denies write_file,
+#   command, unsandboxed, mcp, read_url and execute_url (deny overrides any user
+#   allow rule). --add-dir exposes only the read-only input dir, --sandbox turns
+#   on OS containment, and --disable-slash-commands keeps prompt text raw.
 # - OpenCode (checked 2026-11-17, under numes): ~/.config/opencode holds
 #   the user's MCP servers, custom tools and plugins, so OPENCODE_CONFIG_DIR
 #   replaces it with a round-local one whose only agent denies every tool but
@@ -46,7 +53,7 @@ done
 rc=0
 case "$seat" in
   codex)
-    model=gpt-6.2-sol
+    model=gpt-6.1-sol
     # --ignore-user-config also drops model_reasoning_effort, leaving effort none.
     codex exec --ignore-user-config -c model_reasoning_effort='"medium"' -s read-only -m "$model" \
       -C "$checkout" -o "$out_dir/codex.md" - \
@@ -60,6 +67,32 @@ case "$seat" in
     (cd "$checkout" && claude -p --restricted --tools Read Grep Glob --strict-mcp-config \
       --add-dir "$input" --model "$model" --effort medium \
       < "$input/prompt.md") > "$out_dir/claude.md" 2> "$out_dir/claude.log" || rc=$?
+    ;;
+
+  antigravity)
+    model=gemini-4-neon
+    settings_file="$review_dir/antigravity-settings.json"
+    cat > "$settings_file" <<'EOF'
+{
+  "agentMode": "",
+  "toolPermission": "request-review",
+  "allowNonWorkspaceAccess": false,
+  "enableTerminalSandbox": true,
+  "permissions": {
+    "deny": [
+      "write_file(*)",
+      "command(*)",
+      "unsandboxed(*)",
+      "mcp(*)",
+      "read_url(*)",
+      "execute_url(*)"
+    ]
+  }
+}
+EOF
+    (cd "$checkout" && agy -p "$(cat "$input/prompt.md")" --model "$model" --effort medium \
+      --disable-slash-commands --sandbox --settings "$settings_file" --add-dir "$input" \
+      --output-format text) < /dev/null > "$out_dir/antigravity.md" 2> "$out_dir/antigravity.log" || rc=$?
     ;;
 
   cursor)
@@ -125,7 +158,7 @@ EOF
     ;;
 
   *)
-    echo "unknown seat: $seat (want codex, claude, cursor or opencode)" >&2
+    echo "unknown seat: $seat (want codex, claude, antigravity, cursor or opencode)" >&2
     exit 2
     ;;
 esac

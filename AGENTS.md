@@ -77,8 +77,11 @@ no merge queue. The shipping flow is:
    advisory commit-trailer checks. External/fork PRs, read-only org members, and `ci:full` PRs fail closed into the full
    `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs (`ios-account-clippy`,
    `marmotkit-native-host`) to a team PR regardless of changed paths.
-3. **Squash-merge (only when asked):** Once `Required CI` is green and any required `CODEOWNERS` reviews approve,
-   confirm `headRefOid` matches the reviewed head and run `gh pr merge <pr> --squash --match-head-commit <sha>`.
+3. **Squash-merge (only when told to land):** `master` requires `Required CI`, any `CODEOWNERS` approvals, and a branch
+   up to date with `master`, so a ready PR can merge a minute after it opens: finish step 1 before opening it.
+   Agents stop at a green PR unless the user told them to land it (`.agents/skills/land-change`). To merge, confirm
+   `headRefOid` matches the reviewed head and run `gh pr merge <pr> --squash --match-head-commit <sha>`; never
+   `--auto`, `--admin`, or a direct push.
 4. **Post-merge `Canary` & daily releases:** Bare-metal Linux Canary on `mdk-ci-1` verifies `master` every 30 minutes
    (`fast-ci`, `cargo-audit`, `wasm-check`, `android-check`, `workspace-nextest`, `simulator-smoke`) and advances the
    protected `canary` branch; hourly `.github/workflows/canary.yml` runs the full cross-platform matrix (de-sharded to 6

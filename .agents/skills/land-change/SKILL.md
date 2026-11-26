@@ -1,30 +1,54 @@
 ---
 name: land-change
 description: >-
-  Take an mdk change from an issue or a request to a PR that is ready to
-  merge: confirm the issue is real and not a symptom of a deeper cause, build
-  it test-first, verify locally with the end-to-end smoke, get two independent
-  cross-model reviews of the local diff, open the PR, and bring it to green CI
-  with no conflicts. Then stop and report. Merges only when the user asks. Use
-  when asked to fix an issue ("fix #123", an issue URL), build and ship a
-  change, land, open a PR for, or merge a change.
+  Take an mdk change from an issue or a request to a ready PR, and merge it
+  when the user asked you to land it: confirm the issue is real and not a
+  symptom of a deeper cause, build it test-first, verify locally with
+  everything team CI no longer runs, get two independent cross-model reviews
+  of the local diff, and open the PR only once that is done. Report mode
+  (the default) stops at a green PR; land mode squash-merges it. Use when
+  asked to fix an issue ("fix #123", an issue URL), build and ship a change,
+  land, open a PR for, or merge a change.
 ---
 
 # Land a change
 
-Verification and cross-model review happen on your machine, the team PR gate
-checks commit signatures, formatting, static contracts, `cargo-audit`, and
-advisory commit trailers (~1 minute, zero Rust compile; there is no merge
-queue), and post-merge `Canary` runs (bare-metal Linux Canary on `mdk-ci-1` +
-hourly cross-platform `.github/workflows/canary.yml`) verify `master`
-continuously. Nothing reaches `master` by direct push or unsigned commit.
+Your machine is the only place this change is built and tested before it
+reaches `master`. Team PR CI (`Required CI`) is a ~1-minute static gate:
+commit signatures, formatting, static contracts, `cargo-audit`, and advisory
+commit trailers, with zero Rust compile. There is no merge queue, and `master`
+requires only `Required CI`, any CODEOWNERS approvals, and a branch that is up
+to date with `master`. A ready PR that goes green can be merged a minute later
+with nothing else between it and `master`. Post-merge `Canary` (bare-metal
+Linux on `mdk-ci-1` plus hourly cross-platform `.github/workflows/canary.yml`)
+builds and tests `master` afterwards, and the Bisect Agent reverts what breaks
+it. That is a safety net, not your test run.
 
-You own the change until it is a ready PR: `Required CI` green, both reviewers
-say merge, no conflicts. Then stop and report (step 6). Merge only when the user
-asks (step 7).
+So verification (step 2) and review (step 3) are finished, on the exact commit
+you push, **before** the PR is ready. Opening a ready PR means "this can
+merge". Nothing reaches `master` by direct push, `gh pr merge --admin`, or an
+unsigned commit.
 
 Check `gh auth status` first; if it fails, ask the user to run `gh auth
 login`.
+
+## Report or land
+
+Decide the mode before you build, because it decides where you stop:
+
+- **Report** (the default): bring the PR to ready and green, then stop and
+  report (step 6). The user merges, or tells you to.
+- **Land**: merge it yourself (step 7) without asking. Only when the user said
+  so: "land it", "merge it", "take it through to merge", or a list of issues
+  with "land these on your own".
+
+A request to fix or build something is not by itself permission to merge. If
+you cannot tell which mode the user wants, ask once, now, in one line, and
+carry on building while you wait. Do not save the question for the end.
+
+Some stops apply in either mode: review that does not converge (step 3), a
+failure you cannot classify or a second flake (step 5), or a CODEOWNERS
+approval you cannot give yourself (step 7).
 
 ## 0. Start from an issue
 
@@ -81,8 +105,13 @@ Commit when it works.
 
 ## 2. Verify locally
 
-Run what the root `AGENTS.md` Verification section and the nearest crate
-`AGENTS.md` ask for:
+This step stands in for the CI that team PRs no longer run. Run it on the
+commit you will push: rebase onto `origin/master` first (`git fetch origin
+master && git rebase origin/master`), and run it again after any later
+rebase.
+
+Always run what the root `AGENTS.md` Verification section and the nearest
+crate `AGENTS.md` ask for:
 
 ```sh
 cargo fmt --all
@@ -110,6 +139,26 @@ Keep them as two commands: one invocation would unify features and turn
 take under a minute; the two builds take a few minutes on a warm cache, and the
 first simulator build is the heaviest compile in the workspace.
 
+Then run each row below that your change matches. These are the Canary jobs a
+team PR skips; a row you skip is a failure you push to `master`.
+
+| Your change touches | Run |
+| --- | --- |
+| A `pub` item other crates use (type, field, variant, trait, signature, feature) | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, and the tests of each dependent whose behavior changed |
+| `cgka-traits`, `cgka-engine`, `transport-nostr-peeler`, or anything they depend on | `just wasm-check` |
+| A crate in `marmot-uniffi`'s tree (through `marmot-app` that is nearly every runtime crate; check with `cargo tree -p marmot-uniffi -i <crate>`) | `just android-check`, and `just binding-docs-gate` when the binding surface changed |
+| Convergence, delivery, branch selection, or multi-client behavior | `just simulator-smoke` |
+| `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `Justfile`, `vendor/`, or `.github/workflows/` | `just fast-ci` (includes `cargo-audit-policy-gate`); `cargo --locked audit` for dependency changes |
+| Engine selection, convergence, freeze/settle, recovery, or protocol policy | `just convergence-verification-ci` (reference-model, mutation-adequacy, decision-gate, route-assurance and Stateright mirror tests against production code, then TLC) |
+| `formal/liveness/` (`.tla`, `.cfg`, counterexamples), or the Stateright mirror (`cgka-conformance-simulator`'s `lifecycle_model.rs`) | `just tla-liveness tla-liveness-counterexample` |
+| `formal/tamarin/` or `formal/pairing/` (`.spthy`, `policy_cases.json`), or `cgka-policy-casegen` | `just tamarin` |
+| Behavior a formal model makes claims about (lifecycle fairness, freeze/settle, restart rehydration, device linking, pairing, selector policy), even with no model file changed | Check the model still matches the code with `.agents/skills/formal-verification`; if you change the model, run its row above. Say in the review context which model you checked |
+| A gate the nearest `AGENTS.md` names for the files you touched | that gate |
+
+If a row's tool is missing on your machine (no Android NDK, no `clang` for
+WASM), say so in the PR's Verification section and in the report; do not
+quietly skip it.
+
 An initial cohort-release PR follows the release exception in the root
 `AGENTS.md` Verification section instead of this step: run only
 `just release-pr-preflight <version>`.
@@ -122,13 +171,17 @@ afterwards. If it fails there too, note that in the PR. If it passes there,
 your change broke it. Tests with real sockets or timing can stretch on a
 loaded machine: rerun a failure alone before judging it.
 
+Keep a list of every command you ran; it becomes the `Local-Checks:` trailer.
+
 ## 3. Review locally
 
 Get two independent reviews of the whole local diff from the model families
-that are not yours, using `.agents/skills/review-local`. Its context file
-holds the issue or the user's request, and the two designs from step 1 with
-why you chose one. You are the author: you do not review your own change, and
-you do not decide alone that it is good enough.
+that are not yours, using `.agents/skills/review-local` (default seats:
+`codex`, `claude`, and `antigravity` with Gemini 4 Neon, with `cursor` as an
+alternative and `opencode` as fallback). Its context file holds the issue or
+the user's request, and the two designs from step 1 with why you chose one. You
+are the author: you do not review your own change, and you do not decide alone
+that it is good enough.
 
 - Reviewers are read-only. They report findings; you make every change.
 - Check a finding's premise before acting on it. When you reject one, say why
@@ -137,33 +190,69 @@ you do not decide alone that it is good enough.
   again.
 - You are done when both reviewers say `VERDICT: merge` on the same head
   commit. Record that commit as the **reviewed head**.
-- A later change of HEAD keeps the verdicts only when the files are exactly
-  the same: `git rev-parse HEAD^{tree}` equals `git rev-parse
-  <reviewed-head>^{tree}`. That covers a reworded message or an added
-  signature. The new HEAD then becomes the reviewed head. Anything else,
-  including any rebase, needs a new round; there is no exception for small
-  fixes. To make that rarer, rebase onto `origin/master` before the final
-  round.
 - Put the proposed `Release-Impact: none | patch | minor` trailer on the tip
   commit (or in the review context) **before** the final `review-local` round so
   both seats audit it alongside any `changelog.d/<slug>.md` fragments.
-- Once both seats say `VERDICT: merge`, amend the signed tip commit message
-  (`git commit --amend -S`, preserving `HEAD^{tree}`) to record `Local-Checks:`
-  and `Local-Review:` while keeping the reviewed `Release-Impact:` unchanged,
-  then verify with `just pr-trailers-check`:
 
-  ```text
-  Local-Checks: <commands run locally>
-  Local-Review: <seat-a> + <seat-b> merge @ <reviewed-short-sha>
-  Release-Impact: none | patch | minor
-  ```
+**When the verdicts still hold.** A later HEAD keeps the verdicts in exactly
+two cases; anything else needs a new round, with no exception for small
+fixes:
 
-  Changing `Release-Impact:` during or after the amend invalidates the prior
-  review and requires a fresh `review-local` round. Ensure `Release-Impact:`
-  agrees with any `changelog.d/<slug>.md` fragments (`### Breaking changes`
-  requires `minor`; user-facing entries forbid `none`).
+1. **Same files.** `git rev-parse HEAD^{tree}` equals `git rev-parse
+   <reviewed-head>^{tree}`: a reworded message, added trailers, an added
+   signature.
+2. **Clean rebase.** A rebase onto newer `master` that applied without
+   conflicts and with no edits, where every one of your commits is unchanged.
+   Before rebasing, note the old base and head (`old_base=$(git merge-base
+   HEAD origin/master) old_head=$(git rev-parse HEAD)`). After it, run:
 
-Count the rounds; the report in step 6 says how many it took.
+   ```sh
+   git range-diff "$old_base..$old_head" origin/master..HEAD
+   ```
+
+   Every line must show `=`. A `!`, `<`, or `>` (a changed patch, including
+   changed context lines, or a dropped or added commit) needs a new round.
+   A clean rebase still needs step 2 again on the rebased head, sized to what
+   `master` brought in (below): that rerun is what catches your change
+   breaking against the new `master` code.
+
+**Re-verifying after a clean rebase.** Look at what the new `master` commits
+touched: `git diff --stat "$old_base" origin/master`.
+
+- **No overlap**: they touch none of the crates you changed, none of their
+  dependencies, and none of their dependents (`cargo tree -p <your-crate> -i
+  <their-crate>` finds a dependency; `cargo tree -i <your-crate> --workspace`
+  lists dependents). Rerun only `cargo fmt --all`, `cargo clippy` for
+  your crates, and the targeted `cargo nextest` for your change.
+- **Overlap**, or `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`,
+  `.cargo/`, or `vendor/` changed: rerun all of step 2, including the
+  end-to-end smoke and every table row your change matches.
+
+Keep the rerun short so another merge is less likely to land while it runs;
+`Local-Checks:` names what you reran.
+
+When a case holds, the new HEAD becomes the reviewed head. To need a rebase
+less often, rebase onto `origin/master` before the final round.
+
+**Trailers.** Once both seats say `VERDICT: merge`, amend the signed tip
+commit message (`git commit --amend -S`, preserving `HEAD^{tree}`) to record
+`Local-Checks:` and `Local-Review:` while keeping the reviewed
+`Release-Impact:` unchanged, then verify with `just pr-trailers-check`. The
+CI trailer check is only advisory; for you it is required.
+
+```text
+Local-Checks: <commands run locally>
+Local-Review: <seat-a> + <seat-b> merge @ <reviewed-short-sha>
+Release-Impact: none | patch | minor
+```
+
+`Local-Review:` names the commit the seats read; keep it after a clean rebase.
+Changing `Release-Impact:` during or after the amend invalidates the prior
+review and requires a fresh `review-local` round. Ensure `Release-Impact:`
+agrees with any `changelog.d/<slug>.md` fragments (`### Breaking changes`
+requires `minor`; user-facing entries forbid `none`).
+
+Count the rounds; the report says how many it took.
 
 ### When review does not converge
 
@@ -173,15 +262,28 @@ means, what to report, and how far the user's answer lets you go.
 
 ## 4. Open the PR
 
-Push the branch and open a ready (not draft) PR with a description from
-`.agents/skills/gh-create-pr`, including its Verification section; list the
-end-to-end smoke there too. Put `Fixes #<n>` below Problem and Fix when there
-is an issue.
+Push only when all of these hold on HEAD:
+
+- HEAD is the reviewed head (step 3).
+- Step 2 ran on HEAD, or on a commit with the same tree.
+- HEAD is on top of current `origin/master` (`git fetch origin master`; `git
+  merge-base --is-ancestor origin/master HEAD`). If master moved, rebase and
+  apply step 3's clean-rebase rule before pushing.
+- `just pr-trailers-check` passes.
+
+Then push the branch and open a ready (not draft) PR with a description from
+`.agents/skills/gh-create-pr`, including its Verification section with the
+end-to-end smoke and every step 2 row you ran or could not run. Put `Fixes
+#<n>` below Problem and Fix when there is an issue.
+
+If you need to open the PR before that (to share a branch, or to wait on a
+human), open it as a draft and mark it ready only once the list above holds.
 
 ## 5. Make it ready
 
 The PR is ready when its head is the reviewed head (step 3), its required
-checks pass, and it can merge without conflicts. Read its state:
+checks pass, it is up to date with `master`, and it has no conflicts. Read its
+state:
 
 ```sh
 gh pr view <pr> --json headRefOid,mergeable,mergeStateStatus,reviewDecision
@@ -192,36 +294,44 @@ gh pr view <pr> --json headRefOid,mergeable,mergeStateStatus,reviewDecision
 
 | State | Meaning | What to do |
 | --- | --- | --- |
-| `CLEAN`, `HAS_HOOKS` | Checks pass, nothing blocks | Ready: step 6 |
+| `CLEAN`, `HAS_HOOKS` | Checks pass, nothing blocks | Ready: step 6 or 7 |
 | `UNSTABLE` | A non-required check failed | Classify it with the table below; ready once it is not yours |
-| `BEHIND` | Master moved and the branch must be up to date | Rebase on `origin/master`, redo step 2, redo step 3 (a rebase needs a new round), push, check again |
-| `DIRTY` | Conflicts | Rebase and resolve, redo steps 2 and 3, push, check again |
-| `BLOCKED` | Required checks pending or failing, or a required human review | Wait for checks (below). If only a human approval is missing (`reviewDecision: REVIEW_REQUIRED`), it is ready: step 6 |
+| `BEHIND` | Master moved; `master` requires an up-to-date branch | Rebase on `origin/master`. Clean rebase (step 3): rerun step 2 as sized there, push. Otherwise redo steps 2 and 3, push. Check again. After the third `BEHIND` in a row, stop and report instead of rebasing again |
+| `DIRTY` | Conflicts | Rebase and resolve, redo steps 2 and 3 (resolving a conflict is never a clean rebase), push, check again |
+| `BLOCKED` | Required checks pending or failing, or a required human review | Wait for checks (below). If only a human approval is missing (`reviewDecision: REVIEW_REQUIRED`), it is ready: step 6, in either mode |
 | `UNKNOWN` | GitHub is still computing | Check again shortly |
 
-Team PR CI is the ~1-minute static gate (commit signatures, formatting, static
-contracts, and `cargo-audit`); external/fork PRs and `ci:full` PRs run the full
-matrix. To wait for it, use your host's PR watching if it has it, instead of a polling loop. The only required check, `Required CI`, does not exist until
-the other CI jobs finish, so `gh pr checks <pr> --required` reports "no
-required checks reported" straight away, even with `--watch`. Wait for the
-head's `ci.yml` run instead (`gh run list --workflow ci.yml --event
-pull_request --commit <sha>`, then `gh run watch <id>`) and read `gh pr checks
-<pr> --required` after it. "No required checks reported" once that run has
-finished means it ended without creating the check (for example the workflow
-failed to start): treat it as a failed gate.
+To wait for checks, use your host's PR watching if it has it, instead of a
+polling loop. The only required check, `Required CI`, does not exist until the
+other CI jobs finish, so `gh pr checks <pr> --required` reports "no required
+checks reported" straight away, even with `--watch`. Wait for the head's
+`ci.yml` run instead (`gh run list --workflow ci.yml --event pull_request
+--commit <sha>`, then `gh run watch <id>`) and read `gh pr checks <pr>
+--required` after it. "No required checks reported" once that run has finished
+means it ended without creating the check (for example the workflow failed to
+start): treat it as a failed gate.
 
 When a check fails, read `gh run view <id> --log-failed`. The failed job is
-the cause; jobs shown as cancelled were stopped by it. Reproduce the failing
-test by name (`cargo nextest run -p <crate> -E 'test(=<name>)'`) after `git
-fetch origin master`, so every comparison uses current master, then decide
-which case it is:
+the cause; jobs shown as cancelled were stopped by it.
+
+**On a team PR** the gate compiles no Rust, so a failure is a signature,
+formatting, static-contract, trailer, or `cargo-audit` problem. Run the
+failing command locally (`cargo fmt --all --check`, the `just` gate the job
+names, `cargo --locked audit`), fix it, redo step 2 for what the fix touched
+and step 3 (a fix is a new tree), and push. An audit advisory that also fails
+on `origin/master` is master being broken (table below).
+
+**On a full-matrix PR** (external or fork, or labelled `ci:full`), reproduce a
+failing test by name (`cargo nextest run -p <crate> -E 'test(=<name>)'`) after
+`git fetch origin master`, so every comparison uses current master, then
+decide which case it is:
 
 | Case | How you know | What to do |
 | --- | --- | --- |
 | Your bug | Fails on your branch, passes on `origin/master` | Fix it, redo steps 2 and 3, push |
 | Conflict with a change that landed ahead of you | Passes on your branch alone, fails once rebased onto `origin/master` | Rebase, fix the interaction, redo steps 2–3, push |
 | Flake | Intermittent, also fails on `origin/master`, or in code your change cannot reach | Leave the test alone. Open or update an issue for it (search the test name first), then rerun the job once |
-| Master is broken | The same failure in master's own CI | Find the open PR fixing it and rebase once it lands. Do not fix it again in your PR |
+| Master is broken | The same failure in master's own CI or Canary | Find the open PR fixing it and rebase once it lands. Do not fix it again in your PR |
 
 A flake already on the `just flake-report` leaderboard, or with an open
 `Flaky:` issue, is already tracked: do only what the flake row asks (update
@@ -235,7 +345,7 @@ retry-loop a test to get a change through.
 Human review comments that arrive on the PR are handled with the
 `gh-address-comments` skill.
 
-## 6. Stop and report
+## 6. Report mode: stop and report
 
 Stop here and tell the user, in a few lines:
 
@@ -244,27 +354,42 @@ Stop here and tell the user, in a few lines:
 - Review: <seat> and <seat> both said merge at <short sha>, after <n> round(s).
 - CI: required checks green. Branch up to date with master, no conflicts.
 - <Only if it needs their attention: a finding you rejected and why, a flake
-  you filed, a stated limitation, or a human approval still required.>
+  you filed, a step 2 row you could not run, a stated limitation, or a human
+  approval still required.>
 ```
 
 Nothing else: no finding lists, no round-by-round history, no diff tour.
 
-## 7. Merge (only when asked)
+If the user later tells you to merge it, go to step 7.
 
-Merge only when the user asks, and only the head that was verified and
-reviewed: wait until `Required CI` is green and any required approvals
-(including CODEOWNERS) are present, then re-confirm `headRefOid` is still the
-reviewed head.
+## 7. Land mode: merge
 
-Squash-merge the reviewed head immediately (with `--match-head-commit` so the
-merge fails if the branch moved; avoid `--auto` while checks or approvals are
-still pending, since `--match-head-commit` is verified when auto-merge is
-enabled rather than when GitHub later merges):
+Merge only in land mode, and only the head that was verified and reviewed.
 
-```sh
-gh pr merge <pr> --squash --match-head-commit <sha>
-```
+1. Wait until `Required CI` is green on the head. If a CODEOWNERS approval is
+   required and missing, stop and report as in step 6, naming the approval;
+   you cannot give it yourself.
+2. Re-read `gh pr view <pr> --json headRefOid,mergeStateStatus`.
+   `headRefOid` must be the reviewed head, and `mergeStateStatus` must be
+   `CLEAN` or `HAS_HOOKS`. `BEHIND` means another PR landed first: handle it
+   with the step 5 table, then start this list again.
+3. Squash-merge right away, pinned to that head; any wait between green and
+   the merge is time for another PR to land first:
+
+   ```sh
+   gh pr merge <pr> --squash --match-head-commit <sha>
+   ```
+
+   If the merge is refused because the branch is no longer up to date, treat
+   it as `BEHIND`.
+
+Do not use `--auto`: auto-merge stays on when someone with write access
+pushes, and `--match-head-commit` is checked only when it is turned on, so a
+later, unreviewed commit could merge. Do not use `--admin`, and do not push
+to `master`.
 
 After the merge, confirm the squash commit on master (`gh pr view <pr> --json
 mergeCommit`), delete the branch and your worktree, and report the merged
-commit in one line.
+commit in one line. Post-merge Canary and the Bisect Agent take it from
+there: you do not wait for Canary. With a list of issues, move to the next
+one.
