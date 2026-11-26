@@ -184,9 +184,10 @@ impl SqliteAppStorage {
         let mut drafts = {
             let mut statement = tx
                 .prepare_cached(
-                    "SELECT group_id_hex, content, reply_to_message_id_hex,
+                    "SELECT group_id_hex, coalesce(content, ''), reply_to_message_id_hex,
                             created_at_ms, updated_at_ms, draft_id
-                     FROM message_drafts WHERE active = 1
+                     FROM message_drafts LEFT JOIN message_draft_bodies USING (draft_rowid)
+                     WHERE active = 1
                      ORDER BY updated_at_ms DESC, draft_id",
                 )
                 .storage()?;
@@ -296,21 +297,32 @@ impl SqliteAppStorage {
                 return Err(StorageError::NotFound);
             }
             let before = saved::DraftQuotaUsage::read(&tx, group_id_hex)?;
-            let draft_id: [u8; 16] = tx
+            let (draft_id, rowid): ([u8; 16], i64) = tx
                 .query_row_cached(
                     "INSERT INTO message_drafts (
-                    group_id_hex, content, reply_to_message_id_hex, created_at_ms, updated_at_ms
+                    group_id_hex, reply_to_message_id_hex, created_at_ms, updated_at_ms
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?4)
+                 VALUES (?1, ?2, ?3, ?3)
                  ON CONFLICT(group_id_hex) WHERE active = 1 DO UPDATE SET
-                    content = excluded.content,
                     reply_to_message_id_hex = excluded.reply_to_message_id_hex,
                     updated_at_ms = excluded.updated_at_ms
-                 RETURNING draft_id",
-                    params![group_id_hex, content, reply_to_message_id_hex, now_ms],
-                    |row| row.get(0),
+                 RETURNING draft_id, draft_rowid",
+                    params![group_id_hex, reply_to_message_id_hex, now_ms],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .storage()?;
+            tx.execute_cached(
+                "INSERT INTO message_draft_bodies (draft_rowid, content) VALUES (?1, ?2)
+                 ON CONFLICT(draft_rowid) DO UPDATE SET content = excluded.content",
+                params![rowid, content],
+            )
+            .map_err(|error| {
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::TooBig) {
+                    StorageError::MessageDraftQuotaExceeded
+                } else {
+                    crate::base::codec::map_sqlite_error(error)
+                }
+            })?;
             sync_message_draft_attachments(&tx, &draft_id, media_attachments)?;
             saved::DraftQuotaUsage::read(&tx, group_id_hex)?.check_growth_from(&before)?;
             tx.commit().storage()?;
@@ -695,8 +707,8 @@ fn load_message_draft(
 ) -> StorageResult<Option<StoredMessageDraft>> {
     let draft = conn
         .query_row_cached(
-            "SELECT content, reply_to_message_id_hex, created_at_ms, updated_at_ms, draft_id
-                 FROM message_drafts
+            "SELECT coalesce(content, ''), reply_to_message_id_hex, created_at_ms, updated_at_ms, draft_id
+                 FROM message_drafts LEFT JOIN message_draft_bodies USING (draft_rowid)
                  WHERE group_id_hex = ?1 AND active = 1",
             params![group_id_hex],
             |row| {
@@ -1162,6 +1174,33 @@ mod tests {
                 .save_message_draft(&"33".repeat(16), "draft", None, &[]),
             Err(StorageError::NotFound)
         ));
+    }
+
+    #[test]
+    fn message_draft_text_above_sqlite_limit_returns_quota_error() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        storage
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES ('chat','',0);",
+            )
+            .unwrap();
+        app.save_message_draft("chat", "draft", None, &[]).unwrap();
+        let before = app.selected_message_draft("chat").unwrap();
+        app.lock()
+            .unwrap()
+            .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, 8_000)
+            .unwrap();
+
+        assert!(matches!(
+            app.save_message_draft("chat", &"a".repeat(8_001), None, &[]),
+            Err(StorageError::MessageDraftQuotaExceeded)
+        ));
+        let after = app.selected_message_draft("chat").unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.draft, before.draft);
     }
 
     #[test]

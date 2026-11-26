@@ -608,8 +608,9 @@ impl FilterWriter<'_> {
                 ));
                 format!(
                     "EXISTS(SELECT 1 FROM message_drafts AS draft
+                        LEFT JOIN message_draft_bodies AS body USING (draft_rowid)
                         WHERE draft.group_id_hex = chat_list_rows.group_id_hex AND draft.active = 1
-                          AND (trim(draft.content, ?{white_space}) != ''
+                          AND (trim(body.content, ?{white_space}) != ''
                                OR EXISTS(SELECT 1 FROM message_draft_attachments AS attachment
                                    WHERE attachment.draft_id = draft.draft_id)))"
                 )

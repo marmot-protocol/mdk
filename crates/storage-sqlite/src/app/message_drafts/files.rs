@@ -129,9 +129,9 @@ impl MessageDraftAttachmentStage {
         let now_ms = unix_now_ms();
         let draft_id: [u8; 16] = conn.query_row_cached(
             "INSERT INTO message_drafts (
-                group_id_hex, content, reply_to_message_id_hex, created_at_ms, updated_at_ms
+                group_id_hex, created_at_ms, updated_at_ms
              )
-             VALUES (?1, '', NULL, ?2, ?2)
+             VALUES (?1, ?2, ?2)
              ON CONFLICT(group_id_hex) WHERE active = 1 DO UPDATE SET updated_at_ms = excluded.updated_at_ms
              RETURNING draft_id",
             params![group, now_ms],

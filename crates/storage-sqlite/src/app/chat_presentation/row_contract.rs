@@ -97,7 +97,9 @@ pub(crate) fn selected_preview_tx(
     // selected draft never crosses this boundary whole.
     let bytes: Option<Vec<u8>> = conn
         .query_row_cached(
-            "SELECT coalesce(substr(CAST(trim(content, ?2) AS BLOB), 1, ?3), x'') FROM message_drafts WHERE group_id_hex=?1 AND active=1",
+            "SELECT coalesce(substr(CAST(trim(content, ?2) AS BLOB), 1, ?3), x'')
+             FROM message_drafts LEFT JOIN message_draft_bodies USING (draft_rowid)
+             WHERE group_id_hex = ?1 AND active = 1",
             params![
                 row.group_id_hex,
                 DRAFT_WHITE_SPACE,
@@ -319,7 +321,8 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "UPDATE message_drafts SET content='' WHERE group_id_hex='11'",
+                "UPDATE message_draft_bodies SET content='' WHERE draft_rowid IN
+                   (SELECT draft_rowid FROM message_drafts WHERE group_id_hex='11')",
                 [],
             )
             .unwrap();
@@ -384,11 +387,19 @@ mod tests {
                 .unwrap();
             let size = if count == 200 { 1024 } else { 8 * 1024 * 1024 };
             store.lock().unwrap().execute("INSERT INTO message_draft_attachments(draft_id,position,attachment_id,file_name,media_type,plaintext) VALUES ((SELECT draft_id FROM message_drafts WHERE group_id_hex='11' AND active=1),0,'a','file','image/png',zeroblob(?1))", [size]).unwrap();
-            store.lock().unwrap().execute_batch(&format!("INSERT INTO account_groups(group_id_hex,endpoint,updated_at)
+            store
+                .lock()
+                .unwrap()
+                .execute_batch(&format!(
+                    "INSERT INTO account_groups(group_id_hex,endpoint,updated_at)
                 WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < {count})
                 SELECT printf('other-%08d',x),'',0 FROM n;
-                INSERT INTO message_drafts(group_id_hex,content,created_at_ms,updated_at_ms)
-                SELECT group_id_hex,'unrelated',0,0 FROM account_groups WHERE group_id_hex != '11';")).unwrap();
+                INSERT INTO message_drafts(group_id_hex,created_at_ms,updated_at_ms)
+                SELECT group_id_hex,0,0 FROM account_groups WHERE group_id_hex != '11';
+                INSERT INTO message_draft_bodies SELECT draft_rowid,'unrelated' FROM message_drafts
+                WHERE group_id_hex != '11';"
+                ))
+                .unwrap();
             let (selected, steps) = measure(&store, || preview(&store, &row));
             assert!(
                 matches!(selected, SelectedChatPreview::Draft(d) if d.text == "selected" && d.attachment_count == 1)

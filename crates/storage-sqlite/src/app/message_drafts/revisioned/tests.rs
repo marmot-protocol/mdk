@@ -504,11 +504,19 @@ fn selected_query_work_ignores_other_drafts_and_attachment_blob_size() {
             .app_storage()
             .save_message_draft(GROUP, "selected", None, &[media])
             .unwrap();
-        store.lock().unwrap().execute_batch(&format!("INSERT INTO account_groups(group_id_hex,endpoint,updated_at)
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO account_groups(group_id_hex,endpoint,updated_at)
             WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < {count})
             SELECT printf('other-%08d',x),'',0 FROM n;
-            INSERT INTO message_drafts(group_id_hex,content,created_at_ms,updated_at_ms)
-                SELECT group_id_hex,'unrelated',0,0 FROM account_groups WHERE group_id_hex != '{GROUP}';")).unwrap();
+            INSERT INTO message_drafts(group_id_hex,created_at_ms,updated_at_ms)
+                SELECT group_id_hex,0,0 FROM account_groups WHERE group_id_hex != '{GROUP}';
+            INSERT INTO message_draft_bodies SELECT draft_rowid,'unrelated' FROM message_drafts
+                WHERE group_id_hex != '{GROUP}';"
+            ))
+            .unwrap();
         let (selected, steps) = measure(&store, || {
             store.app_storage().selected_message_draft(GROUP).unwrap()
         });
@@ -760,4 +768,44 @@ fn accepting_a_send_after_switching_consumes_only_the_sent_version() {
         store.put_queued_outbound_intent(&queued(b"next")).unwrap();
         assert!(app.selected_message_draft(GROUP).unwrap().draft.is_none());
     }
+}
+
+#[test]
+fn identical_events_cannot_replace_an_in_flight_draft_binding() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store);
+
+    app.save_message_draft(GROUP, "same text", None, &[])
+        .unwrap();
+    let first = app.selected_message_draft(GROUP).unwrap();
+    app.stage_message_draft_submission(&first.revision, "same-event", b"same-payload")
+        .unwrap();
+    assert!(matches!(
+        app.stage_message_draft_submission(&first.revision, "same-event", b"same-payload"),
+        Err(MessageDraftRevisionError::Conflict)
+    ));
+    let saved = app.archive_message_draft(&first.revision).unwrap();
+
+    app.save_message_draft(GROUP, "same text", None, &[])
+        .unwrap();
+    let second = app.selected_message_draft(GROUP).unwrap();
+    assert!(matches!(
+        app.stage_message_draft_submission(&second.revision, "same-event", b"same-payload"),
+        Err(MessageDraftRevisionError::Conflict)
+    ));
+
+    store
+        .put_queued_outbound_intent(&queued(b"same-payload"))
+        .unwrap();
+    assert_eq!(
+        app.selected_message_draft(GROUP).unwrap().revision,
+        second.revision
+    );
+    assert!(matches!(
+        app.identified_message_draft(GROUP, saved),
+        Err(MessageDraftRevisionError::UnknownDraft)
+    ));
+    app.stage_message_draft_submission(&second.revision, "same-event", b"same-payload")
+        .unwrap();
 }

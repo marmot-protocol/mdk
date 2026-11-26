@@ -10,27 +10,38 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         r#"
 CREATE TABLE message_drafts_next (
-    draft_id BLOB PRIMARY KEY NOT NULL DEFAULT (randomblob(16))
+    draft_rowid INTEGER PRIMARY KEY,
+    draft_id BLOB UNIQUE NOT NULL DEFAULT (randomblob(16))
         CHECK (typeof(draft_id) = 'blob' AND length(draft_id) = 16),
     group_id_hex TEXT NOT NULL REFERENCES account_groups(group_id_hex) ON DELETE CASCADE,
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
     content_revision INTEGER NOT NULL DEFAULT 0,
-    content_bytes INTEGER GENERATED ALWAYS AS (length(CAST(content AS BLOB))) STORED,
+    content_preview BLOB NOT NULL DEFAULT x'',
+    content_bytes INTEGER NOT NULL DEFAULT 0,
     reply_to_message_id_hex TEXT
         CHECK (reply_to_message_id_hex IS NULL OR (
             length(reply_to_message_id_hex) = 64
             AND reply_to_message_id_hex NOT GLOB '*[^0-9a-f]*'
         )),
     created_at_ms INTEGER NOT NULL,
-    updated_at_ms INTEGER NOT NULL,
-    content TEXT NOT NULL DEFAULT ''
+    updated_at_ms INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX message_draft_active_group ON message_drafts_next(group_id_hex) WHERE active = 1;
 INSERT INTO message_drafts_next (
-    group_id_hex, content, reply_to_message_id_hex, created_at_ms, updated_at_ms
+    draft_rowid, group_id_hex, reply_to_message_id_hex, created_at_ms, updated_at_ms,
+    content_preview, content_bytes
 )
-SELECT group_id_hex, content, reply_to_message_id_hex, created_at_ms, updated_at_ms
+SELECT rowid, group_id_hex, reply_to_message_id_hex, created_at_ms, updated_at_ms,
+       coalesce(substr(CAST(content AS BLOB), 1, 4096), x''), length(CAST(content AS BLOB))
 FROM message_drafts;
+
+-- The text row has less overhead than the original group-keyed row. Drafts
+-- that already fill SQLite's maximum record size still fit after the upgrade.
+CREATE TABLE message_draft_bodies (
+    draft_rowid INTEGER PRIMARY KEY REFERENCES message_drafts_next(draft_rowid) ON DELETE CASCADE,
+    content TEXT NOT NULL
+);
+INSERT INTO message_draft_bodies SELECT rowid, content FROM message_drafts;
 
 CREATE TABLE message_draft_attachments_next (
     draft_id BLOB NOT NULL REFERENCES message_drafts_next(draft_id) ON DELETE CASCADE,
@@ -59,31 +70,11 @@ DROP TABLE message_drafts;
 ALTER TABLE message_drafts_next RENAME TO message_drafts;
 ALTER TABLE message_draft_attachments_next RENAME TO message_draft_attachments;
 
--- Keep the preview out of the full-text row so a legacy draft close to
--- SQLite's row-size limit does not grow by another 4 KiB.
-CREATE TABLE message_draft_previews (
-    draft_id BLOB PRIMARY KEY NOT NULL REFERENCES message_drafts(draft_id) ON DELETE CASCADE,
-    content_preview BLOB NOT NULL
-);
-INSERT INTO message_draft_previews
-SELECT draft_id, coalesce(substr(CAST(content AS BLOB), 1, 4096), x'') FROM message_drafts;
-
-CREATE TRIGGER message_draft_preview_insert AFTER INSERT ON message_drafts BEGIN
-    INSERT INTO message_draft_previews
-        VALUES (NEW.draft_id, coalesce(substr(CAST(NEW.content AS BLOB), 1, 4096), x''));
-END;
-CREATE TRIGGER message_draft_preview_update AFTER UPDATE OF content ON message_drafts
-WHEN OLD.content IS NOT NEW.content BEGIN
-    UPDATE message_draft_previews
-        SET content_preview = coalesce(substr(CAST(NEW.content AS BLOB), 1, 4096), x'')
-        WHERE draft_id = NEW.draft_id;
-END;
-
 -- Group revisions check the selected composer; a draft's own version only
--- changes when its content changes, including attachment writes.
-CREATE TRIGGER message_draft_content_revision_update
-AFTER UPDATE OF content, reply_to_message_id_hex ON message_drafts
-WHEN OLD.content IS NOT NEW.content OR OLD.reply_to_message_id_hex IS NOT NEW.reply_to_message_id_hex BEGIN
+-- changes when its content, reply or attachments change.
+CREATE TRIGGER message_draft_reply_content_revision
+AFTER UPDATE OF reply_to_message_id_hex ON message_drafts
+WHEN OLD.reply_to_message_id_hex IS NOT NEW.reply_to_message_id_hex BEGIN
     UPDATE message_drafts SET content_revision = content_revision + 1 WHERE draft_id = NEW.draft_id;
 END;
 
@@ -94,7 +85,9 @@ CREATE TABLE message_draft_submissions_next (
     payload_hash BLOB NOT NULL CHECK (length(payload_hash) = 32),
     draft_id BLOB NOT NULL REFERENCES message_drafts(draft_id) ON DELETE CASCADE,
     content_revision INTEGER NOT NULL,
-    PRIMARY KEY (group_id_hex, revision)
+    PRIMARY KEY (group_id_hex, revision),
+    UNIQUE (group_id_hex, app_event_id),
+    UNIQUE (group_id_hex, payload_hash)
 );
 -- Previously only a binding to the current group revision could clear a draft.
 INSERT INTO message_draft_submissions_next
@@ -105,7 +98,6 @@ JOIN message_drafts d ON d.group_id_hex = s.group_id_hex AND d.active = 1;
 DROP TABLE message_draft_submissions;
 ALTER TABLE message_draft_submissions_next RENAME TO message_draft_submissions;
 CREATE INDEX message_draft_submission_draft ON message_draft_submissions(draft_id);
-
 
 CREATE INDEX message_draft_group_order ON message_drafts(group_id_hex, updated_at_ms DESC, draft_id);
 CREATE INDEX message_draft_attachment_descriptors ON message_draft_attachments (
@@ -128,6 +120,27 @@ END;
     )
     .storage()?;
 
+    for (action, event, condition) in [
+        ("insert", "INSERT", ""),
+        (
+            "update",
+            "UPDATE OF content",
+            "WHEN OLD.content IS NOT NEW.content",
+        ),
+    ] {
+        tx.execute_batch(&format!(
+            "CREATE TRIGGER message_draft_body_{action}
+             AFTER {event} ON message_draft_bodies {condition} BEGIN
+                UPDATE message_drafts
+                   SET content_preview = coalesce(substr(CAST(NEW.content AS BLOB), 1, 4096), x''),
+                       content_bytes = length(CAST(NEW.content AS BLOB)),
+                       content_revision = content_revision + 1
+                 WHERE draft_rowid = NEW.draft_rowid;
+             END;"
+        ))
+        .storage()?;
+    }
+
     // The compatibility projection keeps its group revision. Only active
     // changes advance it; changing selection also invalidates in-flight file
     // staging, which intentionally tolerates ordinary text edits.
@@ -135,7 +148,7 @@ END;
         ("insert", "INSERT", "NEW", "NEW.active = 1", "0"),
         (
             "update",
-            "UPDATE OF active, content, reply_to_message_id_hex, updated_at_ms",
+            "UPDATE OF active, content_bytes, reply_to_message_id_hex, updated_at_ms",
             "NEW",
             "OLD.active = 1 OR NEW.active = 1",
             "OLD.active <> NEW.active",
@@ -204,7 +217,7 @@ mod tests {
                       AND created_at_ms = 11 AND updated_at_ms = 22
                       AND position = 0 AND attachment_id = 'original' AND plaintext = x'010203'
              FROM message_drafts d JOIN message_draft_attachments a USING(draft_id)
-             JOIN message_draft_previews p USING(draft_id)
+             JOIN message_draft_bodies USING(draft_rowid)
              WHERE group_id_hex = 'chat'",
                 [],
                 |row| row.get::<_, bool>(0),
@@ -221,22 +234,43 @@ mod tests {
         run_through(&mut conn, 227).unwrap();
         conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, 8_000)
             .unwrap();
-        conn.execute_batch(
-            "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES ('chat','',0);
-             INSERT INTO message_drafts(group_id_hex, content, created_at_ms, updated_at_ms)
-                VALUES ('chat',replace(hex(zeroblob(3000)), '0', 'a'),11,22);",
+        let group = "ab".repeat(16);
+        conn.execute(
+            "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES (?1,'',0)",
+            [&group],
         )
         .unwrap();
+        let insert =
+            "INSERT INTO message_drafts(group_id_hex, content, created_at_ms, updated_at_ms)
+                      VALUES (?1,?2,1,2)";
+        let content = "a".repeat(7_960);
+        assert!(
+            conn.execute(insert, [&group, &(content.clone() + "a")])
+                .is_err()
+        );
+        conn.execute(insert, [&group, &content]).unwrap();
 
         run_through(&mut conn, 228).unwrap();
-        let length: i64 = conn
+        let (upgraded, preview): (String, Vec<u8>) = conn
             .query_row(
-                "SELECT length(content) FROM message_drafts WHERE group_id_hex = 'chat'",
-                [],
-                |row| row.get(0),
+                "SELECT content, content_preview
+                 FROM message_drafts JOIN message_draft_bodies USING (draft_rowid)
+                 WHERE group_id_hex = ?1",
+                [&group],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(length, 6000);
+        assert_eq!(upgraded, content);
+        assert_eq!(preview, &content.as_bytes()[..4096]);
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -267,7 +301,8 @@ mod tests {
                 "SELECT active = 1 AND length(draft_id) = 16 AND content = 'saved text'
                         AND reply_to_message_id_hex = lower(hex(zeroblob(32)))
                         AND created_at_ms = 1 AND updated_at_ms = 2
-                 FROM message_drafts WHERE group_id_hex = 'chat'",
+                 FROM message_drafts JOIN message_draft_bodies USING(draft_rowid)
+                 WHERE group_id_hex = 'chat'",
                 [],
                 |row| row.get::<_, bool>(0),
             )
@@ -295,7 +330,7 @@ mod tests {
         for table in [
             "message_drafts",
             "message_draft_attachments",
-            "message_draft_previews",
+            "message_draft_bodies",
             "message_draft_submissions",
             "media_files",
         ] {

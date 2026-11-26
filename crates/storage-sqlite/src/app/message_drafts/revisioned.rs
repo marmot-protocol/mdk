@@ -288,15 +288,21 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             check_revision_tx(&conn, expected)?;
+            // Identical sends in the same second can produce the same event.
+            // The first in-flight binding owns acceptance of that event.
             let staged = conn
                 .execute_cached(
                     "INSERT INTO message_draft_submissions
-                    (group_id_hex, revision, app_event_id, payload_hash, draft_id, content_revision)
-                 SELECT group_id_hex, ?2, ?3, ?4, draft_id, content_revision
-                 FROM message_drafts WHERE group_id_hex = ?1 AND active = 1
-                 ON CONFLICT(group_id_hex, revision) DO UPDATE SET
-                    app_event_id = excluded.app_event_id, payload_hash = excluded.payload_hash,
-                    draft_id = excluded.draft_id, content_revision = excluded.content_revision",
+                        (group_id_hex, revision, app_event_id, payload_hash, draft_id, content_revision)
+                     SELECT group_id_hex, ?2, ?3, ?4, draft_id, content_revision
+                     FROM message_drafts WHERE group_id_hex = ?1 AND active = 1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM message_draft_submissions
+                           WHERE group_id_hex = ?1 AND (app_event_id = ?3 OR payload_hash = ?4)
+                       )
+                     ON CONFLICT(group_id_hex, revision) DO UPDATE SET
+                         app_event_id = excluded.app_event_id, payload_hash = excluded.payload_hash,
+                         draft_id = excluded.draft_id, content_revision = excluded.content_revision",
                     params![
                         expected.group_id_hex,
                         expected.revision,
@@ -435,8 +441,9 @@ pub(crate) fn selected_tx(conn: &Connection, group: &str) -> StorageResult<Selec
     let revision = revision_tx(conn, group)?;
     let mut draft = conn
         .query_row_cached(
-            "SELECT content, reply_to_message_id_hex, created_at_ms, updated_at_ms, draft_id
-         FROM message_drafts WHERE group_id_hex = ?1 AND active = 1",
+            "SELECT coalesce(content, ''), reply_to_message_id_hex, created_at_ms, updated_at_ms, draft_id
+             FROM message_drafts LEFT JOIN message_draft_bodies USING (draft_rowid)
+             WHERE group_id_hex = ?1 AND active = 1",
             [group],
             |row| {
                 Ok((

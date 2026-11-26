@@ -591,11 +591,11 @@ impl Drop for DraftSubmissionGuard {
 }
 
 impl MarmotApp {
-    /// List metadata-only composer drafts newest-first. Attachment plaintext is
-    /// deliberately omitted; hydrate one selected composer with
-    /// [`MarmotApp::message_draft`]. Legacy sends leave draft deletion to the host;
-    /// revision-bound sends clear on durable acceptance. Deleting a group
-    /// cascades its remaining draft.
+    /// List active composer drafts newest-first with attachment metadata. Use
+    /// [`MarmotApp::group_message_drafts`] for active and saved drafts, or
+    /// [`MarmotApp::message_draft`] to load the active composer with attachment
+    /// bytes. Legacy sends leave draft deletion to the host. Revision-bound
+    /// sends clear on durable acceptance. Deleting a group removes its drafts.
     pub fn message_drafts(&self, account_ref: &str) -> Result<Vec<MessageDraftSummary>, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;

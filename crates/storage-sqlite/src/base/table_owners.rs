@@ -206,7 +206,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("media_file_refs", Side::App),
     ("media_files", Side::App),
     ("message_draft_attachments", Side::App),
-    ("message_draft_previews", Side::App),
+    ("message_draft_bodies", Side::App),
     ("message_draft_revision_clock", Side::App),
     ("message_draft_revisions", Side::App),
     ("message_draft_submissions", Side::App),

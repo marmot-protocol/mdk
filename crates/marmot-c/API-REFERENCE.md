@@ -2933,7 +2933,7 @@ Stored raw app messages for a group (`group_id_hex` non-NULL) or the whole accou
 MarmotStatus marmot_message_drafts(const struct MarmotClient *client, const char *account_ref, struct MarmotMessageDraftSummaryList **out);
 ```
 
-Every stored draft for the account, attachment metadata only. Free with `marmot_message_draft_summary_list_free`.
+Lists active composer drafts for the account with attachment metadata. Use `marmot_group_message_drafts` to list active and saved drafts in a group. Free with `marmot_message_draft_summary_list_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotmessage_drafts) · [Header contract](include/marmot.h#L12208)
 

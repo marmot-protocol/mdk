@@ -157,7 +157,7 @@ impl SqliteAppStorage {
                 .prepare_cached(
                     "SELECT draft_id, active, content_preview,
                             reply_to_message_id_hex, created_at_ms, updated_at_ms
-                     FROM message_drafts JOIN message_draft_previews USING (draft_id)
+                     FROM message_drafts
                      WHERE group_id_hex = ?1 ORDER BY updated_at_ms DESC, draft_id",
                 )
                 .storage()?;
@@ -203,9 +203,10 @@ impl SqliteAppStorage {
             revision_tx(conn, group)?;
             let mut draft = conn
                 .query_row_cached(
-                    "SELECT draft_id, active, group_id_hex, content, reply_to_message_id_hex,
+                    "SELECT draft_id, active, group_id_hex, coalesce(content, ''), reply_to_message_id_hex,
                             created_at_ms, updated_at_ms, content_revision
-                     FROM message_drafts WHERE group_id_hex = ?1 AND draft_id = ?2",
+                     FROM message_drafts LEFT JOIN message_draft_bodies USING (draft_rowid)
+                     WHERE group_id_hex = ?1 AND draft_id = ?2",
                     params![group, id.as_bytes()],
                     read_row,
                 )
@@ -531,8 +532,9 @@ mod tests {
             .lock()
             .unwrap()
             .execute_batch(
-                "INSERT INTO message_drafts(group_id_hex, content, created_at_ms, updated_at_ms)
-                VALUES ('chat','old',1,1);
+                "INSERT INTO message_drafts(group_id_hex, created_at_ms, updated_at_ms)
+                VALUES ('chat',1,1);
+             INSERT INTO message_draft_bodies SELECT draft_rowid, 'old' FROM message_drafts;
              WITH RECURSIVE slots(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM slots WHERE n < 256)
              INSERT INTO message_draft_attachments
                 (draft_id, position, attachment_id, file_name, media_type, plaintext)

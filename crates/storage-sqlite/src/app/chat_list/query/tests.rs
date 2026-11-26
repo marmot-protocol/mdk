@@ -104,7 +104,13 @@ fn engine_group(store: &SqliteAccountStorage, id: &str) -> GroupId {
 fn draft(store: &SqliteAccountStorage, id: &str, content: &str, attachment: bool) {
     let conn = store.lock().unwrap();
     conn.execute(
-        "INSERT INTO message_drafts(group_id_hex, content, created_at_ms, updated_at_ms) VALUES (?1, ?2, 0, 0)",
+        "INSERT INTO message_drafts(group_id_hex, created_at_ms, updated_at_ms) VALUES (?1, 0, 0)",
+        [id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message_draft_bodies
+         SELECT draft_rowid, ?2 FROM message_drafts WHERE group_id_hex = ?1",
         params![id, content],
     )
     .unwrap();

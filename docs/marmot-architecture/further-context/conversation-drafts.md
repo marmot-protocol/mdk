@@ -1,7 +1,7 @@
 ---
 title: "Revision-safe conversation drafts"
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-11-26
 status: implementation
 ---
 
@@ -36,11 +36,12 @@ that position's filename and media type. This catches metadata/order mismatches,
 metadata: callers must still prepare from the selected revision's bytes and submit that original revision. Missing
 references, stale revisions, and invalid media policy/epoch inputs fail before acceptance. M2 does not upload media.
 
-The command stages a binding between the revision and the exact outgoing event/hash. That binding retains no
-payload bytes and is **not acceptance**. The existing queued intent or application fanout write consumes it and
-clears only the matching draft revision in the same SQLite transaction. Savepoints also protect callers that catch
-an inner write error and later commit their outer transaction. A newer composer survives acceptance of an older
-submission. There is at most one binding per group; the account session serializes sends.
+The command stages a binding from the outgoing event ID and payload hash to the selected draft ID and content
+revision. The queued intent or application fanout write consumes the binding in the same transaction that accepts
+the message. It deletes that version of the draft whether active or saved. Later edits and other drafts stay intact.
+Each event ID and payload hash has at most one binding per group. A second submission of the same event fails with
+a revision conflict while the first binding is pending. The account session serializes sends. Savepoints also
+protect callers that catch an inner write error and later commit their outer transaction.
 
 Before acceptance, an error or cancellation leaves the draft. After acceptance, the existing outgoing message owns
 retry and failure state, and cancellation or restart cannot revive the submitted composer. The legacy send result

@@ -12197,6 +12197,7 @@ MarmotStatus marmot_resolve_public_event_preview(const struct MarmotClient *clie
 
 /**
  * Active composer drafts for the account, attachment metadata only.
+ * Use `marmot_group_message_drafts` for active and saved drafts in a group.
  * Free with `marmot_message_draft_summary_list_free`.
  *
  * # Safety

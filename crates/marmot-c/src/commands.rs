@@ -1501,6 +1501,7 @@ c_cmd! {
     async fn marmot_resolve_public_event_preview(account_ref: str, reference: str) -> rec(MarmotPublicEventPreview) = resolve_public_event_preview;
 
     /// Active composer drafts for the account, attachment metadata only.
+    /// Use `marmot_group_message_drafts` for active and saved drafts in a group.
     /// Free with `marmot_message_draft_summary_list_free`.
     sync fn marmot_message_drafts(account_ref: str) -> rec(MarmotMessageDraftSummaryList) = message_drafts;
 
