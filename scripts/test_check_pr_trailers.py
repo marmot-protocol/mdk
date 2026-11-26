@@ -306,12 +306,14 @@ class PrTrailerTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertNotIn("release-impact", parsed)
 
-        # A `---------` divider followed by normal or colon-bearing prose is ignored.
+        # A `---------` divider followed by non-footer prose (even alongside a
+        # Signed-off-by line) is never stripped as a GitHub squash footer.
         for suffix in (
             "This is prose after a horizontal rule, not a trailer footer.\n",
             "Example: cargo fmt\n",
+            "This is an example: cargo fmt\nSigned-off-by: Alice <alice@example.com>\n",
         ):
-            with self.subTest(suffix=suffix.strip()):
+            with self.subTest(suffix=suffix.splitlines()[0]):
                 prose_after_divider = (
                     "Explain layout (#3801)\n\n"
                     "Local-Checks: cargo fmt\n"
