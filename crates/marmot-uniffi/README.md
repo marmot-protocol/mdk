@@ -1457,7 +1457,9 @@ once by `InviteDeliveryChanged`; it leaves
 (`RelaysUnreachable` when no attempt finished): `RefusedByRelays` there means every relay that attempt tried said no,
 possibly only for now, not that the refusal was permanent. A relay that stores it before the deadline still makes it
 `RelayAccepted`, and so does an attempt started before the deadline and acknowledged after it. MDK records the end
-durably the first time it sees the deadline passed, so a device clock set back afterwards does not reopen it. A Welcome
+durably the first time it sees the deadline passed while the Welcome is owed, so a device clock set back afterwards
+does not reopen it. A Welcome still waiting for the invite's commit to be confirmed is read by the clock until that
+commit settles, so a clock set back in that time can let it go out once the commit confirms. A Welcome
 whose deadline passes while the app is closed is announced on the next start, while its invite is still listed. The `TooLarge` and
 `KeyPackageRetired` problems are not produced yet. At startup MDK asks again only the relays it never asked and those
 whose retry backoff (30 seconds, doubling to an hour) has passed. The account

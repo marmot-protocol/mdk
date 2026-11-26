@@ -125,9 +125,10 @@ pub enum WelcomeExpiry {
 ///   Welcomes kept one has none, and the engine reads its deadline from its
 ///   transport timestamp.
 ///
-///   Once that deadline has passed undelivered, the row is `Failed` and
-///   keeps its [`WelcomeExpiry`] mark (`expiry`); any other Welcome has
-///   none.
+///   Once an owed (`OutboundWelcome`) Welcome's deadline has passed
+///   undelivered, the row is `Failed` and keeps its [`WelcomeExpiry`] mark
+///   (`expiry`); any other Welcome has none, and a staged one is never
+///   marked.
 ///
 ///   A Welcome built for a KeyPackage fetched from a transport keeps that
 ///   KeyPackage's transport event id (`key_package_event_id`), the one its
@@ -189,8 +190,6 @@ pub enum StoredMessagePayload {
         deliver_until: Option<Timestamp>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_package_event_id: Option<MessageId>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expiry: Option<WelcomeExpiry>,
     },
     OpenMlsWire(TransportMessage),
     SignedOpenMlsWire {
@@ -255,7 +254,6 @@ impl StoredMessagePayload {
             key_package_ref,
             deliver_until,
             key_package_event_id: None,
-            expiry: None,
         }
     }
 
@@ -279,9 +277,7 @@ impl StoredMessagePayload {
     /// This Welcome with its expiry mark set to `mark`. Any other payload is
     /// returned unchanged.
     pub fn with_welcome_expiry(mut self, mark: Option<WelcomeExpiry>) -> Self {
-        if let Self::OutboundWelcome { expiry, .. } | Self::StagedInviteWelcome { expiry, .. } =
-            &mut self
-        {
+        if let Self::OutboundWelcome { expiry, .. } = &mut self {
             *expiry = mark;
         }
         self
@@ -477,10 +473,9 @@ impl StoredMessagePayload {
     /// delivery deadline passed undelivered.
     pub fn welcome_expiry(&self) -> Option<WelcomeExpiry> {
         match self {
-            Self::OutboundWelcome { expiry, .. } | Self::StagedInviteWelcome { expiry, .. } => {
-                *expiry
-            }
-            Self::RawTransport(_)
+            Self::OutboundWelcome { expiry, .. } => *expiry,
+            Self::StagedInviteWelcome { .. }
+            | Self::RawTransport(_)
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
             | Self::OwnCommitWire { .. }
@@ -602,7 +597,8 @@ fn encode_stored_message_payload_v2(
             encode_transport_message(message, &mut out)?;
         }
         // An expired Welcome takes the variant that carries every optional
-        // field and its mark; one with no mark keeps its variant below.
+        // field and its mark; one with no mark keeps its variant below. A
+        // staged Welcome is never marked.
         StoredMessagePayload::OutboundWelcome {
             message,
             origin_commit_id,
@@ -616,29 +612,6 @@ fn encode_stored_message_payload_v2(
             encode_option(origin_commit_id.as_ref(), &mut out, |value, out| {
                 encode_var_bytes(value.as_slice(), out, "Welcome origin commit id")
             })?;
-            encode_welcome_expired_tail(
-                key_package_ref.as_ref(),
-                *deliver_until,
-                key_package_event_id.as_ref(),
-                *expiry,
-                &mut out,
-            )?;
-        }
-        StoredMessagePayload::StagedInviteWelcome {
-            message,
-            origin_commit_id,
-            key_package_ref,
-            deliver_until,
-            key_package_event_id,
-            expiry: Some(expiry),
-        } => {
-            out.push(17);
-            encode_transport_message(message, &mut out)?;
-            encode_var_bytes(
-                origin_commit_id.as_slice(),
-                &mut out,
-                "staged Welcome origin commit id",
-            )?;
             encode_welcome_expired_tail(
                 key_package_ref.as_ref(),
                 *deliver_until,
@@ -676,7 +649,6 @@ fn encode_stored_message_payload_v2(
             key_package_ref,
             deliver_until,
             key_package_event_id: Some(key_package_event_id),
-            expiry: None,
         } => {
             out.push(15);
             encode_transport_message(message, &mut out)?;
@@ -730,7 +702,6 @@ fn encode_stored_message_payload_v2(
             key_package_ref,
             deliver_until,
             key_package_event_id: None,
-            expiry: None,
         } => {
             out.push(match (key_package_ref, deliver_until) {
                 (_, Some(_)) => 9,
@@ -857,7 +828,6 @@ fn decode_stored_message_payload_v2(
             key_package_ref: None,
             deliver_until: None,
             key_package_event_id: None,
-            expiry: None,
         },
         6 => StoredMessagePayload::OutboundWelcome {
             message: decoder.transport_message()?,
@@ -873,7 +843,6 @@ fn decode_stored_message_payload_v2(
             key_package_ref: Some(decoder.var_bytes("Welcome KeyPackageRef")?),
             deliver_until: None,
             key_package_event_id: None,
-            expiry: None,
         },
         8 => StoredMessagePayload::OutboundWelcome {
             message: decoder.transport_message()?,
@@ -891,7 +860,6 @@ fn decode_stored_message_payload_v2(
                 .option(|decoder| decoder.var_bytes("Welcome KeyPackageRef"))?,
             deliver_until: Some(Timestamp(decoder.u64("Welcome delivery deadline")?)),
             key_package_event_id: None,
-            expiry: None,
         },
         10 => StoredMessagePayload::StagedSiblingWelcome {
             welcome: decoder.var_bytes("sibling Welcome")?,
@@ -957,7 +925,6 @@ fn decode_stored_message_payload_v2(
             key_package_event_id: Some(MessageId::new(
                 decoder.var_bytes("Welcome KeyPackage event id")?,
             )),
-            expiry: None,
         },
         16 => StoredMessagePayload::OutboundWelcome {
             message: decoder.transport_message()?,
@@ -966,20 +933,6 @@ fn decode_stored_message_payload_v2(
                     decoder.var_bytes("Welcome origin commit id")?,
                 ))
             })?,
-            key_package_ref: decoder
-                .option(|decoder| decoder.var_bytes("Welcome KeyPackageRef"))?,
-            deliver_until: decoder
-                .option(|decoder| Ok(Timestamp(decoder.u64("Welcome delivery deadline")?)))?,
-            key_package_event_id: decoder.option(|decoder| {
-                Ok(MessageId::new(
-                    decoder.var_bytes("Welcome KeyPackage event id")?,
-                ))
-            })?,
-            expiry: Some(decoder.welcome_expiry()?),
-        },
-        17 => StoredMessagePayload::StagedInviteWelcome {
-            message: decoder.transport_message()?,
-            origin_commit_id: MessageId::new(decoder.var_bytes("staged Welcome origin commit id")?),
             key_package_ref: decoder
                 .option(|decoder| decoder.var_bytes("Welcome KeyPackageRef"))?,
             deliver_until: decoder
@@ -1070,8 +1023,7 @@ fn encode_welcome_full_tail(
     )
 }
 
-/// The fields after an expired Welcome's message and origin in variants 16
-/// and 17: an optional KeyPackageRef, an optional delivery deadline, an
+/// The fields after an expired Welcome's message and origin in variant 16: an optional KeyPackageRef, an optional delivery deadline, an
 /// optional KeyPackage event id, then its mark (1 unrecorded, 2 recorded).
 fn encode_welcome_expired_tail(
     key_package_ref: Option<&Vec<u8>>,
@@ -1931,9 +1883,10 @@ mod stored_payload_codec_tests {
     }
 
     /// An expired Welcome keeps its mark across a decode, from the binary
-    /// variants 16 (outbound) and 17 (staged) and from JSON, with every other
-    /// field; its mark is the last byte. Without a mark a Welcome keeps the
-    /// variant it had, so marking is the only change a Welcome's bytes make.
+    /// variant 16 and from JSON, with every other field; its mark is the last
+    /// byte. Without a mark a Welcome keeps the variant it had, so marking is
+    /// the only change a Welcome's bytes make. A staged Welcome takes no mark,
+    /// and no variant 17 exists.
     #[test]
     fn an_expired_welcome_keeps_its_mark_and_every_field() {
         let welcome = transport(TransportEnvelope::Welcome {
@@ -1946,36 +1899,42 @@ mod stored_payload_codec_tests {
             Some(Timestamp(1_700_000_600)),
         )
         .with_key_package_event_id(Some(MessageId::new([0x59; 32])));
+        for (mark, byte) in [(WelcomeExpiry::Unrecorded, 1), (WelcomeExpiry::Recorded, 2)] {
+            let marked = outbound.clone().with_welcome_expiry(Some(mark));
+            let encoded = marked.encode().unwrap();
+            assert_eq!((encoded[7], *encoded.last().unwrap()), (16, byte));
+            let decoded = StoredMessagePayload::decode(&encoded).unwrap();
+            assert_eq!(decoded, marked);
+            assert_eq!(decoded.welcome_expiry(), Some(mark));
+            assert_eq!(
+                StoredMessagePayload::decode(&serde_json::to_vec(&marked).unwrap()).unwrap(),
+                marked
+            );
+            assert_eq!(
+                decoded.with_welcome_expiry(None).encode().unwrap(),
+                outbound.encode().unwrap()
+            );
+        }
+        let mut bad = outbound
+            .clone()
+            .with_welcome_expiry(Some(WelcomeExpiry::Recorded))
+            .encode()
+            .unwrap();
+        *bad.last_mut().unwrap() = 3;
+        assert!(StoredMessagePayload::decode(&bad).is_err());
+        bad[7] = 17;
+        assert!(StoredMessagePayload::decode(&bad).is_err(), "no variant 17");
         let staged = StoredMessagePayload::staged_invite_welcome(
             welcome,
             MessageId::new([0x55]),
             None,
             None,
         );
-        for (unmarked, variant) in [(&outbound, 16), (&staged, 17)] {
-            for (mark, byte) in [(WelcomeExpiry::Unrecorded, 1), (WelcomeExpiry::Recorded, 2)] {
-                let marked = unmarked.clone().with_welcome_expiry(Some(mark));
-                let encoded = marked.encode().unwrap();
-                assert_eq!((encoded[7], *encoded.last().unwrap()), (variant, byte));
-                let decoded = StoredMessagePayload::decode(&encoded).unwrap();
-                assert_eq!(decoded, marked);
-                assert_eq!(decoded.welcome_expiry(), Some(mark));
-                assert_eq!(
-                    StoredMessagePayload::decode(&serde_json::to_vec(&marked).unwrap()).unwrap(),
-                    marked
-                );
-                assert_eq!(
-                    decoded.with_welcome_expiry(None).encode().unwrap(),
-                    unmarked.encode().unwrap()
-                );
-            }
-        }
-        let mut bad = outbound
-            .with_welcome_expiry(Some(WelcomeExpiry::Recorded))
-            .encode()
-            .unwrap();
-        *bad.last_mut().unwrap() = 3;
-        assert!(StoredMessagePayload::decode(&bad).is_err());
+        let marked = staged
+            .clone()
+            .with_welcome_expiry(Some(WelcomeExpiry::Recorded));
+        assert_eq!(marked, staged);
+        assert_eq!(marked.welcome_expiry(), None);
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//! Migration 0227: gate the Welcome payloads that carry an expiry mark
-//! (stored-message tags 16 and 17, mdk#3589).
+//! Migration 0227: gate the Welcome payload that carries an expiry mark
+//! (stored-message tag 16, mdk#3589).
 //!
 //! The body changes no table. The schema ledger is the compatibility gate: a
-//! pre-0227 reader cannot decode tags 16 and 17, so it would read a Welcome
+//! pre-0227 reader cannot decode tag 16, so it would read a Welcome
 //! marked expired as withdrawn and lose what its last attempt found. The
 //! runner refuses this database to it before exposing application tables.
 use cgka_traits::storage::StorageResult;
