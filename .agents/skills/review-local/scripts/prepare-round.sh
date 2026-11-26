@@ -5,7 +5,7 @@
 #
 # usage: prepare-round.sh <seat-a> [<seat-b>] --round n [--user-approved]
 #                         [--context file] [--notes file] [--base ref]
-#   seat       codex | claude | cursor | opencode; one seat only to replace a
+#   seat       codex | claude | antigravity | cursor | opencode; one seat only to replace a
 #              seat that could not run (see SKILL.md)
 #   --round    this round's number (SKILL.md says how to count). Rounds after
 #              the first need --notes. Rounds past the limit need
@@ -71,8 +71,8 @@ fi
 
 for seat in "${seats[@]}"; do
   case "$seat" in
-    codex | claude | cursor | opencode) ;;
-    *) echo "unknown seat: $seat (want codex, claude, cursor or opencode)" >&2; exit 2 ;;
+    codex | claude | antigravity | cursor | opencode) ;;
+    *) echo "unknown seat: $seat (want codex, claude, antigravity, cursor or opencode)" >&2; exit 2 ;;
   esac
 done
 if [[ ${#seats[@]} -eq 2 && "${seats[0]}" == "${seats[1]}" ]]; then
@@ -175,7 +175,11 @@ surrounding code you need. Do not edit files, commit, push or post anything.
    flag as should-fix if a breaking public API, binding, storage-migration, or
    protocol change is labeled none/patch instead of minor, lacks a matching
    changelog.d/ fragment with a `### Breaking changes` heading, or omits a
-   changelog.d/ fragment when user-facing.
+   changelog.d/ fragment when user-facing. Also flag as should-fix a change to
+   behavior a formal model under formal/ makes claims about (convergence
+   lifecycle, fairness, freeze/settle, restart rehydration, device linking,
+   pairing, selector policy) that neither updates the model nor says in the
+   context why the model still matches.
 
 3. Judge simplicity as a defect class, not a style nit. Use
    $input/karpathy-guidelines.md and $input/simplicity-guidelines.md.
