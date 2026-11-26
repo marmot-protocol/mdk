@@ -276,48 +276,163 @@ class PackagingPolicyTests(unittest.TestCase):
 
 
 class MergeGatePolicyTests(unittest.TestCase):
-    def test_only_the_merge_queue_and_opt_ins_select_the_full_matrix(self):
-        script = workflow_step("ci.yml", "Select CI mode")
-        for event, full_label, expected in [
-            ("pull_request", "false", "precheck"),
-            ("pull_request", "true", "full"),
-            ("merge_group", "false", "full"),
-            ("workflow_dispatch", "false", "full"),
-            ("push", "false", "warm"),
-        ]:
-            with self.subTest(event=event, full_label=full_label), tempfile.TemporaryDirectory() as tmp:
+    def test_pr_trust_only_marks_same_repo_collaborator_prs_as_team(self):
+        script = workflow_step("ci.yml", "Classify PR trust")
+        cases = [
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "OWNER", "true"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "MEMBER", "true"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "COLLABORATOR", "true"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "CONTRIBUTOR", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "NONE", "false"),
+            ("pull_request", "marmot-protocol/mdk", "external/mdk", "true", "MEMBER", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "true", "MEMBER", "false"),
+            ("pull_request", "marmot-protocol/mdk", "", "false", "MEMBER", "false"),
+            ("push", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "MEMBER", "false"),
+        ]
+        for event, repo, head_repo, head_fork, assoc, expected in cases:
+            with self.subTest(event=event, head_repo=head_repo, head_fork=head_fork, assoc=assoc), tempfile.TemporaryDirectory() as tmp:
                 output = Path(tmp) / "output"
-                subprocess.run(["bash", "-c", script], check=True, capture_output=True, timeout=10,
-                               env={**os.environ, "EVENT_NAME": event, "FULL_CI": full_label,
-                                    "GITHUB_OUTPUT": str(output)})
+                subprocess.run(
+                    ["bash", "-c", script],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": event,
+                        "REPO": repo,
+                        "HEAD_REPO": head_repo,
+                        "HEAD_FORK": head_fork,
+                        "AUTHOR_ASSOC": assoc,
+                        "GITHUB_OUTPUT": str(output),
+                    },
+                )
+                self.assertEqual(output.read_text(), f"is_team_pr={expected}\n")
+
+    def test_tree_state_fails_closed_unless_green_or_team_bypass_label(self):
+        script = workflow_step("ci.yml", "Check tree state")
+        import base64
+        green_b64 = base64.b64encode(b'{"state":"green"}').decode()
+        red_b64 = base64.b64encode(b'{"state":"red","reason":"canary failed"}').decode()
+        bad_b64 = base64.b64encode(b'{"state":true}').decode()
+        cases = [
+            ("push", "true", "false", "error", True),
+            ("pull_request", "true", "false", green_b64, True),
+            ("pull_request", "false", "false", green_b64, True),
+            ("pull_request", "true", "false", red_b64, False),
+            ("pull_request", "true", "true", red_b64, True),
+            ("pull_request", "false", "true", red_b64, False),
+            ("pull_request", "true", "false", bad_b64, False),
+            ("pull_request", "true", "false", "error", False),
+            ("pull_request", "true", "true", "error", True),
+        ]
+        for event, is_team, bypass, response, expected in cases:
+            with self.subTest(event=event, is_team=is_team, bypass=bypass, response=response[:8]):
+                fake = textwrap.dedent("""\
+                    gh() {
+                      if [[ "$FAKE_RESP" == "error" ]]; then return 1; fi
+                      printf '%s\\n' "$FAKE_RESP"
+                    }
+                """)
+                result = subprocess.run(
+                    ["bash", "-c", fake + script],
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": event,
+                        "REPO": "marmot-protocol/mdk",
+                        "IS_TEAM_PR": is_team,
+                        "TREE_BYPASS": bypass,
+                        "FAKE_RESP": response,
+                    },
+                )
+                self.assertEqual(result.returncode == 0, expected, result.stderr.decode())
+
+    def test_team_prs_select_fast_mode_while_external_prs_and_opt_ins_select_full(self):
+        script = workflow_step("ci.yml", "Select CI mode")
+        for event, full_label, is_team, expected in [
+            ("pull_request", "false", "true", "fast"),
+            ("pull_request", "true", "true", "full"),
+            ("pull_request", "false", "false", "full"),
+            ("pull_request", "false", "", "full"),
+            ("merge_group", "false", "false", "full"),
+            ("workflow_dispatch", "false", "false", "full"),
+            ("push", "false", "false", "warm"),
+        ]:
+            with self.subTest(event=event, full_label=full_label, is_team=is_team), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "output"
+                subprocess.run(
+                    ["bash", "-c", script],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": event,
+                        "FULL_CI": full_label,
+                        "IS_TEAM_PR": is_team,
+                        "GITHUB_OUTPUT": str(output),
+                    },
+                )
                 self.assertEqual(output.read_text(), f"ci_mode={expected}\n")
 
-    def test_required_ci_rejects_skipped_jobs_in_full_runs(self):
+    def test_required_ci_enforces_fast_team_gate_and_full_external_gate(self):
         script = workflow_step("ci.yml", "Require every selected core CI job to succeed")
-        passed = {"signatures": {"result": "success"}, "changes": {"result": "success"},
-                  "rust-test": {"result": "success"}}
+        passed = {
+            "signatures": {"result": "success"},
+            "changes": {"result": "success"},
+            "rust-format": {"result": "success"},
+            "rust-test": {"result": "success"},
+        }
         skipped = {**passed, "rust-test": {"result": "skipped"}}
         failed = {**passed, "rust-test": {"result": "failure"}}
         cancelled = {**passed, "rust-test": {"result": "cancelled"}}
-        for event, mode, needs, expected in [
-            ("pull_request", "precheck", skipped, True),
-            ("pull_request", "precheck", failed, False),
-            ("pull_request", "precheck", {**passed, "signatures": {"result": "skipped"}}, False),
-            ("pull_request", "precheck", {**passed, "signatures": {"result": "failure"}}, False),
-            ("pull_request", "precheck", cancelled, False),
-            ("pull_request", "full", skipped, False),
-            ("merge_group", "full", passed, True),
-            ("merge_group", "full", skipped, False),
-            ("merge_group", "full", cancelled, False),
-            ("merge_group", "precheck", skipped, False),
-            ("merge_group", "", skipped, False),
-            ("push", "warm", skipped, True),
+        for event, mode, is_team, needs, expected in [
+            ("pull_request", "fast", "true", skipped, True),
+            ("pull_request", "fast", "true", failed, False),
+            ("pull_request", "fast", "true", {**skipped, "signatures": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", {**skipped, "changes": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", {**skipped, "rust-format": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", {**skipped, "rust-format": {"result": "failure"}}, False),
+            ("pull_request", "fast", "true", cancelled, False),
+            ("pull_request", "fast", "false", skipped, False),
+            ("pull_request", "full", "false", passed, True),
+            ("pull_request", "full", "false", skipped, False),
+            ("pull_request", "full", "true", skipped, False),
+            ("pull_request", "", "true", skipped, False),
+            ("merge_group", "full", "false", passed, True),
+            ("merge_group", "full", "false", skipped, False),
+            ("merge_group", "full", "false", cancelled, False),
+            ("merge_group", "fast", "true", skipped, False),
+            ("merge_group", "", "false", skipped, False),
+            ("push", "warm", "false", skipped, True),
         ]:
-            with self.subTest(event=event, mode=mode, needs=needs):
-                result = subprocess.run(["bash", "-c", script], capture_output=True, timeout=10,
-                                        env={**os.environ, "EVENT_NAME": event, "CI_MODE": mode,
-                                             "NEEDS": json.dumps(needs)})
+            with self.subTest(event=event, mode=mode, is_team=is_team, needs=needs):
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": event,
+                        "CI_MODE": mode,
+                        "IS_TEAM_PR": is_team,
+                        "NEEDS": json.dumps(needs),
+                    },
+                )
                 self.assertEqual(result.returncode == 0, expected)
+
+    def test_fast_team_gate_skips_heavy_compile_and_audit_jobs(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        for job_name in ("rust-audit", "rust-wasm-check", "rust-clippy", "rust-test-build"):
+            with self.subTest(job=job_name):
+                block = next(
+                    b for b in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs)
+                    if b.startswith(f"{job_name}:\n")
+                )
+                self.assertIn("needs.changes.outputs.ci_mode != 'fast'", block)
 
     def test_required_ci_needs_every_gating_job(self):
         # Required CI is the only required check, so a job missing from its
@@ -331,12 +446,10 @@ class MergeGatePolicyTests(unittest.TestCase):
                          sorted(jobs - {"archive-layout-experiment", "merge-group-fail-fast", "required-ci"}))
 
     def test_full_runs_use_nextest_profiles_without_a_default_filter(self):
-        # The merge queue is the only gate that runs every test to the end, so a
-        # profile filter would silently drop coverage from master.
         profiles = tomllib.loads((ROOT / ".config/nextest.toml").read_text())["profile"]
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         used = set(re.findall(r"--profile (\S+)", workflow)) - {"minimal"}
-        self.assertEqual(used, {"ci", "default", "precheck"})
+        self.assertEqual(used, {"ci", "default"})
         for profile in used:
             with self.subTest(profile=profile):
                 config = profiles.get(profile, {})
@@ -345,25 +458,16 @@ class MergeGatePolicyTests(unittest.TestCase):
                 for override in config.get("overrides", []):
                     self.assertNotIn("default-filter", override)
 
-    def test_only_the_pre_check_counts_a_stopped_test_as_passed(self):
-        # A test that passes on timeout never finishes, so only the pull-request
-        # pre-check may select a profile that allows it.
+    def test_no_nextest_profile_counts_a_stopped_test_as_passed(self):
         profiles = tomllib.loads((ROOT / ".config/nextest.toml").read_text())["profile"]
         for name, config in profiles.items():
             timeouts = [config.get("slow-timeout")]
             timeouts += [override.get("slow-timeout") for override in config.get("overrides", [])]
             passes = any(isinstance(t, dict) and t.get("on-timeout") == "pass" for t in timeouts)
             with self.subTest(profile=name):
-                self.assertEqual(passes, name == "precheck")
+                self.assertFalse(passes)
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        steps = [step for step in workflow.split("\n      - name: ")[1:] if "--profile precheck" in step]
-        self.assertEqual(len(steps), 1)
-        self.assertIn("\n        if: needs.changes.outputs.ci_mode == 'precheck'\n", steps[0])
-        # The job holding that step must still start for a pre-check, or the
-        # pre-check silently loses its tests: it accepts skipped jobs.
-        jobs = workflow.split("\njobs:\n", 1)[1]
-        job = next(block for block in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs) if "--profile precheck" in block)
-        self.assertRegex(job, r"(?m)^    if: needs\.changes\.outputs\.run_full == 'true'$")
+        self.assertNotIn("--profile precheck", workflow)
 
     def test_only_the_merge_group_watcher_can_cancel_and_it_cannot_fail_the_run(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

@@ -220,20 +220,18 @@ cargo test -p <crate>        # targeted tests for the crate you changed
 just ci                      # full local parity with GitHub CI (slow)
 ```
 
-Pull requests run a pre-check of a few minutes: formatting, the static and
-contract gates (the tracing audit among them), dependency audit, workspace
-clippy, the WASM build, and the workspace tests with the `precheck` nextest
-profile. That profile stops each test after half a second and counts it as
-passed, so the pre-check fails on a test that fails quickly and leaves the
-slower ones to the queue. The merge queue runs the full matrix on the exact
-commit it merges: every workspace test with the `ci` nextest profile, the CLI
-and relay end-to-end suites, simulator lanes, C bindings, iOS clippy, Windows
-filesystem contracts, Tamarin, Hermes and installer checks. `Required CI` must
-pass there before a change lands. A queue run stops at its first failed job, so
-the queue ejects a failing change within minutes rather than after the whole
-run. Master pushes run CI only to refresh the Rust dependency caches that pull
-requests and merge groups restore, and only when `Cargo.lock`, a `Cargo.toml`,
-the toolchain pin, Cargo config or `ci.yml` changes.
+Team pull requests run a ~1-minute static gate: verified commit signatures, the
+signed `tree-state` check (which pauses merges while `master` is red unless
+labeled `tree-fix` or `revert`), formatting, static/contract gates (the tracing
+audit among them), and advisory commit-trailer checks. External/fork pull
+requests and `ci:full` / manual runs execute the full `ci.yml` matrix on
+GitHub-hosted runners: dependency audit, workspace clippy, WASM build, every
+workspace test with the `ci` nextest profile, the CLI and relay end-to-end
+suites, simulator lanes, C bindings, iOS clippy, Windows filesystem contracts,
+Tamarin, Hermes and installer checks. `Required CI` must pass before a change
+lands, and post-merge `Canary` runs continuously verify `master`. Master pushes
+run CI only to refresh the Rust dependency caches when `Cargo.lock`, a
+`Cargo.toml`, the toolchain pin, Cargo config or `ci.yml` changes.
 
 Workspace test shards keep the runner's unused SDKs when at least 32 GiB is
 free; below that budget they reclaim SDK space before downloading the test

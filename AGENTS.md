@@ -61,12 +61,14 @@ before adding behavior or bindings.
 
 ## Landing changes
 
-Every change reaches master through the merge queue; nobody pushes to master or bypasses the queue. Verification and
-review happen locally, the PR carries the change, and the queue runs the full CI matrix on the exact commit that
-lands. Follow `.agents/skills/land-change`: targeted tests plus the end-to-end smoke, two independent cross-model
-reviews of the local diff (`.agents/skills/review-local`) until both recommend merge, a short PR
-(`.agents/skills/gh-create-pr`) brought to a green pre-check with no conflicts, then a report. Enqueue only when the
-user asks, and then own the queue result until the change merges.
+Every change reaches master through a reviewed, signed squash PR; nobody pushes directly to master. Verification and
+cross-model review happen locally, the team PR gate checks signatures, `tree-state`, formatting, and static contracts
+(~1 minute, zero Rust compile), and post-merge `Canary` runs continuously verify `master`. Follow
+`.agents/skills/land-change`: targeted tests plus the end-to-end smoke, two independent cross-model reviews of the
+local diff (`.agents/skills/review-local`) until both recommend merge, a short PR (`.agents/skills/gh-create-pr`)
+brought to green `Required CI` with no conflicts, then a report. Merge (`gh pr merge --auto --squash`) only when the
+user asks. If `tree-state` is `red` (Meltdown Mode), only team PRs labeled `tree-fix` or `revert` may merge until
+`Canary` turns green.
 
 Record three commit trailers on the final signed commit (which GitHub preserves in squash commits under
 `COMMIT_MESSAGES`), and verify them locally with `just pr-trailers-check`:
@@ -140,16 +142,13 @@ Record three commit trailers on the final signed commit (which GitHub preserves 
 
 ## Verification
 
-GitHub CI is the full gate. Local verification proves your change and stays scoped to it: several agents usually
-build on the same machine, so workspace-wide builds and suites run locally only when a rule below calls for one. By
-default, CI runs a pre-check of a few minutes on a PR: fmt, the static gates (including the tracing audit),
-`cargo audit`, clippy (default and `--all-features`), the WASM build, and the workspace tests with the `precheck`
-nextest profile. That profile stops each test after half a second and counts it as passed, so it catches only a test
-that fails quickly; unless the PR carries `ci:full`, your local tests are the only signal from the slower tests before
-the merge queue. The merge queue runs the whole matrix (every crate's tests, the simulator,
-and the C, iOS and Windows lanes) and is the merge gate; the `ci:full` label runs that matrix on a PR, `ci:apple`
-adds only the iOS lane. Master pushes only refresh CI's Rust caches, and only when a dependency or toolchain input
-changes.
+Local verification proves your change before merge, and post-merge `Canary` runs continuously verify `master` across
+the full suite. Keep local runs scoped to your change: several agents usually build on the same machine, so
+workspace-wide builds and suites run locally only when a rule below calls for one. On team pull requests, `Required CI`
+runs a ~1-minute static gate (verified commit signatures, `tree-state`, `cargo fmt --check`, static/contract gates,
+and advisory commit-trailer checks) with zero Rust compile. External/fork pull requests and PRs labelled `ci:full` run
+the full `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds the macOS lane on a team PR. Master pushes only
+refresh CI's Rust caches, and only when a dependency or toolchain input changes.
 
 While iterating, run only the test you are working on. Before each push, run once:
 

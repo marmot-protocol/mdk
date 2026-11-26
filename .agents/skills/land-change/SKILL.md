@@ -5,22 +5,21 @@ description: >-
   merge: confirm the issue is real and not a symptom of a deeper cause, build
   it test-first, verify locally with the end-to-end smoke, get two independent
   cross-model reviews of the local diff, open the PR, and bring it to green CI
-  with no conflicts. Then stop and report. Enqueues only when the user asks,
-  and then owns the merge-queue result until the change merges. Use when asked
-  to fix an issue ("fix #123", an issue URL), build and ship a change, land,
-  open a PR for, enqueue, or merge a change.
+  with no conflicts. Then stop and report. Merges only when the user asks. Use
+  when asked to fix an issue ("fix #123", an issue URL), build and ship a
+  change, land, open a PR for, or merge a change.
 ---
 
 # Land a change
 
-The merge queue is the only full gate. Verification and review happen on your
-machine, the PR carries the change to CI, and the queue runs the full CI
-matrix on the exact commit that becomes master. Nothing reaches master any
-other way: no direct pushes, no admin merges, no ruleset bypass.
+Verification and cross-model review happen on your machine, the team PR gate
+checks commit signatures, `tree-state`, formatting, and static contracts (~1
+minute), and post-merge `Canary` runs verify `master` continuously. Nothing
+reaches `master` by direct push or unsigned commit.
 
-You own the change until it is a ready PR: CI green, both reviewers say
-merge, no conflicts. Then stop and report (step 6). Enqueue only when the user
-asks (step 7), and then own the queue result until the change merges.
+You own the change until it is a ready PR: `Required CI` green, both reviewers
+say merge, no conflicts. Then stop and report (step 6). Merge only when the user
+asks (step 7).
 
 Check `gh auth status` first; if it fails, ask the user to run `gh auth
 login`.
@@ -192,16 +191,17 @@ gh pr view <pr> --json headRefOid,mergeable,mergeStateStatus,reviewDecision
 | `BLOCKED` | Required checks pending or failing, or a required human review | Wait for checks (below). If only a human approval is missing (`reviewDecision: REVIEW_REQUIRED`), it is ready: step 6 |
 | `UNKNOWN` | GitHub is still computing | Check again shortly |
 
-PR CI is the pre-check of a few minutes; the full matrix runs in the merge
-queue (step 7). To wait for it, use your host's PR watching if it has it,
-instead of a polling loop. The only required check, `Required CI`, does not
-exist until the other CI jobs finish, so `gh pr checks <pr> --required`
-reports "no required checks reported" straight away, even with `--watch`.
-Wait for the head's `ci.yml` run instead (`gh run list --workflow ci.yml
---event pull_request --commit <sha>`, then `gh run watch <id>`) and read
-`gh pr checks <pr> --required` after it. "No required checks reported" once
-that run has finished means it ended without creating the check (for example
-the workflow failed to start): treat it as a failed pre-check.
+Team PR CI is the ~1-minute static gate (commit signatures, `tree-state`,
+formatting, and static contracts); external/fork PRs and `ci:full` PRs run the
+full matrix. To wait for it, use your host's PR watching if it has it, instead
+of a polling loop. The only required check, `Required CI`, does not exist until
+the other CI jobs finish, so `gh pr checks <pr> --required` reports "no
+required checks reported" straight away, even with `--watch`. Wait for the
+head's `ci.yml` run instead (`gh run list --workflow ci.yml --event
+pull_request --commit <sha>`, then `gh run watch <id>`) and read `gh pr checks
+<pr> --required` after it. "No required checks reported" once that run has
+finished means it ended without creating the check (for example the workflow
+failed to start): treat it as a failed gate.
 
 When a check fails, read `gh run view <id> --log-failed`. The failed job is
 the cause; jobs shown as cancelled were stopped by it. Reproduce the failing
@@ -245,63 +245,23 @@ Nothing else: no finding lists, no round-by-round history, no diff tour.
 ## 7. Merge (only when asked)
 
 Merge only when the user asks, and only the head that was verified and
-reviewed: confirm `headRefOid` is still the reviewed head.
+reviewed: confirm `headRefOid` is still the reviewed head and `Required CI` is
+green.
 
-Master has a merge queue, so enqueue that head. `expectedHeadOid` makes the
-enqueue fail if the PR head has moved:
+If `Check tree state` failed because the signed `tree-state` branch is `red`
+(Meltdown Mode), do not bypass it on unrelated changes; only team PRs labeled
+`tree-fix` or `revert` may merge while `master` is red.
 
-```sh
-gh api graphql \
-  -f query='mutation($id: ID!, $oid: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) { mergeQueueEntry { position } } }' \
-  -f id="$(gh pr view <pr> --json id -q .id)" \
-  -f oid=<sha>
-```
-
-An enqueue refused with `Required status check "Required CI" is expected`
-means CI has not finished on the head yet. Wait and enqueue again. Do not use
-`gh pr merge`; repository auto-merge is off, so it fails.
-
-Then own the queue run until the PR merges. A queue run takes about 30–35
-minutes; one that fails stops at its first failed job, and the queue ejects
-the PR within minutes. Use your host's PR watching if it has it; otherwise
-check every few minutes:
+Squash-merge the reviewed head (with `--match-head-commit` so the merge fails
+if the branch moved):
 
 ```sh
-gh api graphql -F owner='{owner}' -F repo='{repo}' -F n=<pr> -f query='
-query($owner: String!, $repo: String!, $n: Int!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $n) {
-      state isInMergeQueue
-      timelineItems(last: 1, itemTypes: [ADDED_TO_MERGE_QUEUE_EVENT, REMOVED_FROM_MERGE_QUEUE_EVENT]) {
-        nodes {
-          __typename
-          ... on AddedToMergeQueueEvent { createdAt }
-          ... on RemovedFromMergeQueueEvent { createdAt reason }
-        }
-      }
-    }
-  }
-}'
+gh pr merge <pr> --squash --auto --match-head-commit <sha>
 ```
 
-Judge only the latest queue event:
-
-- `state: MERGED`: done.
-- Latest is `AddedToMergeQueueEvent`: queued, keep waiting. A rebuild because
-  a PR ahead of yours failed is not your failure.
-- Latest is `RemovedFromMergeQueueEvent` after your enqueue, with the PR
-  still `OPEN`: the queue ejected it, and `reason` says why. Find its run
-  (its branch is `gh-readonly-queue/master/pr-<pr>-<sha>`):
-
-  ```sh
-  gh run list --workflow ci.yml --event merge_group --limit 50 \
-    --json databaseId,headBranch,conclusion,createdAt \
-    --jq '.[] | select(.headBranch | startswith("gh-readonly-queue/master/pr-<pr>-"))'
-  ```
-
-  Classify the failure with the step 5 table, fix it, bring the PR back to
-  ready, and enqueue again.
-- No queue event since your enqueue: not recorded yet, check again.
+If `Required CI` is already green and no approvals are pending, GitHub merges
+immediately; otherwise auto-merge completes as soon as required checks and
+CODEOWNERS reviews clear.
 
 After the merge, confirm the squash commit on master (`gh pr view <pr> --json
 mergeCommit`), delete the branch and your worktree, and report the merged

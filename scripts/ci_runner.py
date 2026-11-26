@@ -137,7 +137,7 @@ def run(label: str, command: list[str], child_umask: int = -1) -> int:
         config.write_text("\n".join(
             f'[profile.{profile}.junit]\npath = "{name}.xml"\n'
             'store-success-output = false\nstore-failure-output = false\n'
-            for profile in ("default", "ci", "precheck")))
+            for profile in ("default", "ci")))
         command = [*command[:3], "--tool-config-file", f"mdk-ci:{config}", *command[3:]]
     snapshot("before-" + label)
     tail = bytearray()
