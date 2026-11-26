@@ -1694,18 +1694,6 @@ where
             );
             return self.publish_fresh_key_package().await;
         };
-        if lifecycle
-            .current_not_after
-            .is_some_and(|deadline| deadline <= self.wall_clock.now())
-        {
-            tracing::debug!(
-                target: TRACE_TARGET,
-                method = "republish_key_package",
-                fallback_reason = "current_not_after_expired",
-                "no republishable current key package artifact; falling back to fresh publication"
-            );
-            return self.publish_fresh_key_package().await;
-        }
         self.ensure_key_package_announced(
             lifecycle
                 .current_key_package_ref

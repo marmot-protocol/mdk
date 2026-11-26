@@ -1688,6 +1688,8 @@ impl AppClient {
         boxed(|| self.device_rename_upkeep()).await;
         boxed(|| self.drive_history_deliveries()).await;
         let prepared = self.epoch_gap_held_groups().and_then(|held| {
+            // Safety net for direct AppClient callers and any missed worker
+            // relay-config signals; no-op when endpoints are unchanged.
             self.refresh_key_package_routing()?;
             self.sync_key_package_announcement_group()?;
             self.sync_device_tag_group()?;

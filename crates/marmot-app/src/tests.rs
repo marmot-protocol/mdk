@@ -7484,11 +7484,12 @@ fn key_package_fallback_routing_excludes_nip65_read_only_relays() {
         directory.path(),
         vec![
             "wss://read-only.example/".into(),
-            "wss://fallback.example".into(),
+            "wss://FALLBACK.example/".into(),
         ],
     );
 
-    // Empty write relays with a NIP-65 read-only relay matching one configured default.
+    // Empty write relays with a NIP-65 read-only relay matching one configured default;
+    // remaining fallback relays are canonicalized to match NIP-65 URL spelling.
     let mut empty_writes = app.account_relay_list_status(&account.label).unwrap();
     empty_writes.nip65.relays.clear();
     empty_writes.nip65.write_relays.clear();
@@ -7512,7 +7513,7 @@ fn key_package_fallback_routing_excludes_nip65_read_only_relays() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn live_worker_refreshes_key_package_routing_when_nip65_roles_change() {
     use cgka_traits::{MaintenancePhase, Timestamp, TransportFanoutAttemptState};
 
@@ -7522,8 +7523,13 @@ async fn live_worker_refreshes_key_package_routing_when_nip65_roles_change() {
     let relay_a = "wss://relay-a.example";
     let relay_b = "wss://relay-b.example";
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relays(directory.path(), vec![relay_a.into(), relay_b.into()])
-        .with_test_relay_client(relay.clone());
+    // Configure relay B with non-canonical casing/trailing slash to prove a
+    // fallback-to-NIP-65 transition matches the persisted target cleanly.
+    let app = MarmotApp::with_relays(
+        directory.path(),
+        vec![relay_a.into(), "wss://RELAY-B.example/".into()],
+    )
+    .with_test_relay_client(relay.clone());
 
     let make_status = |created_at: u64, write_relays: &[&str], read_relays: &[&str]| {
         let mut status = app.account_relay_list_status(&account.label).unwrap();
@@ -7536,10 +7542,16 @@ async fn live_worker_refreshes_key_package_routing_when_nip65_roles_change() {
         status.refresh();
         status
     };
+    // Start with a non-canonical spelling of relay B so initial publication
+    // canonicalizes it and later NIP-65 updates match the persisted target.
     app.directory()
         .remember_directory_relay_lists(
             &account.account_id_hex,
-            &make_status(100, &[relay_a, relay_b], &[relay_a, relay_b]),
+            &make_status(
+                100,
+                &[relay_a, "wss://RELAY-B.example/"],
+                &[relay_a, "wss://RELAY-B.example/"],
+            ),
         )
         .unwrap();
 
@@ -7582,7 +7594,7 @@ async fn live_worker_refreshes_key_package_routing_when_nip65_roles_change() {
     );
 
     // Demote relay B to read-only while the worker stays running, then make B
-    // reachable and past its retry backoff. Maintenance must not retry B.
+    // past its retry backoff. Maintenance refreshes routing and must not retry B.
     app.directory()
         .remember_directory_relay_lists(
             &account.account_id_hex,
@@ -7610,33 +7622,33 @@ async fn live_worker_refreshes_key_package_routing_when_nip65_roles_change() {
 
     // Restore relay B to writable without restarting the worker or manually
     // calling run_due_maintenance: relay-config reconciliation must refresh
-    // live KeyPackage routing, re-evaluate maintenance due, and deliver the
-    // exact same signed KeyPackage event to B.
+    // live KeyPackage routing, re-evaluate maintenance due, and wake the
+    // scheduled retry to deliver the exact same signed KeyPackage event to B.
+    let (retry_started, release_retry) = relay.hold_next_publish_of_kind(KIND_MARMOT_KEY_PACKAGE);
     app.directory()
         .remember_directory_relay_lists(
             &account.account_id_hex,
             &make_status(300, &[relay_a, relay_b], &[relay_a, relay_b]),
         )
         .unwrap();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let restored = loop {
-        let lifecycle = runtime
-            .key_package_maintenance_status(&account.label)
-            .await
-            .unwrap()
-            .expect("key package lifecycle");
-        let b_accepted = lifecycle.publication_targets.iter().any(|target| {
-            target.endpoint.0 == relay_b && target.state == TransportFanoutAttemptState::Accepted
-        });
-        if b_accepted && lifecycle.phase == MaintenancePhase::Complete {
-            break lifecycle;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "live worker should automatically retry and deliver KeyPackage to restored writable relay B"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), retry_started.notified())
+        .await
+        .expect("live worker should automatically wake and retry KeyPackage to restored relay B");
+    release_retry.notify_one();
+
+    // A serialized worker command (that does not itself run maintenance) waits
+    // behind the in-flight automatic retry until it finishes and persists.
+    runtime.pause_maintenance(&account.label).await.unwrap();
+    let restored = app
+        .account_storage(&account.label)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .expect("key package lifecycle");
+    assert!(restored.publication_targets.iter().any(|target| {
+        target.endpoint.0 == relay_b && target.state == TransportFanoutAttemptState::Accepted
+    }));
+    assert_eq!(restored.phase, MaintenancePhase::Complete);
     assert_eq!(
         restored
             .authored_signed_event

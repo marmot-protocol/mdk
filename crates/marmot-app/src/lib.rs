@@ -7147,8 +7147,20 @@ impl MarmotApp {
                 .collect()
         });
         let offered = outbox.len();
-        let safe =
-            self.retain_safe_discovered_endpoints(outbox, "local account key package routing");
+        let canonicalize = |endpoints: Vec<TransportEndpoint>| -> Vec<TransportEndpoint> {
+            let mut canonical = Vec::with_capacity(endpoints.len());
+            for endpoint in endpoints {
+                let endpoint =
+                    TransportEndpoint(transport_nostr::canonical_relay(endpoint.as_str()));
+                if !canonical.contains(&endpoint) {
+                    canonical.push(endpoint);
+                }
+            }
+            canonical
+        };
+        let safe = canonicalize(
+            self.retain_safe_discovered_endpoints(outbox, "local account key package routing"),
+        );
         if !safe.is_empty() {
             return Ok(safe);
         }
@@ -7168,12 +7180,15 @@ impl MarmotApp {
             .collect();
         let default_endpoints = self.relay_endpoints();
         let default_count = default_endpoints.len();
-        let fallback: Vec<_> = default_endpoints
-            .into_iter()
-            .filter(|endpoint| {
-                RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| !read_only.contains(&relay))
-            })
-            .collect();
+        let fallback = canonicalize(
+            default_endpoints
+                .into_iter()
+                .filter(|endpoint| {
+                    RelayUrl::parse(endpoint.as_str())
+                        .is_ok_and(|relay| !read_only.contains(&relay))
+                })
+                .collect(),
+        );
         if offered > 0 || fallback.len() < default_count {
             tracing::warn!(
                 target: "marmot_app::relay_plane",
