@@ -1908,10 +1908,15 @@ impl SqliteAppStorage {
         })
     }
 
-    /// The relay reconnected: its cooldown and unreachable streak end, and a
-    /// spell longer than the policy's bound makes its re-checks due in the
-    /// same transaction. Returns when the cooldown spell it ended began, if
-    /// one was running.
+    /// The relay reconnected: its cooldown and unreachable streak end, every
+    /// unit on the relay that is not parked waiting for a timed probe
+    /// (`state != Broken` or holding an armed probe) clears any unreachable
+    /// retry wait (`next_attempt_at_seconds <= now_seconds +
+    /// policy.unreachable_retry_seconds`) while preserving longer
+    /// `NoProgress` backoffs, `no_progress` and `backoff_step`, and a spell
+    /// longer than the policy's bound makes its re-checks due in the same
+    /// transaction. Returns when the cooldown spell it ended began, if one was
+    /// running.
     pub fn record_recovery_relay_reconnected(
         &self,
         relay: &str,
@@ -1925,6 +1930,14 @@ impl SqliteAppStorage {
                 "UPDATE account_recovery_relays SET unreachable_streak = 0,
                  cooldown_since_seconds = NULL, cooldown_until_seconds = NULL WHERE relay = ?1",
                 [relay],
+            )
+            .storage()?;
+            let unreachable_cutoff = now_seconds.saturating_add(policy.unreachable_retry_seconds);
+            conn.execute_cached(
+                "UPDATE account_recovery_units SET next_attempt_at_seconds = 0
+                 WHERE relay = ?1 AND (state != ?2 OR probe = 1)
+                 AND next_attempt_at_seconds <= ?3",
+                params![relay, BROKEN, integer(unreachable_cutoff)?],
             )
             .storage()?;
             cooldown_ended_tx(&conn, relay, since, policy, now_seconds)?;
