@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "state": "green",
-  "updated_at": "2026-11-26T11:38:07Z",
-  "reason": "initial state",
+  "state": "red",
+  "updated_at": "2026-11-26T17:31:22Z",
+  "reason": "canary failed twice on workspace-nextest (86f43a6f7..0932cdd49)",
   "run_url": null
 }
