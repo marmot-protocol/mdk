@@ -417,6 +417,167 @@ fn unreachable_waits_and_cools_the_relay_after_three() {
     );
 }
 
+/// Reconnecting a relay clears unreachable retry waits on that relay for
+/// active (even after a single unreachable attempt before cooldown), retired,
+/// and probing broken units while keeping longer `NoProgress` backoffs,
+/// progress/backoff counters, timed probes for parked broken units, and other
+/// relays untouched.
+#[test]
+fn reconnect_clears_unreachable_unit_waits_but_keeps_broken_probes() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (active, retired, probing, parked, other) =
+        (group(1), group(2), group(3), group(4), group(5));
+    for route in [&retired, &probing, &parked] {
+        owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    }
+
+    // Retired unit waiting on a 60s NoProgress doubling backoff (step 1 -> 2,
+    // `next_attempt_at_seconds = NOW + 60`), never unreachable.
+    break_unit(&app, &retired, NOW);
+    app.retire_route_park_as_converted(&retired);
+    settle(
+        &app,
+        &retired,
+        RELAY,
+        RecoveryUnitOutcome::NoProgress,
+        NOW - 30,
+    );
+    settle(&app, &retired, RELAY, RecoveryUnitOutcome::NoProgress, NOW);
+    assert_eq!(
+        unit(&app, &retired, RELAY).next_attempt_at_seconds,
+        NOW + 60
+    );
+
+    // Broken unit holding an armed probe.
+    break_unit(&app, &probing, NOW);
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&probing),
+        NOW - 700,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
+    assert!(unit(&app, &probing, RELAY).probe);
+
+    // Broken unit parked waiting for its timed probe (`probe = 0`).
+    let parked_before = settle(&app, &parked, RELAY, RecoveryUnitOutcome::Refused, NOW);
+    assert_eq!(
+        (
+            parked_before.state,
+            parked_before.probe,
+            parked_before.next_attempt_at_seconds,
+        ),
+        (
+            RecoveryUnitState::Broken(RecoveryUnitBreak::Refused),
+            false,
+            NOW + POLICY.probe_base_seconds,
+        )
+    );
+
+    // Unrelated relay unit waiting on its own unreachable retry.
+    settle(&app, &other, OTHER, RecoveryUnitOutcome::Unreachable, NOW);
+    assert_eq!(unit(&app, &other, OTHER).next_attempt_at_seconds, NOW + 30);
+
+    // A single unreachable attempt on `RELAY` (no cooldown yet) sets a 30s
+    // per-unit wait. Reconnecting clears it immediately without disturbing the
+    // retired unit's 60s NoProgress backoff, the parked broken unit, or `OTHER`.
+    settle(&app, &active, RELAY, RecoveryUnitOutcome::Unreachable, NOW);
+    assert_eq!(
+        (
+            health(&app, RELAY).unreachable_streak,
+            health(&app, RELAY).cooldown,
+            unit(&app, &active, RELAY).next_attempt_at_seconds,
+        ),
+        (1, None, NOW + 30)
+    );
+    assert_eq!(
+        app.record_recovery_relay_reconnected(RELAY, &POLICY, NOW + 5)
+            .unwrap(),
+        None
+    );
+    assert_eq!(health(&app, RELAY).unreachable_streak, 0);
+    let active_after = unit(&app, &active, RELAY);
+    assert_eq!(
+        (
+            active_after.state,
+            active_after.no_progress,
+            active_after.backoff_step,
+            active_after.next_attempt_at_seconds,
+        ),
+        (RecoveryUnitState::Active, 0, 0, 0)
+    );
+    let retired_after = unit(&app, &retired, RELAY);
+    assert_eq!(
+        (
+            retired_after.state,
+            retired_after.no_progress,
+            retired_after.backoff_step,
+            retired_after.next_attempt_at_seconds,
+        ),
+        (RecoveryUnitState::Retired, 2, 2, NOW + 60)
+    );
+    assert!(unit(&app, &parked, RELAY) == parked_before);
+    assert_eq!(unit(&app, &other, OTHER).next_attempt_at_seconds, NOW + 30);
+
+    // Once due, unreachable waits on retired and probing broken units clear on
+    // reconnect too, keeping their state, probe allowance, and counters intact.
+    settle(
+        &app,
+        &retired,
+        RELAY,
+        RecoveryUnitOutcome::Unreachable,
+        NOW + 60,
+    );
+    settle(
+        &app,
+        &probing,
+        RELAY,
+        RecoveryUnitOutcome::Unreachable,
+        NOW + 60,
+    );
+    assert_eq!(
+        unit(&app, &retired, RELAY).next_attempt_at_seconds,
+        NOW + 90
+    );
+    assert_eq!(
+        unit(&app, &probing, RELAY).next_attempt_at_seconds,
+        NOW + 90
+    );
+    assert_eq!(
+        app.record_recovery_relay_reconnected(RELAY, &POLICY, NOW + 65)
+            .unwrap(),
+        None
+    );
+    let retired_after = unit(&app, &retired, RELAY);
+    assert_eq!(
+        (
+            retired_after.state,
+            retired_after.no_progress,
+            retired_after.backoff_step,
+            retired_after.next_attempt_at_seconds,
+        ),
+        (RecoveryUnitState::Retired, 2, 2, 0)
+    );
+    let probing_after = unit(&app, &probing, RELAY);
+    assert_eq!(
+        (
+            probing_after.state,
+            probing_after.probe,
+            probing_after.backoff_step,
+            probing_after.next_attempt_at_seconds,
+        ),
+        (
+            RecoveryUnitState::Broken(RecoveryUnitBreak::NoProgress),
+            true,
+            1,
+            0,
+        )
+    );
+    assert!(unit(&app, &parked, RELAY) == parked_before);
+    assert_eq!(unit(&app, &other, OTHER).next_attempt_at_seconds, NOW + 30);
+    assert_eq!(health(&app, OTHER).unreachable_streak, 1);
+}
+
 /// A cooldown spell longer than the bound makes every re-check on its relay
 /// due in the write that ends it, by an answer or a reconnect; a shorter one
 /// and other relays' passes are left alone.
