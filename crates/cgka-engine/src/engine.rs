@@ -4774,9 +4774,14 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    /// Mark the retained outbound Welcome `id` expired, if its delivery
-    /// deadline has passed at `now` while it is undelivered and its commit is
-    /// canonical or still pending (mdk#3589). One write turns its row
+    /// Mark the retained outbound Welcome `id` expired, if it is owed for
+    /// delivery (an `OutboundWelcome` whose commit is canonical, or a founding
+    /// one) and its delivery deadline has passed at `now` undelivered
+    /// (mdk#3589). A Welcome still staged with its unconfirmed commit is never
+    /// marked: that commit's resumption counts its staged Welcomes, so it
+    /// stays as it is, read by the clock, until the commit confirms and
+    /// promotes it (then it can be marked) or loses (then it is superseded).
+    /// These are the rows withdrawal turns `Failed` too. One write turns its row
     /// `Failed` and gives its payload the [`WelcomeExpiry::Unrecorded`] mark,
     /// so it is settled as expired from then on whatever the clock reads:
     /// nothing publishes it again, a later delivered mark is refused, and
@@ -4785,8 +4790,8 @@ impl<S: StorageProvider> Engine<S> {
     /// mark.
     ///
     /// Returns the Welcome's mark after the call: `None` when it was not
-    /// marked (not past its deadline, delivered, withdrawn, its commit lost,
-    /// or no such Welcome). The caller reconciles any acknowledgement it holds
+    /// marked (not owed, not past its deadline, delivered, withdrawn, its
+    /// commit lost or pending, or no such Welcome). The caller reconciles any acknowledgement it holds
     /// first, then records the expiry once and says so with
     /// [`Self::record_sent_welcome_expiry`]. Like withdrawal, this touches
     /// only the Welcome's own row, so it works before hydration.
@@ -4805,19 +4810,14 @@ impl<S: StorageProvider> Engine<S> {
         if record.state == MessageState::Failed {
             return Ok(payload.welcome_expiry());
         }
-        let welcome = match &payload {
+        let owed = matches!(
+            &payload,
             StoredMessagePayload::OutboundWelcome { message, .. }
-            | StoredMessagePayload::StagedInviteWelcome { message, .. } => {
-                matches!(message.envelope, TransportEnvelope::Welcome { .. })
-            }
-            _ => false,
-        };
+                if matches!(message.envelope, TransportEnvelope::Welcome { .. })
+        );
         if record.state != MessageState::Sent
-            || !welcome
-            || matches!(
-                self.welcome_origin_state(&record.group_id, &payload)?,
-                MessageState::EpochInvalidated | MessageState::Failed
-            )
+            || !owed
+            || self.welcome_origin_state(&record.group_id, &payload)? != MessageState::Processed
             || !crate::welcome_deadline::stored_welcome_deliver_until(&payload)
                 .is_some_and(|deliver_until| now >= deliver_until)
         {

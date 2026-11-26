@@ -304,3 +304,34 @@ async fn recovery_artifact_quarantine() {
         );
     }
 }
+
+/// A recovery commit still pending when one of its staged Welcomes passes its
+/// delivery deadline: the Welcome is not marked expired, because only a
+/// Welcome owed for delivery is (mdk#3589). Marking it would leave the commit
+/// with fewer staged Welcomes than its request ids, and the next start would
+/// quarantine the group instead of resuming the commit.
+#[tokio::test]
+async fn a_pending_recovery_commits_staged_welcome_is_never_marked_expired() {
+    let (mut admin, storage, mut target, _, group_id, target_storage) =
+        member_recovery_fixture().await;
+    let grant = grant_for_request(&admin, &mut target, &target_storage, &group_id, [23; 32]).await;
+    let SendResult::GroupEvolution { welcomes, .. } = admin
+        .send(SendIntent::RecoverMembers {
+            group_id: group_id.clone(),
+            members: vec![grant],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected recovery evolution");
+    };
+    let staged = &welcomes[0].id;
+    let deadline = admin.sent_welcome_deliver_until(staged).unwrap().unwrap();
+    assert_eq!(admin.expire_sent_welcome(staged, deadline).unwrap(), None);
+    drop(admin);
+
+    let mut reopened = current_client(b"recovery-admin", storage.clone());
+    reopened.hydrate_all_stored_groups().unwrap();
+    assert!(reopened.quarantined_groups().is_empty());
+    assert_eq!(reopened.drain_auto_publish().len(), 1, "the commit resumes");
+}
