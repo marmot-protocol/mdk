@@ -4202,6 +4202,7 @@ where
                 };
                 self.rollback_prepared_session_commit_refused(commit, None)
                     .await?;
+                self.forget_sealing_commit(pending);
                 return Err(error);
             }
         };
@@ -6121,6 +6122,7 @@ where
             Err(error) => {
                 self.rollback_unstaged_pending(Some(pending), output, queue)
                     .await?;
+                self.forget_sealing_commit(pending);
                 return Err(EngineError::Peeler(error).into());
             }
         };
@@ -6201,6 +6203,7 @@ where
             Err(error) => {
                 self.rollback_unstaged_pending(Some(pending), output, queue)
                     .await?;
+                self.forget_sealing_commit(pending);
                 return Err(EngineError::Peeler(error).into());
             }
         };
@@ -6783,7 +6786,9 @@ where
     /// call dropped here would leave it pending for good. The commit is noted
     /// across the await for [`Self::settle_dropped_seals`] to roll back, as a
     /// seal failure would. A later seal keeps the notes of earlier dropped
-    /// ones.
+    /// ones. A failed seal keeps its note until the caller's rollback has
+    /// returned ([`Self::forget_sealing_commit`]), since that rollback can
+    /// wait too.
     async fn seal_commit_welcomes(
         &mut self,
         pending: PendingStateRef,
@@ -6791,8 +6796,15 @@ where
     ) -> Result<Vec<SealedWelcome>, cgka_traits::error::PeelerError> {
         self.sealing_commits.push(pending);
         let sealed = self.session.seal_welcomes(welcomes).await;
-        self.sealing_commits.retain(|noted| *noted != pending);
+        if sealed.is_ok() {
+            self.forget_sealing_commit(pending);
+        }
         sealed
+    }
+
+    /// Drop the note [`Self::seal_commit_welcomes`] keeps for `pending`.
+    fn forget_sealing_commit(&mut self, pending: PendingStateRef) {
+        self.sealing_commits.retain(|noted| *noted != pending);
     }
 
     /// Roll back each commit a call dropped mid-seal left staged; see
@@ -6823,7 +6835,7 @@ where
                     continue;
                 }
             }
-            self.sealing_commits.retain(|noted| *noted != pending);
+            self.forget_sealing_commit(pending);
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
         Ok(output)
