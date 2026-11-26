@@ -33,7 +33,8 @@ use cgka_traits::maintenance::{
     KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, MaintenanceTrigger,
     PendingKeyPackageReplacement, PeriodicMaintenancePolicy, PostJoinHistoryFetch,
     PostJoinHistoryFetchCompletion, PostJoinHistoryFetchOutcome, RetainedKeyPackagePrivateMaterial,
-    SendMaintenanceDisposition, TransportFanoutAttemptState, TransportFanoutTarget,
+    SendMaintenanceDisposition, SignedPublicationArtifact, TransportFanoutAttemptState,
+    TransportFanoutTarget,
 };
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, RosterTagKey};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -58,8 +59,9 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{AccountError, AccountResult};
 use crate::key_package::{
-    KeyPackagePublication, KeyPackagePublicationRoutes, KeyPackagePublisher,
-    KeyPackageSlotWithdrawal, NoopKeyPackagePublisher,
+    KeyPackagePublication, KeyPackagePublicationRoutes, KeyPackagePublishError,
+    KeyPackagePublishReceipt, KeyPackagePublisher, KeyPackageSlotWithdrawal,
+    NoopKeyPackagePublisher,
 };
 use crate::routing::{
     StaticTransportRouting, TransportRoutingPolicy, publish_target_group_id, publish_target_kind,
@@ -1717,6 +1719,12 @@ where
                 .as_deref()
                 .unwrap_or_default(),
         )?;
+        if lifecycle
+            .current_not_after
+            .is_some_and(|deadline| deadline <= self.wall_clock.now())
+        {
+            return self.publish_fresh_key_package_with_routes(routes).await;
+        }
 
         lifecycle.phase = cgka_traits::MaintenancePhase::Fanout;
         self.session.put_key_package_lifecycle(&lifecycle)?;
@@ -1727,10 +1735,17 @@ where
             created_at: artifact.created_at,
             endpoints: current_endpoints,
         };
+        let fallback_not_after = routes
+            .filter(|routes| routes.via_fallback)
+            .and(lifecycle.current_not_after);
         match self
-            .key_packages
-            .publish_prepared_key_package(&publication, &artifact)
-            .await
+            .publish_key_package_artifact(
+                &mut lifecycle,
+                &publication,
+                &artifact,
+                fallback_not_after,
+            )
+            .await?
         {
             Ok(receipt) => {
                 note_key_package_attempt(
@@ -1871,6 +1886,7 @@ where
                     publication_targets: Vec::new(),
                     setup_publication: false,
                     fallback_publication: None,
+                    fallback_withdrawal_targets: Default::default(),
                     refresh_at: None,
                     upgrade_rotation_recorded: false,
                     generation_revision: 0,
@@ -1895,7 +1911,7 @@ where
             || lifecycle
                 .pending_replacement
                 .as_ref()
-                .is_none_or(|pending| self.pending_replacement_obsolete(&lifecycle, pending))
+                .is_none_or(|pending| self.pending_replacement_obsolete(&lifecycle, pending, now))
         {
             // Newer than every publication in the slot, a foreign one
             // included, and than its withdrawal: relays drop anything up to
@@ -2055,6 +2071,14 @@ where
                 .expect("prepared replacement has an exact signed event")
                 .clone();
             let now = self.wall_clock.now();
+            // An asynchronous signer may have returned after the package expired.
+            // The next preparation replaces it and runs the announcement gate again.
+            if pending.not_after <= now {
+                return Err(crate::key_package::KeyPackagePublishError::unexposed(
+                    "the prepared KeyPackage expired before publication",
+                )
+                .into());
+            }
             let publication = KeyPackagePublication {
                 account_id: self.session.self_id().clone(),
                 key_package: pending.key_package.clone(),
@@ -2083,10 +2107,17 @@ where
                 )
                 .into());
             }
+            let fallback_not_after = routes
+                .filter(|routes| routes.via_fallback)
+                .map(|_| pending.not_after);
             let error = match self
-                .key_packages
-                .publish_prepared_key_package(&publication, &artifact)
-                .await
+                .publish_key_package_artifact(
+                    &mut lifecycle,
+                    &publication,
+                    &artifact,
+                    fallback_not_after,
+                )
+                .await?
             {
                 Ok(receipt) => break (lifecycle, artifact, publication, receipt),
                 Err(error) => error,
@@ -2174,20 +2205,26 @@ where
         // replacements superseded before any was confirmed; a consumed one
         // keeps the grace period it started when it was superseded.
         let confirmed_at = self.wall_clock.now();
-        for material in &mut lifecycle.retained_private_material {
+        let mut retired = Vec::new();
+        lifecycle.retained_private_material.retain_mut(|material| {
             if material.awaiting_confirmed_replacement {
                 material.awaiting_confirmed_replacement = false;
                 if !material.consumed {
                     material.replaced_at = confirmed_at;
                 }
             }
-        }
-        let mut retired = Vec::new();
+            if material.not_after <= confirmed_at {
+                retired.push(material.key_package.clone());
+                return false;
+            }
+            true
+        });
         if let Some(key_package) = lifecycle.current_key_package.clone() {
             match (
                 lifecycle.current_key_package_ref.clone(),
                 lifecycle.current_not_after,
             ) {
+                (_, Some(not_after)) if not_after <= confirmed_at => retired.push(key_package),
                 (Some(key_package_ref), Some(not_after)) => lifecycle
                     .retained_private_material
                     .push(RetainedKeyPackagePrivateMaterial {
@@ -2314,7 +2351,7 @@ where
         let now = self.wall_clock.now();
         Ok(match lifecycle.pending_replacement.as_ref() {
             Some(pending) => {
-                self.pending_replacement_obsolete(&lifecycle, pending)
+                self.pending_replacement_obsolete(&lifecycle, pending, now)
                     || pending.signed_event.is_none()
                     || pending
                         .targets
@@ -2326,6 +2363,49 @@ where
                     || self.current_key_package_replacement_due(&lifecycle, now)
             }
         })
+    }
+
+    /// Persist the destinations of a fallback wave before it can expose the
+    /// signed event. A lost reply or interrupted send keeps the history. A
+    /// definitive failure before exposure restores older evidence unchanged.
+    async fn publish_key_package_artifact(
+        &self,
+        lifecycle: &mut KeyPackageLifecycleState,
+        publication: &KeyPackagePublication,
+        artifact: &SignedPublicationArtifact,
+        fallback_not_after: Option<Timestamp>,
+    ) -> AccountResult<Result<KeyPackagePublishReceipt, KeyPackagePublishError>> {
+        let previous_targets = if let Some(not_after) = fallback_not_after {
+            let previous = lifecycle.fallback_withdrawal_targets.clone();
+            for endpoint in &publication.endpoints {
+                lifecycle
+                    .fallback_withdrawal_targets
+                    .entry(endpoint.clone())
+                    .and_modify(|expiry| *expiry = (*expiry).max(not_after))
+                    .or_insert(not_after);
+            }
+            if previous != lifecycle.fallback_withdrawal_targets {
+                self.session.put_key_package_lifecycle(lifecycle)?;
+                Some(previous)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let result = self
+            .key_packages
+            .publish_prepared_key_package(publication, artifact)
+            .await;
+        if result
+            .as_ref()
+            .is_err_and(|error| !error.externally_exposed)
+            && let Some(previous) = previous_targets
+        {
+            lifecycle.fallback_withdrawal_targets = previous;
+            self.session.put_key_package_lifecycle(lifecycle)?;
+        }
+        Ok(result)
     }
 
     fn reconcile_pending_setup_targets(&self, lifecycle: &mut KeyPackageLifecycleState) -> bool {
@@ -2362,8 +2442,8 @@ where
             || !self.advertises_current_capabilities(current)
     }
 
-    /// Whether `pending` must be replaced before it is published: built by an
-    /// older generator revision, superseded in the slot (staged before its
+    /// Whether `pending` must be replaced before it is published: expired,
+    /// built by an older generator revision, superseded in the slot (staged before its
     /// withdrawal, or no newer than a foreign publication found there), or
     /// built without the capabilities this device now advertises, such as a
     /// device tag once this device tags (mdk#2628 3.1d).
@@ -2371,8 +2451,10 @@ where
         &self,
         lifecycle: &KeyPackageLifecycleState,
         pending: &PendingKeyPackageReplacement,
+        now: Timestamp,
     ) -> bool {
-        pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+        pending.not_after <= now
+            || pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
             || self.slot_publication_superseded(lifecycle, pending.authored_created_at)
             || !self.advertises_current_capabilities(&pending.key_package)
     }
@@ -2422,9 +2504,15 @@ where
         let Some(previous) = self.session.key_package_lifecycle()? else {
             return Ok(0);
         };
+        let now = self.wall_clock.now();
+        let mut withdrawn = previous.clone();
+        withdrawn
+            .fallback_withdrawal_targets
+            .retain(|_, not_after| *not_after > now);
         let pending = previous.pending_replacement.as_ref();
         let published = previous.authored_event_id.is_some()
-            || pending.is_some_and(|pending| pending.signed_event.is_some());
+            || pending.is_some_and(|pending| pending.signed_event.is_some())
+            || !withdrawn.fallback_withdrawal_targets.is_empty();
         if !published || previous.stable_slot_id.is_empty() {
             return Ok(0);
         }
@@ -2435,15 +2523,17 @@ where
             .into_iter()
             .chain(pending.map(|pending| pending.authored_created_at))
             .chain(previous.slot_withdrawn_at)
-            .fold(self.wall_clock.now(), Timestamp::max);
+            .fold(now, Timestamp::max);
         let mut endpoints = self.routing.key_package_endpoints().to_vec();
-        for target in previous
+        for endpoint in previous
             .publication_targets
             .iter()
             .chain(pending.into_iter().flat_map(|pending| &pending.targets))
+            .map(|target| &target.endpoint)
+            .chain(withdrawn.fallback_withdrawal_targets.keys())
         {
-            if !endpoints.contains(&target.endpoint) {
-                endpoints.push(target.endpoint.clone());
+            if !endpoints.contains(endpoint) {
+                endpoints.push(endpoint.clone());
             }
         }
         if endpoints.is_empty() {
@@ -2453,7 +2543,6 @@ where
             .into());
         }
 
-        let mut withdrawn = previous.clone();
         withdrawn.slot_withdrawn_at = Some(created_at);
         self.session.put_key_package_lifecycle(&withdrawn)?;
         let withdrawal = KeyPackageSlotWithdrawal {
@@ -2469,6 +2558,19 @@ where
             .await
         {
             Ok(receipt) if !receipt.accepted.is_empty() => {
+                let historical_targets = withdrawn.fallback_withdrawal_targets.len();
+                withdrawn
+                    .fallback_withdrawal_targets
+                    .retain(|endpoint, _| !receipt.accepted.contains(endpoint));
+                if withdrawn.fallback_withdrawal_targets.len() != historical_targets
+                    && self.session.put_key_package_lifecycle(&withdrawn).is_err()
+                {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        method = "withdraw_key_package_slot",
+                        "could not record the acknowledged fallback withdrawals"
+                    );
+                }
                 tracing::info!(
                     target: TRACE_TARGET,
                     method = "withdraw_key_package_slot",
@@ -2555,6 +2657,12 @@ where
                 .as_deref()
                 .unwrap_or_default(),
         )? {
+            return Ok(());
+        }
+        if lifecycle
+            .current_not_after
+            .is_some_and(|deadline| deadline <= self.wall_clock.now())
+        {
             return Ok(());
         }
         lifecycle.phase = cgka_traits::MaintenancePhase::Fanout;
@@ -2699,8 +2807,15 @@ where
             }
         }
         lifecycle.retained_private_material = retained;
+        let historical_targets = lifecycle.fallback_withdrawal_targets.len();
+        lifecycle
+            .fallback_withdrawal_targets
+            .retain(|_, not_after| *not_after > now);
         let deleted = retired.len();
-        if deleted > 0 || marker_migrated {
+        if deleted > 0
+            || marker_migrated
+            || lifecycle.fallback_withdrawal_targets.len() != historical_targets
+        {
             self.session
                 .promote_key_package_lifecycle(&retired, &lifecycle)?;
             let mut activity = self
@@ -3078,6 +3193,7 @@ where
         // Paused maintenance may finish existing publication intent, but an
         // obsolete pending replacement requires fresh private material and
         // therefore waits for resume like every other new preparation.
+        let now = self.wall_clock.now();
         let key_package_prepared = self
             .session
             .key_package_lifecycle()?
@@ -3085,7 +3201,9 @@ where
                 lifecycle
                     .pending_replacement
                     .as_ref()
-                    .is_some_and(|pending| !self.pending_replacement_obsolete(&lifecycle, pending))
+                    .is_some_and(|pending| {
+                        !self.pending_replacement_obsolete(&lifecycle, pending, now)
+                    })
             });
         if key_package_due && (!self.maintenance_paused || key_package_prepared) {
             let started = self.monotonic_clock.elapsed();

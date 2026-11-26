@@ -11,6 +11,7 @@ use crate::transport::{Timestamp, TransportMessage};
 use crate::transport_adapter::{TransportEndpoint, TransportPublishTarget};
 use crate::types::{EpochId, GroupId, MessageId};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub const POST_JOIN_CONTENTION_JITTER_MAX_MS: u64 = 30_000;
@@ -601,6 +602,11 @@ pub struct KeyPackageLifecycleState {
     /// authorized delivery targets. Absence denotes no journaled fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_publication: Option<KeyPackageFallbackPublication>,
+    /// Latest lifetime end of any package a setup fallback relay might still
+    /// serve. Kept independently of retry targets and private key material so
+    /// sign-out can withdraw older publications after rotation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fallback_withdrawal_targets: BTreeMap<TransportEndpoint, Timestamp>,
     pub refresh_at: Option<Timestamp>,
     pub upgrade_rotation_recorded: bool,
     /// Generator policy of the acknowledged current package, promoted atomically
@@ -664,6 +670,7 @@ impl KeyPackageLifecycleState {
             publication_targets: Vec::new(),
             setup_publication: false,
             fallback_publication: None,
+            fallback_withdrawal_targets: BTreeMap::new(),
             refresh_at: None,
             upgrade_rotation_recorded: false,
             generation_revision: 0,
@@ -996,6 +1003,26 @@ mod tests {
         let decoded: RetainedKeyPackagePrivateMaterial =
             serde_json::from_value(serde_json::to_value(&written).unwrap()).unwrap();
         assert_eq!(decoded, written);
+    }
+
+    #[test]
+    fn lifecycle_records_without_fallback_withdrawal_targets_decode() {
+        let mut original = lifecycle();
+        original.fallback_withdrawal_targets.insert(
+            crate::TransportEndpoint("wss://fallback.example".into()),
+            Timestamp(5_000),
+        );
+        let mut stored = serde_json::to_value(&original).unwrap();
+        assert_eq!(
+            serde_json::from_value::<KeyPackageLifecycleState>(stored.clone()).unwrap(),
+            original,
+        );
+        stored
+            .as_object_mut()
+            .unwrap()
+            .remove("fallback_withdrawal_targets");
+        let legacy: KeyPackageLifecycleState = serde_json::from_value(stored).unwrap();
+        assert!(legacy.fallback_withdrawal_targets.is_empty());
     }
 
     #[test]

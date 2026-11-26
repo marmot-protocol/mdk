@@ -1533,6 +1533,8 @@ impl AppClient {
             .await
         {
             Ok(package) => {
+                // Preserve the discovery requirement after any fallback send.
+                // An outbox may acknowledge a replay while denying inviter reads.
                 if first_wave.via_fallback
                     || self
                         .runtime

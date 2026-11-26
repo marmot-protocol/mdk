@@ -239,7 +239,7 @@ where
         // prepares nothing new, as the run does.
         match lifecycle.pending_replacement.as_ref() {
             Some(pending)
-                if self.pending_replacement_obsolete(&lifecycle, pending)
+                if self.pending_replacement_obsolete(&lifecycle, pending, now)
                     || pending.signed_event.is_none() =>
             {
                 if !self.maintenance_paused {

@@ -7,6 +7,7 @@
 struct WithdrawingKeyPackages {
     publications: RecordingKeyPackages,
     withdrawals: Arc<Mutex<Vec<KeyPackageSlotWithdrawal>>>,
+    next_publication_error: Arc<Mutex<Option<KeyPackagePublishError>>>,
     /// Endpoints answer the withdrawal without accepting it.
     refuse: Arc<std::sync::atomic::AtomicBool>,
     /// Never answer the withdrawal, as if the process stopped while sending it.
@@ -40,9 +41,15 @@ impl KeyPackagePublisher for WithdrawingKeyPackages {
         publication: &KeyPackagePublication,
         artifact: &cgka_traits::SignedPublicationArtifact,
     ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
-        self.publications
+        let receipt = self
+            .publications
             .publish_prepared_key_package(publication, artifact)
-            .await
+            .await?;
+        self.next_publication_error
+            .lock()
+            .unwrap()
+            .take()
+            .map_or(Ok(receipt), Err)
     }
 
     async fn withdraw_key_package_slot(
@@ -379,4 +386,111 @@ async fn a_device_that_never_published_withdraws_nothing() {
     );
     runtime.publish_fresh_key_package().await.unwrap();
     assert_eq!(publisher.publications.publications().len(), 1);
+}
+
+#[tokio::test]
+async fn a_rotated_setup_fallback_is_withdrawn_after_private_key_retirement() {
+    assert_rotated_setup_fallback_withdrawal(None, false, true).await;
+}
+
+#[tokio::test]
+async fn an_ambiguous_setup_fallback_is_withdrawn_after_rotation() {
+    assert_rotated_setup_fallback_withdrawal(
+        Some(KeyPackagePublishError::exposed("fallback acknowledgement lost")),
+        false,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_unexposed_setup_fallback_is_not_withdrawn_after_rotation() {
+    assert_rotated_setup_fallback_withdrawal(
+        Some(KeyPackagePublishError::unexposed("failed before transport")),
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_expired_setup_fallback_is_not_withdrawn_after_rotation() {
+    assert_rotated_setup_fallback_withdrawal(None, true, false).await;
+}
+
+async fn assert_rotated_setup_fallback_withdrawal(
+    fallback_error: Option<KeyPackagePublishError>,
+    expire_fallback: bool,
+    withdraw_fallback: bool,
+) {
+    use marmot_session::KeyPackagePublicationRoutes;
+
+    let dir = relaxed_storage_dir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("kp historical setup fallback withdrawal").unwrap();
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let publisher = WithdrawingKeyPackages::default();
+    let open = || {
+        slot_runtime(
+            current_session(&database, &key, b"alice"),
+            publisher.clone(),
+            &wall,
+            0,
+            &[KEY_ENDPOINT],
+        )
+    };
+    let declared = TransportEndpoint(KEY_ENDPOINT.into());
+    let fallback = TransportEndpoint("wss://fallback.example".into());
+    let unattempted = TransportEndpoint("wss://never-sent.example".into());
+    let fallback_failed = fallback_error.is_some();
+    *publisher.next_publication_error.lock().unwrap() = fallback_error;
+
+    let mut runtime = open();
+    let result = runtime
+        .publish_fresh_key_package_with_routes(Some(KeyPackagePublicationRoutes {
+            attempt: std::slice::from_ref(&fallback),
+            retain: &[declared.clone(), unattempted],
+            via_fallback: true,
+        }))
+        .await;
+    assert_eq!(result.is_err(), fallback_failed);
+    if fallback_failed {
+        // Recover through the current outbox after the fallback send failed.
+        drop(runtime);
+        runtime = open();
+        runtime.publish_fresh_key_package().await.unwrap();
+    }
+    let initial = slot_lifecycle(&runtime);
+    let closes_at = initial.current_not_after.unwrap();
+    let rotate_at = initial.refresh_at.unwrap();
+
+    // Ordinary rotation reaches only the declared outbox. Close and reopen
+    // before withdrawal so the fallback cannot come from a runtime cache.
+    wall.set(rotate_at.0);
+    runtime.run_due_maintenance().await.unwrap();
+    let rotated = slot_lifecycle(&runtime);
+    assert_ne!(rotated.authored_event_id, initial.authored_event_id);
+    assert_eq!(rotated.stable_slot_id, initial.stable_slot_id);
+    let publications = publisher.publications.publications();
+    assert_eq!(publications[0].endpoints, [fallback.clone()]);
+    assert!(publications[1..].iter().all(|publication| publication.endpoints == [declared.clone()]));
+    drop(runtime);
+
+    let mut runtime = open();
+    if expire_fallback {
+        wall.set(closes_at.0);
+    } else {
+        wall.set(rotate_at.0 + DAY);
+        assert!(wall.now() < closes_at);
+        assert_eq!(runtime.sweep_expired_key_package_private_material().unwrap(), 1);
+    }
+    assert_eq!(runtime.withdraw_key_package_slot().await.unwrap(), if withdraw_fallback { 2 } else { 1 });
+    let withdrawals = publisher.withdrawals();
+    let withdrawal = withdrawals.first().unwrap();
+    assert_eq!(withdrawals.len(), 1);
+    assert_eq!(withdrawal.slot_id, initial.stable_slot_id);
+    assert!(withdrawal.created_at >= initial.authored_event_created_at.unwrap());
+    let expected = if withdraw_fallback { vec![declared, fallback] } else { vec![declared] };
+    assert_eq!(withdrawal.endpoints, expected);
+    assert!(slot_lifecycle(&runtime).fallback_withdrawal_targets.is_empty());
 }

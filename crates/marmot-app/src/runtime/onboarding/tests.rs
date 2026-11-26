@@ -1540,16 +1540,11 @@ impl NostrRelayClient for Network {
             .cloned()
             .partition(|endpoint| is_key_package && refusals.contains(&relay_key(&endpoint.0)));
         if is_key_package {
-            let mut locations = self.key_package_locations.lock();
-            if !refusals.is_empty()
-                || !withheld_acks.is_empty()
-                || locations.contains_key(&event.id)
-            {
-                locations
-                    .entry(event.id.clone())
-                    .or_default()
-                    .extend(stored.iter().map(|endpoint| relay_key(&endpoint.0)));
-            }
+            self.key_package_locations
+                .lock()
+                .entry(event.id.clone())
+                .or_default()
+                .extend(stored.iter().map(|endpoint| relay_key(&endpoint.0)));
         }
         if refused.is_empty() || !stored.is_empty() {
             self.events.lock().push(event.clone());
@@ -1583,6 +1578,45 @@ impl NostrRelayClient for Network {
         self.publish_event(endpoints, event, required_acks).await
     }
 }
+
+#[tokio::test]
+async fn key_package_fixture_only_serves_relays_that_stored_the_event() {
+    let network = Network::default();
+    let keys = nostr::prelude::Keys::generate();
+    let event = signed(&keys, 30443, Vec::new(), "opaque", unix_now_seconds());
+    let accepting = TransportEndpoint("wss://accepting.example".into());
+    let refusing = TransportEndpoint("wss://refusing.example".into());
+    let read = |endpoint: &TransportEndpoint| {
+        network.directory_records(&DirectoryFetchRequest {
+            endpoints: vec![endpoint.clone()],
+            queries: vec![DirectoryEventQuery::new(
+                event.kind,
+                vec![event.pubkey.clone()],
+                1,
+            )],
+        })
+    };
+    let outcome = network
+        .publish_event(std::slice::from_ref(&accepting), &event, 1)
+        .await
+        .unwrap();
+    assert_eq!(outcome.accepted.len(), 1);
+    assert_eq!(read(&accepting).len(), 1);
+    assert!(read(&refusing).is_empty());
+
+    network
+        .key_package_refusals
+        .lock()
+        .insert(relay_key(&refusing.0));
+    let outcome = network
+        .publish_event(std::slice::from_ref(&refusing), &event, 1)
+        .await
+        .unwrap();
+    assert_eq!(outcome.failed.len(), 1);
+    assert_eq!(read(&accepting).len(), 1);
+    assert!(read(&refusing).is_empty());
+}
+
 fn options() -> OnboardingOptions {
     OnboardingOptions {
         default_relays: vec!["wss://default.example".into()],
@@ -5036,6 +5070,119 @@ async fn initial_key_package_relay_edit_rejects_a_newer_list_seen_during_preview
     runtime.shutdown_and_close().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inconclusive_key_package_relay_edit_checks_outbox_for_a_newer_list() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let setup = runtime.account_setup();
+    // The fixture serves index_events only to index.example. Use an independent
+    // lookup source so the replacement is visible exclusively to the outbox.
+    let outbox = "wss://index.example";
+    let fallback = "wss://default.example";
+    let unanswered = "wss://unanswered.example";
+    setup
+        .set_onboarding_discovery_relays(
+            &id,
+            vec!["wss://lookup.example".into(), unanswered.into()],
+        )
+        .await
+        .unwrap();
+    setup
+        .continue_onboarding_without(&id, OnboardingStep::Profile)
+        .await
+        .unwrap();
+    let at = unix_now_seconds();
+    *network.events.lock() = vec![
+        signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), outbox.into()]],
+            "",
+            at - 2,
+        ),
+        signed(
+            &keys,
+            10050,
+            vec![vec!["relay".into(), fallback.into()]],
+            "",
+            at - 2,
+        ),
+    ];
+    network
+        .directory_offline
+        .lock()
+        .insert(relay_key(unanswered));
+    network
+        .key_package_refusals
+        .lock()
+        .extend([outbox, fallback].map(relay_key));
+    let preflight = setup
+        .continue_onboarding_without(&id, OnboardingStep::Follows)
+        .await
+        .unwrap();
+    let relays = &preflight.steps[OnboardingStep::Relays.index()];
+    assert_eq!(relays.status, OnboardingStatus::Passed);
+    assert!(check_inconclusive(&relays.findings));
+    let failed = setup
+        .acknowledge_onboarding_single_device(&id, preflight.revision)
+        .await
+        .unwrap();
+    let relays = &failed.steps[OnboardingStep::Relays.index()];
+    assert_eq!(relays.status, OnboardingStatus::RetryableFailure);
+    assert!(relays.findings.iter().any(|finding| {
+        finding.issue == OnboardingIssue::NoUsableRoute
+            && finding.purpose == OnboardingCheckPurpose::EventPublication
+    }));
+    let edit = || Some((vec![outbox.into()], vec!["wss://edited.example".into()]));
+    let initial = setup
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, edit())
+        .await
+        .unwrap();
+    assert!(initial.proposal.unwrap().inconclusive);
+    setup.cancel_onboarding_repair(&id).await.unwrap();
+
+    let newer = signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://newly-declared.example".into()]],
+        "",
+        at - 1,
+    );
+    network.index_events.lock().push(newer.clone());
+    let preview = setup
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, edit())
+        .await
+        .unwrap();
+    network.directory_offline.lock().insert(relay_key(outbox));
+    assert!(preview.proposal.is_none());
+    let relays = &preview.steps[OnboardingStep::Relays.index()];
+    assert!(relays.findings.iter().any(|finding| {
+        finding.issue == OnboardingIssue::RecordChanged
+            && finding.purpose == OnboardingCheckPurpose::SourceFreshness
+    }));
+    assert!(matches!(
+        setup.approve_onboarding_repair(&id, preview.revision).await,
+        Err(AppError::OnboardingActionUnavailable)
+    ));
+    let checkpoint = runtime
+        .accounts()
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        checkpoint.records[OnboardingStep::Relays.index()],
+        Some(newer)
+    );
+    assert!(
+        network
+            .attempts
+            .lock()
+            .iter()
+            .all(|event| event.kind != 10002)
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 async fn assert_initial_key_package_reviewed_write_relay_edit(
     default_role: Option<&str>,
     read_outbox_fails: bool,
@@ -5388,6 +5535,66 @@ fn offers_relay_edits(state: &OnboardingStepState) -> bool {
         && state
             .actions
             .contains(&OnboardingAction::UseRecommendedRelays)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_retry_rechecks_incomplete_declared_route_preflight() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let setup = runtime.account_setup();
+    setup.run_onboarding(&id).await.unwrap();
+    setup
+        .continue_onboarding_without(&id, OnboardingStep::Profile)
+        .await
+        .unwrap();
+
+    let declared = "wss://declared.example";
+    network.events.lock().push(signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), declared.into()]],
+        "",
+        unix_now_seconds(),
+    ));
+    network.inspection_errors.lock().insert(
+        "declared.example".into(),
+        transport_nostr::DirectoryInspectionError::Incomplete,
+    );
+    let stopped = setup
+        .continue_onboarding_without(&id, OnboardingStep::Follows)
+        .await
+        .unwrap();
+    let relays = &stopped.steps[OnboardingStep::Relays.index()];
+    assert_eq!(relays.status, OnboardingStatus::RetryableFailure);
+    assert!(relays.findings.iter().any(|finding| {
+        finding.issue == OnboardingIssue::DiscoveryIncomplete
+            && finding.context == OnboardingFindingContext::DeclaredRoute
+            && finding.purpose == OnboardingCheckPurpose::DirectoryQuery
+            && finding.endpoint.as_deref().map(relay_key) == Some(relay_key(declared))
+    }));
+    network.inspected_endpoints.lock().clear();
+    let still_stopped = setup
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let relays = &still_stopped.steps[OnboardingStep::Relays.index()];
+    assert_eq!(relays.status, OnboardingStatus::RetryableFailure);
+    assert!(relays.findings.iter().any(|finding| {
+        finding.issue == OnboardingIssue::NoUsableRoute
+            && finding.context == OnboardingFindingContext::DeclaredRoute
+    }));
+    assert!(
+        network
+            .inspected_endpoints
+            .lock()
+            .iter()
+            .any(|endpoint| relay_key(endpoint) == relay_key(declared))
+    );
+    assert_eq!(
+        still_stopped.steps[OnboardingStep::InboxRelays.index()].status,
+        OnboardingStatus::Pending
+    );
+    assert!(network.attempts.lock().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

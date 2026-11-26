@@ -53,6 +53,81 @@ fn advertised_components(key_package: &cgka_traits::engine::KeyPackage) -> Vec<u
 }
 
 #[tokio::test]
+async fn setup_fallback_reuses_only_unexpired_pending_key_packages() {
+    use marmot_session::KeyPackagePublicationRoutes;
+
+    for expires in [false, true] {
+        let dir = relaxed_storage_dir().unwrap();
+        let key = SqlCipherKey::new("kp setup fallback expiry").unwrap();
+        let wall = Arc::new(TestWallClock::new(unix_now()));
+        let primary = TransportEndpoint(KEY_ENDPOINT.into());
+        let fallback = TransportEndpoint("wss://fallback.example".into());
+        let publisher = FlakyKeyPackages::new(1);
+        let mut runtime = slot_runtime(
+            current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+            publisher.clone(),
+            &wall,
+            0,
+            &[KEY_ENDPOINT],
+        );
+        let first = runtime
+            .prepare_fresh_key_package(vec![primary.clone()])
+            .await
+            .unwrap();
+        // Production MLS lifetimes use system time, so shorten just the
+        // staged record's deadline for the session's simulated wall clock.
+        let deadline = Timestamp(wall.now().0 + 2);
+        let mut lifecycle = slot_lifecycle(&runtime);
+        let pending = lifecycle.pending_replacement.as_mut().unwrap();
+        pending.not_after = deadline;
+        pending.refresh_at = deadline;
+        let first_artifact = pending.signed_event.clone().unwrap();
+        runtime.session().put_key_package_lifecycle(&lifecycle).unwrap();
+
+        wall.set(deadline.0 - 1);
+        runtime
+            .publish_fresh_key_package_with_routes(Some(KeyPackagePublicationRoutes {
+                attempt: std::slice::from_ref(&primary),
+                retain: &[],
+                via_fallback: false,
+            }))
+            .await
+            .expect_err("the primary send received no acknowledgement");
+        if expires {
+            wall.set(deadline.0);
+        }
+        let acknowledged = runtime
+            .publish_fresh_key_package_with_routes(Some(KeyPackagePublicationRoutes {
+                attempt: std::slice::from_ref(&fallback),
+                retain: std::slice::from_ref(&primary),
+                via_fallback: true,
+            }))
+            .await
+            .unwrap();
+
+        let calls = publisher.publications();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].endpoints, [primary]);
+        assert_eq!(calls[0].key_package, first);
+        assert_eq!(calls[1].endpoints, [fallback]);
+        assert_eq!(calls[1].key_package, acknowledged);
+        assert_eq!(calls[1].slot_id, calls[0].slot_id);
+        let lifecycle = slot_lifecycle(&runtime);
+        let current_artifact = lifecycle.authored_signed_event.unwrap();
+        assert!(lifecycle.current_not_after.unwrap() > wall.now());
+        if expires {
+            assert_ne!(acknowledged, first);
+            assert_ne!(current_artifact, first_artifact);
+            assert!(current_artifact.created_at > first_artifact.created_at);
+            assert!(lifecycle.retained_private_material.is_empty());
+        } else {
+            assert_eq!(acknowledged, first);
+            assert_eq!(current_artifact, first_artifact);
+        }
+    }
+}
+
+#[tokio::test]
 async fn key_package_pending_fallback_restarts_on_declared_routes_only() {
     assert_key_package_pending_setup_restarts_on_declared_routes_only(true).await;
 }

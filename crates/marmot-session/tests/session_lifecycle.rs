@@ -1722,6 +1722,7 @@ async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
         publication_targets: Vec::new(),
         setup_publication: false,
         fallback_publication: None,
+        fallback_withdrawal_targets: Default::default(),
         refresh_at: None,
         upgrade_rotation_recorded: false,
         generation_revision: 0,

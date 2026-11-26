@@ -2404,13 +2404,13 @@ impl AccountSetup<'_> {
             self.run_onboarding_locked(&mut c).await?;
         } else {
             c.snapshot.proposal = None;
+            let relays = &c.snapshot.steps[OnboardingStep::Relays.index()];
             let step = if matches!(step, OnboardingStep::Relays | OnboardingStep::KeyPackage)
-                && c.snapshot.steps[OnboardingStep::Relays.index()]
-                    .findings
-                    .iter()
-                    .any(key_package_route_finding)
+                && relays.status == OnboardingStatus::RetryableFailure
+                && c.snapshot.steps[OnboardingStep::KeyPackage.index()].status
+                    == OnboardingStatus::RetryableFailure
+                && relays.findings.iter().any(key_package_route_finding)
             {
-                let relays = &c.snapshot.steps[OnboardingStep::Relays.index()];
                 let checked_at = relays.checked_at;
                 let findings = relays
                     .findings
@@ -2510,7 +2510,10 @@ impl AccountSetup<'_> {
 }
 
 fn key_package_discovery_finding(finding: &OnboardingFinding) -> bool {
-    finding.context == OnboardingFindingContext::DeclaredRoute
+    // The initial publication checks discovery across routes. Incomplete
+    // preflight probes carry the individual declared endpoint that failed.
+    finding.endpoint.is_none()
+        && finding.context == OnboardingFindingContext::DeclaredRoute
         && finding.purpose == OnboardingCheckPurpose::DirectoryQuery
         && finding.issue == OnboardingIssue::DiscoveryIncomplete
 }
@@ -3232,7 +3235,6 @@ impl AccountSetup<'_> {
         let findings = &c.snapshot.steps[step.index()].findings;
         let mut inconclusive = check_inconclusive(findings);
         if !manual_review
-            && !inconclusive
             && step == OnboardingStep::Relays
             && findings.iter().any(key_package_route_finding)
             && let Some(basis) = c.records[step.index()].as_ref()
@@ -3269,7 +3271,7 @@ impl AccountSetup<'_> {
                     self.save_onboarding(&mut c)?;
                     return Ok(c.snapshot);
                 }
-                inconclusive = failures.iter().any(|failure| {
+                inconclusive |= failures.iter().any(|failure| {
                     failure.endpoint.is_some()
                         && matches!(
                             failure.issue,
