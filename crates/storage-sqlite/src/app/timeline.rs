@@ -401,6 +401,10 @@ pub struct TimelineReplyPreview {
     /// can resolve its `imeta` media into downloadable attachment references.
     /// `None` for local sends not yet committed to an epoch.
     pub source_epoch: Option<u64>,
+    #[serde(default)]
+    pub retention_seconds: Option<u64>,
+    #[serde(default)]
+    pub retention_expires_at: Option<u64>,
     pub media: Option<Value>,
     pub deleted: bool,
     #[serde(default)]
@@ -5337,8 +5341,14 @@ fn hydrate_timeline_presentation(
                 |row| row.get::<_, bool>(0),
             )
             .storage()?;
-        if message.agent_item_first_event_missing {
-            hydrate_held_agent_item_source(conn, message)?;
+        if message.agent_item_first_event_missing
+            && let Some(source) =
+                held_agent_item_source(conn, &message.group_id_hex, &message.message_id_hex)?
+        {
+            message.retention_seconds = source.retention_seconds;
+            message.retention_expires_at = source.retention_expires_at;
+            message.history_import_provenance = source.provenance;
+            message.imported_from = source.imported_from;
         }
     }
     let mut legacy_roots = HashMap::new();
@@ -5383,29 +5393,34 @@ fn hydrate_timeline_presentation(
     Ok(())
 }
 
+struct HeldAgentItemSource {
+    retention_seconds: Option<u64>,
+    retention_expires_at: Option<u64>,
+    provenance: Option<HistoryImportProvenance>,
+    imported_from: Option<HistoryImportSource>,
+}
+
 /// A row built from an agent item's edits has the retention and import source
 /// of the edit it was built from, chosen as the projection chose it: the first
 /// event the row stands for has neither.
-fn hydrate_held_agent_item_source(
+fn held_agent_item_source(
     conn: &Connection,
-    message: &mut TimelineMessageRecord,
-) -> StorageResult<()> {
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<Option<HeldAgentItemSource>> {
     let edits = app_events_targeting_message_tx(
         conn,
-        &message.group_id_hex,
+        group_id_hex,
         MARMOT_APP_EVENT_KIND_EDIT,
-        &message.message_id_hex,
+        message_id_hex,
     )?;
-    let deleted = deleted_reaction_ids_for_target_tx(conn, &message.group_id_hex, &edits)?;
-    let Some(anchor) =
-        edits::held_agent_item_anchor(&message.message_id_hex, edits.iter(), &deleted)
-    else {
-        return Ok(());
+    let deleted = deleted_reaction_ids_for_target_tx(conn, group_id_hex, &edits)?;
+    let Some(anchor) = edits::held_agent_item_anchor(message_id_hex, edits.iter(), &deleted) else {
+        return Ok(None);
     };
-    let anchor = conn
-        .query_row_cached(
-            &format!(
-                "SELECT source.retention_seconds, source.retention_expires_at,
+    conn.query_row_cached(
+        &format!(
+            "SELECT source.retention_seconds, source.retention_expires_at,
                         {TIMELINE_IMPORT_PROVENANCE_SQL},
                         {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
                  FROM app_events AS source
@@ -5413,35 +5428,31 @@ fn hydrate_held_agent_item_source(
                    ON imported.group_id_hex = source.group_id_hex
                   AND imported.message_id_hex = source.message_id_hex
                  WHERE source.group_id_hex = ?1 AND source.message_id_hex = ?2"
-            ),
-            params![message.group_id_hex, anchor.message_id_hex],
-            |row| {
-                Ok((
-                    row.get::<_, Option<i64>>(0)?
-                        .and_then(|value| value.try_into().ok()),
-                    row.get::<_, Option<i64>>(1)?
-                        .and_then(|value| value.try_into().ok()),
-                    history_import_provenance_from_row(row)?,
-                    row.get::<_, Option<Vec<u8>>>("imported_source_slot")?
-                        .map(|slot| -> rusqlite::Result<_> {
-                            Ok(HistoryImportSource::new(
-                                &slot,
-                                row.get("imported_source_label")?,
-                            ))
-                        })
-                        .transpose()?,
-                ))
-            },
-        )
-        .optional()
-        .storage()?;
-    if let Some((retention_seconds, retention_expires_at, provenance, imported_from)) = anchor {
-        message.retention_seconds = retention_seconds;
-        message.retention_expires_at = retention_expires_at;
-        message.history_import_provenance = provenance;
-        message.imported_from = imported_from;
-    }
-    Ok(())
+        ),
+        params![group_id_hex, anchor.message_id_hex],
+        |row| {
+            Ok(HeldAgentItemSource {
+                retention_seconds: row
+                    .get::<_, Option<i64>>(0)?
+                    .and_then(|value| value.try_into().ok()),
+                retention_expires_at: row
+                    .get::<_, Option<i64>>(1)?
+                    .and_then(|value| value.try_into().ok()),
+                provenance: history_import_provenance_from_row(row)?,
+                imported_from: row
+                    .get::<_, Option<Vec<u8>>>("imported_source_slot")?
+                    .map(|slot| -> rusqlite::Result<_> {
+                        Ok(HistoryImportSource::new(
+                            &slot,
+                            row.get("imported_source_label")?,
+                        ))
+                    })
+                    .transpose()?,
+            })
+        },
+    )
+    .optional()
+    .storage()
 }
 
 fn filter_blocked_reactions(
@@ -5501,21 +5512,36 @@ fn load_reply_previews(
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT message_id_hex, sender, plaintext, kind, tags_json, media_json, deleted, source_epoch,
-                        invalidation_status, deletion_source, reply_to_message_id_hex
-                 FROM visible_message_timeline
-                 WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
+                "SELECT timeline.message_id_hex, timeline.sender, timeline.plaintext, timeline.kind,
+                        timeline.tags_json, timeline.media_json, timeline.deleted, timeline.source_epoch,
+                        timeline.invalidation_status, timeline.deletion_source, timeline.reply_to_message_id_hex,
+                        source.retention_seconds, source.retention_expires_at, source.message_id_hex IS NULL
+                 FROM visible_message_timeline AS timeline
+                 LEFT JOIN app_events AS source
+                   ON source.group_id_hex = timeline.group_id_hex
+                  AND source.message_id_hex = timeline.message_id_hex
+                 WHERE timeline.group_id_hex = ? AND timeline.message_id_hex IN ({placeholders})"
             );
             let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
             params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
             params.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
             let mut stmt = conn.prepare_cached(&sql).storage()?;
             let rows = stmt
-                .query_map(params_from_iter(params.iter()), reply_preview_from_row)
+                .query_map(params_from_iter(params.iter()), |row| {
+                    Ok((reply_preview_from_row(row)?, row.get::<_, bool>(13)?))
+                })
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
                 .storage()?;
-            for mut preview in rows {
+            for (mut preview, source_missing) in rows {
+                if source_missing
+                    && preview.kind == MARMOT_APP_EVENT_KIND_AGENT_ITEM
+                    && let Some(source) =
+                        held_agent_item_source(conn, &group_id_hex, &preview.message_id_hex)?
+                {
+                    preview.retention_seconds = source.retention_seconds;
+                    preview.retention_expires_at = source.retention_expires_at;
+                }
                 preview.thread = threads::thread_ref(
                     conn,
                     &threads::ReadRow {
@@ -5557,6 +5583,12 @@ fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineR
         deleted: row.get::<_, i64>(6)? != 0,
         source_epoch: row
             .get::<_, Option<i64>>(7)?
+            .and_then(|value| value.try_into().ok()),
+        retention_seconds: row
+            .get::<_, Option<i64>>(11)?
+            .and_then(|value| value.try_into().ok()),
+        retention_expires_at: row
+            .get::<_, Option<i64>>(12)?
             .and_then(|value| value.try_into().ok()),
         invalidation_status: row.get(8)?,
         deletion_source: DeletionSource::from_storage(&row.get::<_, String>(9)?),

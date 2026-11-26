@@ -194,6 +194,8 @@ c_mirror! {
         opt_rec thread: MarmotTimelineThreadRef,
         /// The previewed message's own reply target. Nullable.
         opt_str reply_to_message_id_hex,
+        opt_copy has_retention_seconds/retention_seconds: u64,
+        opt_copy has_retention_expires_at/retention_expires_at: u64,
     }
 }
 

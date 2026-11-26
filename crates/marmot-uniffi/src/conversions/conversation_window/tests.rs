@@ -198,6 +198,8 @@ fn prepared_conversion_reuses_rows_and_text_but_keeps_all_visible_changes() {
                 kind: 9,
                 tags: vec![],
                 source_epoch: None,
+                retention_seconds: None,
+                retention_expires_at: None,
                 media: None,
                 deleted: false,
                 deletion_source: Default::default(),
