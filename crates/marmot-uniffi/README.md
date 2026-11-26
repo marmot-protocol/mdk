@@ -1439,7 +1439,9 @@ its delivery deadline, and stays visible through `pending_welcome_deliveries` an
 and `accepted` those that stored it. Of the rest, by the latest attempt, `refused` counts relays that answered and
 said no for any reason (including rate-limited and auth-required), `unreachable` relays that gave no answer, and
 `untried` relays it did not try. `last_problem` says why the latest attempt fell short: `NoInboxRelays`,
-`RefusedByRelays` (every relay tried said no, possibly only for now), `RelaysUnreachable` or `Mixed`. `Sending` can briefly show an accepted relay: MDK saves a relay's acceptance before it marks the
+`InboxLookupFailed` (no usable inbox relay is known and MDK's latest lookup of the recipient's inbox relay list
+failed; MDK looks it up again at its next retry), `RefusedByRelays` (every relay tried said no, possibly only for now),
+`RelaysUnreachable` or `Mixed`. `Sending` can briefly show an accepted relay: MDK saves a relay's acceptance before it marks the
 Welcome delivered, and until that mark lands (in the same pass, or on the next maintenance pass if it failed) MDK may
 still send it; the state then becomes `RelayAccepted` and an `InviteDeliveryChanged` follows.
 

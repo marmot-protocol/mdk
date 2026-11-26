@@ -20,6 +20,7 @@
 //! delays a host's notice; the query is always current.
 
 use super::*;
+use crate::routing::{MissingInboxRouteCause, TransportRoutingError};
 use crate::session::{OutboundWelcomeStatus, WelcomeSettlement};
 use cgka_traits::maintenance::{
     WelcomeCancelReason, WelcomeDeliveryProblem, WelcomeDeliveryRecord, WelcomeDeliveryState,
@@ -198,15 +199,25 @@ where
     }
 
     /// Count a publish of the Welcome `welcome_id` that found no route to the
-    /// recipient's inbox relays on its record. It stores no retry record, so
-    /// this is the attempt's only write. A Welcome with no record is left
-    /// without one.
-    pub(super) fn record_welcome_route_failure(&self, welcome_id: &cgka_traits::MessageId) {
+    /// recipient's inbox relays on its record, with `error`, the routing
+    /// failure, as its problem. It stores no retry record, so this is the
+    /// attempt's only write. A Welcome with no record is left without one.
+    pub(super) fn record_welcome_route_failure(
+        &self,
+        welcome_id: &cgka_traits::MessageId,
+        error: &TransportRoutingError,
+    ) {
+        let problem = match error {
+            TransportRoutingError::MissingInboxRoute(MissingInboxRouteCause::LookupFailed) => {
+                WelcomeDeliveryProblem::InboxLookupFailed
+            }
+            _ => WelcomeDeliveryProblem::NoInboxRelays,
+        };
         let recorded = match self.session.welcome_delivery_record(welcome_id) {
             Ok(Some(mut record)) => {
                 record.attempts = record.attempts.saturating_add(1);
                 record.last_attempt_at = Some(self.wall_clock.now());
-                record.last_problem = Some(WelcomeDeliveryProblem::NoInboxRelays);
+                record.last_problem = Some(problem);
                 record.relays = WelcomeRelayCounts::default();
                 self.session
                     .put_welcome_delivery_record(&record)

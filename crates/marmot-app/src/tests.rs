@@ -49,7 +49,7 @@ mod small_state;
 mod suspension_close;
 mod unreachable_group_relays;
 mod user_blocks;
-mod welcome_routes;
+pub(crate) mod welcome_routes;
 
 use super::*;
 use async_trait::async_trait;

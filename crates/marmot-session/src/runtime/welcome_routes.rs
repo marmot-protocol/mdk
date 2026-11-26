@@ -9,9 +9,19 @@
 //! owed Welcomes, the startup pass, a redelivery) are not held. The pacing is
 //! in memory, so a new runtime starts with none: a restart allows one fresh
 //! attempt.
+//!
+//! Each paced attempt that finds no route also owes the host one lookup of
+//! the recipient's inbox list ([`AccountDeviceRuntime::take_due_welcome_route_lookups`]).
+//! The host runs it, installs what it found in its routing policy, and, when
+//! that gives a route, releases the recipient's retry
+//! ([`AccountDeviceRuntime::release_welcome_route_retry`]), so the next pass
+//! sends the Welcome. A lookup that finds nothing usable leaves the pacing as
+//! it was. Route discovery stays with the host: the runtime only says whom to
+//! look up.
 
 use super::*;
 use crate::routing::{MissingInboxRouteCause, TransportRoutingError};
+use crate::session::OutboundWelcomeStatus;
 
 /// The wait after a recipient's first publish that found no route.
 const FIRST_ROUTE_RETRY_SECS: u64 = 10 * 60;
@@ -27,6 +37,9 @@ pub(super) struct WelcomeRouteRetries(HashMap<MemberId, RouteRetry>);
 struct RouteRetry {
     failures: u32,
     retry_at: Timestamp,
+    /// The host owes a lookup of the recipient's inbox list, for the paced
+    /// attempt that last failed.
+    lookup_due: bool,
 }
 
 impl WelcomeRouteRetries {
@@ -37,12 +50,38 @@ impl WelcomeRouteRetries {
         let retry = self.0.entry(recipient.clone()).or_insert(RouteRetry {
             failures: 0,
             retry_at: now,
+            lookup_due: false,
         });
         if retry.retry_at > now {
             return;
         }
         retry.failures = retry.failures.saturating_add(1);
         retry.retry_at = Timestamp(now.0.saturating_add(route_retry_delay_secs(retry.failures)));
+        retry.lookup_due = true;
+    }
+
+    /// Whether any recipient's lookup is owed.
+    fn lookup_owed(&self) -> bool {
+        self.0.values().any(|retry| retry.lookup_due)
+    }
+
+    /// Take up to `limit` owed lookups of recipients `take` accepts.
+    fn take_lookups(
+        &mut self,
+        limit: usize,
+        mut take: impl FnMut(&MemberId) -> bool,
+    ) -> Vec<MemberId> {
+        let mut taken = Vec::new();
+        for (recipient, retry) in &mut self.0 {
+            if taken.len() == limit {
+                break;
+            }
+            if retry.lookup_due && take(recipient) {
+                retry.lookup_due = false;
+                taken.push(recipient.clone());
+            }
+        }
+        taken
     }
 
     /// A publish to `recipient` found a route.
@@ -74,7 +113,8 @@ fn route_retry_delay_secs(failures: u32) -> u64 {
 
 /// The v5 `welcome_publish_not_started` reason for a routing failure: a
 /// recipient whose list is known and gives nothing to send to has no
-/// eligible route; one whose list is unknown could not be resolved.
+/// eligible route; one whose list is unknown, or could not be looked up,
+/// could not be resolved.
 pub(super) fn route_not_started_reason(
     error: &TransportRoutingError,
 ) -> audit_v5::NotStartedReason {
@@ -82,7 +122,9 @@ pub(super) fn route_not_started_reason(
         TransportRoutingError::MissingInboxRoute(
             MissingInboxRouteCause::EmptyList | MissingInboxRouteCause::NoneUsable,
         ) => audit_v5::NotStartedReason::NoEligibleRoute,
-        TransportRoutingError::MissingInboxRoute(MissingInboxRouteCause::NoList)
+        TransportRoutingError::MissingInboxRoute(
+            MissingInboxRouteCause::NoList | MissingInboxRouteCause::LookupFailed,
+        )
         | TransportRoutingError::MissingGroupRoute => {
             audit_v5::NotStartedReason::RouteResolutionFailed
         }
@@ -105,10 +147,7 @@ where
         let Some(recipient) = welcome_recipient(message) else {
             return;
         };
-        let mut retries = self
-            .welcome_route_retries
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut retries = self.lock_welcome_route_retries();
         match routed {
             Ok(()) => retries.routed(&recipient),
             Err(_) => retries.failed(&recipient, self.wall_clock.now()),
@@ -119,9 +158,7 @@ where
     /// because its recipient's route retry is not due yet.
     pub(super) fn welcome_route_retry_holds(&self, message: &TransportMessage) -> bool {
         welcome_recipient(message).is_some_and(|recipient| {
-            self.welcome_route_retries
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
+            self.lock_welcome_route_retries()
                 .holds(&recipient, self.wall_clock.now())
         })
     }
@@ -132,6 +169,48 @@ where
             .get_mut()
             .unwrap_or_else(|error| error.into_inner())
             .retain(owed);
+    }
+
+    /// The recipients whose inbox list the host should look up now: at most
+    /// `limit` of those whose last paced Welcome publish found no route, that
+    /// `take` accepts (a host skips one it is already looking up), and that
+    /// an owed Welcome is still addressed to. Each is taken once per paced
+    /// attempt; one `take` refuses stays owed. A Welcome that is withdrawn,
+    /// expired, delivered or still staged with its commit is not owed, so
+    /// nobody is looked up for it.
+    pub fn take_due_welcome_route_lookups(
+        &self,
+        limit: usize,
+        take: impl FnMut(&MemberId) -> bool,
+    ) -> AccountResult<Vec<MemberId>> {
+        if limit == 0 || !self.lock_welcome_route_retries().lookup_owed() {
+            return Ok(Vec::new());
+        }
+        let now = self.wall_clock.now();
+        let mut owed = HashSet::new();
+        for id in &self.watched_welcomes {
+            if let OutboundWelcomeStatus::Owed { message, .. } =
+                self.session.outbound_welcome_status(id, now)?
+                && let Some(recipient) = welcome_recipient(&message)
+            {
+                owed.insert(recipient);
+            }
+        }
+        let mut retries = self.lock_welcome_route_retries();
+        retries.retain(&owed);
+        Ok(retries.take_lookups(limit, take))
+    }
+
+    /// The host installed a route to `recipient` in its routing policy: end
+    /// its pacing, so the next maintenance pass sends its owed Welcomes.
+    pub fn release_welcome_route_retry(&self, recipient: &MemberId) {
+        self.lock_welcome_route_retries().routed(recipient);
+    }
+
+    fn lock_welcome_route_retries(&self) -> std::sync::MutexGuard<'_, WelcomeRouteRetries> {
+        self.welcome_route_retries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 }
 
@@ -171,11 +250,12 @@ mod tests {
         let reason =
             |cause| route_not_started_reason(&TransportRoutingError::MissingInboxRoute(cause));
         assert_eq!(
-            [NoList, EmptyList, NoneUsable].map(reason),
+            [NoList, EmptyList, NoneUsable, LookupFailed].map(reason),
             [
                 audit_v5::NotStartedReason::RouteResolutionFailed,
                 audit_v5::NotStartedReason::NoEligibleRoute,
                 audit_v5::NotStartedReason::NoEligibleRoute,
+                audit_v5::NotStartedReason::RouteResolutionFailed,
             ]
         );
         assert_eq!(

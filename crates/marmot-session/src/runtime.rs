@@ -7488,7 +7488,7 @@ where
                         welcome_routes::route_not_started_reason(&e),
                     );
                     if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
-                        self.record_welcome_route_failure(&message.id);
+                        self.record_welcome_route_failure(&message.id, &e);
                     }
                     self.record_audit_event(
                         welcome_facts.as_ref().map(|facts| &facts.group_id),

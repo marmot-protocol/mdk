@@ -573,6 +573,101 @@ async fn staged_invite_welcome_without_a_route_waits_for_its_paced_retry() {
     );
 }
 
+/// mdk#2261: each paced attempt that finds no route owes the host one lookup
+/// of the recipient's inbox list, taken once. A pass inside the wait owes
+/// none. Once the host installs a route and releases the retry, the next
+/// pass sends the Welcome without waiting out the pacing, and a delivered
+/// Welcome owes no lookup.
+#[tokio::test]
+async fn a_route_less_welcome_owes_one_lookup_per_paced_attempt() {
+    let dir = relaxed_storage_dir().unwrap();
+    let mut invite = retained_invite(dir.path()).await;
+    let carol = vec![invite.carol_id.clone()];
+    let take = |invite: &RetainedInvite| {
+        invite
+            .runtime
+            .take_due_welcome_route_lookups(4, |_| true)
+            .unwrap()
+    };
+    invite.route_carol(false);
+    invite.confirm_commit().await;
+    assert!(take(&invite).is_empty(), "no attempt has found no route yet");
+
+    invite.runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        invite
+            .runtime
+            .take_due_welcome_route_lookups(4, |_| false)
+            .unwrap()
+            .is_empty(),
+        "a recipient the host is already looking up is left owed"
+    );
+    assert_eq!(take(&invite), carol);
+    assert!(take(&invite).is_empty(), "one lookup per paced attempt");
+
+    invite.wall.set(300_100 + 599);
+    invite.runtime.run_due_maintenance().await.unwrap();
+    assert!(take(&invite).is_empty(), "a pass inside the wait owes none");
+    invite.wall.set(300_100 + 600);
+    invite.runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(take(&invite), carol);
+
+    // The lookup found a list: the host installs it and releases the retry.
+    invite.route_carol(true);
+    invite
+        .runtime
+        .release_welcome_route_retry(&invite.carol_id);
+    invite.wall.set(300_100 + 601);
+    invite.runtime.run_due_maintenance().await.unwrap();
+    let sent = staged_welcome_publishes(&invite.adapter);
+    assert_eq!(sent.len(), 1, "released, it goes out inside the wait");
+    assert_eq!(sent[0].id, invite.welcome.id);
+    assert!(
+        invite
+            .runtime
+            .outstanding_welcome_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(take(&invite).is_empty());
+}
+
+/// mdk#2261: nobody is looked up for a Welcome that is no longer owed. A
+/// lookup owed when the Welcome is withdrawn, or when it passes its delivery
+/// deadline, is never taken.
+#[tokio::test]
+async fn no_lookup_is_taken_for_a_withdrawn_or_expired_welcome() {
+    for withdraw in [true, false] {
+        let dir = relaxed_storage_dir().unwrap();
+        let mut invite = retained_invite(dir.path()).await;
+        invite.route_carol(false);
+        invite.confirm_commit().await;
+        invite.runtime.run_due_maintenance().await.unwrap();
+        if withdraw {
+            assert_eq!(
+                invite.runtime.withdraw_welcome(&invite.welcome.id).unwrap(),
+                WelcomeWithdrawal::Withdrawn
+            );
+        } else {
+            let deadline = invite
+                .runtime
+                .session()
+                .sent_welcome_deliver_until(&invite.welcome.id)
+                .unwrap()
+                .expect("an invite's Welcome has a delivery deadline");
+            invite.wall.set(deadline.0);
+        }
+        assert!(
+            invite
+                .runtime
+                .take_due_welcome_route_lookups(4, |_| true)
+                .unwrap()
+                .is_empty(),
+            "withdrawn: {withdraw}"
+        );
+    }
+}
+
 /// A Welcome stays watched while its stored fanout retries it, so if that
 /// fanout expires with the Welcome still owed, the next pass sends it again,
 /// as the startup pass would at the next open.

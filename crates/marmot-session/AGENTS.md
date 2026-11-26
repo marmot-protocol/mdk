@@ -164,8 +164,11 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     maintenance leaves its owed Welcomes alone until then; explicit publishes are not held, and each retry asks the
     routing policy again. A held pass writes nothing, the Welcome's delivery record included, so that record counts
     one route failure per paced attempt. The policy's `MissingInboxRouteCause` maps to the v5 `welcome_publish_not_started` reason
-    (`no_eligible_route` for an empty or unusable list, `route_resolution_failed` for none known); add no reason for
-    it. Route discovery stays with the host.
+    (`no_eligible_route` for an empty or unusable list, `route_resolution_failed` for none known or a failed lookup,
+    `LookupFailed`, which the delivery record shows as `InboxLookupFailed`); add no reason for it. Route discovery
+    stays with the host: each paced attempt that finds no route owes it one lookup of the recipient
+    (`take_due_welcome_route_lookups`, only while an owed Welcome is addressed to them), and a host that installs a
+    route releases the retry (`release_welcome_route_retry`) so the next pass sends it.
   - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b), and join a
     chat from a sibling Welcome the app admitted (3.5b); like a confirmed rejoin, that join's events wait for the
     caller's drain. It also lists the sibling Welcomes this device owes and records a carrier's outcome on one
