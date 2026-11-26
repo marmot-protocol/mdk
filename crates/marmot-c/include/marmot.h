@@ -741,7 +741,10 @@ typedef enum MarmotInviteDeliveryStateKind {
 
 /**
  * Why an invite has not reached a relay (mdk#1706). `TooLarge` and
- * `KeyPackageRetired` are not produced yet.
+ * `KeyPackageRetired` are not produced yet. `InboxLookupFailed`: no
+ * usable inbox relay is known for the recipient and MDK's latest lookup
+ * of their inbox relay list failed; MDK looks it up again at its next
+ * retry.
  */
 typedef enum MarmotInviteDeliveryProblem {
   MARMOT_INVITE_DELIVERY_PROBLEM_NO_INBOX_RELAYS,
@@ -750,6 +753,7 @@ typedef enum MarmotInviteDeliveryProblem {
   MARMOT_INVITE_DELIVERY_PROBLEM_MIXED,
   MARMOT_INVITE_DELIVERY_PROBLEM_TOO_LARGE,
   MARMOT_INVITE_DELIVERY_PROBLEM_KEY_PACKAGE_RETIRED,
+  MARMOT_INVITE_DELIVERY_PROBLEM_INBOX_LOOKUP_FAILED,
 } MarmotInviteDeliveryProblem;
 
 /**

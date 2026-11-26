@@ -6,6 +6,7 @@ mod read_queue;
 pub(crate) mod recovery_credits;
 mod schedule;
 mod sign_in_reads;
+mod welcome_route_lookups;
 mod welcome_runs;
 
 use read_queue::run_as_account_worker;
@@ -1827,6 +1828,9 @@ async fn run_app_runtime_account_worker(
     client.detach_welcome_waves();
     client.start_startup_welcome_retry();
     let mut welcome_runs = welcome_runs::WelcomeRuns::default();
+    // Lookups of invited recipients' inbox lists, beside the writer too
+    // (mdk#2261).
+    let mut welcome_route_lookups = welcome_route_lookups::WelcomeRouteLookups::default();
 
     let mut yield_to_convergence = false;
     let mut local_submission_service_owed = false;
@@ -1880,6 +1884,9 @@ async fn run_app_runtime_account_worker(
                 &account_label,
             );
         }
+        // Look up the inbox list of each recipient whose owed Welcome last
+        // found no route, as the session owes after each paced attempt.
+        welcome_route_lookups.adopt(&client);
         // An invitation answered here, or one a sibling's decision settled,
         // goes out and applies on this turn, not at the next maintenance
         // pass (mdk#3566). What it leaves owed retries with maintenance. Not
@@ -2333,6 +2340,16 @@ async fn run_app_runtime_account_worker(
                 // The continuation can replace this device's KeyPackage.
                 maintenance_due_dirty = true;
                 finish_sign_in_check(&mut client, settled, &shared, &events, &account_id_hex, &account_label);
+            }
+            // An inbox lookup ended: install what it found, on the writer.
+            // One that gives a route releases its recipient's retry, and
+            // maintenance runs now to send the Welcome.
+            ended = welcome_route_lookups.next(), if welcome_route_lookups.is_running() => {
+                let _unit = unit.enter(WorkerUnit::Maintenance);
+                if welcome_route_lookups.settle(&client, ended) {
+                    schedule.wake(schedule::Job::SessionMaintenance);
+                    maintenance_due_dirty = true;
+                }
             }
             command = async {
                 match ready_command.and_then(|index| pending.remove(index)) {
@@ -2846,6 +2863,9 @@ async fn run_app_runtime_account_worker(
                         // A read belongs to its client: a waiting host check
                         // keeps its place, and the new client reads again.
                         sign_in_reads.replace();
+                        // So does each inbox lookup; the new client's
+                        // session owes its own.
+                        welcome_route_lookups.replace();
                         // A outlives the client: its successor continues
                         // the versions (mdk#3273).
                         let mut read_state = client.take_read_state();
@@ -3491,6 +3511,8 @@ async fn run_app_runtime_account_worker(
     // A waiting host check gets the error a queued command gets; no read
     // outlives the worker.
     sign_in_reads.end().await;
+    // No inbox lookup outlives the worker either.
+    welcome_route_lookups.end().await;
     // Each exit that still held the client stopped the runner on it; any
     // other exit's drop aborts the task and refunds the attempts it left
     // open. What a quantum staged stays durable.
@@ -10022,6 +10044,7 @@ mod tests {
     mod selective_history_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod sign_in_read_tests;
+    mod welcome_route_lookup_tests;
     pub(super) mod welcome_wave_tests;
     mod worker_recovery_resume_tests;
     mod writer_hold_tests;

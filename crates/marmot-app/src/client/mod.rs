@@ -111,6 +111,7 @@ mod small_state;
 mod sync;
 #[cfg(test)]
 pub(crate) mod upload_cleanup_tests;
+pub(crate) mod welcome_route_lookups;
 pub(crate) mod welcome_waves;
 pub(crate) mod worker_due;
 
