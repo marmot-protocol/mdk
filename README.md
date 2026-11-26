@@ -260,8 +260,8 @@ request; `ci:apple` adds the iOS clippy and MarmotKit native host checks in
 automatically on pull requests or `master` pushes; run
 `gh workflow run bindings-profile.yml --ref <branch>` when a change needs
 packaged candidate validation before merging, and the
-[nightly release](release.md#nightly-builds) builds and validates the same
-packages from `master` on nights it does not skip.
+[daily RC workflow](release.md#daily-release-candidates) builds and validates the same
+packages from the verified `canary` branch tip.
 Existing nightly and weekly campaigns retain their wider coverage.
 
 Common targeted runs:
@@ -278,6 +278,8 @@ just flake-stress <package> '<filter>' [count]                      # rerun a fi
 just test-timing-ratchet                                            # fail when test files gain sleeps or sub-second timeouts
 just pr-trailers-check                                              # validate Local-Checks, Local-Review, and Release-Impact trailers
 just bisect-agent-contract                                          # run unit and synthetic-repo tests for the revert-only Bisect Agent
+just rc-release-contract                                            # test 3-layer SemVer RC classifier, publisher, and promotion guards
+just promote-rc <rc-version> [override-version]                     # promote a verified SemVer RC to a formal Stable cohort
 ```
 
 The CLI's real-relay end-to-end tests need the local relay stack:
@@ -309,9 +311,10 @@ The root and crate `CHANGELOG.md` files list changes by release. Changes not yet
 `changelog.d/`, one Markdown file per change, so pull requests never edit the same changelog lines. The release PR folds
 them into `CHANGELOG.md` with `just changelog-release <version>`; `just changelog-gate` checks them.
 
-Nightly pre-releases such as `marmotkit-v0.14.0-nightly.20261020` are built every day from the newest master commit that
-passed CI. They are for testing only: pin a formal release for anything you ship, expect each nightly to be deleted
-after 30 days, and don't count on going back to an older nightly. See [nightly builds](release.md#nightly-builds).
+SemVer Release Candidates such as `marmotkit-v0.20.0-rc.1` are built every day from the verified `canary` branch tip
+once `simulator-nightly`, `convergence-hardening`, and all three tracks pass, publishing `rc/latest.json` and
+`rc/signature_delta.json` on `rc-meta`. Promote a verified RC to a formal Stable cohort with
+`just promote-rc <rc-version>`. See [daily release candidates](release.md#daily-release-candidates).
 
 ## License
 

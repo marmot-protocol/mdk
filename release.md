@@ -118,61 +118,80 @@ cherry-picked onto it and the stable version on that branch. master stays on `0.
 publishing workflows still require release commits reachable from `origin/master`, so extend those checks before
 cutting the first point release from a release branch.
 
-### Nightly builds
+### Daily release candidates
 
-Every day `.github/workflows/nightly-releases.yml` builds MarmotKit (iOS, macOS, Android), Marmot C and WN Agent from
-the newest `master` commit verified at the `canary` branch tip (or whose merge-queue `Required CI` passed). It is
-scheduled for 00:17 UTC, but GitHub can start
-scheduled runs hours late; nothing depends on the start time except the date in the name. If that commit is the
-previous nightly's source, the night is skipped.
+Every day `.github/workflows/rc-releases.yml` builds SemVer Release Candidates (MarmotKit for iOS, macOS, and Android,
+Marmot C, and WN Agent) strictly from the verified `origin/canary` branch tip (never unverified `master`). It is
+scheduled for 00:17 UTC, and skips immediately when `origin/canary` matches the previous published RC's `source_sha`.
 
-Nightlies are for testing. Pin a formal release for anything you ship. Each nightly is deleted after 30 days, and going
-back to an older nightly (for example across a storage migration) is not supported.
+RCs are for staging and client integration testing. Pin a formal Stable release (`v<version>`) for production, or
+promote a verified RC directly via `.github/workflows/promote-release.yml` (`just promote-rc <rc_version>`).
 
-- **Version.** `<X.Y.Z>-nightly.<YYYYMMDD>`, where `X.Y.Z` is master's `X.Y.Z-dev` workspace version and the date is the
-  run's UTC date. A second nightly on the same day becomes `<X.Y.Z>-nightly.<YYYYMMDD>.1`, and so on. These sort after
-  the previous release and before `X.Y.Z` in semver. No version change is committed: the nightly version appears only
-  in asset names, manifests and release metadata, and every manifest records the exact source SHA.
-- **Releases.** Tags `marmotkit-v<nightly>`, `marmotc-v<nightly>` and `wn-agent-v<nightly>` on the source commit, titled
-  `v<nightly> - MarmotKit`, `v<nightly> - Marmot C` and `v<nightly> - wn-agent`. They are immutable pre-releases on the
-  main releases page and never Latest. There is no `v*` source release for a nightly. The tag-pushed release workflows
-  ignore nightly tags; the nightly calls those workflows itself.
-- **All three or none.** Each track uploads and verifies its assets on a draft. The publish job checks all three
-  drafts before it publishes any, so a failed build publishes nothing, and the next attempt replaces its drafts.
-  Published releases are immutable, so if publishing fails partway, re-run the failed publish job: it accepts the
-  tracks already published from the same commit and finishes the rest. `latest.json` moves only after all three are
-  public.
-- **WN Agent.** Nightlies carry the `wn-agent` and harness binary bundles and the Hermes and OpenClaw plugin bundles,
-  but no installers: download a bundle by hand and check it against its sibling `.sha256`. Installers, install guidance
-  and the install gates keep pinning the newest formal release; they never resolve to a nightly.
-- **`latest.json`.** After publishing, the workflow commits `latest.json` to the `nightly-meta` branch, which holds only
-  that file and never reaches `master`. GitHub signs the commit; the workflow refuses to move the branch to an
-  unverified commit. The file records `version`, `source_sha`, `date`, `workflow_run`, and for each track (`marmotkit`,
-  `marmotc`, `wn-agent`) its `tag`, `release_url` and every asset's `name`, `url`, `sha256` and `size`. App repositories
-  read it to bump their own pins.
-- **Retention.** Every scheduled run deletes nightly releases and their tags more than 30 days old, by the date in the
-  tag. It matches only `<track>-vX.Y.Z-nightly.YYYYMMDD[.N]` tags, so formal releases and `marmotkit-snapshot-*`
-  snapshots are never touched, and it keeps the nightly that `latest.json` names. Deleted nightly tag names are never
-  reused.
-- **Runner sharing.** A nightly waits up to three hours for running cohort releases and MarmotKit snapshots to finish,
-  then skips the night. Once a nightly is building, MarmotKit tag and snapshot runs and `just release-all` wait up to
-  three hours for it. The check is best effort: a release started in the seconds while a nightly passes its wait can
-  still overlap it.
-- **Failures.** When a job in a scheduled run fails or times out, the run's last job opens an issue titled "Nightly
-  release failed", or comments on the open one, with the source SHA, the failed jobs and the run URL. Skipped nights
-  (an unchanged source, a version that is not `X.Y.Z-dev`, a lane still busy after three hours) are not failures and
-  file nothing. Neither do cancelled runs or manual dispatches: whoever starts or cancels a run is watching it, and
-  rehearsals can run from any branch. Close the issue once a nightly publishes again.
+- **3-layer SemVer classification (`scripts/classify_release_impact.py`).** Each RC compares `origin/canary` against
+  the latest reachable stable `vX.Y.Z` tag across three layers (max-wins):
+  1. Mechanical UniFFI (`crates/marmot-uniffi/src/`) and C ABI (`crates/marmot-c/include/marmot.h`) signature and type
+     diff, emitting `rc/signature_delta.json` and Markdown deltas for downstream White Noise client agents.
+  2. Mechanical SQLite migration detector (`crates/storage-sqlite/src/base/migrations/`): any new or modified migration
+     triggers `minor` because downgrade across schema migrations is unsupported.
+  3. Commit trailers (`Release-Impact: none | patch | minor`) and pending `changelog.d/` fragments (`### Breaking changes`
+     triggers `minor`).
+  Breaking changes target `0.(X+1).0-rc.N`; compatible changes target `0.X.(Y+1)-rc.N`. Counter `N` (`>= 1`) increments
+  monotonically across all three tracks and deleted tag names are never reused. No version change is committed on
+  `master` for an RC.
+- **Five-gate publication (all or none).** `simulator-nightly` and `convergence-hardening` run first on the exact
+  `origin/canary` commit before acquiring the shared macOS `release-lane`. Once both verification gates pass, `MarmotKit`,
+  `Marmot C`, and `wn-agent` build in parallel and stage verified draft pre-releases (`<track>-v<rc>`). The `publish`
+  job runs ONLY when all five gates succeed, publishing all three immutable pre-releases (`make_latest: false`) before
+  advancing `rc-meta`. If a build or gate fails before `publish` starts, `cleanup-drafts` drops unpublished drafts so
+  retries start clean; if `publish` fails mid-way, remaining drafts are preserved so re-running `publish` resumes
+  atomically.
+- **WN Agent.** RCs carry the `wn-agent` and harness binary bundles plus Hermes and OpenClaw plugin bundles, without
+  installers. Installers, install guidance, and install gates keep pinning the newest formal Stable release.
+- **`rc-meta` branch.** After publishing, `rc_release.py publish` writes a GitHub-signed commit to the orphan `rc-meta`
+  branch containing `rc/latest.json`, `rc/signature_delta.json`, `rc/impact_report.json`, `rc/integration-notes.md`, and
+  `rc/releases/<rc_version>.json`. Client repositories consume `rc/latest.json` and `rc/signature_delta.json` for
+  automated staging bumps.
+- **Retention.** Every scheduled run deletes RC pre-releases and legacy `*-nightly.*` pre-releases older than 30 days,
+  protecting the RC named in `rc/latest.json` and never touching formal Stable releases or `marmotkit-snapshot-*` tags.
+- **Runner sharing.** An RC waits up to three hours for running cohort releases, promotions, and MarmotKit snapshots to
+  finish, then skips the day. Once an RC is building, formal releases, promotions, and snapshots wait up to three hours
+  for it.
+- **Failures.** Scheduled failures open or comment on the single open issue titled `"RC release failed"`.
 
-Rehearse with a manual dispatch; a dispatch that publishes must run the workflow from `master`:
+Rehearse with a manual dispatch; a publishing dispatch must run from `master`:
 
 ```sh
-gh workflow run nightly-releases.yml --ref master -f dry_run=true     # plan and retention report only
-gh workflow run nightly-releases.yml --ref master -f build_only=true  # build every track, publish nothing
+gh workflow run rc-releases.yml --ref master -f dry_run=true     # plan, 3-layer impact report, and signature delta only
+gh workflow run rc-releases.yml --ref master -f build_only=true  # build all 3 tracks without hardening gates or publish
 ```
 
-The plan job's summary shows the selected commit, the previous nightly, the version and the skip decision. A
-`build_only` run always builds, even when the source is unchanged; `force=true` does the same for a publishing run.
+### One-click Stable promotion
+
+Once an RC (`0.X.Y-rc.N`) has been validated in staging clients, promote it directly to a formal Stable cohort without
+manual version-bump PRs or redundant test/simulator/hardening re-runs:
+
+```sh
+just promote-rc 0.20.0-rc.1
+# Override patch <-> minor ONLY for a verified classifier false positive (never downgrade a real breaking API or migration change):
+just promote-rc 0.20.0-rc.1 0.19.1
+# Rehearse metadata stamping and zero-compile gates without pushing:
+just promote-rc 0.20.0-rc.1 "" true
+```
+
+`.github/workflows/promote-release.yml` (`scripts/promote_release.py`):
+
+1. Preflights `secrets.RELEASE_TOKEN` (required for live promotions to publish ruleset-protected formal tags and trigger
+   `Required CI` on the follow-up sync PR), verifies the named RC in `rc-meta`, and confirms all three immutable RC
+   pre-releases point at the same `source_sha` reachable from `origin/master`.
+2. Checks out that exact `source_sha`, stamps `Cargo.toml`, `Cargo.lock`, vector `conformance_version`, folded
+   `CHANGELOG.md`s, finalized `docs/release/<v>.md` and `docs/integration/<v>.md`, and installer pins, then enforces a
+   fail-closed metadata-only diff guard (`verify-metadata-diff`) and runs the zero-compile release gates.
+3. Builds final `MarmotKit`, `Marmot C`, and `wn-agent` Stable bundles in parallel from the signed `release/v<v>` commit
+   (skipping workspace tests, simulators, Tamarin, and hardening already proven by the RC).
+4. Publishes `v<v> - MDK` (`Latest`) and all three Stable track releases via `secrets.RELEASE_TOKEN`, commits
+   `rc-meta:stable/latest.json` with a GitHub-signed commit via `GITHUB_TOKEN`, validates the published iOS and macOS
+   SwiftPM consumers against `marmotkit-v<v>`, and opens a signed three-way docs/changelog/next-dev sync PR back to
+   `master`.
 
 Each release artifact should include a manifest recording the source commit, workspace version, release tag, artifact
 version, `Cargo.lock` hash when relevant, toolchain version, and package contents. Add explicit protocol or ABI fields
@@ -420,8 +439,8 @@ The workflow lives at:
 
 Hermes/OpenClaw plugin and agent-control contract pull requests run plugin validation checks only (no native binary
 builds); `master` pushes and unrelated core-crate PRs do not trigger this workflow. Manual runs build all targets for
-validation only. Publishing happens only when a tag matching `wn-agent-v*` is pushed (or via `nightly-releases.yml` for
-nightly pre-releases). The workflow validates version-like tags such as `wn-agent-v0.9.0` and requires the tag version
+validation only. Publishing happens only when a tag matching `wn-agent-v*` is pushed (or via `rc-releases.yml` / `promote-release.yml`
+for RC pre-releases and promoted Stable releases). The workflow validates version-like tags such as `wn-agent-v0.9.0` and requires the tag version
 to match the root workspace version in `Cargo.toml`.
 
 Before a WN Agent release, run the normal preflight plus:
@@ -642,7 +661,8 @@ The workflow lives at:
 It runs when a tag matching `marmotkit-v*` is pushed. The workflow validates version-like tags such as
 `marmotkit-v0.9.0`, builds the iOS, macOS, and Android binding bundles, and creates the matching immutable GitHub
 Release. It can also be dispatched with a full commit SHA reachable from `master` to create an immutable iOS, macOS,
-and Android snapshot. The [nightly workflow](#nightly-builds) calls it to stage each nightly's MarmotKit draft.
+and Android snapshot. The [daily RC workflow](#daily-release-candidates) and [promotion workflow](#one-click-stable-promotion) call it to
+stage each RC or promoted Stable MarmotKit draft.
 
 ### Parallel builds and build-only rehearsals
 
