@@ -61,7 +61,7 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   instead of waiting out the EOSE window, while an `AUTH` challenge still waits until the deadline), so a refusal on
   connect still decides a later close; a persistent NIP-67 `auth` EOSE hint is `AuthenticationRequired` and `more` is
   `Incomplete` (not for the inbox probe). `CLOSED` `rate-limited:` is `RateLimited` and bare `error: <other>` is
-  `Unreachable`, while permanent prefixes stay `Restricted`; verified records returned before an incomplete or closed
+  `Unreachable`, while permanent prefixes stay `Restricted`; verified kind 10002/10050 records returned before an incomplete or closed
   end are kept in `Partial { records, cause }`. Each query's relays share one byte budget
   (`FiniteRequests::sharing`); directory and public reads set no item cap, since a relay's every EVENT frame would count,
   matching or not. Frames not yet read are bounded per relay request, not per query: a queue of the budget plus one

@@ -11024,12 +11024,8 @@ async fn transient_relay_list_lookup_failure_retries_once_and_preserves_partial_
     use transport_nostr::DirectoryInspectionError;
 
     let (_dir, runtime, network, keys, id) = fixture().await;
-    // 1. Transient failure on first attempt succeeds on the 500ms retry -> clean Missing.
-    network.scripted_inspection_errors.lock().insert(
-        "index.example".into(),
-        vec![Some(DirectoryInspectionError::Unreachable), None],
-    );
-    let snapshot = inbox_step(
+    // Settle earlier steps first so the scripted failure targets kind-10050 itself.
+    let _ = inbox_step(
         &runtime,
         &network,
         &keys,
@@ -11038,6 +11034,27 @@ async fn transient_relay_list_lookup_failure_retries_once_and_preserves_partial_
         None,
     )
     .await;
+    // 1. Transient failure on first attempt succeeds on the 500ms retry -> clean Missing.
+    network.inspected_endpoints.lock().clear();
+    network.scripted_inspection_errors.lock().insert(
+        "index.example".into(),
+        vec![Some(DirectoryInspectionError::Unreachable), None],
+    );
+    let snapshot = runtime
+        .account_setup()
+        .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    assert_eq!(
+        network
+            .inspected_endpoints
+            .lock()
+            .iter()
+            .filter(|endpoint| endpoint.contains("index.example"))
+            .count(),
+        2,
+        "kind-10050 transient failure must retry once on the same relay"
+    );
     let state = &snapshot.steps[OnboardingStep::InboxRelays.index()];
     assert_eq!(state.status, OnboardingStatus::NeedsInput);
     assert!(
@@ -11483,13 +11500,15 @@ async fn interrupted_repair_publish_stays_exposed_even_if_retry_is_blocked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approval_does_not_combine_partial_basis_with_empty_authoritative_eose() {
     let (_dir, runtime, network, keys, id) = fixture().await;
+    // Declare `partial.example` as write-only so it is included in approval's
+    // `onboarding_sources` while the declaration still needs a read relay.
     let basis = signed(
         &keys,
         10002,
         vec![vec![
             "r".into(),
             "wss://partial.example".into(),
-            "read".into(),
+            "write".into(),
         ]],
         "",
         unix_now_seconds() - 10,
@@ -11517,10 +11536,10 @@ async fn approval_does_not_combine_partial_basis_with_empty_authoritative_eose()
         .unwrap();
     assert!(!proposed.proposal.as_ref().unwrap().inconclusive);
 
-    // During approval: `index.example` (authoritative) completes EOSE with NO
-    // events, while `partial.example` returns `basis` before failing. Neither
-    // completed authoritative source corroborated `basis`, so approval must
-    // neither renew nor publish.
+    // 1. Cross-source split: `index.example` completes EOSE with NO events,
+    //    while `partial.example` returns `basis` before failing. Neither
+    //    completed authoritative source corroborated `basis`, so approval must
+    //    neither renew nor publish.
     network.events.lock().clear();
     network.inspection_errors.lock().insert(
         "partial.example".into(),
@@ -11536,13 +11555,65 @@ async fn approval_does_not_combine_partial_basis_with_empty_authoritative_eose()
         .approve_onboarding_repair(&id, proposed.revision)
         .await
         .unwrap();
-    assert_eq!(
-        after.steps[OnboardingStep::Relays.index()].status,
-        OnboardingStatus::RetryableFailure
+    let step = &after.steps[OnboardingStep::Relays.index()];
+    assert_eq!(step.status, OnboardingStatus::RetryableFailure);
+    assert!(
+        step.findings.iter().any(|f| {
+            f.endpoint.as_deref() == Some("wss://partial.example")
+                && f.issue == OnboardingIssue::Unreachable
+        }),
+        "approval must actually query partial.example: {:?}",
+        step.findings
     );
     assert!(
         after.proposal.is_none(),
         "empty authoritative EOSE + partial basis must not renew the proposal"
+    );
+    assert!(network.attempts.lock().is_empty());
+
+    // 2. Within-relay retry split: `partial.example` returns `basis` before
+    //    `RateLimited`, then answers an empty EOSE on retry (so every source
+    //    completes empty). The failed attempt's partial record must not pass as
+    //    completed corroboration on either the complete or inconclusive path.
+    network.inspection_errors.lock().clear();
+    network.events.lock().push(basis.clone());
+    let checked = setup
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    assert_eq!(
+        checked.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    let re_proposed = setup
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    network.events.lock().clear();
+    network.scripted_inspection_errors.lock().insert(
+        "partial.example".into(),
+        vec![
+            Some(transport_nostr::DirectoryInspectionError::partial(
+                vec![DirectoryRelayEventRecord {
+                    endpoints: vec![TransportEndpoint("wss://partial.example".into())],
+                    event: basis.clone(),
+                }],
+                transport_nostr::DirectoryInspectionError::RateLimited,
+            )),
+            None,
+        ],
+    );
+    let after_retry = setup
+        .approve_onboarding_repair(&id, re_proposed.revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_retry.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::RetryableFailure
+    );
+    assert!(
+        after_retry.proposal.is_none(),
+        "partial first attempt + empty EOSE retry must not satisfy approval"
     );
     assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();

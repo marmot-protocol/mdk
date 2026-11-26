@@ -1255,54 +1255,50 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             let result = finite
                 .fetch_watching(&relay, vec![filter], limits, &cancel, &mut auth)
                 .await;
-            if query.kind != 1059 {
-                // Retain verified records even if the relay later ended
-                // incompletely or closed the REQ.
+            let preserve_partial = matches!(query.kind, 10002 | 10050);
+            let collect_verified = |target: &mut Vec<DirectoryRelayEventRecord>| {
+                if query.kind == 1059 {
+                    return;
+                }
                 for event in &result.events {
                     if let Some(event) = validated_directory_event(event, &query) {
-                        records.push(DirectoryRelayEventRecord {
+                        target.push(DirectoryRelayEventRecord {
                             endpoints: request.endpoints.clone(),
                             event,
                         });
                     }
                 }
-            }
+            };
             match &result.end {
-                // NIP-67 `auth`: `FiniteRequests` already retried once after
-                // authenticating when a signer was available; a persistent
-                // `auth` hint means the relay still withholds events behind
-                // authentication. The inbox probe needs only an answer.
-                FiniteEnd::Eose if result.auth && query.kind != 1059 => {
-                    return Err(DirectoryInspectionError::partial(
-                        records,
-                        AuthenticationRequired,
-                    ));
+                FiniteEnd::Eose if !result.auth && !result.more => {
+                    collect_verified(&mut records);
                 }
-                // NIP-67 `more`: the relay cut its answer, so a newer event
-                // may be unread.
-                FiniteEnd::Eose if result.more && query.kind != 1059 => {
-                    return Err(DirectoryInspectionError::partial(records, Incomplete));
+                end => {
+                    // NIP-67 `auth`: `FiniteRequests` already retried once after
+                    // authenticating when a signer was available; a persistent
+                    // `auth` hint means the relay still withholds events behind
+                    // authentication. NIP-67 `more`: the relay cut its answer.
+                    // The inbox probe (`kind == 1059`) needs only an EOSE answer.
+                    let cause = match end {
+                        FiniteEnd::Eose if result.auth && query.kind != 1059 => {
+                            AuthenticationRequired
+                        }
+                        FiniteEnd::Eose if result.more && query.kind != 1059 => Incomplete,
+                        FiniteEnd::Eose => continue,
+                        FiniteEnd::Closed(reason) => directory_closed_reason(reason),
+                        FiniteEnd::TimedOut if signing_pending.load(Ordering::Relaxed) => {
+                            AuthenticationTimedOut
+                        }
+                        FiniteEnd::TimedOut => TimedOut,
+                        FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => Restricted,
+                        _ => Unreachable,
+                    };
+                    if preserve_partial {
+                        collect_verified(&mut records);
+                        return Err(DirectoryInspectionError::partial(records, cause));
+                    }
+                    return Err(cause);
                 }
-                FiniteEnd::Eose => {}
-                FiniteEnd::Closed(reason) => {
-                    return Err(DirectoryInspectionError::partial(
-                        records,
-                        directory_closed_reason(reason),
-                    ));
-                }
-                FiniteEnd::TimedOut if signing_pending.load(Ordering::Relaxed) => {
-                    return Err(DirectoryInspectionError::partial(
-                        records,
-                        AuthenticationTimedOut,
-                    ));
-                }
-                FiniteEnd::TimedOut => {
-                    return Err(DirectoryInspectionError::partial(records, TimedOut));
-                }
-                FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => {
-                    return Err(DirectoryInspectionError::partial(records, Restricted));
-                }
-                _ => return Err(DirectoryInspectionError::partial(records, Unreachable)),
             }
         }
         Ok(records)

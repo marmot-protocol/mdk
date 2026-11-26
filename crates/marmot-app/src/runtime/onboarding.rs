@@ -2908,6 +2908,7 @@ impl AccountSetup<'_> {
                     }
                 };
                 let mut result = inspect_once(CHECK_WAIT).await;
+                let mut prior_partial = Vec::new();
                 if retry_transient
                     && !external_signer
                     && let Err(error) = &result
@@ -2919,32 +2920,38 @@ impl AccountSetup<'_> {
                         let remaining =
                             deadline.saturating_duration_since(tokio::time::Instant::now());
                         if !remaining.is_zero() {
-                            let (mut prior_records, _) = result.unwrap_err().into_parts();
-                            result = match inspect_once(remaining).await {
-                                Ok(mut retry_records) => {
-                                    prior_records.append(&mut retry_records);
-                                    Ok(prior_records)
-                                }
-                                Err(retry_error) => {
-                                    let (mut retry_records, retry_cause) = retry_error.into_parts();
-                                    prior_records.append(&mut retry_records);
-                                    Err(transport_nostr::DirectoryInspectionError::partial(
-                                        prior_records,
-                                        retry_cause,
-                                    ))
-                                }
-                            };
+                            let (prior_records, _) = result.unwrap_err().into_parts();
+                            prior_partial = prior_records;
+                            result = inspect_once(remaining).await;
                         }
                     }
                 }
-                (endpoint, result)
+                (endpoint, prior_partial, result)
             });
         }
         let mut records = Vec::new();
         let mut completed_records: HashMap<String, Vec<NostrTransportEvent>> = HashMap::new();
+        let admit = |record: DirectoryRelayEventRecord, failures: &mut Vec<OnboardingFinding>| {
+            let event = record.event;
+            let valid = event.kind == kind
+                && event.pubkey == account_id
+                && event.to_verified_nostr_event().is_ok();
+            if kind == 30443 && event.kind == kind && event.pubkey == account_id && !valid {
+                failures.push(finding(OnboardingIssue::Malformed));
+            }
+            valid.then_some(event)
+        };
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok((endpoint, Ok(events))) => {
+                Ok((endpoint, prior_partial, Ok(events))) => {
+                    // Partial records from an earlier failed attempt still
+                    // detect newer records, but never count as completed
+                    // corroboration from the retry's EOSE reply.
+                    for record in prior_partial {
+                        if let Some(event) = admit(record, &mut failures) {
+                            records.push(event);
+                        }
+                    }
                     let key = relay_key(&endpoint);
                     completed.insert(key.clone(), endpoint);
                     // A full bounded page may omit another installation's slot.
@@ -2959,40 +2966,18 @@ impl AccountSetup<'_> {
                     }
                     let mut source_verified = Vec::new();
                     for record in events {
-                        let event = record.event;
-                        let valid = event.kind == kind
-                            && event.pubkey == account_id
-                            && event.to_verified_nostr_event().is_ok();
-                        if kind == 30443
-                            && event.kind == kind
-                            && event.pubkey == account_id
-                            && !valid
-                        {
-                            failures.push(finding(OnboardingIssue::Malformed));
-                        }
-                        if valid {
+                        if let Some(event) = admit(record, &mut failures) {
                             source_verified.push(event.clone());
                             records.push(event);
                         }
                     }
                     completed_records.insert(key, source_verified);
                 }
-                Ok((endpoint, Err(error))) => {
+                Ok((endpoint, prior_partial, Err(error))) => {
                     use transport_nostr::DirectoryInspectionError::*;
                     let (partial, cause) = error.into_parts();
-                    for record in partial {
-                        let event = record.event;
-                        let valid = event.kind == kind
-                            && event.pubkey == account_id
-                            && event.to_verified_nostr_event().is_ok();
-                        if kind == 30443
-                            && event.kind == kind
-                            && event.pubkey == account_id
-                            && !valid
-                        {
-                            failures.push(finding(OnboardingIssue::Malformed));
-                        }
-                        if valid {
+                    for record in prior_partial.into_iter().chain(partial) {
+                        if let Some(event) = admit(record, &mut failures) {
                             records.push(event);
                         }
                     }
@@ -3810,6 +3795,12 @@ impl AccountSetup<'_> {
         // only an unanswered source holds is the accepted risk.
         let auth_keys = self.authoritative_completed_keys(&c, &sources, &completed);
         let authoritative = !auth_keys.is_empty();
+        let completed_corroborates_basis = match proposal.previous_event_id.as_ref() {
+            Some(expected_id) => completed_records
+                .values()
+                .any(|events| events.iter().any(|event| &event.id == expected_id)),
+            None => !completed.is_empty() && records.is_empty(),
+        };
         let authoritative_corroborates_basis = match proposal.previous_event_id.as_ref() {
             Some(expected_id) => auth_keys.iter().any(|key| {
                 completed_records
@@ -3882,7 +3873,9 @@ impl AccountSetup<'_> {
                 OnboardingAction::ApproveRepair,
                 OnboardingAction::CancelRepair,
             ];
-        } else if !complete && !(accepted_risk && basis_newest) {
+        } else if (complete && !completed_corroborates_basis)
+            || (!complete && !(accepted_risk && basis_newest))
+        {
             let failures = if failures.is_empty() {
                 vec![finding(OnboardingIssue::DiscoveryIncomplete)]
             } else {
