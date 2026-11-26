@@ -343,8 +343,14 @@ class LeaderboardTests(unittest.TestCase):
         self.assertEqual([row["test"] for row in data["tests"]], ["flaky"])
         self.assertEqual([path.name for path in self.cache.rglob("run-*")], ["run-1.json.gz"])
 
+    def test_defaults_query_scheduled_canary_runs_while_keeping_overrides(self):
+        defaults = flake_report.parse_args([])
+        self.assertEqual((defaults.workflow, defaults.event), ("canary.yml", "schedule"))
+        override = flake_report.parse_args(["--workflow", "ci.yml", "--event", "merge_group"])
+        self.assertEqual((override.workflow, override.event), ("ci.yml", "merge_group"))
+
     def test_markdown_shrinks_to_fit_an_issue_body(self):
-        report_data = {"generated_at": "now", "workflow": "ci.yml", "since": "then", "notes": [],
+        report_data = {"generated_at": "now", "workflow": "canary.yml", "event": "schedule", "since": "then", "notes": [],
                        "runs": {"with_reports": 1, "malformed_reports": 0},
                        "tests": [{"test": f"t{n}", "binary_id": "p", "flaky_attempts": 1, "failed_attempts": 0,
                                   "runs_seen": 1, "first_seen": "d", "last_seen": "d", "stress": "s",

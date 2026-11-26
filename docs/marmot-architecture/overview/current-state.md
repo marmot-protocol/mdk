@@ -260,7 +260,7 @@ uploaded-before-success semantics while also enforcing the new group-image byte,
 before canonical creation.
 
 The workspace maintains a compile-only browser WASM boundary for `cgka-traits`, `cgka-engine`, and
-`transport-nostr-peeler` on `wasm32-unknown-unknown`. Required CI keeps those three libraries compiling with
+`transport-nostr-peeler` on `wasm32-unknown-unknown`. Canary and full CI keep those three libraries compiling with
 warnings denied, and `just wasm-check` provides the matching local gate. This is a portability boundary, not a
 browser-runtime acceptance claim: SQLCipher storage, `marmot-app`, UniFFI/C bindings, the CLI, and daemons remain
 outside its scope, and browser execution still requires downstream acceptance coverage.

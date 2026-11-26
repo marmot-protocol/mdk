@@ -220,17 +220,21 @@ cargo test -p <crate>        # targeted tests for the crate you changed
 just ci                      # full local parity with GitHub CI (slow)
 ```
 
-Team pull requests run a ~1-minute static gate: verified commit signatures,
-formatting, static/contract gates (the tracing audit among them), `cargo-audit`,
-and advisory commit-trailer checks. External/fork pull requests and `ci:full` /
-manual runs execute the full `ci.yml` matrix on GitHub-hosted runners:
-workspace clippy, WASM build, every workspace test with the `ci` nextest
+Team pull requests run a ~1-minute static gate (there is no merge queue):
+verified commit signatures, formatting, static/contract gates (the tracing audit
+among them), `cargo-audit`, and advisory commit-trailer checks. External/fork
+pull requests, read-only org members, and `ci:full` / manual runs execute the
+full `ci.yml` matrix on GitHub-hosted runners: workspace clippy, WASM build,
+Android arm64-v8a cross-check, every workspace test with the `ci` nextest
 profile, the CLI and relay end-to-end suites, simulator lanes, C bindings, iOS
 clippy, Windows filesystem contracts, Tamarin, Hermes and installer checks.
-`Required CI` must pass before a change lands, and post-merge `Canary` runs
-continuously verify `master`. Master pushes run CI only to refresh the Rust
-dependency caches when `Cargo.lock`, a `Cargo.toml`, the toolchain pin, Cargo
-config or `ci.yml` changes.
+`Required CI` must pass before a change lands. Post-merge `Canary` verification
+runs continuously on `master` (bare-metal Linux Canary advances the protected
+`canary` branch; hourly `.github/workflows/canary.yml` runs the 6-shard full
+cross-platform matrix and conditional `bindings-profile.yml` under a serialized
+`macos-packaging` concurrency group whenever `master` moves). Master pushes run
+`ci.yml` only to refresh Rust dependency caches when `Cargo.lock`, a
+`Cargo.toml`, the toolchain pin, Cargo config or `ci.yml` changes.
 
 Workspace test shards keep the runner's unused SDKs when at least 32 GiB is
 free; below that budget they reclaim SDK space before downloading the test
@@ -266,8 +270,10 @@ Common targeted runs:
 cargo test -p cgka-engine
 cargo test -p cgka-conformance-simulator                            # scenarios, vectors, property tests
 cargo test -p cgka-conformance-simulator --features conformance-slow  # wider property-test run
+just wasm-check                                                     # compile-check browser WASM libraries
+just android-check                                                  # compile-check marmot-uniffi for Android arm64-v8a (needs NDK)
 just tamarin                                                        # formal models
-just flake-report                                                   # rank tests that failed an attempt in recent merge-queue runs
+just flake-report                                                   # rank tests that failed an attempt in recent CI runs
 just flake-stress <package> '<filter>' [count]                      # rerun a filter with no retries to prove a flake fix
 just test-timing-ratchet                                            # fail when test files gain sleeps or sub-second timeouts
 just pr-trailers-check                                              # validate Local-Checks, Local-Review, and Release-Impact trailers

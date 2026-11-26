@@ -13,9 +13,11 @@ description: >-
 # Land a change
 
 Verification and cross-model review happen on your machine, the team PR gate
-checks commit signatures, formatting, static contracts, and `cargo-audit` (~1
-minute), and post-merge `Canary` runs verify `master` continuously. Nothing
-reaches `master` by direct push or unsigned commit.
+checks commit signatures, formatting, static contracts, `cargo-audit`, and
+advisory commit trailers (~1 minute, zero Rust compile; there is no merge
+queue), and post-merge `Canary` runs (bare-metal Linux Canary on `mdk-ci-1` +
+hourly cross-platform `.github/workflows/canary.yml`) verify `master`
+continuously. Nothing reaches `master` by direct push or unsigned commit.
 
 You own the change until it is a ready PR: `Required CI` green, both reviewers
 say merge, no conflicts. Then stop and report (step 6). Merge only when the user

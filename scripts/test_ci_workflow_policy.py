@@ -225,6 +225,7 @@ class PackagingPolicyTests(unittest.TestCase):
         bindings_profile = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
         bp_trigger = bindings_profile.split("\npermissions:\n", 1)[0]
         self.assertIn("  workflow_dispatch:", bp_trigger)
+        self.assertIn("  workflow_call:", bp_trigger)
         self.assertNotIn("  pull_request:", bp_trigger)
         self.assertNotIn("  push:", bp_trigger)
         self.assertNotIn("issues: write", bindings_profile)
@@ -320,16 +321,23 @@ class MergeGatePolicyTests(unittest.TestCase):
 
     def test_team_prs_select_fast_mode_while_external_prs_and_opt_ins_select_full(self):
         script = workflow_step("ci.yml", "Select CI mode")
-        for event, full_label, is_team, expected in [
-            ("pull_request", "false", "true", "fast"),
-            ("pull_request", "true", "true", "full"),
-            ("pull_request", "false", "false", "full"),
-            ("pull_request", "false", "", "full"),
-            ("merge_group", "false", "false", "full"),
-            ("workflow_dispatch", "false", "false", "full"),
-            ("push", "false", "false", "warm"),
+        for event, full_label, is_team, requested_shards, expected_mode, expected_shards in [
+            ("pull_request", "false", "true", "", "fast", "14"),
+            ("pull_request", "true", "true", "6", "full", "14"),
+            ("pull_request", "false", "false", "6", "full", "14"),
+            ("pull_request", "false", "", "", "full", "14"),
+            ("merge_group", "false", "false", "6", "full", "14"),
+            ("workflow_dispatch", "false", "false", "", "full", "14"),
+            ("workflow_dispatch", "false", "false", "6", "full", "6"),
+            ("schedule", "false", "false", "6", "full", "6"),
+            ("push", "false", "false", "", "warm", "14"),
         ]:
-            with self.subTest(event=event, full_label=full_label, is_team=is_team), tempfile.TemporaryDirectory() as tmp:
+            with self.subTest(
+                event=event,
+                full_label=full_label,
+                is_team=is_team,
+                shards=requested_shards,
+            ), tempfile.TemporaryDirectory() as tmp:
                 output = Path(tmp) / "output"
                 subprocess.run(
                     ["bash", "-c", script],
@@ -341,10 +349,39 @@ class MergeGatePolicyTests(unittest.TestCase):
                         "EVENT_NAME": event,
                         "FULL_CI": full_label,
                         "IS_TEAM_PR": is_team,
+                        "REQUESTED_SHARDS": requested_shards,
+                        "SOURCE_SHA": "",
                         "GITHUB_OUTPUT": str(output),
                     },
                 )
-                self.assertEqual(output.read_text(), f"ci_mode={expected}\n")
+                parsed = dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line)
+                self.assertEqual(parsed["ci_mode"], expected_mode)
+                self.assertEqual(parsed["rust_test_shards"], expected_shards)
+                self.assertEqual(
+                    json.loads(parsed["rust_test_partitions"]),
+                    list(range(1, int(expected_shards) + 1)),
+                )
+
+        # Invalid shard counts and malformed source_sha inputs must fail closed.
+        for bad_env in (
+            {"EVENT_NAME": "schedule", "REQUESTED_SHARDS": "9", "SOURCE_SHA": ""},
+            {"EVENT_NAME": "schedule", "REQUESTED_SHARDS": "6", "SOURCE_SHA": "not-a-sha"},
+        ):
+            with self.subTest(bad_env=bad_env), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "output"
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "FULL_CI": "false",
+                        "IS_TEAM_PR": "false",
+                        "GITHUB_OUTPUT": str(output),
+                        **bad_env,
+                    },
+                )
+                self.assertNotEqual(result.returncode, 0)
 
     def test_required_ci_enforces_fast_team_gate_and_full_external_gate(self):
         script = workflow_step("ci.yml", "Require every selected core CI job to succeed")
@@ -420,7 +457,7 @@ class MergeGatePolicyTests(unittest.TestCase):
             for block in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs)
             if ":\n" in block
         }
-        for job_name in ("rust-wasm-check", "rust-clippy", "rust-test-build"):
+        for job_name in ("rust-wasm-check", "rust-android-check", "rust-clippy", "rust-test-build"):
             with self.subTest(job=job_name):
                 self.assertIn("needs.changes.outputs.ci_mode != 'fast'", blocks[job_name])
         # `ci:apple` must trigger both macOS jobs even when changed paths leave run_ios=false.
@@ -431,6 +468,25 @@ class MergeGatePolicyTests(unittest.TestCase):
                     "      || (needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_ios == 'true')",
                     blocks[job_name],
                 )
+
+    def test_android_check_and_workflow_call_contracts(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        justfile = (ROOT / "Justfile").read_text()
+        self.assertIn("  workflow_call:\n", workflow)
+        self.assertIn("ANDROID_NDK_VERSION: 27.2.12479018", workflow)
+        android_job = workflow.split("\n  rust-android-check:\n", 1)[1].split("\n  rust-clippy:\n", 1)[0]
+        # `ci_runner.py prepare` deletes /usr/local/lib/android, so android-check must skip it.
+        self.assertNotIn("ci_runner.py prepare", android_job)
+        self.assertNotIn("Upload runner diagnostics", android_job)
+        # CI and local development share the single `just android-check` recipe.
+        self.assertIn("run: just android-check", android_job)
+        self.assertIn("cargo check --locked --target aarch64-linux-android -p marmot-uniffi", justfile)
+        self.assertIn("aarch64-linux-android26-clang", justfile)
+        # Every checkout in ci.yml must honor optional inputs.source_sha for Canary pinning.
+        checkouts = workflow.count("uses: actions/checkout@")
+        pinned = workflow.count("ref: ${{ inputs.source_sha }}")
+        self.assertEqual(checkouts, pinned)
+        self.assertGreaterEqual(checkouts, 24)
 
     def test_required_ci_needs_every_gating_job(self):
         # Required CI is the only required check, so a job missing from its
@@ -1603,6 +1659,256 @@ sha256sum() { shasum -a 256 "$@"; }
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("pr-trailers: OK (Release-Impact: patch)", result.stdout)
             self.assertNotIn("::warning", result.stdout)
+
+
+class CanaryWorkflowPolicyTests(unittest.TestCase):
+    @staticmethod
+    def _permissions_union(text: str) -> dict[str, str]:
+        rank = {"none": 0, "read": 1, "write": 2}
+        merged: dict[str, str] = {}
+        for match in re.finditer(r"(?m)^([ ]*)permissions:\n((?:\1  [a-z-]+: [a-z]+\n)+)", text):
+            for scope, level in re.findall(r"([a-z-]+): ([a-z]+)", match.group(2)):
+                if rank.get(level, -1) > rank.get(merged.get(scope, "none"), -1):
+                    merged[scope] = level
+        return merged
+
+    def test_canary_workflow_structure_permissions_and_concurrency(self):
+        workflow = (ROOT / ".github/workflows/canary.yml").read_text()
+        ci_workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        bp_workflow = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
+
+        self.assertIn('    - cron: "7 * * * *"\n', workflow)
+        self.assertIn("  workflow_dispatch:\n", workflow)
+        self.assertNotIn("  pull_request:", workflow)
+        self.assertIn("permissions:\n  actions: read\n  contents: read\n", workflow)
+        self.assertIn("concurrency:\n  group: canary\n  cancel-in-progress: false\n", workflow)
+        self.assertIn("uses: ./.github/workflows/ci.yml", workflow)
+        self.assertIn("rust_test_shards: 6", workflow)
+        self.assertIn("uses: ./.github/workflows/bindings-profile.yml", workflow)
+
+        # `verify-ci` must cover the full permission union requested by `ci.yml`
+        # (GitHub validates nested permissions before evaluating job `if:`s),
+        # while no other Canary job may hold write permissions.
+        verify_ci = workflow.split("\n  verify-ci:\n", 1)[1].split("\n  # Serialization", 1)[0]
+        verify_bp = workflow.split("\n  verify-bindings-profile:\n", 1)[1].split("\n  summary:\n", 1)[0]
+        plan_block = workflow.split("\n  plan:\n", 1)[1].split("\n  # GitHub validates", 1)[0]
+        summary_block = workflow.split("\n  summary:\n", 1)[1]
+
+        rank = {"none": 0, "read": 1, "write": 2}
+        ci_required = self._permissions_union(ci_workflow)
+        verify_ci_granted = self._permissions_union(verify_ci)
+        for scope, level in ci_required.items():
+            with self.subTest(scope=scope, required=level):
+                self.assertGreaterEqual(rank[verify_ci_granted.get(scope, "none")], rank[level])
+
+        bp_required = self._permissions_union(bp_workflow)
+        verify_bp_granted = self._permissions_union(verify_bp)
+        for scope, level in bp_required.items():
+            with self.subTest(bp_scope=scope, required=level):
+                self.assertGreaterEqual(rank[verify_bp_granted.get(scope, "none")], rank[level])
+
+        for readonly_name, block in (("plan", plan_block), ("verify-bindings-profile", verify_bp), ("summary", summary_block)):
+            with self.subTest(job=readonly_name):
+                self.assertNotIn(": write", block)
+
+        # Avoid nested concurrency deadlock: `bindings-profile.yml` owns `macos-packaging`.
+        self.assertNotIn("concurrency:", verify_bp)
+        self.assertIn("group: macos-packaging", bp_workflow)
+
+    def test_canary_plan_skips_unchanged_master_and_triggers_packaging_only_on_binding_diffs(self):
+        script = workflow_step("canary.yml", "Resolve Canary target and packaging trigger")
+        fake_gh = textwrap.dedent("""\
+            gh() {
+              if [[ "$FAKE_RUNS_JSON" == "error" ]]; then return 1; fi
+              if [[ "$FAKE_RUNS_JSON" == "error_body" ]]; then
+                printf '{"message":"Internal Server Error"}\\n'
+                return 1
+              fi
+              printf '%s\\n' "$FAKE_RUNS_JSON"
+            }
+        """)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "-b", "master")
+            git("config", "user.name", "Test")
+            git("config", "user.email", "test@example.com")
+            git("config", "commit.gpgsign", "false")
+            (repo / "crates/cgka-engine/src").mkdir(parents=True)
+            (repo / "crates/cgka-engine/src/lib.rs").write_text("// base\n")
+            git("add", ".")
+            git("commit", "-m", "c0")
+            c0 = git("rev-parse", "HEAD")
+
+            (repo / "crates/cgka-engine/src/lib.rs").write_text("// core change\n")
+            git("add", ".")
+            git("commit", "-m", "c1")
+            c1 = git("rev-parse", "HEAD")
+
+            (repo / "crates/marmot-uniffi/src").mkdir(parents=True)
+            (repo / "crates/marmot-uniffi/src/lib.rs").write_text("// binding change\n")
+            git("add", ".")
+            git("commit", "-m", "c2")
+            c2 = git("rev-parse", "HEAD")
+
+            (repo / ".github/actions/setup-odin").mkdir(parents=True)
+            (repo / ".github/actions/setup-odin/action.yml").write_text("name: setup-odin\n")
+            git("add", ".")
+            git("commit", "-m", "c3")
+            c3 = git("rev-parse", "HEAD")
+
+            (repo / ".cargo").mkdir(parents=True)
+            (repo / ".cargo/config.toml").write_text("[build]\n")
+            git("add", ".")
+            git("commit", "-m", "c4")
+            c4 = git("rev-parse", "HEAD")
+
+            (repo / "crates/marmot-uniffi-macros/src").mkdir(parents=True)
+            (repo / "crates/marmot-uniffi-macros/src/lib.rs").write_text("// macro change\n")
+            git("add", ".")
+            git("commit", "-m", "c5")
+            c5 = git("rev-parse", "HEAD")
+
+            # Simulate bare-metal Canary already sitting at c2.
+            git("update-ref", "refs/remotes/origin/canary", c2)
+
+            def run_plan(checkout_sha, runs, force="false", force_bp="false"):
+                git("checkout", "-q", checkout_sha)
+                out = repo / "gh_out"
+                out.unlink(missing_ok=True)
+                if isinstance(runs, str):
+                    runs_json = runs
+                elif isinstance(runs, dict):
+                    runs_json = json.dumps(runs)
+                else:
+                    runs_json = json.dumps({"workflow_runs": runs})
+                subprocess.run(
+                    ["bash", "-c", fake_gh + script],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "REPO": "marmot-protocol/mdk",
+                        "RUN_ID": "999",
+                        "FAKE_RUNS_JSON": runs_json,
+                        "FORCE": force,
+                        "FORCE_BINDINGS_PROFILE": force_bp,
+                        "GITHUB_OUTPUT": str(out),
+                    },
+                )
+                return dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+
+            def green(sha, run_id=100, updated_at="2026-11-26T15:00:00Z"):
+                return {"id": run_id, "head_sha": sha, "conclusion": "success", "updated_at": updated_at}
+
+            def failed(sha, run_id=101, updated_at="2026-11-26T15:30:00Z"):
+                return {"id": run_id, "head_sha": sha, "conclusion": "failure", "updated_at": updated_at}
+
+            # Unchanged master whose latest completed run succeeded skips quickly.
+            self.assertEqual(run_plan(c1, [green(c1)])["should_run"], "false")
+            # Force overrides skip.
+            forced = run_plan(c1, [green(c1)], force="true")
+            self.assertEqual((forced["should_run"], forced["run_bindings_profile"]), ("true", "false"))
+            # Manual run_bindings_profile=true also bypasses early skip on an already-green SHA.
+            forced_bp = run_plan(c1, [green(c1)], force="false", force_bp="true")
+            self.assertEqual((forced_bp["should_run"], forced_bp["run_bindings_profile"]), ("true", "true"))
+            # An older green run followed by a newer failed run on the same SHA must NOT skip
+            # and must retry packaging rather than letting the older green run bury the failure.
+            failed_after_green = run_plan(c1, [failed(c1, 102), green(c1, 100)])
+            self.assertEqual(
+                (failed_after_green["should_run"], failed_after_green["run_bindings_profile"]),
+                ("true", "true"),
+            )
+            # A rerun of an older run ID sits behind a newer ID in GitHub's creation-ordered list,
+            # but has a newer updated_at; ordering by completion recency must not skip it.
+            rerun_failed_behind_newer_green = run_plan(
+                c1,
+                [
+                    green(c1, 105, updated_at="2026-11-26T15:10:00Z"),
+                    failed(c1, 100, updated_at="2026-11-26T15:45:00Z"),
+                ],
+            )
+            self.assertEqual(
+                (rerun_failed_behind_newer_green["should_run"], rerun_failed_behind_newer_green["run_bindings_profile"]),
+                ("true", "true"),
+            )
+            # Core-only diff runs CI without heavy macOS bindings-profile packaging.
+            core = run_plan(c1, [green(c0)])
+            self.assertEqual((core["should_run"], core["run_bindings_profile"]), ("true", "false"))
+            # Binding diff triggers bindings-profile packaging.
+            binding = run_plan(c2, [green(c1)])
+            self.assertEqual((binding["should_run"], binding["run_bindings_profile"]), ("true", "true"))
+            # Tooling-only diff (setup-odin) also triggers bindings-profile packaging.
+            odin_tooling = run_plan(c3, [green(c2)])
+            self.assertEqual((odin_tooling["should_run"], odin_tooling["run_bindings_profile"]), ("true", "true"))
+            # Cargo config diff (.cargo/config.toml) also triggers bindings-profile packaging.
+            cargo_cfg = run_plan(c4, [green(c3)])
+            self.assertEqual((cargo_cfg["should_run"], cargo_cfg["run_bindings_profile"]), ("true", "true"))
+            # Binding proc-macro diff (crates/marmot-uniffi-macros/) also triggers packaging.
+            macro_diff = run_plan(c5, [green(c4)])
+            self.assertEqual((macro_diff["should_run"], macro_diff["run_bindings_profile"]), ("true", "true"))
+            # API failure (empty, error JSON on stdout with nonzero exit, or malformed payload)
+            # and missing hosted baseline all fail safe to running CI + packaging even if
+            # bare-metal `origin/canary` already sits at `source_sha`.
+            for bad_runs in ("error", "error_body", {"message": "bad payload"}, []):
+                with self.subTest(bad_runs=bad_runs):
+                    res = run_plan(c2, bad_runs)
+                    self.assertEqual((res["should_run"], res["run_bindings_profile"]), ("true", "true"))
+
+    def test_canary_summary_records_json_and_enforces_gate(self):
+        write_script = workflow_step("canary.yml", "Write Canary summary artifact")
+        gate_script = workflow_step("canary.yml", "Enforce Canary gate")
+        cases = [
+            ("success", "false", "false", "skipped", "skipped", "skipped", True),
+            ("success", "true", "false", "success", "skipped", "success", True),
+            ("success", "true", "true", "success", "success", "success", True),
+            ("success", "true", "false", "failure", "skipped", "failure", False),
+            ("success", "true", "true", "success", "failure", "failure", False),
+            ("failure", "true", "false", "skipped", "skipped", "failure", False),
+        ]
+        for plan_res, should_run, run_bp, ci_res, bp_res, expected_overall, gate_ok in cases:
+            with self.subTest(plan=plan_res, should_run=should_run, run_bp=run_bp, ci=ci_res, bp=bp_res), \
+                    tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                out = tmp_path / "out"
+                summary_md = tmp_path / "summary.md"
+                subprocess.run(
+                    ["bash", "-c", write_script],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "RUNNER_TEMP": tmp,
+                        "GITHUB_OUTPUT": str(out),
+                        "GITHUB_STEP_SUMMARY": str(summary_md),
+                        "PLAN_RESULT": plan_res,
+                        "SHOULD_RUN": should_run,
+                        "SOURCE_SHA": "a" * 40,
+                        "PREVIOUS_SHA": "b" * 40,
+                        "RUN_BINDINGS_PROFILE": run_bp,
+                        "CI_RESULT": ci_res,
+                        "BINDINGS_PROFILE_RESULT": bp_res,
+                        "RUN_ID": "42",
+                        "RUN_URL": "https://github.com/marmot-protocol/mdk/actions/runs/42",
+                    },
+                )
+                doc = json.loads((tmp_path / "canary-summary.json").read_text())
+                self.assertEqual(doc["overall"], expected_overall)
+                gate = subprocess.run(
+                    ["bash", "-c", gate_script],
+                    capture_output=True,
+                    timeout=10,
+                    env={**os.environ, "OVERALL": doc["overall"]},
+                )
+                self.assertEqual(gate.returncode == 0, gate_ok)
 
 
 if __name__ == "__main__":

@@ -61,20 +61,30 @@ before adding behavior or bindings.
 
 ## Landing changes
 
-Every change reaches master through a reviewed, signed squash PR; nobody pushes directly to master. Verification and
-cross-model review happen locally, the team PR gate checks signatures, formatting, static contracts, `cargo-audit`,
-and advisory commit trailers (~1 minute, zero Rust compile), and post-merge `Canary` runs continuously verify `master`.
-Follow `.agents/skills/land-change`: targeted tests plus the end-to-end smoke, two independent cross-model reviews of
-the local diff (`.agents/skills/review-local`) until both recommend merge, a short PR (`.agents/skills/gh-create-pr`)
-brought to green `Required CI` with no conflicts, then a report. Merge (`gh pr merge --squash --match-head-commit <sha>`)
-only when the user asks.
+Every change reaches `master` through a reviewed, signed squash PR; nobody pushes directly to `master` and there is
+no merge queue. The shipping flow is:
 
-Record three commit trailers on the final signed commit (which GitHub preserves in squash commits under
-`COMMIT_MESSAGES`), and verify them locally with `just pr-trailers-check`:
-
-- `Local-Checks: <commands run locally>`
-- `Local-Review: <seat-a> + <seat-b> merge @ <short-sha>` (or `human` / `exempt (<reason>)`)
-- `Release-Impact: none | patch | minor` — cross-checked against any `changelog.d/<slug>.md` fragments (`### Breaking changes` requires `minor`; non-breaking user-facing fragments forbid `none`).
+1. **Local verification & review:** Run scoped checks plus the end-to-end smoke (`.agents/skills/land-change`), get two
+   independent cross-model reviews (`.agents/skills/review-local`) until both recommend merge, and record three commit
+   trailers on the final signed commit (which GitHub preserves in squash commits under `COMMIT_MESSAGES`, verified
+   locally with `just pr-trailers-check`):
+   - `Local-Checks: <commands run locally>`
+   - `Local-Review: <seat-a> + <seat-b> merge @ <short-sha>` (or `human` / `exempt (<reason>)`)
+   - `Release-Impact: none | patch | minor` — cross-checked against any `changelog.d/<slug>.md` fragments (`### Breaking changes` requires `minor`; non-breaking user-facing fragments forbid `none`).
+2. **Fast team PR gate (`Required CI`):** Open a short PR (`.agents/skills/gh-create-pr`). Team PRs (same-repo branch
+   by an author with `write`, `maintain`, or `admin` permission) run a ~1-minute static gate with zero Rust compile:
+   verified commit signatures, `cargo fmt --all --check`, all static/contract gates, `cargo --locked audit`, and
+   advisory commit-trailer checks. External/fork PRs, read-only org members, and `ci:full` PRs fail closed into the full
+   `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs (`ios-account-clippy`,
+   `marmotkit-native-host`) to a team PR regardless of changed paths.
+3. **Squash-merge (only when asked):** Once `Required CI` is green and any required `CODEOWNERS` reviews approve,
+   confirm `headRefOid` matches the reviewed head and run `gh pr merge <pr> --squash --match-head-commit <sha>`.
+4. **Post-merge `Canary` & daily releases:** Bare-metal Linux Canary on `mdk-ci-1` verifies `master` every 30 minutes
+   (`fast-ci`, `cargo-audit`, `wasm-check`, `android-check`, `workspace-nextest`, `simulator-smoke`) and advances the
+   protected `canary` branch; hourly `.github/workflows/canary.yml` runs the full cross-platform matrix (de-sharded to 6
+   workspace shards plus Android, WASM, C bindings, macOS, Windows, Tamarin, and conditional `bindings-profile.yml`
+   under `macos-packaging` concurrency) whenever `master` moves. Daily `.github/workflows/nightly-releases.yml` builds
+   from the verified `canary` branch tip.
 
 ## Documentation
 
@@ -85,7 +95,7 @@ Record three commit trailers on the final signed commit (which GitHub preserves 
   crate map and the affected crate README in the same change.
 - Record a user-facing change as a new fragment file, `changelog.d/<slug>.md`, beside the `CHANGELOG.md` it belongs
   to (repository root or crate). Never edit a `CHANGELOG.md` to add an entry: concurrent PRs that add lines at the same
-  spot conflict in the merge queue. A fragment holds one or more `### <Section>` headings
+  spot conflict on merge. A fragment holds one or more `### <Section>` headings
   (`Breaking changes`, `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`), each followed by its
   entries, and its kebab-case slug names the change. To revise an unreleased entry, edit or delete its fragment.
   The release metadata PR folds the fragments in with `just changelog-release <version>`. Run `just changelog-gate`

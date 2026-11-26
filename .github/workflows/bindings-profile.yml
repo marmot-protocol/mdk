@@ -2,12 +2,18 @@ name: MarmotKit Release Profile
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact commit SHA to validate (defaults to github.sha)
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: marmotkit-profile-${{ github.sha }}
+  group: macos-packaging
   cancel-in-progress: false
 
 env:
@@ -35,11 +41,11 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_sha || github.sha }}
       - name: Record exact candidate identity
         id: identity
         env:
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ inputs.source_sha || github.sha }}
         shell: bash
         run: |
           set -euo pipefail
