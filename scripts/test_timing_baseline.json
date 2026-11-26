@@ -208,7 +208,7 @@
       "sleep": 3
     },
     "crates/marmot-app/src/runtime/account_worker/tests/selective_history_tests.rs": {
-      "sleep": 6
+      "sleep": 5
     },
     "crates/marmot-app/src/runtime/account_worker/tests/worker_recovery_resume_tests.rs": {
       "sleep": 2,
@@ -443,7 +443,7 @@
     },
     "crates/transport-nostr-adapter/src/sdk_client.rs": {
       "sleep": 10,
-      "short_timeout": 12
+      "short_timeout": 10
     },
     "crates/transport-nostr-adapter/src/sweep/tests.rs": {
       "sleep": 3

@@ -113,11 +113,9 @@ pub use relay_list::{
 };
 #[cfg(feature = "sdk")]
 pub use sdk_client::{
-    NostrReconciliationEndpointFailure, NostrReconciliationFailure, NostrReconciliationItem,
-    NostrReconciliationProgress, NostrReconciliationSummary, NostrSdkNotification,
-    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayLiveness,
-    RelayLivenessStatus, RelayRegistrationOutcome, dispatch_sdk_replay, sdk_subscription_refusal,
-    sign_transport_event_for_publish,
+    NostrSdkNotification, NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan,
+    RelayLiveness, RelayLivenessStatus, RelayRegistrationOutcome, dispatch_sdk_replay,
+    sdk_subscription_refusal, sign_transport_event_for_publish,
 };
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,
@@ -533,7 +531,7 @@ pub struct NostrAdapterMetrics {
     #[serde(default)]
     pub reconciliation_received_items: usize,
     /// Group passes that returned nothing because no time order covered the
-    /// history they were missing (`NostrReconciliationSummary::order_unproven`).
+    /// history they were missing.
     #[serde(default)]
     pub reconciliation_order_unproven_passes: usize,
     /// Account activations whose every REQ reached every relay.
@@ -1424,19 +1422,6 @@ impl NostrTransportAdapter {
             }
         }
         outcome
-    }
-
-    /// Record one privacy-safe aggregate NIP-77 result. These counters are
-    /// diagnostic only and never feed routing, convergence, or cursor policy.
-    #[cfg(feature = "sdk")]
-    pub async fn record_reconciliation(&self, summary: &NostrReconciliationSummary) {
-        let mut state = self.state.write().await;
-        state.metrics.reconciliation_attempts += 1;
-        state.metrics.reconciliation_relays_succeeded += summary.relays_succeeded;
-        state.metrics.reconciliation_relays_failed += summary.relays_failed;
-        state.metrics.reconciliation_remote_items += summary.remote_items;
-        state.metrics.reconciliation_received_items += summary.received_items;
-        state.metrics.reconciliation_order_unproven_passes += usize::from(summary.order_unproven);
     }
 
     /// Record one read-back: the REQs it sent and the relays that returned
