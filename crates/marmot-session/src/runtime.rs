@@ -736,10 +736,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     entropy: Arc<dyn EntropySource>,
     maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
-    /// Staged commits whose Welcomes are being sealed, each held only across
-    /// that await (see [`Self::seal_commit_welcomes`]). One still held when
-    /// no call is sealing names a commit whose call was dropped mid-seal,
-    /// which maintenance rolls back.
+    /// Commits noted before their Welcome seal. They stay here until returned
+    /// to a caller, durably staged for fanout, or rolled back. Maintenance
+    /// rolls back any commit left here when a call is dropped.
     sealing_commits: Vec<PendingStateRef>,
     /// This runtime was asked to withdraw the device's slot for sign-out, so
     /// it publishes nothing more, whether or not a relay accepted. The next
@@ -911,6 +910,7 @@ where
         monotonic_clock: Arc<dyn MonotonicClock>,
         entropy: Arc<dyn EntropySource>,
     ) -> Self {
+        self.session.set_founding_welcome_clock(wall_clock.clone());
         self.wall_clock = wall_clock;
         self.monotonic_clock = monotonic_clock;
         self.entropy = entropy;
@@ -4043,8 +4043,10 @@ where
         intent: SendIntent,
         context: AuditEventContext,
     ) -> AccountResult<PreparedSessionSend> {
-        self.confirm_commit_without_publish_from(intent, context, SendOrigin::Automatic)
-            .await
+        let prepared = self
+            .confirm_commit_without_publish_from(intent, context, SendOrigin::Automatic)
+            .await?;
+        Ok(self.hand_off_prepared_send(prepared))
     }
 
     /// Accept a group change the host asked for without publishing it, as
@@ -4055,8 +4057,17 @@ where
         intent: SendIntent,
         context: AuditEventContext,
     ) -> AccountResult<PreparedSessionSend> {
-        self.confirm_commit_without_publish_from(intent, context, SendOrigin::Host)
-            .await
+        let prepared = self
+            .confirm_commit_without_publish_from(intent, context, SendOrigin::Host)
+            .await?;
+        Ok(self.hand_off_prepared_send(prepared))
+    }
+
+    fn hand_off_prepared_send(&mut self, prepared: PreparedSessionSend) -> PreparedSessionSend {
+        if let PreparedSessionSend::Commit(commit) = &prepared {
+            self.forget_sealing_commit(commit.pending);
+        }
+        prepared
     }
 
     async fn confirm_commit_without_publish_from(
@@ -4202,7 +4213,6 @@ where
                 };
                 self.rollback_prepared_session_commit_refused(commit, None)
                     .await?;
-                self.forget_sealing_commit(pending);
                 return Err(error);
             }
         };
@@ -4245,6 +4255,7 @@ where
         output.absorb_session_effects(prepared_effects, &mut queue);
 
         let rollback = self.session.publish_failed(pending).await;
+        self.finish_unstaged_rollback(pending, &rollback);
         // A rollback can commit, retiring Welcomes, and fail after: record
         // what it retired either way.
         if let (Some(refusal), Some(unretired)) = (refusal, unretired) {
@@ -4299,7 +4310,7 @@ where
             _ => None,
         };
         let prepared = self
-            .confirm_commit_without_publish_with_audit_context(intent, context.clone())
+            .confirm_commit_without_publish_from(intent, context.clone(), SendOrigin::Automatic)
             .await?;
         let (session_effects, welcomes) = match prepared {
             PreparedSessionSend::Commit(prepared) => {
@@ -6122,7 +6133,6 @@ where
             Err(error) => {
                 self.rollback_unstaged_pending(Some(pending), output, queue)
                     .await?;
-                self.forget_sealing_commit(pending);
                 return Err(EngineError::Peeler(error).into());
             }
         };
@@ -6203,7 +6213,6 @@ where
             Err(error) => {
                 self.rollback_unstaged_pending(Some(pending), output, queue)
                     .await?;
-                self.forget_sealing_commit(pending);
                 return Err(EngineError::Peeler(error).into());
             }
         };
@@ -6233,6 +6242,7 @@ where
                 RollbackPass::Staging,
             )
             .await;
+            self.finish_unstaged_rollback(pending, &effects);
             // Recorded even when the rollback fails after it committed.
             let retired = self.retired_welcomes(unretired);
             self.record_v5_welcomes_refused(&retired, &refusal);
@@ -6740,6 +6750,9 @@ where
                     .await?;
                 return Err(error.into());
             }
+            if let Some(pending) = pending {
+                self.forget_sealing_commit(pending);
+            }
             // Welcomes of a create or commit first reach the runtime here,
             // once their sealed rows exist.
             if !bind.is_empty() {
@@ -6772,7 +6785,9 @@ where
         queue: &mut VecDeque<PublishWork>,
     ) -> AccountResult<()> {
         if let Some(pending) = pending {
-            let effects = self.session.publish_failed(pending).await?;
+            let rollback = self.session.publish_failed(pending).await;
+            self.finish_unstaged_rollback(pending, &rollback);
+            let effects = rollback?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -6781,25 +6796,18 @@ where
         Ok(())
     }
 
-    /// Seal the Welcomes of the staged commit `pending`. A remote signer can
-    /// hold the seal for minutes, and no fanout names the commit yet, so a
-    /// call dropped here would leave it pending for good. The commit is noted
-    /// across the await for [`Self::settle_dropped_seals`] to roll back, as a
-    /// seal failure would. A later seal keeps the notes of earlier dropped
-    /// ones. A failed seal keeps its note until the caller's rollback has
-    /// returned ([`Self::forget_sealing_commit`]), since that rollback can
-    /// wait too.
+    /// Note the commit before asking the signer. A seal does not transfer
+    /// ownership: a later size check or a rollback can still wait before the
+    /// commit has a fanout.
     async fn seal_commit_welcomes(
         &mut self,
         pending: PendingStateRef,
         welcomes: &[OutboundWelcome],
     ) -> Result<Vec<SealedWelcome>, cgka_traits::error::PeelerError> {
-        self.sealing_commits.push(pending);
-        let sealed = self.session.seal_welcomes(welcomes).await;
-        if sealed.is_ok() {
-            self.forget_sealing_commit(pending);
+        if !welcomes.is_empty() && !self.sealing_commits.contains(&pending) {
+            self.sealing_commits.push(pending);
         }
-        sealed
+        self.session.seal_welcomes(welcomes).await
     }
 
     /// Drop the note [`Self::seal_commit_welcomes`] keeps for `pending`.
@@ -6807,17 +6815,30 @@ where
         self.sealing_commits.retain(|noted| *noted != pending);
     }
 
-    /// Roll back each commit a call dropped mid-seal left staged; see
-    /// [`Self::seal_commit_welcomes`]. A commit the engine no longer holds is
-    /// settled: a rollback that failed after taking it left nothing to retry.
-    /// Any other failure keeps the commit for the next pass, which
-    /// [`Self::maintenance_due`] reports as owed. Each note stays until its
-    /// rollback settles, so a pass dropped mid-rollback loses none.
+    fn finish_unstaged_rollback(
+        &mut self,
+        pending: PendingStateRef,
+        rollback: &SessionResult<SessionEffects>,
+    ) {
+        if rollback.is_ok()
+            || rollback
+                .as_ref()
+                .is_err_and(|error| matches!(error.as_engine_error(), EngineError::UnknownPending))
+        {
+            self.forget_sealing_commit(pending);
+        }
+    }
+
+    /// Roll back commits whose call dropped before handing them off. A
+    /// failed or canceled rollback stays owed until the engine no longer
+    /// holds the commit.
     async fn settle_dropped_seals(&mut self) -> AccountResult<AccountDeviceEffects> {
         let mut output = AccountDeviceEffects::default();
         let mut queue = VecDeque::new();
         for pending in self.sealing_commits.clone() {
-            match self.session.publish_failed(pending).await {
+            let rollback = self.session.publish_failed(pending).await;
+            self.finish_unstaged_rollback(pending, &rollback);
+            match rollback {
                 Ok(effects) => {
                     output
                         .pending
@@ -6832,10 +6853,8 @@ where
                         error_kind = error.as_engine_error().privacy_safe_kind(),
                         "dropped-seal rollback failed; retried next pass"
                     );
-                    continue;
                 }
             }
-            self.forget_sealing_commit(pending);
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
         Ok(output)

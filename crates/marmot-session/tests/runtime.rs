@@ -508,6 +508,7 @@ struct RecordingAdapterInner {
     commit_too_large: Mutex<Vec<TransportEndpoint>>,
     /// Inbox relays whose known limit every Welcome is over.
     welcome_too_large: Mutex<Vec<TransportEndpoint>>,
+    park_next_welcome_preflight: Mutex<Option<tokio::sync::oneshot::Sender<MessageId>>>,
     /// Each commit size check's target endpoints, in order.
     commit_size_checks: Mutex<Vec<Vec<TransportEndpoint>>>,
     commit_size_check_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -966,6 +967,16 @@ impl TransportAdapter for RecordingAdapter {
         if !matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
             return None;
         }
+        let parked = self
+            .inner
+            .park_next_welcome_preflight
+            .lock()
+            .unwrap()
+            .take();
+        if let Some(parked) = parked {
+            parked.send(message.id.clone()).unwrap();
+            std::future::pending::<()>().await;
+        }
         self.size_class_over_event_len(message.payload.len(), target)
             .await
     }
@@ -1371,6 +1382,77 @@ async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
             .any(|member| member.id == bob_id)
     );
     assert_eq!(staged_welcome_publishes(&adapter).len(), 2);
+}
+
+#[tokio::test]
+async fn cancel_welcome_preflight() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("invite preflight cancellation key").unwrap();
+    let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"alice");
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_id = bob.self_id();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "invite preflight cancellation".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group = created.group_id;
+    let routing = staged_invite_routing(&group, &TransportEndpoint("wss://group.example".into()))
+        .with_inbox_route(
+            bob_id.clone(),
+            vec![TransportEndpoint("wss://bob-inbox.example".into())],
+        );
+    let adapter = RecordingAdapter::default();
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    );
+    let invite = SendIntent::Invite {
+        group_id: group.clone(),
+        key_packages: vec![bob.fresh_key_package().await.unwrap()],
+        initial_admins: Vec::new(),
+    };
+
+    let (parked, preflight) = tokio::sync::oneshot::channel();
+    *adapter.inner.park_next_welcome_preflight.lock().unwrap() = Some(parked);
+    let abandoned_welcome = tokio::select! {
+        _ = runtime.confirm_commit_without_publish_with_audit_context(
+            invite.clone(), Default::default(),
+        ) => panic!("the invite returned before parking in Welcome preflight"),
+        result = preflight => result.unwrap(),
+    };
+
+    let maintained = runtime.run_due_maintenance().await.unwrap();
+    assert!(matches!(
+        maintained.pending.as_slice(),
+        [PendingResolution::RolledBack { .. }]
+    ));
+    assert!(adapter.commit_publishes().is_empty());
+    assert!(adapter.publishes().is_empty());
+
+    let sent = runtime.send(invite).await.unwrap();
+    assert!(matches!(
+        sent.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    assert_eq!(adapter.commit_publishes().len(), 1);
+    let welcomes = staged_welcome_publishes(&adapter);
+    let [welcome] = welcomes.as_slice() else {
+        panic!("the replacement invite should publish one Welcome");
+    };
+    assert_ne!(welcome.id, abandoned_welcome);
+    assert!(matches!(
+        &welcome.envelope,
+        TransportEnvelope::Welcome { recipient } if *recipient == bob_id
+    ));
 }
 
 include!("runtime/frozen_fanout.rs");

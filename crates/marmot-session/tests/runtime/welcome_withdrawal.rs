@@ -895,7 +895,11 @@ async fn withdraw_before_hydration(past_deadline: bool) {
 async fn a_link_welcome_is_never_published_from_its_deadline_on() {
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot link welcome deadline key").unwrap();
-    let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"alice-deadline");
+    let wall = Arc::new(TestWallClock::new(300_000));
+    let mut alice = AccountDeviceSession::open(
+        mock_session_config(dir.path().join("alice.sqlite"), &key, b"alice-deadline", Arc::new(MockSealer))
+            .maintenance_sources(wall.clone(), Arc::new(TestRandom::new(0))),
+    ).unwrap();
     let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob-deadline");
     let bob_id = bob.self_id();
     let chosen = GroupId::new(vec![0x42; 16]);
@@ -934,7 +938,6 @@ async fn a_link_welcome_is_never_published_from_its_deadline_on() {
                 bob_id,
                 vec![TransportEndpoint("wss://bob-inbox.example".into())],
             );
-    let wall = Arc::new(TestWallClock::new(300_000));
     let mut runtime = AccountDeviceRuntime::new(
         alice,
         adapter.clone(),
@@ -1001,7 +1004,10 @@ async fn an_expired_link_welcome_is_audited_once_across_restarts() {
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot expired link audit key").unwrap();
     let alice_path = dir.path().join("alice.sqlite");
-    let mut alice = current_nostr_welcome_session(&alice_path, &key, b"alice-expired-link");
+    let mut alice = AccountDeviceSession::open(
+        current_nostr_welcome_config(&alice_path, &key, b"alice-expired-link")
+            .maintenance_sources(Arc::new(TestWallClock::new(300_000)), Arc::new(TestRandom::new(0))),
+    ).unwrap();
     let mut bob =
         current_nostr_welcome_session(dir.path().join("bob.sqlite"), &key, b"bob-expired-link");
     let bob_id = bob.self_id();
@@ -1122,7 +1128,11 @@ struct LinkWelcome {
 /// `bob_accepts`.
 async fn link_welcome(dir: &std::path::Path, bob_accepts: bool) -> LinkWelcome {
     let key = SqlCipherKey::new("marmot link deadline pass key").unwrap();
-    let mut alice = current_nostr_welcome_session(dir.join("alice.sqlite"), &key, b"alice-pass");
+    let wall = Arc::new(TestWallClock::new(300_000));
+    let mut alice = AccountDeviceSession::open(
+        current_nostr_welcome_config(dir.join("alice.sqlite"), &key, b"alice-pass")
+            .maintenance_sources(wall.clone(), Arc::new(TestRandom::new(0))),
+    ).unwrap();
     let mut bob = current_nostr_welcome_session(dir.join("bob.sqlite"), &key, b"bob-pass");
     let bob_id = bob.self_id();
     let bob_inbox = TransportEndpoint("wss://bob-inbox.example".into());
@@ -1162,7 +1172,6 @@ async fn link_welcome(dir: &std::path::Path, bob_accepts: bool) -> LinkWelcome {
                 vec![TransportEndpoint("wss://group.example".into())],
             )
             .with_inbox_route(bob_id, vec![bob_inbox]);
-    let wall = Arc::new(TestWallClock::new(300_000));
     let runtime = AccountDeviceRuntime::new(alice, adapter, policy, RecordingKeyPackages::default())
         .with_maintenance_sources(
             wall.clone(),

@@ -365,6 +365,7 @@ impl<S: StorageProvider> Engine<S> {
                 key_package_ref: Some(welcome.key_package_ref),
                 deliver_until: Some(deliver_until),
                 key_package_event_id: welcome.key_package_event_id,
+                expiry: None,
             },
             group_id,
             epoch,

@@ -1270,10 +1270,14 @@ impl<S: StorageProvider> Engine<S> {
                     key_package_ref,
                     deliver_until,
                     key_package_event_id,
+                    ..
                 } = payload
                 else {
                     return Err(EngineError::InvalidWelcome);
                 };
+                if origin == UnsealedWelcomeOrigin::Founding && record.state != MessageState::Sent {
+                    return Err(EngineError::InvalidWelcome);
+                }
                 if !matches!(
                     &entry.message.envelope,
                     TransportEnvelope::Welcome { recipient } if *recipient == welcome.recipient
@@ -4855,7 +4859,11 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(OutboundWelcomeStatus::Waiting);
         }
         Ok(match payload {
-            StoredMessagePayload::StagedInviteWelcome { .. } => OutboundWelcomeStatus::Waiting,
+            StoredMessagePayload::StagedInviteWelcome { .. }
+            | StoredMessagePayload::UnsealedWelcome {
+                origin: UnsealedWelcomeOrigin::Founding,
+                ..
+            } => OutboundWelcomeStatus::Waiting,
             StoredMessagePayload::OutboundWelcome { message, .. }
                 if matches!(message.envelope, TransportEnvelope::Welcome { .. }) =>
             {
@@ -5019,8 +5027,9 @@ impl<S: StorageProvider> Engine<S> {
     /// marked: that commit's resumption counts its staged Welcomes, so it
     /// stays as it is, read by the clock, until the commit confirms and
     /// promotes it (then it can be marked) or loses (then it is superseded).
-    /// These are the rows withdrawal turns `Failed` too. One write turns its row
-    /// `Failed` and gives its payload the [`WelcomeExpiry::Unrecorded`] mark,
+    /// One write turns its row `Failed` and marks its payload expired
+    /// ([`WelcomeExpiry::Recorded`] if it was never sealed and has nothing
+    /// to reconcile, otherwise [`WelcomeExpiry::Unrecorded`]),
     /// so it is settled as expired from then on whatever the clock reads:
     /// nothing publishes it again, a later delivered mark is refused, and
     /// promotion never re-owes it. A host's explicit reopening, not built
@@ -5048,36 +5057,48 @@ impl<S: StorageProvider> Engine<S> {
         if record.state == MessageState::Failed {
             return Ok(payload.welcome_expiry());
         }
-        let owed = matches!(
-            &payload,
+        let sealed = match &payload {
             StoredMessagePayload::OutboundWelcome { message, .. }
-                if matches!(message.envelope, TransportEnvelope::Welcome { .. })
-        );
+                if matches!(message.envelope, TransportEnvelope::Welcome { .. }) =>
+            {
+                true
+            }
+            StoredMessagePayload::UnsealedWelcome {
+                origin: UnsealedWelcomeOrigin::Founding,
+                ..
+            } => false,
+            _ => return Ok(None),
+        };
         if record.state != MessageState::Sent
-            || !owed
             || self.welcome_origin_state(&record.group_id, &payload)? != MessageState::Processed
             || !crate::welcome_deadline::stored_welcome_deliver_until(&payload)
                 .is_some_and(|deliver_until| now >= deliver_until)
         {
             return Ok(None);
         }
-        let mark = WelcomeExpiry::Unrecorded;
+        let mark = if sealed {
+            WelcomeExpiry::Unrecorded
+        } else {
+            WelcomeExpiry::Recorded
+        };
         record.payload = payload
             .with_welcome_expiry(Some(mark))
             .encode()
             .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
         record.state = MessageState::Failed;
         self.storage.put_message(&record)?;
-        self.audit_group(
-            &record.group_id,
-            crate::audit_helpers::message_state_transition_event(
-                hex::encode(id.as_slice()),
-                Some(MessageState::Sent),
-                MessageState::Failed,
-                Some(record.epoch),
-                "state_update",
-            ),
-        );
+        if sealed {
+            self.audit_group(
+                &record.group_id,
+                crate::audit_helpers::message_state_transition_event(
+                    hex::encode(id.as_slice()),
+                    Some(MessageState::Sent),
+                    MessageState::Failed,
+                    Some(record.epoch),
+                    "state_update",
+                ),
+            );
+        }
         Ok(Some(mark))
     }
 

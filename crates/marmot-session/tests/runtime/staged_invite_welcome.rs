@@ -223,6 +223,21 @@ fn reopen_staged_invite_runtime(
 
 #[tokio::test]
 async fn founding_welcome_unsealed_at_stop_is_delivered_after_restart() {
+    retry_founding_after_restart(FoundingRestart::BeforeDeadline).await;
+}
+
+#[tokio::test]
+async fn expired_founding_skips_signer() {
+    retry_founding_after_restart(FoundingRestart::AtDeadline).await;
+}
+
+#[derive(Clone, Copy)]
+enum FoundingRestart {
+    BeforeDeadline,
+    AtDeadline,
+}
+
+async fn retry_founding_after_restart(restart: FoundingRestart) {
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new(STAGED_INVITE_KEY).unwrap();
     let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"founding-bob");
@@ -234,13 +249,13 @@ async fn founding_welcome_unsealed_at_stop_is_delivered_after_restart() {
         StaticTransportRouting::new(vec![])
             .with_inbox_route(bob_id.clone(), vec![bob_inbox.clone()]),
     )));
-    let wall = Arc::new(TestWallClock::new(unix_now()));
-    let refusing = SwitchableSealer::default();
-    refusing.fail.store(true, Ordering::SeqCst);
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let sealer = Arc::new(FirstRecipientRefusingSealer::default());
     let mut runtime = reopen_staged_invite_runtime(
         dir.path(),
-        std::convert::identity,
-        Arc::new(refusing),
+        |config| config.maintenance_sources(wall.clone(), Arc::new(TestRandom::new(0))),
+        sealer.clone(),
         adapter.clone(),
         routing.clone(),
         wall.clone(),
@@ -257,22 +272,47 @@ async fn founding_welcome_unsealed_at_stop_is_delivered_after_restart() {
         .await
         .unwrap();
     assert!(staged_welcome_publishes(&adapter).is_empty());
-    assert_eq!(runtime.session().unsealed_owed_welcomes().unwrap().len(), 1);
+    let unsealed = runtime.session().unsealed_owed_welcomes().unwrap();
+    let [welcome] = unsealed.as_slice() else { panic!("expected one unsealed founding Welcome") };
+    let local_id = welcome.local_id.clone();
+    assert_eq!(sealer.attempts.load(Ordering::SeqCst), 1);
     drop(runtime);
 
     routing.update(|_| {
         staged_invite_routing(&group, &group_relay)
             .with_inbox_route(bob_id.clone(), vec![bob_inbox.clone()])
     });
+    if matches!(restart, FoundingRestart::AtDeadline) {
+        wall.set(now + 7 * 24 * 60 * 60);
+    }
+    sealer.allow_all.store(true, Ordering::SeqCst);
     let mut runtime = reopen_staged_invite_runtime(
         dir.path(),
         std::convert::identity,
-        Arc::new(MockSealer),
+        sealer.clone(),
         adapter.clone(),
         routing,
-        wall,
+        wall.clone(),
     );
     runtime.run_due_maintenance().await.unwrap();
+    if matches!(restart, FoundingRestart::AtDeadline) {
+        assert_eq!(sealer.attempts.load(Ordering::SeqCst), 1);
+        assert!(staged_welcome_publishes(&adapter).is_empty());
+        assert_eq!(runtime.session().stored_message_state(&local_id).unwrap(), Some(cgka_traits::MessageState::Failed));
+        assert!(runtime.session().outbound_welcome_audit_facts(&local_id).unwrap().is_none());
+
+        wall.set(now);
+        runtime.run_due_maintenance().await.unwrap();
+        assert_eq!(sealer.attempts.load(Ordering::SeqCst), 1);
+        assert!(staged_welcome_publishes(&adapter).is_empty());
+        assert_eq!(
+            runtime.session().expire_sent_welcome(&local_id, Timestamp(now)).unwrap(),
+            Some(cgka_traits::message::WelcomeExpiry::Recorded),
+            "the local row stays expired even before the deadline"
+        );
+        return;
+    }
+    assert_eq!(sealer.attempts.load(Ordering::SeqCst), 2);
     let publishes = adapter.publishes();
     let welcomes = publishes.iter().filter(|request| {
         matches!(request.message.envelope, TransportEnvelope::Welcome { .. })
@@ -298,11 +338,12 @@ async fn founding_welcome_unsealed_at_stop_is_delivered_after_restart() {
     )));
 }
 
-/// Refuses every Welcome to the first recipient it is asked to seal for and
-/// seals the rest as [`MockSealer`] does: a founding Welcome that never seals.
+/// Refuses Welcomes to the first recipient until `allow_all` is set.
 #[derive(Default)]
 struct FirstRecipientRefusingSealer {
     refused: Mutex<Option<MemberId>>,
+    attempts: AtomicUsize,
+    allow_all: AtomicBool,
 }
 
 #[async_trait]
@@ -315,13 +356,14 @@ impl InboxSealer for FirstRecipientRefusingSealer {
         &self,
         welcome: &OutboundWelcome,
     ) -> Result<TransportMessage, PeelerError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
         let refused = self
             .refused
             .lock()
             .unwrap()
             .get_or_insert_with(|| welcome.recipient.clone())
             .clone();
-        if refused == welcome.recipient {
+        if refused == welcome.recipient && !self.allow_all.load(Ordering::SeqCst) {
             return Err(PeelerError::MissingContext {
                 label: "welcome_metadata".into(),
             });

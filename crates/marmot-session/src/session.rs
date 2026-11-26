@@ -324,6 +324,8 @@ pub struct AccountDeviceSession {
     /// Seals and unseals the account inbox with the account signer. The
     /// engine never calls it.
     pub(super) sealer: Arc<dyn InboxSealer>,
+    founding_welcome_clock: Arc<dyn WallClock>,
+    founding_welcomes_unfinished: bool,
     pub(super) detached_welcome_publishes: HashSet<MessageId>,
     pub(super) detached_welcome_holds: DetachedWelcomeHolds,
     pub(super) welcome_selection: Arc<futures::lock::Mutex<()>>,
@@ -548,7 +550,9 @@ impl AccountDeviceSession {
             builder
         };
         let mut builder = builder.peeler(config.peeler);
+        let mut founding_welcome_clock: Arc<dyn WallClock> = Arc::new(cgka_traits::SystemWallClock);
         if let Some((wall_clock, entropy)) = config.maintenance_sources {
+            founding_welcome_clock = wall_clock.clone();
             builder = builder.maintenance_sources(wall_clock, entropy);
         }
         let audit = config
@@ -611,6 +615,8 @@ impl AccountDeviceSession {
             engine,
             storage: maintenance_storage,
             sealer: config.sealer,
+            founding_welcome_clock,
+            founding_welcomes_unfinished: true,
             detached_welcome_publishes: HashSet::new(),
             detached_welcome_holds: Arc::new(std::sync::Mutex::new(HashMap::new())),
             welcome_selection: Arc::new(futures::lock::Mutex::new(())),
@@ -1212,7 +1218,9 @@ impl AccountDeviceSession {
     /// never discards local history.
     pub fn retry_hydrate_quarantined_group(&mut self, group_id: &GroupId) -> SessionResult<bool> {
         self.with_welcome_publishes_paused(|session| {
-            Ok(session.engine.retry_hydrate_quarantined_group(group_id)?)
+            let recovered = session.engine.retry_hydrate_quarantined_group(group_id)?;
+            session.founding_welcomes_unfinished |= recovered;
+            Ok(recovered)
         })
     }
 
@@ -1229,8 +1237,15 @@ impl AccountDeviceSession {
     /// the same terminal state an open-time hydration failure produces.
     pub fn ensure_group_hydrated(&mut self, group_id: &GroupId) -> SessionResult<bool> {
         self.with_welcome_publishes_paused(|session| {
+            let was_unhydrated = matches!(
+                session.engine.check_group_live(group_id),
+                Err(EngineError::GroupNotHydrated(_))
+            );
             match session.engine.ensure_hydrated(group_id) {
-                Ok(()) => Ok(true),
+                Ok(()) => {
+                    session.founding_welcomes_unfinished |= was_unhydrated;
+                    Ok(true)
+                }
                 Err(EngineError::UnknownGroup(_)) => Ok(false),
                 Err(other) => Err(other.into()),
             }
@@ -2494,6 +2509,23 @@ impl AccountDeviceSession {
         Ok(self.engine.unsealed_owed_welcomes()?)
     }
 
+    pub(super) fn set_founding_welcome_clock(&mut self, clock: Arc<dyn WallClock>) {
+        self.founding_welcome_clock = clock;
+    }
+
+    pub(super) fn founding_welcomes_unfinished(&self) -> bool {
+        self.founding_welcomes_unfinished
+    }
+
+    pub(super) async fn seal_owed_founding_welcomes(
+        &mut self,
+    ) -> SessionResult<Vec<TransportMessage>> {
+        self.founding_welcomes_unfinished = true;
+        let welcomes = self.unsealed_owed_welcomes()?;
+        self.founding_welcomes_unfinished = false;
+        Ok(self.seal_founding_welcomes(&welcomes).await)
+    }
+
     pub fn pending_origin_message_id(&self, pending: PendingStateRef) -> SessionResult<MessageId> {
         Ok(self.engine.pending_origin_message_id(pending)?)
     }
@@ -2836,21 +2868,34 @@ impl AccountDeviceSession {
     /// sealed messages bound. Their group is already canonical, so a Welcome
     /// that fails to seal, or a failed bind, stays unsealed and owed for
     /// maintenance to retry; one Welcome that never seals holds back no other.
-    pub(super) async fn seal_founding_welcomes(
+    async fn seal_founding_welcomes(
         &mut self,
         welcomes: &[OutboundWelcome],
     ) -> Vec<TransportMessage> {
+        if welcomes.is_empty() {
+            return Vec::new();
+        }
+        // An immediate create can be dropped while waiting for its signer.
+        let mut unfinished = std::mem::replace(&mut self.founding_welcomes_unfinished, true);
         let mut sealed = Vec::with_capacity(welcomes.len());
         for welcome in welcomes {
+            if !self.founding_welcome_may_seal(&welcome.local_id, &mut unfinished) {
+                continue;
+            }
             if let Ok(message) = self.sealer.seal_welcome(welcome).await {
                 sealed.push(SealedWelcome {
                     local_id: welcome.local_id.clone(),
                     message,
                 });
+            } else {
+                unfinished = true;
             }
         }
-        let unsealed = welcomes.len() - sealed.len();
-        if let Err(error) = self.bind_sealed_welcomes(&sealed, None) {
+        sealed.retain(|welcome| self.founding_welcome_may_seal(&welcome.local_id, &mut unfinished));
+        if !sealed.is_empty()
+            && let Err(error) = self.bind_sealed_welcomes(&sealed, None)
+        {
+            unfinished = true;
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "seal_founding_welcomes",
@@ -2860,15 +2905,24 @@ impl AccountDeviceSession {
             );
             sealed.clear();
         }
-        if unsealed > 0 {
-            tracing::debug!(
-                target: TRACE_TARGET,
-                method = "seal_founding_welcomes",
-                unsealed,
-                "founding Welcomes left unsealed for maintenance"
-            );
-        }
+        self.founding_welcomes_unfinished = unfinished;
         sealed.into_iter().map(|sealed| sealed.message).collect()
+    }
+
+    fn founding_welcome_may_seal(&self, id: &MessageId, unfinished: &mut bool) -> bool {
+        let now = self.founding_welcome_clock.now();
+        match self.outbound_welcome_status(id, now) {
+            Ok(OutboundWelcomeStatus::Waiting) => return true,
+            Ok(OutboundWelcomeStatus::PastDeadline) => {
+                if matches!(self.expire_sent_welcome(id, now), Ok(Some(_))) {
+                    return false;
+                }
+            }
+            Ok(_) => return false,
+            Err(_) => {}
+        }
+        *unfinished = true;
+        false
     }
 
     fn collect_effects(&mut self, results: Vec<SendResult>) -> SessionEffects {

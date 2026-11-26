@@ -937,6 +937,7 @@ impl<S: StorageProvider> Engine<S> {
                             key_package_ref: None,
                             deliver_until: None,
                             key_package_event_id: None,
+                            expiry: None,
                         },
                         &group_id,
                         EpochId(0),
@@ -1047,6 +1048,7 @@ impl<S: StorageProvider> Engine<S> {
                                     .source
                                     .as_ref()
                                     .map(|source| source.event_id.clone()),
+                                expiry: None,
                             }
                             .encode()
                             .map_err(|error| {

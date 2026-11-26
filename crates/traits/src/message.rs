@@ -244,6 +244,8 @@ pub enum StoredMessagePayload {
         deliver_until: Option<Timestamp>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_package_event_id: Option<MessageId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expiry: Option<WelcomeExpiry>,
     },
 }
 
@@ -303,7 +305,13 @@ impl StoredMessagePayload {
     /// This Welcome with its expiry mark set to `mark`. Any other payload is
     /// returned unchanged.
     pub fn with_welcome_expiry(mut self, mark: Option<WelcomeExpiry>) -> Self {
-        if let Self::OutboundWelcome { expiry, .. } = &mut self {
+        if let Self::OutboundWelcome { expiry, .. }
+        | Self::UnsealedWelcome {
+            origin: UnsealedWelcomeOrigin::Founding,
+            expiry,
+            ..
+        } = &mut self
+        {
             *expiry = mark;
         }
         self
@@ -510,7 +518,12 @@ impl StoredMessagePayload {
     /// delivery deadline passed undelivered.
     pub fn welcome_expiry(&self) -> Option<WelcomeExpiry> {
         match self {
-            Self::OutboundWelcome { expiry, .. } => *expiry,
+            Self::OutboundWelcome { expiry, .. }
+            | Self::UnsealedWelcome {
+                origin: UnsealedWelcomeOrigin::Founding,
+                expiry,
+                ..
+            } => *expiry,
             Self::StagedInviteWelcome { .. }
             | Self::RawTransport(_)
             | Self::OpenMlsWire(_)
@@ -834,6 +847,7 @@ fn encode_stored_message_payload_v2(
             key_package_ref,
             deliver_until,
             key_package_event_id,
+            expiry,
         } => {
             out.push(17);
             encode_outbound_welcome(welcome, &mut out)?;
@@ -855,6 +869,12 @@ fn encode_stored_message_payload_v2(
             encode_option(key_package_event_id.as_ref(), &mut out, |value, out| {
                 encode_var_bytes(value.as_slice(), out, "Welcome KeyPackage event id")
             })?;
+            if let Some(expiry) = expiry {
+                if *origin != UnsealedWelcomeOrigin::Founding {
+                    return Err(invalid("expiry mark on a non-founding unsealed Welcome"));
+                }
+                out.push(welcome_expiry_byte(*expiry));
+            }
         }
     }
     Ok(out)
@@ -1016,26 +1036,37 @@ fn decode_stored_message_payload_v2(
             })?,
             expiry: Some(decoder.welcome_expiry()?),
         },
-        17 => StoredMessagePayload::UnsealedWelcome {
-            welcome: decoder.outbound_welcome()?,
-            origin: match decoder.u8("unsealed Welcome origin")? {
+        17 => {
+            let welcome = decoder.outbound_welcome()?;
+            let origin = match decoder.u8("unsealed Welcome origin")? {
                 0 => UnsealedWelcomeOrigin::StagedCommit(MessageId::new(
                     decoder.var_bytes("unsealed Welcome origin commit id")?,
                 )),
                 1 => UnsealedWelcomeOrigin::Founding,
                 2 => UnsealedWelcomeOrigin::LegacyCreate,
                 _ => return Err(invalid("unsealed Welcome origin")),
-            },
-            key_package_ref: decoder
-                .option(|decoder| decoder.var_bytes("Welcome KeyPackageRef"))?,
-            deliver_until: decoder
-                .option(|decoder| Ok(Timestamp(decoder.u64("Welcome delivery deadline")?)))?,
-            key_package_event_id: decoder.option(|decoder| {
-                Ok(MessageId::new(
-                    decoder.var_bytes("Welcome KeyPackage event id")?,
-                ))
-            })?,
-        },
+            };
+            StoredMessagePayload::UnsealedWelcome {
+                welcome,
+                key_package_ref: decoder
+                    .option(|decoder| decoder.var_bytes("Welcome KeyPackageRef"))?,
+                deliver_until: decoder
+                    .option(|decoder| Ok(Timestamp(decoder.u64("Welcome delivery deadline")?)))?,
+                key_package_event_id: decoder.option(|decoder| {
+                    Ok(MessageId::new(
+                        decoder.var_bytes("Welcome KeyPackage event id")?,
+                    ))
+                })?,
+                expiry: if origin == UnsealedWelcomeOrigin::Founding
+                    && !decoder.remaining.is_empty()
+                {
+                    Some(decoder.welcome_expiry()?)
+                } else {
+                    None
+                },
+                origin,
+            }
+        }
         variant => {
             return Err(invalid(format!(
                 "unknown stored-message payload variant {variant}"
@@ -1134,11 +1165,15 @@ fn encode_welcome_expired_tail(
     encode_option(key_package_event_id, out, |value, out| {
         encode_var_bytes(value.as_slice(), out, "Welcome KeyPackage event id")
     })?;
-    out.push(match expiry {
+    out.push(welcome_expiry_byte(expiry));
+    Ok(())
+}
+
+fn welcome_expiry_byte(expiry: WelcomeExpiry) -> u8 {
+    match expiry {
         WelcomeExpiry::Unrecorded => 1,
         WelcomeExpiry::Recorded => 2,
-    });
-    Ok(())
+    }
 }
 
 /// An unsealed Welcome: its local id, recipient, payload ciphertext and AAD,
@@ -1718,6 +1753,7 @@ mod stored_payload_codec_tests {
                 key_package_ref: Some(vec![0x58; 32]),
                 deliver_until: Some(Timestamp(1_700_000_600)),
                 key_package_event_id: Some(MessageId::new([0x59; 32])),
+                expiry: None,
             },
             StoredMessagePayload::UnsealedWelcome {
                 welcome: OutboundWelcome {
@@ -1728,6 +1764,15 @@ mod stored_payload_codec_tests {
                 key_package_ref: Some(vec![0x58; 32]),
                 deliver_until: None,
                 key_package_event_id: None,
+                expiry: None,
+            },
+            StoredMessagePayload::UnsealedWelcome {
+                welcome: unsealed.clone(),
+                origin: UnsealedWelcomeOrigin::Founding,
+                key_package_ref: Some(vec![0x58; 32]),
+                deliver_until: Some(Timestamp(1_700_000_600)),
+                key_package_event_id: Some(MessageId::new([0x59; 32])),
+                expiry: Some(WelcomeExpiry::Unrecorded),
             },
             StoredMessagePayload::UnsealedWelcome {
                 welcome: unsealed,
@@ -1735,6 +1780,7 @@ mod stored_payload_codec_tests {
                 key_package_ref: None,
                 deliver_until: None,
                 key_package_event_id: None,
+                expiry: None,
             },
         ];
 

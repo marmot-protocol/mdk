@@ -855,11 +855,7 @@ where
     /// publishes them. One that fails to seal stays owed for the next pass
     /// and holds back none of the others.
     async fn seal_owed_welcomes(&mut self) -> AccountResult<()> {
-        let welcomes = self.session.unsealed_owed_welcomes()?;
-        if welcomes.is_empty() {
-            return Ok(());
-        }
-        let messages = self.session.seal_founding_welcomes(&welcomes).await;
+        let messages = self.session.seal_owed_founding_welcomes().await?;
         self.note_retained_welcomes(&messages);
         Ok(())
     }
