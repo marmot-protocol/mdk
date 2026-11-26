@@ -2936,6 +2936,10 @@ impl MarmotApp {
         status.refresh();
         self.directory()
             .remember_directory_relay_lists(&account.account_id_hex, &status)?;
+        let follow_list_created_at = requests
+            .iter()
+            .find(|request| request.event.kind == nostr_directory::KIND_NOSTR_CONTACT_LIST)
+            .map_or(0, |request| request.event.created_at);
         self.directory()
             .remember_directory_follow_edges_for_search(
                 &account.account_id_hex,
@@ -2945,6 +2949,7 @@ impl MarmotApp {
                         .iter()
                         .map(|endpoint| endpoint.0.clone())
                         .collect(),
+                    created_at: follow_list_created_at,
                 },
             )?;
         // Cache the signed kind-0 timestamp: retries can author it ahead of the

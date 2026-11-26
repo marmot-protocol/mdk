@@ -50,6 +50,7 @@ fn profile(shared: &SqliteSharedStorage, name: Option<&str>) {
             event_kind: None,
             event_created_at: None,
             follows: vec![],
+            follows_created_at: 0,
         })
         .unwrap();
 }
@@ -190,6 +191,7 @@ fn restart_mid_fanout_and_coalesced_newer_profiles_do_not_skip_other_identities(
             event_kind: None,
             event_created_at: None,
             follows: vec![],
+            follows_created_at: 0,
         })
         .unwrap();
     profile(&shared, Some("Latest update"));
@@ -311,6 +313,7 @@ fn unrelated_directory_history_is_skipped_and_new_unrelated_changes_are_batched(
                 event_kind: None,
                 event_created_at: None,
                 follows: vec![],
+                follows_created_at: 0,
             })
             .unwrap();
     }

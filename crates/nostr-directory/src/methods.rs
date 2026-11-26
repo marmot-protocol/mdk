@@ -1185,6 +1185,7 @@ pub fn cached_or_unknown_follow_list(
         return FetchedFollowList {
             follows: entry.follows,
             source_relays: entry.follow_source_relays,
+            created_at: entry.follows_created_at,
         };
     }
     FetchedFollowList {
@@ -1193,5 +1194,6 @@ pub fn cached_or_unknown_follow_list(
             .iter()
             .map(|endpoint| endpoint.0.clone())
             .collect(),
+        created_at: 0,
     }
 }

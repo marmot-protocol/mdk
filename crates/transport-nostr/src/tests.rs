@@ -5477,10 +5477,12 @@ async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
     let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"immediate"}"#)
         .finalize(&keys)
         .unwrap();
-    source.send(RelayPoolNotification::Event {
+    source.send(RelayPoolNotification::Message {
         relay_url: endpoint.clone(),
-        subscription_id: SubscriptionId::new(id),
-        event: Box::new(profile.clone()),
+        message: Box::new(RelayMessage::Event {
+            subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+            event: std::borrow::Cow::Owned(profile.clone()),
+        }),
     });
     let record = timeout(Duration::from_secs(2), events.recv())
         .await
@@ -5501,10 +5503,12 @@ async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
     assert!(to_add.contains(id));
     assert_eq!(directory.stats().await.active_subscriptions, 0);
     assert!(directory.mark_auth_required(id, endpoint.as_str()).await);
-    source.send(RelayPoolNotification::Event {
+    source.send(RelayPoolNotification::Message {
         relay_url: endpoint,
-        subscription_id: SubscriptionId::new(id),
-        event: Box::new(profile),
+        message: Box::new(RelayMessage::Event {
+            subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+            event: std::borrow::Cow::Owned(profile),
+        }),
     });
     source.send(RelayPoolNotification::Shutdown);
     timeout(Duration::from_secs(2), forwarder)
@@ -5525,8 +5529,9 @@ async fn directory_forwarder_verifies_each_notification_independently() {
     let directory =
         directory_plane_with_active_subscription(id, vec![keys.public_key().to_hex()], vec![0])
             .await;
+    let other_endpoint = RelayUrl::parse("wss://relay-two.example").unwrap();
     directory
-        .set_subscription_endpoints(std::slice::from_ref(&endpoint))
+        .set_subscription_endpoints(&[endpoint.clone(), other_endpoint.clone()])
         .await;
     let valid = EventBuilder::new(Kind::Metadata, r#"{"name":"authentic"}"#)
         .finalize(&keys)
@@ -5538,18 +5543,46 @@ async fn directory_forwarder_verifies_each_notification_independently() {
     assert!(!tampered.verify_id());
     assert!(invalid_signature.verify_id());
     assert!(!invalid_signature.verify_signature());
-    // Exercise the real forwarder after SDK admission, so the SDK's own
-    // verification cannot mask removal of MDK's independent check (mdk#2521).
-    let notifications = [valid.clone(), tampered, invalid_signature, valid.clone()]
-        .into_iter()
-        .map(|event| {
-            NotificationUpdate::Notification(ClientNotification::Event {
-                relay_url: endpoint.clone(),
-                subscription_id: SubscriptionId::new(id),
-                event: Box::new(event),
-            })
-        })
-        .collect::<Vec<_>>();
+    // Exercise the real forwarder after SDK admission:
+    // 1. First-seen `ClientNotification::Event` is ignored (no double delivery).
+    // 2. Per-message `RelayMessage::Event` verifies supplied bytes on every copy
+    //    (mdk#2521) and forwards copies from a second relay without SDK
+    //    `seen_event_ids` hiding them (#2897).
+    let notifications = vec![
+        NotificationUpdate::Notification(ClientNotification::Event {
+            relay_url: endpoint.clone(),
+            subscription_id: SubscriptionId::new(id),
+            event: Box::new(valid.clone()),
+        }),
+        NotificationUpdate::Notification(ClientNotification::Message {
+            relay_url: endpoint.clone(),
+            message: Box::new(RelayMessage::Event {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+                event: std::borrow::Cow::Owned(tampered),
+            }),
+        }),
+        NotificationUpdate::Notification(ClientNotification::Message {
+            relay_url: endpoint.clone(),
+            message: Box::new(RelayMessage::Event {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+                event: std::borrow::Cow::Owned(invalid_signature),
+            }),
+        }),
+        NotificationUpdate::Notification(ClientNotification::Message {
+            relay_url: endpoint.clone(),
+            message: Box::new(RelayMessage::Event {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+                event: std::borrow::Cow::Owned(valid.clone()),
+            }),
+        }),
+        NotificationUpdate::Notification(ClientNotification::Message {
+            relay_url: other_endpoint.clone(),
+            message: Box::new(RelayMessage::Event {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+                event: std::borrow::Cow::Owned(valid.clone()),
+            }),
+        }),
+    ];
     let (sender, mut events) = broadcast::channel(8);
     let forwarder = spawn_directory_notification_forwarder(
         Box::pin(futures::stream::iter(notifications)),
@@ -5562,12 +5595,22 @@ async fn directory_forwarder_verifies_each_notification_independently() {
         .unwrap();
     let mut forwarded = Vec::new();
     while let Ok(DirectoryRelayPlaneEvent::Record(record)) = events.try_recv() {
-        forwarded.push(record.event);
+        forwarded.push((record.endpoints, record.event));
     }
+    let expected = NostrTransportEvent::from_nostr_event(&valid).unwrap();
     assert_eq!(
         forwarded,
-        vec![NostrTransportEvent::from_nostr_event(&valid).unwrap(); 2],
-        "only authentic copies may cross the directory notification boundary"
+        vec![
+            (
+                vec![TransportEndpoint(endpoint.to_string())],
+                expected.clone()
+            ),
+            (
+                vec![TransportEndpoint(other_endpoint.to_string())],
+                expected
+            ),
+        ],
+        "only authentic per-message copies cross the directory notification boundary, with each relay's endpoint preserved"
     );
 }
 
@@ -7163,12 +7206,9 @@ async fn directory_wire_rejects_forgery_when_verified_ids_outlive_seen_state() {
             ])
             .await
             .unwrap();
-        let expected = if clear_seen {
-            vec![&seed, &fence]
-        } else {
-            vec![&fence]
-        };
-        for event in expected {
+        // Per-message `RelayMessage::Event` admission rejects every forged copy
+        // and forwards the authentic `seed` copy regardless of SDK seen-state.
+        for event in [&seed, &fence] {
             let DirectoryRelayPlaneEvent::Record(record) =
                 timeout(Duration::from_secs(5), events.recv())
                     .await

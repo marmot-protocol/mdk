@@ -26,11 +26,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "0003_follow_availability",
         apply: version_3,
     },
+    Migration {
+        version: 4,
+        name: "0004_follows_created_at",
+        apply: version_4,
+    },
 ];
 
 const VERSION_1_SQL: &str = include_str!("v1.sql");
 const VERSION_2_SQL: &str = include_str!("v2.sql");
 const VERSION_3_SQL: &str = include_str!("v3.sql");
+const VERSION_4_SQL: &str = include_str!("v4.sql");
 
 /// Open the cache's independent migration domain without exposing stored values.
 pub(super) fn run_all(conn: &mut Connection) -> Result<(), DirectoryError> {
@@ -150,6 +156,11 @@ fn version_3(tx: &Transaction<'_>) -> Result<(), DirectoryError> {
     Ok(())
 }
 
+fn version_4(tx: &Transaction<'_>) -> Result<(), DirectoryError> {
+    tx.execute_batch(VERSION_4_SQL)?;
+    Ok(())
+}
+
 /// IF NOT EXISTS can adopt an existing table without checking its shape. Use
 /// the frozen v1 DDL as the reference, including types, nullability, defaults,
 /// primary keys and index columns, before blessing an unversioned database.
@@ -235,7 +246,7 @@ mod tests {
     #[test]
     fn migration_errors_preserve_safe_diagnostics_without_trigger_payloads() {
         let mut conn = Connection::open_in_memory().unwrap();
-        run_all(&mut conn).unwrap();
+        run(&mut conn, &MIGRATIONS[..1]).unwrap();
         conn.execute_batch(
             "DELETE FROM app_cache_schema_migrations;
             CREATE TRIGGER reject_history BEFORE INSERT ON app_cache_schema_migrations
@@ -353,7 +364,12 @@ mod tests {
             },
             Migration {
                 version: 4,
-                name: "0004_test",
+                name: MIGRATIONS[3].name,
+                apply: version_4,
+            },
+            Migration {
+                version: 5,
+                name: "0005_test",
                 apply: |tx| {
                     tx.execute_batch(
                         "CREATE TABLE rollback_probe (value INTEGER);
@@ -382,7 +398,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
     }
 }
 

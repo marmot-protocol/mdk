@@ -16,7 +16,7 @@ fn fresh_file_preserves_pragmas_permissions_and_close() {
     let storage = SqliteSharedStorage::open(&path).unwrap();
     {
         let conn = storage.lock().unwrap();
-        assert_eq!(count(&conn), 5);
+        assert_eq!(count(&conn), 6);
         for (pragma, expected) in [
             ("busy_timeout", 5000),
             ("synchronous", 1),
@@ -79,7 +79,7 @@ fn current_open_is_read_only_and_idempotent_while_writer_holds_lock() {
         .unwrap();
     let second = SqliteSharedStorage::open(&path).unwrap();
     let conn = second.lock().unwrap();
-    assert_eq!(count(&conn), 5);
+    assert_eq!(count(&conn), 6);
     assert_eq!(
         conn.query_row(
             "SELECT applied_at_unix_seconds FROM shared_schema_migrations",
@@ -110,7 +110,7 @@ fn concurrent_openers_record_once() {
                 scope.spawn(|| {
                     barrier.wait();
                     let storage = SqliteSharedStorage::open(&path).unwrap();
-                    assert_eq!(count(&storage.lock().unwrap()), 5);
+                    assert_eq!(count(&storage.lock().unwrap()), 6);
                 })
             })
             .collect();
@@ -118,7 +118,7 @@ fn concurrent_openers_record_once() {
             handle.join().unwrap();
         }
     });
-    assert_eq!(count(&conn), 5);
+    assert_eq!(count(&conn), 6);
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn invalid_history_and_future_versions_fail_before_body() {
         "(1, 'private name', 0)",
         "(0, '0001_shared_store', 0)",
         "(-1, '0001_shared_store', 0), (1, '0001_shared_store', 0)",
-        "(6, 'future private name', 0)",
+        "(7, 'future private name', 0)",
     ] {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(LEDGER_SQL).unwrap();
@@ -191,12 +191,12 @@ fn invalid_history_and_future_versions_fail_before_body() {
         ))
         .unwrap();
         let error = run_all(&mut conn).unwrap_err();
-        if rows.starts_with("(6") {
+        if rows.starts_with("(7") {
             assert!(matches!(
                 error,
                 StorageError::UnsupportedSchemaVersion {
-                    found: 6,
-                    latest_supported: 5
+                    found: 7,
+                    latest_supported: 6
                 }
             ));
         } else {
@@ -272,7 +272,7 @@ fn body_and_ledger_failures_roll_back_and_redact_sqlite_messages() {
     assert!(!table_exists(&conn, "directory_users").unwrap());
     conn.execute_batch("DROP TRIGGER reject").unwrap();
     run_all(&mut conn).unwrap();
-    assert_eq!(count(&conn), 5);
+    assert_eq!(count(&conn), 6);
 }
 
 #[test]
@@ -294,6 +294,7 @@ fn fresh_schema_matches_frozen_contract_and_has_independent_ledger() {
     let conn = storage.lock().unwrap();
     let reference = Connection::open_in_memory().unwrap();
     reference.execute_batch(VERSION_1_SQL).unwrap();
+    reference.execute_batch(include_str!("v6.sql")).unwrap();
     for table in TABLES {
         assert!(table_matches(&conn, &reference, table).unwrap());
     }
@@ -498,7 +499,7 @@ fn presentation_migration_preserves_existing_usage_settings_and_cached_profiles(
         VALUES ('peer', 'fixture', '{\"name\":\"Cached before P2\"}', '{}');").unwrap();
     run_all(&mut conn).unwrap();
     run_all(&mut conn).unwrap();
-    assert_eq!(count(&conn), 5);
+    assert_eq!(count(&conn), 6);
     let settings: (i64, String, i64) = conn
         .query_row(
             "SELECT decision, policy_revision, updated_at_ms FROM usage_diagnostics_settings",
@@ -545,7 +546,7 @@ fn key_package_replacement_migration_upgrades_v4_once() {
 
     run_all(&mut conn).unwrap();
     run_all(&mut conn).unwrap();
-    assert_eq!(count(&conn), 5);
+    assert_eq!(count(&conn), 6);
     let name: String = conn
         .query_row(
             "SELECT name FROM shared_schema_migrations WHERE version = 5",
@@ -554,6 +555,22 @@ fn key_package_replacement_migration_upgrades_v4_once() {
         )
         .unwrap();
     assert_eq!(name, "0005_key_package_replacements");
+    let v6_name: String = conn
+        .query_row(
+            "SELECT name FROM shared_schema_migrations WHERE version = 6",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v6_name, "0006_directory_follows_created_at");
+    let has_follows_created_at: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('directory_users') WHERE name = 'follows_created_at'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_follows_created_at, 1);
     let reference = Connection::open_in_memory().unwrap();
     reference.execute_batch(include_str!("v5.sql")).unwrap();
     for table in [

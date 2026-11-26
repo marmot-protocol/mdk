@@ -2988,6 +2988,12 @@ fn spawn_relay_notification_forwarder_scoped(
 /// Public directory interests have their own unauthenticated SDK client and
 /// receiver. A gap here invalidates directory coverage without interrupting
 /// an account's live delivery or attributing the loss to an account.
+///
+/// Admission reads per-message `RelayMessage::Event` frames rather than
+/// first-seen `ClientNotification::Event` so SDK pool `seen_event_ids` cannot
+/// suppress copies from another relay, reconnect, or rebuilt subscription.
+/// Every supplied wire event is still verified independently (`event.verify()`)
+/// at MDK's directory boundary (mdk#2521).
 fn spawn_directory_notification_forwarder(
     mut receiver: DirectoryNotificationStream,
     events: broadcast::Sender<DirectoryRelayPlaneEvent>,
@@ -2996,48 +3002,50 @@ fn spawn_directory_notification_forwarder(
     tokio::spawn(async move {
         loop {
             match receiver.next().await {
-                Some(NotificationUpdate::Notification(ClientNotification::Event {
-                    relay_url,
-                    subscription_id,
-                    event,
-                })) => {
-                    // SDK admission and seen-state are not authentication at
-                    // MDK's directory boundary (mdk#2521).
-                    if event.verify().is_err() {
-                        continue;
-                    }
-                    let subscription_id = subscription_id.to_string();
-                    if let Ok(event) = NostrTransportEvent::from_nostr_event(&event)
-                        && directory
-                            .accepts_live_event_from(
-                                &subscription_id,
-                                relay_url.as_str(),
-                                &event.pubkey,
-                                event.kind,
-                                &event.tags,
-                            )
-                            .await
-                    {
-                        let _ = events.send(DirectoryRelayPlaneEvent::Record(
-                            DirectoryRelayEventRecord {
-                                endpoints: vec![TransportEndpoint(relay_url.to_string())],
-                                event,
-                            },
-                        ));
-                    }
-                }
+                // Ignore SDK first-seen Event notifications; every wire EVENT
+                // arrives via `ClientNotification::Message(RelayMessage::Event)`
+                // without SDK pool deduplication hiding later copies.
+                Some(NotificationUpdate::Notification(ClientNotification::Event { .. })) => {}
                 Some(NotificationUpdate::Notification(ClientNotification::Message {
                     relay_url,
                     message,
-                })) => {
-                    if let RelayMessage::Closed {
+                })) => match *message {
+                    RelayMessage::Event {
+                        subscription_id,
+                        event,
+                    } => {
+                        // SDK admission and seen-state are not authentication at
+                        // MDK's directory boundary (mdk#2521). Verify the supplied
+                        // wire bytes (id hash + Schnorr signature) on every copy.
+                        if event.verify().is_err() {
+                            continue;
+                        }
+                        if let Ok(event) = NostrTransportEvent::from_nostr_event(event.as_ref())
+                            && directory
+                                .accepts_live_event_from(
+                                    subscription_id.as_str(),
+                                    relay_url.as_str(),
+                                    &event.pubkey,
+                                    event.kind,
+                                    &event.tags,
+                                )
+                                .await
+                        {
+                            let _ = events.send(DirectoryRelayPlaneEvent::Record(
+                                DirectoryRelayEventRecord {
+                                    endpoints: vec![TransportEndpoint(relay_url.to_string())],
+                                    event,
+                                },
+                            ));
+                        }
+                    }
+                    RelayMessage::Closed {
                         subscription_id,
                         message,
-                    } = *message
-                        && message.starts_with("auth-required:")
+                    } if message.starts_with("auth-required:")
                         && directory
                             .mark_auth_required(subscription_id.as_str(), relay_url.as_str())
-                            .await
+                            .await =>
                     {
                         let count = directory.stats().await.auth_required_routes;
                         tracing::warn!(
@@ -3047,7 +3055,8 @@ fn spawn_directory_notification_forwarder(
                             "anonymous directory request requires authentication",
                         );
                     }
-                }
+                    _ => {}
+                },
                 Some(NotificationUpdate::Notification(ClientNotification::Shutdown)) => break,
                 Some(NotificationUpdate::Lagged { skipped }) => {
                     tracing::warn!(

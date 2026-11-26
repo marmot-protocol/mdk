@@ -7448,6 +7448,7 @@ mod tests {
                 event_kind: None,
                 event_created_at: None,
                 follows: Vec::new(),
+                follows_created_at: 0,
             })
             .unwrap();
         assert!(
@@ -8415,6 +8416,7 @@ mod tests {
                 event_kind: None,
                 event_created_at: None,
                 follows: Vec::new(),
+                follows_created_at: 0,
             })
             .unwrap();
         assert!(

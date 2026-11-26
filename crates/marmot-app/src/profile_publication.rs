@@ -274,6 +274,7 @@ impl MarmotApp {
                     .iter()
                     .map(|endpoint| endpoint.0.clone())
                     .collect(),
+                created_at: event.created_at,
             };
             if let Err(error) = blocking_app_task(move || {
                 Ok(app

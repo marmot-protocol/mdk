@@ -8566,6 +8566,7 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
             profile: None,
             follows: Vec::new(),
             follow_source_relays: Vec::new(),
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: Some(DirectoryKeyPackage {
                 key_package_id: "current-directory".into(),
@@ -11149,6 +11150,7 @@ fn directory_search_bounds_frontier_from_cached_follow_lists() {
             profile: None,
             follows: follows.clone(),
             follow_source_relays: Vec::new(),
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         })
@@ -11174,6 +11176,7 @@ fn directory_search_bounds_frontier_from_cached_follow_lists() {
                 }),
                 follows: Vec::new(),
                 follow_source_relays: Vec::new(),
+                follows_created_at: 0,
                 relay_lists: AccountRelayListStatus::empty(),
                 key_package: None,
             })
@@ -11211,6 +11214,7 @@ fn directory_search_uses_graph_cache_without_promoting_known_user() {
             profile: None,
             follows: vec![graph_user.clone()],
             follow_source_relays: Vec::new(),
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         })
@@ -11280,6 +11284,7 @@ fn test_directory_record(account_id_hex: &str, name: &str, created_at: u64) -> U
         }),
         follows: Vec::new(),
         follow_source_relays: Vec::new(),
+        follows_created_at: 0,
         relay_lists: AccountRelayListStatus::empty(),
         key_package: None,
     }
@@ -12584,6 +12589,7 @@ fn legacy_plaintext_directory_cache_keeps_file_when_migration_fails() {
             profile: None,
             follows: Vec::new(),
             follow_source_relays: Vec::new(),
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         })
@@ -13068,6 +13074,7 @@ fn local_account_directory_refresh_still_promotes_follows() {
     let follow_list = FetchedFollowList {
         follows: vec![follow.clone()],
         source_relays: vec!["wss://relay.example".to_owned()],
+        created_at: 0,
     };
     app.directory()
         .remember_directory_follow_list_for_test(&account.account_id_hex, &follow_list)
@@ -13107,6 +13114,7 @@ fn empty_follow_fetch_preserves_cached_edges() {
         profile: None,
         follows: vec![followed.clone()],
         follow_source_relays: vec!["wss://cached.example".to_owned()],
+        follows_created_at: 0,
         relay_lists: AccountRelayListStatus::empty(),
         key_package: None,
     };

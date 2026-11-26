@@ -1051,7 +1051,7 @@ async fn extend_with_follows<R: DirectoryResources + DirectoryObserver>(
     for batch in unknown.chunks(SEARCH_PUBKEY_BATCH_SIZE) {
         let fetched = fetch_follow_lists(directory, batch).await?;
         cache_resolved_follows(directory, &fetched).await?;
-        for (_, follows) in fetched {
+        for (_, follows, _) in fetched {
             if searcher.is_some() {
                 emitter.remember_follows(&follows);
             }
@@ -1182,7 +1182,7 @@ async fn partition_cached_follows<R: DirectoryResources + DirectoryObserver>(
 async fn fetch_follow_lists<R: DirectoryResources + DirectoryObserver>(
     directory: &Directory<R>,
     batch: &[String],
-) -> Result<Vec<(String, Vec<String>)>, DirectoryError> {
+) -> Result<Vec<(String, Vec<String>, u64)>, DirectoryError> {
     let records = directory
         .fetch_events_for_account_ids(batch, KIND_NOSTR_CONTACT_LIST, &[])
         .await?;
@@ -1198,10 +1198,13 @@ async fn fetch_follow_lists<R: DirectoryResources + DirectoryObserver>(
         .iter()
         .filter_map(|account_id_hex| {
             let records = by_author.remove(account_id_hex)?;
-            let follows = latest_follow_list_from_records(account_id_hex, records, freshness)
-                .value?
-                .follows;
-            Some((account_id_hex.clone(), follows))
+            let follow_list =
+                latest_follow_list_from_records(account_id_hex, records, freshness).value?;
+            Some((
+                account_id_hex.clone(),
+                follow_list.follows,
+                follow_list.created_at,
+            ))
         })
         .collect())
 }
@@ -1213,17 +1216,19 @@ async fn fetch_follow_lists<R: DirectoryResources + DirectoryObserver>(
 /// somebody follows somebody is graph data, not a relationship of the user's.
 async fn cache_resolved_follows<R: DirectoryResources + DirectoryObserver>(
     directory: &Directory<R>,
-    fetched: &[(String, Vec<String>)],
+    fetched: &[(String, Vec<String>, u64)],
 ) -> Result<(), DirectoryError> {
     let fetched = fetched.to_vec();
     let directory = directory.clone();
     blocking_directory_task(move || {
         for cache in directory.resources.current_caches()? {
-            for (account_id_hex, follows) in &fetched {
+            for (account_id_hex, follows, created_at) in &fetched {
                 cache.remember_search_graph_follows(
                     account_id_hex,
                     &npub_for_account_id_lossy(account_id_hex),
                     follows,
+                    *created_at,
+                    false,
                 )?;
             }
         }
@@ -1571,6 +1576,7 @@ mod tests {
             }),
             follows: Vec::new(),
             follow_source_relays: Vec::new(),
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         }
