@@ -240,6 +240,139 @@ async fn subscription_capacity_error_echoes_request_id_and_is_retryable() {
     server.await.unwrap().unwrap();
 }
 
+/// A first frame that cannot become a request gets an `error` response naming
+/// the problem, with the request `id` when one could be read, instead of a
+/// silent close (#2242). The cases are the ones the issue reported, plus a bad
+/// field value and a repeated `id`, which the typed decode refuses.
+#[tokio::test]
+async fn rejected_control_frames_get_an_error_response() {
+    let v2 = agent_control::AGENT_CONTROL_PROTOCOL_V2;
+    let long_id = "x".repeat(300);
+    // (frame, echoed id, code, text the message names)
+    let cases: Vec<(String, Option<&str>, &str, &str)> = vec![
+        (
+            r#"{"marmot_agent_control":"v2","id":"b","type":"diagnostic_status"}"#.to_owned(),
+            Some("b"),
+            "unsupported_protocol",
+            "marmot.agent-control.v2",
+        ),
+        (
+            r#"{"id":"c","type":"diagnostic_status"}"#.to_owned(),
+            Some("c"),
+            "unsupported_protocol",
+            "marmot.agent-control.v2",
+        ),
+        (
+            format!(r#"{{"marmot_agent_control":"{v2}","id":"d","type":"no_such_request"}}"#),
+            Some("d"),
+            "unknown_request",
+            "unknown request type",
+        ),
+        (
+            format!(r#"{{"marmot_agent_control":"{v2}","id":"e","type":"timeline_list"}}"#),
+            Some("e"),
+            "invalid_request",
+            "`account_id_hex`",
+        ),
+        (
+            format!(r#"{{"marmot_agent_control":"{v2}","id":"f"}}"#),
+            Some("f"),
+            "invalid_request",
+            "`type`",
+        ),
+        // A known type with a bad field value is invalid, not unknown.
+        (
+            format!(
+                r#"{{"marmot_agent_control":"{v2}","id":"g","type":"invite_policy_set","account_id_hex":"{}","policy":"bogus"}}"#,
+                "ab".repeat(32)
+            ),
+            Some("g"),
+            "invalid_request",
+            "value",
+        ),
+        // An otherwise valid request with a repeated `id` is refused, and
+        // neither id is echoed.
+        (
+            format!(
+                r#"{{"marmot_agent_control":"{v2}","id":"h","id":"i","type":"diagnostic_status"}}"#
+            ),
+            None,
+            "invalid_request",
+            "duplicate field `id`",
+        ),
+        // The typed decode reports the first duplicate it meets, here
+        // `auth_token`; a repeated `id` is still not echoed.
+        (
+            format!(
+                r#"{{"marmot_agent_control":"{v2}","auth_token":"t","auth_token":"u","id":"j","id":"k","type":"diagnostic_status"}}"#
+            ),
+            None,
+            "invalid_request",
+            "duplicate field `auth_token`",
+        ),
+        // A present `type` of the wrong JSON type is not reported missing.
+        (
+            format!(r#"{{"marmot_agent_control":"{v2}","id":"l","type":null}}"#),
+            Some("l"),
+            "invalid_request",
+            "`type` must be a string",
+        ),
+        ("hello".to_owned(), None, "invalid_request", "JSON"),
+        ("[1,2]".to_owned(), None, "invalid_request", "JSON object"),
+        (
+            format!(r#"{{"marmot_agent_control":"{v2}","id":"{long_id}","type":"nope"}}"#),
+            None,
+            "unknown_request",
+            "unknown request type",
+        ),
+    ];
+    for (frame, id, code, names) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dev").join("wn-agent.sock");
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            Vec::new(),
+            false,
+            false,
+        ))
+        .unwrap();
+        let listener = bind_connector_socket(&socket).unwrap();
+        let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+        let client = UnixStream::connect(&socket).await.unwrap();
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let response: AgentControlEnvelope<AgentControlResponse> = read_envelope(&mut client_read)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no response to {frame:.60}"));
+        assert_eq!(response.id.as_deref(), id, "{frame:.60}");
+        let AgentControlResponse::Error {
+            code: got,
+            message,
+            retryable,
+        } = response.payload
+        else {
+            panic!(
+                "expected an error for {frame:.60}, got {:?}",
+                response.payload
+            );
+        };
+        assert_eq!(got, code, "{frame:.60}");
+        assert!(!retryable);
+        assert!(message.contains(names), "{message:?} names {names:?}");
+        for value in ["no_such_request", "hello", "bogus", "\"v2\""] {
+            assert!(!message.contains(value), "{message:?} quotes the frame");
+        }
+        server.await.unwrap().unwrap();
+    }
+}
+
 #[test]
 fn poisoned_connector_store_mutex_recovers_inner_state() {
     let mutex = std::sync::Arc::new(std::sync::Mutex::new(vec![1]));
