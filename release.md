@@ -121,7 +121,8 @@ cutting the first point release from a release branch.
 ### Nightly builds
 
 Every day `.github/workflows/nightly-releases.yml` builds MarmotKit (iOS, macOS, Android), Marmot C and WN Agent from
-the newest `master` commit whose merge-queue `Required CI` passed. It is scheduled for 00:17 UTC, but GitHub can start
+the newest `master` commit verified at the `canary` branch tip (or whose merge-queue `Required CI` passed). It is
+scheduled for 00:17 UTC, but GitHub can start
 scheduled runs hours late; nothing depends on the start time except the date in the name. If that commit is the
 previous nightly's source, the night is skipped.
 

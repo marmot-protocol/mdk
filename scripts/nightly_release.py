@@ -112,7 +112,7 @@ def select_source(
     previous_sha: str | None,
     required_ci_passed: Callable[[str], bool],
 ) -> str | None:
-    """Return the newest master commit whose merge-queue Required CI passed.
+    """Return the newest verified master commit (exact canary tip or merge-queue Required CI).
 
     Walking stops at the previous nightly's source, which already passed, so selection never moves
     backwards and an unchanged master resolves to the previous SHA.
@@ -379,25 +379,25 @@ def workspace_version_at(sha: str) -> str:
     return manifest["workspace"]["package"]["version"]
 
 
-def canary_verified_commits(canary_ref: str | None, depth: int) -> set[str]:
-    """Return the first-parent commit set reachable from `canary_ref`, if present."""
+def canary_tip_commit(canary_ref: str | None) -> str | None:
+    """Return the exact verified commit SHA at `canary_ref`, if present."""
     if not canary_ref:
-        return set()
+        return None
     probe = subprocess.run(
         ["git", "rev-parse", "--verify", "--quiet", f"{canary_ref}^{{commit}}"],
         capture_output=True,
         text=True,
     )
     if probe.returncode != 0:
-        return set()
-    return set(git("rev-list", "--first-parent", f"--max-count={depth}", canary_ref).split())
+        return None
+    return probe.stdout.strip() or None
 
 
 def command_plan(args: argparse.Namespace) -> int:
     gh = github_from_env()
     day = today_utc(args.today)
     shas = git("rev-list", "--first-parent", f"--max-count={args.depth}", args.master_ref).split()
-    canary_shas = canary_verified_commits(args.canary_ref, args.depth)
+    canary_tip = canary_tip_commit(args.canary_ref)
     latest = gh.read_latest()
     previous_sha = latest["source_sha"] if latest else None
     previous_version = latest["version"] if latest else "none"
@@ -405,7 +405,7 @@ def command_plan(args: argparse.Namespace) -> int:
     source_sha = select_source(
         shas,
         previous_sha,
-        lambda sha: sha in canary_shas or gh.required_ci_passed(sha),
+        lambda sha: (canary_tip is not None and sha == canary_tip) or gh.required_ci_passed(sha),
     )
     if source_sha is None:
         raise NightlyError(

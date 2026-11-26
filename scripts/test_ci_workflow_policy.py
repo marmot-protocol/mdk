@@ -832,16 +832,17 @@ class NightlyReleasePolicyTests(unittest.TestCase):
             cwd = os.getcwd()
             try:
                 os.chdir(repo)
-                canary_shas = nightly_release.canary_verified_commits("canary", 50)
-                missing_shas = nightly_release.canary_verified_commits("nonexistent", 50)
+                canary_tip = nightly_release.canary_tip_commit("canary")
+                missing_tip = nightly_release.canary_tip_commit("nonexistent")
             finally:
                 os.chdir(cwd)
 
-            self.assertEqual(canary_shas, {c1, c2})
-            self.assertEqual(missing_shas, set())
-            # Newer unverified master commit c3 is skipped; canary-verified c2 is selected.
-            selected = nightly_release.select_source([c3, c2, c1], c1, lambda sha: sha in canary_shas)
-            self.assertEqual(selected, c2)
+            self.assertEqual(canary_tip, c2)
+            self.assertIsNone(missing_tip)
+            # Only the exact canary tip c2 is treated as Canary-verified (not unverified c3 or untested ancestor c1).
+            predicate = lambda sha: sha == canary_tip
+            self.assertEqual(nightly_release.select_source([c3, c2, c1], c1, predicate), c2)
+            self.assertIsNone(nightly_release.select_source([c1], None, predicate))
 
     def test_nightly_jobs_require_their_dependencies_and_own_concurrency(self):
         workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
