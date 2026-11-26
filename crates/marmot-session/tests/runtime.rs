@@ -4289,11 +4289,13 @@ async fn undelivered_commit_is_reported_and_holds_the_next_self_update_for_an_ho
     let mut runtime = AccountDeviceRuntime::new(
         current_session(database, &key, b"alice"),
         adapter.clone(),
-        StaticTransportRouting::new(vec![]).with_group_route(
-            group_id.clone(),
-            group_id.as_slice().to_vec(),
-            vec![relay_a.clone(), relay_b.clone()],
-        ),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![relay_a.clone(), relay_b.clone()],
+            ),
         RecordingKeyPackages::default(),
     )
     .with_maintenance_sources(
@@ -7451,6 +7453,7 @@ async fn manual_only_group_runtime(
         current_session(database, &key, b"alice"),
         RecordingAdapter::default(),
         StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())])
             .required_acks(1)
             .with_group_route(
                 group_id.clone(),
@@ -8304,7 +8307,8 @@ async fn an_overdue_component_recheck_is_owed_not_due_now() {
     let mut runtime = AccountDeviceRuntime::new(
         session(dir.path().join("alice.sqlite"), &key, b"alice"),
         RecordingAdapter::default(),
-        StaticTransportRouting::new(vec![]),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
         RecordingKeyPackages::default(),
     )
     .with_maintenance_sources(
