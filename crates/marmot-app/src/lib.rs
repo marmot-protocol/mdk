@@ -7593,6 +7593,7 @@ impl MarmotApp {
                     success,
                     migrations_completed,
                 } => (version, success, migrations_completed),
+                _ => return,
             };
             if completed > 0 {
                 account_open.migration_applied();

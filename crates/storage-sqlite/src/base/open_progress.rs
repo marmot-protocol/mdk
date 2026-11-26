@@ -9,6 +9,7 @@ pub enum StorageOpenPhase {
 }
 /// Numeric schema progress is available before and after each migration transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StorageOpenProgress {
     Phase(StorageOpenPhase),
     MigrationStarted(u32),

@@ -82,6 +82,9 @@ pub(super) fn apply(
     migrations: &[Migration],
     observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
 ) -> StorageResult<usize> {
+    if !starts_empty(connection).storage()? {
+        return Ok(0);
+    }
     let covered = migrations
         .iter()
         .take_while(|migration| migration.version <= BASELINE_VERSION)
@@ -90,9 +93,6 @@ pub(super) fn apply(
         return Err(StorageError::Backend(
             "migration baseline does not end at a registered migration".into(),
         ));
-    }
-    if !starts_empty(connection).storage()? {
-        return Ok(0);
     }
     let version = BASELINE_VERSION as u32;
     crate::base::open_progress::observe(
@@ -250,11 +250,9 @@ mod tests {
             let quoted = columns
                 .iter()
                 .map(|column| {
-                    let renewed = RENEWED_PER_DATABASE.iter().find(|entry| {
-                        !LEDGER_TABLES.contains(&entry.table)
-                            && entry.table == table
-                            && entry.column == column
-                    });
+                    let renewed = RENEWED_PER_DATABASE
+                        .iter()
+                        .find(|entry| entry.table == table && entry.column == column);
                     match (renewed, renewed_render) {
                         (Some(entry), RenewedRender::Expression) => {
                             let escaped = entry.expression.replace('\'', "''");
@@ -286,6 +284,30 @@ mod tests {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
+            if !values.is_empty() && table != "sqlite_sequence" {
+                let has_integer_pk: bool = connection
+                    .query_row(
+                        &format!(
+                            "SELECT count(*) = 1 AND max(upper(type)) = 'INTEGER'
+                             FROM pragma_table_info('{table}') WHERE pk > 0"
+                        ),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let without_rowid: bool = connection
+                    .query_row(
+                        "SELECT upper(sql) LIKE '%WITHOUT ROWID%'
+                         FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                        [&table],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    has_integer_pk || without_rowid,
+                    "seeded table {table} uses an implicit rowid; preserve rowid in dump_rows"
+                );
+            }
             for value in values {
                 out.push_str(&format!(
                     "INSERT INTO \"{table}\" ({names}) VALUES ({value});\n"
@@ -413,7 +435,8 @@ mod tests {
     }
 
     /// Migrations registered after `BASELINE_VERSION` replay normally after the
-    /// baseline commits, even when `BASELINE_VERSION` equals the current head.
+    /// baseline commits, see the tables and seed rows it created, and report
+    /// their own progress after the batch finishes.
     #[test]
     fn baseline_is_followed_by_later_migrations() {
         use crate::StorageOpenProgress::{
@@ -427,8 +450,12 @@ mod tests {
             name: "9999_baseline_tail_probe",
             suspend_foreign_keys: &[],
             apply: |tx| {
-                tx.execute_batch("CREATE TABLE baseline_tail_probe (id INTEGER PRIMARY KEY);")
-                    .storage()
+                tx.execute_batch(
+                    "CREATE TABLE baseline_tail_probe (store_epoch BLOB NOT NULL);
+                     INSERT INTO baseline_tail_probe (store_epoch)
+                     SELECT store_epoch FROM chat_presentation_meta;",
+                )
+                .storage()
             },
         });
 
@@ -440,9 +467,27 @@ mod tests {
             extended.len()
         );
 
-        let mut replayed = open_in_memory_fk();
-        run(&mut replayed, &extended).unwrap();
-        assert_same_state(&fresh, &replayed);
+        let expected_epoch: Vec<u8> = fresh
+            .query_row("SELECT store_epoch FROM chat_presentation_meta", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let observed_epoch: Vec<u8> = fresh
+            .query_row("SELECT store_epoch FROM baseline_tail_probe", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(observed_epoch, expected_epoch);
+        assert_eq!(observed_epoch.len(), 16);
+        assert_ne!(observed_epoch, vec![0u8; 16]);
+        let recorded_name: String = fresh
+            .query_row(
+                "SELECT name FROM cgka_schema_migrations WHERE version = ?1",
+                [tail_version],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded_name, "9999_baseline_tail_probe");
 
         let baseline = BASELINE_VERSION as u32;
         let covered_count = MIGRATIONS
@@ -451,17 +496,34 @@ mod tests {
             .count() as u32;
         let tail = tail_version as u32;
         let progress = progress.into_inner();
-        assert!(progress.contains(&MigrationStarted(baseline)));
-        assert!(progress.contains(&MigrationBatchFinished {
-            version: baseline,
-            success: true,
-            migrations_completed: covered_count,
-        }));
-        assert!(progress.contains(&MigrationStarted(tail)));
-        assert!(progress.contains(&MigrationFinished {
-            version: tail,
-            success: true,
-        }));
+        let batch_finished = progress
+            .iter()
+            .position(|event| {
+                *event
+                    == MigrationBatchFinished {
+                        version: baseline,
+                        success: true,
+                        migrations_completed: covered_count,
+                    }
+            })
+            .expect("baseline batch finished event");
+        let tail_started = progress
+            .iter()
+            .position(|event| *event == MigrationStarted(tail))
+            .expect("tail started event");
+        let tail_finished = progress
+            .iter()
+            .position(|event| {
+                *event
+                    == MigrationFinished {
+                        version: tail,
+                        success: true,
+                    }
+            })
+            .expect("tail finished event");
+        assert!(progress[..batch_finished].contains(&MigrationStarted(baseline)));
+        assert!(batch_finished < tail_started);
+        assert!(tail_started < tail_finished);
     }
 
     /// A failure while recording the ledger rolls the whole baseline back and
