@@ -47,15 +47,24 @@ async fn a_looked_up_inbox_list_delivers_the_owed_welcome() {
         .unwrap()
         .push(bob_inbox_list(&bob_id, BOB_LISTED_INBOX, now - 10));
     let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
 
     timeout(SETTLE, async {
-        while bob_state(&runtime, &group).await != WelcomeDeliveryState::RelayAccepted {
-            sleep(Duration::from_millis(25)).await;
+        loop {
+            if let Ok(MarmotAppEvent::InviteDeliveryChanged { delivery, .. }) = events.recv().await
+                && delivery.state == WelcomeDeliveryState::RelayAccepted
+            {
+                break;
+            }
         }
     })
     .await
     .expect("the looked-up list delivers the Welcome");
+    assert_eq!(
+        bob_state(&runtime, &group).await,
+        WelcomeDeliveryState::RelayAccepted
+    );
     assert!(
         relay
             .attempted_routes()
@@ -85,35 +94,22 @@ async fn a_held_lookup_leaves_the_worker_answering_and_ends_at_shutdown() {
         ..
     } = invite;
     drop(alice);
-    let held_author = bob_id.clone();
+    let looking_up = Arc::new(tokio::sync::Notify::new());
+    let entered = looking_up.clone();
     fetcher.never_answer(move |request| {
-        request.queries.iter().any(|query| {
-            query.kind == KIND_MARMOT_INBOX_RELAY_LIST && query.authors == [held_author.clone()]
-        })
+        let held = request.queries.iter().any(|query| {
+            query.kind == KIND_MARMOT_INBOX_RELAY_LIST && query.authors == [bob_id.clone()]
+        });
+        if held {
+            entered.notify_one();
+        }
+        held
     });
-    let lookups = || {
-        fetcher
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|request| {
-                request.queries.iter().any(|query| {
-                    query.kind == KIND_MARMOT_INBOX_RELAY_LIST && query.authors == [bob_id.clone()]
-                })
-            })
-            .count()
-    };
-    let before = lookups();
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
-    timeout(SETTLE, async {
-        while lookups() == before {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the worker looks Bob's inbox list up");
+    timeout(SETTLE, looking_up.notified())
+        .await
+        .expect("the worker looks Bob's inbox list up");
 
     assert_eq!(
         bob_state(&runtime, &group).await,
