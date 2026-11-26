@@ -1333,6 +1333,25 @@ fn decode_onboarding_checkpoint(
     Ok(checkpoint)
 }
 
+pub(crate) fn onboarding_defers_key_package_maintenance(
+    app: &MarmotApp,
+    account_ref: &str,
+) -> bool {
+    match SetupRecords::new(app).require_onboarding_complete(account_ref) {
+        Ok(()) => false,
+        Err(AppError::OnboardingRequired | AppError::OnboardingActionUnavailable) => true,
+        Err(error) => {
+            tracing::warn!(
+                target: "marmot_app::onboarding",
+                method = "onboarding_defers_key_package_maintenance",
+                error_kind = error.privacy_safe_kind(),
+                "deferring key package maintenance after onboarding state error"
+            );
+            true
+        }
+    }
+}
+
 impl<'a> SetupRecords<'a> {
     pub(super) fn new(app: &'a MarmotApp) -> Self {
         Self { app }

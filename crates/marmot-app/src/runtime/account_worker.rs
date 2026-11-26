@@ -2151,6 +2151,20 @@ async fn run_app_runtime_account_worker(
                 break 'worker;
             }
             () = std::future::ready(()), if relay_config_work == RelayConfigWork::Ready => {
+                let mut routing_refresh_error = None;
+                let key_package_routing_refreshed = match client.refresh_key_package_routing() {
+                    Ok(changed) => {
+                        if changed {
+                            maintenance_due_dirty = true;
+                        }
+                        true
+                    }
+                    Err(error) if error.is_account_not_active() => false,
+                    Err(error) => {
+                        routing_refresh_error = Some(error);
+                        false
+                    }
+                };
                 let health_read = publish_relay_health_change(
                     &client,
                     &events,
@@ -2159,9 +2173,23 @@ async fn run_app_runtime_account_worker(
                     &mut announced_relay_health,
                 );
                 relay_config_work = match client.sync_relay_liveness().await {
-                    // A failed health read still owes hosts its answer.
-                    Ok(_) if health_read => RelayConfigWork::Idle,
-                    Ok(_) => RelayConfigWork::Retry,
+                    // A failed health or KeyPackage routing read still owes reconciliation.
+                    Ok(_) if health_read && key_package_routing_refreshed => RelayConfigWork::Idle,
+                    Ok(_) => {
+                        if let Some(error) = routing_refresh_error {
+                            publish_app_runtime_account_error(
+                                Emit::Quiescent(&client),
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                account_error_message(
+                                    "relay configuration reconciliation failed",
+                                    &error,
+                                ),
+                            );
+                        }
+                        RelayConfigWork::Retry
+                    }
                     Err(error) if error.is_account_not_active() => RelayConfigWork::Retry,
                     Err(error) => {
                         publish_app_runtime_account_error(

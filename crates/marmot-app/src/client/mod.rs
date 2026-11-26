@@ -1374,6 +1374,9 @@ pub(crate) enum MaintenancePasses {
     /// A wake-collection runtime (`CursorPersistence::Frozen`) leaves the
     /// passes to an advancing one.
     Frozen,
+    /// Interactive onboarding has not completed yet: setup owns the first
+    /// KeyPackage publication and background maintenance waits for it.
+    Onboarding,
 }
 
 impl AppClient {
@@ -1597,6 +1600,11 @@ impl AppClient {
             MaintenancePasses::SignOutHeld
         } else if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
             MaintenancePasses::Frozen
+        } else if crate::runtime::onboarding_defers_key_package_maintenance(
+            &self.app,
+            &self.state.label,
+        ) {
+            MaintenancePasses::Onboarding
         } else {
             MaintenancePasses::Run
         })
@@ -1619,7 +1627,7 @@ impl AppClient {
                     .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
                 return Ok(maintenance_run_summary_from_account(summary));
             }
-            MaintenancePasses::Frozen => {
+            MaintenancePasses::Frozen | MaintenancePasses::Onboarding => {
                 self.runtime.sweep_expired_key_package_private_material()?;
                 self.discard_expired_sibling_key_packages();
                 let summary = self
@@ -1680,6 +1688,9 @@ impl AppClient {
         boxed(|| self.device_rename_upkeep()).await;
         boxed(|| self.drive_history_deliveries()).await;
         let prepared = self.epoch_gap_held_groups().and_then(|held| {
+            // Safety net for direct AppClient callers and any missed worker
+            // relay-config signals; no-op when endpoints are unchanged.
+            self.refresh_key_package_routing()?;
             self.sync_key_package_announcement_group()?;
             self.sync_device_tag_group()?;
             Ok(held)
@@ -1898,7 +1909,7 @@ impl AppClient {
     }
 
     pub(crate) fn key_package_maintenance_requires_catch_up(&self) -> bool {
-        self.app.cursor_persistence() == crate::CursorPersistence::Advance
+        matches!(self.maintenance_passes(), Ok(MaintenancePasses::Run))
             && self
                 .runtime
                 .key_package_maintenance_requires_catch_up()
@@ -7543,6 +7554,17 @@ impl AppClient {
             .retain(|route| !group_is_terminal(&self.runtime, &route.group_id));
         self.routing.replace(snapshot);
         Ok(())
+    }
+
+    /// Refresh only the account's KeyPackage publication endpoints from the
+    /// latest directory relay lists so a live worker or maintenance pass picks
+    /// up NIP-65 read/write changes without rebuilding group subscriptions.
+    pub(crate) fn refresh_key_package_routing(&self) -> Result<bool, AppError> {
+        let relay_lists = self.app.account_relay_list_status(&self.state.label)?;
+        let endpoints = self
+            .app
+            .key_package_endpoints(&self.state.label, &relay_lists)?;
+        Ok(self.routing.replace_key_package_endpoints(endpoints))
     }
 
     /// Install the inbox routes of the given members, which a Welcome publish

@@ -229,17 +229,25 @@ where
         if self.key_package_slot_withdrawn {
             return Ok(());
         }
+        let current_endpoints = self.routing.key_package_endpoints();
         // The current publication's unacknowledged relays, at their backoff.
         if self.key_package_has_pending_fanout()? {
             for target in &lifecycle.publication_targets {
-                due.at_opt(target_retry_at(target));
+                if !current_endpoints.contains(&target.endpoint) {
+                    continue;
+                }
+                if target.state == TransportFanoutAttemptState::PolicyProhibited {
+                    due.owed();
+                } else {
+                    due.at_opt(target_retry_at(target));
+                }
             }
         }
         // Paused maintenance finishes publishing what is prepared and
         // prepares nothing new, as the run does.
         match lifecycle.pending_replacement.as_ref() {
             Some(pending)
-                if self.pending_replacement_obsolete(&lifecycle, pending)
+                if self.pending_replacement_obsolete(&lifecycle, pending, now)
                     || pending.signed_event.is_none() =>
             {
                 if !self.maintenance_paused {
@@ -247,8 +255,14 @@ where
                 }
             }
             Some(pending) => {
-                for target in &pending.targets {
-                    due.at_opt(target_retry_at(target));
+                if has_newly_authorized_pending_target(&pending.targets, &current_endpoints) {
+                    due.owed();
+                } else {
+                    for target in &pending.targets {
+                        if current_endpoints.contains(&target.endpoint) {
+                            due.at_opt(target_retry_at(target));
+                        }
+                    }
                 }
             }
             None if self.maintenance_paused => {}
