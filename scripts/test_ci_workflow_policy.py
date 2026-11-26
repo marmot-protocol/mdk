@@ -1720,6 +1720,10 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
         fake_gh = textwrap.dedent("""\
             gh() {
               if [[ "$FAKE_RUNS_JSON" == "error" ]]; then return 1; fi
+              if [[ "$FAKE_RUNS_JSON" == "error_body" ]]; then
+                printf '{"message":"Internal Server Error"}\\n'
+                return 1
+              fi
               printf '%s\\n' "$FAKE_RUNS_JSON"
             }
         """)
@@ -1764,6 +1768,12 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
             git("commit", "-m", "c4")
             c4 = git("rev-parse", "HEAD")
 
+            (repo / "crates/marmot-uniffi-macros/src").mkdir(parents=True)
+            (repo / "crates/marmot-uniffi-macros/src/lib.rs").write_text("// macro change\n")
+            git("add", ".")
+            git("commit", "-m", "c5")
+            c5 = git("rev-parse", "HEAD")
+
             # Simulate bare-metal Canary already sitting at c2.
             git("update-ref", "refs/remotes/origin/canary", c2)
 
@@ -1771,7 +1781,12 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
                 git("checkout", "-q", checkout_sha)
                 out = repo / "gh_out"
                 out.unlink(missing_ok=True)
-                runs_json = "error" if runs == "error" else json.dumps({"workflow_runs": runs})
+                if isinstance(runs, str):
+                    runs_json = runs
+                elif isinstance(runs, dict):
+                    runs_json = json.dumps(runs)
+                else:
+                    runs_json = json.dumps({"workflow_runs": runs})
                 subprocess.run(
                     ["bash", "-c", fake_gh + script],
                     cwd=repo,
@@ -1790,11 +1805,11 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
                 )
                 return dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
 
-            def green(sha, run_id=100):
-                return {"id": run_id, "head_sha": sha, "conclusion": "success"}
+            def green(sha, run_id=100, updated_at="2026-11-26T15:00:00Z"):
+                return {"id": run_id, "head_sha": sha, "conclusion": "success", "updated_at": updated_at}
 
-            def failed(sha, run_id=101):
-                return {"id": run_id, "head_sha": sha, "conclusion": "failure"}
+            def failed(sha, run_id=101, updated_at="2026-11-26T15:30:00Z"):
+                return {"id": run_id, "head_sha": sha, "conclusion": "failure", "updated_at": updated_at}
 
             # Unchanged master whose latest completed run succeeded skips quickly.
             self.assertEqual(run_plan(c1, [green(c1)])["should_run"], "false")
@@ -1811,6 +1826,19 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
                 (failed_after_green["should_run"], failed_after_green["run_bindings_profile"]),
                 ("true", "true"),
             )
+            # A rerun of an older run ID sits behind a newer ID in GitHub's creation-ordered list,
+            # but has a newer updated_at; ordering by completion recency must not skip it.
+            rerun_failed_behind_newer_green = run_plan(
+                c1,
+                [
+                    green(c1, 105, updated_at="2026-11-26T15:10:00Z"),
+                    failed(c1, 100, updated_at="2026-11-26T15:45:00Z"),
+                ],
+            )
+            self.assertEqual(
+                (rerun_failed_behind_newer_green["should_run"], rerun_failed_behind_newer_green["run_bindings_profile"]),
+                ("true", "true"),
+            )
             # Core-only diff runs CI without heavy macOS bindings-profile packaging.
             core = run_plan(c1, [green(c0)])
             self.assertEqual((core["should_run"], core["run_bindings_profile"]), ("true", "false"))
@@ -1823,12 +1851,16 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
             # Cargo config diff (.cargo/config.toml) also triggers bindings-profile packaging.
             cargo_cfg = run_plan(c4, [green(c3)])
             self.assertEqual((cargo_cfg["should_run"], cargo_cfg["run_bindings_profile"]), ("true", "true"))
-            # API failure or missing hosted baseline fails safe to running packaging
-            # even if bare-metal `origin/canary` already sits at `source_sha`.
-            api_err = run_plan(c2, "error")
-            self.assertEqual((api_err["should_run"], api_err["run_bindings_profile"]), ("true", "true"))
-            first_run = run_plan(c2, [])
-            self.assertEqual((first_run["should_run"], first_run["run_bindings_profile"]), ("true", "true"))
+            # Binding proc-macro diff (crates/marmot-uniffi-macros/) also triggers packaging.
+            macro_diff = run_plan(c5, [green(c4)])
+            self.assertEqual((macro_diff["should_run"], macro_diff["run_bindings_profile"]), ("true", "true"))
+            # API failure (empty, error JSON on stdout with nonzero exit, or malformed payload)
+            # and missing hosted baseline all fail safe to running CI + packaging even if
+            # bare-metal `origin/canary` already sits at `source_sha`.
+            for bad_runs in ("error", "error_body", {"message": "bad payload"}, []):
+                with self.subTest(bad_runs=bad_runs):
+                    res = run_plan(c2, bad_runs)
+                    self.assertEqual((res["should_run"], res["run_bindings_profile"]), ("true", "true"))
 
     def test_canary_summary_records_json_and_enforces_gate(self):
         write_script = workflow_step("canary.yml", "Write Canary summary artifact")
