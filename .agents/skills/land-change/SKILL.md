@@ -143,6 +143,20 @@ you do not decide alone that it is good enough.
   including any rebase, needs a new round; there is no exception for small
   fixes. To make that rarer, rebase onto `origin/master` before the final
   round.
+- Once both seats say `VERDICT: merge`, amend the signed tip commit message
+  (`git commit --amend -S`, preserving `HEAD^{tree}`) to record the three
+  required trailers and check them with `just pr-trailers-check`:
+
+  ```text
+  Local-Checks: <commands run locally>
+  Local-Review: <seat-a> + <seat-b> merge @ <reviewed-short-sha>
+  Release-Impact: none | patch | minor
+  ```
+
+  Ensure `Release-Impact:` agrees with any `changelog.d/<slug>.md` fragments
+  (`### Breaking changes` requires `minor`; user-facing entries forbid `none`)
+  and that no earlier commit on the branch declares a conflicting
+  `Release-Impact:`.
 
 Count the rounds; the report in step 6 says how many it took.
 
