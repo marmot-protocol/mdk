@@ -4106,27 +4106,53 @@ async fn the_worker_samples_push_timing_only_while_owed() {
     runtime.shutdown().await;
 }
 
-/// An account whose KeyPackage cannot publish (no relays) owes session
-/// maintenance work with no stored time. It retries 15 s after its last
-/// run by the worker's clock, as the tick did, never back to back on each
-/// re-read of its due time (mdk#3265).
+/// An account with owed untimed session maintenance work (an overdue
+/// component recheck that cannot finish because the epoch-gap read fails)
+/// retries 15 s after its last run by the worker's clock, as the tick did,
+/// never back to back on each re-read of its due time (mdk#3265).
 #[tokio::test(flavor = "current_thread")]
 async fn owed_session_maintenance_retries_15_s_apart_not_back_to_back() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let app = relayless_app_without_device_groups(dir.path());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_open_ranking_provider(None, Vec::new())
+            .with_device_groups(false),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     app.account_home()
         .create_account("alice")
         .expect("create alice");
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.accounts().reconcile().await.expect("alice starts");
+    runtime
+        .create_group("alice", "owed-retry", &[], None)
+        .await
+        .expect("alice creates a group");
     let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    let before_overdue = count(RuntimeOp::WorkerMaintenanceDue);
+    runtime
+        .accounts()
+        .overdue_component_recheck_for_test("alice")
+        .await
+        .expect("the recheck is held overdue");
+    // Step past the read spacing and initial retry window so one maintenance
+    // run completes with the overdue recheck owed and anchors `last_run`.
+    for _ in 0..17 {
+        if count(RuntimeOp::WorkerMaintenanceDue) > before_overdue {
+            break;
+        }
+        advance_held_clock(Duration::from_secs(1)).await;
+    }
     timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-        while count(RuntimeOp::WorkerMaintenanceDue) == 0 {
+        while count(RuntimeOp::WorkerMaintenanceDue) == before_overdue {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the first session maintenance run completes");
+    .expect("the first owed session maintenance run completes");
     let runs = count(RuntimeOp::WorkerMaintenanceDue);
     // The run's retry is due 15 s after it started, so no later than 15 s
     // from here on the worker's clock.
