@@ -3,7 +3,7 @@
 //! bytes are checkpointed before they can reach a relay.
 use super::*;
 use nostr::prelude::{EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord, RelayEndpointPolicy};
 use transport_nostr_peeler::NostrTransportEvent;
@@ -675,6 +675,8 @@ struct OnboardingCheckpoint {
     snapshot: OnboardingSnapshot,
     options: OnboardingOptions,
     records: Vec<Option<NostrTransportEvent>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inbox_auth_probe: Option<InboxAuthProbe>,
     // Persisted before signing/publication. Approval survives cancellation;
     // a retry republishes precisely the same event once signed.
     approved: bool,
@@ -719,6 +721,41 @@ struct OnboardingCheckpoint {
     // The pauses this attempt has counted in usage diagnostics (mdk#3440).
     #[serde(default)]
     reported_pauses: Vec<analytics::OnboardingPauseKey>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct InboxAuthProbe {
+    declaration: InboxAuthDeclaration,
+    endpoint: String,
+    try_next: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InboxAuthDeclaration {
+    created_at: u64,
+    routes_hash: [u8; 32],
+}
+
+impl InboxAuthDeclaration {
+    fn new(created_at: u64, endpoints: &[String]) -> Self {
+        use sha2::{Digest, Sha256};
+
+        // The cache keeps no event ID. Use the same identity for an effective
+        // inbox list whether it came from a relay or the directory cache.
+        let routes: BTreeSet<_> = endpoints
+            .iter()
+            .map(|endpoint| relay_key(endpoint))
+            .collect();
+        let mut digest = Sha256::new();
+        for route in routes {
+            digest.update((route.len() as u64).to_be_bytes());
+            digest.update(route.as_bytes());
+        }
+        Self {
+            created_at,
+            routes_hash: digest.finalize().into(),
+        }
+    }
 }
 
 /// A device notice the user acknowledged, with the findings shown beside it.
@@ -834,6 +871,7 @@ impl OnboardingCheckpoint {
             },
             options,
             records: vec![None; STEP_COUNT],
+            inbox_auth_probe: None,
             approved: false,
             signed_repair: None,
             repair_may_have_published: None,
@@ -2138,6 +2176,7 @@ impl AccountSetup<'_> {
                 existing.manual_relay_edit = false;
                 existing.single_device_acknowledged = false;
                 existing.stale_device_acknowledgment = None;
+                existing.inbox_auth_probe = None;
                 existing.snapshot.single_device_notice = None;
                 existing.snapshot.created_inbox_list = None;
                 existing.seen_signed_inbox_list = false;
@@ -2882,6 +2921,8 @@ fn retryable_inspection_error(error: &transport_nostr::DirectoryInspectionError)
         RateLimited | Incomplete | Unreachable | TimedOut => true,
         AuthenticationRequired
         | AuthenticationTimedOut
+        | AuthenticationSignerFailed
+        | AuthenticationRejected
         | PaymentRequired
         | Restricted
         | InvalidRequest => false,
@@ -2999,11 +3040,20 @@ impl AccountSetup<'_> {
     async fn inspect_onboarding_inbox(
         &self,
         account_id: &str,
+        declaration: InboxAuthDeclaration,
         endpoints: Vec<String>,
+        probe: &mut Option<InboxAuthProbe>,
     ) -> OnboardingInspection {
         let mut inspection = self
             .inspect_onboarding_relays(account_id, 1059, endpoints)
             .await;
+        if !inspection.completed.is_empty()
+            || probe
+                .as_ref()
+                .is_some_and(|previous| previous.declaration != declaration)
+        {
+            *probe = None;
+        }
         if !inspection.completed.is_empty() {
             return inspection;
         }
@@ -3013,26 +3063,39 @@ impl AccountSetup<'_> {
         if account.local_signing || !account.external_signing {
             return inspection;
         }
-        // A single external AUTH request is enough to check an inbox route.
-        // Choose a route only after it actually refused the anonymous read.
-        let Some(index) = inspection
+        let previous = probe.as_ref();
+        // Try one authenticated route per check. A signer pause keeps its
+        // route while eligible. After a relay failure Retry tries the next one.
+        let Some((index, endpoint)) = inspection
             .failures
             .iter()
             .enumerate()
             .filter(|(_, failure)| failure.issue == OnboardingIssue::AuthenticationRequired)
-            .min_by_key(|(_, failure)| failure.endpoint.as_deref())
-            .map(|(index, _)| index)
+            .filter_map(|(index, failure)| Some((index, failure.endpoint.as_deref()?)))
+            .min_by_key(|&(_, endpoint)| {
+                let after_preferred = previous.is_some_and(|previous| {
+                    if previous.try_next {
+                        endpoint <= previous.endpoint.as_str()
+                    } else {
+                        endpoint != previous.endpoint.as_str()
+                    }
+                });
+                (after_preferred, endpoint)
+            })
         else {
             return inspection;
         };
-        let Some(endpoint) = inspection.failures[index].endpoint.clone() else {
-            return inspection;
+        let mut selected = InboxAuthProbe {
+            declaration,
+            endpoint: endpoint.to_owned(),
+            try_next: false,
         };
         let Ok(signer) = self.app().account_signer_for_summary(&account) else {
             inspection.failures[index] = OnboardingFinding {
-                endpoint: Some(endpoint),
+                endpoint: Some(selected.endpoint.clone()),
                 ..finding(OnboardingIssue::SignerUnavailable)
             };
+            *probe = Some(selected);
             return inspection;
         };
         inspection.failures.swap_remove(index);
@@ -3040,11 +3103,16 @@ impl AccountSetup<'_> {
             .inspect_onboarding_relays_with_signer(
                 account_id,
                 1059,
-                vec![endpoint],
+                vec![selected.endpoint.clone()],
                 Some(signer),
                 None,
             )
             .await;
+        selected.try_next = !signed
+            .failures
+            .iter()
+            .any(|failure| failure.issue == OnboardingIssue::SignerUnavailable);
+        *probe = signed.completed.is_empty().then_some(selected);
         inspection.failures.extend(signed.failures);
         inspection.completed.extend(signed.completed);
         inspection
@@ -3081,8 +3149,11 @@ impl AccountSetup<'_> {
             }
             let plane = self.app().relay_plane.clone();
             let signer = signer.clone();
-            let query =
+            let mut query =
                 DirectoryEventQuery::new(kind, vec![account_id.to_owned()], DISCOVERY_PAGE_LIMIT);
+            if external_signer && kind == 1059 {
+                query = query.with_external_inbox_auth();
+            }
             tasks.spawn(async move {
                 let deadline = tokio::time::Instant::now() + CHECK_WAIT;
                 let inspect_once = |remaining: Duration| {
@@ -3192,11 +3263,18 @@ impl AccountSetup<'_> {
                         }
                     }
                     let issue = match cause {
-                        AuthenticationTimedOut if external_signer => {
+                        AuthenticationTimedOut | AuthenticationSignerFailed if external_signer => {
                             OnboardingIssue::SignerUnavailable
                         }
-                        AuthenticationTimedOut | TimedOut => OnboardingIssue::TimedOut,
-                        AuthenticationRequired => OnboardingIssue::AuthenticationRequired,
+                        AuthenticationTimedOut | AuthenticationSignerFailed | TimedOut => {
+                            OnboardingIssue::TimedOut
+                        }
+                        AuthenticationRejected if external_signer => {
+                            OnboardingIssue::AccessRestricted
+                        }
+                        AuthenticationRequired | AuthenticationRejected => {
+                            OnboardingIssue::AuthenticationRequired
+                        }
                         PaymentRequired => OnboardingIssue::PaymentRequired,
                         RateLimited => OnboardingIssue::RateLimited,
                         Restricted => OnboardingIssue::AccessRestricted,
@@ -3537,7 +3615,7 @@ impl AccountSetup<'_> {
     }
     async fn evaluate_cached_inbox_routes(
         &self,
-        c: &OnboardingCheckpoint,
+        c: &mut OnboardingCheckpoint,
         cached_inbox: crate::AccountRelayListState,
         failures: Vec<OnboardingFinding>,
     ) -> (OnboardingStatus, Vec<OnboardingFinding>) {
@@ -3572,7 +3650,7 @@ impl AccountSetup<'_> {
     #[allow(clippy::too_many_arguments)]
     async fn evaluate_onboarding_relay_routes(
         &self,
-        c: &OnboardingCheckpoint,
+        c: &mut OnboardingCheckpoint,
         step: OnboardingStep,
         raw: Vec<String>,
         capabilities: &HashMap<String, OnboardingRelayCapability>,
@@ -3636,6 +3714,7 @@ impl AccountSetup<'_> {
                 ));
                 Some(OnboardingStatus::NeedsInput)
             } else {
+                let created_at = state.created_at;
                 let mut endpoints = state.relays;
                 if step == OnboardingStep::Relays {
                     // A declared read route can complete the bounded check
@@ -3676,8 +3755,14 @@ impl AccountSetup<'_> {
                     )
                     .await
                 } else {
-                    self.inspect_onboarding_inbox(&c.snapshot.account_id_hex, endpoints)
-                        .await
+                    let declaration = InboxAuthDeclaration::new(created_at, &endpoints);
+                    self.inspect_onboarding_inbox(
+                        &c.snapshot.account_id_hex,
+                        declaration,
+                        endpoints,
+                        &mut c.inbox_auth_probe,
+                    )
+                    .await
                 };
                 let waiting_for_signer = route_failures
                     .iter()
@@ -3739,7 +3824,7 @@ impl AccountSetup<'_> {
     }
     async fn evaluate_onboarding_record(
         &self,
-        c: &OnboardingCheckpoint,
+        c: &mut OnboardingCheckpoint,
         step: OnboardingStep,
         event: NostrTransportEvent,
         failures: Vec<OnboardingFinding>,

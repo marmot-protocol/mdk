@@ -111,15 +111,15 @@ pub(crate) fn established(
         .map(|(relay, result)| {
             let state = match result {
                 Ok(()) => Some((Healthy, None)),
-                Err(AuthenticationRequired) => {
+                Err(AuthenticationRequired | AuthenticationRejected) => {
                     Some((refused, Some(RelayHealthFault::AuthenticationRequired)))
                 }
                 // The relay's reply to the AUTH went unread (a refusal cannot
-                // be told from a rate limit), or the signer was still signing
-                // when the read expired: never `Failing`.
-                Err(AuthenticationUnconfirmed | AuthenticationTimedOut) => {
-                    Some((Suspected, Some(RelayHealthFault::AuthenticationRequired)))
-                }
+                // be told from a rate limit), or the signer did not produce a
+                // usable signature: never `Failing`.
+                Err(
+                    AuthenticationUnconfirmed | AuthenticationTimedOut | AuthenticationSignerFailed,
+                ) => Some((Suspected, Some(RelayHealthFault::AuthenticationRequired))),
                 Err(PaymentRequired) => Some((refused, Some(RelayHealthFault::PaymentRequired))),
                 Err(Restricted) => Some((refused, Some(RelayHealthFault::Restricted))),
                 Err(Unexplained) => Some((Suspected, Some(RelayHealthFault::Unexplained))),

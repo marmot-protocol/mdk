@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -71,6 +71,10 @@ pub enum DirectoryInspectionError {
     AuthenticationRequired,
     /// A requested NIP-42 signature was still pending when the read expired.
     AuthenticationTimedOut,
+    /// The signer failed to produce a valid NIP-42 event during inbox onboarding.
+    AuthenticationSignerFailed,
+    /// The relay rejected the matching signed AUTH event for a policy reason.
+    AuthenticationRejected,
     PaymentRequired,
     RateLimited,
     Restricted,
@@ -137,6 +141,7 @@ pub struct DirectoryEventQuery {
     pub limit: usize,
     pub reference: Option<(char, String)>,
     pub(crate) since: Option<u64>,
+    external_inbox_auth: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,7 +354,16 @@ impl DirectoryEventQuery {
             limit,
             reference: None,
             since: None,
+            external_inbox_auth: false,
         }
+    }
+
+    /// Use the external-signer AUTH policy for a standalone inbox inspection.
+    /// Once a signature is requested, another challenge waits for the next
+    /// inspection. An AUTH-hinted EOSE cannot verify this signed inbox route.
+    pub fn with_external_inbox_auth(mut self) -> Self {
+        self.external_inbox_auth = true;
+        self
     }
 
     pub fn deletion_reference(
@@ -1169,10 +1183,16 @@ pub async fn fetch_public_events(
     result
 }
 
+const SIGNATURE_IDLE: u8 = 0;
+const SIGNATURE_PENDING: u8 = 1;
+const SIGNATURE_SIGNED: u8 = 2;
+const SIGNATURE_FAILED: u8 = 3;
+
 #[derive(Debug)]
 struct InspectionAuthenticator {
     signer: SignerAuthenticator<SdkSigner>,
-    pending: Arc<AtomicBool>,
+    signing: Arc<AtomicU8>,
+    single_signature: bool,
     /// The AUTH events it signed, so a relay's reply is matched to them.
     signed: Arc<std::sync::Mutex<Vec<EventId>>>,
 }
@@ -1184,21 +1204,61 @@ impl Authenticator for InspectionAuthenticator {
         challenge: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Event, nostr_sdk::prelude::Error>> + Send + 'a>> {
         Box::pin(async move {
-            struct PendingSignature<'a>(&'a AtomicBool);
+            struct PendingSignature<'a> {
+                state: &'a AtomicU8,
+                cancelled: u8,
+            }
             impl Drop for PendingSignature<'_> {
                 fn drop(&mut self) {
-                    self.0.store(false, Ordering::Relaxed);
+                    let _ = self.state.compare_exchange(
+                        SIGNATURE_PENDING,
+                        self.cancelled,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
                 }
             }
 
-            self.pending.store(true, Ordering::Relaxed);
-            let _pending = PendingSignature(&self.pending);
-            let event = self.signer.make_auth_event(relay_url, challenge).await?;
-            self.signed
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(event.id);
-            Ok(event)
+            if self.single_signature {
+                if self
+                    .signing
+                    .compare_exchange(
+                        SIGNATURE_IDLE,
+                        SIGNATURE_PENDING,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_err()
+                {
+                    return Err(nostr_sdk::prelude::Error::other(
+                        "inbox inspection already requested an AUTH signature",
+                    ));
+                }
+            } else {
+                self.signing.store(SIGNATURE_PENDING, Ordering::Relaxed);
+            }
+            let _pending = PendingSignature {
+                state: &self.signing,
+                cancelled: if self.single_signature {
+                    SIGNATURE_FAILED
+                } else {
+                    SIGNATURE_IDLE
+                },
+            };
+            let result = self.signer.make_auth_event(relay_url, challenge).await;
+            let state = if let Ok(event) = &result
+                && nostr::nips::nip42::is_valid_auth_event(event, relay_url, challenge)
+            {
+                self.signed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event.id);
+                SIGNATURE_SIGNED
+            } else {
+                SIGNATURE_FAILED
+            };
+            self.signing.store(state, Ordering::Relaxed);
+            result
         })
     }
 }
@@ -1213,13 +1273,17 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         use DirectoryInspectionError::*;
         // The signer belongs to this request only, never to a shared mutable
         // directory client that could authenticate as another account.
-        let signing_pending = Arc::new(AtomicBool::new(false));
+        let signing = Arc::new(AtomicU8::new(SIGNATURE_IDLE));
         let auth_signed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let signed = signer.is_some();
+        let external_inbox_auth = signed
+            && !request.verify_inbox
+            && matches!(request.queries.as_slice(), [query] if query.kind == 1059 && query.external_inbox_auth);
         let builder = match signer {
             Some(signer) => super::nostr_builder().authenticator(InspectionAuthenticator {
                 signer: SignerAuthenticator::new(SdkSigner(signer)),
-                pending: signing_pending.clone(),
+                signing: signing.clone(),
+                single_signature: external_inbox_auth,
                 signed: auth_signed.clone(),
             }),
             None => super::nostr_builder(),
@@ -1303,9 +1367,11 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 max_event_bytes: DIRECTORY_REPLY_MAX_BYTES,
                 timeout: remaining,
             };
+            let auth_watch_available = auth.is_some();
             let result = finite
                 .fetch_watching(&relay, vec![filter], limits, &cancel, &mut auth)
                 .await;
+            let waited_for_auth = auth_watch_available && auth.is_none();
             let preserve_partial = matches!(query.kind, 10002 | 10050);
             let collect_verified = |target: &mut Vec<DirectoryRelayEventRecord>| {
                 if query.kind == 1059 {
@@ -1322,7 +1388,11 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             };
             if request.verify_inbox {
                 let evidence = signed.then(|| auth_evidence(&mut auth_replies, &auth_signed));
-                return verified_inbox_answer(&result, evidence, &signing_pending);
+                return verified_inbox_answer(
+                    &result,
+                    evidence,
+                    signing.load(Ordering::Relaxed) == SIGNATURE_PENDING,
+                );
             }
             match &result.end {
                 FiniteEnd::Eose if !result.auth && !result.more => {
@@ -1333,18 +1403,50 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                     // authenticating when a signer was available; a persistent
                     // `auth` hint means the relay still withholds events behind
                     // authentication. NIP-67 `more`: the relay cut its answer.
-                    // The inbox probe (`kind == 1059`) needs only an EOSE answer.
+                    // Legacy inbox probes use EOSE for reachability. An
+                    // external-signer probe must see the auth gate clear.
+                    let use_auth_evidence = match end {
+                        FiniteEnd::Eose => external_inbox_auth && waited_for_auth && result.auth,
+                        FiniteEnd::Closed(reason) => {
+                            waited_for_auth
+                                && directory_closed_reason(reason) == AuthenticationRequired
+                        }
+                        // A relay can challenge on connect and then leave the
+                        // inbox request unanswered. The finite read never takes
+                        // its watch in that case, but still has AUTH evidence.
+                        FiniteEnd::TimedOut => auth_watch_available,
+                        _ => false,
+                    };
+                    let signing_state = signing.load(Ordering::Relaxed);
+                    if query.kind == 1059 && use_auth_evidence && !result.retried {
+                        match signing_state {
+                            SIGNATURE_PENDING => return Err(AuthenticationTimedOut),
+                            SIGNATURE_FAILED => return Err(AuthenticationSignerFailed),
+                            _ => {}
+                        }
+                        let evidence = auth_evidence(&mut auth_replies, &auth_signed);
+                        match evidence.reply {
+                            AuthReply::Refused => return Err(AuthenticationRejected),
+                            AuthReply::RateLimited => return Err(RateLimited),
+                            _ => {}
+                        }
+                    }
                     let cause = match end {
-                        FiniteEnd::Eose if result.auth && query.kind != 1059 => {
+                        FiniteEnd::Eose
+                            if result.auth && (query.kind != 1059 || external_inbox_auth) =>
+                        {
                             AuthenticationRequired
                         }
                         FiniteEnd::Eose if result.more && query.kind != 1059 => Incomplete,
                         FiniteEnd::Eose => continue,
                         FiniteEnd::Closed(reason) => directory_closed_reason(reason),
-                        FiniteEnd::TimedOut if signing_pending.load(Ordering::Relaxed) => {
+                        FiniteEnd::TimedOut if signing_state == SIGNATURE_PENDING => {
                             AuthenticationTimedOut
                         }
                         FiniteEnd::TimedOut => TimedOut,
+                        FiniteEnd::ItemLimit | FiniteEnd::ByteLimit if query.kind == 1059 => {
+                            Incomplete
+                        }
                         FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => Restricted,
                         _ => Unreachable,
                     };
@@ -1487,7 +1589,7 @@ fn auth_evidence<Gap>(
 fn verified_inbox_answer(
     result: &transport_nostr_adapter::FiniteReply,
     evidence: Option<AuthEvidence>,
-    signing_pending: &AtomicBool,
+    signing_pending: bool,
 ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
     use DirectoryInspectionError::*;
     let challenged = evidence
@@ -1510,7 +1612,7 @@ fn verified_inbox_answer(
             },
             error => error,
         },
-        FiniteEnd::TimedOut if signing_pending.load(Ordering::Relaxed) => AuthenticationTimedOut,
+        FiniteEnd::TimedOut if signing_pending => AuthenticationTimedOut,
         // A challenge the relay sent and never saw through: it answered.
         FiniteEnd::TimedOut if challenged => AuthenticationUnconfirmed,
         FiniteEnd::TimedOut => TimedOut,
@@ -2386,11 +2488,15 @@ mod tests {
         /// `challenge`) after the CLOSED. Answer EOSE once authenticated.
         WrappedAuthRequired { challenge: bool },
         /// Challenge on connect and refuse the client's AUTH, then answer a
-        /// REQ with EOSE once it has refused, and close an inbox REQ as
-        /// `auth-required:`.
-        RefusesAuthOnConnect,
+        /// REQ with EOSE once it has refused, and either close an inbox REQ
+        /// as `auth-required:` or leave it unanswered.
+        RefusesAuthOnConnect { closes_inbox: bool },
         /// Answer each REQ with an EOSE carrying this NIP-67 hint.
         SaysHint(&'static str),
+        /// After the first authenticated retry, challenge again and hold its REQ open.
+        RepeatsChallenge,
+        /// After accepting AUTH, answer the retried inbox REQ with an auth hint.
+        AuthHintAfterAuthentication,
         /// Accept the WebSocket handshake after the first delay, then answer
         /// each REQ's EOSE after the second.
         Slow { handshake: Duration, eose: Duration },
@@ -2422,7 +2528,7 @@ mod tests {
             let mut socket = accept_async(stream).await.unwrap();
             let mut authenticated = false;
             let (mut refused, mut held) = (false, Vec::new());
-            if matches!(script, InspectionRelay::RefusesAuthOnConnect) {
+            if matches!(script, InspectionRelay::RefusesAuthOnConnect { .. }) {
                 let challenge = serde_json::json!(["AUTH", "connect-challenge"]);
                 let _ = socket
                     .send(Message::Text(challenge.to_string().into()))
@@ -2434,7 +2540,7 @@ mod tests {
                 };
                 let request: serde_json::Value = serde_json::from_str(&text).unwrap();
                 let replies = match (request[0].as_str(), script) {
-                    (Some("AUTH"), InspectionRelay::RefusesAuthOnConnect) => {
+                    (Some("AUTH"), InspectionRelay::RefusesAuthOnConnect { .. }) => {
                         refused = true;
                         let mut replies = vec![serde_json::json!([
                             "OK",
@@ -2445,9 +2551,12 @@ mod tests {
                         replies.append(&mut held);
                         replies
                     }
-                    (Some("REQ"), InspectionRelay::RefusesAuthOnConnect) => {
+                    (Some("REQ"), InspectionRelay::RefusesAuthOnConnect { closes_inbox }) => {
                         counted.fetch_add(1, Ordering::SeqCst);
                         if request[2]["kinds"][0] == 1059 {
+                            if !closes_inbox {
+                                continue;
+                            }
                             vec![serde_json::json!([
                                 "CLOSED",
                                 request[1],
@@ -2463,6 +2572,29 @@ mod tests {
                     (Some("AUTH"), _) => {
                         authenticated = true;
                         vec![serde_json::json!(["OK", request[1]["id"], true, ""])]
+                    }
+                    (Some("REQ"), InspectionRelay::AuthHintAfterAuthentication) => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        if authenticated {
+                            vec![serde_json::json!(["EOSE", request[1], ["auth"]])]
+                        } else {
+                            vec![
+                                serde_json::json!(["CLOSED", request[1], "auth-required: sign in"]),
+                                serde_json::json!(["AUTH", "inspection-challenge"]),
+                                serde_json::json!(["AUTH", "inspection-challenge"]),
+                            ]
+                        }
+                    }
+                    (Some("REQ"), InspectionRelay::RepeatsChallenge) => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        if authenticated {
+                            vec![serde_json::json!(["AUTH", "second-challenge"])]
+                        } else {
+                            vec![
+                                serde_json::json!(["CLOSED", request[1], "auth-required: sign in"]),
+                                serde_json::json!(["AUTH", "first-challenge"]),
+                            ]
+                        }
                     }
                     (Some("REQ"), InspectionRelay::WrappedAuthRequired { challenge })
                         if !authenticated =>
@@ -2508,13 +2640,14 @@ mod tests {
     async fn inspect_inbox(
         endpoint: TransportEndpoint,
         signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
+        external_inbox_auth: bool,
     ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
         let recipient = nostr::prelude::Keys::generate().public_key().to_hex();
-        let request = DirectoryFetchRequest::new(
-            vec![endpoint],
-            vec![DirectoryEventQuery::new(1059, vec![recipient], 32)],
-        )
-        .unwrap();
+        let mut query = DirectoryEventQuery::new(1059, vec![recipient], 32);
+        if external_inbox_auth {
+            query = query.with_external_inbox_auth();
+        }
+        let request = DirectoryFetchRequest::new(vec![endpoint], vec![query]).unwrap();
         timeout(
             DIRECTORY_INSPECTION_WAIT + Duration::from_secs(1),
             NostrSdkDirectoryRelayFetcher::standalone().inspect_directory_events(request, signer),
@@ -2532,7 +2665,7 @@ mod tests {
             spawn_inspection_relay(InspectionRelay::WrappedAuthRequired { challenge: true }).await;
         let signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner> =
             Arc::new(nostr::prelude::Keys::generate());
-        let result = inspect_inbox(endpoint.clone(), Some(signer)).await;
+        let result = inspect_inbox(endpoint.clone(), Some(signer), false).await;
         server.abort();
         assert_eq!(result, Ok(Vec::new()));
         assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -2540,7 +2673,7 @@ mod tests {
         // Without a signer there is nothing to retry with.
         let (endpoint, reqs, server) =
             spawn_inspection_relay(InspectionRelay::WrappedAuthRequired { challenge: true }).await;
-        let result = inspect_inbox(endpoint, None).await;
+        let result = inspect_inbox(endpoint, None, false).await;
         server.abort();
         assert_eq!(
             result,
@@ -2559,7 +2692,7 @@ mod tests {
         let signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner> =
             Arc::new(nostr::prelude::Keys::generate());
         let started = tokio::time::Instant::now();
-        let result = inspect_inbox(endpoint, Some(signer)).await;
+        let result = inspect_inbox(endpoint, Some(signer), true).await;
         server.abort();
         assert_eq!(
             result,
@@ -2694,9 +2827,130 @@ mod tests {
 
             let (endpoint, _, server) =
                 spawn_inspection_relay(InspectionRelay::SaysHint(hint)).await;
-            let result = inspect_inbox(endpoint, None).await;
+            let result = inspect_inbox(endpoint, None, false).await;
             server.abort();
             assert_eq!(result, Ok(Vec::new()), "{hint}");
+        }
+    }
+
+    use nostr::prelude::UnsignedEvent;
+    use transport_nostr_peeler::{MarmotNostrSigner, MarmotSignerError, SignerFuture};
+
+    type SignatureReply<'a, T> = SignerFuture<'a, Result<T, MarmotSignerError>>;
+
+    #[derive(Debug)]
+    struct InspectionTestSigner {
+        keys: nostr::prelude::Keys,
+        calls: std::sync::atomic::AtomicUsize,
+        rejects: bool,
+    }
+
+    impl MarmotNostrSigner for InspectionTestSigner {
+        fn get_public_key(&self) -> SignatureReply<'_, PublicKey> {
+            MarmotNostrSigner::get_public_key(&self.keys)
+        }
+
+        fn sign_event(&self, event: UnsignedEvent) -> SignatureReply<'_, Event> {
+            assert_eq!(event.kind, Kind::from(22242));
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.rejects {
+                Box::pin(std::future::ready(Err("signature rejected".into())))
+            } else {
+                MarmotNostrSigner::sign_event(&self.keys, event)
+            }
+        }
+
+        fn nip04_encrypt<'a>(&'a self, _: &'a PublicKey, _: &'a str) -> SignatureReply<'a, String> {
+            unreachable!("NIP-42 does not encrypt")
+        }
+
+        fn nip04_decrypt<'a>(&'a self, _: &'a PublicKey, _: &'a str) -> SignatureReply<'a, String> {
+            unreachable!("NIP-42 does not decrypt")
+        }
+
+        fn nip44_encrypt<'a>(&'a self, _: &'a PublicKey, _: &'a str) -> SignatureReply<'a, String> {
+            unreachable!("NIP-42 does not encrypt")
+        }
+
+        fn nip44_decrypt<'a>(&'a self, _: &'a PublicKey, _: &'a str) -> SignatureReply<'a, String> {
+            unreachable!("NIP-42 does not decrypt")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_inspection_reports_a_rejected_signer_request() {
+        for relay in [
+            InspectionRelay::WrappedAuthRequired { challenge: true },
+            InspectionRelay::RefusesAuthOnConnect {
+                closes_inbox: false,
+            },
+        ] {
+            let (endpoint, requests, server) = spawn_inspection_relay(relay).await;
+            let signer = InspectionTestSigner {
+                keys: nostr::prelude::Keys::generate(),
+                calls: Default::default(),
+                rejects: true,
+            };
+            let result = inspect_inbox(endpoint, Some(Arc::new(signer)), true).await;
+            server.abort();
+            assert_eq!(
+                result,
+                Err(DirectoryInspectionError::AuthenticationSignerFailed)
+            );
+            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_inspection_reports_a_matching_auth_refusal_on_timeout() {
+        let (endpoint, requests, server) =
+            spawn_inspection_relay(InspectionRelay::RefusesAuthOnConnect {
+                closes_inbox: false,
+            })
+            .await;
+        let signer = Arc::new(nostr::prelude::Keys::generate());
+        let result = inspect_inbox(endpoint, Some(signer), true).await;
+        server.abort();
+        assert_eq!(
+            result,
+            Err(DirectoryInspectionError::AuthenticationRejected)
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_inspection_requests_one_signature_when_the_relay_challenges_again() {
+        use std::sync::atomic::Ordering;
+
+        let (endpoint, requests, server) =
+            spawn_inspection_relay(InspectionRelay::RepeatsChallenge).await;
+        let signer = Arc::new(InspectionTestSigner {
+            keys: nostr::prelude::Keys::generate(),
+            calls: Default::default(),
+            rejects: false,
+        });
+        let result = inspect_inbox(endpoint, Some(signer.clone()), true).await;
+        server.abort();
+        assert_eq!(result, Err(DirectoryInspectionError::TimedOut));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbox_inspection_checks_auth_hints_for_external_signers_only() {
+        use std::sync::atomic::Ordering;
+
+        for (external, expected) in [
+            (false, Ok(Vec::new())),
+            (true, Err(DirectoryInspectionError::AuthenticationRequired)),
+        ] {
+            let (endpoint, requests, server) =
+                spawn_inspection_relay(InspectionRelay::AuthHintAfterAuthentication).await;
+            let signer = Arc::new(nostr::prelude::Keys::generate());
+            let result = inspect_inbox(endpoint, Some(signer), external).await;
+            server.abort();
+            assert_eq!(result, expected);
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
         }
     }
 
@@ -2706,7 +2960,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn signed_inspection_sees_an_authentication_refused_on_connect() {
         let (endpoint, reqs, server) =
-            spawn_inspection_relay(InspectionRelay::RefusesAuthOnConnect).await;
+            spawn_inspection_relay(InspectionRelay::RefusesAuthOnConnect { closes_inbox: true })
+                .await;
         let keys = nostr::prelude::Keys::generate();
         let request = DirectoryFetchRequest::new(
             vec![endpoint],
@@ -2726,7 +2981,7 @@ mod tests {
         server.abort();
         assert_eq!(
             result,
-            Err(DirectoryInspectionError::AuthenticationRequired)
+            Err(DirectoryInspectionError::AuthenticationRejected)
         );
         assert_eq!(reqs.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
@@ -2746,7 +3001,7 @@ mod tests {
         assert!(handshake + eose > DIRECTORY_INSPECTION_EOSE_WAIT);
         let (endpoint, _, server) =
             spawn_inspection_relay(InspectionRelay::Slow { handshake, eose }).await;
-        let result = inspect_inbox(endpoint, None).await;
+        let result = inspect_inbox(endpoint, None, false).await;
         server.abort();
         assert_eq!(result, Ok(Vec::new()));
     }

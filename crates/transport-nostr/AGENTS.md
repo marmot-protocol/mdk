@@ -60,7 +60,10 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   `AUTH_CHALLENGE_WAIT` (so a bare `auth-required:` CLOSED with no `AUTH` challenge ends as `AuthenticationRequired`
   instead of waiting out the EOSE window, while an `AUTH` challenge still waits until the deadline), so a refusal on
   connect still decides a later close; a persistent NIP-67 `auth` EOSE hint is `AuthenticationRequired` and `more` is
-  `Incomplete` (not for the inbox probe). `CLOSED` `rate-limited:` is `RateLimited` and bare `error: <other>` is
+  `Incomplete` (the inbox probe tolerates `more` and only checks `auth` on external-signer reads). Onboarding's external-signer
+  inbox probe asks for one signature per read and distinguishes signer failure (`AuthenticationSignerFailed`) from an
+  explicit AUTH event refusal (`AuthenticationRejected`) or rate limit matched to its own signed event. `CLOSED` `rate-limited:` is
+  `RateLimited` and bare `error: <other>` is
   `Unreachable`, while permanent prefixes stay `Restricted`; verified kind 10002/10050 records returned before an incomplete or closed
   end are kept in `Partial { records, cause }`. Relay health's `inspect_inbox` sets `verifying_inbox` on its request,
   which onboarding never does: its answer is classified strictly (`inbox_closed_reason`, `verified_inbox_answer`), the
