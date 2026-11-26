@@ -19,17 +19,21 @@ use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::{GroupMessageMetadata, PreparedGroupMessage, TransportPeeler};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{GroupId, MemberId, MessageId};
+use cgka_traits::{EntropySource, OsEntropy, SystemWallClock, WallClock};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr::prelude::{
-    Event, EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, PublicKey, RelayUrl,
-    Tag, Timestamp as NostrTimestamp, UnsignedEvent,
+    Event, EventBuilder, FinalizeUnsignedEvent, Keys, Kind, PublicKey, RelayUrl, SecretKey, Tag,
+    Timestamp as NostrTimestamp, UnsignedEvent,
 };
-use rand::RngCore;
-use std::sync::Arc;
+use secp256k1::{All, Secp256k1};
+use std::fmt;
+use std::sync::{Arc, OnceLock};
+use zeroize::Zeroizing;
 
 const NONCE_LEN: usize = 12;
+const MAX_EPHEMERAL_KEY_DRAWS: usize = 16;
 const WELCOME_SIGNER_CONTEXT: &str = "nostr_welcome_signer";
 const KEY_PACKAGE_EVENT_TAG: &str = "e";
 const WELCOME_RELAYS_TAG: &str = "relays";
@@ -81,23 +85,38 @@ impl AccountGiftWrap {
 }
 
 /// Nostr implementation of the Marmot transport peeler.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NostrMlsPeeler {
     exporter_label: String,
     welcome_signer: Option<Arc<dyn MarmotNostrSigner>>,
+    entropy: Arc<dyn EntropySource>,
+    clock: Arc<dyn WallClock>,
+    signing_context: Arc<OnceLock<Secp256k1<All>>>,
+}
+
+impl fmt::Debug for NostrMlsPeeler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NostrMlsPeeler")
+            .field("exporter_label", &self.exporter_label)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NostrMlsPeeler {
-    /// Build a peeler with the current engine exporter label.
+    /// Use the supplied entropy for kind-445 signing and sealing, and the
+    /// supplied clock for default event timestamps.
     ///
     /// The peeler does not hold the account identity: kind-445 group events are
     /// signed by a fresh ephemeral key per event
     /// (`spec/transports/nostr.md:32-34`), and NIP-59 welcomes use the injected
     /// `with_welcome_signer`.
-    pub fn new() -> Self {
+    pub fn new(entropy: Arc<dyn EntropySource>, clock: Arc<dyn WallClock>) -> Self {
         Self {
             exporter_label: DEFAULT_EXPORTER_LABEL.into(),
             welcome_signer: None,
+            entropy,
+            clock,
+            signing_context: Arc::new(OnceLock::new()),
         }
     }
 
@@ -148,6 +167,19 @@ impl NostrMlsPeeler {
         Ok(secret)
     }
 
+    fn ephemeral_secret(&self) -> Result<SecretKey, PeelerError> {
+        let mut candidate = Zeroizing::new([0_u8; 32]);
+        for _ in 0..MAX_EPHEMERAL_KEY_DRAWS {
+            self.entropy.fill_bytes(&mut candidate[..]);
+            if let Ok(secret) = SecretKey::from_slice(&candidate[..]) {
+                return Ok(secret);
+            }
+        }
+        Err(PeelerError::WrapFailed(
+            "invalid ephemeral kind-445 secret key".into(),
+        ))
+    }
+
     fn wrap_group_message_inner(
         &self,
         payload: &EncryptedPayload,
@@ -169,7 +201,7 @@ impl NostrMlsPeeler {
         }
         let key = self.group_key(ctx)?;
         let mut nonce = [0_u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        self.entropy.fill_bytes(&mut nonce);
         let cipher = ChaCha20Poly1305::new_from_slice(key)
             .map_err(|e| PeelerError::WrapFailed(e.to_string()))?;
         let ciphertext = cipher
@@ -192,24 +224,42 @@ impl NostrMlsPeeler {
         // the sender's account identity and never reused. Generate one per
         // call and sign here so the adapter publishes the event as-is rather
         // than re-signing it with the account signer.
-        let ephemeral = Keys::generate();
+        let secret = self.ephemeral_secret()?;
+        let context = self.signing_context.get_or_init(|| {
+            let mut context = Secp256k1::new();
+            let mut seed = Zeroizing::new([0_u8; 32]);
+            self.entropy.fill_bytes(&mut seed[..]);
+            context.seeded_randomize(&seed);
+            context
+        });
+        let ephemeral = Keys::new_with_ctx(context, secret);
         let mut tags = vec![Tag::custom(GROUP_TAG, [hex::encode(group_id)])];
         if let Some(expiration) = metadata.and_then(GroupMessageMetadata::expiration_timestamp) {
             tags.push(Tag::custom(EXPIRATION_TAG, [expiration.to_string()]));
         }
         // Package E (#630 cross-client): bind the outer kind-445 `created_at` to
         // the inner app event's sender-authenticated `created_at` so the sender
-        // and every receiver record the same `recorded_at`. Without this the
-        // builder defaults to wrap-time `now()`, which only receivers agree on.
-        // Commits/proposals carry no inner timestamp, so they keep the default.
-        let mut builder =
-            EventBuilder::new(Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16), content).tags(tags);
-        if let Some(created_at) = metadata.and_then(GroupMessageMetadata::outer_created_at) {
-            builder = builder.custom_created_at(NostrTimestamp::from_secs(created_at));
-        }
-        let signed = builder
-            .finalize(&ephemeral)
-            .map_err(|e| PeelerError::WrapFailed(format!("ephemeral kind-445 sign: {e}")))?;
+        // and receivers agree on `recorded_at`. Commits and proposals use wrap time.
+        let created_at = metadata
+            .and_then(GroupMessageMetadata::outer_created_at)
+            .unwrap_or_else(|| self.clock.now().0);
+        let unsigned = EventBuilder::new(Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16), content)
+            .tags(tags)
+            .custom_created_at(NostrTimestamp::from_secs(created_at))
+            .finalize_unsigned(ephemeral.public_key());
+        let id = unsigned.compute_id();
+        let mut aux = Zeroizing::new([0_u8; 32]);
+        self.entropy.fill_bytes(&mut aux[..]);
+        let sig = ephemeral.sign_schnorr_with_aux_rand(context, id.as_bytes(), &aux);
+        let signed = Event::new(
+            id,
+            unsigned.pubkey,
+            unsigned.created_at,
+            unsigned.kind,
+            unsigned.tags,
+            unsigned.content,
+            sig,
+        );
         let event = NostrTransportEvent::from_nostr_event(&signed).map_err(to_peeler_error)?;
         event.to_transport_message().map_err(to_peeler_error)
     }
@@ -363,7 +413,7 @@ impl NostrMlsPeeler {
 
 impl Default for NostrMlsPeeler {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(OsEntropy), Arc::new(SystemWallClock))
     }
 }
 
@@ -465,6 +515,7 @@ impl TransportPeeler for NostrMlsPeeler {
                 ),
                 Tag::public_key(receiver),
             ])
+            .custom_created_at(NostrTimestamp::from_secs(self.clock.now().0))
             .finalize_unsigned(sender);
         let gift_wrap = crate::gift_wrap_rumor(signer.clone(), receiver, rumor).await?;
         let event = NostrTransportEvent::from_nostr_event(&gift_wrap).map_err(to_peeler_error)?;
@@ -539,6 +590,7 @@ impl TransportPeeler for NostrMlsPeeler {
                 metadata.relays.iter().map(|relay| relay.as_str()),
             ),
         ])
+        .custom_created_at(NostrTimestamp::from_secs(self.clock.now().0))
         .finalize_unsigned(sender_pubkey);
         let gift_wrap = crate::gift_wrap_rumor(signer.clone(), recipient_pubkey, rumor).await?;
         let event = NostrTransportEvent::from_nostr_event(&gift_wrap).map_err(to_peeler_error)?;
@@ -694,12 +746,118 @@ fn map_nip59_error(_err: nostr::error::Error) -> PeelerError {
 mod tests {
     use super::*;
     use crate::{DEFAULT_EXPORTER_LABEL, KIND_MARMOT_GROUP_MESSAGE};
-    use cgka_traits::TransportEndpoint;
     use cgka_traits::group_context::GroupContextSnapshot;
     use cgka_traits::ingest::PeeledContent;
     use cgka_traits::types::{EpochId, MessageId};
+    use cgka_traits::{Timestamp, TransportEndpoint};
     use nostr::nips::nip59::GiftWrapBuilder;
+    use nostr::prelude::FinalizeEvent;
+    use rand::{RngCore, SeedableRng, rngs::StdRng};
     use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    const FIXED_CREATED_AT: Timestamp = Timestamp(1_700_000_321);
+
+    struct FixedClock;
+
+    impl WallClock for FixedClock {
+        fn now(&self) -> Timestamp {
+            FIXED_CREATED_AT
+        }
+
+        fn now_ms(&self) -> u64 {
+            FIXED_CREATED_AT.0 * 1_000
+        }
+    }
+
+    struct TestEntropy(Mutex<StdRng>);
+
+    impl EntropySource for TestEntropy {
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            self.0.lock().unwrap().fill_bytes(dest);
+        }
+    }
+
+    fn group_wrap_inputs() -> (EncryptedPayload, GroupContextSnapshot) {
+        let payload = EncryptedPayload {
+            ciphertext: b"inner mls bytes".to_vec(),
+            aad: vec![],
+        };
+        let ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(
+                DEFAULT_EXPORTER_LABEL.into(),
+                vec![0x7a; NOSTR_GROUP_KEY_LEN],
+            )]),
+            Some(vec![0x99; 32]),
+        );
+        (payload, ctx)
+    }
+
+    #[tokio::test]
+    async fn kind_445_uses_sources() {
+        let (payload, ctx) = group_wrap_inputs();
+        let peeler = || {
+            NostrMlsPeeler::new(
+                Arc::new(TestEntropy(Mutex::new(StdRng::seed_from_u64(3497)))),
+                Arc::new(FixedClock),
+            )
+        };
+        let first = peeler();
+        let a = first.wrap_group_message(&payload, &ctx).await.unwrap();
+        let b = peeler().wrap_group_message(&payload, &ctx).await.unwrap();
+        assert_eq!(a.timestamp, FIXED_CREATED_AT);
+        assert_eq!(b.timestamp, FIXED_CREATED_AT);
+
+        let a_dto = NostrTransportEvent::from_transport_message(&a).unwrap();
+        let b_dto = NostrTransportEvent::from_transport_message(&b).unwrap();
+        let nonce = |event: &NostrTransportEvent| -> [u8; NONCE_LEN] {
+            BASE64_STANDARD.decode(&event.content).unwrap()[..NONCE_LEN]
+                .try_into()
+                .unwrap()
+        };
+        assert_eq!(nonce(&a_dto), nonce(&b_dto));
+        assert_eq!(a_dto.pubkey, b_dto.pubkey);
+        assert_eq!(a_dto.sig, b_dto.sig);
+        for (dto, message) in [(&a_dto, &a), (&b_dto, &b)] {
+            assert_eq!(dto.created_at, FIXED_CREATED_AT.0);
+            let verified = dto.to_verified_nostr_event().unwrap();
+            assert_eq!(verified.id.as_bytes(), message.id.as_slice());
+        }
+
+        let explicit = 1_700_000_123;
+        let c = first
+            .wrap_group_message_with_metadata(
+                &payload,
+                &ctx,
+                &GroupMessageMetadata::application(explicit, None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(c.timestamp, Timestamp(explicit));
+        let c = NostrTransportEvent::from_transport_message(&c).unwrap();
+        assert_eq!(c.created_at, explicit);
+        assert_ne!(nonce(&a_dto), nonce(&c));
+        assert_ne!(a_dto.pubkey, c.pubkey);
+    }
+
+    #[tokio::test]
+    async fn kind_445_rejects_bad_scalar() {
+        struct ZeroEntropy;
+
+        impl EntropySource for ZeroEntropy {
+            fn fill_bytes(&self, dest: &mut [u8]) {
+                dest.fill(0);
+            }
+        }
+
+        let (payload, ctx) = group_wrap_inputs();
+        let peeler = NostrMlsPeeler::new(Arc::new(ZeroEntropy), Arc::new(FixedClock));
+        let err = peeler.wrap_group_message(&payload, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, PeelerError::WrapFailed(reason) if reason == "invalid ephemeral kind-445 secret key")
+        );
+    }
 
     #[tokio::test]
     async fn group_wrap_and_peel_round_trips_mls_bytes() {
@@ -1114,7 +1272,7 @@ mod tests {
             HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
             Some(vec![0x99; 32]),
         );
-        let peeler = NostrMlsPeeler::new().with_welcome_signer(account.clone());
+        let peeler = NostrMlsPeeler::default().with_welcome_signer(account.clone());
         let payload = EncryptedPayload {
             ciphertext: b"inner mls bytes".to_vec(),
             aad: vec![],
@@ -1229,8 +1387,9 @@ mod tests {
         let sender = sender_keys();
         let receiver = receiver_keys();
         let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
-        let sender_peeler = NostrMlsPeeler::new().with_welcome_signer(sender.clone());
-        let receiver_peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
+        let sender_peeler = NostrMlsPeeler::new(Arc::new(OsEntropy), Arc::new(FixedClock))
+            .with_welcome_signer(sender.clone());
+        let receiver_peeler = NostrMlsPeeler::default().with_welcome_signer(receiver.clone());
 
         let wrapped = sender_peeler
             .wrap_welcome_with_metadata(
@@ -1268,13 +1427,10 @@ mod tests {
             peeled.sender,
             Some(MemberId::new(sender.public_key().to_bytes().to_vec()))
         );
-        let unwrapped =
-            nostr::nips::nip59::extract_rumor(&receiver, &event.to_verified_nostr_event().unwrap())
-                .unwrap();
         assert_eq!(
             peeled.content,
             PeeledContent::Welcome {
-                created_at: Some(cgka_traits::Timestamp(unwrapped.rumor.created_at.as_secs())),
+                created_at: Some(FIXED_CREATED_AT),
                 bytes: b"mls welcome bytes".to_vec(),
                 // The engine decides from the `e` claim whether the delivery
                 // is addressed to this device, so it travels with the bytes.
@@ -1293,7 +1449,7 @@ mod tests {
         let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
         let welcome: Vec<u8> = (0..55_176u32).map(|i| i as u8).collect();
 
-        let wrapped = NostrMlsPeeler::new()
+        let wrapped = NostrMlsPeeler::default()
             .with_welcome_signer(sender)
             .wrap_welcome_with_metadata(
                 &EncryptedPayload {
@@ -1323,7 +1479,7 @@ mod tests {
                 .unwrap();
         assert_nip44_extended_length(&seal.content, rumor_json.len());
 
-        let peeled = NostrMlsPeeler::new()
+        let peeled = NostrMlsPeeler::default()
             .with_welcome_signer(receiver)
             .peel_welcome(&wrapped)
             .await
@@ -1365,7 +1521,7 @@ mod tests {
     async fn welcome_provenance_uses_computed_unsigned_rumor_id() {
         let sender = sender_keys();
         let receiver = receiver_keys();
-        let peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
+        let peeler = NostrMlsPeeler::default().with_welcome_signer(receiver.clone());
         let base = EventBuilder::new(
             Kind::Custom(KIND_MARMOT_WELCOME_RUMOR),
             BASE64_STANDARD.encode(b"mls welcome bytes"),
@@ -1403,8 +1559,8 @@ mod tests {
         let receiver = receiver_keys();
         let wrong_receiver = wrong_receiver_keys();
         let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
-        let sender_peeler = NostrMlsPeeler::new().with_welcome_signer(sender);
-        let wrong_peeler = NostrMlsPeeler::new().with_welcome_signer(wrong_receiver);
+        let sender_peeler = NostrMlsPeeler::default().with_welcome_signer(sender);
+        let wrong_peeler = NostrMlsPeeler::default().with_welcome_signer(wrong_receiver);
         let wrapped = sender_peeler
             .wrap_welcome_with_metadata(
                 &EncryptedPayload {
@@ -1430,7 +1586,7 @@ mod tests {
         let sender = sender_keys();
         let receiver = receiver_keys();
         let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
-        let peeler = NostrMlsPeeler::new().with_welcome_signer(sender.clone());
+        let peeler = NostrMlsPeeler::default().with_welcome_signer(sender.clone());
         let mut wrapped = peeler
             .wrap_welcome_with_metadata(
                 &EncryptedPayload {
@@ -1446,7 +1602,7 @@ mod tests {
             recipient: MemberId::new(vec![0x55; 32]),
         };
 
-        let err = NostrMlsPeeler::new()
+        let err = NostrMlsPeeler::default()
             .with_welcome_signer(receiver)
             .peel_welcome(&wrapped)
             .await
@@ -1463,7 +1619,7 @@ mod tests {
         let sender = sender_keys();
         let receiver = receiver_keys();
         let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
-        let mut wrapped = NostrMlsPeeler::new()
+        let mut wrapped = NostrMlsPeeler::default()
             .with_welcome_signer(sender)
             .wrap_welcome_with_metadata(
                 &EncryptedPayload {
@@ -1480,7 +1636,7 @@ mod tests {
         event.id = event.computed_id();
         wrapped.payload = serde_json::to_vec(&event).unwrap();
 
-        let err = NostrMlsPeeler::new()
+        let err = NostrMlsPeeler::default()
             .with_welcome_signer(receiver)
             .peel_welcome(&wrapped)
             .await
@@ -1506,7 +1662,7 @@ mod tests {
             .to_transport_message()
             .expect("route mapping accepts unverified gift-wrap envelope");
 
-        let err = NostrMlsPeeler::new()
+        let err = NostrMlsPeeler::default()
             .with_welcome_signer(receiver)
             .peel_welcome(&unsigned)
             .await
@@ -1529,7 +1685,7 @@ mod tests {
             .to_transport_message()
             .unwrap();
 
-        let peeler = NostrMlsPeeler::new().with_welcome_signer(receiver);
+        let peeler = NostrMlsPeeler::default().with_welcome_signer(receiver);
         let err = peeler
             .peel_welcome(&wrapped)
             .await
@@ -1556,7 +1712,7 @@ mod tests {
         let receiver = receiver_keys();
         let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
         let metadata = sample_welcome_metadata();
-        let wrapped = NostrMlsPeeler::new()
+        let wrapped = NostrMlsPeeler::default()
             .with_welcome_signer(sender.clone())
             .wrap_welcome_with_metadata(
                 &EncryptedPayload {
@@ -1595,7 +1751,7 @@ mod tests {
     async fn welcome_peel_rejects_missing_key_package_or_relays_tags() {
         let sender = sender_keys();
         let receiver = receiver_keys();
-        let receiver_peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
+        let receiver_peeler = NostrMlsPeeler::default().with_welcome_signer(receiver.clone());
 
         let missing_key_package =
             welcome_rumor_gift_wrap(&sender, &receiver, 0, &[&["wss://group-a.example"]]).await;
@@ -1617,7 +1773,7 @@ mod tests {
         // the kind-445 `h` path; duplicates are rejected, not first-matched.
         let sender = sender_keys();
         let receiver = receiver_keys();
-        let receiver_peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
+        let receiver_peeler = NostrMlsPeeler::default().with_welcome_signer(receiver.clone());
 
         let duplicate_key_package =
             welcome_rumor_gift_wrap(&sender, &receiver, 2, &[&["wss://group-a.example"]]).await;
@@ -1645,7 +1801,7 @@ mod tests {
         // bound each entry's length, and require well-formed ws/wss URLs.
         let sender = sender_keys();
         let receiver = receiver_keys();
-        let receiver_peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
+        let receiver_peeler = NostrMlsPeeler::default().with_welcome_signer(receiver.clone());
 
         let too_many: Vec<String> = (0..MAX_WELCOME_RELAYS + 1)
             .map(|i| format!("wss://relay-{i}.example"))
@@ -1681,7 +1837,7 @@ mod tests {
         let sender = sender_keys();
         let receiver = receiver_keys();
         let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
-        let peeler = NostrMlsPeeler::new().with_welcome_signer(sender);
+        let peeler = NostrMlsPeeler::default().with_welcome_signer(sender);
 
         let too_many: Vec<TransportEndpoint> = (0..MAX_WELCOME_RELAYS + 1)
             .map(|i| TransportEndpoint(format!("wss://relay-{i}.example")))

@@ -1233,6 +1233,15 @@ fn openmls_filtered_message_sql(
                 ));
             }
         }
+        OpenMlsContentFilter::NoOpenMlsMessage => {
+            let all: Vec<_> = states.iter().collect();
+            if !all.is_empty() {
+                arms.push(id_query(
+                    &state_list(&all),
+                    &format!("{OPENMLS_CONTENT_NONE}, {unknown}"),
+                ));
+            }
+        }
         OpenMlsContentFilter::Commits => {
             let all: Vec<_> = states.iter().collect();
             if !all.is_empty() {

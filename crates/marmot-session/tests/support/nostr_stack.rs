@@ -180,7 +180,7 @@ impl NostrStackHarness {
                 self._dir.path().join(format!("{label}.sqlite")),
                 SqlCipherKey::new(self.database_key_material).unwrap(),
                 keys.public_key().to_bytes().to_vec(),
-                Box::new(NostrMlsPeeler::new().with_welcome_signer(keys.clone())),
+                Box::new(NostrMlsPeeler::default().with_welcome_signer(keys.clone())),
             )
             .legacy_compatibility_profile()
             .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {

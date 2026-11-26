@@ -25,6 +25,11 @@ Install Odin `dev-2026-10` at commit `84bc3fc2100b0f7880a3af37f71bccdcda41c6f9`,
 toolchain. `build.rs` checks the compiler version and compiles a static native archive for Cargo's target. Set `ODIN`
 to an executable path when Odin is not on `PATH`.
 
+The build uses `llvm-nm` and `llvm-objcopy` from `llvm-tools-preview` or `PATH` to keep the parser's runtime symbols
+separate from those in an Odin host. When cross-compiling for Windows, set `ODIN_WINDOWS_SDK_ROOT` to the target SDK
+directory. For `x86_64-pc-windows-gnullvm`, use LLVM-MinGW's `x86_64-w64-mingw32` directory. The build uses `llvm-ar`
+to package the resulting object.
+
 Optimized `x86_64-unknown-linux-gnu` builds use the pinned Rust toolchain's `llvm-tools-preview` component to optimize
 Odin's LLVM IR and generate native code in parallel. This work finishes before Rust consumes the archive; optimization
 is not deferred to an application link. Android also uses these LLVM tools, with complete Android target triples and

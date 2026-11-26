@@ -115,9 +115,9 @@ pub enum InviteDeliveryStateFfi {
     /// count (one relay today) and MDK recorded it delivered. This is not
     /// proof that the recipient received it or joined.
     RelayAccepted,
-    /// It will not be sent again: no relay stored it by its delivery
-    /// deadline, 7 days after the invite or its KeyPackage's expiry if
-    /// sooner. `cause` is what the latest attempt found
+    /// It will not be sent again: no relay acknowledged it by its delivery
+    /// deadline, 7 days after it was staged with the invite or its
+    /// KeyPackage's expiry if sooner. `cause` is what the latest attempt found
     /// (`RelaysUnreachable` when none finished); `RefusedByRelays` here means
     /// every relay that attempt tried said no, possibly only for now.
     Undeliverable { cause: InviteDeliveryProblemFfi },

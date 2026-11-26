@@ -52,8 +52,9 @@ mod tests {
         (group_id_hex, client_token, message_id_hex, request_hash, payload_hash, state, outcome_json)
         VALUES ('aa', ?1, ?2, zeroblob(32), zeroblob(32), ?3, ?4)";
 
-    /// Existing sends keep every field and their order, and state 4 is
-    /// accepted only from this version.
+    /// Existing sends keep every field and their order, a queued send keeps
+    /// the payload and request it is published from, and state 4 is accepted
+    /// only from this version.
     #[test]
     fn rebuild_keeps_sends_and_admits_the_refused_state() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -65,6 +66,13 @@ mod tests {
         .unwrap();
         conn.execute(ROW, rusqlite::params!["sent", "m1", 1, "outcome"])
             .unwrap();
+        conn.execute(
+            "INSERT INTO local_message_submissions
+                (group_id_hex, client_token, message_id_hex, request_hash, payload_hash, payload, request_json)
+                VALUES ('aa', 'queued', 'm3', zeroblob(32), zeroblob(32), x'0102', '{\"version\":1}')",
+            [],
+        )
+        .unwrap();
         assert!(
             conn.execute(ROW, rusqlite::params!["early", "m2", 4, None::<String>])
                 .is_err()
@@ -73,12 +81,20 @@ mod tests {
         run_through(&mut conn, 226).unwrap();
         let kept: (i64, String, i64, String) = conn
             .query_row(
-                "SELECT sequence, message_id_hex, state, outcome_json FROM local_message_submissions",
+                "SELECT sequence, message_id_hex, state, outcome_json FROM local_message_submissions WHERE client_token = 'sent'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
         assert_eq!(kept, (1, "m1".into(), 1, "outcome".into()));
+        let queued: (i64, Vec<u8>, String) = conn
+            .query_row(
+                "SELECT sequence, payload, request_json FROM local_message_submissions WHERE state = 0 ORDER BY sequence LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(queued, (2, vec![1, 2], "{\"version\":1}".into()));
         conn.execute(ROW, rusqlite::params!["refused", "m2", 4, None::<String>])
             .unwrap();
         let sequence: i64 = conn
@@ -88,6 +104,6 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(sequence > 1, "the sequence keeps counting");
+        assert!(sequence > 2, "the sequence keeps counting");
     }
 }

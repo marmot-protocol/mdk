@@ -367,8 +367,9 @@ pub struct TransportGroupRoute {
 ///
 /// A row is classified by its payload: the content type and epoch of the
 /// OpenMLS message that [`crate::message::StoredMessagePayload::as_openmls_wire`]
-/// carries. Every variant leaves out rows whose payload carries no OpenMLS
-/// wire message. A row the backend cannot classify (an undecodable payload,
+/// carries. Every variant but [`Self::NoOpenMlsMessage`] leaves out rows
+/// whose payload carries no OpenMLS wire message. A row the backend cannot
+/// classify (an undecodable payload,
 /// MLS bytes that are not a framed public or private message, an epoch the
 /// backend cannot index) is never left out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -385,6 +386,10 @@ pub enum OpenMlsContentFilter {
     /// Only commits and proposals whose epoch is from `from` through
     /// `through`, the selection input inside a convergence pass's horizon.
     CommitsAndProposalsBetween { from: EpochId, through: EpochId },
+    /// Only rows whose payload carries no OpenMLS wire message, such as the
+    /// retained outbound Welcomes, leaving out every commit, proposal and
+    /// application.
+    NoOpenMlsMessage,
 }
 
 /// Messages + epoch-scoped snapshot/rollback hooks.
@@ -1266,10 +1271,11 @@ pub struct RosterTagKey {
     /// by.
     pub slot: [u8; 32],
     pub tag_signature_key: Vec<u8>,
-    /// Whether a roster state listed it in the slot's `removed` record. A
-    /// recorded key keeps this once any state this device applied did, so
-    /// the app knows a `removed` record for the slot was held even after it
-    /// went (mdk#2761, "The removal Commit").
+    /// Whether a roster state listed it in the slot's `removed` record, or
+    /// recorded the slot as `removed` with no key while this device kept it
+    /// (marmot#520). A recorded key keeps this once any state this device
+    /// applied did, so the app knows a `removed` record for the slot was
+    /// held even after it went (mdk#2761, "The removal Commit").
     pub held_as_removed: bool,
 }
 
@@ -1322,6 +1328,18 @@ pub trait RosterTagKeyStorage {
         slot: &[u8; 32],
         since: u64,
         seen_at: u64,
+    ) -> StorageResult<()>;
+    /// Hold every key of `group_id`'s `slot` last seen at or after `since`
+    /// as removed, keeping their sighting times and order, unless one of
+    /// them already is: a roster state recorded the slot as `removed` with
+    /// no key (marmot#520), so the keys this device keeps for it say the
+    /// record was held. A slot that already holds a key keeps it as its one
+    /// newest held key, the one a prune past `per_slot` keeps.
+    fn hold_roster_tag_keys_as_removed(
+        &self,
+        group_id: &GroupId,
+        slot: &[u8; 32],
+        since: u64,
     ) -> StorageResult<()>;
     /// What `group_id`'s rosters listed, last seen at or after `since`: by
     /// slot, and within a slot the most recently seen first.

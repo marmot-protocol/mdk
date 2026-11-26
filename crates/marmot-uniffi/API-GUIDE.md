@@ -1241,7 +1241,7 @@ Return the account's retained Welcome repair handles in oldest-first order after
 
 ### `Marmot::invite_deliveries`
 
-Whether each of the account's invites reached the invited account's inbox relays (mdk#1706): one `InviteDeliveryFfi` per group and invited account, as its newest invite left it, for `group_id_hex` or every group when `None`. `RelayAccepted` means a relay stored the Welcome, not that the recipient received it or joined; an account reads `RelayAccepted` once any of its devices' Welcomes was stored, so show `accepted_device_count` of `device_count`. A local account-worker read of durable records: it answers after a restart and for a group not loaded yet, and sends nothing. `InviteDeliveryChanged` reports each change of state. Relays appear only as counts. A Welcome no relay stored by its delivery deadline (7 days after the invite, or its KeyPackage's expiry if sooner) reads `Undeliverable` with its latest attempt's problem, and is never sent again. Only invites sent after this device upgraded are listed; an older Welcome stays in `pending_welcome_deliveries` until its delivery deadline. A Welcome whose deadline passes while the app is closed is not announced; read it from this query. Use the matching regenerated bindings/native library. See [Invite delivery](README.md#invite-delivery).
+Whether each of the account's invites reached the invited account's inbox relays (mdk#1706): one `InviteDeliveryFfi` per group and invited account, as its newest invite left it, for `group_id_hex` or every group when `None`. `RelayAccepted` means a relay stored the Welcome, not that the recipient received it or joined; an account reads `RelayAccepted` once any of its devices' Welcomes was stored, so show `accepted_device_count` of `device_count`. A local account-worker read of durable records: it answers after a restart and for a group not loaded yet, and sends nothing. `InviteDeliveryChanged` reports each change of state. Relays appear only as counts. A Welcome no relay acknowledged by its delivery deadline (7 days after it was staged with the invite, or its KeyPackage's expiry if sooner) reads `Undeliverable` with its latest attempt's problem, and is never sent again, whatever the device clock later reads. Only invites sent after this device upgraded are listed; an older Welcome stays in `pending_welcome_deliveries` until its delivery deadline. A Welcome whose deadline passes while the app is closed is announced once, on the next start, while its invite is still listed. Use the matching regenerated bindings/native library. See [Invite delivery](README.md#invite-delivery).
 
 ### `Marmot::group_recovery_status`
 
@@ -3247,6 +3247,16 @@ and ends this observer. Snapshot production runs on MDK's runtime, not the calli
 
 Take the initial list once; subsequent calls return an empty list. An empty first list is valid for an account
 without configured relay entries. This method does not consume a later update or initiate a connection.
+
+## Account relay health
+
+### `Marmot::account_relay_health`
+
+Read the account's relay health from its cached inbox and NIP-65 lists and the dial policy: one row per relay with its
+roles, state, policy fault and liveness, and warnings about invitations sent through the published inbox list, each
+with a severity, the relays it concerns and the actions that would fix it. Never dials. An inbox list MDK does not hold reads as
+`inbox_list: Unknown` and raises no warning. Re-read on `RelayHealthChanged`. See the
+[conditions for each warning](README.md#account-relay-health); keep a default branch over its enums.
 
 <details>
 <summary>nip46.rs</summary>

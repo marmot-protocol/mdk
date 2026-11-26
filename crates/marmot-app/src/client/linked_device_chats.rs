@@ -423,7 +423,7 @@ impl AppClient {
                     entry.status,
                     DeviceStatusV1::Active | DeviceStatusV1::Inactive
                 )
-                || entry.tag_signature_key.is_none()
+                || !exchange.link_made(&slot)
             {
                 continue;
             }
@@ -499,7 +499,8 @@ impl AppClient {
     /// The devices whose links this device approved and decided made less
     /// than [`LINK_CHAT_ADD_SECS`] ago, in this device group, that the roster
     /// lists as active and linked by this device, with "add to all my chats"
-    /// on and their tag signature key set. A device this device's user
+    /// on and their link made in its current tree, which a branch dropping
+    /// the device's first commit undoes (marmot#521). A device this device's user
     /// decided to remove is none of them, while its removal waits to commit
     /// or is made again; nor is one in a slot a roster state this device
     /// applied held as `removed`, while this device keeps that record's key.
@@ -530,14 +531,15 @@ impl AppClient {
                 let entry = exchange.roster.devices.get(&slot)?;
                 (entry.linked_by == Some(exchange.own_slot)
                     && entry.status == DeviceStatusV1::Active
-                    && entry.settings.add_to_all_chats)
-                    .then(|| entry.tag_signature_key.clone())?
-                    .map(|tag_signature_key| NewDevice {
-                        slot,
-                        expires_at,
-                        link_ref: link.key_package_ref_hex,
-                        tag_signature_key,
-                    })
+                    && entry.settings.add_to_all_chats
+                    && exchange.link_made(&slot))
+                .then(|| entry.tag_signature_key.clone())?
+                .map(|tag_signature_key| NewDevice {
+                    slot,
+                    expires_at,
+                    link_ref: link.key_package_ref_hex,
+                    tag_signature_key,
+                })
             })
             .collect())
     }

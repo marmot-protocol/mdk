@@ -527,6 +527,11 @@ pub enum SiblingAddRefusal {
     /// The selected chat already holds this sibling, identified by its slot
     /// tag or roster signature key. A different KeyPackage cannot resolve it.
     AlreadyPresent,
+    /// The sibling's link is not made in this device's copy of the device
+    /// group: its leaf there has not committed since the Add that linked it
+    /// (marmot#521). Its first commit there resolves it; a different
+    /// KeyPackage cannot.
+    LinkPending,
     /// The KeyPackage cannot add that sibling to this chat: it is published,
     /// expired, another account's, not tagged as the sibling's slot, or does
     /// not advertise or prove what the chat requires.

@@ -31,7 +31,7 @@ The one exception is the live preview stream. The `stream_begin`, `stream_append
 and the `stream_update` event carried agent text previews over QUIC. That feature is retired: no client used it, and
 the successor protocol (agent-control v3, built in `marmot-protocol/marmot-agents`) has no live preview stream. The
 operations were removed from `v2` outright rather than kept as dead surface. A connector cannot decode them, so it
-closes the connection without a response, as it does for any unknown request type. Send every reply as a durable
+answers them with an `unknown_request` error, as it does for any unknown request type. Send every reply as a durable
 message with `send_final`.
 
 `group_state_changed` includes an optional `event_id_hex`: the opaque durable occurrence id shared by live events and

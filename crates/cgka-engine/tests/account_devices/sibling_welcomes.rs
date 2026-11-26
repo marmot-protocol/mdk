@@ -12,13 +12,15 @@
 //! again. A direct send's refusal comes before anything is written; so does a
 //! queued one's, checked before the queue, and the drain checks it again.
 
-use super::device_roster::{clocked_roster_device, key_package_ref, roster_device, slot};
+use super::device_roster::{
+    clocked_roster_device, key_package_ref, roster_device, roster_of, roster_update, slot,
+};
 use super::device_tag::hold_slot;
 use super::send_intents::Untouched;
 use super::tagged_siblings::*;
 use super::*;
 use cgka_engine::private_key_packages::SiblingWelcome;
-use cgka_traits::app_components::DEVICE_ROSTER_COMPONENT_ID;
+use cgka_traits::app_components::{DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1};
 use cgka_traits::engine::KeyPackageSource;
 use cgka_traits::error::SiblingAddRefusal;
 use cgka_traits::message::{MessageRecord, MessageState};
@@ -740,9 +742,9 @@ impl cgka_traits::maintenance::WallClock for AtTime {
         self.0 * 1_000
     }
 }
-impl cgka_traits::maintenance::MaintenanceRandom for AtTime {
-    fn next_u64(&self) -> u64 {
-        0
+impl cgka_traits::EntropySource for AtTime {
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        dest.fill(0);
     }
 }
 
@@ -2133,6 +2135,65 @@ async fn a_queued_sibling_add_is_checked_before_the_queue_and_at_drain() {
     assert!(queued(&m.bob).is_empty());
     assert!(sibling_rows(&m.bob, &gid).is_empty());
     assert!(owed(&m.bob).is_empty());
+}
+
+/// A sibling's private KeyPackage verifies against the roster before its
+/// link is made: the Add that linked it set its key (marmot#521). Here
+/// bob holds the laptop's KeyPackage while the laptop's first commit in the
+/// device group has not reached him, as when a branch drops that commit
+/// after the KeyPackage arrived. Admission, shared by every send and queue
+/// drain, refuses the Add as `LinkPending` until that commit lands.
+#[tokio::test]
+async fn a_sibling_whose_link_is_not_made_is_not_added() {
+    let mut bob = roster_device(b"bob");
+    let mut laptop = roster_device(b"bob");
+    let device_gid = super::device_roster::found_device_group(
+        &mut bob,
+        &super::device_roster::roster(&[(1, "Phone"), (2, "Laptop")]),
+        &mut [&mut laptop],
+    )
+    .await;
+    for (device, own) in [(&mut bob, slot(1)), (&mut laptop, slot(2))] {
+        hold_slot(device, own);
+        device
+            .engine
+            .set_device_tag_group(Some(device_gid.clone()))
+            .unwrap();
+    }
+    super::device_tag::set_own_key(&mut bob, slot(1), &device_gid, &mut [&mut laptop]).await;
+    let laptop_entry = roster_of(&laptop, &device_gid).devices[&slot(2)].clone();
+    let first_commit = send_commit(
+        &mut laptop,
+        roster_update(
+            &device_gid,
+            vec![DeviceRosterOperationV1::SetDevice(slot(2), laptop_entry)],
+        ),
+        &device_gid,
+    )
+    .await;
+    let sibling = handed(&mut laptop, slot(2), slot(1));
+    let mut m = routed_members(chat_device(b"alice"), bob).await;
+    let gid = m.gid.clone();
+
+    assert_eq!(
+        m.bob.engine.sibling_add_refusal(&gid, &sibling).unwrap(),
+        Some(SiblingAddRefusal::LinkPending)
+    );
+    let before = (Untouched::of(&m.bob, &gid), rows(&m.bob, &gid));
+    assert_refused(
+        m.bob
+            .engine
+            .send(add_own_devices(&gid, vec![sibling.clone()]))
+            .await,
+        "the sibling's link is not made yet",
+    );
+    assert_eq!((Untouched::of(&m.bob, &gid), rows(&m.bob, &gid)), before);
+
+    assert_accepted(&mut m.bob, &first_commit, &device_gid).await;
+    assert_eq!(
+        m.bob.engine.sibling_add_refusal(&gid, &sibling).unwrap(),
+        None
+    );
 }
 
 /// Creation's one canonical founding Add retains a sibling's private

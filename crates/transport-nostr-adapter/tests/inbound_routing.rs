@@ -3804,7 +3804,7 @@ async fn recovery_account_inbox() {
             device_key_hash: [9; 32],
         },
     };
-    let message = NostrMlsPeeler::new()
+    let message = NostrMlsPeeler::default()
         .with_welcome_signer(sender.clone())
         .wrap_group_recovery(&body, &receiver_id)
         .await
@@ -3848,7 +3848,7 @@ async fn recovery_account_inbox() {
             recipient: receiver_id
         }
     );
-    let peeled = NostrMlsPeeler::new()
+    let peeled = NostrMlsPeeler::default()
         .with_welcome_signer(receiver)
         .peel_welcome(&delivery.message)
         .await

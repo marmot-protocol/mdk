@@ -141,7 +141,7 @@ c_enum! {
 c_enum! {
     /// Which `MarmotInviteDeliveryState` this is. `RelayAccepted` means a relay
     /// stored the Welcome, not that the recipient received it or joined.
-    /// `Undeliverable`: no relay stored it by its deadline; it is not resent.
+    /// `Undeliverable`: no relay acknowledged it by its deadline; it is not resent.
     MarmotInviteDeliveryStateKind {
         Waiting,
         Sending,

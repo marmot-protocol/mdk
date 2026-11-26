@@ -318,7 +318,7 @@ impl AppClient {
         }
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         // An invitation answered here applies here, linked or not.
-        let mut owed = self.invitation_decisions_changed || self.invitation_work_held;
+        let mut owed = self.invitation_turn_owed() || self.invitation_work_held;
         // The rest only a linked device sends or applies: an unlinked one
         // keeps its decisions and edits unsent until it links. A sibling this
         // device added to a chat is owed that chat's history.

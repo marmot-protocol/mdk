@@ -1845,6 +1845,7 @@ pub(crate) fn notification_update_from_event_cached(
         | MarmotAppEvent::RecoveryStatusChanged { .. }
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::RelayHealthChanged { .. }
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }

@@ -431,6 +431,8 @@ mod migration_0224_epoch_gap_evidence_floor;
 mod migration_0225_welcome_delivery_ledger;
 #[path = "migrations/0226_local_submission_refused.rs"]
 mod migration_0226_local_submission_refused;
+#[path = "migrations/0227_welcome_expiry_mark.rs"]
+mod migration_0227_welcome_expiry_mark;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1641,6 +1643,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0226_local_submission_refused",
         suspend_foreign_keys: &[],
         apply: migration_0226_local_submission_refused::apply,
+    },
+    Migration {
+        version: 227,
+        name: "0227_welcome_expiry_mark",
+        suspend_foreign_keys: &[],
+        apply: migration_0227_welcome_expiry_mark::apply,
     },
 ];
 

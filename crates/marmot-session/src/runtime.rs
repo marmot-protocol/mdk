@@ -71,8 +71,7 @@ use crate::session::{
     SessionError, SessionOpenTimings, SessionResult, WelcomeHold, WelcomeWithdrawal,
 };
 use crate::time::{
-    MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
-    WallClock,
+    EntropySource, MonotonicClock, OsEntropy, SystemMonotonicClock, SystemWallClock, WallClock,
 };
 
 mod device_roster;
@@ -730,7 +729,7 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     key_packages: K,
     wall_clock: Arc<dyn WallClock>,
     monotonic_clock: Arc<dyn MonotonicClock>,
-    maintenance_random: Arc<dyn MaintenanceRandom>,
+    entropy: Arc<dyn EntropySource>,
     maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
     /// This runtime was asked to withdraw the device's slot for sign-out, so
@@ -777,6 +776,18 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// Welcomes whose withdrawal `withdraw_welcome` recorded, so the
     /// watcher does not record it again.
     v5_withdrawn_welcomes: std::sync::Mutex<HashSet<cgka_traits::MessageId>>,
+    /// Welcomes whose expiry notice and row this process recorded while the
+    /// write marking that done has not landed yet, so a retry only writes it.
+    v5_expired_welcomes: std::sync::Mutex<HashSet<cgka_traits::MessageId>>,
+    /// Whether this process has searched every group for unrecorded Welcome
+    /// expiries (see `welcome_delivery`), and the groups that search, or a
+    /// retry of it, could not read: each later pass reads them again.
+    welcome_expiries_read: bool,
+    unread_expiry_groups: Vec<GroupId>,
+    /// Welcomes a withdrawal or a redelivery marked expired whose record
+    /// could not be written then; the next pass watches them, so the record
+    /// is retried before the next start.
+    expiries_to_record: std::sync::Mutex<Vec<cgka_traits::MessageId>>,
     /// The `(group, recipient)` pairs whose Welcome delivery state changed
     /// and that no host has taken yet (`take_welcome_delivery_changes`).
     welcome_delivery_changes: std::sync::Mutex<Vec<(GroupId, MemberId)>>,
@@ -845,7 +856,7 @@ where
             key_packages,
             wall_clock: Arc::new(SystemWallClock),
             monotonic_clock: Arc::new(SystemMonotonicClock::default()),
-            maintenance_random: Arc::new(OsMaintenanceRandom),
+            entropy: Arc::new(OsEntropy),
             maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
             key_package_slot_withdrawn: false,
@@ -862,6 +873,10 @@ where
             watched_welcomes: Vec::new(),
             v5_prepared_welcomes: HashSet::new(),
             v5_withdrawn_welcomes: std::sync::Mutex::new(HashSet::new()),
+            v5_expired_welcomes: std::sync::Mutex::new(HashSet::new()),
+            welcome_expiries_read: false,
+            unread_expiry_groups: Vec::new(),
+            expiries_to_record: std::sync::Mutex::new(Vec::new()),
             welcome_delivery_changes: std::sync::Mutex::new(Vec::new()),
             welcome_route_retries: std::sync::Mutex::default(),
             welcome_store_read: false,
@@ -884,11 +899,11 @@ where
         mut self,
         wall_clock: Arc<dyn WallClock>,
         monotonic_clock: Arc<dyn MonotonicClock>,
-        maintenance_random: Arc<dyn MaintenanceRandom>,
+        entropy: Arc<dyn EntropySource>,
     ) -> Self {
         self.wall_clock = wall_clock;
         self.monotonic_clock = monotonic_clock;
-        self.maintenance_random = maintenance_random;
+        self.entropy = entropy;
         self
     }
 
@@ -1127,6 +1142,17 @@ where
         roster: &DeviceRosterV1,
     ) -> AccountResult<Vec<(Vec<u8>, DeviceTagClaim)>> {
         Ok(self.session.own_account_leaf_claims(group_id, roster)?)
+    }
+
+    /// The slots of `roster`, `group_id`'s current roster, whose link that
+    /// device group's current tree shows made. See
+    /// [`cgka_engine::engine::Engine::made_device_links`].
+    pub fn made_device_links(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> AccountResult<std::collections::BTreeSet<cgka_traits::app_components::DeviceSlotId>> {
+        Ok(self.session.made_device_links(group_id, roster)?)
     }
 
     /// This account's leaves in `group_id` of its device in `slot`, each
@@ -1885,7 +1911,7 @@ where
                 return Err(AccountError::ClockSkewBlocked);
             }
             let refresh_after = self
-                .maintenance_random
+                .entropy
                 .sample_inclusive(KEY_PACKAGE_REFRESH_MIN_SECS, KEY_PACKAGE_REFRESH_MAX_SECS);
             if supersede_pending {
                 // Recorded with the replacement it pays for, so a restart
@@ -2663,7 +2689,7 @@ where
         hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
         hasher.update(group_id.as_slice());
         hasher.update(now.0.to_be_bytes());
-        hasher.update(self.maintenance_random.next_u64().to_be_bytes());
+        hasher.update(self.entropy.next_u64().to_be_bytes());
         let id = cgka_traits::MessageId::new(hasher.finalize().to_vec());
         let obligation = MaintenanceObligation {
             id: id.clone(),
@@ -2678,7 +2704,7 @@ where
             quiet_since: Some(now),
             own_leaf_baseline_hash: Some(self.session.own_leaf_hash(group_id)?),
             sampled_jitter_ms: self
-                .maintenance_random
+                .entropy
                 .sample_inclusive(0, self.maintenance_timing.contention_jitter_max_ms()),
             not_before: None,
             attempt_count: 0,
@@ -3069,7 +3095,7 @@ where
                     grace_until: None,
                     quiet_since: Some(now),
                     own_leaf_baseline_hash: Some(self.session.own_leaf_hash(&group_id)?),
-                    sampled_jitter_ms: self.maintenance_random.sample_inclusive(0, 15 * 60 * 1_000),
+                    sampled_jitter_ms: self.entropy.sample_inclusive(0, 15 * 60 * 1_000),
                     not_before: None,
                     attempt_count: 0,
                     semantic_rearm_count: 0,
@@ -3593,7 +3619,7 @@ where
                     grace_until: None,
                     quiet_since: Some(now),
                     own_leaf_baseline_hash: Some(self.session.own_leaf_hash(group_id)?),
-                    sampled_jitter_ms: self.maintenance_random.sample_inclusive(0, 15 * 60 * 1_000),
+                    sampled_jitter_ms: self.entropy.sample_inclusive(0, 15 * 60 * 1_000),
                     not_before: None,
                     attempt_count: 0,
                     semantic_rearm_count: 0,
@@ -5597,7 +5623,7 @@ where
         let earliest = baseline.0.saturating_add(PERIODIC_MIN_SECS);
         let latest = baseline.0.saturating_add(PERIODIC_MAX_SECS);
         let first = baseline.0.saturating_add(
-            self.maintenance_random
+            self.entropy
                 .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
         );
         let mut deadline = first;
@@ -7003,6 +7029,7 @@ where
                 self.mark_welcome_delivered_best_effort(fanout.message_id());
             } else if attempted_any
                 && matches!(fanout.mls_state(), FanoutMlsState::Confirmed)
+                && !self.welcome_past_deadline_now(fanout.message_id())
                 && let Some(recipient) = welcome_recipient(&fanout.request().message)
             {
                 output.welcome_failures.push(WelcomeDeliveryFailure {

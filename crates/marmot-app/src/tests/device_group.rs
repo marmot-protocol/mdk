@@ -188,6 +188,16 @@ fn roster(client: &AppClient, group: &GroupId) -> DeviceRosterV1 {
     decode_device_roster_v1(&bytes).unwrap()
 }
 
+/// Whether `client` reads the link of `slot` in `group` as made: its leaf
+/// there tags as `slot` and has committed since its Add (marmot#521).
+fn link_made(client: &AppClient, group: &GroupId, slot: &[u8; 32]) -> bool {
+    client
+        .runtime
+        .made_device_links(group, &roster(client, group))
+        .unwrap()
+        .contains(slot)
+}
+
 fn roster_devices(client: &AppClient, group: &GroupId) -> usize {
     roster(client, group).devices.len()
 }
@@ -2253,8 +2263,9 @@ fn key_package_claim(client: &AppClient, roster: &DeviceRosterV1) -> DeviceTagCl
 
 /// Each device tags from the device group it trusts (mdk#2628 3.1d). The
 /// founder's founding entry carries its tag signature key, so its leaf reads
-/// as its slot from the start. The laptop sets its own key on its next
-/// maintenance pass, in a roster commit whose own leaf already carries the
+/// as its slot from the start. The Add that linked the laptop set its key
+/// (marmot#521), but its link is not made until its own first commit there:
+/// its next maintenance pass makes that commit, whose own leaf carries the
 /// tag, before it stages anything; the same pass then announces and
 /// publishes a tagged KeyPackage. The phone's next pass replaces its
 /// untagged one.
@@ -2276,7 +2287,11 @@ async fn each_device_tags_from_the_device_group_it_trusts() {
         founding.devices[&phone_slot].tag_signature_key,
         Some(phone.runtime.own_signature_key())
     );
-    assert_eq!(founding.devices[&laptop_slot].tag_signature_key, None);
+    assert_eq!(
+        founding.devices[&laptop_slot].tag_signature_key,
+        Some(laptop.runtime.own_signature_key())
+    );
+    assert!(!link_made(&laptop, &group, &laptop_slot));
     assert_eq!(
         leaf_claim(&laptop, &group, &phone, &founding),
         Some(DeviceTagClaim::Device(phone_slot))
@@ -2314,6 +2329,7 @@ async fn each_device_tags_from_the_device_group_it_trusts() {
             leaf_claim(reader, &group, &laptop, &roster),
             Some(DeviceTagClaim::Device(laptop_slot))
         );
+        assert!(link_made(reader, &group, &laptop_slot));
     }
     assert_eq!(
         key_package_claim(&laptop, &roster(&laptop, &group)),
@@ -2429,12 +2445,12 @@ async fn each_device_keeps_its_history_key_in_its_own_entry() {
     }
 }
 
-/// A KeyPackage staged while this device's tag signature key is due would go
-/// out untagged once the key is set (mdk#2628 3.1d), so nothing is staged
-/// until the merged roster carries it. When the relay refuses the roster
-/// commit, neither maintenance nor a host publication stages or publishes a
-/// KeyPackage. Once it accepts, one host rotation sets the key, then
-/// announces and publishes a tagged KeyPackage.
+/// A KeyPackage staged while this device's first device-group commit is due
+/// would go out untagged once that commit makes its link (mdk#2628 3.1d,
+/// marmot#521), so nothing is staged until the link is made. When the relay
+/// refuses that commit, neither maintenance nor a host publication stages or
+/// publishes a KeyPackage. Once it accepts, one host rotation makes the
+/// commit, then announces and publishes a tagged KeyPackage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_key_package_waits_for_the_tag_signature_key() {
     let (
@@ -2461,16 +2477,10 @@ async fn a_key_package_waits_for_the_tag_signature_key() {
     let status = laptop.key_package_maintenance_status().unwrap().unwrap();
     assert!(status.pending_replacement.is_none(), "nothing is staged");
     assert_eq!(current_ref(&laptop), current);
-    assert_eq!(
-        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
-        None
-    );
+    assert!(!link_made(&laptop, &group, &laptop_slot));
 
     laptop.rotate_key_package().await.unwrap();
-    assert_eq!(
-        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
-        Some(laptop.runtime.own_signature_key())
-    );
+    assert!(link_made(&laptop, &group, &laptop_slot));
     assert_ne!(current_ref(&laptop), current);
     assert_eq!(announced(&laptop, &group, &laptop), current_ref(&laptop));
     assert_eq!(
@@ -2522,10 +2532,11 @@ async fn an_untagged_staged_key_package_is_replaced_once_the_device_tags() {
     );
 }
 
-/// A refresh waiting for this device's tag signature key (mdk#2628 3.1d) is
-/// held back like one waiting for its announcement: once the slot's
-/// publication is a week old it is overdue, though the current KeyPackage is
-/// announced. It clears once the key is set and a tagged KeyPackage publishes.
+/// A refresh waiting for this device's first device-group commit (mdk#2628
+/// 3.1d, marmot#521) is held back like one waiting for its announcement: once
+/// the slot's publication is a week old it is overdue, though the current
+/// KeyPackage is announced. It clears once that commit makes the link and a
+/// tagged KeyPackage publishes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refresh_waiting_for_the_tag_signature_key_is_overdue_after_a_week() {
     let (
@@ -2544,10 +2555,7 @@ async fn a_refresh_waiting_for_the_tag_signature_key_is_overdue_after_a_week() {
     assert_eq!(announced(&laptop, &group, &laptop), current_ref(&laptop));
     relay.reject_next_publish();
     laptop.run_due_maintenance().await.unwrap();
-    assert_eq!(
-        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
-        None
-    );
+    assert!(!link_made(&laptop, &group, &laptop_slot));
     assert!(laptop.key_package_refresh_overdue().unwrap());
     assert!(laptop.take_key_package_refresh_overdue_changed());
 
@@ -2560,7 +2568,8 @@ async fn a_refresh_waiting_for_the_tag_signature_key_is_overdue_after_a_week() {
     assert!(laptop.take_key_package_refresh_overdue_changed());
 }
 
-/// While another device's entry carries this device's tag signature key, this
+/// While another device's entry carries this device's tag signature key and
+/// its own entry has none, as when an earlier device moved the key, this
 /// device cannot set the key in its own entry, since a roster gives each key
 /// one device (mdk#2628 3.1d). The engine tags only from this device's own
 /// entry, so maintenance does not hold the refresh back: it announces and
@@ -2578,14 +2587,21 @@ async fn a_key_held_by_another_device_leaves_key_packages_untagged() {
         group,
     ) = linked_devices().await;
     let laptop_slot = slot_of(&laptop);
+    let keyless = DeviceEntryV1 {
+        tag_signature_key: None,
+        ..roster(&phone, &group).devices[&laptop_slot].clone()
+    };
     let update = encode_device_roster_update_v1(
-        &DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
-            [9; 32],
-            DeviceEntryV1 {
-                tag_signature_key: Some(laptop.runtime.own_signature_key()),
-                ..DeviceEntryV1::default()
-            },
-        )])
+        &DeviceRosterUpdateV1::new(vec![
+            DeviceRosterOperationV1::SetDevice(laptop_slot, keyless),
+            DeviceRosterOperationV1::SetDevice(
+                [9; 32],
+                DeviceEntryV1 {
+                    tag_signature_key: Some(laptop.runtime.own_signature_key()),
+                    ..DeviceEntryV1::default()
+                },
+            ),
+        ])
         .unwrap(),
     )
     .unwrap();

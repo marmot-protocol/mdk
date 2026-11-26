@@ -50,10 +50,11 @@ use cgka_traits::error::{AccountDevicesActivationRefusal, EngineError};
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::{
-    DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
-    MaintenanceObligation, MaintenanceRandom, PeriodicMaintenancePolicy, TransportFanoutTarget,
-    WallClock,
+    DurableGroupEvolution, DurableTransportFanout, EntropySource, GroupMaintenanceState,
+    KeyPackageLifecycleState, MaintenanceObligation, PeriodicMaintenancePolicy,
+    TransportFanoutTarget, WallClock,
 };
+pub(crate) use cgka_traits::message::WelcomeExpiry;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     DeviceGroupWelcomeExpectation, MaintenanceStorage, MessageStorage, OutboundFanoutStorage,
@@ -142,7 +143,7 @@ pub struct SessionConfig {
     storage_options: SqliteStorageOptions,
     convergence_policy: CanonicalizationPolicy,
     recorder: Option<Box<dyn ForensicRecorder>>,
-    maintenance_sources: Option<(Arc<dyn WallClock>, Arc<dyn MaintenanceRandom>)>,
+    maintenance_sources: Option<(Arc<dyn WallClock>, Arc<dyn EntropySource>)>,
     defer_group_hydration: bool,
 }
 
@@ -298,9 +299,9 @@ impl SessionConfig {
     pub fn maintenance_sources(
         mut self,
         wall_clock: Arc<dyn WallClock>,
-        maintenance_random: Arc<dyn MaintenanceRandom>,
+        entropy: Arc<dyn EntropySource>,
     ) -> Self {
-        self.maintenance_sources = Some((wall_clock, maintenance_random));
+        self.maintenance_sources = Some((wall_clock, entropy));
         self
     }
 }
@@ -534,8 +535,8 @@ impl AccountDeviceSession {
             builder
         };
         let mut builder = builder.peeler(config.peeler);
-        if let Some((wall_clock, maintenance_random)) = config.maintenance_sources {
-            builder = builder.maintenance_sources(wall_clock, maintenance_random);
+        if let Some((wall_clock, entropy)) = config.maintenance_sources {
+            builder = builder.maintenance_sources(wall_clock, entropy);
         }
         let audit = config
             .recorder
@@ -1123,6 +1124,46 @@ impl AccountDeviceSession {
         Ok(withdrawal)
     }
 
+    /// See `Engine::expire_sent_welcome`. A detached wave reserving the
+    /// Welcome skips every attempt it has not started, as after a withdrawal.
+    pub fn expire_sent_welcome(
+        &self,
+        id: &MessageId,
+        now: Timestamp,
+    ) -> SessionResult<Option<WelcomeExpiry>> {
+        let mut holds = self
+            .detached_welcome_holds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let expiry = self.engine.expire_sent_welcome(id, now)?;
+        if expiry.is_some()
+            && let Some(hold) = holds.get_mut(id)
+        {
+            *hold = Some(WelcomeHold::Withdrawn);
+        }
+        Ok(expiry)
+    }
+
+    /// See `Engine::record_sent_welcome_expiry`.
+    pub(crate) fn record_sent_welcome_expiry(&self, id: &MessageId) -> SessionResult<()> {
+        Ok(self.engine.record_sent_welcome_expiry(id)?)
+    }
+
+    /// See `Engine::unrecorded_welcome_expiries`.
+    pub(crate) fn unrecorded_welcome_expiries(
+        &self,
+    ) -> SessionResult<cgka_engine::engine::UnrecordedWelcomeExpiries> {
+        Ok(self.engine.unrecorded_welcome_expiries()?)
+    }
+
+    /// See `Engine::unrecorded_welcome_expiries_in`.
+    pub(crate) fn unrecorded_welcome_expiries_in(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<MessageId>> {
+        Ok(self.engine.unrecorded_welcome_expiries_in(group_id)?)
+    }
+
     /// See `Engine::sent_welcomes_for_key_package`.
     pub fn sent_welcomes_for_key_package(
         &self,
@@ -1267,6 +1308,15 @@ impl AccountDeviceSession {
         roster: &DeviceRosterV1,
     ) -> SessionResult<Vec<(Vec<u8>, DeviceTagClaim)>> {
         Ok(self.engine.own_account_leaf_claims(group_id, roster)?)
+    }
+
+    /// See [`cgka_engine::engine::Engine::made_device_links`].
+    pub fn made_device_links(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<std::collections::BTreeSet<cgka_traits::app_components::DeviceSlotId>> {
+        Ok(self.engine.made_device_links(group_id, roster)?)
     }
 
     /// See [`cgka_engine::engine::Engine::own_device_leaves`].

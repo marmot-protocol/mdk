@@ -90,6 +90,34 @@ impl RosterTagKeyStorage for SqliteAccountStorage {
         Ok(())
     }
 
+    fn hold_roster_tag_keys_as_removed(
+        &self,
+        group_id: &GroupId,
+        slot: &[u8; 32],
+        since: u64,
+    ) -> StorageResult<()> {
+        let conn = self.lock()?;
+        let since = u64_to_i64(since)?;
+        let held = conn
+            .query_row_cached(
+                "SELECT EXISTS (SELECT 1 FROM cgka_roster_tag_keys
+                     WHERE group_id = ?1 AND slot = ?2 AND last_seen_at >= ?3
+                         AND held_as_removed)",
+                params![group_id.as_slice(), slot.as_slice(), since],
+                |row| row.get::<_, bool>(0),
+            )
+            .storage()?;
+        if !held {
+            conn.execute_cached(
+                "UPDATE cgka_roster_tag_keys SET held_as_removed = 1
+                 WHERE group_id = ?1 AND slot = ?2 AND last_seen_at >= ?3",
+                params![group_id.as_slice(), slot.as_slice(), since],
+            )
+            .storage()?;
+        }
+        Ok(())
+    }
+
     fn roster_tag_keys(&self, group_id: &GroupId, since: u64) -> StorageResult<Vec<RosterTagKey>> {
         let conn = self.lock()?;
         let mut stmt = conn
@@ -306,6 +334,64 @@ mod tests {
             .unwrap();
         assert_eq!(store.roster_tag_keys(&gid(1), 0).unwrap(), slot_1);
         assert_eq!(store.roster_tag_keys(&gid(2), 0).unwrap(), vec![key(1, 7)]);
+    }
+
+    /// Holding a slot as removed (marmot#520) marks each of its keys last
+    /// seen since the bound and moves neither their order nor their sighting
+    /// time. Another slot's keys, and the same slot in another group, stay
+    /// as they were. A slot that already holds a key is left alone, so that
+    /// key stays the one a prune past the cap keeps.
+    #[test]
+    fn holding_a_slot_as_removed_marks_its_keys_only() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 1)).unwrap();
+        store.put_group(&sample_group(gid(2), 0, 1)).unwrap();
+        store
+            .record_roster_tag_keys(&gid(1), &[key(1, 1)], 50)
+            .unwrap();
+        store
+            .record_roster_tag_keys(&gid(1), &[key(1, 2), key(1, 3), key(2, 1)], 100)
+            .unwrap();
+        store
+            .record_roster_tag_keys(&gid(2), &[key(1, 3)], 100)
+            .unwrap();
+
+        store
+            .hold_roster_tag_keys_as_removed(&gid(1), &[1; 32], 100)
+            .unwrap();
+
+        let held = |slot, n| RosterTagKey {
+            held_as_removed: true,
+            ..key(slot, n)
+        };
+        assert_eq!(
+            store.roster_tag_keys(&gid(1), 0).unwrap(),
+            vec![held(1, 3), held(1, 2), key(1, 1), key(2, 1)]
+        );
+        assert!(store.roster_tag_keys(&gid(1), 101).unwrap().is_empty());
+        assert_eq!(store.roster_tag_keys(&gid(2), 0).unwrap(), vec![key(1, 3)]);
+
+        let newer = [key(3, 2), key(3, 3), key(3, 4), key(3, 5)];
+        store
+            .record_roster_tag_keys(&gid(1), &[held(3, 1)], 100)
+            .unwrap();
+        store.record_roster_tag_keys(&gid(1), &newer, 100).unwrap();
+        store
+            .hold_roster_tag_keys_as_removed(&gid(1), &[3; 32], 100)
+            .unwrap();
+        store
+            .prune_roster_tag_keys(100, ROSTER_TAG_KEYS_PER_SLOT)
+            .unwrap();
+        let slot_3 = store
+            .roster_tag_keys(&gid(1), 0)
+            .unwrap()
+            .into_iter()
+            .filter(|key| key.slot == [3; 32])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slot_3,
+            vec![key(3, 5), key(3, 4), key(3, 3), key(3, 2), held(3, 1)]
+        );
     }
 
     /// A branch-selection rewind keeps the keys the dropped branch listed; a

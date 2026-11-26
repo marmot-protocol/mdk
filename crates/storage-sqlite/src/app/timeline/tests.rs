@@ -2519,7 +2519,12 @@ fn reply_preview_is_hydrated_even_when_parent_is_outside_page() {
         "m image/png".to_owned(),
         "filename diagram.png".to_owned(),
     ]];
-    store.record_app_event(&parent).unwrap();
+    store
+        .record_app_event_with_retention(
+            &parent,
+            Some(AppMessageRetentionDecision::new(parent.recorded_at, 300)),
+        )
+        .unwrap();
     // Same epoch, so the page orders the two by time and the reply is newest.
     let mut child = reply("reply", "bob", "parent", 2, "answer");
     child.source_epoch = Some(5);
@@ -2546,6 +2551,8 @@ fn reply_preview_is_hydrated_even_when_parent_is_outside_page() {
     assert_eq!(preview.plaintext, "the original");
     assert!(!preview.deleted);
     assert_eq!(preview.source_epoch, Some(5));
+    assert_eq!(preview.retention_seconds, Some(300));
+    assert_eq!(preview.retention_expires_at, Some(301));
     let parent_row = store
         .timeline_message(&"11".repeat(32), "parent")
         .unwrap()

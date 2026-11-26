@@ -626,11 +626,16 @@ impl<'t> Admission<'t> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let staged = ranges
-            .iter()
-            .copied()
-            .zip(turn.app.staged_recovery_first_seconds(&ranges)?)
-            .collect::<BTreeMap<_, _>>();
+        // No capture, no staged range: skip the read and its lock.
+        let staged = if ranges.is_empty() {
+            BTreeMap::new()
+        } else {
+            ranges
+                .iter()
+                .copied()
+                .zip(turn.app.staged_recovery_first_seconds(&ranges)?)
+                .collect::<BTreeMap<_, _>>()
+        };
         for (group, members) in &mut pending {
             for (member, captures) in members {
                 for capture in captures.iter() {

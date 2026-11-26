@@ -3731,6 +3731,22 @@ Frees a user emoji list, its sets and missing coordinates. NULL is safe.
 
 </details>
 
+## Account relay health
+
+### `marmot_account_relay_health`
+
+Write the account's relay health from its cached lists and the dial policy: `rows` (`roles`, `state`, `fault` read only when
+`has_fault`, `liveness`), `warnings` about invitations sent through the published inbox list, ordered from the most severe, `highest_severity` read only when
+`has_highest_severity`, `inbox_list` and `falls_back_to_defaults`. A local read that never dials; the call blocks the
+calling thread. Re-read on `MARMOT_EVENT_RELAY_HEALTH_CHANGED`. Keep a default case over the warning kind, fault,
+action, role and state enums. Free the result with `marmot_account_relay_health_free`.
+
+[Shared method and API guidance](../marmot-uniffi/API-GUIDE.md#marmotaccount_relay_health)
+
+### `marmot_account_relay_health_free`
+
+Deep-free a record returned by `marmot_account_relay_health`, including its rows, warnings, URLs, role and action arrays. NULL is a no-op.
+
 ## Relay liveness
 
 ### `marmot_account_relay_liveness`

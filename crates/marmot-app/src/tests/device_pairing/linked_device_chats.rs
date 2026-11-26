@@ -3125,6 +3125,82 @@ async fn a_device_that_answers_after_its_removal_is_dropped_is_added_to_no_chat(
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
 }
 
+/// A deeper branch from the tablet keeps the laptop's Add but drops the
+/// laptop's first commit, after the phone saved the link as linked and took
+/// the laptop's KeyPackages. The saved outcome and the roster key from the
+/// Add both survive, but the selected tree shows the link not made, so the
+/// phone adds the laptop to no chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_whose_first_commit_a_branch_drops_is_added_to_no_chat() {
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let group = link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    passes(&relay, &mut [&mut phone, &mut tablet], 2).await;
+    let chat = phone
+        .client
+        .create_group("chat", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let slot_hex = choose_link(&relay, &mut phone, &mut laptop).await;
+    laptop.op(DeviceLinkOp::ConfirmMatch).await;
+    laptop.step(&relay).await; // phone's confirm in, laptop's out
+    phone.step(&relay).await; // laptop's confirm in: the Add
+    deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
+    let slot: [u8; 32] = hex::decode(&slot_hex).unwrap().try_into().unwrap();
+    assert!(tablet.roster(&group).devices.contains_key(&slot));
+    laptop.step(&relay).await; // the Welcome, and its first commit
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    phone.op(DeviceLinkOp::Read).await;
+    assert_eq!(
+        link_record(&phone, &group, &slot_hex).outcome,
+        DeviceLinkOutcome::Linked
+    );
+
+    let epoch = |device: &Device| device.client.runtime.group_record(&group).unwrap().epoch;
+    let phone_epoch = epoch(&phone);
+    let mut renames = 0;
+    while epoch(&tablet) <= phone_epoch {
+        renames += 1;
+        let tablet_slot = tablet.slot_hex();
+        tablet
+            .client
+            .rename_linked_device(&tablet_slot, &format!("Tablet {renames}"))
+            .await
+            .unwrap();
+    }
+    converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 8).await;
+    // The renames changed the roster its last small state was made for.
+    phone.client.drive_small_state().await;
+    let roster = phone.roster(&group);
+    assert_eq!(
+        roster.devices[&slot].tag_signature_key,
+        Some(laptop.client.runtime.own_signature_key()),
+        "the selected branch keeps the laptop's Add"
+    );
+    assert!(
+        !phone
+            .client
+            .runtime
+            .made_device_links(&group, &roster)
+            .unwrap()
+            .contains(&slot),
+        "the selected branch drops the laptop's first commit"
+    );
+    assert_eq!(
+        link_record(&phone, &group, &slot_hex).outcome,
+        DeviceLinkOutcome::Linked
+    );
+
+    let before = taken_from(&phone, &laptop);
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    assert_eq!(taken_from(&phone, &laptop), before);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+}
+
 /// A chat whose relays a sibling Welcome cannot carry takes no same-account
 /// Add: the phone counts it, never takes a KeyPackage for it, and adds the
 /// laptop to its other chat.

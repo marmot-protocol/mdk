@@ -158,8 +158,14 @@ mod tagged_siblings {
             devices: [(own_slot(&phone), entry("Phone"))].into_iter().collect(),
             ..DeviceRosterV1::default()
         };
+        // The Add binds the laptop's leaf key to its entry (marmot#521).
         let laptop_entry = DeviceEntryV1 {
             announced_key_package: Some(key_package_ref(&laptop.key_package)),
+            tag_signature_key: Some(
+                key_package_metadata(&laptop.key_package)
+                    .unwrap()
+                    .leaf_signature_key,
+            ),
             ..entry("Laptop")
         };
         let roster_update = encode_device_roster_update_v1(

@@ -84,21 +84,22 @@ impl OutboundIntentStorage for SqliteAccountStorage {
     ) -> StorageResult<()> {
         // A message refused for a new member settles its local send in the
         // same transaction, so a crash before the host sees the announcement
-        // cannot leave the send looking pending.
+        // cannot leave the send looking pending. Any other refusal is the
+        // plain delete.
+        let cgka_traits::SendIntent::AppMessage { payload, .. } = &record.intent else {
+            return self.delete_queued_outbound_intent(&record.id);
+        };
+        if error_kind != cgka_traits::error::EngineError::AppMessageNewMembers.privacy_safe_kind() {
+            return self.delete_queued_outbound_intent(&record.id);
+        }
         self.connection.with_transaction(|| {
             self.delete_queued_outbound_intent(&record.id)?;
-            if let cgka_traits::SendIntent::AppMessage { payload, .. } = &record.intent
-                && error_kind
-                    == cgka_traits::error::EngineError::AppMessageNewMembers.privacy_safe_kind()
-            {
-                let conn = self.lock()?;
-                crate::cross::outbound::refuse_queued_payload(
-                    &conn,
-                    &hex::encode(record.group_id.as_slice()),
-                    payload,
-                )?;
-            }
-            Ok(())
+            let conn = self.lock()?;
+            crate::cross::outbound::refuse_queued_payload(
+                &conn,
+                &hex::encode(record.group_id.as_slice()),
+                payload,
+            )
         })
     }
 

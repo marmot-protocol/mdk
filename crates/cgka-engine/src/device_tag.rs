@@ -10,9 +10,13 @@
 //! [`DeviceTagClaim::Unclaimed`], never an error.
 //!
 //! This device signs its tags with its MLS signature key, so the roster's
-//! `tag_signature_key` for its entry is that key. Its entry is the one at its
-//! slot, its KeyPackage publication slot: [`OwnDeviceTag`] tags from that
-//! entry once it carries the key, never from another entry that does.
+//! `tag_signature_key` for its entry is that key, which the Commit that added
+//! the device set (marmot#521). Its entry is the one at its slot, its
+//! KeyPackage publication slot: [`OwnDeviceTag`] tags from that entry, never
+//! from another entry carrying the key. A joined device's first Commit in the
+//! device group tags its leaf there, and it tags nothing else until that
+//! Commit has landed. Other devices read the link as made from that
+//! committed leaf ([`link_made`]).
 //! `SignWithLabel`'s label keeps a tag signature apart from every MLS
 //! signature made with the same key.
 
@@ -142,6 +146,15 @@ impl OwnDeviceTag {
         device_tag_claim(leaf, &self.roster) == DeviceTagClaim::Device(self.slot)
     }
 
+    /// Whether `leaf`, this device's leaf in the device group, shows that
+    /// this device's own Commit there has landed ([`committed_or_founded`]).
+    /// Its tag need not read as this device's once it has committed: after a
+    /// move, ordinary maintenance tags the destination leaf for the original
+    /// group until the next destination Commit retags it.
+    pub(crate) fn committed_or_founded(&self, leaf: &LeafNode) -> bool {
+        committed_or_founded(leaf, &self.roster, &self.slot)
+    }
+
     /// A fresh tag for a leaf signed by `signer`, this device's MLS signer.
     pub(crate) fn seal<C: OpenMlsCrypto + OpenMlsRand>(
         &self,
@@ -174,11 +187,11 @@ impl<S: StorageProvider> Engine<S> {
     /// moved to it and no earlier group may tag in its place; the error says
     /// it is not live, as it does on every later call while that holds.
     ///
-    /// This device tags once that roster holds an entry whose
-    /// `tag_signature_key` is its MLS signature key (`own_signature_key`;
-    /// device-tag-v1.md, "Producing tags"). It sets that key itself in a
-    /// roster update (`SendIntent::ReplaceDeviceEntry`), whose UpdatePath
-    /// then carries the first tag.
+    /// This device's entry carries its MLS signature key (`own_signature_key`)
+    /// from the Commit that added it. Its first own Commit in the device group
+    /// tags its UpdatePath there; it tags its KeyPackages and its leaves in
+    /// other groups only once that Commit has landed (device-tag-v1.md,
+    /// "Producing tags").
     pub fn set_device_tag_group(&mut self, group_id: Option<GroupId>) -> Result<(), EngineError> {
         self.device_tag_group = group_id;
         match self.device_tag_group.clone() {
@@ -216,7 +229,13 @@ impl<S: StorageProvider> Engine<S> {
                 );
             })?;
         let own_slot = own_device_slot(storage)?;
-        Ok(self.own_device_tag_after(&device_group, &[], own_slot))
+        Ok(self
+            .own_device_tag_after(&device_group, &[], own_slot)
+            .filter(|own| {
+                device_group
+                    .own_leaf_node()
+                    .is_some_and(|leaf| own.committed_or_founded(leaf))
+            }))
     }
 
     /// This device's entry, the one at `own_slot`, in `device_group`'s roster
@@ -253,9 +272,12 @@ impl<S: StorageProvider> Engine<S> {
         OwnDeviceTag::find(roster, own_slot, self.identity.signer.public())
     }
 
-    /// The first Commit setting this device's own key in a destination
-    /// roster tags only its UpdatePath there (D102). This does not name the
-    /// destination for ordinary leaves or KeyPackages before Made.
+    /// This device's first own Commit in a device group other than the named
+    /// one, a move's destination or a device group it just joined, tags only
+    /// its UpdatePath there (D102, marmot#521): the Commit that replaces the
+    /// leaf its Add built, from the entry the Add bound to that leaf or the
+    /// one this Commit writes. This does not name the group for ordinary
+    /// leaves or KeyPackages before the link is made.
     pub(crate) fn first_own_roster_tag(
         &self,
         group: &MlsGroup,
@@ -268,15 +290,11 @@ impl<S: StorageProvider> Engine<S> {
         {
             return None;
         }
-        if !proposals.iter().any(|proposal| matches!(proposal,
-            Proposal::AppDataUpdate(update) if update.component_id() == DEVICE_ROSTER_COMPONENT_ID
-        )) {
+        let leaf = group.own_leaf_node()?;
+        if !matches!(crate::engine::add_leaf_lifetime(leaf), Ok(Some(_))) {
             return None;
         }
         let own_slot = own_device_slot(&self.storage).ok().flatten();
-        if self.own_device_tag_after(group, &[], own_slot).is_some() {
-            return None;
-        }
         self.own_device_tag_after(group, proposals, own_slot)
     }
 
@@ -337,6 +355,44 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
+    /// The slots of `roster`, `group_id`'s current roster, whose link the
+    /// group's current tree shows made ([`link_made`]), this device's own
+    /// included: the device group's leaves of this account that sign with
+    /// their slot's key and have committed since their Add, or are the
+    /// founder's. The Commit that adds a device sets its key, so a key in an
+    /// entry alone says nothing about whether its link is made. Errs while
+    /// the group is not live.
+    pub fn made_device_links(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> Result<std::collections::BTreeSet<DeviceSlotId>, EngineError> {
+        self.ensure_group_live(group_id)?;
+        let account = self.identity.self_id().as_slice().to_vec();
+        self.with_mls_group(group_id, |group| Ok(made_links(group, &account, roster)))
+    }
+
+    /// [`Self::made_device_links`] of the device group this device tags in,
+    /// read through `storage`, or `None` while it names none. Errs while that
+    /// group does not load.
+    pub(crate) fn own_device_group_made_links(
+        &self,
+        storage: &S,
+        roster: &DeviceRosterV1,
+    ) -> Result<Option<std::collections::BTreeSet<DeviceSlotId>>, EngineError> {
+        let Some(group_id) = self.device_tag_group.as_ref() else {
+            return Ok(None);
+        };
+        let device_group = self
+            .load_mls_group_in(storage.mls_storage(), group_id)?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        Ok(Some(made_links(
+            &device_group,
+            self.identity.self_id().as_slice(),
+            roster,
+        )))
+    }
+
     /// The roster slots of this account's other devices whose leaves `staged`
     /// adds to `group_id`, as each leaf's device tag reads against the device
     /// group's current roster, read through `storage` (mdk#2628 D76). Empty
@@ -394,6 +450,59 @@ impl<S: StorageProvider> Engine<S> {
         }
         slots
     }
+}
+
+/// The slots of `roster` whose link `group`, a device group, shows made
+/// ([`link_made`]): the leaves of `account` that sign with their slot's key.
+fn made_links(
+    group: &MlsGroup,
+    account: &[u8],
+    roster: &DeviceRosterV1,
+) -> std::collections::BTreeSet<DeviceSlotId> {
+    group
+        .members()
+        .filter(|member| {
+            openmls::prelude::BasicCredential::try_from(member.credential.clone())
+                .is_ok_and(|credential| credential.identity() == account)
+        })
+        .filter_map(|member| {
+            let leaf = group.public_group().leaf(member.index)?;
+            let (slot, _) = roster.devices.iter().find(|(_, entry)| {
+                entry.tag_signature_key.as_deref() == Some(member.signature_key.as_slice())
+            })?;
+            link_made(leaf, roster, slot).then_some(*slot)
+        })
+        .collect()
+}
+
+/// Whether `leaf`, a leaf of the account in its device group, shows that the
+/// link of `slot` is made (device-group.md, "Approving"; marmot#521): it signs
+/// with the key `slot`'s entry carries, which the Add bound to the leaf it
+/// added, and it has committed since its Add, which only that device can do,
+/// or it is the founding leaf of `slot` ([`committed_or_founded`]). Its tag
+/// need not read as `slot`: during a move, ordinary maintenance tags the
+/// destination leaf for the original group. A leaf still built from its Add's
+/// KeyPackage is a link not made yet.
+pub(crate) fn link_made(leaf: &LeafNode, roster: &DeviceRosterV1, slot: &DeviceSlotId) -> bool {
+    roster.devices.get(slot).is_some_and(|entry| {
+        entry.tag_signature_key.as_deref() == Some(leaf.signature_key().as_slice())
+    }) && committed_or_founded(leaf, roster, slot)
+}
+
+/// Whether `leaf`, the leaf of `slot` in its device group, has committed
+/// since its Add, or is the founding leaf of `slot`, the device that created
+/// the group: OpenMLS builds that leaf from a KeyPackage too, and the
+/// creation tags it as `slot`'s. A joined device's KeyPackage leaf carries no
+/// tag that reads as its slot.
+fn committed_or_founded(leaf: &LeafNode, roster: &DeviceRosterV1, slot: &DeviceSlotId) -> bool {
+    if matches!(crate::engine::add_leaf_lifetime(leaf), Ok(None)) {
+        return true;
+    }
+    roster
+        .devices
+        .get(slot)
+        .is_some_and(|entry| entry.linked_by.is_none())
+        && device_tag_claim(leaf, roster) == DeviceTagClaim::Device(*slot)
 }
 
 /// This device's roster slot, the slot its KeyPackage lifecycle publishes

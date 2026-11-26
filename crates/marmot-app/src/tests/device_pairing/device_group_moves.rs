@@ -84,6 +84,7 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
         let imported_slot = [91; 32];
         let destination_rejected_slot = [92; 32];
         let expired_slot = [93; 32];
+        let removed_slot = [94; 32];
         let rejected_at = unix_now_seconds().saturating_sub(10);
         let not_me = |at| RejectedSlotV1 {
             reason: RejectedSlotReasonV1::NotMe,
@@ -120,7 +121,7 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
                 RejectedSlotV1 {
                     reason: RejectedSlotReasonV1::Removed,
                     rejected_at: unix_now_seconds().saturating_sub(30 * 24 * 60 * 60),
-                    tag_signature_key: Some(moving.client.runtime.own_signature_key()),
+                    tag_signature_key: None,
                 },
                 Default::default(),
             )
@@ -131,6 +132,21 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
             .observe_drained_session_events(&effects)
             .await
             .unwrap();
+        // A removal Commit's record keeps a key the old group can check.
+        let removed = |tag_signature_key| RejectedSlotV1 {
+            reason: RejectedSlotReasonV1::Removed,
+            rejected_at,
+            tag_signature_key,
+        };
+        crate::tests::sign_ins::commit_roster(
+            &mut moving.client,
+            &old,
+            vec![DeviceRosterOperationV1::SetRejectedSlot(
+                removed_slot,
+                removed(Some(vec![0x94; 32])),
+            )],
+        )
+        .await;
         let destination_rejection = not_me(rejected_at.saturating_sub(1));
         let effects = destination
             .client
@@ -590,6 +606,39 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
             "the destination's existing rejection wins"
         );
         assert!(!target_roster.rejected_slots.contains_key(&expired_slot));
+        assert_eq!(
+            target_roster.rejected_slots[&removed_slot],
+            removed(None),
+            "a carried `removed` record keeps no key from the old group"
+        );
+        // The next pass finds the carried records in place and settles them,
+        // with no second import.
+        let epoch = moving.client.runtime.group_record(&target).unwrap().epoch;
+        moving
+            .client
+            .drive_device_group_moves(unix_now_seconds())
+            .await
+            .unwrap();
+        assert_eq!(
+            moving.client.runtime.group_record(&target).unwrap().epoch,
+            epoch
+        );
+        let carried = store
+            .app_storage()
+            .device_group_move(&target)
+            .unwrap()
+            .unwrap()
+            .rejected_slots
+            .unwrap();
+        for slot in [imported_slot, removed_slot] {
+            assert_eq!(
+                carried
+                    .iter()
+                    .find(|fact| fact.slot == slot)
+                    .and_then(|fact| fact.outcome),
+                Some(storage_sqlite::MoveCarryOutcome::Imported)
+            );
+        }
         assert!(target_roster.devices.contains_key(&collision_slot));
         assert!(!target_roster.rejected_slots.contains_key(&collision_slot));
         let view = moving.op(DeviceLinkOp::Read).await;

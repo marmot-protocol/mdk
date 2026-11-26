@@ -21,8 +21,9 @@
 //!   decision's time, so once that is 30 days past its record drops at the
 //!   next expiry pass. When a failed link's undo took the entry instead,
 //!   which writes no record, the deciding device commits the `removed`
-//!   record alone, with the tag signature key it remembers for the slot
-//!   (mdk#2761), so devices that never saw that key learn it.
+//!   record alone (mdk#2761), with no tag signature key: that Commit
+//!   removes no leaf and the roster has no entry, so nothing in it proves
+//!   one (marmot#520). Devices that applied the entry keep its key.
 //! - **The slot.** Once the settled roster no longer lists the slot as a
 //!   device, whether it records it as `removed` or that record has expired,
 //!   the device that decided the removal deletes the removed device's public
@@ -134,22 +135,13 @@ impl AppClient {
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Err(AppError::DeviceGroupRefused("no_device_group"));
         };
-        let Some(entry) = roster.devices.get(&slot) else {
+        if !roster.devices.contains_key(&slot) {
             return Err(AppError::DeviceGroupRefused("unknown_device"));
-        };
+        }
         if slot == self.own_slot()? {
             return Err(AppError::DeviceGroupRefused("this_device"));
         }
-        // A device sets its tag signature key with its first commit in the
-        // device group; until then the link may still fail and be undone.
-        // One that cleared the key since is removed by its committed leaf
-        // whose tag it signed with that leaf's own key for the slot
-        // (mdk#3679); a pending link's leaf is still its KeyPackage leaf.
-        if entry.tag_signature_key.is_none()
-            && self
-                .device_group_leaf_of(&group_id, &roster, &slot)?
-                .is_none()
-        {
+        if self.device_link_pending(&group_id, &roster, &slot)? {
             return Err(AppError::DeviceGroupRefused("device_link_pending"));
         }
         self.app
@@ -341,16 +333,19 @@ impl AppClient {
 
     /// A failed link's undo can take the entry of a device the user decided
     /// to remove, and it writes no `removed` record. Commit that record
-    /// alone, with the tag signature key this device remembers a roster
-    /// listing for the slot and the decision's time, so every device that
-    /// applies it learns the key and cleans up after the device, even one
-    /// that never applied the branch that listed it (mdk#2761).
+    /// alone, with the decision's time, so every device that applies it
+    /// cleans up after the device (mdk#2761), by the keys it remembers for
+    /// the slot. The record keeps no tag signature key (marmot#520): this
+    /// Commit removes no leaf and the roster has no entry, so nothing in it
+    /// proves one. It is made only while this device remembers a key a
+    /// roster listed for the slot.
     ///
     /// Only while the decision is under 30 days old, so a record the expiry
     /// pass drops is not made again; the undo comes about an hour after the
     /// link, which comes before the decision. Only until a roster state this
     /// device applied has held a `removed` record for the slot, as its
-    /// remembered keys say (`held_as_removed`): a record a sibling's expiry
+    /// remembered keys say (`held_as_removed`, which a record with no key
+    /// sets on the keys kept for the slot): a record a sibling's expiry
     /// pass or branch selection dropped is not made again, even when one pass
     /// applied it and its drop, or after a restart, while a send that went
     /// nowhere, or whose Commit failed or was rolled back, is made again.
@@ -380,16 +375,10 @@ impl AppClient {
         if remembered
             .iter()
             .any(|key| key.slot == *slot && key.held_as_removed)
+            || !remembered.iter().any(|key| key.slot == *slot)
         {
             return Ok(());
         }
-        let Some(tag_signature_key) = remembered
-            .into_iter()
-            .find(|key| key.slot == *slot)
-            .map(|key| key.tag_signature_key)
-        else {
-            return Ok(());
-        };
         let held = self.epoch_gap_held_groups()?;
         let context = Self::local_human_action_context(
             "record_removed_device",
@@ -400,7 +389,7 @@ impl AppClient {
         let record = RejectedSlotV1 {
             reason: RejectedSlotReasonV1::Removed,
             rejected_at: removal.requested_at,
-            tag_signature_key: Some(tag_signature_key),
+            tag_signature_key: None,
         };
         let effects = match self
             .runtime
@@ -460,11 +449,11 @@ impl AppClient {
                 Some(DeviceGroupLeaf::SelfSigned(leaf)) => (leaf.clone(), Some(leaf)),
                 None => (Vec::new(), entry.tag_signature_key.clone()),
             };
-        // Branch selection can drop the commit that set the device's tag
-        // signature key after the user decided. Until the key is back, or
-        // the device's leaf carries a tag it signed for the slot, the link
-        // may still fail, and a failed link's undo ends the decision.
-        if tag_signature_key.is_none() {
+        // Branch selection can drop the device's first commit after the
+        // user decided. Until its link is made again, or its leaf carries a
+        // tag it signed for the slot, the link may still fail, and a failed
+        // link's undo ends the decision.
+        if tag_signature_key.is_none() || self.device_link_pending(group_id, roster, slot)? {
             return Ok(());
         }
         let operations = vec![
@@ -501,6 +490,39 @@ impl AppClient {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Whether the link of the device in `slot` may still fail and be undone
+    /// (marmot#521, mdk#3679): it is not made, no leaf of it has committed
+    /// since its Add, and either its entry has no key, from an Add that set
+    /// none, or a leaf still built from its Add's KeyPackage signs with the
+    /// entry's key. A device that cleared or moved its key since is found by
+    /// its committed leaf.
+    fn device_link_pending(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+        slot: &DeviceSlotId,
+    ) -> Result<bool, AppError> {
+        if self
+            .runtime
+            .made_device_links(group_id, roster)?
+            .contains(slot)
+            || self.device_group_leaf_of(group_id, roster, slot)?.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(entry) = roster.devices.get(slot) else {
+            return Ok(false);
+        };
+        Ok(match entry.tag_signature_key.as_deref() {
+            None => true,
+            Some(key) => self
+                .runtime
+                .own_device_leaves(group_id, roster, slot, Some(key))?
+                .iter()
+                .any(|leaf| leaf.signature_key == key && leaf.add_not_after.is_some()),
+        })
     }
 
     /// The device-group leaf of the device in `slot` (mdk#3679): the one

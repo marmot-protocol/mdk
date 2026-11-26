@@ -560,6 +560,8 @@ async fn a_copys_welcome_time_starts_only_its_standing_goal() {
     );
 
     fixture.client.record_open_coverage_goals();
+    // The pass reads the clock itself, which may have ticked since `now`.
+    let recorded_by = unix_now_seconds();
     assert_eq!(
         app.recovery_coverage_goal(&group_route).unwrap(),
         Some(welcome_floor)
@@ -567,7 +569,8 @@ async fn a_copys_welcome_time_starts_only_its_standing_goal() {
     for route in routes(&fixture.client) {
         if route != group_route {
             assert!(
-                app.recovery_coverage_goal(&route).unwrap() <= Some(super::retention_floor(now))
+                app.recovery_coverage_goal(&route).unwrap()
+                    <= Some(super::retention_floor(recorded_by))
             );
         }
     }

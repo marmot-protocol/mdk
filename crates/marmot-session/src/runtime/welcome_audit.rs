@@ -8,7 +8,7 @@
 //! ([`welcome_audit_operation_id`]).
 
 use super::*;
-use crate::session::{OutboundWelcomeStatus, WelcomeSettlement};
+use crate::session::{OutboundWelcomeStatus, WelcomeExpiry, WelcomeSettlement};
 
 /// The most Welcome ids remembered as already prepared in this process. A
 /// prepared row is written once per Welcome; past this many the memory is
@@ -378,10 +378,11 @@ where
 
     /// Whether `fanout` is a Welcome's whose stored acceptances meet its
     /// policy while a later delivered mark can still close it: the Welcome is
-    /// owed, waiting on its group or commit, or past its deadline with its
-    /// commit not lost. The acceptance must not be dropped then; an expired
-    /// Welcome is never published again to replace it. A Welcome settled any
-    /// other way (withdrawn, its commit lost, delivered) owes nothing.
+    /// owed, waiting on its group or commit, or past its deadline but not yet
+    /// marked expired. The acceptance must not be dropped then; a Welcome
+    /// past its deadline is never published again to replace it. A Welcome
+    /// settled any way (marked expired, withdrawn, its commit lost,
+    /// delivered) owes nothing.
     pub(super) fn welcome_still_owes_met_policy(
         &self,
         fanout: &DurableTransportFanout,
@@ -398,7 +399,7 @@ where
                 Ok(
                     OutboundWelcomeStatus::Owed { .. }
                     | OutboundWelcomeStatus::Waiting
-                    | OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired),
+                    | OutboundWelcomeStatus::PastDeadline,
                 ) => true,
                 Ok(OutboundWelcomeStatus::Settled(_)) => false,
                 // Unreadable now: keep it for a later pass.
@@ -407,7 +408,7 @@ where
     }
 
     /// Whether a Welcome past its deadline may still close as delivered, so
-    /// the watcher records no expiry yet: a detached pass started before the
+    /// the watcher does not mark it expired yet: a detached pass started before the
     /// deadline holds it and may yet be acknowledged, or its stored
     /// acceptances meet its policy (marked here, if the mark can land now).
     /// A fanout that cannot be read now is asked again on a later pass.
@@ -429,6 +430,67 @@ where
         }
         self.settle_met_welcome(&fanout.exact_message, accepted, fanout.required_acks);
         true
+    }
+
+    /// Mark the Welcome `welcome_id`, past its delivery deadline at `now`,
+    /// expired, and record that once: its delivery notice, its
+    /// `welcome_withdrawn` (`expired`) row, then the mark's recorded flag
+    /// (mdk#3589). The caller has reconciled any acknowledgement it holds.
+    ///
+    /// The mark is written first and alone settles the Welcome. A stop before
+    /// the row leaves the mark unrecorded, and the next start records it; a
+    /// stop between the row and the flag records the row again on the next
+    /// start, under the same operation id.
+    ///
+    /// True once the expiry is recorded, now or before; false when a step
+    /// could not be done now, or the Welcome is not past its deadline any
+    /// more (a clock set back before the mark), so the watcher reads it again
+    /// on a later pass.
+    pub(super) fn expire_welcome(
+        &self,
+        welcome_id: &cgka_traits::MessageId,
+        now: Timestamp,
+    ) -> bool {
+        match self.session.expire_sent_welcome(welcome_id, now) {
+            Ok(Some(WelcomeExpiry::Unrecorded)) => self.record_welcome_expiry(welcome_id),
+            Ok(Some(WelcomeExpiry::Recorded)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                log_unrecorded_welcome_expiry(&error);
+                false
+            }
+        }
+    }
+
+    /// Record the expiry of `welcome_id`, marked and not yet recorded: the
+    /// steps of [`Self::expire_welcome`] after the mark. False when one could
+    /// not be done now; the watcher, or else the next start, retries.
+    pub(super) fn record_welcome_expiry(&self, welcome_id: &cgka_traits::MessageId) -> bool {
+        let recorded = || {
+            self.v5_expired_welcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        // The notice goes first, so a retry never records the row twice; one
+        // this process already recorded only has its flag written again.
+        if !recorded().contains(welcome_id) {
+            if !self.note_welcome_delivery_changed(welcome_id)
+                || !self.record_v5_welcome_settled(welcome_id, WelcomeSettlement::Expired)
+            {
+                return false;
+            }
+            recorded().insert(welcome_id.clone());
+        }
+        match self.session.record_sent_welcome_expiry(welcome_id) {
+            Ok(()) => {
+                recorded().remove(welcome_id);
+                true
+            }
+            Err(error) => {
+                log_unrecorded_welcome_expiry(&error);
+                false
+            }
+        }
     }
 
     /// Record `welcome_withdrawn` for a watched Welcome that settled without
@@ -766,4 +828,13 @@ fn v5_size_class(size_class: cgka_traits::EventSizeClass) -> audit_v5::EventSize
         cgka_traits::EventSizeClass::From2To4Mib => audit_v5::EventSizeClass::From2To4Mib,
         cgka_traits::EventSizeClass::Over4Mib => audit_v5::EventSizeClass::Over4Mib,
     }
+}
+
+fn log_unrecorded_welcome_expiry(error: &crate::session::SessionError) {
+    tracing::warn!(
+        target: TRACE_TARGET,
+        method = "expire_welcome",
+        transient = error.is_transient(),
+        "Welcome expiry not written; retried on a later pass"
+    );
 }

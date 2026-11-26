@@ -70,6 +70,21 @@ impl Marmot {
             .collect())
     }
 
+    /// The account's relay health from its held lists and the relay policy:
+    /// one row per relay its inbox and NIP-65 lists name, and warnings about
+    /// invitations sent through its published inbox list. Local read; never
+    /// dials. Re-read on `RelayHealthChanged`.
+    pub async fn account_relay_health(
+        &self,
+        account_ref: String,
+    ) -> Result<conversions::AccountRelayHealthFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .account_relay_health(&account_ref)
+            .await?
+            .into())
+    }
+
     /// Watch complete account-scoped snapshots; slow readers may skip intermediate states.
     pub async fn subscribe_relay_liveness(
         &self,

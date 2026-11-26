@@ -1159,6 +1159,18 @@ where
     R: AsyncBufRead + Unpin,
     T: DeserializeOwned,
 {
+    match read_frame_bytes(reader).await? {
+        Some(frame) => decode_frame(&frame).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Read one newline-delimited frame without decoding it, under the same size
+/// cap as [`read_frame`]. `None` means the peer closed the stream first.
+pub async fn read_frame_bytes<R>(reader: &mut R) -> Result<Option<Vec<u8>>, AgentControlError>
+where
+    R: AsyncBufRead + Unpin,
+{
     let mut frame = Vec::new();
     // Cap the read itself so a client that never sends a newline cannot make us
     // buffer unbounded memory before the size check runs. We allow one byte past
@@ -1175,7 +1187,7 @@ where
     if frame.len() > MAX_AGENT_CONTROL_FRAME_BYTES {
         return Err(AgentControlError::FrameTooLarge(frame.len()));
     }
-    decode_frame(&frame).map(Some)
+    Ok(Some(frame))
 }
 
 pub async fn read_envelope<R, T>(
@@ -1212,7 +1224,7 @@ mod tests {
         AgentControlRelayListDirection, AgentControlRelayListType, AgentControlRelayLists,
         AgentControlRequest, AgentControlResponse, AgentControlSendMaintenanceDisposition,
         AgentControlTimelineCursor, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, decode_frame,
-        encode_frame, read_envelope, read_frame, write_frame,
+        encode_frame, read_envelope, read_frame, read_frame_bytes, write_frame,
     };
 
     #[test]
@@ -1889,6 +1901,25 @@ mod tests {
         let received: AgentControlEnvelope<AgentControlRequest> =
             read_envelope(&mut reader).await.unwrap().unwrap();
         assert_eq!(received, request);
+    }
+
+    #[tokio::test]
+    async fn read_frame_bytes_returns_each_raw_line_under_the_cap() {
+        let oversized = vec![b'x'; MAX_AGENT_CONTROL_FRAME_BYTES + 1];
+        let mut input = b"{\"id\":\"a\",\"id\":\"b\"}\n".to_vec();
+        input.extend_from_slice(&oversized);
+        let mut reader = BufReader::new(input.as_slice());
+        // The frame comes back byte for byte, repeated keys and all.
+        assert_eq!(
+            read_frame_bytes(&mut reader).await.unwrap().as_deref(),
+            Some(&b"{\"id\":\"a\",\"id\":\"b\"}\n"[..])
+        );
+        assert!(matches!(
+            read_frame_bytes(&mut reader).await,
+            Err(AgentControlError::FrameTooLarge(_))
+        ));
+        let mut empty = BufReader::new(&b""[..]);
+        assert_eq!(read_frame_bytes(&mut empty).await.unwrap(), None);
     }
 
     #[tokio::test]

@@ -10,12 +10,14 @@ use crate::engine_state::PendingStateRef;
 use crate::transport::{Timestamp, TransportMessage};
 use crate::transport_adapter::{TransportEndpoint, TransportPublishTarget};
 use crate::types::{EpochId, GroupId, MessageId};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 pub const POST_JOIN_CONTENTION_JITTER_MAX_MS: u64 = 30_000;
 
-/// Injectable wall clock for persisted maintenance deadlines.
+/// Injectable wall clock for protocol timestamps and persisted deadlines.
 pub trait WallClock: Send + Sync {
     fn now(&self) -> Timestamp;
 
@@ -27,14 +29,51 @@ pub trait WallClock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
+/// Production wall clock: the system's time since the Unix epoch.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemWallClock;
+
+// The system clock itself (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
+impl WallClock for SystemWallClock {
+    fn now(&self) -> Timestamp {
+        Timestamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+    }
+
+    fn now_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}
+
 /// Injectable monotonic clock for process-local quiet windows and timeouts.
 pub trait MonotonicClock: Send + Sync {
     fn elapsed(&self) -> Duration;
 }
 
-/// Injectable entropy source. Every sampled delay is persisted before use.
-pub trait MaintenanceRandom: Send + Sync {
-    fn next_u64(&self) -> u64;
+/// Injectable source of random bytes.
+///
+/// Implementations must fill the entire destination. Production sources must
+/// return fresh cryptographically secure bytes. Use deterministic streams only
+/// in isolated tests. Never reset one on a live database or use one to seal
+/// real traffic.
+pub trait EntropySource: Send + Sync {
+    fn fill_bytes(&self, dest: &mut [u8]);
+
+    fn next_u64(&self) -> u64 {
+        let mut bytes = [0_u8; 8];
+        self.fill_bytes(&mut bytes);
+        u64::from_le_bytes(bytes)
+    }
 
     fn sample_inclusive(&self, minimum: u64, maximum: u64) -> u64 {
         if minimum >= maximum {
@@ -42,6 +81,16 @@ pub trait MaintenanceRandom: Send + Sync {
         }
         let span = maximum.saturating_sub(minimum).saturating_add(1);
         minimum.saturating_add(self.next_u64() % span)
+    }
+}
+
+/// Production entropy from the operating system.
+#[derive(Debug, Default)]
+pub struct OsEntropy;
+
+impl EntropySource for OsEntropy {
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        rand::rngs::OsRng.fill_bytes(dest);
     }
 }
 

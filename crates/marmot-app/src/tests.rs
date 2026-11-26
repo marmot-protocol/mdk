@@ -8167,7 +8167,7 @@ async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
             &session_path,
             session_key,
             account_id.as_slice().to_vec(),
-            Box::new(NostrMlsPeeler::new().with_welcome_signer_arc(nostr_signer)),
+            Box::new(NostrMlsPeeler::default().with_welcome_signer_arc(nostr_signer)),
         )
         .legacy_compatibility_profile()
         .account_identity_proof_signer(signer.as_proof_signer())
@@ -8230,7 +8230,7 @@ async fn fresh_key_package_with_components(
         session_path.to_path_buf(),
         session_key,
         account_id.as_slice().to_vec(),
-        Box::new(NostrMlsPeeler::new().with_welcome_signer_arc(signer.as_nostr_signer())),
+        Box::new(NostrMlsPeeler::default().with_welcome_signer_arc(signer.as_nostr_signer())),
     )
     .account_identity_proof_signer(signer.as_proof_signer())
     .feature_registry(app_feature_registry())
@@ -8515,6 +8515,7 @@ pub(crate) async fn member_resolution_fixture_with_relays(
                 KIND_NIP65_RELAY_LIST,
                 vec![vec!["r".into(), relay.into()]],
                 String::new(),
+                &cgka_traits::SystemWallClock,
             ));
         fetcher
             .events
@@ -8525,6 +8526,7 @@ pub(crate) async fn member_resolution_fixture_with_relays(
                 KIND_MARMOT_INBOX_RELAY_LIST,
                 vec![vec!["relay".into(), relay.into()]],
                 String::new(),
+                &cgka_traits::SystemWallClock,
             ));
     }
     app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
@@ -8557,6 +8559,7 @@ async fn member_inbox_is_resolved_on_discovered_outbox() {
             "write".into(),
         ]],
         String::new(),
+        &cgka_traits::SystemWallClock,
     ));
     let outbox_events = events
         .iter()
@@ -8625,12 +8628,14 @@ async fn account_outbox_route_cap_keeps_usable_first_hop_metadata() {
             KIND_NIP65_RELAY_LIST,
             nip65_tags,
             String::new(),
+            &cgka_traits::SystemWallClock,
         ),
         NostrTransportEvent::new_unsigned(
             account_id.clone(),
             KIND_MARMOT_INBOX_RELAY_LIST,
             vec![vec!["relay".into(), inbox.into()]],
             String::new(),
+            &cgka_traits::SystemWallClock,
         ),
     ];
 
@@ -8804,6 +8809,7 @@ async fn account_outbox_route_cap_without_inbox_remains_unknown() {
             })
             .collect(),
         String::new(),
+        &cgka_traits::SystemWallClock,
     )];
     let error = app
         .directory()
@@ -8886,12 +8892,14 @@ async fn account_read_only_nip65_returns_typed_missing_write_routes() {
                 "read".into(),
             ]],
             String::new(),
+            &cgka_traits::SystemWallClock,
         ),
         NostrTransportEvent::new_unsigned(
             id.clone(),
             KIND_MARMOT_INBOX_RELAY_LIST,
             vec![vec!["relay".into(), "wss://inbox.example".into()]],
             String::new(),
+            &cgka_traits::SystemWallClock,
         ),
     ];
     let error = app
@@ -9207,6 +9215,7 @@ async fn unsafe_cached_inbox_is_refreshed_before_member_resolution_succeeds() {
         KIND_MARMOT_INBOX_RELAY_LIST,
         vec![vec!["relay".into(), unsafe_inbox.into()]],
         String::new(),
+        &cgka_traits::SystemWallClock,
     );
     let unsafe_created_at = unsafe_event.created_at;
     fetcher.events.lock().unwrap().push(unsafe_event);
@@ -9231,6 +9240,7 @@ async fn unsafe_cached_inbox_is_refreshed_before_member_resolution_succeeds() {
         KIND_MARMOT_INBOX_RELAY_LIST,
         vec![vec!["relay".into(), "wss://safe-inbox.example".into()]],
         String::new(),
+        &cgka_traits::SystemWallClock,
     );
     safe_event.created_at = unsafe_created_at.saturating_add(1);
     fetcher.events.lock().unwrap().push(safe_event);
@@ -9292,6 +9302,7 @@ async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_cre
             KIND_MARMOT_INBOX_RELAY_LIST,
             vec![vec!["relay".into(), "wss://shared.example".into()]],
             String::new(),
+            &cgka_traits::SystemWallClock,
         ));
     fetcher.requests.lock().unwrap().clear();
 
@@ -9396,6 +9407,7 @@ async fn partial_invite_route_retry() {
             KIND_MARMOT_INBOX_RELAY_LIST,
             vec![vec!["relay".into(), "wss://shared.example".into()]],
             String::new(),
+            &cgka_traits::SystemWallClock,
         ));
     fetcher.requests.lock().unwrap().clear();
     let retry = client
@@ -10457,6 +10469,7 @@ fn nip65_relay_list_targets_only_include_write_capable_entries() {
             vec!["r".into(), "wss://both.example".into()],
         ],
         String::new(),
+        &cgka_traits::SystemWallClock,
     );
     assert_eq!(
         relays_from_relay_list_event(&event),
@@ -10490,6 +10503,7 @@ fn newer_all_read_nip65_list_clears_stale_write_targets() {
         KIND_NIP65_RELAY_LIST,
         vec![vec!["r".into(), "wss://stale-write.example".into()]],
         String::new(),
+        &cgka_traits::SystemWallClock,
     );
     older.created_at = 1;
     older.id = "00".repeat(32);
@@ -10502,6 +10516,7 @@ fn newer_all_read_nip65_list_clears_stale_write_targets() {
             "read".into(),
         ]],
         String::new(),
+        &cgka_traits::SystemWallClock,
     );
     newer.created_at = 2;
     newer.id = "11".repeat(32);
@@ -10557,6 +10572,7 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
             KIND_NIP65_RELAY_LIST,
             tags,
             String::new(),
+            &cgka_traits::SystemWallClock,
         );
         event.created_at = created_at;
         let event = sign_directory_fixture(&keys, event);
@@ -10616,6 +10632,7 @@ fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
                 kind,
                 vec![vec![tag_name.into(), relay.into()]],
                 String::new(),
+                &cgka_traits::SystemWallClock,
             );
             event.created_at = created_at;
             let event = sign_directory_fixture(&keys, event);
@@ -10663,6 +10680,7 @@ fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
         KIND_MARMOT_INBOX_RELAY_LIST,
         vec![vec!["relay".into(), "wss://inbox.example".into()]],
         String::new(),
+        &cgka_traits::SystemWallClock,
     );
     event.created_at = 0;
     let event = sign_directory_fixture(&keys, event);
@@ -11219,6 +11237,7 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
                 KIND_NOSTR_METADATA,
                 Vec::new(),
                 serde_json::json!({ "name": "bob", "about": "one\ntwo" }).to_string(),
+                &cgka_traits::SystemWallClock,
             );
             event.created_at = created_at;
             let event = sign_directory_fixture(keys, event);
@@ -11384,6 +11403,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
         KIND_NIP65_RELAY_LIST,
         vec![vec!["r".into(), "wss://stale.example".into()]],
         String::new(),
+        &cgka_traits::SystemWallClock,
     );
     stale_event.created_at = 15;
     let stale_event = sign_directory_fixture(&keys, stale_event);
@@ -12654,6 +12674,7 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
             "source_relays": ["wss://spoof.example"]
         })
         .to_string(),
+        &cgka_traits::SystemWallClock,
     );
     event.created_at = 1_700_000_867;
     let event = sign_directory_fixture(&keys, event);
@@ -12761,6 +12782,7 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
             "source_relays": ["wss://spoof.example"]
         })
         .to_string(),
+        &cgka_traits::SystemWallClock,
     );
     event.created_at = 1_700_000_868;
     let event = sign_directory_fixture(&keys, event);

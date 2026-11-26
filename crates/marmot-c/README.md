@@ -16,6 +16,7 @@ per feature.
 - [Lifecycle and teardown](#lifecycle-and-teardown)
 - [Onboarding relay repair](#onboarding-relay-repair)
 - [Relay liveness](#relay-liveness)
+- [Account relay health](#account-relay-health)
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction),
   [device groups](#device-groups),
@@ -60,6 +61,20 @@ terminal NULL on failure. Blocking `next` returns the same error status directly
 freeing the handle; release it with `marmot_relay_liveness_subscription_free` before
 freeing its client. Callback cancellation and context lifetime follow the generic
 subscription rules below.
+
+## Account relay health
+
+`marmot_account_relay_health` follows the [shared relay health
+contract](../marmot-uniffi/README.md#account-relay-health), including the condition for each warning. It blocks the
+calling thread for a local read and never dials. It returns an owned `MarmotAccountRelayHealth`; release the whole
+result with `marmot_account_relay_health_free`. `falls_back_to_defaults` on its own says nothing about invitations; the
+warnings do. Read a row's `fault` only when `has_fault` is true and `highest_severity` only when `has_highest_severity`
+is true. `roles` and `actions` are arrays of their enums with explicit lengths. `MARMOT_EVENT_RELAY_HEALTH_CHANGED` says
+to read it again, carries no relays, and comes only from a running account worker, so also read it when the account
+starts and when the relay screen opens. For `NoAllowedInboxRelay`, remove the refused entries and add an allowed relay
+in one `marmot_set_account_inbox_relays` call, since an empty inbox list is rejected. Later versions append values to
+`MarmotRelayWarningKind`, `MarmotRelayHealthFault`, `MarmotRelayRepairAction`, `MarmotRelayRole` and
+`MarmotRelayHealthState`: keep a default case.
 
 
 ## Direct-follow availability

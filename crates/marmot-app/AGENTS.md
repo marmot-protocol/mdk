@@ -146,9 +146,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   announcement does. Naming hydrates it, so never name it at a deferred open's end: the post-hydration reconcile
   does, as do settling a join, creating a group, maintenance and every KeyPackage publication. Name it before reading
   whether the current KeyPackage still serves (`key_package_republish_falls_back`), since an untagged one is stale once
-  this device tags. The founder's founding entry carries its own tag signature key; every other device sets its own
-  in maintenance or, before a host KeyPackage publication, through `set_device_tag_key`, once per call, since the
-  runtime stages no KeyPackage while the key is due.
+  this device tags. The founder's founding entry carries its own tag signature key; the Add that links every other
+  device sets its key (marmot#521), and that device makes its first commit there in maintenance or, before a host
+  KeyPackage publication, through `set_device_tag_key`, once per call, since the runtime stages no KeyPackage while
+  that commit is due. Read a link as made from `runtime.made_device_links` (the leaf signing with the slot's key has
+  committed since its Add, or founded the group), never from a key in its entry alone.
 - The overdue-refresh warning (`key_package_refresh_overdue`) asks the runtime's announcement gate, never a copy of
   the roster. The client recomputes it after each maintenance pass; a change sets
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
@@ -320,11 +322,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   through `renew_roster_tag_keys`, every kept key of a slot with a `held_as_removed` key whose leaf a scanned chat
   still holds, in one step that moves only their sighting time and keeps their order, so a leftover outlives the
   30-day retention and no prune drops the key that reads it. The deciding device commits a lone `removed` record after a
-  failed link's undo, only through the runtime's `record_removed_slot`, which the engine never queues or re-issues, and
-  only while the decision is under 30 days old, the group is settled and quiet, and no roster state this device
-  applied has held a `removed` record for the slot, as the engine's remembered keys record (`held_as_removed`): a send
-  that went nowhere or failed is made again, a record a sibling's expiry pass or branch selection dropped is not, even
-  within one pass or after a restart.
+  failed link's undo, with no tag signature key (marmot#520), only through the runtime's `record_removed_slot`, which
+  the engine never queues or re-issues, and only while the decision is under 30 days old, the group is settled and
+  quiet, this device remembers a key for the slot, and no roster state this device applied has held a `removed` record
+  for the slot, as the engine's remembered keys record (`held_as_removed`, set on a slot's kept keys when its record
+  keeps none): a send that went nowhere or failed is made again, a record a sibling's expiry pass or branch selection
+  dropped is not, even within one pass or after a restart. A `removed` record carried into a move's destination keeps
+  no tag signature key either: the destination cannot check a key from another group.
 - The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a and 3.7b, D53) is storage's
   (`account_compromise_warning_items`): every `not_me` slot in the trusted roster, plus this device's own rejected
   sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and restoring an item,
@@ -542,8 +546,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `SendIntent::LinkDevice` commit, sent through `runtime.send_with_audit_context` so the runtime releases its Welcome
   only once the commit is confirmed (never split the Welcome off for app delivery). On both paths the prompt stays
   `Linking` after the commit: `decide_device_links` is the one gate for every link in `device_links`, prompt or not
-  (D40). A link is `Linked` once the new device's first commit, which sets its roster entry's `tag_signature_key` to
-  the leaf key the link added (`leaf_signature_key_hex`), is on the selected branch: the device group is `Stable` with
+  (D40). The link's Add sets the new device's `tag_signature_key` to the leaf key it adds (`leaf_signature_key_hex`,
+  marmot#521). A link is `Linked` once the new device's first commit from that leaf is on the selected branch
+  (`made_device_links` lists its slot): the device group is `Stable` with
   no pending convergence input. It fails when its group was never made, when the quiet roster has not listed it as
   this device's link for a whole settlement window (`MarmotApp::settlement_quiescence_ms`, in milliseconds, whose
   override only test-policy builds read), or when that commit is still absent `LINK_DEADLINE_SECS` after the entry's
@@ -899,9 +904,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   runner fixture that owes history on a quiet group either owes it through a loss (`uncover_recovery_coverage`) after
   its live REQs went out or opts out with `MarmotApp::with_unvouched_relay_replies_for_test`; tests of the wire
   proof itself never opt out. Read the
-  un-cover mark before each look at the adapter and write through `record_recovery_coverage_since`; a generation that
-  loss imported since the last look may have reached never proves again (`LiveCoverage`), and the log is read again
-  after the look so loss imported during it gives no tail; the adapter is looked at again after the write, and a
+  un-cover mark before each look at the adapter and write through `record_recovery_coverage_since`; a route that
+  loss imported since the last look may have reached never proves again on a generation that carries it, and loss
+  that names no routes reaches every route (`LiveCoverage`); the log is read again after the look so loss imported
+  during it gives no tail; the adapter is looked at again after the write, and a
   generation it no longer reports streaming with the same count gives none either. Past the request an open,
   healthy REQ vouches only provisionally: `LiveTails`, held in memory and never written to the ledger, because nothing
   proves when an open REQ stopped delivering. A tail starts at the count's `live_from`, which for a REQ the relay pool
@@ -1433,7 +1439,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   encoding and address, and retention; tests in `backup_archive/tests.rs`), `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
-  `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `profile_pseudonyms.rs` (cosmetic display names; not a
+  `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `relay_health.rs`
+  (the account's relay rows and inbox warnings from its held lists and the dial policy, never dialing; the worker's
+  relay-configuration seam announces `RelayHealthChanged` when that answer differs, so liveness never moves it), `profile_pseudonyms.rs` (cosmetic display names; not a
   security primitive), `root_runtime_lease.rs` (cross-process exclusive root lease), `usage_diagnostics.rs`
   (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
   product collector only through `marmot_observability::wiring`, consent lock before state lock), `projection.rs` (legacy account

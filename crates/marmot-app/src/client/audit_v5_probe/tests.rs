@@ -123,10 +123,10 @@ async fn blocked_inbox_demux() {
             &|_, _| false,
         )
         .unwrap();
-    let from = NostrMlsPeeler::new().with_welcome_signer(sender.clone());
+    let from = NostrMlsPeeler::default().with_welcome_signer(sender.clone());
     let target = MemberId::new(recipient.public_key().to_bytes().to_vec());
     let peeler = ProbePeeler {
-        inner: NostrMlsPeeler::new().with_welcome_signer(OnceSigner {
+        inner: NostrMlsPeeler::default().with_welcome_signer(OnceSigner {
             keys: recipient,
             consumed: Arc::new(Mutex::new(HashSet::new())),
             denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -312,7 +312,7 @@ async fn blocked_inbox_single_unseal() {
                 device_key_hash: [9; 32],
             },
         };
-        let wrapped = NostrMlsPeeler::new()
+        let wrapped = NostrMlsPeeler::default()
             .with_welcome_signer_arc(sender)
             .wrap_group_recovery(
                 &control,
@@ -1369,7 +1369,8 @@ async fn recovery_inbox_audit_metrics() {
                 .map(|probe| probe.rows.len());
             let bob = scenario.bob.app.account_home().account("bob").unwrap();
             let signer = scenario.bob.app.account_signer_for_summary(&bob).unwrap();
-            let peeler = NostrMlsPeeler::new().with_welcome_signer_arc(signer.as_nostr_signer());
+            let peeler =
+                NostrMlsPeeler::default().with_welcome_signer_arc(signer.as_nostr_signer());
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -1550,7 +1551,7 @@ async fn pairing_inbox_audit_metrics() {
             // without an armed audit capture or an enabled pairing inbox.
             let slot = Arc::new(Mutex::new(PeelSlot::default()));
             let peeler = ProbePeeler {
-                inner: NostrMlsPeeler::new().with_welcome_signer_arc(signer.as_nostr_signer()),
+                inner: NostrMlsPeeler::default().with_welcome_signer_arc(signer.as_nostr_signer()),
                 slot: slot.clone(),
                 storage: scenario
                     .alice
@@ -2321,7 +2322,7 @@ async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
     let sender = nostr::prelude::Keys::generate();
     let recipient = nostr::prelude::Keys::generate();
     let wrong_key = nostr::prelude::Keys::generate();
-    let message = NostrMlsPeeler::new()
+    let message = NostrMlsPeeler::default()
         .with_welcome_signer(sender)
         .wrap_welcome_with_metadata(
             &EncryptedPayload {
@@ -2346,7 +2347,7 @@ async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
         ),
     );
     let peeler = ProbePeeler {
-        inner: NostrMlsPeeler::new().with_welcome_signer(wrong_key),
+        inner: NostrMlsPeeler::default().with_welcome_signer(wrong_key),
         slot: slot.clone(),
         storage: storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()

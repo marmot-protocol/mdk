@@ -1647,9 +1647,9 @@ async fn a_removal_while_the_device_group_is_busy_waits_for_it() {
     );
 }
 
-/// A removal recorded while the device's entry had its tag signature key,
-/// which branch selection then dropped, waits: committing it would leave the
-/// device's untagged leaf and record no key. Once the device sets its key
+/// A removal recorded while the device's link was made, which branch
+/// selection then dropped, waits: committing it would take a leaf still built
+/// from its Add's KeyPackage. Once the device's first commit makes the link
 /// again, the next maintenance pass removes it with the key recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removal_waits_for_the_devices_tag_signature_key() {
@@ -1666,10 +1666,7 @@ async fn a_removal_waits_for_the_devices_tag_signature_key() {
     ) = linked_devices().await;
     let laptop_slot = own_slot(&laptop);
     let laptop_slot_bytes = slot_of(&laptop);
-    assert_eq!(
-        roster(&phone, &group).devices[&laptop_slot_bytes].tag_signature_key,
-        None
-    );
+    assert!(!link_made(&phone, &group, &laptop_slot_bytes));
     // The decision the user took a minute ago, before the key was dropped.
     let decided_at = crate::unix_now_seconds() - 60;
     phone_app
@@ -1690,8 +1687,8 @@ async fn a_removal_waits_for_the_devices_tag_signature_key() {
     assert_eq!(pending_removals(&phone_app), 1);
 
     // The laptop sees the phone's pass, which announces the phone's new
-    // KeyPackage, then sets its key; once the phone settles that commit, its
-    // next maintenance pass removes the laptop. The device group is hidden,
+    // KeyPackage, then makes its first commit; once the phone settles that
+    // commit, its next maintenance pass removes the laptop. The device group is hidden,
     // so convergence runs through the runtime.
     deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
     laptop.sync().await.unwrap();
@@ -1710,6 +1707,7 @@ async fn a_removal_waits_for_the_devices_tag_signature_key() {
         roster(&phone, &group).devices[&laptop_slot_bytes].tag_signature_key,
         Some(tag_key.clone())
     );
+    assert!(link_made(&phone, &group, &laptop_slot_bytes));
     assert!(phone.group_quiet(&group).unwrap());
     phone.run_due_maintenance().await.unwrap();
     let after = roster(&phone, &group);
@@ -2116,44 +2114,27 @@ async fn a_lone_removed_record_a_fork_drops_is_not_made_again() {
 
 /// A failed link's undo can take the entry of a device the user decided to
 /// remove, and it writes no `removed` record. The deciding device commits
-/// that record alone, with the tag signature key it remembers for the slot
-/// and the decision's time, so devices that never applied a roster listing
-/// the key learn it (mdk#2761). Once the phone has seen the record it does
-/// not make it again this run: a sibling whose clock drops it early gets no
-/// second one. A decision 30 days old makes no record, since the next expiry
-/// pass would drop it.
+/// that record alone, with the decision's time and no tag signature key,
+/// since nothing in that Commit proves one (mdk#2761, marmot#520), and still
+/// removes the device's chat leaf. Once the phone has seen the record it
+/// does not make it again this run: a sibling whose clock drops it early gets
+/// no second one. A decision 30 days old makes no record, since the next
+/// expiry pass would drop it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removal_a_failed_link_undid_is_recorded_alone() {
     for (days_ago, recorded) in [(0, true), (31, false)] {
-        let (
-            Devices {
-                _dirs,
-                relay,
-                phone_app,
-                mut phone,
-                laptop,
-                ..
-            },
-            group,
-        ) = tagging_devices().await;
+        let (mut devices, group) = tagging_devices().await;
+        let chat = chat_with_both(&mut devices).await;
+        let Devices {
+            _dirs,
+            relay,
+            phone_app,
+            mut phone,
+            laptop,
+            ..
+        } = devices;
         let laptop_slot = slot_of(&laptop);
-        // Later roster states list another key for the laptop's slot, then
-        // its own again: the record carries the key listed last, not the
-        // one listed first.
         let entry = roster(&phone, &group).devices[&laptop_slot].clone();
-        let tag_signature_key = entry.tag_signature_key.clone();
-        for key in [Some(vec![0x01; 32]), tag_signature_key.clone()] {
-            let entry = DeviceEntryV1 {
-                tag_signature_key: key,
-                ..entry.clone()
-            };
-            commit_roster(
-                &mut phone,
-                &group,
-                vec![DeviceRosterOperationV1::SetDevice(laptop_slot, entry)],
-            )
-            .await;
-        }
         let decided_at = crate::unix_now_seconds() - days_ago * 24 * 60 * 60 - 60;
         phone_app
             .account_storage("alice")
@@ -2184,8 +2165,12 @@ async fn a_removal_a_failed_link_undid_is_recorded_alone() {
             Some(RejectedSlotV1 {
                 reason: RejectedSlotReasonV1::Removed,
                 rejected_at: decided_at,
-                tag_signature_key,
+                tag_signature_key: None,
             })
+        );
+        assert!(
+            chat_claims(&phone, &chat, &group).is_empty(),
+            "the laptop's chat leaf is gone"
         );
         commit_roster(
             &mut phone,
@@ -2206,8 +2191,9 @@ async fn a_removal_a_failed_link_undid_is_recorded_alone() {
             "the record is made once"
         );
         // Four later states list newer keys for the slot, then it is unlisted
-        // again. The key the record carried is no longer among the slot's
-        // four newest, and still the record is not made again.
+        // again. The key the keyless record held as removed is no longer
+        // among the slot's four newest, and still the record is not made
+        // again.
         for key in 2..=5 {
             let entry = DeviceEntryV1 {
                 tag_signature_key: Some(vec![key; 32]),
@@ -2352,10 +2338,11 @@ async fn a_device_that_cleared_its_tag_signature_key_is_removed() {
     a_device_that_rewrote_its_entry_is_removed(EntryRewrite::NoKey).await;
 }
 
-/// A listed device's entry can name the key of a link still pending: that
-/// link's device has not committed yet, so its entry has no key and its
-/// leaf is still the one its Add built from its KeyPackage. Removing the
-/// device whose entry names that key takes none of the pending link's.
+/// A listed device's entry can name the key of a link still pending, once an
+/// earlier device moved that key off the link's own entry: that link's device
+/// has not committed yet, so its leaf is still the one its Add built from its
+/// KeyPackage. Removing the device whose entry names that key is refused as a
+/// pending link, and takes none of the pending link's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removal_never_takes_a_pending_links_leaf() {
     let (
@@ -2370,25 +2357,38 @@ async fn a_removal_never_takes_a_pending_links_leaf() {
     let laptop_slot = slot_of(&laptop);
     let pending = laptop.runtime.own_signature_key();
     let other_slot = [0x07; 32];
+    let laptop_entry = roster(&phone, &group).devices[&laptop_slot].clone();
     let entry = DeviceEntryV1 {
         announced_key_package: None,
         tag_signature_key: Some(pending),
-        ..roster(&phone, &group).devices[&laptop_slot].clone()
+        ..laptop_entry.clone()
+    };
+    let keyless = DeviceEntryV1 {
+        tag_signature_key: None,
+        ..laptop_entry
     };
     commit_roster(
         &mut phone,
         &group,
-        vec![DeviceRosterOperationV1::SetDevice(other_slot, entry)],
+        vec![
+            DeviceRosterOperationV1::SetDevice(laptop_slot, keyless),
+            DeviceRosterOperationV1::SetDevice(other_slot, entry),
+        ],
     )
     .await;
 
-    phone
-        .remove_linked_device(&hex::encode(other_slot))
-        .await
-        .unwrap();
+    assert_eq!(
+        refusal(
+            phone
+                .remove_linked_device(&hex::encode(other_slot))
+                .await
+                .unwrap_err()
+        ),
+        "device_link_pending"
+    );
 
     let after = roster(&phone, &group);
-    assert!(!after.devices.contains_key(&other_slot));
+    assert!(after.devices.contains_key(&other_slot));
     assert_eq!(after.devices[&laptop_slot].tag_signature_key, None);
     assert_eq!(
         phone.runtime.group_record(&group).unwrap().members.len(),

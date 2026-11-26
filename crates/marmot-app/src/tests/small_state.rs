@@ -672,14 +672,24 @@ async fn siblings_exchange_small_state_through_the_device_group() {
         devices.phone.runtime.epoch_state(&group),
         Some(cgka_traits::EpochState::PendingPublish(_))
     ));
+    let records = phone_storage().device_group_messages().unwrap();
     assert!(devices.phone.drive_changed_invitation_decisions().await);
     // A maintenance pass in between clears the turn's flag and is refused
-    // the same way; it must leave the send owed to the next turn too.
+    // the same way; it must leave the send owed to the next turn too, also
+    // when it ends early on a failed read.
     devices.phone.run_due_maintenance().await.unwrap();
+    devices.phone.test_fail_epoch_gap_read = true;
+    assert!(devices.phone.run_due_maintenance().await.is_err());
+    devices.phone.test_fail_epoch_gap_read = false;
     assert_eq!(
         phone_storage().unsent_invitation_decisions().unwrap(),
         std::slice::from_ref(&decision),
         "refused while the epoch settles"
+    );
+    assert_eq!(
+        phone_storage().device_group_messages().unwrap(),
+        records,
+        "a refused send records no message"
     );
     devices.relay.allow_publishes();
     assert!(devices.phone.note_connectivity_restored().unwrap() > 0);

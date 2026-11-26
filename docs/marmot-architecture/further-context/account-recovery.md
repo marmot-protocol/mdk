@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-11-23
+updated: 2026-11-25
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -555,7 +555,7 @@ in `marmot-app` fills it from facts the owner already has:
 | --- | --- |
 | Every account open, with or without a transport cursor | Every current route's goal widens to its standing floor, directly in the ledger. No extra incremental-history obligation is created for the old owner when a cursor exists |
 | A route becomes current, including a group join or route addition | At the runner's routing-change settlement, before its next debt read, current routes' goals widen to their standing floors. Existing wider goals and durable coverage stay intact |
-| A live REQ's endpoint admitted and placed its whole original window, and counted the stored events its relay sent before EOSE | Live boundary on every route the filter carries, from the second after the oldest event counted (never before the REQ's `since`) through the second before the REQ went out (below); a count with no event proves nothing, unless the wire showed its relay sent no EVENT frame before EOSE, and then it proves from the REQ's `since`. Written once per generation, while it is healthy (input placed, no loss or spill hand-off pending). A generation that loss may have reached proves nothing. Released seconds stay out (below). The time since the request is a provisional tail, never written (below) |
+| A live REQ's endpoint admitted and placed its whole original window, and counted the stored events its relay sent before EOSE | Live boundary on every route the filter carries, from the second after the oldest event counted (never before the REQ's `since`) through the second before the REQ went out (below); a count with no event proves nothing, unless the wire showed its relay sent no EVENT frame before EOSE, and then it proves from the REQ's `since`. Written once per generation, while it is healthy (input placed, no loss or spill hand-off pending). A route that loss may have reached proves nothing on that generation (below). Released seconds stay out (below). The time since the request is a provisional tail, never written (below) |
 | A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route, less every range un-covered after the grant was selected |
 | A loss import charged a generation, including a notification lag that charges no count | In the import's own transaction, a generation whose every charge named its routes un-covers only those routes, each from its own bound, and widens their goals: for queue loss, every dropped delivery the relay plane placed on a route, from the earliest `created_at` dropped there; for a notification lag on the account's own SDK context, every REQ it issued with a floor and known routes, from the lowest `since` among the REQs that select the route. Any other generation un-covers every route the ledger holds from its floor up (all of it when a floor is unknown) and widens their goals to it; the recorder then widens the other current routes' goals. A generation that touches more than 256 routes counts as one that named none. A worker that observes a generation past its durable count passes the relay plane's routes for it, merged as a marker write's are; if the plane holds none, the generation names none. After a restart the relay plane counts new drops under a fresh token, so new loss always raises a count |
 | A receipt was released for replay | In the release's transaction, its event's second is un-covered on each route its inventory row placed it on, and that route's goal widens to it. A second below the retained window is owed nowhere, so that release changes nothing in the ledger: its coverage stays until pruning drops it. The REQ that delivered the event will not deliver it again, so only a comparison on a relay covers that second there again; live boundaries never cover it, until retention pruning passes it. A release with no inventory row changes nothing here; the epoch gap it arms keeps that debt |
@@ -745,9 +745,11 @@ stalest route.
 The recorder knows a generation loss may have reached by the un-cover log (below): it reads
 the log's generation before each look at the adapter's REQs, so a REQ generation one look did
 not see began after that look's mark, and any loss imported after it, other than a released
-second, breaks every generation it could have reached (all of them while loss is account-wide).
-It reads the log again after the look, so loss imported while it looked also ends the tails of
-the generations it saw. It also looks at the adapter again after the write, and a generation the
+second, breaks the routes it names on every generation that carries them, and every route of every
+generation when it names none. Loss that names its routes lost nothing a batched REQ carried for
+another route, so that route keeps its boundary and tail.
+It reads the log again after the look, so loss imported while it looked also breaks, by the same
+rule, the routes it reached on the generations it saw. It also looks at the adapter again after the write, and a generation the
 adapter ended meanwhile (a `CLOSED` or reconnect it processed) gets no tail. The first mark is read when the client opens; the relay plane's shared adapter can still report
 REQs an earlier session of the account opened, and those never prove for the new session.
 

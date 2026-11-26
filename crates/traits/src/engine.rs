@@ -311,9 +311,9 @@ pub enum SendIntent {
     /// (mdk#2761): the record a device whose user decided a removal makes
     /// once a failed link's undo took that slot's entry. `roster_update` is a
     /// `marmot.account.device-roster.v1` update of exactly one
-    /// `SetRejectedSlot`, with reason `removed` and a `tag_signature_key`,
-    /// for a slot the roster lists neither as a device nor as a rejected
-    /// slot. Like a link, it is never queued, and a lost fork never re-issues
+    /// `SetRejectedSlot`, with reason `removed` and no `tag_signature_key`
+    /// (marmot#520), for a slot the roster lists neither as a device nor as
+    /// a rejected slot. Like a link, it is never queued, and a lost fork never re-issues
     /// it: once a roster state the device applied held the record, the device
     /// does not make it again, so only its caller decides whether to send it
     /// again.

@@ -60,7 +60,12 @@ where
         let now = self.wall_clock.now();
         self.key_package_due(now, &mut due)?;
         self.transport_fanouts_due(&mut due)?;
-        if !self.watched_welcomes.is_empty() || !self.pending_leaf_reconciliations.is_empty() {
+        // An unfinished search for unrecorded Welcome expiries is owed too,
+        // retried on each pass until it reads (`welcome_delivery`).
+        if !self.watched_welcomes.is_empty()
+            || !self.pending_leaf_reconciliations.is_empty()
+            || self.welcome_expiries_unfinished()
+        {
             due.owed();
         }
         let (recovery_at, coordinating) = self.group_recovery_due()?;

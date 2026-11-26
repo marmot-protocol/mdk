@@ -10,8 +10,8 @@
 use super::activation::{buffer_unsettled, queued_intents};
 use super::device_roster::{
     NO_WELCOME_DEADLINE, create_under, entry, expect_link_welcome, found_device_group,
-    key_package_ref, phone_and_laptop, roster, roster_device, roster_device_with_peeler, roster_of,
-    roster_update, slot,
+    key_package_ref, leaf_signature_key, phone_and_laptop, roster, roster_device,
+    roster_device_with_peeler, roster_of, roster_update, slot,
 };
 use super::send_intents::{pending_proposals, queue, store_pending_add};
 use super::*;
@@ -23,13 +23,14 @@ use cgka_traits::app_components::{
 use openmls::prelude::ProposalOrRefType;
 
 /// The sender rule's refusal of an Add without its roster entry.
-const UNANNOUNCED: &str = "a device group's Commit that adds a device sets its roster entry, for a new slot, announcing the added KeyPackage";
+const UNANNOUNCED: &str = "a device group's Commit that adds a device sets its roster entry, for a new slot, announcing the added KeyPackage with its leaf signature key";
 
 /// The entry a link writes for the device in `key_package`.
 fn linked_entry(label: &str, key_package: &KeyPackage) -> DeviceEntryV1 {
     DeviceEntryV1 {
         linked_by: Some(slot(1)),
         announced_key_package: Some(key_package_ref(key_package)),
+        tag_signature_key: Some(leaf_signature_key(key_package)),
         ..entry(label)
     }
 }
@@ -105,7 +106,7 @@ async fn a_links_welcome_keeps_its_delivery_deadline() {
     ));
     assert_eq!(
         phone.engine.outbound_welcome_status(id, deadline).unwrap(),
-        OutboundWelcomeStatus::Settled(cgka_engine::engine::WelcomeSettlement::Expired)
+        OutboundWelcomeStatus::PastDeadline
     );
 }
 
@@ -221,8 +222,8 @@ async fn a_refused_link_leaves_the_group_as_it_was() {
     let held = roster_of(&phone, &gid);
 
     // The update sets exactly one device entry, and the Commit meets the
-    // sender rule: the entry is for a new slot and announces the linked
-    // KeyPackage.
+    // sender rule: the entry is for a new slot, announces the linked
+    // KeyPackage and binds its leaf's key (marmot#521).
     let cases = [
         (
             vec![
@@ -244,6 +245,26 @@ async fn a_refused_link_leaves_the_group_as_it_was() {
             UNANNOUNCED,
         ),
         (vec![set(3, entry("Tablet"))], UNANNOUNCED),
+        (
+            vec![set(
+                3,
+                DeviceEntryV1 {
+                    tag_signature_key: None,
+                    ..linked_entry("Tablet", &key_package)
+                },
+            )],
+            UNANNOUNCED,
+        ),
+        (
+            vec![set(
+                3,
+                DeviceEntryV1 {
+                    tag_signature_key: Some(phone.engine.own_signature_key()),
+                    ..linked_entry("Tablet", &key_package)
+                },
+            )],
+            UNANNOUNCED,
+        ),
     ];
     for (operations, reason) in cases {
         assert_refused(
@@ -398,10 +419,7 @@ async fn a_link_needs_a_device_group() {
         .await;
     let refused_record = alice
         .engine
-        .send(record_removed_slot(
-            &gid,
-            vec![removed_slot(3, Some(vec![0x44; 32]))],
-        ))
+        .send(record_removed_slot(&gid, vec![removed_slot(3, None)]))
         .await;
     let refused_unlink = alice
         .engine
@@ -1041,16 +1059,31 @@ async fn a_removal_records_the_slot_as_removed_in_the_same_commit() {
 }
 
 /// A removed device can leave its entry without the key its leaf signs with
-/// (mdk#3679): here the tablet has committed and its entry carries no tag
-/// signature key. The removal then records the slot as `removed` with the
-/// signature key of the leaf it removes. Every member accepts it, as every
-/// member accepts any well-formed roster update.
+/// (mdk#3679): here the tablet has committed and then dropped the key its Add
+/// bound. The removal then records the slot as `removed` with the signature
+/// key of the leaf it removes. Every member accepts it, as every member
+/// accepts any well-formed roster update.
 #[tokio::test]
 async fn a_removal_can_record_the_removed_leafs_key() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
     let mut tablet = link_tablet(&mut phone, &mut laptop, &gid).await;
     commit_tablet_update(&mut tablet, &mut phone, &mut laptop, &gid).await;
     let tablet_key = signature_key(&tablet, &gid);
+    let keyless = DeviceEntryV1 {
+        tag_signature_key: None,
+        ..roster_of(&tablet, &gid).devices[&slot(3)].clone()
+    };
+    let drop_key = send_commit(
+        &mut tablet,
+        roster_update(
+            &gid,
+            vec![DeviceRosterOperationV1::SetDevice(slot(3), keyless)],
+        ),
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut phone, &drop_key, &gid).await;
+    assert_accepted(&mut laptop, &drop_key, &gid).await;
     assert_eq!(
         roster_of(&phone, &gid).devices[&slot(3)].tag_signature_key,
         None
@@ -1212,9 +1245,7 @@ async fn a_refused_unlink_leaves_the_group_as_it_was() {
             ),
             "has reason removed and keeps the entry's tag signature key",
         ),
-        // A record always keeps a key. The tablet's entry has none, and its
-        // leaf is still its link's KeyPackage leaf, so it set no key a
-        // removal could keep (mdk#3679).
+        // A record always keeps a key.
         (
             unlink(
                 &gid,
@@ -1223,13 +1254,16 @@ async fn a_refused_unlink_leaves_the_group_as_it_was() {
             ),
             "has reason removed and keeps the entry's tag signature key",
         ),
+        // The tablet's entry holds the key its Add bound, but its leaf is
+        // still its link's KeyPackage leaf, so the link is not made and the
+        // slot is not recorded (mdk#3679).
         (
             unlink(
                 &gid,
                 tablet_key.clone(),
                 vec![remove(3), removed_slot(3, Some(tablet_key.clone()))],
             ),
-            "has reason removed and keeps the entry's tag signature key",
+            "the removed leaf is still its link's KeyPackage leaf",
         ),
         (
             unlink(&gid, signature_key(&phone, &gid), vec![remove(1)]),
@@ -1288,7 +1322,8 @@ fn record_removed_slot(gid: &GroupId, operations: Vec<DeviceRosterOperationV1>) 
 
 /// A removed slot's lone record (mdk#2761) records exactly one slot the
 /// roster holds neither as a device nor as a rejected slot, as `removed`
-/// with a tag signature key; anything else is refused with nothing staged.
+/// with no tag signature key (marmot#520): nothing in the Commit proves a
+/// key. Anything else is refused with nothing staged.
 /// Like an unlink, it is refused, not queued, while this device's Commit is
 /// in flight or convergence input is unsettled, so no drain makes it later.
 #[tokio::test]
@@ -1296,13 +1331,12 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
     let commit = send_commit(&mut phone, roster_update(&gid, vec![reject_slot(5)]), &gid).await;
     assert_accepted(&mut laptop, &commit, &gid).await;
-    let key = || Some(vec![0x44; 32]);
     let epoch = phone.engine.epoch(&gid).unwrap();
     let held = roster_of(&phone, &gid);
 
     let cases = [
         (
-            vec![removed_slot(3, key()), removed_slot(4, key())],
+            vec![removed_slot(3, None), removed_slot(4, None)],
             "it must set exactly one rejected slot",
         ),
         (
@@ -1311,18 +1345,18 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
         ),
         (
             vec![reject_slot(3)],
-            "it has reason removed and keeps a tag signature key",
+            "it has reason removed and keeps no tag signature key",
         ),
         (
-            vec![removed_slot(3, None)],
-            "it has reason removed and keeps a tag signature key",
+            vec![removed_slot(3, Some(vec![0x44; 32]))],
+            "it has reason removed and keeps no tag signature key",
         ),
         (
-            vec![removed_slot(2, key())],
+            vec![removed_slot(2, None)],
             "the roster already holds the slot",
         ),
         (
-            vec![removed_slot(5, key())],
+            vec![removed_slot(5, None)],
             "the roster already holds the slot",
         ),
     ];
@@ -1338,7 +1372,7 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
     assert_eq!(phone.engine.epoch(&gid).unwrap(), epoch);
     assert_eq!(roster_of(&phone, &gid), held);
 
-    let intent = record_removed_slot(&gid, vec![removed_slot(3, key())]);
+    let intent = record_removed_slot(&gid, vec![removed_slot(3, None)]);
     let assert_unsettled = |refused: Result<SendResult, EngineError>, phone: &Device| {
         assert!(
             matches!(&refused, Err(EngineError::LinkDeviceUnsettled { group_id }) if *group_id == gid),
@@ -1380,10 +1414,48 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
             RejectedSlotV1 {
                 reason: RejectedSlotReasonV1::Removed,
                 rejected_at: 7,
-                tag_signature_key: key(),
+                tag_signature_key: None,
             }
         );
     }
+}
+
+/// A device group move's carried rejections keep no tag signature key
+/// (marmot#520): the destination cannot check a key from another group. One
+/// that keeps a key is refused with nothing staged; one without goes in as
+/// it is.
+#[tokio::test]
+async fn a_carried_rejection_keeps_no_key() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let rejected_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let record = |tag_signature_key| RejectedSlotV1 {
+        reason: RejectedSlotReasonV1::Removed,
+        rejected_at,
+        tag_signature_key,
+    };
+    let carried = |tag_signature_key| SendIntent::ImportDeviceGroupRejections {
+        group_id: gid.clone(),
+        roster_update: update(vec![DeviceRosterOperationV1::SetRejectedSlot(
+            slot(3),
+            record(tag_signature_key),
+        )]),
+    };
+    let epoch = phone.engine.epoch(&gid).unwrap();
+    assert_refused(
+        phone.engine.send(carried(Some(vec![0x44; 32]))).await,
+        "carried rejection keeps a tag signature key",
+    );
+    assert_eq!(phone.engine.epoch(&gid).unwrap(), epoch);
+
+    let commit = send_commit(&mut phone, carried(None), &gid).await;
+    assert_accepted(&mut laptop, &commit, &gid).await;
+    assert_eq!(
+        roster_of(&laptop, &gid).rejected_slots[&slot(3)],
+        record(None)
+    );
 }
 
 /// A lone record that loses branch selection is not made again by the
@@ -1392,7 +1464,7 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
 #[tokio::test]
 async fn a_lone_removed_record_a_lost_fork_drops_is_not_reissued() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
-    let record = record_removed_slot(&gid, vec![removed_slot(3, Some(vec![0x44; 32]))]);
+    let record = record_removed_slot(&gid, vec![removed_slot(3, None)]);
     send_commit(&mut phone, record, &gid).await;
     // The laptop's branch is longer, so it wins.
     let mut rivals = Vec::new();

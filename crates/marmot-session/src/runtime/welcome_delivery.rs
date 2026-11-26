@@ -1,12 +1,14 @@
 //! Outbound Welcome delivery (mdk#2628 item 3.5a).
 //!
 //! The engine's Welcome row is the obligation: staged with its commit, owed
-//! once the commit confirms (or at a founding create), delivered, or
-//! withdrawn. Every publish reads that row first (`welcome_hold`), so a
-//! withdrawn Welcome never goes out again, a staged one waits for its
-//! commit, and no Welcome goes out once its delivery deadline passes
+//! once the commit confirms (or at a founding create), delivered, withdrawn,
+//! or marked expired. Every publish reads that row first (`welcome_hold`), so
+//! a withdrawn or expired Welcome never goes out again, a staged one waits
+//! for its commit, and no Welcome goes out once its delivery deadline passes
 //! (a device link's at the end of the new device's wait, any other seven
-//! days after it was staged, mdk#3589). Per-endpoint
+//! days after it was staged, mdk#3589). The watcher marks a Welcome past its
+//! deadline expired once nothing it has received can still deliver it, and
+//! records that once (`expire_welcome`). Per-endpoint
 //! attempts and backoff live on the Welcome's `DurableTransportFanout`,
 //! which maintenance retries; only `redeliver_welcome` skips that backoff.
 
@@ -312,6 +314,7 @@ where
                 && !status.awaits_commit
                 && !status.met_required_acks
                 && !deferred_unasked
+                && !self.welcome_past_deadline_now(&welcome_id)
                 && let Some(recipient) = recipient
             {
                 effects.welcome_failures.push(self.welcome_delivery_failure(
@@ -369,6 +372,20 @@ where
             .is_some_and(|deliver_until| self.wall_clock.now() >= deliver_until))
     }
 
+    /// Whether an attempt on `message_id` that fell short ended past its
+    /// deadline, or with its Welcome marked expired whatever the clock, so it
+    /// is never published again and is not pending: no delivery failure is
+    /// reported for it. A row that cannot be read now reports the failure, as
+    /// before deadlines existed.
+    pub(super) fn welcome_past_deadline_now(&self, message_id: &cgka_traits::MessageId) -> bool {
+        self.welcome_past_deadline(message_id).unwrap_or(false)
+            || matches!(
+                self.session
+                    .outbound_welcome_status(message_id, self.wall_clock.now()),
+                Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired))
+            )
+    }
+
     /// `welcomes` without those past their delivery deadline, which are no
     /// longer owed to anyone.
     fn welcomes_before_deadline(
@@ -399,8 +416,31 @@ where
         &mut self,
         message_id: &cgka_traits::MessageId,
     ) -> AccountResult<AccountDeviceEffects> {
-        let (group_id, message) = self.session.stored_sent_welcome(message_id)?;
         let mut output = AccountDeviceEffects::default();
+        // An expired Welcome is never published again: nothing is published
+        // and no failure recorded. One this call finds past its deadline is
+        // marked expired and recorded here (mdk#3589), after any acceptance
+        // it holds is reconciled, unless that acceptance or a wave may still
+        // deliver it, so a clock set back before the next maintenance pass
+        // cannot let a second call publish it.
+        let now = self.wall_clock.now();
+        match self.session.outbound_welcome_status(message_id, now)? {
+            OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired) => return Ok(output),
+            OutboundWelcomeStatus::PastDeadline => {
+                // An acceptance it holds was reconciled, or a wave holding it
+                // settles it: nothing to publish.
+                if self.expired_welcome_may_still_close(message_id) {
+                    return Ok(output);
+                }
+                if self.session.expire_sent_welcome(message_id, now)?.is_some() {
+                    self.record_welcome_expiry_or_retry(message_id);
+                    return Ok(output);
+                }
+                // Not owed (staged with its commit): refused below, as before.
+            }
+            _ => {}
+        }
+        let (group_id, message) = self.session.stored_sent_welcome(message_id)?;
         // A detached wave holds this Welcome: it is the Welcome's one
         // publisher, and until it settles the Welcome is in flight, not
         // undelivered.
@@ -419,6 +459,7 @@ where
         // The attempt that met the policy marked the Welcome delivered.
         if !status.met_required_acks
             && !status.withdrawn
+            && !self.welcome_past_deadline_now(message_id)
             && let Some(recipient) = recipient
         {
             let failure = self.welcome_delivery_failure(
@@ -455,40 +496,60 @@ where
         // saved acceptance that meets its policy, whose mark a stop
         // interrupted, is reconciled first. A record that cannot be read now
         // does not stop the withdrawal.
-        if let Ok(Some(fanout)) = self.session.transport_fanout(message_id) {
+        let fanout = self.session.transport_fanout(message_id);
+        if let Ok(Some(fanout)) = &fanout {
             self.settle_met_welcome(
                 &fanout.exact_message,
-                accepted_fanout_targets(&fanout),
+                accepted_fanout_targets(fanout),
                 fanout.required_acks,
             );
         }
-        // The Welcome's terminal reason, read before the withdrawal hides
-        // it: `withdrawn` for a live one; for one already settled (expired,
-        // its commit lost) that the watcher has not recorded yet, the reason
-        // it settled for. One no watcher holds was recorded when it settled,
-        // or settled before this process watched it.
-        let reason = if self.audit.records_v5() {
-            match self
-                .session
-                .outbound_welcome_status(message_id, self.wall_clock.now())
-            {
-                Ok(OutboundWelcomeStatus::Owed { .. } | OutboundWelcomeStatus::Waiting) => {
-                    Some(audit_v5::WithdrawalReason::Withdrawn)
-                }
-                Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired))
-                    if self.watched_welcomes.contains(message_id) =>
-                {
-                    Some(audit_v5::WithdrawalReason::Expired)
-                }
-                Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::CommitSuperseded))
-                    if self.watched_welcomes.contains(message_id) =>
-                {
-                    Some(audit_v5::WithdrawalReason::CommitSuperseded)
-                }
-                _ => None,
+        // An acceptance whose delivered mark did not land, or a record that
+        // cannot be read now, may still deliver it.
+        let may_deliver = match &fanout {
+            Ok(Some(fanout)) => accepted_fanout_targets(fanout) >= fanout.required_acks.max(1),
+            Ok(None) => false,
+            Err(_) => true,
+        };
+        // Read before the withdrawal hides it, from the stored rows, so a
+        // group not loaded yet reads as its rows stand: one past its deadline
+        // ends expired, not withdrawn.
+        let now = self.wall_clock.now();
+        let status = self.session.stored_outbound_welcome_status(message_id, now);
+        // A Welcome past its deadline has expired, which is why it was never
+        // delivered: withdrawing it marks and records that expiry, once, even
+        // while a wave holds it, since the withdrawal stops that wave too,
+        // unless `may_deliver`. A record step that fails now is retried by
+        // the watcher or the next start; a mark that cannot be written fails
+        // the call.
+        if matches!(status, Ok(OutboundWelcomeStatus::PastDeadline))
+            && !may_deliver
+            && self.session.expire_sent_welcome(message_id, now)?.is_some()
+        {
+            self.record_welcome_expiry_or_retry(message_id);
+            if !self.session.detached_welcome_publishes.contains(message_id) {
+                self.session.delete_transport_fanout(message_id)?;
             }
-        } else {
-            None
+            return Ok(WelcomeWithdrawal::Withdrawn);
+        }
+        // The Welcome's terminal reason, as its row will read: `withdrawn`
+        // for a live one, or one past its deadline withdrawn as is; for one
+        // whose commit lost that the watcher has not recorded yet, that. One
+        // no watcher holds was recorded when it settled, or settled before
+        // this process watched it. An expired one was recorded when marked.
+        let reason = match status {
+            _ if !self.audit.records_v5() => None,
+            Ok(
+                OutboundWelcomeStatus::Owed { .. }
+                | OutboundWelcomeStatus::Waiting
+                | OutboundWelcomeStatus::PastDeadline,
+            ) => Some(audit_v5::WithdrawalReason::Withdrawn),
+            Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::CommitSuperseded))
+                if self.watched_welcomes.contains(message_id) =>
+            {
+                Some(audit_v5::WithdrawalReason::CommitSuperseded)
+            }
+            _ => None,
         };
         let withdrawal = self.session.withdraw_sent_welcome(message_id)?;
         self.note_welcome_delivery_changed(message_id);
@@ -610,7 +671,10 @@ where
     /// of every owed Welcome not past its delivery deadline, as
     /// [`Self::prepare_welcome_retry_task_with_audit_context`] does, and
     /// watches every staged or owed one, so maintenance publishes each once it
-    /// is owed, unless an attempt record holds it by then. The retry respects
+    /// is owed, unless an attempt record holds it by then. It marks and
+    /// records the expiry of every one past its deadline itself, and records
+    /// every mark a stop left unrecorded, once each (mdk#3589); only what
+    /// cannot be done now is left to maintenance. The retry respects
     /// each relay's backoff. Returns the owed Welcomes' ids beside the task, or
     /// `None` when nothing is owed.
     #[doc(hidden)]
@@ -622,6 +686,7 @@ where
         A: Clone + 'static,
     {
         let work = self.session.outbound_welcome_work()?;
+        self.adopt_unrecorded_expiries();
         self.welcome_store_read = true;
         self.unread_welcome_groups = work.unread_groups;
         self.adopt_stored_welcomes(work.staged);
@@ -660,25 +725,101 @@ where
     /// Watch Welcomes read from the store, except one already settled: it
     /// settled before this process watched it, and a later start reads it
     /// again, so its settlement is neither this process's to audit nor to
-    /// announce. A host reads it from the delivery query (mdk#3589).
+    /// announce. A host reads it from the delivery query. The exception is
+    /// expiry, which is recorded once from its durable mark (mdk#3589): one
+    /// whose deadline passed while no process ran is marked and recorded
+    /// here, unless an acceptance may still deliver it, and so is one marked
+    /// before a stop that came before its record. Whatever cannot be done now
+    /// is left to the watcher.
     fn adopt_stored_welcomes(&mut self, ids: impl IntoIterator<Item = cgka_traits::MessageId>) {
         let now = self.wall_clock.now();
         for id in ids {
-            if self.watched_welcomes.contains(&id)
-                || matches!(
-                    self.session.outbound_welcome_status(&id, now),
-                    Ok(OutboundWelcomeStatus::Settled(_))
-                )
-            {
+            if self.watched_welcomes.contains(&id) {
                 continue;
             }
-            self.watched_welcomes.push(id);
+            let settled = match self.session.outbound_welcome_status(&id, now) {
+                Ok(OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired)) => {
+                    self.expire_welcome(&id, now)
+                }
+                Ok(OutboundWelcomeStatus::PastDeadline) => {
+                    !self.expired_welcome_may_still_close(&id) && self.expire_welcome(&id, now)
+                }
+                Ok(OutboundWelcomeStatus::Settled(_)) => true,
+                _ => false,
+            };
+            if !settled {
+                self.watched_welcomes.push(id);
+            }
+        }
+    }
+
+    /// [`Self::record_welcome_expiry`] for a Welcome this call just marked,
+    /// leaving it for the next pass to record if that cannot be done now.
+    fn record_welcome_expiry_or_retry(&self, message_id: &cgka_traits::MessageId) {
+        if !self.record_welcome_expiry(message_id) {
+            self.expiries_to_record
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(message_id.clone());
+        }
+    }
+
+    /// Whether the search for unrecorded Welcome expiries still has work: it
+    /// ran and could not read the group list, a group could not be read, or
+    /// a mark is left to record. A search not yet run is not owed: the
+    /// startup pass or the first maintenance pass runs it.
+    pub(super) fn welcome_expiries_unfinished(&self) -> bool {
+        (self.welcome_store_read && !self.welcome_expiries_read)
+            || !self.unread_expiry_groups.is_empty()
+            || !self
+                .expiries_to_record
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+    }
+
+    /// Watch every Welcome marked expired whose expiry a stop left
+    /// unrecorded, so it is recorded: every group's on the first call, then,
+    /// on each later call, each group whose rows could not be read before,
+    /// until they read. A read that fails is logged and stops nothing else:
+    /// owed Welcomes are read and published as usual.
+    fn adopt_unrecorded_expiries(&mut self) {
+        let to_record = std::mem::take(
+            &mut *self
+                .expiries_to_record
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        self.adopt_stored_welcomes(to_record);
+        for group_id in std::mem::take(&mut self.unread_expiry_groups) {
+            match self.session.unrecorded_welcome_expiries_in(&group_id) {
+                Ok(ids) => self.adopt_stored_welcomes(ids),
+                Err(error) => {
+                    log_unread_welcome_expiries(1, Some(&error));
+                    self.unread_expiry_groups.push(group_id);
+                }
+            }
+        }
+        if self.welcome_expiries_read {
+            return;
+        }
+        match self.session.unrecorded_welcome_expiries() {
+            Ok(found) => {
+                self.welcome_expiries_read = true;
+                if !found.unread_groups.is_empty() {
+                    log_unread_welcome_expiries(found.unread_groups.len(), None);
+                }
+                self.unread_expiry_groups = found.unread_groups;
+                self.adopt_stored_welcomes(found.ids);
+            }
+            Err(error) => log_unread_welcome_expiries(0, Some(&error)),
         }
     }
 
     /// Read the store for Welcomes to watch: all of it the first time, unless
     /// the startup pass did, then each group a read skipped, once it is live.
     fn read_welcome_store(&mut self) -> AccountResult<()> {
+        self.adopt_unrecorded_expiries();
         if !self.welcome_store_read {
             let work = self.session.outbound_welcome_work()?;
             self.welcome_store_read = true;
@@ -725,9 +866,10 @@ where
         // The recipients of every owed Welcome, unless a status read failed.
         let mut owed_recipients = Some(HashSet::new());
         for id in std::mem::take(&mut self.watched_welcomes) {
+            let now = self.wall_clock.now();
             let status = self
                 .session
-                .outbound_welcome_status(&id, self.wall_clock.now())
+                .outbound_welcome_status(&id, now)
                 .and_then(|status| {
                     let held = matches!(status, OutboundWelcomeStatus::Owed { .. })
                         && (self.session.detached_welcome_publishes.contains(&id)
@@ -735,11 +877,20 @@ where
                     Ok((status, held))
                 });
             match status {
-                Ok((OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired), _))
+                Ok((OutboundWelcomeStatus::PastDeadline, _))
                     if self.expired_welcome_may_still_close(&id) =>
                 {
-                    // Recorded once a mark or the pass settles it.
+                    // Marked once a delivered mark or the pass settles it.
                     watching.push(id);
+                }
+                Ok((
+                    OutboundWelcomeStatus::PastDeadline
+                    | OutboundWelcomeStatus::Settled(WelcomeSettlement::Expired),
+                    _,
+                )) => {
+                    if !self.expire_welcome(&id, now) {
+                        watching.push(id);
+                    }
                 }
                 Ok((OutboundWelcomeStatus::Settled(settlement), _)) => {
                     // Its watch ends only once a host is told and the
@@ -789,4 +940,16 @@ where
         }
         Ok(())
     }
+}
+
+/// A search for unrecorded Welcome expiries that could not read `groups`
+/// groups (0: the group list itself), retried on the next maintenance pass.
+fn log_unread_welcome_expiries(groups: usize, error: Option<&crate::session::SessionError>) {
+    tracing::warn!(
+        target: TRACE_TARGET,
+        method = "adopt_unrecorded_expiries",
+        groups,
+        transient = error.map(crate::session::SessionError::is_transient),
+        "unrecorded Welcome expiries not read; retried on a later pass"
+    );
 }

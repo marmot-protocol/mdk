@@ -47,7 +47,6 @@ pub struct MoveRejectedSlot {
     pub slot: [u8; 32],
     pub removed: bool,
     pub rejected_at: u64,
-    pub tag_signature_key: Option<Vec<u8>>,
     /// Unsettled, imported, destination-device collision, destination rejection,
     /// or expired. This is local carry progress, not another roster authority.
     pub outcome: Option<MoveCarryOutcome>,

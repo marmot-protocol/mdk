@@ -878,7 +878,7 @@ mod tests {
                 .protocol_profile(ProtocolProfile::Current)
                 .supported_app_components(harness_supported_app_components(false))
                 .peeler(Box::new(OpaquePeeler(
-                    NostrMlsPeeler::new().with_welcome_signer(client.signer.clone()),
+                    NostrMlsPeeler::default().with_welcome_signer(client.signer.clone()),
                 )))
                 .build()
                 .unwrap(),
@@ -1776,7 +1776,10 @@ fn build_harness_engine(
         ProtocolProfile::Legacy,
         "the legacy harness protocol profile is unavailable in release builds"
     );
-    let inner_peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
+    let entropy = Arc::new(cgka_traits::OsEntropy);
+    let clock = Arc::new(cgka_traits::SystemWallClock);
+    let inner_peeler =
+        NostrMlsPeeler::new(entropy.clone(), clock.clone()).with_welcome_signer(signer.clone());
     #[cfg(test)]
     let peeler: Box<dyn TransportPeeler> = match options.welcome_wrap_refusal {
         Some(flag) => Box::new(WelcomeWrapRefusalPeeler {
@@ -1798,6 +1801,7 @@ fn build_harness_engine(
             options.account_devices_supported,
         ))
         .peeler(peeler)
+        .maintenance_sources(clock, entropy)
         .recorder(Box::new(CapturingRecorder::new(audit_capture.clone())));
     #[cfg(debug_assertions)]
     if protocol_profile == ProtocolProfile::Legacy {

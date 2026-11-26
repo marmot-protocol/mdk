@@ -102,9 +102,9 @@ use crate::types::push::{
     MarmotPushRegistrationShareOutcome, MarmotPushRegistrationSyncResult,
 };
 use crate::types::relay::{
-    MarmotAccountRelayLists, MarmotRelayEndpointClassificationList, MarmotRelayHealth,
-    MarmotRelayLiveness, MarmotRelayLivenessList, MarmotRelayTelemetryRuntimeConfig,
-    MarmotRelayTelemetrySettings,
+    MarmotAccountRelayHealth, MarmotAccountRelayLists, MarmotRelayEndpointClassificationList,
+    MarmotRelayHealth, MarmotRelayLiveness, MarmotRelayLivenessList,
+    MarmotRelayTelemetryRuntimeConfig, MarmotRelayTelemetrySettings,
 };
 use crate::types::sign_in::{MarmotSignInResponse, MarmotUnrecognizedSignInList};
 use crate::types::sticker::{
@@ -1213,6 +1213,13 @@ c_cmd! {
 
     /// Configured relay connection states. Free with `marmot_relay_liveness_list_free`.
     async fn marmot_account_relay_liveness(account_ref: str) -> rec(MarmotRelayLivenessList) = account_relay_liveness;
+
+    /// The account's relay health from its held lists and the relay policy:
+    /// rows, warnings about invitations sent through its published inbox list,
+    /// and the highest severity. Local read; never dials.
+    /// Re-read on `MARMOT_EVENT_RELAY_HEALTH_CHANGED`.
+    /// Free with `marmot_account_relay_health_free`.
+    async fn marmot_account_relay_health(account_ref: str) -> rec(MarmotAccountRelayHealth) = account_relay_health;
 
     /// Reconnect one configured relay and return its next observed state.
     /// Free with `marmot_relay_liveness_free`.

@@ -15,8 +15,13 @@ serde_json.workspace = true
 hex.workspace = true
 url.workspace = true
 openmls_traits.workspace = true
+rand.workspace = true
 sha2.workspace = true
+web-time.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 criterion.workspace = true

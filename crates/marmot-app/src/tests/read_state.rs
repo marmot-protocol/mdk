@@ -1012,7 +1012,7 @@ async fn a_clock_moved_back_rebuilds_the_time_dependent_entry() {
     client.runtime = client.runtime.with_maintenance_sources(
         Arc::new(SetClock(Arc::clone(&clock), Arc::clone(&step_after_read))),
         Arc::new(marmot_session::SystemMonotonicClock::default()),
-        Arc::new(marmot_session::OsMaintenanceRandom),
+        Arc::new(marmot_session::OsEntropy),
     );
     let id = cgka_traits::MessageId::new(vec![0x5e; 32]);
     let endpoint = |url: &str| cgka_traits::TransportEndpoint(url.to_owned());

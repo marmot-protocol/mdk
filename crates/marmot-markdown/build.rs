@@ -1,6 +1,8 @@
 use std::{
+    collections::BTreeSet,
     env,
     ffi::OsString,
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -44,7 +46,11 @@ fn main() {
         _ => panic!("unsupported Odin target OS: {target}"),
     };
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
-    let archive = out_dir.join(if os == "windows" {
+    let tools = native_tools();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV");
+    let msvc = target_env.as_deref() == Ok("msvc");
+    // GNU Rust targets look for libname.a even on Windows.
+    let archive = out_dir.join(if msvc {
         "marmot_markdown_odin.lib"
     } else {
         "libmarmot_markdown_odin.a"
@@ -54,7 +60,7 @@ fn main() {
     if archive.exists() {
         fs::remove_file(&archive).expect("remove previous Odin archive");
     }
-    let object_output = os == "android" || os == "ios";
+    let object_output = matches!(os.as_str(), "android" | "ios" | "windows");
     let parallel_codegen =
         target == "x86_64-unknown-linux-gnu" && env::var("OPT_LEVEL").as_deref() != Ok("0");
     let llvm_output = parallel_codegen || os == "android";
@@ -62,6 +68,8 @@ fn main() {
         let directory = out_dir.join("llvm");
         fs::create_dir_all(&directory).expect("create native LLVM output directory");
         directory
+    } else if os == "windows" {
+        out_dir.join("marmot_markdown_odin.obj")
     } else if object_output {
         out_dir.join("marmot_markdown_odin.o")
     } else {
@@ -103,6 +111,15 @@ fn main() {
     if os == "windows" {
         command.arg("-linker:msvc");
     }
+    if !cfg!(windows) && os == "windows" {
+        println!("cargo:rerun-if-env-changed=ODIN_WINDOWS_SDK_ROOT");
+        if let Some(root) = env::var_os("ODIN_WINDOWS_SDK_ROOT") {
+            command.arg(format!("-windows-sdk-root:{}", Path::new(&root).display()));
+        }
+    }
+    if os == "windows" && target_env.as_deref() == Ok("gnu") {
+        command.arg("-define:MARMOT_MARKDOWN_MINGW=true");
+    }
     if os == "ios" {
         command.arg(if target.ends_with("-sim") || arch == "amd64" {
             "-subtarget:iphonesimulator"
@@ -135,6 +152,14 @@ fn main() {
         Some(Command::new(archiver))
     } else if os == "ios" {
         Some(Command::new("ar"))
+    } else if os == "windows" {
+        let mut ar = Command::new(llvm_tool(&tools, "llvm-ar"));
+        ar.arg(if msvc {
+            "--format=coff"
+        } else {
+            "--format=gnu"
+        });
+        Some(ar)
     } else {
         None
     };
@@ -150,24 +175,92 @@ fn main() {
         "Odin parser compilation failed for {target}"
     );
     if parallel_codegen {
-        finalize_native(&native_output, &archive);
-    } else if let Some(mut archiver) = archiver {
-        let object = match android_target {
-            Some(target) => finalize_android(&native_output, &target),
-            None => native_output,
-        };
-        let status = archiver
-            .arg("crs")
-            .arg(&archive)
-            .arg(&object)
-            .status()
-            .expect("run native object archiver");
-        assert!(status.success(), "archive Odin object for {target}");
+        finalize_native(&tools, &native_output, &archive);
+    }
+    let native_output = match android_target {
+        Some(target) => finalize_android(&tools, &native_output, &target),
+        None => native_output,
+    };
+    // Rewrite objects before archiving them. llvm-objcopy cannot rewrite the
+    // .lib Odin emits on Windows, even though llvm-nm can list its symbols.
+    let symbol_file = if archiver.is_some() {
+        &native_output
+    } else {
+        &archive
+    };
+    let underscore = matches!(os.as_str(), "macos" | "ios") || (os == "windows" && arch == "i386");
+    rename_odin_symbols(
+        &tools,
+        &out_dir,
+        symbol_file,
+        if underscore { "_" } else { "" },
+    );
+    if let Some(mut archiver) = archiver {
+        run_native(archiver.arg("crs").arg(&archive).arg(&native_output));
     }
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=marmot_markdown_odin");
-    if os != "windows" {
+    if os == "windows" {
+        // The parser's runtime entropy source calls BCryptGenRandom.
+        println!("cargo:rustc-link-lib=bcrypt");
+    } else {
         println!("cargo:rustc-link-lib=m");
+    }
+}
+
+// Keep only the entry points in src/native.rs under their original names.
+// Odin hosts link a second copy of the runtime and compiler-generated symbols.
+fn rename_odin_symbols(tools: &Path, out_dir: &Path, native_file: &Path, prefix: &str) {
+    const EXPORTS: [&str; 3] = ["markdown_parse", "markdown_free", "markdown_classify"];
+    let listing = Command::new(llvm_tool(tools, "llvm-nm"))
+        .args(["--defined-only", "--extern-only", "--format=just-symbols"])
+        .arg(native_file)
+        .output()
+        .expect("run llvm-nm; install llvm-tools-preview or put llvm-nm on PATH");
+    assert!(
+        listing.status.success(),
+        "list Odin symbols: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listing = String::from_utf8(listing.stdout).expect("UTF-8 Odin symbols");
+    // llvm-nm puts a `member:` heading before each archive member.
+    let symbols: BTreeSet<_> = listing
+        .lines()
+        .filter(|symbol| !symbol.is_empty() && !symbol.ends_with(':'))
+        .collect();
+    let mut renames = String::new();
+    for symbol in symbols {
+        let name = symbol.strip_prefix(prefix).unwrap_or(symbol);
+        if !EXPORTS.contains(&name) {
+            writeln!(
+                renames,
+                "\"--redefine-sym={symbol}={prefix}marmot_markdown.{name}\""
+            )
+            .unwrap();
+        }
+    }
+    if !renames.is_empty() {
+        // A response file avoids the Windows command-line limit without
+        // treating the `#` in Odin symbols as a --redefine-syms comment.
+        let mapping = out_dir.join("markdown-symbols.rsp");
+        fs::write(&mapping, renames).expect("write Odin symbol map");
+        let mut response = OsString::from("@");
+        response.push(mapping);
+        run_native(
+            Command::new(llvm_tool(tools, "llvm-objcopy"))
+                .arg(response)
+                .arg(native_file),
+        );
+    }
+}
+
+fn llvm_tool(tools: &Path, name: &str) -> PathBuf {
+    let executable = format!("{name}{}", env::consts::EXE_SUFFIX);
+    let bundled = tools.join(&executable);
+    if bundled.is_file() {
+        bundled
+    } else {
+        PathBuf::from(executable)
     }
 }
 
@@ -185,8 +278,7 @@ fn native_tools() -> PathBuf {
         .join("bin")
 }
 
-fn finalize_android(directory: &Path, target: &str) -> PathBuf {
-    let tools = native_tools();
+fn finalize_android(tools: &Path, directory: &Path, target: &str) -> PathBuf {
     let suffix = env::consts::EXE_SUFFIX;
     let optimized = env::var("OPT_LEVEL").as_deref() != Ok("0");
     // Odin's pinned Android triples omit the vendor. Set a complete triple
@@ -216,8 +308,7 @@ fn finalize_android(directory: &Path, target: &str) -> PathBuf {
     object
 }
 
-fn finalize_native(directory: &Path, archive: &Path) {
-    let tools = native_tools();
+fn finalize_native(tools: &Path, directory: &Path, archive: &Path) {
     let suffix = env::consts::EXE_SUFFIX;
     let combine = "instcombine<max-iterations=1;no-verify-fixpoint>";
     // Bounded scalar cleanup plus inlining; ELF LTO partitions only machine-code

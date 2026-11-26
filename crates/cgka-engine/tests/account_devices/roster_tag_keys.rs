@@ -82,21 +82,34 @@ async fn every_roster_state_a_device_applies_records_its_tag_keys() {
     initial.devices.get_mut(&slot(1)).unwrap().tag_signature_key = Some(vec![0xa1; 32]);
     let gid = found_device_group(&mut phone, &initial, &mut [&mut laptop]).await;
     // The founding create and the Welcome join record the roster they start
-    // from. The laptop has set no key yet.
+    // from, with the key the Add bound to the laptop's entry.
+    let laptop_key = RosterTagKey {
+        slot: slot(2),
+        tag_signature_key: laptop.engine.own_signature_key(),
+        held_as_removed: false,
+    };
     for device in [&phone, &laptop] {
-        assert_eq!(recorded(device, &gid), BTreeSet::from([tag_key(1, 0xa1)]));
+        assert_eq!(
+            recorded(device, &gid),
+            BTreeSet::from([tag_key(1, 0xa1), laptop_key.clone()])
+        );
     }
 
     // The committer records when its Commit is confirmed, a receiver when it
     // applies it: a device entry's key and a `removed` record's alike.
     for intent in [
-        set_key(&gid, 2, "Laptop", 0xb2),
-        record_removed(&gid, 3, 0xb3),
+        set_key(&gid, 3, "Tablet", 0xb3),
+        record_removed(&gid, 4, 0xb4),
     ] {
         let commit = send_commit(&mut phone, intent, &gid).await;
         assert_accepted(&mut laptop, &commit, &gid).await;
     }
-    let expected = BTreeSet::from([tag_key(1, 0xa1), tag_key(2, 0xb2), removed_key(3, 0xb3)]);
+    let expected = BTreeSet::from([
+        tag_key(1, 0xa1),
+        laptop_key,
+        tag_key(3, 0xb3),
+        removed_key(4, 0xb4),
+    ]);
     for device in [&phone, &laptop] {
         assert_eq!(recorded(device, &gid), expected);
     }
@@ -158,6 +171,62 @@ async fn a_removed_record_dropped_within_one_pass_is_recorded() {
         .filter(|key| key.slot == slot(4))
         .collect::<Vec<_>>();
     assert_eq!(slot_4_newest_first, [tag_key(4, 0xd1), tag_key(4, 0xd2)]);
+}
+
+/// A `removed` record that keeps no key (marmot#520) holds the keys a
+/// device keeps for its slot as removed, on the device whose own Commits
+/// list the key and make the record, and on one that applies the listing,
+/// the record and its drop within one pass. A key the slot is listed with
+/// after the drop, and another slot's key, are not held.
+#[tokio::test]
+async fn a_removed_record_without_a_key_holds_the_slots_keys() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let listed = roster_update(
+        &gid,
+        vec![set_key_op(4, "Tablet", 0xd4), set_key_op(5, "Watch", 0xd5)],
+    );
+    let first = roster_update(
+        &gid,
+        vec![
+            DeviceRosterOperationV1::RemoveDevice(slot(4)),
+            DeviceRosterOperationV1::SetRejectedSlot(
+                slot(4),
+                RejectedSlotV1 {
+                    reason: RejectedSlotReasonV1::Removed,
+                    rejected_at: 1,
+                    tag_signature_key: None,
+                },
+            ),
+        ],
+    );
+    let second = roster_update(
+        &gid,
+        vec![
+            DeviceRosterOperationV1::RemoveRejectedSlot(slot(4)),
+            set_key_op(4, "Tablet", 0xe4),
+        ],
+    );
+    let listed = send_commit(&mut phone, listed, &gid).await;
+    let first = send_commit(&mut phone, first, &gid).await;
+    let second = send_commit(&mut phone, second, &gid).await;
+    for commit in [&listed, &first, &second] {
+        laptop
+            .engine
+            .buffer_openmls_convergence_message_at(&gid, commit.clone(), 500)
+            .unwrap();
+    }
+    let result = laptop
+        .engine
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    assert_eq!(result.accepted_commits.len(), 3, "{result:?}");
+    for device in [&phone, &laptop] {
+        let keys = recorded(device, &gid);
+        assert!(keys.contains(&removed_key(4, 0xd4)), "{keys:?}");
+        assert!(!keys.contains(&tag_key(4, 0xd4)), "{keys:?}");
+        assert!(keys.contains(&tag_key(4, 0xe4)), "{keys:?}");
+        assert!(keys.contains(&tag_key(5, 0xd5)), "{keys:?}");
+    }
 }
 
 /// The phone and the laptop each set a key from the same epoch, then
