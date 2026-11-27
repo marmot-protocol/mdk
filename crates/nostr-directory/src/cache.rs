@@ -67,9 +67,10 @@ impl DirectoryCache {
         // sidecars left behind by earlier permissive builds.
         fs_private::ensure_private_db_files(&path)?;
         let conn = Connection::open(path)?;
-        // Mirror storage-sqlite's hardened open: pin cipher_compatibility and
-        // enable cipher_memory_security before keying, and scrub deleted rows /
-        // keep temp state in memory for this long-lived encrypted cache.
+        // Mirror storage-sqlite's hardened open: enable cipher_memory_security
+        // before keying, pin cipher_compatibility after keying, and scrub
+        // deleted rows / keep temp state in memory for this long-lived
+        // encrypted cache.
         open_hardened_sqlcipher(&conn, key, SqlCipherHardening::live_cache())?;
         Self::from_connection(conn)
     }
@@ -160,7 +161,7 @@ impl DirectoryCache {
         let conn = self.lock()?;
         let mut statement = conn.prepare(
             "SELECT account_id_hex, npub, local_account_json, profile_json,
-                    relay_lists_json, key_package_json
+                    relay_lists_json, key_package_json, follows_created_at
              FROM directory_users
              ORDER BY account_id_hex",
         )?;
@@ -358,6 +359,64 @@ impl DirectoryCache {
         reason: &str,
     ) -> Result<(), DirectoryError> {
         let now = unix_now_seconds() as i64;
+        let follows_created_at = i64::try_from(entry.follows_created_at).unwrap_or(i64::MAX);
+        conn.execute(
+            "INSERT INTO directory_users (
+                account_id_hex,
+                npub,
+                local_account_json,
+                profile_json,
+                relay_lists_json,
+                key_package_json,
+                follows_created_at,
+                updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(account_id_hex) DO UPDATE SET
+                npub = excluded.npub,
+                local_account_json = excluded.local_account_json,
+                profile_json = excluded.profile_json,
+                relay_lists_json = excluded.relay_lists_json,
+                key_package_json = excluded.key_package_json,
+                follows_created_at = excluded.follows_created_at,
+                updated_at = excluded.updated_at",
+            params![
+                &entry.account_id_hex,
+                &entry.npub,
+                optional_json(&entry.local_account)?,
+                optional_json(&entry.profile)?,
+                serde_json::to_string(&entry.relay_lists)?,
+                optional_json(&entry.key_package)?,
+                follows_created_at,
+                now,
+            ],
+        )?;
+        Self::replace_follow_rows(
+            conn,
+            "directory_user_follows",
+            &entry.account_id_hex,
+            &entry.follows,
+            now,
+        )?;
+        Self::replace_follow_source_rows(
+            conn,
+            &entry.account_id_hex,
+            &entry.follow_source_relays,
+            now,
+        )?;
+        Self::remember_known_reason(conn, &entry.account_id_hex, reason, now)?;
+        Self::put_search_graph_snapshot(conn, entry, now)?;
+        Ok(())
+    }
+
+    /// Frozen v1-schema insert used only during migration 1 (`migrate_legacy_json_records`),
+    /// before migration 4 adds `follows_created_at`. Do not modify its v1 column list.
+    fn put_v1_record_locked(
+        conn: &Connection,
+        entry: &UserDirectoryRecord,
+        reason: &str,
+    ) -> Result<(), DirectoryError> {
+        let now = unix_now_seconds() as i64;
         conn.execute(
             "INSERT INTO directory_users (
                 account_id_hex,
@@ -400,7 +459,60 @@ impl DirectoryCache {
             now,
         )?;
         Self::remember_known_reason(conn, &entry.account_id_hex, reason, now)?;
-        Self::put_search_graph_snapshot(conn, entry, now)?;
+        let follows = (!entry.follows.is_empty()).then(|| entry.follows.clone());
+        let follows_known = follows.is_some();
+        let follows_updated_at = follows_known.then_some(now);
+        let metadata_updated_at = entry
+            .profile
+            .as_ref()
+            .and_then(|profile| i64::try_from(profile.created_at).ok());
+        conn.execute(
+            "INSERT INTO directory_search_graph_users (
+                account_id_hex,
+                npub,
+                profile_json,
+                metadata_updated_at,
+                metadata_expires_at,
+                follows_known,
+                follows_updated_at,
+                created_at,
+                updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?7)
+             ON CONFLICT(account_id_hex) DO UPDATE SET
+                npub = excluded.npub,
+                profile_json = excluded.profile_json,
+                metadata_updated_at = excluded.metadata_updated_at,
+                metadata_expires_at = excluded.metadata_expires_at,
+                follows_known = CASE
+                    WHEN ?8 THEN excluded.follows_known
+                    ELSE directory_search_graph_users.follows_known
+                END,
+                follows_updated_at = CASE
+                    WHEN ?8 THEN excluded.follows_updated_at
+                    ELSE directory_search_graph_users.follows_updated_at
+                END,
+                updated_at = excluded.updated_at",
+            params![
+                &entry.account_id_hex,
+                &entry.npub,
+                optional_json(&entry.profile)?,
+                metadata_updated_at,
+                i64::from(follows_known),
+                follows_updated_at,
+                now,
+                follows_known,
+            ],
+        )?;
+        if let Some(follows) = &follows {
+            Self::replace_follow_rows(
+                conn,
+                "directory_search_graph_follows",
+                &entry.account_id_hex,
+                follows,
+                now,
+            )?;
+        }
         Ok(())
     }
 
@@ -410,7 +522,7 @@ impl DirectoryCache {
     ) -> Result<Option<DirectoryUserRow>, DirectoryError> {
         conn.query_row(
             "SELECT account_id_hex, npub, local_account_json, profile_json,
-                    relay_lists_json, key_package_json
+                    relay_lists_json, key_package_json, follows_created_at
              FROM directory_users
              WHERE account_id_hex = ?1",
             [account_id_hex],
@@ -433,6 +545,7 @@ impl DirectoryCache {
             profile: optional_value(row.profile_json)?,
             follows,
             follow_source_relays,
+            follows_created_at: row.follows_created_at,
             relay_lists: serde_json::from_str(&row.relay_lists_json)?,
             key_package: optional_value(row.key_package_json)?,
         })
@@ -453,7 +566,8 @@ impl DirectoryCache {
         let conn = self.lock()?;
         let Some(row) = conn
             .query_row(
-                "SELECT account_id_hex, npub, profile_json, follows_known, metadata_expires_at
+                "SELECT account_id_hex, npub, profile_json, follows_known,
+                        follows_created_at, metadata_expires_at
              FROM directory_search_graph_users
              WHERE account_id_hex = ?1",
                 [account_id_hex],
@@ -463,7 +577,8 @@ impl DirectoryCache {
                         npub: row.get(1)?,
                         profile_json: row.get(2)?,
                         follows_known: row.get::<_, i64>(3)? != 0,
-                        metadata_expires_at: row.get(4)?,
+                        follows_created_at: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                        metadata_expires_at: row.get(5)?,
                     })
                 },
             )
@@ -489,6 +604,7 @@ impl DirectoryCache {
             profile,
             follows,
             follow_source_relays: Vec::new(),
+            follows_created_at: row.follows_created_at,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         }))
@@ -505,15 +621,16 @@ impl DirectoryCache {
                 account_id_hex: entry.account_id_hex.clone(),
                 npub: entry.npub.clone(),
                 profile: entry.profile.clone(),
-                // An empty `directory_users` follow list often means this
-                // promotion path has not observed a contact list. Do not let
-                // that absence erase independently discovered search-graph
-                // edges; an explicit `Some([])` from the graph writer still
-                // records a known-empty contact list.
-                follows: (!entry.follows.is_empty()).then(|| entry.follows.clone()),
+                // An empty `directory_users` follow list with `follows_created_at == 0`
+                // often means this promotion path has not observed a contact list. Do not
+                // let that absence erase independently discovered search-graph edges; an
+                // explicit timestamped empty list still records a known-empty contact list.
+                follows: (!entry.follows.is_empty() || entry.follows_created_at > 0)
+                    .then(|| entry.follows.clone()),
                 metadata_updated_at: entry.profile.as_ref().map(|profile| profile.created_at),
                 metadata_expires_at: None,
             },
+            entry.follows_created_at,
             now,
         )
     }
@@ -557,7 +674,7 @@ impl DirectoryCache {
     ) -> Result<(), DirectoryError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        Self::put_search_graph_record_locked(&tx, record, now)?;
+        Self::put_search_graph_record_locked(&tx, record, 0, now)?;
         tx.commit()?;
         Ok(())
     }
@@ -568,32 +685,44 @@ impl DirectoryCache {
     /// directory search while avoiding the unbounded social-graph crawl that
     /// promoting every follow would trigger (mdk#687). The author's
     /// cached profile metadata in the search graph is preserved; only the
-    /// follow edges are replaced.
+    /// follow edges are replaced, and only when the incoming event is not older
+    /// than the cached `follows_created_at` (strictly newer when
+    /// `require_strictly_newer` is set for live relay ingest).
     pub(crate) fn remember_search_graph_follows(
         &self,
         account_id_hex: &str,
         npub: &str,
         follows: &[String],
+        created_at: u64,
+        require_strictly_newer: bool,
     ) -> Result<(), DirectoryError> {
         let now = unix_now_seconds() as i64;
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
+        let existing_created_at = Self::search_graph_follows_created_at(&tx, account_id_hex)?;
+        if !follow_recency_accepts(existing_created_at, created_at, require_strictly_newer) {
+            return Ok(());
+        }
+        let next_created_at = created_at.max(existing_created_at);
+        let next_created_at_i64 = i64::try_from(next_created_at).unwrap_or(i64::MAX);
         tx.execute(
             "INSERT INTO directory_search_graph_users (
                 account_id_hex,
                 npub,
                 follows_known,
                 follows_updated_at,
+                follows_created_at,
                 created_at,
                 updated_at
              )
-             VALUES (?1, ?2, 1, ?3, ?3, ?3)
+             VALUES (?1, ?2, 1, ?3, ?4, ?3, ?3)
              ON CONFLICT(account_id_hex) DO UPDATE SET
                 npub = excluded.npub,
                 follows_known = 1,
                 follows_updated_at = excluded.follows_updated_at,
+                follows_created_at = excluded.follows_created_at,
                 updated_at = excluded.updated_at",
-            params![account_id_hex, npub, now],
+            params![account_id_hex, npub, now, next_created_at_i64],
         )?;
         Self::replace_follow_rows(
             &tx,
@@ -606,9 +735,50 @@ impl DirectoryCache {
         Ok(())
     }
 
+    pub(crate) fn search_graph_follows_with_created_at(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<(Vec<String>, u64)>, DirectoryError> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT follows_known, follows_created_at
+                 FROM directory_search_graph_users
+                 WHERE account_id_hex = ?1",
+                [account_id_hex],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((known, created_at)) = row else {
+            return Ok(None);
+        };
+        if known == 0 {
+            return Ok(None);
+        }
+        let follows = Self::follow_rows(&conn, "directory_search_graph_follows", account_id_hex)?;
+        Ok(Some((follows, u64::try_from(created_at).unwrap_or(0))))
+    }
+
+    fn search_graph_follows_created_at(
+        conn: &Connection,
+        account_id_hex: &str,
+    ) -> Result<u64, DirectoryError> {
+        let existing = conn
+            .query_row(
+                "SELECT follows_created_at FROM directory_search_graph_users WHERE account_id_hex = ?1",
+                [account_id_hex],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0);
+        Ok(existing)
+    }
+
     fn put_search_graph_record_locked(
         conn: &Connection,
         record: &DirectorySearchGraphRecord,
+        follows_created_at: u64,
         now: i64,
     ) -> Result<(), DirectoryError> {
         let metadata_updated_at = record
@@ -617,8 +787,18 @@ impl DirectoryCache {
         let metadata_expires_at = record
             .metadata_expires_at
             .and_then(|value| i64::try_from(value).ok());
-        let follows_known = record.follows.is_some();
-        let follows_updated_at = follows_known.then_some(now);
+        let existing_follows_created_at =
+            Self::search_graph_follows_created_at(conn, &record.account_id_hex)?;
+        let update_follows = record.follows.is_some()
+            && follow_recency_accepts(existing_follows_created_at, follows_created_at, false);
+        let follows_updated_at = update_follows.then_some(now);
+        let next_follows_created_at = if update_follows && follows_created_at > 0 {
+            follows_created_at
+        } else {
+            existing_follows_created_at
+        };
+        let next_follows_created_at_i64 =
+            i64::try_from(next_follows_created_at).unwrap_or(i64::MAX);
         conn.execute(
             "INSERT INTO directory_search_graph_users (
                 account_id_hex,
@@ -628,22 +808,27 @@ impl DirectoryCache {
                 metadata_expires_at,
                 follows_known,
                 follows_updated_at,
+                follows_created_at,
                 created_at,
                 updated_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
              ON CONFLICT(account_id_hex) DO UPDATE SET
                 npub = excluded.npub,
                 profile_json = excluded.profile_json,
                 metadata_updated_at = excluded.metadata_updated_at,
                 metadata_expires_at = excluded.metadata_expires_at,
                 follows_known = CASE
-                    WHEN ?9 THEN excluded.follows_known
+                    WHEN ?10 THEN excluded.follows_known
                     ELSE directory_search_graph_users.follows_known
                 END,
                 follows_updated_at = CASE
-                    WHEN ?9 THEN excluded.follows_updated_at
+                    WHEN ?10 THEN excluded.follows_updated_at
                     ELSE directory_search_graph_users.follows_updated_at
+                END,
+                follows_created_at = CASE
+                    WHEN ?10 THEN excluded.follows_created_at
+                    ELSE directory_search_graph_users.follows_created_at
                 END,
                 updated_at = excluded.updated_at",
             params![
@@ -652,13 +837,14 @@ impl DirectoryCache {
                 optional_json(&record.profile)?,
                 metadata_updated_at,
                 metadata_expires_at,
-                i64::from(follows_known),
+                i64::from(update_follows),
                 follows_updated_at,
+                next_follows_created_at_i64,
                 now,
-                follows_known,
+                update_follows,
             ],
         )?;
-        if let Some(follows) = &record.follows {
+        if update_follows && let Some(follows) = &record.follows {
             Self::replace_follow_rows(
                 conn,
                 "directory_search_graph_follows",
@@ -804,7 +990,7 @@ impl DirectoryCache {
 
         for json in json_entries {
             let entry = serde_json::from_str::<UserDirectoryRecord>(&json)?;
-            Self::put_with_reason_locked(conn, &entry, "directory")?;
+            Self::put_v1_record_locked(conn, &entry, "directory")?;
             #[cfg(test)]
             LEGACY_RECORDS_CONVERTED.with(|count| count.set(count.get() + 1));
         }
@@ -877,6 +1063,24 @@ fn record_directory_cache_open() {
     );
 }
 
+pub(crate) fn follow_recency_accepts(
+    cached_created_at: u64,
+    incoming_created_at: u64,
+    require_strictly_newer: bool,
+) -> bool {
+    if cached_created_at == 0 {
+        return true;
+    }
+    if incoming_created_at == 0 {
+        return false;
+    }
+    if require_strictly_newer {
+        incoming_created_at > cached_created_at
+    } else {
+        incoming_created_at >= cached_created_at
+    }
+}
+
 struct DirectoryUserRow {
     account_id_hex: String,
     npub: String,
@@ -884,6 +1088,7 @@ struct DirectoryUserRow {
     profile_json: Option<String>,
     relay_lists_json: String,
     key_package_json: Option<String>,
+    follows_created_at: u64,
 }
 
 struct SearchGraphUserRow {
@@ -891,6 +1096,7 @@ struct SearchGraphUserRow {
     npub: String,
     profile_json: Option<String>,
     follows_known: bool,
+    follows_created_at: u64,
     metadata_expires_at: Option<i64>,
 }
 
@@ -913,6 +1119,7 @@ fn directory_user_row_from_row(
         profile_json: row.get(3)?,
         relay_lists_json: row.get(4)?,
         key_package_json: row.get(5)?,
+        follows_created_at: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
     })
 }
 
@@ -1021,6 +1228,7 @@ mod tests {
             }),
             follows,
             follow_source_relays: vec!["wss://follows.example".to_owned()],
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         }
@@ -1217,7 +1425,8 @@ mod tests {
                 vec![
                     (1, "0001_directory_cache".into()),
                     (2, "0002_public_event_previews".into()),
-                    (3, "0003_follow_availability".into())
+                    (3, "0003_follow_availability".into()),
+                    (4, "0004_follows_created_at".into()),
                 ]
             );
             let count: i64 = conn.query_row(
@@ -1231,7 +1440,7 @@ mod tests {
         cache.close().unwrap();
         let key = SqlCipherKey::new("test-key").unwrap();
         let cache = DirectoryCache::open(dir.path().join("directory.sqlite3"), &key).unwrap();
-        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 3);
+        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 4);
     }
 
     #[test]
@@ -1240,7 +1449,13 @@ mod tests {
         let record = directory_record(account_id(1), vec![account_id(2)]);
         cache.put(&record).unwrap();
         cache
-            .remember_search_graph_follows(&account_id(3), "search-only", &[account_id(4)])
+            .remember_search_graph_follows(
+                &account_id(3),
+                "search-only",
+                &[account_id(4)],
+                0,
+                false,
+            )
             .unwrap();
         cache
             .lock()
@@ -1249,7 +1464,9 @@ mod tests {
             .execute_batch(
                 "DROP TABLE app_cache_schema_migrations;
                  DROP TABLE public_event_previews;
-                 DROP TABLE follow_availability",
+                 DROP TABLE follow_availability;
+                 ALTER TABLE directory_users DROP COLUMN follows_created_at;
+                 ALTER TABLE directory_search_graph_users DROP COLUMN follows_created_at;",
             )
             .unwrap();
         cache.close().unwrap();
@@ -1264,7 +1481,7 @@ mod tests {
             cache.search_graph_follows(&account_id(3)).unwrap(),
             Some(vec![account_id(4)])
         );
-        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 3);
+        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 4);
     }
 
     #[test]
@@ -1274,7 +1491,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO app_cache_schema_migrations VALUES (4, 'private-name', 0)",
+                "INSERT INTO app_cache_schema_migrations VALUES (5, 'private-name', 0)",
                 [],
             )
             .unwrap();
@@ -1285,15 +1502,15 @@ mod tests {
             DirectoryCache::open(path.clone(), &key),
             Err(DirectoryError::Storage(
                 cgka_traits::storage::StorageError::UnsupportedSchemaVersion {
-                    found: 4,
-                    latest_supported: 3
+                    found: 5,
+                    latest_supported: 4
                 }
             ))
         ));
         let conn = Connection::open(&path).unwrap();
         open_hardened_sqlcipher(&conn, &key, SqlCipherHardening::live_cache()).unwrap();
         conn.execute_batch(
-            "DELETE FROM app_cache_schema_migrations WHERE version = 4;
+            "DELETE FROM app_cache_schema_migrations WHERE version = 5;
             UPDATE app_cache_schema_migrations SET name = 'private-name'",
         )
         .unwrap();
@@ -1353,7 +1570,7 @@ mod tests {
         )
         .unwrap();
         migrations::run_all(&mut conn).unwrap();
-        assert_eq!(migration_rows(&conn).len(), 3);
+        assert_eq!(migration_rows(&conn).len(), 4);
         assert!(!DirectoryCache::table_exists_locked(&conn, "user_directory_records").unwrap());
     }
 
@@ -1549,6 +1766,8 @@ mod tests {
                 &follows_nobody,
                 &npub_for_account_id_lossy(&follows_nobody),
                 &[],
+                0,
+                false,
             )
             .unwrap();
         cache
@@ -1556,6 +1775,8 @@ mod tests {
                 &follows_someone,
                 &npub_for_account_id_lossy(&follows_someone),
                 std::slice::from_ref(&friend),
+                0,
+                false,
             )
             .unwrap();
 
@@ -1581,6 +1802,8 @@ mod tests {
                 &alice,
                 &npub_for_account_id_lossy(&alice),
                 std::slice::from_ref(&bob),
+                0,
+                false,
             )
             .unwrap();
         cache
@@ -1639,6 +1862,6 @@ mod tests {
         assert_eq!(entry.follows, vec![bob]);
         assert_eq!(user_count, 1);
         assert!(!legacy_table_exists);
-        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 3);
+        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 4);
     }
 }

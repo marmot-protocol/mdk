@@ -63,6 +63,8 @@ impl SqliteAppStorage {
         now: u64,
         byte_budget: u64,
     ) -> StorageResult<Vec<Vec<u8>>> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         if plaintext.is_empty()
             || plaintext.len() > 64
             || plaintext
@@ -126,6 +128,8 @@ impl SqliteAppStorage {
         message: &str,
         tags: &[Vec<String>],
     ) -> StorageResult<()> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for tag in tags
@@ -151,7 +155,7 @@ impl SqliteAppStorage {
         fallback_budget: u64,
     ) {
         let store = self.clone();
-        let group = group.to_owned();
+        let group = canonical_group_id_hex(group).into_owned();
         let message = message.to_owned();
         self.connection.after_commit(move || {
             let result = (|| -> StorageResult<()> {
@@ -182,6 +186,8 @@ impl SqliteAppStorage {
         now: u64,
         fallback_budget: u64,
     ) -> StorageResult<usize> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         let started = std::time::Instant::now();
         let verified_files = super::file_staging::verify(self, group, message)?;
         self.connection.with_transaction(|| {
@@ -272,6 +278,8 @@ impl SqliteAppStorage {
         group: &str,
         slots: &[serde_json::Value],
     ) -> StorageResult<()> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for slot in slots {
@@ -298,7 +306,8 @@ impl SqliteAppStorage {
         message: &str,
         index: usize,
     ) -> StorageResult<bool> {
-        self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex) JOIN outgoing_attachment_uploads u ON u.group_id_hex=h.group_id_hex AND u.source_epoch=h.source_epoch AND u.slot_json=h.slot_json WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.attachment_index=?3 AND a.direction='sent')",params![group,message,index as i64],|row|row.get(0)).storage()
+        let group = canonical_group_id_hex(group);
+        self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex) JOIN outgoing_attachment_uploads u ON u.group_id_hex=h.group_id_hex AND u.source_epoch=h.source_epoch AND u.slot_json=h.slot_json WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.attachment_index=?3 AND a.direction='sent')",params![group.as_ref(),message,index as i64],|row|row.get(0)).storage()
     }
 
     /// Recover confirmed staged sources after quota recovery without network

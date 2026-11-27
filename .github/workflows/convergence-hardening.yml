@@ -17,12 +17,29 @@ on:
         description: Exact 40-character ancestor commit used for mixed-build release hardening
         required: false
         type: string
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Optional exact 40-character commit SHA to check out (used by rc-releases.yml)
+        required: false
+        default: ""
+        type: string
+      lane:
+        description: Execution lane (weekly_manual or release_hardening)
+        required: false
+        default: weekly_manual
+        type: string
+      baseline_revision:
+        description: Exact 40-character ancestor commit used for mixed-build release hardening
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: convergence-hardening-${{ github.event_name }}-${{ github.ref }}
+  group: convergence-hardening-${{ inputs.source_sha || github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -48,6 +65,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install pinned Odin
         uses: ./.github/actions/setup-odin
@@ -62,7 +80,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
         with:
-          tool: cargo-nextest@0.9.104
+          tool: cargo-nextest@0.9.132
 
       - name: Install just
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
@@ -86,21 +104,22 @@ jobs:
             -- docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
 
       - name: Require an exact release baseline revision
-        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        if: inputs.lane == 'release_hardening'
         env:
           BASELINE_REVISION: ${{ inputs.baseline_revision }}
+          TARGET_SHA: ${{ inputs.source_sha || github.sha }}
         run: |
           set -euo pipefail
           if [[ ! "$BASELINE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
             echo "baseline_revision must be an exact lowercase 40-character commit" >&2
             exit 1
           fi
-          test "$BASELINE_REVISION" != "$GITHUB_SHA"
+          test "$BASELINE_REVISION" != "$TARGET_SHA"
           git cat-file -e "$BASELINE_REVISION^{commit}"
-          git merge-base --is-ancestor "$BASELINE_REVISION" "$GITHUB_SHA"
+          git merge-base --is-ancestor "$BASELINE_REVISION" "$TARGET_SHA"
 
       - name: Check out exact release baseline
-        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        if: inputs.lane == 'release_hardening'
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 1
@@ -109,7 +128,7 @@ jobs:
           ref: ${{ inputs.baseline_revision }}
 
       - name: Build baseline distributed campaign image
-        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        if: inputs.lane == 'release_hardening'
         env:
           BASELINE_REVISION: ${{ inputs.baseline_revision }}
         run: |
@@ -125,9 +144,10 @@ jobs:
               baseline-source
 
       - name: Materialize reviewed mixed-build release campaign
-        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        if: inputs.lane == 'release_hardening'
         env:
           BASELINE_REVISION: ${{ inputs.baseline_revision }}
+          TARGET_SHA: ${{ inputs.source_sha || github.sha }}
         run: |
           set -euo pipefail
           current_image="$(docker image inspect --format '{{.Id}}' marmot-conformance:local)"
@@ -136,7 +156,7 @@ jobs:
           cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
             materialize-release-campaign \
             --output-dir "$release_input_dir" \
-            --current-revision "$GITHUB_SHA" \
+            --current-revision "$TARGET_SHA" \
             --current-image "$current_image" \
             --baseline-revision "$BASELINE_REVISION" \
             --baseline-image "$baseline_image"
@@ -164,7 +184,7 @@ jobs:
               --run-ignored ignored-only --no-tests fail
 
       - name: Run release-hardening lane
-        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        if: inputs.lane == 'release_hardening'
         run: |
           cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
             observe-step \
@@ -192,7 +212,7 @@ jobs:
             --output "$CGKA_LANE_EVIDENCE_DIR/budget-evaluation.v1.json"
 
       - name: Collect release-hardening lane observation
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        if: always() && inputs.lane == 'release_hardening'
         run: |
           manifest_args=()
           if [[ -f "$DISTRIBUTED_MANIFEST" ]]; then
@@ -209,20 +229,22 @@ jobs:
             --output "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json"
 
       - name: Enforce release-hardening lane budget
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        if: always() && inputs.lane == 'release_hardening'
         run: |
           cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
             check-budget release_hardening "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json" \
             --output "$CGKA_LANE_EVIDENCE_DIR/budget-evaluation.v1.json"
 
       - name: Assemble and verify release-hardening evidence bundle
-        if: success() && github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        if: success() && inputs.lane == 'release_hardening'
+        env:
+          TARGET_SHA: ${{ inputs.source_sha || github.sha }}
         run: |
           bundle="$CGKA_LANE_EVIDENCE_DIR/release-bundle/convergence-evidence.v1.json"
           cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- \
             assemble-release-evidence \
             --claim crates/convergence-campaign-runner/release-claims/cross-route-mixed-build.v1.json \
-            --source-revision "$GITHUB_SHA" \
+            --source-revision "$TARGET_SHA" \
             --manifest "$DISTRIBUTED_MANIFEST" \
             --observation "$CGKA_LANE_EVIDENCE_DIR/observed-usage.v1.json" \
             --budget "$CGKA_LANE_EVIDENCE_DIR/budget-evaluation.v1.json" \
@@ -263,6 +285,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install pinned Odin
         uses: ./.github/actions/setup-odin

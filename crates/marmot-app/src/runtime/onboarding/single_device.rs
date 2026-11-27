@@ -26,8 +26,12 @@ impl AccountSetup<'_> {
         let sources = self
             .onboarding_sources(checkpoint, OnboardingStep::SingleDevice)
             .await;
-        let (events, mut findings, completed) =
-            self.inspect_onboarding_relays(id, 30443, sources).await;
+        let OnboardingInspection {
+            records: events,
+            failures: mut findings,
+            completed,
+            ..
+        } = self.inspect_onboarding_relays(id, 30443, sources).await;
         let now = unix_now_seconds();
         let mut packages = Vec::new();
         let mut seen_slots = HashSet::new();
@@ -117,6 +121,12 @@ impl AccountSetup<'_> {
                 checkpoint.single_device_acknowledged = true;
                 OnboardingStatus::Passed
             }
+            None if checkpoint.options.pass_device_notice_when_none_found
+                && notice.discovery == OnboardingDeviceDiscovery::NoneFound
+                && notice.discovery_complete =>
+            {
+                OnboardingStatus::Passed
+            }
             None => OnboardingStatus::NeedsInput,
         };
         checkpoint.snapshot.single_device_notice = Some(notice);
@@ -169,6 +179,7 @@ impl AccountSetup<'_> {
         if checkpoint.snapshot.recovery_epoch.as_deref() != recovery_epoch
             || checkpoint.snapshot.revision != revision
             || checkpoint.approved
+            || checkpoint.auto_inbox.is_some()
             || checkpoint.snapshot.proposal.is_some()
             || checkpoint.single_device_acknowledged
             || checkpoint.snapshot.steps[..OnboardingStep::SingleDevice.index()]

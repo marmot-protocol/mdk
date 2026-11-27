@@ -358,7 +358,7 @@ impl MarmotApp {
     }
 
     pub(crate) fn audit_delivery_active_path(&self, label: &str) -> Result<PathBuf, AppError> {
-        let account_dir = self.account_dir(label);
+        let account_dir = self.account_home().try_account_dir(label)?;
         let device_id = audit_device_id_hex(&account_dir)?;
         let engine_id = audit_engine_id_hex(&self.member_id(label)?, &device_id);
         Ok(marmot_forensics::default_v5_jsonl_path(

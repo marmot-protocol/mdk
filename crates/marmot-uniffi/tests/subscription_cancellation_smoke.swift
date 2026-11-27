@@ -199,6 +199,134 @@ private func cancelWhileWaiting(_ makeHandle: @escaping @Sendable () -> UInt64) 
   }
 }
 
+// Models uniffi_core::RustFuture::scheduler holding its Mutex while invoking
+// uniffiFutureContinuationCallback (which resumes the Swift continuation and
+// acquires AsyncTask's StatusRecordLock), racing with Task.cancel() (which
+// holds StatusRecordLock while invoking withTaskCancellationHandler's onCancel).
+// Calling cancelFunc synchronously inside onCancel deadlocks here
+// deterministically (mdk#3821). Also verifies that a MaybeReady wake after
+// cancel does not re-poll the future, and that freeFunc never runs ahead of an
+// in-flight cancelFunc.
+private final class WakeCancelRaceHarness: @unchecked Sendable {
+  private let schedulerLock = NSLock()
+  private let polled = DispatchSemaphore(value: 0)
+  private let cancelEntered = DispatchSemaphore(value: 0)
+
+  private let stateLock = NSLock()
+  private var callback: UniffiRustFutureContinuationCallback?
+  private var callbackData: UInt64 = 0
+  private var polls = 0
+  private var freed = false
+
+  var pollCount: Int {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    return polls
+  }
+
+  var wasFreed: Bool {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    return freed
+  }
+
+  func poll(_ callback: @escaping UniffiRustFutureContinuationCallback, _ data: UInt64) {
+    stateLock.lock()
+    polls += 1
+    self.callback = callback
+    self.callbackData = data
+    stateLock.unlock()
+    polled.signal()
+  }
+
+  func wakeWhileHoldingSchedulerLock(_ onLockAcquired: () -> Void) {
+    polled.wait()
+    schedulerLock.lock()
+    onLockAcquired()
+    cancelEntered.wait()
+    stateLock.lock()
+    let cb = callback
+    let data = callbackData
+    callback = nil
+    stateLock.unlock()
+    if let cb {
+      cb(data, 1)
+    }
+    schedulerLock.unlock()
+  }
+
+  func cancel() {
+    cancelEntered.signal()
+    schedulerLock.lock()
+    defer { schedulerLock.unlock() }
+    stateLock.lock()
+    precondition(!freed, "cancelFunc ran after freeFunc")
+    let cb = callback
+    let data = callbackData
+    callback = nil
+    stateLock.unlock()
+    if let cb {
+      cb(data, 0)
+    }
+  }
+
+  func free() {
+    stateLock.lock()
+    freed = true
+    stateLock.unlock()
+  }
+}
+
+private func cancelRacingWithWake() async throws {
+  for _ in 0..<20 {
+    let harness = WakeCancelRaceHarness()
+    let (wakerReady, signalWakerReady) = AsyncStream<Void>.makeStream()
+    let (wakerDone, signalWakerDone) = AsyncStream<Void>.makeStream()
+    let waiting = Task.detached {
+      let _: Void = try await uniffiRustCallAsync(
+        rustFutureFunc: { 1 },
+        pollFunc: { _, callback, data in
+          harness.poll(callback, data)
+        },
+        completeFunc: { _, callStatus -> Void in
+          callStatus.pointee.code = CALL_CANCELLED
+        },
+        freeFunc: { _ in
+          harness.free()
+        },
+        cancelFunc: { _ in
+          harness.cancel()
+        },
+        liftFunc: { (_: Void) -> Void in
+          preconditionFailure("cancelled wake-race future lifted a value")
+        },
+        errorHandler: nil
+      )
+    }
+    DispatchQueue.global().async {
+      harness.wakeWhileHoldingSchedulerLock {
+        signalWakerReady.yield()
+        signalWakerReady.finish()
+      }
+      signalWakerDone.yield()
+      signalWakerDone.finish()
+    }
+    var readyIter = wakerReady.makeAsyncIterator()
+    _ = await readyIter.next()
+    waiting.cancel()
+    do {
+      try await waiting.value
+      preconditionFailure("wake-race cancelled future returned normally")
+    } catch is CancellationError {
+    }
+    var doneIter = wakerDone.makeAsyncIterator()
+    _ = await doneIter.next()
+    precondition(harness.pollCount == 1, "cancelled future re-polled after MaybeReady wake")
+    precondition(harness.wasFreed, "cancelled future was not freed")
+  }
+  print("Swift cancel-vs-wake lock-order race passed")
+}
+
 private func receiveMatching<Value>(
   _ next: () async throws -> Value?,
   matching predicate: (Value) -> Bool
@@ -324,6 +452,7 @@ private struct SubscriptionCancellationSmoke {
     try await cancelWhileWaiting {
       uniffi_marmot_uniffi_fn_method_blocklistsubscription_next(blocks.uniffiClonePointer())
     }
+    try await cancelRacingWithWake()
     // A receive generated without `throws`, through the helper its adapter uses.
     try await cancelNativePending(
       "EventsSubscription",

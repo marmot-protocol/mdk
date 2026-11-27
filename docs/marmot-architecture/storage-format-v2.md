@@ -484,9 +484,9 @@ Use a SQLCipher CLI compatible with the pinned cipher format. For a migrated
 database, the key statement is:
 
 ```sql
-PRAGMA cipher_compatibility = 4;
 PRAGMA cipher_memory_security = ON;
 PRAGMA key = "x'<64 HKDF hex>'";
+PRAGMA cipher_compatibility = 4;
 SELECT count(*) FROM sqlite_master;
 PRAGMA secure_delete = ON;
 PRAGMA synchronous = FULL;
@@ -519,9 +519,9 @@ PRAGMA rekey = '<64 HKDF hex>';
 Close the connection and reopen a fresh connection in this order:
 
 ```sql
-PRAGMA cipher_compatibility = 4;
 PRAGMA cipher_memory_security = ON;
 PRAGMA key = '<64 HKDF hex>';
+PRAGMA cipher_compatibility = 4;
 SELECT count(*) FROM sqlite_master;
 PRAGMA secure_delete = ON;
 PRAGMA synchronous = FULL;

@@ -206,6 +206,7 @@ pub(crate) fn target_presentation(
     selected: &SelectedAvatar,
     now: u64,
 ) -> StorageResult<Option<AvatarAssetPresentation>> {
+    let group = crate::base::connection::canonical_group_id_hex(group);
     let Some(source) = source_key(selected) else {
         return Ok(None);
     };
@@ -222,7 +223,7 @@ pub(crate) fn target_presentation(
          WHERE r.group_id_hex = ?1 AND m.id = 1",
     )
     .storage()?
-    .query_row(params![group, member, source], |r| {
+    .query_row(params![group.as_ref(), member, source], |r| {
         let epoch: Vec<u8> = r.get(0)?;
         let row: Vec<u8> = r.get(1)?;
         let token: Option<Vec<u8>> = r.get(2)?;

@@ -118,6 +118,7 @@ async fn connected_searcher_ignores_another_accounts_stale_follows() {
             &nostr_directory::FetchedFollowList {
                 follows: Vec::new(),
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();

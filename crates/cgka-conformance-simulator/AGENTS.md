@@ -350,7 +350,7 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
 
 ```sh
 cargo test -p cgka-conformance-simulator            # or: just conformance
-just simulator-smoke                                # merge-queue lane selection
+just simulator-smoke                                # Canary smoke lane selection
 ```
 
 Add the narrowest gate that covers the change:

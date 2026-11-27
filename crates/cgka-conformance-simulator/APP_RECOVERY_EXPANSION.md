@@ -32,7 +32,7 @@ there is no automatic retry or conversion of an unexercised race into a pass.
 | `public-app-retained-traffic/v1` | 2 cases/seed | Same cycles with 16–24-message bursts, repeated real membership/profile operations, repeated history repair and one hidden historical message per cycle |
 | `public-app-longevity-extended/v1` | explicit only | 48 cycles in one harness, using the same identities and databases; not a wall-clock duration guarantee |
 
-Invite/profile is generator version `2`, retained traffic version `3`, and longevity version `1`.
+Invite/profile is generator version `2`, retained traffic version `4`, and longevity version `2`.
 Existing families and their versions are unchanged. Indices are independently seeded, so increasing case count preserves prefixes.
 OS scheduling and cryptographic identities remain nondeterministic; saved inputs pin the
 schedule, not a promise that a race will occur. The runtime evidence must prove recovery.

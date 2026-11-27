@@ -270,131 +270,6 @@ Injected `NostrRelayClient` implementations opt in with `supports_scoped_subscri
 default (`false`) rejects recovery sessions before staging routes or teardown work. Existing `GroupMaintenance` values
 and legacy installation/removal APIs retain their shape and ids.
 
-## Reconciliation progress ownership
-
-`NostrSdkRelayClient::reconcile_subscription` requires a `NostrReconciliationProgress` store for
-that account and route. Hosts serialize reconciliation per route and preserve its cursor across
-subscription rebuilds. The first ID of each exact-ID request is checkpointed before the request,
-including when the caller later cancels; after the response the cursor moves through the IDs that
-returned. An ID left unattempted by the pass budget does not move the cursor.
-A failed progress read or write stops replay; it must not silently restart at a refused prefix.
-Empty remote sets preserve the cursor: failed relay comparisons can also produce an empty set, and
-the next nonempty set wraps around the saved position.
-
-MarmotApp stores the cursor in its encrypted account database alongside existing route inventory
-(migration 0061). Route retirement deletes it, and a late replay cannot recreate deleted route
-state. There is no shared cross-route cursor cache, so activity on other routes cannot evict an
-active route's progress. State adds at most one 32-byte cursor to each existing route row.
-
-MarmotApp stages SDK progress in memory and saves a route's cursor after every owned comparison
-event has completed its ordinary ingest attempt. Capacity refusals still permit rotation, but
-remain outside inventory and cannot certify coverage. Failed network requests and interrupted
-admission preserve the pre-pass cursor.
-
-Selected-only comparison plans are validated but not reused. The next grant rebuilds its operational
-plan from existing coverage debt. Ignoring a legacy plan leaves messages, replay cursors, coverage
-evidence, retry cost and capability blocks intact. A new comparison request clears the prior
-operational plan; a duplicate request key leaves the current plan intact.
-
-Pass budgets:
-
-- The NIP-77 remote-only selection holds at most 512 IDs from a 16,384-ID reconciliation set.
-- The first NIP-77 reply gets up to five seconds. A pass uses the earlier of its caller's absolute
-  cutoff and a twenty-second SDK allowance. MarmotApp runs up to four routes concurrently under
-  its account-wide cutoff, keeping time for partial-result handoff and epoch-gap window fetches.
-- Each pass sends at most 16 request-local exact-ID acquisitions within that deadline and the
-  aggregate 256-item / 1-MiB-serialized-event allowance. The first request names one ID; later ones name up to 64
-  consecutive IDs the same endpoints claimed, sized to the byte room left at the largest event the pass has seen,
-  because a relay streams every event a request names before the byte limit can stop it. Until an event has
-  returned, batches start at one ID and double. When a budget cuts a request short, its first unreturned ID leads
-  the next pass; when no relay answers, the pass stops after advancing through what returned, at least one ID.
-- One event up to 5 MiB can occupy an otherwise empty pass, matching the pinned SDK's default normalized-message
-  ceiling; larger events remain incomplete. Full-event SDK cache hits share this rule with fetched events.
-- The first exact-ID request may temporarily retain up to 5 MiB per endpoint before deduplication, and the SDK can
-  observe one rejected boundary event beyond its byte limit. The largest endpoint's received count/bytes
-  conservatively charges each network request. Relays can return different events from one batch, so the
-  distinct events a pass returns are held to the same allowance; one that does not fit leads the next pass.
-- These are returned-result and SDK-received budgets, not complete wire or memory ceilings.
-
-Each exact-ID request goes only to the endpoints whose comparison claimed that ID, and
-each endpoint's comparison has its own deadline. Once one endpoint has compared, the others get
-until half of what was left of the pass, so a relay that answers once and then stalls cannot use
-up the time to fetch what the others claimed. Fast endpoint failures leave that endpoint
-incomplete while healthy IDs continue within the same pass budgets; a silent endpoint can still
-consume most of the remaining deadline for the IDs it claimed. A byte/item/deadline exit
-retains partial events but leaves incomplete every endpoint whose claimed IDs the pass did not
-return. An endpoint that claimed nothing left behind still succeeds, and
-`NostrReconciliationSummary::failed_endpoints` names the ones that failed, so a caller can
-certify a subset of a route's relays. `incomplete_endpoints` names the failed ones that still
-answered: they finished the comparison and served their exact-ID requests, but this pass did
-not return every ID they claimed. The rest timed out, errored or truncated.
-`endpoint_failures` gives each failed endpoint one `NostrReconciliationFailure`: the first stage that
-failed it, such as a NEG-ERR (with its reason's machine-readable prefix, never the text), no first
-reply, the pass deadline, or an endpoint outside the account's pool. A failure in a later window or
-boundary probe is classified the same way. An incomplete endpoint is `Withheld` only when it reached
-EOSE on an exact-ID fetch without an ID it claimed; one this pass's own budget or ordering left
-unasked or cut short is `PassLimit`.
-
-Wrapper clones of one SDK pool share eight comparison permits per canonical relay. Initial comparisons,
-window searches and boundary probes take the same permits; waiting spends the caller's existing deadline.
-`SDK_RECONCILIATION_WINDOW_PROBES` sets both this per-relay permit limit and the window-search probe count.
-Different endpoints and independently built account pools have independent permits. This bounds active SDK
-sync futures, not the lifetime of remote sessions: cancellation queues the SDK's asynchronous cleanup task
-but does not confirm that NEG-CLOSE has reached the socket before a permit is reused.
-
-strfry answers a NEG-OPEN past its per-connection session cap with a session-less NOTICE (`ERROR: too
-many concurrent NEG requests`) that nostr-sdk ignores, so the comparison waits out its first-reply
-timeout. The client watches the relay while the NEG-OPEN is pending and reports that timeout as
-`NegCapNotice`. It keeps no per-relay rejection state between passes; the caller paces retries.
-
-A group route's gap is fetched from its oldest end. MLS applies commits in order, so fetching IDs in ID order,
-which is effectively random in time, could let commits carry a member's epoch more than the retained-epoch window
-past older messages still missing, which can then never be read (mdk#2086).
-
-- **Window.** When the gap holds more than one pass (256 IDs, or fewer when the route's events are large enough that
-  256 would exceed 1 MiB), the pass finds the oldest window `[since, bound]` that fits with dry-run comparisons: up to
-  six rounds of eight concurrent probes within half of what is left of the deadline. A first search starts at the
-  recent end, where a catch-up gap sits, at distances shrinking by powers of two; later rounds spread evenly within
-  the bracket. A probe counts as fitting only when every relay asked answered it: a relay that missed it may hold
-  older history the others lack.
-- **Unfinished searches.** A pass whose search did not find such a window fetches nothing and the next pass resumes
-  its bracket, because fetching a window larger than a pass would return part of it in ID order. It fetches anyway
-  when the bracket can no longer shrink or the previous pass already waited: the narrowest window a complete probe
-  measured, or else the whole gap, with delivery still held to a time prefix. A pass whose probes no relay answered
-  fetches nothing.
-- **Time prefix.** A window the byte budget or deadline cuts short returns only events older than every one it left
-  for the next pass, found with one more probe round up to the returned events' timestamps; timestamps are whole
-  seconds, so a second split by the budget is held together. When no probe gets a complete answer the boundary is
-  unknown and the pass holds everything. Events held back are fetched again. Every ID of the window not returned
-  holds delivery back, including ones a request timed out on, except an event every claimant answered without or one
-  over the single-object ceiling. Ordered passes reserve part of the deadline for that probe round.
-- **No order, no delivery.** A route that cannot prove an order (a relay that answers comparisons but never the
-  probes, or one second holding more than a pass) returns nothing and stays quiet. Its events stay fetchable, and
-  recovery parks it with its "history may be incomplete" notice if that persists, rather than admit newer commits
-  ahead of older messages. Such a pass sets `NostrReconciliationSummary::order_unproven`; the relay plane counts it,
-  and opt-in telemetry exports the device-wide total as `relay_reconciliation_order_unproven_passes`.
-- **Memory.** The client remembers, per route and in memory only, the last bound that fit, how far past it to look
-  next, an unfinished bracket, and the route's average event size, so a backlog being worked through usually needs
-  one round. It also sets aside IDs a pass returned that the account has not admitted since, and IDs every claimant
-  answered without (not ones this pass's own allowance dropped), or that can never fit the single-object ceiling:
-  they yield to history not tried yet and are
-  retried with leftover room. A route keeps as many as its relays' comparisons can name together, up to 65,536;
-  beyond that it cannot keep an order and stays quiet. Past 65,536 across routes the least recently used route's
-  memory is dropped, and it sets its IDs aside again. Losing this memory costs at most extra narrowing or a refetch.
-
-A window is fetched in the cursor's rotation and returned in time order. The rotation's first ID leads, and the rest
-are grouped by claiming relays so requests batch fully. A budget cut leaves the cursor just before the ID it deferred,
-so that ID is the next pass's first request with the single-object allowance, whichever relays claim it. Selection never changes the summary's endpoint results: a relay that claimed an ID this pass left unfetched stays incomplete. The
-account inbox route keeps ID-order selection. The extra dry-run comparisons are control traffic: about 200 KiB to
-fetch an eight-event, 2.6-MB gap against 1,100 retained events in the adapter fixture.
-
-Replay position is advisory, separate from admitted event inventory. A cancelled fetch retains its
-pre-I/O cursor advance. A completed byte-limit rejection of an otherwise eligible network ID
-restores the preceding cursor when earlier results consumed this pass's allowance, so the ID leads
-the next pass even if that earlier result stays unadmitted. Repeated route URLs are counted once
-after parsing, preserving one acquisition obligation per distinct relay. Refused and over-ceiling
-events recur on wrap; only durable app ingestion removes an event from the missing set.
-
 ## Raw page evidence
 
 Bounded acquisition sends each endpoint's request as a finite request, as the sweep does (below), so its replies
@@ -442,7 +317,10 @@ under the relay's cap). A window whose relay set reaches the 16,384-item limit m
 is certified once every id the relay named is fetched; a call cut by its deadline, its event or byte budget, a
 withheld id or a refusal hands over what it fetched uncertified, so its caller holds those events and the next call
 resumes without fetching them again. A cut fetch is interrupted as a sweep's request is, so what it read is reported.
-`SdkSweepRelay` implements the relay side. The recovery runner (#2660) uses it
+`SdkSweepRelay` implements the relay side. Wrapper clones of one SDK pool share eight NIP-77
+comparison permits per canonical relay (`SDK_NEG_CONCURRENT_SESSIONS`), and watch for strfry's
+session-less `ERROR: too many concurrent NEG requests` NOTICE so cap refusals surface as rate
+limits rather than generic timeouts. The recovery runner (#2660) uses it
 for owed ranges where the account already holds events, and for its periodic re-checks of covered history.
 
 ## Run tests

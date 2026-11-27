@@ -683,14 +683,13 @@ impl MarmotApp {
         purged
     }
 
-    /// Close `label`'s report admission, stop its in-flight report work and
-    /// delete every report it queued. Admission stays closed until the fence
-    /// drops, so a teardown holds it until the account is signed out or gone.
-    /// The fence is returned even when the purge fails.
-    pub(crate) async fn fence_moderation_reports(
+    /// Close `label`'s report admission and wait for any in-flight report work
+    /// to stop, without mutating stored reports. Admission stays closed until
+    /// the returned fence drops.
+    pub(crate) async fn close_moderation_report_admission(
         &self,
         label: &str,
-    ) -> (ModerationReportFence, Result<u64, AppError>) {
+    ) -> ModerationReportFence {
         let slot = self.moderation_reports.slot(label);
         // Raise the fence before bumping: work that subscribes after the bump
         // sees the fence under the lock instead.
@@ -700,6 +699,16 @@ impl MarmotApp {
         slot.generation
             .send_modify(|generation| *generation = generation.wrapping_add(1));
         let _work = slot.work.lock().await;
+        fence
+    }
+
+    /// Delete every queued moderation report for `label` while holding its
+    /// admission fence.
+    fn purge_fenced_moderation_reports(
+        &self,
+        label: &str,
+        _fence: &ModerationReportFence,
+    ) -> Result<u64, AppError> {
         // An account that cannot sign, or whose database was never created,
         // has no reports. Do not create and migrate a database to learn that.
         #[cfg(test)]
@@ -708,12 +717,9 @@ impl MarmotApp {
             .fail_next_purge
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return (
-                fence,
-                Err(AppError::Storage(cgka_traits::storage::StorageError::Busy(
-                    "injected".into(),
-                ))),
-            );
+            return Err(AppError::Storage(cgka_traits::storage::StorageError::Busy(
+                "injected".into(),
+            )));
         }
         let purged = match self.account_home.account(label) {
             Ok(account) if !account.can_sign() => Ok(0),
@@ -730,6 +736,19 @@ impl MarmotApp {
                 "failed to purge queued moderation reports"
             );
         }
+        purged
+    }
+
+    /// Close `label`'s report admission, stop its in-flight report work and
+    /// delete every report it queued. Admission stays closed until the fence
+    /// drops, so a teardown holds it until the account is signed out or gone.
+    /// The fence is returned even when the purge fails.
+    pub(crate) async fn fence_moderation_reports(
+        &self,
+        label: &str,
+    ) -> (ModerationReportFence, Result<u64, AppError>) {
+        let fence = self.close_moderation_report_admission(label).await;
+        let purged = self.purge_fenced_moderation_reports(label, &fence);
         (fence, purged)
     }
 

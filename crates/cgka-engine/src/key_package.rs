@@ -14,8 +14,8 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::StorageProvider;
 use openmls::prelude::{
-    KeyPackage as MlsKeyPackage, KeyPackageBundle, KeyPackageVerifyError, Lifetime,
-    MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolVersion,
+    KeyPackage as MlsKeyPackage, KeyPackageBundle, KeyPackageVerifyError, LeafNodeLifetimePolicy,
+    Lifetime, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolVersion,
 };
 use openmls::treesync::LeafNodeSource;
 use openmls_rust_crypto::RustCrypto;
@@ -627,7 +627,7 @@ impl<S: StorageProvider> Engine<S> {
     /// fails the read instead: skipping it would report an owned KeyPackage
     /// as not owned.
     pub fn durably_owned_key_packages(&self) -> Result<Vec<KeyPackage>, EngineError> {
-        durably_owned_key_packages(&self.storage, self.new_protocol_profile)
+        durably_owned_key_packages(self.storage.as_ref(), self.new_protocol_profile)
     }
 
     /// [`Self::durably_owned_key_packages`] with how long the list holds while
@@ -635,7 +635,7 @@ impl<S: StorageProvider> Engine<S> {
     pub fn durably_owned_key_packages_with_validity(
         &self,
     ) -> Result<OwnedKeyPackages, EngineError> {
-        durably_owned_key_packages_with_validity(&self.storage, self.new_protocol_profile)
+        durably_owned_key_packages_with_validity(self.storage.as_ref(), self.new_protocol_profile)
     }
 
     /// Whether `key_package` advertises what a KeyPackage built now would:
@@ -903,10 +903,27 @@ pub(crate) fn validate_key_package(
     kp_in: openmls::prelude::KeyPackageIn,
     crypto: &impl OpenMlsCrypto,
 ) -> Result<MlsKeyPackage, EngineError> {
+    validate_key_package_with_lifetime_policy(kp_in, crypto, LeafNodeLifetimePolicy::Verify)
+}
+
+/// Authenticate the exact package before deriving its local storage key for
+/// deletion. A package whose validity window has elapsed can still be retired.
+pub(crate) fn validate_key_package_for_retirement(
+    kp_in: openmls::prelude::KeyPackageIn,
+    crypto: &impl OpenMlsCrypto,
+) -> Result<MlsKeyPackage, EngineError> {
+    validate_key_package_with_lifetime_policy(kp_in, crypto, LeafNodeLifetimePolicy::Skip)
+}
+
+fn validate_key_package_with_lifetime_policy(
+    kp_in: openmls::prelude::KeyPackageIn,
+    crypto: &impl OpenMlsCrypto,
+    lifetime_policy: LeafNodeLifetimePolicy,
+) -> Result<MlsKeyPackage, EngineError> {
     let key_package = kp_in
-        .validate(crypto, ProtocolVersion::Mls10)
+        .validate_with_lifetime_policy(crypto, ProtocolVersion::Mls10, lifetime_policy)
         .map_err(key_package_verify_error)?;
-    validate_key_package_lifetime_policy(&key_package)?;
+    validate_key_package_lifetime_range(&key_package)?;
     Ok(key_package)
 }
 
@@ -922,7 +939,7 @@ fn key_package_verify_error(err: KeyPackageVerifyError) -> EngineError {
     }
 }
 
-fn validate_key_package_lifetime_policy(key_package: &MlsKeyPackage) -> Result<(), EngineError> {
+fn validate_key_package_lifetime_range(key_package: &MlsKeyPackage) -> Result<(), EngineError> {
     let lifetime = key_package.life_time();
     if !lifetime.has_acceptable_range() {
         return Err(EngineError::InvalidKeyPackageLifetime {

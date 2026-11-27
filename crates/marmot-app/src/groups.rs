@@ -669,7 +669,8 @@ pub struct AppGroupProfileComponent {
 /// `image_key_hex`/`image_upload_key_hex` are key material that travels
 /// in-band inside the MLS-protected component (`data_hex` carries the same
 /// bytes). Serialization is the component's design; the hand-written `Debug`
-/// impl below redacts the key fields so a `{:?}` never prints key material.
+/// impl below redacts the key fields so a `{:?}` never prints key material,
+/// and `Drop` erases the key fields and `data_hex` when dropped.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupImageComponent {
     pub component_id: u16,
@@ -698,6 +699,17 @@ impl std::fmt::Debug for AppGroupImageComponent {
             .finish()
     }
 }
+
+impl Drop for AppGroupImageComponent {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.image_key_hex.zeroize();
+        self.image_upload_key_hex.zeroize();
+        self.data_hex.zeroize();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for AppGroupImageComponent {}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupAvatarUrlComponent {
@@ -1547,34 +1559,36 @@ impl AppGroupProfileComponent {
 }
 
 impl AppGroupImageComponent {
-    pub(crate) fn new(input: AppGroupImageInput) -> Self {
+    pub(crate) fn new(mut input: AppGroupImageInput) -> Self {
         let present = !input.image_hash_hex.is_empty()
             || !input.image_key_hex.is_empty()
             || !input.image_nonce_hex.is_empty()
             || !input.image_upload_key_hex.is_empty()
             || input.media_type.is_some();
         let image_hash = hex::decode(&input.image_hash_hex).unwrap_or_default();
-        let image_key = hex::decode(&input.image_key_hex).unwrap_or_default();
+        let image_key =
+            zeroize::Zeroizing::new(hex::decode(&input.image_key_hex).unwrap_or_default());
         let image_nonce = hex::decode(&input.image_nonce_hex).unwrap_or_default();
-        let image_upload_key = hex::decode(&input.image_upload_key_hex).unwrap_or_default();
+        let image_upload_key =
+            zeroize::Zeroizing::new(hex::decode(&input.image_upload_key_hex).unwrap_or_default());
         let media_type_bytes = input.media_type.as_deref().unwrap_or("").as_bytes();
-        let data = encode_component_vectors(&[
+        let data = zeroize::Zeroizing::new(encode_component_vectors(&[
             image_hash.as_slice(),
             image_key.as_slice(),
             image_nonce.as_slice(),
             image_upload_key.as_slice(),
             media_type_bytes,
-        ]);
+        ]));
         Self {
             component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
             component: GROUP_BLOSSOM_IMAGE_COMPONENT.to_owned(),
             present,
-            image_hash_hex: input.image_hash_hex,
-            image_key_hex: input.image_key_hex,
-            image_nonce_hex: input.image_nonce_hex,
-            image_upload_key_hex: input.image_upload_key_hex,
-            media_type: input.media_type,
-            data_hex: hex::encode(data),
+            image_hash_hex: std::mem::take(&mut input.image_hash_hex),
+            image_key_hex: std::mem::take(&mut input.image_key_hex),
+            image_nonce_hex: std::mem::take(&mut input.image_nonce_hex),
+            image_upload_key_hex: std::mem::take(&mut input.image_upload_key_hex),
+            media_type: input.media_type.take(),
+            data_hex: hex::encode(&*data),
         }
     }
 }
@@ -1968,6 +1982,16 @@ impl std::fmt::Debug for AppGroupImageInput {
     }
 }
 
+impl Drop for AppGroupImageInput {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.image_key_hex.zeroize();
+        self.image_upload_key_hex.zeroize();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for AppGroupImageInput {}
+
 impl AppGroupImageInput {
     /// Whether a usable image is present (matches the engine's all-or-nothing
     /// validation: hash, key, nonce, and media type must all be set).
@@ -1983,24 +2007,24 @@ impl AppGroupImageInput {
     /// Returns the default (absent) input when the component is empty.
     pub(crate) fn from_component_bytes(bytes: &[u8]) -> Option<Self> {
         let mut cursor = bytes;
-        let mut fields: Vec<Vec<u8>> = Vec::with_capacity(5);
-        for _ in 0..5 {
-            fields.push(read_component_vector(&mut cursor)?);
-        }
+        let image_hash = read_component_vector(&mut cursor)?;
+        let image_key = zeroize::Zeroizing::new(read_component_vector(&mut cursor)?);
+        let image_nonce = read_component_vector(&mut cursor)?;
+        let image_upload_key = zeroize::Zeroizing::new(read_component_vector(&mut cursor)?);
+        let media_type = read_component_vector(&mut cursor)?;
         if !cursor.is_empty() {
             return None;
         }
-        let media_type = fields.pop().unwrap_or_default();
         let media_type = if media_type.is_empty() {
             None
         } else {
             Some(String::from_utf8(media_type).ok()?)
         };
         Some(Self {
-            image_hash_hex: hex::encode(&fields[0]),
-            image_key_hex: hex::encode(&fields[1]),
-            image_nonce_hex: hex::encode(&fields[2]),
-            image_upload_key_hex: hex::encode(&fields[3]),
+            image_hash_hex: hex::encode(&image_hash),
+            image_key_hex: hex::encode(image_key.as_slice()),
+            image_nonce_hex: hex::encode(&image_nonce),
+            image_upload_key_hex: hex::encode(image_upload_key.as_slice()),
             media_type,
         })
     }
@@ -2337,7 +2361,7 @@ pub(crate) fn observe_event(
             // frozen V1's message-fatal rule. V2 rejection is attachment-local,
             // and locator-kind policy gates fetchability at download time rather
             // than delivery.
-            let Some(mut message) = decode_received_event(
+            let mut message = decode_received_event(
                 payload,
                 &sender_hex,
                 sender_display_name,
@@ -2348,10 +2372,7 @@ pub(crate) fn observe_event(
                 source_received_at,
                 outer_transport_at,
                 allow_loopback_http,
-            ) else {
-                summary.events.push(host_group_event(event));
-                return None;
-            };
+            )?;
             message.authority = *authority;
             // A device-group kind is read only in the device group this
             // account trusts, whose events never reach a chat's projection.
@@ -2364,7 +2385,6 @@ pub(crate) fn observe_event(
                     kind = message.kind,
                     "ignoring a device-group kind outside the device group",
                 );
-                summary.events.push(host_group_event(event));
                 return None;
             }
             // Gossip remains available to native ingestion, but must never enter
@@ -3283,5 +3303,129 @@ mod group_roster_api_tests {
             assert_eq!(record.presentation_member_ids_hex, None, "{roster:?}");
             assert_eq!(record.direct_member_ids_hex, None, "{roster:?}");
         }
+    }
+
+    #[test]
+    fn observe_event_omits_rejected_and_device_group_messages_from_summary_events() {
+        let group_id = GroupId::new(vec![0x42; 16]);
+        let sender = MemberId::new(vec![0x11; 32]);
+        let sender_hex = hex::encode(sender.as_slice());
+        let mut state = AccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: Vec::new(),
+        };
+        let display_names = HashMap::new();
+
+        // 1. Payload that fails `decode_received_event` (invalid inner JSON).
+        let mut summary = SyncSummary::default();
+        let malformed = GroupEvent::MessageReceived {
+            group_id: group_id.clone(),
+            message_id: cgka_traits::MessageId::new(vec![0xaa; 32]),
+            sender: sender.clone(),
+            sender_leaf_index: Some(1),
+            epoch: cgka_traits::EpochId(1),
+            payload: b"{}".to_vec(),
+            retention: None,
+            authority: None,
+            encrypted_media_secret: None,
+        };
+        let source_a = "aa".repeat(32);
+        assert!(
+            observe_event(
+                &mut state,
+                &display_names,
+                &mut summary,
+                &malformed,
+                None,
+                &source_a,
+                100,
+                None,
+                false,
+            )
+            .is_none()
+        );
+        assert!(summary.messages.is_empty());
+        assert!(
+            summary.events.is_empty(),
+            "rejected messages must not be pushed to SyncSummary.events"
+        );
+
+        // 2. Validly signed/canonical device-group kind received outside a device group.
+        let inner = cgka_traits::app_event::MarmotAppEvent::new(
+            sender_hex,
+            100,
+            crate::client::device_group::KIND_DEVICE_HEARTBEAT,
+            Vec::new(),
+            "{}",
+        );
+        let device_kind_event = GroupEvent::MessageReceived {
+            group_id,
+            message_id: cgka_traits::MessageId::new(vec![0xbb; 32]),
+            sender,
+            sender_leaf_index: Some(1),
+            epoch: cgka_traits::EpochId(1),
+            payload: inner.encode().unwrap(),
+            retention: None,
+            authority: None,
+            encrypted_media_secret: None,
+        };
+        let mut summary = SyncSummary::default();
+        let source_b = "bb".repeat(32);
+        assert!(
+            observe_event(
+                &mut state,
+                &display_names,
+                &mut summary,
+                &device_kind_event,
+                None,
+                &source_b,
+                100,
+                None,
+                false,
+            )
+            .is_none()
+        );
+        assert!(summary.messages.is_empty());
+        assert!(
+            summary.events.is_empty(),
+            "device-group kinds in non-device chats must not reach SyncSummary.events"
+        );
+    }
+
+    #[test]
+    fn app_group_image_component_zeroizes_on_drop_and_redacts_debug() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<AppGroupImageInput>();
+        assert_zeroize_on_drop::<AppGroupImageComponent>();
+
+        let hash_hex = "11".repeat(32);
+        let key_hex = "ab".repeat(32);
+        let nonce_hex = "22".repeat(12);
+        let upload_key_hex = "cd".repeat(32);
+        let input = AppGroupImageInput {
+            image_hash_hex: hash_hex.clone(),
+            image_key_hex: key_hex.clone(),
+            image_nonce_hex: nonce_hex.clone(),
+            image_upload_key_hex: upload_key_hex.clone(),
+            media_type: Some("image/png".to_owned()),
+        };
+
+        let component = AppGroupImageComponent::new(input);
+        assert!(component.present);
+        assert_eq!(component.image_key_hex, key_hex);
+        assert_eq!(component.image_upload_key_hex, upload_key_hex);
+        assert!(!component.data_hex.is_empty());
+
+        let rendered = format!("{component:?}");
+        assert!(rendered.contains(&hash_hex));
+        assert!(rendered.contains("<redacted>"));
+        assert!(
+            !rendered.contains(&key_hex)
+                && !rendered.contains(&upload_key_hex)
+                && !rendered.contains(&component.data_hex),
+            "AppGroupImageComponent Debug must redact keys and encoded component bytes: {rendered}"
+        );
     }
 }

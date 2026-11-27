@@ -121,23 +121,24 @@ pub use conversions::{
     MessageDraftAttachmentSummaryFfi, MessageDraftFfi, MessageDraftSummaryFfi, MessageTagFfi,
     NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTrafficClassFfi,
     NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
-    OnboardingActionFfi, OnboardingDeviceDiscoveryFfi, OnboardingDevicePackageFfi,
-    OnboardingFindingFfi, OnboardingIssueFfi, OnboardingOptionsFfi, OnboardingRelayCapabilityFfi,
-    OnboardingRelayRepairFfi, OnboardingRelayRepairModeFfi, OnboardingRelayTagChangeFfi,
-    OnboardingRelayTagDispositionFfi, OnboardingRelayTagFfi, OnboardingRelayTagRoleFfi,
-    OnboardingRepairProposalFfi, OnboardingSingleDeviceNoticeFfi, OnboardingSnapshotFfi,
-    OnboardingStatusFfi, OnboardingStepFfi, OnboardingStepStateFfi, PeriodicMaintenancePolicyFfi,
-    PollOptionResultFfi, PollProjectionFfi, PollTypeFfi, PollVoteFfi, PollVotePageFfi,
-    ProductAnalyticsActivityFfi, ProductAnalyticsMetadataFfi, ProductAnalyticsRuntimeConfigFfi,
-    ProductEventFfi, ProductEventModeFfi, ProductEventPropertyFfi, ProductEventSchemaFfi,
-    ProductPropertyKindFfi, ProductPropertySchemaFfi, ProductRecordResultFfi, PushPlatformFfi,
-    PushRegistrationFfi, PushRegistrationShareOutcomeFfi, PushRegistrationShareStatusFfi,
-    PushRegistrationSyncResultFfi, RelayEndpointClassificationFfi, RelayEndpointPolicyFfi,
-    RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
-    RetentionSweepGroupOutcomeFfi, RetentionSweepReportFfi, RetentionSweepStatusFfi,
-    RuntimeProjectionUpdateFfi, SecureDeleteExpiredResultFfi, StickerAssetFfi, StickerFfi,
-    StickerImportResultFfi, StickerPackFfi, StickerRefFfi, StickerSyncResultFfi,
-    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    OnboardingActionFfi, OnboardingCreatedInboxListFfi, OnboardingDeviceDiscoveryFfi,
+    OnboardingDevicePackageFfi, OnboardingFindingFfi, OnboardingIssueFfi, OnboardingOptionsFfi,
+    OnboardingRelayCapabilityFfi, OnboardingRelayRepairFfi, OnboardingRelayRepairModeFfi,
+    OnboardingRelayTagChangeFfi, OnboardingRelayTagDispositionFfi, OnboardingRelayTagFfi,
+    OnboardingRelayTagRoleFfi, OnboardingRepairProposalFfi, OnboardingSingleDeviceNoticeFfi,
+    OnboardingSnapshotFfi, OnboardingStatusFfi, OnboardingStepFfi, OnboardingStepStateFfi,
+    PeriodicMaintenancePolicyFfi, PollOptionResultFfi, PollProjectionFfi, PollTypeFfi, PollVoteFfi,
+    PollVotePageFfi, ProductAnalyticsActivityFfi, ProductAnalyticsMetadataFfi,
+    ProductAnalyticsRuntimeConfigFfi, ProductEventFfi, ProductEventModeFfi,
+    ProductEventPropertyFfi, ProductEventSchemaFfi, ProductPropertyKindFfi,
+    ProductPropertySchemaFfi, ProductRecordResultFfi, PushPlatformFfi, PushRegistrationFfi,
+    PushRegistrationShareOutcomeFfi, PushRegistrationShareStatusFfi, PushRegistrationSyncResultFfi,
+    RelayEndpointClassificationFfi, RelayEndpointPolicyFfi, RelayTelemetryResourceFfi,
+    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RetentionSweepGroupOutcomeFfi,
+    RetentionSweepReportFfi, RetentionSweepStatusFfi, RuntimeProjectionUpdateFfi,
+    SecureDeleteExpiredResultFfi, StickerAssetFfi, StickerFfi, StickerImportResultFfi,
+    StickerPackFfi, StickerRefFfi, StickerSyncResultFfi, TimelineMessageChangeFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
     TimelineUserReactionFfi, TransportFanoutStatusFfi, UsageDiagnosticsDecisionFfi,
@@ -257,6 +258,9 @@ pub struct MarmotOptions {
     pub secret_store: Option<Arc<dyn SecretStore>>,
     #[uniffi(default = None)]
     pub attachment_acquisition_mode: Option<AttachmentAcquisitionModeFfi>,
+    /// Disable background acquisition of public avatar URLs. Defaults to false.
+    #[uniffi(default = false)]
+    pub disable_public_avatar_acquisition: bool,
     /// Destination for private moderation reports (`submit_moderation_report`). Set per
     /// build flavor. Invalid values leave reporting unconfigured; `configure_moderation_reporting`
     /// reports why.
@@ -280,6 +284,7 @@ impl MarmotOptions {
             device_platform: None,
             secret_store: None,
             attachment_acquisition_mode: None,
+            disable_public_avatar_acquisition: false,
             moderation_report_config: None,
             deployment,
         }
@@ -288,6 +293,7 @@ impl MarmotOptions {
     fn app_config(&self) -> MarmotAppConfig {
         let relay_policy = self.relay_policy.unwrap_or(RelayPolicyFfi::PublicOnly);
         MarmotAppConfig::default()
+            .with_public_avatar_acquisition(!self.disable_public_avatar_acquisition)
             .with_attachment_acquisition_mode(
                 self.attachment_acquisition_mode.unwrap_or_default().into(),
             )

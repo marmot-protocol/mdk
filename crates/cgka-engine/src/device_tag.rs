@@ -294,7 +294,7 @@ impl<S: StorageProvider> Engine<S> {
         if !matches!(crate::engine::add_leaf_lifetime(leaf), Ok(Some(_))) {
             return None;
         }
-        let own_slot = own_device_slot(&self.storage).ok().flatten();
+        let own_slot = own_device_slot(self.storage.as_ref()).ok().flatten();
         self.own_device_tag_after(group, proposals, own_slot)
     }
 
@@ -314,7 +314,7 @@ impl<S: StorageProvider> Engine<S> {
             .as_ref()
             .is_some_and(|group_id| group_id.as_slice() == mls_group.group_id().as_slice());
         let own = if in_device_group {
-            let own_slot = own_device_slot(&self.storage).ok().flatten();
+            let own_slot = own_device_slot(self.storage.as_ref()).ok().flatten();
             self.own_device_tag_after(mls_group, proposals, own_slot)
         } else {
             self.first_own_roster_tag(mls_group, proposals)
@@ -670,7 +670,7 @@ mod tests {
 
     fn roster_with_device(tag_signature_key: Option<Vec<u8>>) -> DeviceRosterV1 {
         let mut roster = DeviceRosterV1 {
-            leaf_tag_key: LEAF_TAG_KEY,
+            leaf_tag_key: LEAF_TAG_KEY.into(),
             ..DeviceRosterV1::default()
         };
         roster.devices.insert(
@@ -825,7 +825,7 @@ mod tests {
         unclaimed(&spec_tag(), &[0x67; 32], &roster);
         // Another account's leaf_tag_key.
         let other_key = DeviceRosterV1 {
-            leaf_tag_key: [0x34; 32],
+            leaf_tag_key: [0x34; 32].into(),
             ..roster.clone()
         };
         unclaimed(&spec_tag(), &LEAF_SIGNATURE_KEY, &other_key);

@@ -185,19 +185,20 @@ pub use runtime::{
     AccountSetupRequest, AccountSetupResult, AuditOtlpAttemptOutcome, BackgroundBackupOutcome,
     CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport,
     ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction, OnboardingCheckOutcome,
-    OnboardingCheckPurpose, OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding,
-    OnboardingFindingContext, OnboardingIssue, OnboardingOptions, OnboardingRelayCapability,
-    OnboardingRelayRemovalReason, OnboardingRelayRepair, OnboardingRelayRepairMode,
-    OnboardingRelayTag, OnboardingRelayTagChange, OnboardingRelayTagDisposition,
-    OnboardingRelayTagRole, OnboardingRepairProposal, OnboardingSingleDeviceNotice,
-    OnboardingSnapshot, OnboardingStatus, OnboardingStep, OnboardingStepState,
-    OnboardingSubscription, RelayFailure, RuntimeAccountAttentionSubscription, RuntimeAccountError,
-    RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
-    RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
-    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
-    RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeRelayLivenessSubscription,
-    RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
-    SignOutOptions, SignOutOutcome, TimelineWindowHandle, WipeOutcome,
+    OnboardingCheckPurpose, OnboardingCreatedInboxList, OnboardingDeviceDiscovery,
+    OnboardingDevicePackage, OnboardingFinding, OnboardingFindingContext, OnboardingIssue,
+    OnboardingOptions, OnboardingRelayCapability, OnboardingRelayRemovalReason,
+    OnboardingRelayRepair, OnboardingRelayRepairMode, OnboardingRelayTag, OnboardingRelayTagChange,
+    OnboardingRelayTagDisposition, OnboardingRelayTagRole, OnboardingRepairProposal,
+    OnboardingSingleDeviceNotice, OnboardingSnapshot, OnboardingStatus, OnboardingStep,
+    OnboardingStepState, OnboardingSubscription, RelayFailure, RuntimeAccountAttentionSubscription,
+    RuntimeAccountError, RuntimeChatListSubscription, RuntimeChatListUpdate,
+    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
+    RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
+    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
+    RuntimeRelayLivenessSubscription, RuntimeSharedServices, RuntimeTimelineMessageUpdate,
+    RuntimeTimelineMessagesSubscription, SignOutOptions, SignOutOutcome, TimelineWindowHandle,
+    WipeOutcome,
 };
 pub use runtime::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
@@ -2297,16 +2298,18 @@ impl MarmotApp {
         relay_plane: &MarmotRelayPlane,
         lifecycle: runtime::RuntimeLifecycle,
         startup_progress: Option<&AccountStartupProgress>,
+        tasks: Option<&runtime::account_worker::WorkerTaskScope>,
     ) -> Result<AppClient, AppError> {
         // Deferred hydration (mdk#1161): the account worker drives the
         // background per-group hydration pipeline after signalling local
         // readiness, so runtime opens stay flat in stored-group count.
-        self.local_client_with_relay_plane_and_hydration(
+        self.local_client_with_relay_plane_and_hydration_scoped(
             label,
             relay_plane,
             Some(lifecycle),
             true,
             startup_progress,
+            tasks,
         )
         .await
     }
@@ -2353,6 +2356,26 @@ impl MarmotApp {
         defer_group_hydration: bool,
         startup_progress: Option<&AccountStartupProgress>,
     ) -> Result<AppClient, AppError> {
+        self.local_client_with_relay_plane_and_hydration_scoped(
+            label,
+            relay_plane,
+            lifecycle,
+            defer_group_hydration,
+            startup_progress,
+            None,
+        )
+        .await
+    }
+
+    async fn local_client_with_relay_plane_and_hydration_scoped(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+        lifecycle: Option<runtime::RuntimeLifecycle>,
+        defer_group_hydration: bool,
+        startup_progress: Option<&AccountStartupProgress>,
+        tasks: Option<&runtime::account_worker::WorkerTaskScope>,
+    ) -> Result<AppClient, AppError> {
         let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
@@ -2364,11 +2387,12 @@ impl MarmotApp {
                 marmot_account::AccountHomeError::AccountUnlinked(account.label),
             ));
         }
+        let account_id_hex = account.account_id_hex;
         let label = account.label;
         let relay_plane_for_open = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
-            .map(runtime::RuntimeLifecycle::begin_account_open)
+            .map(|lifecycle| lifecycle.begin_account_open(&account_id_hex))
             .transpose()?;
         // Only a starting worker records stage spans; other opens pass `None`.
         let enter_stage = |progress: Option<&AccountStartupProgress>, stage| {
@@ -2378,21 +2402,49 @@ impl MarmotApp {
         };
         enter_stage(startup_progress, AccountStartupStage::OpenQueued);
         let blocking_progress = startup_progress.cloned();
-        let open = blocking_app_task(move || {
+        let cancel = tasks.map(runtime::account_worker::WorkerTaskScope::token);
+        // Transfer the opened account through a oneshot inside the blocking
+        // closure so if this future is cancelled or aborted while opening, the
+        // rejected `OpenedAccount` (and its session-owner guard) drops BEFORE
+        // `_permit` and the `WorkerTaskScope` token drop (mdk#3801).
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel();
+        let run_open = move || {
             let _permit = permit;
+            if cancel
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                let _ = open_tx.send(Err(AppError::TransportClosed));
+                return;
+            }
             enter_stage(
                 blocking_progress.as_ref(),
                 AccountStartupStage::AccountState,
             );
-            app.ensure_account_state(&label)?;
-            enter_stage(blocking_progress.as_ref(), AccountStartupStage::SessionOpen);
-            let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
-            #[cfg(test)]
-            app.local_open_gates
-                .wait(&label, AccountStartupStage::SessionOpen);
-            open
-        })
-        .await?;
+            let open = match app.ensure_account_state(&label) {
+                Ok(()) => {
+                    enter_stage(blocking_progress.as_ref(), AccountStartupStage::SessionOpen);
+                    let open =
+                        app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
+                    #[cfg(test)]
+                    app.local_open_gates
+                        .wait(&label, AccountStartupStage::SessionOpen);
+                    open
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(rejected) = open_tx.send(open) {
+                drop(rejected);
+            }
+        };
+        if let Some(tasks) = tasks {
+            tasks.spawn_blocking(run_open);
+        } else {
+            tokio::task::spawn_blocking(run_open);
+        }
+        let open = open_rx
+            .await
+            .map_err(|_| AppError::BlockingTask("blocking account open task failed".into()))??;
         enter_stage(startup_progress, AccountStartupStage::ClientRestore);
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
@@ -2494,6 +2546,7 @@ impl MarmotApp {
             ),
             state: open.state,
             seen_events_index,
+            inbox_relay_checks: Default::default(),
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
             announced_convergence_parks: std::collections::HashSet::new(),
@@ -2640,6 +2693,10 @@ impl MarmotApp {
             .app
             .retire_cached_non_current_key_package(&client.state.label)
             .await;
+        // Interactive onboarding owns the initial KeyPackage publication.
+        if runtime::onboarding_defers_key_package_maintenance(self, &client.state.label) {
+            return;
+        }
         if client
             .app
             .key_package_cutover_replacement_pending(&client.state.label)
@@ -2930,6 +2987,10 @@ impl MarmotApp {
         status.refresh();
         self.directory()
             .remember_directory_relay_lists(&account.account_id_hex, &status)?;
+        let follow_list_created_at = requests
+            .iter()
+            .find(|request| request.event.kind == nostr_directory::KIND_NOSTR_CONTACT_LIST)
+            .map_or(0, |request| request.event.created_at);
         self.directory()
             .remember_directory_follow_edges_for_search(
                 &account.account_id_hex,
@@ -2939,6 +3000,7 @@ impl MarmotApp {
                         .iter()
                         .map(|endpoint| endpoint.0.clone())
                         .collect(),
+                    created_at: follow_list_created_at,
                 },
             )?;
         // Cache the signed kind-0 timestamp: retries can author it ahead of the
@@ -3655,6 +3717,22 @@ impl MarmotApp {
         self.spawn_account_publication_copy(account_id_hex, copy.run());
     }
 
+    /// Return the current cached or persisted replaceable-record timestamp
+    /// floor for `(pubkey, kind)` without mutating it.
+    pub(crate) fn replaceable_identity_floor(
+        &self,
+        account_ref: &str,
+        pubkey: &str,
+        kind: u64,
+    ) -> Result<u64, AppError> {
+        let latest = self
+            .replaceable_identity_created_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (pubkey.to_owned(), kind);
+        self.read_replaceable_identity_floor_locked(&latest, account_ref, &key)
+    }
+
     /// Sign a replaceable identity record (kind 0, kind 3, relay lists) with a
     /// `created_at` strictly after the previous version authored for the same
     /// account and kind. Relays keep the lower event id on a timestamp tie, so
@@ -3667,42 +3745,71 @@ impl MarmotApp {
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
         event: &NostrTransportEvent,
     ) -> Result<NostrTransportEvent, AppError> {
-        let created_at = self.reserve_replaceable_identity_created_at(account_ref, event)?;
-        let event = NostrTransportEvent::new_unsigned_at(
-            event.pubkey.clone(),
-            event.kind,
-            event.tags.clone(),
-            event.content.clone(),
-            created_at,
-        );
-        sign_account_publication_event(signer, &event).await
+        let created_at = match self.reserve_replaceable_identity_created_at_within(
+            account_ref,
+            event,
+            u64::MAX,
+        )? {
+            Ok(created_at) | Err(created_at) => created_at,
+        };
+        sign_replaceable_identity_event_at(signer, event, created_at).await
     }
 
-    fn reserve_replaceable_identity_created_at(
+    /// Sign a replaceable identity event only if the effective timestamp
+    /// (`max(event.created_at, floor + 1)`) does not exceed `max_created_at`.
+    /// When exceeded, refuses without advancing the persisted floor or calling
+    /// the signer.
+    pub(crate) async fn sign_replaceable_identity_event_bounded(
+        &self,
+        account_ref: &str,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+        event: &NostrTransportEvent,
+        max_created_at: u64,
+        on_exceeded: impl FnOnce(u64) -> AppError,
+    ) -> Result<NostrTransportEvent, AppError> {
+        let created_at = self
+            .reserve_replaceable_identity_created_at_within(account_ref, event, max_created_at)?
+            .map_err(on_exceeded)?;
+        sign_replaceable_identity_event_at(signer, event, created_at).await
+    }
+
+    fn read_replaceable_identity_floor_locked(
+        &self,
+        latest: &std::collections::HashMap<(String, u64), u64>,
+        account_ref: &str,
+        key: &(String, u64),
+    ) -> Result<u64, AppError> {
+        match latest.get(key) {
+            Some(floor) => Ok(*floor),
+            None => Ok(self
+                .account_home()
+                .replaceable_record_floors(account_ref)?
+                .get(&key.1)
+                .copied()
+                .unwrap_or(0)),
+        }
+    }
+
+    fn reserve_replaceable_identity_created_at_within(
         &self,
         account_ref: &str,
         event: &NostrTransportEvent,
-    ) -> Result<u64, AppError> {
-        let kind = event.kind;
+        max_created_at: u64,
+    ) -> Result<Result<u64, u64>, AppError> {
         let mut latest = self
             .replaceable_identity_created_at
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = (event.pubkey.clone(), kind);
-        let floor = match latest.get(&key) {
-            Some(floor) => *floor,
-            None => self
-                .account_home()
-                .replaceable_record_floors(account_ref)?
-                .get(&kind)
-                .copied()
-                .unwrap_or(0),
-        };
+        let key = (event.pubkey.clone(), event.kind);
+        let floor = self.read_replaceable_identity_floor_locked(&latest, account_ref, &key)?;
         let created_at = event.created_at.max(floor.saturating_add(1));
+        if created_at > max_created_at {
+            return Ok(Err(created_at));
+        }
         self.account_home()
-            .advance_replaceable_record_floor(account_ref, kind, created_at)?;
+            .advance_replaceable_record_floor(account_ref, key.1, created_at)?;
         latest.insert(key, created_at);
-        Ok(created_at)
+        Ok(Ok(created_at))
     }
 
     pub(crate) fn spawn_quorum_cancelled_delivery(&self, delivery: QuorumCancelledDelivery) {
@@ -3911,6 +4018,19 @@ impl MarmotApp {
                 now_seconds,
                 skew_now_seconds,
             )?)
+    }
+
+    pub(crate) fn groups_with_expiring_app_events(
+        &self,
+        label: &str,
+        now_seconds: u64,
+    ) -> Result<Vec<String>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .groups_with_expiring_app_events(now_seconds)?)
     }
 
     pub fn message_edit_history(
@@ -7114,45 +7234,85 @@ impl MarmotApp {
         // list. Fall back to the configured default relays when the account has
         // no usable NIP-65 relay. This runtime fallback is not published as a
         // replacement for the account's relay list.
-        let mut outbox = relay_lists
-            .nip65
-            .relays
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect::<Vec<_>>();
-        if outbox.is_empty() {
+        let refreshed_nip65;
+        let mut nip65 = &relay_lists.nip65;
+        let generated_outbox = if nip65.relays.is_empty() {
             // An open generated setup has not projected the NIP-65 list its
             // bootstrap publishes yet. Route to the relays that list declares,
             // not to the app's (mdk#2359).
-            outbox = match self.generated_setup_outbox_relays(label)? {
-                Some(relays) => relays,
+            let generated = self.generated_setup_outbox_relays(label)?;
+            if generated.is_none() {
                 // Setup removes its journal and context only after projecting
                 // its lists, so one that completed since `relay_lists` was
                 // read shows them in a fresh read.
-                None => self
-                    .account_relay_list_status(label)?
-                    .nip65
-                    .relays
-                    .into_iter()
-                    .map(TransportEndpoint)
-                    .collect(),
-            };
-        }
+                refreshed_nip65 = self.account_relay_list_status(label)?.nip65;
+                if !refreshed_nip65.relays.is_empty() || !refreshed_nip65.read_relays.is_empty() {
+                    nip65 = &refreshed_nip65;
+                }
+            }
+            generated
+        } else {
+            None
+        };
+        let outbox = generated_outbox.unwrap_or_else(|| {
+            nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect()
+        });
         let offered = outbox.len();
-        let safe =
-            self.retain_safe_discovered_endpoints(outbox, "local account key package routing");
+        let canonicalize = |endpoints: Vec<TransportEndpoint>| -> Vec<TransportEndpoint> {
+            let mut canonical = Vec::with_capacity(endpoints.len());
+            for endpoint in endpoints {
+                let endpoint =
+                    TransportEndpoint(transport_nostr::canonical_relay(endpoint.as_str()));
+                if !canonical.contains(&endpoint) {
+                    canonical.push(endpoint);
+                }
+            }
+            canonical
+        };
+        let safe = canonicalize(
+            self.retain_safe_discovered_endpoints(outbox, "local account key package routing"),
+        );
         if !safe.is_empty() {
             return Ok(safe);
         }
-        let fallback = self.relay_endpoints();
-        if offered > 0 {
+        // Respect NIP-65 read-only declarations even when declared write relays
+        // are empty or unsafe and routing falls back to configured defaults.
+        use nostr::prelude::RelayUrl;
+        let writes: BTreeSet<_> = nip65
+            .relays
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint).ok())
+            .collect();
+        let read_only: BTreeSet<_> = nip65
+            .read_relays
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint).ok())
+            .filter(|relay| !writes.contains(relay))
+            .collect();
+        let default_endpoints = self.relay_endpoints();
+        let default_count = default_endpoints.len();
+        let fallback = canonicalize(
+            default_endpoints
+                .into_iter()
+                .filter(|endpoint| {
+                    RelayUrl::parse(endpoint.as_str())
+                        .is_ok_and(|relay| !read_only.contains(&relay))
+                })
+                .collect(),
+        );
+        if offered > 0 || fallback.len() < default_count {
             tracing::warn!(
                 target: "marmot_app::relay_plane",
                 method = "key_package_endpoints",
                 offered = offered,
+                fallback_before_read_only = default_count,
                 fallback = fallback.len(),
-                "published account outbox has no usable endpoints; using configured defaults"
+                "published account outbox has no usable endpoints; using filtered configured defaults"
             );
         }
         Ok(fallback)
@@ -7571,31 +7731,42 @@ impl MarmotApp {
         let account_open = self.account_open_progress(label);
         let observer = |progress| {
             use storage_sqlite::{StorageOpenPhase as Phase, StorageOpenProgress as Progress};
-            match progress {
-                Progress::Phase(phase) => probe.phase(match phase {
-                    Phase::CipherConfiguration => NativeStartupStage::CipherConfiguration,
-                    Phase::CipherKeyApplication => NativeStartupStage::CipherKeyApplication,
-                    Phase::OperationalPragmas => NativeStartupStage::OperationalPragmas,
-                    Phase::MigrationInspection => NativeStartupStage::MigrationInspection,
-                }),
+            let (version, success, completed) = match progress {
+                Progress::Phase(phase) => {
+                    probe.phase(match phase {
+                        Phase::CipherConfiguration => NativeStartupStage::CipherConfiguration,
+                        Phase::CipherKeyApplication => NativeStartupStage::CipherKeyApplication,
+                        Phase::OperationalPragmas => NativeStartupStage::OperationalPragmas,
+                        Phase::MigrationInspection => NativeStartupStage::MigrationInspection,
+                    });
+                    return;
+                }
                 Progress::MigrationStarted(version) => {
-                    probe.progress(NativeStartupStage::MigrationApply, Some(version), false)
+                    probe.progress(NativeStartupStage::MigrationApply, Some(version), 0);
+                    return;
                 }
                 Progress::MigrationFinished { version, success } => {
-                    if success {
-                        account_open.migration_applied();
-                    }
-                    probe.progress(
-                        if success {
-                            NativeStartupStage::MigrationInspection
-                        } else {
-                            NativeStartupStage::MigrationApply
-                        },
-                        Some(version),
-                        success,
-                    )
+                    (version, success, u32::from(success))
                 }
+                Progress::MigrationBatchFinished {
+                    version,
+                    success,
+                    migrations_completed,
+                } => (version, success, migrations_completed),
+                _ => return,
+            };
+            if completed > 0 {
+                account_open.migration_applied();
             }
+            probe.progress(
+                if success {
+                    NativeStartupStage::MigrationInspection
+                } else {
+                    NativeStartupStage::MigrationApply
+                },
+                Some(version),
+                completed,
+            );
         };
         let opened = SqliteAccountStorage::open_encrypted_observed(&path, &key, &observer);
         if let Some(observation) = migration_observation {
@@ -8370,7 +8541,9 @@ impl MarmotApp {
         account_id_hex: &str,
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     ) -> Arc<dyn NostrRelayClient> {
-        let stop = self.account_publish_stop(account_id_hex);
+        let entry = self.account_publish_stop_entry_resolved(account_id_hex);
+        let app = self.clone();
+        let account_id_owned = account_id_hex.to_owned();
         // The publisher sends nothing once the account is unlinked, and no
         // event over a relay's known limit (mdk#2334).
         let guard = |client: Arc<dyn NostrRelayClient>| -> Arc<dyn NostrRelayClient> {
@@ -8378,8 +8551,11 @@ impl MarmotApp {
                 client,
                 self.relay_event_limits(),
             ));
-            Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
-                client, stop,
+            Arc::new(unlinked_publish_gate::UnlinkedPublishGate::for_account(
+                client,
+                app,
+                account_id_owned,
+                entry,
             ))
         };
         #[cfg(test)]
@@ -9007,6 +9183,16 @@ impl AppTransportRouting {
         self.write().inbox_routes.insert(member, route);
     }
 
+    /// Replace the account's KeyPackage publication endpoints when they changed.
+    fn replace_key_package_endpoints(&self, endpoints: Vec<TransportEndpoint>) -> bool {
+        let mut state = self.write();
+        if state.key_package_endpoints == endpoints {
+            return false;
+        }
+        state.key_package_endpoints = endpoints;
+        true
+    }
+
     fn replace(&self, state: AppRoutingState) {
         let mut installed = self.write();
         let routes_changed = installed.local_inbox_endpoints != state.local_inbox_endpoints
@@ -9296,11 +9482,19 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             .publish_prepared_key_package(&nostr_publication, &event)
             .await
             .map_err(|error| {
+                let endpoint_failures = match &error {
+                    cgka_traits::TransportAdapterError::PublishEndpoints(failure) => {
+                        failure.endpoint_failures.clone()
+                    }
+                    _ => Vec::new(),
+                };
                 // A size refusal by every relay reaches the caller typed
                 // (mdk#2334); the lifecycle sees the failure as before.
-                KeyPackagePublishError::exposed(error.to_string()).with_event_size_class(
-                    error::publish_size_refusal(&error).map(|cause| cause.size_class),
-                )
+                KeyPackagePublishError::exposed(error.to_string())
+                    .with_event_size_class(
+                        error::publish_size_refusal(&error).map(|cause| cause.size_class),
+                    )
+                    .with_endpoint_failures(endpoint_failures)
             })?;
         let accepted = outcome
             .accepted
@@ -9568,6 +9762,21 @@ fn unique_transport_endpoints(
         }
     }
     unique
+}
+
+async fn sign_replaceable_identity_event_at(
+    signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+    event: &NostrTransportEvent,
+    created_at: u64,
+) -> Result<NostrTransportEvent, AppError> {
+    let unsigned = NostrTransportEvent::new_unsigned_at(
+        event.pubkey.clone(),
+        event.kind,
+        event.tags.clone(),
+        event.content.clone(),
+        created_at,
+    );
+    sign_account_publication_event(signer, &unsigned).await
 }
 
 async fn sign_account_publication_event(

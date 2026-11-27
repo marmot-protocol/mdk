@@ -305,6 +305,7 @@ pub(crate) const ONBOARDING_PAUSE_ISSUES: &[&str] = &[
     "multi_device_unsupported",
     "other_installation_possible",
     "discovery_incomplete",
+    "rate_limited",
 ];
 /// The relay operation behind an onboarding pause's primary finding.
 pub(crate) const ONBOARDING_PAUSE_CONTEXTS: &[&str] = &[

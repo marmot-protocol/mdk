@@ -132,8 +132,8 @@ impl InboundMarks {
         }
         // Never create the account directory: a mark written after the account was wiped
         // fails rather than leaving a stray directory behind.
-        let dir = self.account_home.account_dir(account_label);
-        let path = self.path(account_label);
+        let dir = self.account_home.try_account_dir(account_label)?;
+        let path = dir.join(INBOUND_MARKS_FILE);
         let temp_path = dir.join(format!(".{INBOUND_MARKS_FILE}.tmp"));
         let bytes = serde_json::to_vec_pretty(&record)?;
         let result = (|| {
@@ -147,14 +147,15 @@ impl InboundMarks {
         Ok(result?)
     }
 
-    fn path(&self, account_label: &str) -> std::path::PathBuf {
-        self.account_home
-            .account_dir(account_label)
-            .join(INBOUND_MARKS_FILE)
+    fn path(&self, account_label: &str) -> Result<std::path::PathBuf, ConnectorError> {
+        Ok(self
+            .account_home
+            .try_account_dir(account_label)?
+            .join(INBOUND_MARKS_FILE))
     }
 
     fn read(&self, account_label: &str) -> Result<Option<Vec<u8>>, ConnectorError> {
-        match std::fs::read(self.path(account_label)) {
+        match std::fs::read(self.path(account_label)?) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err.into()),

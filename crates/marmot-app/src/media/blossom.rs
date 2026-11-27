@@ -532,14 +532,14 @@ async fn upload_blossom_body(
     require_descriptor_digest_and_size: bool,
 ) -> Result<String, AppError> {
     let (upload_url, server_host) = blossom_endpoint(server, "upload")?;
-    let authorization =
-        blossom_authorization_header(signer, &server_host, blob_hash_hex, "upload", "Upload Blob")
-            .await?;
     let upload_transport = BlossomHttpTransport {
         kind: MediaHttpKind::Upload,
         ..transport.clone()
     };
     let client = upload_transport.client_for_url(&upload_url).await?;
+    let authorization =
+        blossom_authorization_header(signer, &server_host, blob_hash_hex, "upload", "Upload Blob")
+            .await?;
     let response = client
         .put(upload_url.clone())
         .timeout(if require_descriptor_digest_and_size {
@@ -620,16 +620,15 @@ pub(crate) async fn delete_blossom_blob(
     transport: &BlossomHttpTransport,
 ) -> Result<(), AppError> {
     let (url, server_host) = blossom_endpoint(server, blob_hash_hex)?;
-    let authorization =
-        blossom_authorization_header(signer, &server_host, blob_hash_hex, "delete", "Delete Blob")
-            .await?;
     let transport = BlossomHttpTransport {
         kind: MediaHttpKind::Upload,
         ..transport.clone()
     };
-    let response = transport
-        .client_for_url(&url)
-        .await?
+    let client = transport.client_for_url(&url).await?;
+    let authorization =
+        blossom_authorization_header(signer, &server_host, blob_hash_hex, "delete", "Delete Blob")
+            .await?;
+    let response = client
         .delete(url)
         .timeout(BLOSSOM_DELETE_TIMEOUT)
         .header(reqwest::header::AUTHORIZATION, authorization)

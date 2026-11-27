@@ -375,55 +375,17 @@ mod tests {
 
     #[test]
     fn legacy_audit_cleanup_removes_logs_left_by_a_failed_account_wipe() {
-        use marmot_account::{
-            AccountHomeResult, AccountSecretStore, AccountSummary, LocalFileSecretStore,
-        };
-
-        struct FailSecretRemoval(LocalFileSecretStore);
-        impl AccountSecretStore for FailSecretRemoval {
-            fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
-                self.0.has_secret_for_label(label)
-            }
-            fn write_secret(
-                &self,
-                account: &AccountSummary,
-                keys: &nostr::prelude::Keys,
-            ) -> AccountHomeResult<()> {
-                self.0.write_secret(account, keys)
-            }
-            fn load_secret(
-                &self,
-                account: &AccountSummary,
-            ) -> AccountHomeResult<nostr::prelude::Keys> {
-                self.0.load_secret(account)
-            }
-            fn remove_secret(&self, _account: &AccountSummary) -> AccountHomeResult<()> {
-                Err(io::Error::from(io::ErrorKind::PermissionDenied).into())
-            }
-        }
-
         let root = tempfile::tempdir().unwrap();
-        let home = AccountHome::open_with_secret_store(
-            root.path(),
-            std::sync::Arc::new(FailSecretRemoval(LocalFileSecretStore::new(root.path()))),
-        );
-        home.create_account("alice").unwrap();
-        let account = home.account_dir("alice");
+        // Seed a wipe tombstone remnant directly (as left by a crash between
+        // tombstone rename and recursive delete, or by an older wipe) so
+        // startup cleanup still proves it removes legacy audit logs there.
+        let remnant = root.path().join(".wipe-tombstones").join("alice.1234.0");
+        fs::create_dir_all(&remnant).unwrap();
         let old = format!("audit-{ENGINE}-v2.jsonl");
         let v4 = format!("audit-{ENGINE}-v4.jsonl");
         for name in [&old, &v4, "audit-key-reveal.jsonl"] {
-            fs::write(account.join(name), b"PRESERVED_UNTIL_CLEANUP").unwrap();
+            fs::write(remnant.join(name), b"PRESERVED_UNTIL_CLEANUP").unwrap();
         }
-        // Exercise the real rename-to-tombstone path. A credential-store error
-        // after the rename leaves the removed account's files outside accounts/.
-        assert!(home.remove_account("alice").is_err());
-        let remnant = fs::read_dir(root.path().join(".wipe-tombstones"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        assert!(!account.exists());
         assert!(remnant.join(&old).exists());
         drop(open_app(root.path()).unwrap());
         assert!(!remnant.join(old).exists());

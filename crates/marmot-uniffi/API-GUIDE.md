@@ -1925,7 +1925,7 @@ Observe onboarding snapshots for one account.
 
 **Current.**
 
-Change discovery sources for the workflow without publishing them as account relay lists.
+Change discovery sources for the workflow without modifying existing published account relay lists. When `OnboardingOptionsFfi.create_missing_inbox_list` is enabled, a complete lookup that confirms no kind-10050 inbox list exists can trigger automatic creation of the recommended inbox list.
 
 ### `Marmot::run_onboarding`
 
@@ -3252,11 +3252,23 @@ without configured relay entries. This method does not consume a later update or
 
 ### `Marmot::account_relay_health`
 
-Read the account's relay health from its cached inbox and NIP-65 lists and the dial policy: one row per relay with its
+Read the account's relay health from its cached inbox and NIP-65 lists, the dial policy and this process's inbox checks: one row per relay with its
 roles, state, policy fault and liveness, and warnings about invitations sent through the published inbox list, each
 with a severity, the relays it concerns and the actions that would fix it. Never dials. An inbox list MDK does not hold reads as
 `inbox_list: Unknown` and raises no warning. Re-read on `RelayHealthChanged`. See the
 [conditions for each warning](README.md#account-relay-health); keep a default branch over its enums.
+
+### `Marmot::check_account_relays`
+
+Ask the account's worker to check whether its inbox relays serve the account's inbox, then return
+`account_relay_health` as it reads after the check. The worker gives each allowed inbox relay (the first 16 by URL) one
+bounded read of the account's gift wraps (kind 1059 addressed to it) on a connection of its own, answered with the
+signer it holds, within 15 seconds; a relay the policy refuses is never dialed. A remote or host signer may be asked to
+sign a relay's authentication challenge, so call it from a user action for such an account. While a check of the
+account runs it is refused at once with `RelayCheckRunning`; without a running account worker it fails as the account
+not being active and dials nothing. A check in which no relay answered changes nothing. The returned health is the
+answer; `RelayHealthChanged` follows a changed answer from the worker. See
+[what each state means](README.md#account-relay-health).
 
 <details>
 <summary>nip46.rs</summary>

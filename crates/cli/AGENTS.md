@@ -99,16 +99,17 @@ behavior and JSON fields are documented in the README; the rules below are the o
 - `src/lib.rs`: crate entrypoint and wiring. Owns `run_from`/`run_cli_local`, the `execute`/`execute_inner` command
   dispatch (which calls `commands::<namespace>::<handler>`), the daemon-socket routing/fallback glue, `CliOutput` /
   `CommandOutput` / `CliRuntimeInfo` types, and the broadly-shared `pub(crate)` helpers (`resolve_account`,
-  `npub_for_account_id`, `ensure_local_signing`, `normalize_group_id_hex`, `relay_endpoints`, `validate_relay_url`,
-  `group_json`/`group_show_output`, `unsupported_command`, home/secret-store resolution, etc.).
+  `npub_for_account_id`, `ensure_signing_capable`, `ensure_signing_ready`, `normalize_group_id_hex`, `relay_endpoints`,
+  `validate_relay_url`, `group_json`/`group_show_output`, `unsupported_command`, home/secret-store resolution, etc.).
 - `src/commands/`: per-namespace command handlers, each module mirroring a `*Command` enum in `args.rs`. The
   `foo_command` / `foo_command_with_runtime` pairs plus the output/format helpers used only by that namespace live
-  here. Modules: `account` (create-identity/login/whoami/account(s) + account-setup output), `key_package` (keys),
+  here. Modules: `account` (create-identity/login/whoami/account(s) + account-setup output), `nip46` (NIP-46
+  `bunker://` / `nostrconnect://` login, pairing, re-registration, status, and removal), `key_package` (keys),
   `chats`, `media`, `groups` (group + groups), `messages` (incl. the `timeline` subgroup), `follows`, `profile`,
   `relays`, `settings`, `users`, `notifications`, `debug`, `sync`, and `relay_stats`. Handlers and helpers reached
   from the lib dispatch, from the `daemon` module, or across namespaces are `pub(crate)`.
 - `src/main.rs` / `src/bin/wnd.rs`: thin `wn` and `wnd` binary entrypoints.
-- `src/secret.rs`: zeroizing stdin nsec import with redacted diagnostics.
+- `src/secret.rs`: zeroizing stdin nsec and NIP-46 bunker URI import with redacted diagnostics.
 - `src/terminal.rs`: terminal-safe rendering of untrusted human-facing text (non-JSON output).
 - `src/args.rs`: clap argument/command enums (`Cli`, `Command`, and the per-namespace `*Command` types).
 - `src/error.rs`: `WnError` and the `--json` error rendering.

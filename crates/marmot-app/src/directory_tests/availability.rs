@@ -22,6 +22,7 @@ fn remember_follows(app: &MarmotApp, owner: &AccountSummary, follows: Vec<String
             &FetchedFollowList {
                 follows,
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();

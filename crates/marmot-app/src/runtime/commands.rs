@@ -426,19 +426,36 @@ impl AccountManager {
         }
     }
 
-    fn spawn_create_catch_up(&self, command: WorkerCommands) {
+    pub(super) fn spawn_create_catch_up(&self, command: WorkerCommands) {
+        let mut tasks = self
+            .invite_catch_up_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.handles.retain(|task| !task.is_finished());
+        if !tasks.accepting {
+            return;
+        }
         let manager = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            let mut stopping = manager.shared.lifecycle().subscribe_shutdown();
             // Test-only barrier (`test-policy-overrides`): lets integration
             // tests prove the caller returned while this catch-up was still
             // blocked, instead of depending on scheduler timing.
             if cfg!(feature = "test-policy-overrides")
                 && let Some(barrier) = manager.shared.create_group_catch_up_barrier()
             {
-                barrier.notified().await;
+                tokio::select! {
+                    biased;
+                    _ = super::wait_for_runtime_shutdown(&mut stopping) => return,
+                    _ = barrier.notified() => {}
+                }
             }
             let started_at = Instant::now();
-            let result = manager.catch_up_account_commands(vec![command]).await;
+            let result = tokio::select! {
+                biased;
+                _ = super::wait_for_runtime_shutdown(&mut stopping) => return,
+                result = manager.catch_up_account_commands(vec![command]) => result,
+            };
             manager
                 .shared
                 .observer
@@ -465,6 +482,7 @@ impl AccountManager {
                 );
             }
         });
+        tasks.handles.push(handle);
     }
 
     /// Force one complete relay-history query for a local account and project
@@ -607,11 +625,10 @@ impl AccountManager {
         Ok(created.group_id)
     }
 
-    pub async fn create_group_with_options(
+    async fn create_group_request(
         &self,
         account_ref: &str,
-        name: &str,
-        members: &[String],
+        request: GroupCreationRequest,
         options: AppCreateGroupOptions,
     ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         let started_at = Instant::now();
@@ -621,11 +638,7 @@ impl AccountManager {
             command
                 .send(AccountWorkerCommand::CreateGroup {
                     queued_at: Instant::now(),
-                    request: GroupCreationRequest::Group {
-                        name: name.to_owned(),
-                        members: members.to_vec(),
-                        prepared_image_upload_id: None,
-                    },
+                    request,
                     options,
                     respond,
                 })
@@ -651,6 +664,25 @@ impl AccountManager {
             operation: created.operation.map(|created| created.group_id),
             member_outcomes: created.member_outcomes,
         })
+    }
+
+    pub async fn create_group_with_options(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        options: AppCreateGroupOptions,
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
+        self.create_group_request(
+            account_ref,
+            GroupCreationRequest::Group {
+                name: name.to_owned(),
+                members: members.to_vec(),
+                prepared_image_upload_id: None,
+            },
+            options,
+        )
+        .await
     }
 
     pub async fn stage_prepared_group_image(
@@ -751,39 +783,19 @@ impl AccountManager {
         description: Option<String>,
         upload_id: String,
     ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
-        let started_at = Instant::now();
-        let result = async {
-            let command = self.worker_commands(account_ref).await?;
-            let (respond, response) = oneshot::channel();
-            command
-                .send(AccountWorkerCommand::CreateGroup {
-                    queued_at: Instant::now(),
-                    request: GroupCreationRequest::Group {
-                        name: name.to_owned(),
-                        members: members.to_vec(),
-                        prepared_image_upload_id: Some(upload_id),
-                    },
-                    options: AppCreateGroupOptions {
-                        description: description.unwrap_or_default(),
-                        ..Default::default()
-                    },
-                    respond,
-                })
-                .await
-                .map_err(|_| AppError::TransportClosed)?;
-            long_account_worker_response(response).await
-        }
-        .await;
-        let result = result.map(|created| crate::GroupMemberResult {
-            operation: created.operation.map(|created| created.group_id),
-            member_outcomes: created.member_outcomes,
-        });
-        self.shared.observer.performance().record(
-            AppPerformanceOperation::GroupCreateTotalCallerLatency,
-            started_at.elapsed(),
-            result.is_ok(),
-        );
-        result
+        self.create_group_request(
+            account_ref,
+            GroupCreationRequest::Group {
+                name: name.to_owned(),
+                members: members.to_vec(),
+                prepared_image_upload_id: Some(upload_id),
+            },
+            AppCreateGroupOptions {
+                description: description.unwrap_or_default(),
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     pub async fn create_group_with_initial_image_detailed(
@@ -3289,6 +3301,44 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    /// Ask the account's worker for an inbox check; it answers when the
+    /// check ends. Without a running worker nothing is dialed.
+    pub(super) async fn check_inbox_relays(&self, account_ref: &str) -> Result<(), AppError> {
+        let account = self.resolve(account_ref)?;
+        let not_active = || {
+            AppError::from(cgka_traits::TransportAdapterError::AccountNotActive(
+                cgka_traits::MemberId::new(
+                    hex::decode(&account.account_id_hex).unwrap_or_default(),
+                ),
+            ))
+        };
+        let command = self
+            .existing_worker_commands(account_ref)
+            .await?
+            .ok_or_else(not_active)?
+            .commands;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CheckRelays { respond })
+            .await
+            .map_err(|_| not_active())?;
+        long_account_worker_response(response).await
+    }
+
+    /// The account worker's inbox checks, as `account_relay_health` reads
+    /// them; nothing while no worker runs.
+    pub(super) async fn relay_check_snapshot(
+        &self,
+        account_id_hex: &str,
+    ) -> crate::relay_health::CheckSnapshot {
+        self.workers
+            .lock()
+            .await
+            .get(account_id_hex)
+            .map(|worker| worker.relay_checks.borrow().clone())
+            .unwrap_or_default()
+    }
+
     pub(super) async fn reconnect_relay(
         &self,
         account_ref: &str,
@@ -3421,6 +3471,8 @@ mod tests {
                 shutdown,
                 unit: Default::default(),
                 read_state: Default::default(),
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
+                tasks: Default::default(),
             },
         );
         let error = manager
@@ -3503,6 +3555,8 @@ mod tests {
                 shutdown,
                 unit: Default::default(),
                 read_state: Default::default(),
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
+                tasks: Default::default(),
             },
         );
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -3587,6 +3641,8 @@ mod tests {
                 shutdown,
                 unit: Default::default(),
                 read_state: Default::default(),
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
+                tasks: Default::default(),
             },
         );
         assert!(
@@ -3677,6 +3733,8 @@ mod tests {
                 shutdown,
                 unit: Default::default(),
                 read_state,
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
+                tasks: Default::default(),
             },
         );
         let telemetry = runtime.shared_services().observer.performance().clone();

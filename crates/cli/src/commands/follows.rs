@@ -6,8 +6,9 @@ use marmot_app::{AccountRelayListBootstrap, AppError, MarmotApp, MarmotAppRuntim
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, FollowsCommand, WnError, ensure_local_signing, npub_for_account_id,
-    parse_public_key, replaceable_list_inconclusive, resolve_account, validate_relay_url,
+    CommandOutput, FollowsCommand, WnError, ensure_signing_capable, ensure_signing_ready,
+    npub_for_account_id, parse_public_key, replaceable_list_inconclusive, resolve_account,
+    validate_relay_url,
 };
 
 pub(crate) async fn follows_command(
@@ -36,9 +37,9 @@ pub(crate) async fn follows_command_with_runtime(
     relay: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let account = resolve_account(account_home, account_flag)?;
-    ensure_local_signing(&account)?;
     match command {
         FollowsCommand::List => {
+            ensure_signing_capable(&account)?;
             let follows = app
                 .directory()
                 .directory_entry_for_account_id(&account.account_id_hex)?
@@ -47,6 +48,7 @@ pub(crate) async fn follows_command_with_runtime(
             follows_output(account.account_id_hex, follows)
         }
         FollowsCommand::Check { pubkey } => {
+            ensure_signing_capable(&account)?;
             let target = parse_public_key(&pubkey)?;
             let follows = app
                 .directory()
@@ -69,9 +71,11 @@ pub(crate) async fn follows_command_with_runtime(
             })
         }
         FollowsCommand::Add { pubkey } => {
+            ensure_signing_ready(runtime, &account).await?;
             update_follows_command(runtime, account, relay, pubkey, true).await
         }
         FollowsCommand::Remove { pubkey } => {
+            ensure_signing_ready(runtime, &account).await?;
             update_follows_command(runtime, account, relay, pubkey, false).await
         }
     }

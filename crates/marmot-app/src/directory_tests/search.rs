@@ -39,6 +39,7 @@ fn record_named(account_id_hex: &str, name: &str) -> UserDirectoryRecord {
         }),
         follows: Vec::new(),
         follow_source_relays: Vec::new(),
+        follows_created_at: 0,
         relay_lists: AccountRelayListStatus::empty(),
         key_package: None,
     }

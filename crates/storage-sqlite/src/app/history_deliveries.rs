@@ -3,7 +3,7 @@
 //! deliveries it read before it held their chat or fetched their bundle. See
 //! migrations 0149 and 0166.
 
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::StorageResult;
 use rusqlite::{OptionalExtension as _, params};
@@ -160,13 +160,14 @@ impl SqliteAppStorage {
     /// Whether this exact unsent obligation still owns a detached upload.
     /// A newer add or withdrawal has a different revision.
     pub fn history_delivery_is_current(&self, owed: &OwedHistoryDelivery) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(&owed.group_id_hex);
         self.lock()?
             .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM history_deliveries_owed
              WHERE group_id_hex = ?1 AND receiver_slot_hex = ?2
                AND revision = ?3 AND sent_at IS NULL)",
                 params![
-                    owed.group_id_hex,
+                    group_id_hex.as_ref(),
                     owed.receiver_slot_hex,
                     u64_to_i64(owed.revision)?
                 ],
@@ -181,6 +182,7 @@ impl SqliteAppStorage {
         &self,
         parked: &ParkedHistoryDelivery,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(&parked.group_id_hex);
         self.lock()?
             .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM history_deliveries_parked
@@ -188,7 +190,7 @@ impl SqliteAppStorage {
                AND sealed = ?4 AND received_at = ?5)",
                 params![
                     parked.app_event_id,
-                    parked.group_id_hex,
+                    group_id_hex.as_ref(),
                     parked.sender_slot_hex,
                     parked.sealed,
                     u64_to_i64(parked.received_at)?
@@ -207,6 +209,7 @@ impl SqliteAppStorage {
         receiver_slot_hex: &str,
         now: u64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .execute_cached(
                 "INSERT INTO history_deliveries_owed
@@ -218,7 +221,7 @@ impl SqliteAppStorage {
                      revision = revision + 1,
                      blossom_due_at = NULL,
                      blossom_attempts = 0",
-                params![group_id_hex, receiver_slot_hex, u64_to_i64(now)?],
+                params![group_id_hex.as_ref(), receiver_slot_hex, u64_to_i64(now)?],
             )
             .storage()?;
         Ok(())
@@ -234,6 +237,7 @@ impl SqliteAppStorage {
         receiver_slot_hex: &str,
         now: u64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .execute_cached(
                 "INSERT OR REPLACE INTO history_delivery_sends
@@ -241,7 +245,7 @@ impl SqliteAppStorage {
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
                     app_event_id,
-                    group_id_hex,
+                    group_id_hex.as_ref(),
                     receiver_slot_hex,
                     u64_to_i64(now)?
                 ],
@@ -302,13 +306,14 @@ impl SqliteAppStorage {
         owed: &OwedHistoryDelivery,
         now: u64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(&owed.group_id_hex);
         self.lock()?
             .execute_cached(
                 "UPDATE history_deliveries_owed SET blossom_due_at = ?4
                  WHERE group_id_hex = ?1 AND receiver_slot_hex = ?2
                    AND revision = ?3 AND sent_at IS NULL AND blossom_due_at IS NULL",
                 params![
-                    owed.group_id_hex,
+                    group_id_hex.as_ref(),
                     owed.receiver_slot_hex,
                     u64_to_i64(owed.revision)?,
                     u64_to_i64(now)?
@@ -347,6 +352,7 @@ impl SqliteAppStorage {
         owed: &OwedHistoryDelivery,
         until: u64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(&owed.group_id_hex);
         self.lock()?
             .execute_cached(
                 "UPDATE history_deliveries_owed
@@ -354,7 +360,7 @@ impl SqliteAppStorage {
                  WHERE group_id_hex = ?1 AND receiver_slot_hex = ?2
                    AND revision = ?3 AND sent_at IS NULL AND blossom_due_at IS NOT NULL",
                 params![
-                    owed.group_id_hex,
+                    group_id_hex.as_ref(),
                     owed.receiver_slot_hex,
                     u64_to_i64(owed.revision)?,
                     u64_to_i64(until)?
@@ -372,13 +378,14 @@ impl SqliteAppStorage {
         owed: &OwedHistoryDelivery,
         now: u64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(&owed.group_id_hex);
         self.lock()?
             .execute_cached(
                 "UPDATE history_deliveries_owed SET sent_at = ?4
                  WHERE group_id_hex = ?1 AND receiver_slot_hex = ?2
                    AND revision = ?3 AND sent_at IS NULL",
                 params![
-                    owed.group_id_hex,
+                    group_id_hex.as_ref(),
                     owed.receiver_slot_hex,
                     u64_to_i64(owed.revision)?,
                     u64_to_i64(now)?
@@ -391,13 +398,14 @@ impl SqliteAppStorage {
     /// Forget `owed`, if it is still owed as it was read, once it can no
     /// longer be sent.
     pub fn forget_history_delivery(&self, owed: &OwedHistoryDelivery) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(&owed.group_id_hex);
         self.lock()?
             .execute_cached(
                 "DELETE FROM history_deliveries_owed
                  WHERE group_id_hex = ?1 AND receiver_slot_hex = ?2
                    AND revision = ?3 AND sent_at IS NULL",
                 params![
-                    owed.group_id_hex,
+                    group_id_hex.as_ref(),
                     owed.receiver_slot_hex,
                     u64_to_i64(owed.revision)?
                 ],
@@ -409,6 +417,7 @@ impl SqliteAppStorage {
     /// Keep a delivery until this device holds its chat and its bundle. One
     /// already parked is kept as it was. All but the newest 1,024 go.
     pub fn park_history_delivery(&self, delivery: &ParkedHistoryDelivery) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(&delivery.group_id_hex);
         let (bundle, blossom, fetch_due_at, fetch_attempts) = match &delivery.bundle {
             ParkedBundle::Inline(bundle) => (Some(bundle.as_slice()), None, None, 0),
             ParkedBundle::Blossom {
@@ -431,7 +440,7 @@ impl SqliteAppStorage {
                 ),
                 params![
                     delivery.app_event_id,
-                    delivery.group_id_hex,
+                    group_id_hex.as_ref(),
                     delivery.sender_slot_hex,
                     delivery.sealed,
                     bundle,
@@ -496,6 +505,7 @@ impl SqliteAppStorage {
         &self,
         group_id_hex: &str,
     ) -> StorageResult<Vec<ParkedHistoryDelivery>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare_cached(&format!(
@@ -504,7 +514,7 @@ impl SqliteAppStorage {
             ))
             .storage()?;
         let rows = stmt
-            .query_map(params![group_id_hex], parked_row)
+            .query_map(params![group_id_hex.as_ref()], parked_row)
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;

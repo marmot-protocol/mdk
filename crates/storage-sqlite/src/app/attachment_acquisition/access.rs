@@ -19,6 +19,7 @@ impl SqliteAppStorage {
         index: u32,
         now: u64,
     ) -> StorageResult<Option<RetainedAttachmentAsset>> {
+        let group = canonical_group_id_hex(group);
         let conn = self.lock()?;
         conn.query_row(
             &format!(
@@ -30,7 +31,7 @@ impl SqliteAppStorage {
                    AND q.state=3 AND {RETAINED_BODY} AND {SOURCE_MATCH}
                    AND (q.expires_at IS NULL OR q.expires_at>?5)"
             ),
-            params![group, message, source, index, u64_to_i64(now)?],
+            params![group.as_ref(), message, source, index, u64_to_i64(now)?],
             |r| {
                 Ok(RetainedAttachmentAsset {
                     reference: AttachmentAssetRef {
@@ -62,6 +63,7 @@ impl SqliteAppStorage {
         index: u32,
         now: u64,
     ) -> StorageResult<Option<(String, Option<u64>)>> {
+        let group = canonical_group_id_hex(group);
         let conn = self.lock()?;
         conn.query_row(
             &format!(
@@ -71,7 +73,7 @@ impl SqliteAppStorage {
                    AND q.state=3 AND {RETAINED_BODY} AND {SOURCE_MATCH}
                    AND (q.expires_at IS NULL OR q.expires_at>?5)"
             ),
-            params![group, message, source, index, u64_to_i64(now)?],
+            params![group.as_ref(), message, source, index, u64_to_i64(now)?],
             |r| {
                 let epoch: Option<i64> = r.get(1)?;
                 Ok((r.get(0)?, epoch.and_then(|e| u64::try_from(e).ok())))

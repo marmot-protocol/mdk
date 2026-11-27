@@ -19,6 +19,7 @@
 //! a bad one only means that device gets no history.
 
 use crate::engine::Engine;
+use cgka_traits::SecretBytes;
 use cgka_traits::app_components::encode_component_vectors;
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::{AccountDeviceHistoryKey, StorageProvider};
@@ -97,7 +98,7 @@ pub fn open_history<C: OpenMlsCrypto>(
     private_key: &[u8],
     context: &[u8],
     sealed: &[u8],
-) -> Option<Vec<u8>> {
+) -> Option<SecretBytes> {
     open_with_label(
         crypto,
         ciphersuite,
@@ -116,7 +117,7 @@ pub(crate) fn open_with_label<C: OpenMlsCrypto>(
     private_key: &[u8],
     context: &[u8],
     sealed: &[u8],
-) -> Option<Vec<u8>> {
+) -> Option<SecretBytes> {
     let mut cursor = sealed;
     let ciphertext = HpkeCiphertext::tls_deserialize(&mut cursor).ok()?;
     if !cursor.is_empty() {
@@ -131,6 +132,7 @@ pub(crate) fn open_with_label<C: OpenMlsCrypto>(
             &[],
         )
         .ok()
+        .map(SecretBytes::new)
 }
 
 /// MLS's `EncryptContext`: the label, then the context, each a vector.
@@ -182,7 +184,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         context: &[u8],
         sealed: &[u8],
-    ) -> Result<Option<Vec<u8>>, EngineError> {
+    ) -> Result<Option<SecretBytes>, EngineError> {
         let Some(key) = self.stored_history_key()? else {
             return Ok(None);
         };
@@ -255,7 +257,7 @@ mod tests {
                 CONTEXT,
                 &sealed
             ),
-            Some(b"bundle".to_vec())
+            Some(SecretBytes::new(b"bundle".to_vec()))
         );
         assert_eq!(
             open_history(
@@ -401,7 +403,7 @@ mod tests {
                 CONTEXT,
                 &independently_sealed,
             ),
-            Some(b"independent history".to_vec()),
+            Some(SecretBytes::new(b"independent history".to_vec())),
         );
         // The same key and context under MLS's own Welcome label.
         let welcome_info = encode_component_vectors(&[b"MLS 1.0 Welcome", CONTEXT]);
@@ -425,6 +427,41 @@ mod tests {
                 &sealed
             ),
             None
+        );
+    }
+
+    #[test]
+    fn open_history_result_debug_redacts_decrypted_bytes() {
+        let crypto = RustCrypto::default();
+        let pair = key_pair(&crypto);
+        let plaintext = [0xde, 0xad, 0xbe, 0xef, 0x13, 0x37, 0xca, 0xfe];
+        let sealed = seal_history(
+            &crypto,
+            DEFAULT_CIPHERSUITE,
+            &pair.public,
+            CONTEXT,
+            &plaintext,
+        )
+        .unwrap();
+
+        let opened = open_history(
+            &crypto,
+            DEFAULT_CIPHERSUITE,
+            &pair.private,
+            CONTEXT,
+            &sealed,
+        )
+        .unwrap();
+        assert_eq!(opened.as_slice(), &plaintext);
+
+        let rendered = format!("{opened:?}");
+        assert!(
+            rendered.contains("<redacted>"),
+            "open_history Debug must show redaction marker: {rendered}"
+        );
+        assert!(
+            !rendered.contains("222, 173, 190, 239") && !rendered.contains("deadbeef"),
+            "open_history Debug must not expose decrypted bytes: {rendered}"
         );
     }
 }

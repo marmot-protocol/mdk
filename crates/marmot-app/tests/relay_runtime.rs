@@ -8155,12 +8155,19 @@ async fn directory_sync_worker_caches_follow_edges_without_promoting_follows() {
     let followed = format!("{:064x}", 77);
 
     runtime.start().await.unwrap();
+    let initial_follow_list_timestamp = app
+        .directory()
+        .directory_entry_for_account_id(&setup.account.account_id_hex)
+        .unwrap()
+        .expect("directory entry for the local account")
+        .follows_created_at;
     publish_follow_list_at(
         &AccountHome::open(dir.path()),
         &setup.account.label,
         &url,
         std::slice::from_ref(&followed),
-        test_unix_now_seconds(),
+        // The directory accepts only contact lists newer than the initial list.
+        initial_follow_list_timestamp + 1,
     )
     .await;
 
@@ -11111,6 +11118,98 @@ async fn sweep_keeps_unread_message_in_read_marker_wall_second() {
             .iter()
             .any(|message| message.message_id_hex == unread_id),
         "once read, the expired pair prunes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sweep_prunes_expired_messages_after_policy_turns_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("policy zero retention", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_id_hex = hex::encode(group_id.as_slice());
+    bob.sync().await.unwrap();
+
+    alice
+        .update_message_retention(&group_id, 24 * 60 * 60)
+        .await
+        .unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
+
+    let expiring_id = alice
+        .send(&group_id, b"must expire after policy turns off")
+        .await
+        .unwrap()
+        .message_ids
+        .into_iter()
+        .next()
+        .expect("send accepted");
+    bob.sync().await.unwrap();
+    app.mark_timeline_message_read("bob", &group_id_hex, &expiring_id)
+        .unwrap();
+    let expires_at = app
+        .timeline_messages_with_query(
+            "bob",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|message| message.message_id_hex == expiring_id)
+        .and_then(|message| message.retention_expires_at)
+        .expect("disappearing message pins an expiry");
+
+    // Turning disappearing messages off must not strand previously sent
+    // disappearing messages whose source epoch pinned an expiry.
+    alice.update_message_retention(&group_id, 0).await.unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
+
+    let sweep_now_ms = (expires_at + 6) * 1_000;
+    let report = bob.sweep_expired_retention(sweep_now_ms).unwrap();
+    let outcome = report
+        .groups
+        .iter()
+        .find(|outcome| outcome.group_id_hex == group_id_hex)
+        .expect("policy-0 group with expiring row must still be swept");
+    assert_eq!(outcome.status, RetentionSweepStatus::Pruned);
+    assert!(outcome.pruned_messages >= 1);
+    assert!(
+        !app.timeline_messages_with_query(
+            "bob",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .iter()
+        .any(|message| message.message_id_hex == expiring_id),
+        "disappearing message must be pruned even after retention policy is set to 0"
     );
 }
 
@@ -17186,6 +17285,7 @@ async fn onboarding_fixture() -> (
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -17450,6 +17550,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -17477,6 +17578,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
+                ..Default::default()
             },
         )
         .await
@@ -17507,6 +17609,7 @@ async fn onboarding_cancellation_retains_external_signer_for_explicit_sign_in() 
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
+                ..Default::default()
             },
         )
         .await
@@ -17569,6 +17672,7 @@ async fn onboarding_payment_required_query_is_not_a_missing_record() {
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
+                ..Default::default()
             },
         )
         .await
@@ -17613,6 +17717,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -17817,6 +17922,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -17919,6 +18025,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -17985,6 +18092,7 @@ async fn onboarding_single_device_unknown_discovery_still_offers_explicit_contin
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await
@@ -18036,6 +18144,7 @@ async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_
         default_relays: vec![url.clone()],
         inbox_relays: Vec::new(),
         discovery_relays: vec![url.clone()],
+        ..Default::default()
     };
     assert!(
         runtime
@@ -18141,6 +18250,7 @@ async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
                 default_relays: vec![url.clone()],
                 inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
+                ..Default::default()
             },
         )
         .await

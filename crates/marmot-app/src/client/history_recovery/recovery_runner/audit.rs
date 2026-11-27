@@ -84,6 +84,7 @@ pub(super) fn sweep_end(end: SweepEnd) -> RecoveryRunnerFetchEnd {
         SweepEnd::RateLimited => RecoveryRunnerFetchEnd::RateLimited,
         SweepEnd::Refused(_) => RecoveryRunnerFetchEnd::Refused,
         SweepEnd::Unreachable(kind) => unreachable(kind),
+        SweepEnd::LocalBusy => RecoveryRunnerFetchEnd::Deadline,
         SweepEnd::SinkFailed => RecoveryRunnerFetchEnd::SinkFailed,
         SweepEnd::StoreFailed => RecoveryRunnerFetchEnd::StoreFailed,
     }
@@ -102,6 +103,7 @@ pub(super) fn compare_end(end: CompareEnd) -> RecoveryRunnerFetchEnd {
         CompareEnd::Refused(_) => RecoveryRunnerFetchEnd::Refused,
         CompareEnd::Unsupported => RecoveryRunnerFetchEnd::Unsupported,
         CompareEnd::Unreachable(kind) => unreachable(kind),
+        CompareEnd::LocalBusy => RecoveryRunnerFetchEnd::Deadline,
         CompareEnd::SinkFailed => RecoveryRunnerFetchEnd::SinkFailed,
     }
 }

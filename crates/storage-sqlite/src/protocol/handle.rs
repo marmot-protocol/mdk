@@ -193,6 +193,10 @@ impl SqliteAccountStorage {
         connection: rusqlite::Connection,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
+        use crate::SqliteResultExt;
+        connection
+            .busy_timeout(std::time::Duration::from_millis(options.busy_timeout_ms))
+            .storage()?;
         finish_account_open(connection, options, None).and_then(Self::from_opened)
     }
 

@@ -407,13 +407,19 @@ Build the NIP-92 `imeta` tag for an already-uploaded attachment, so a host can c
 
 [Shared method and API guidance](../marmot-uniffi/API-GUIDE.md#marmotbuild_media_imeta_tag)
 
+### `marmot_begin_onboarding_with_options`
+
+Import an identity and persist its onboarding gate without publishing, configured by bitmask `flags`: `0` keeps both opt-in behaviors off, `MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST` (`1`) automatically creates a kind-10050 inbox list from recommended defaults after complete discovery confirms none exists, and `MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND` (`2`) passes `SingleDevice` automatically when complete discovery finds `MARMOT_ONBOARDING_DEVICE_DISCOVERY_NONE_FOUND` while keeping `single_device_notice` populated. Unknown flag bits return `MARMOT_STATUS_INVALID_ARGUMENT` after clearing `*out`. Free the returned snapshot (including any nested `created_inbox_list`) with `marmot_onboarding_snapshot_free`.
+
+[Shared method and API guidance](../marmot-uniffi/API-GUIDE.md#marmotbegin_onboarding)
+
 ### `marmot_begin_onboarding`
 
-Import an identity and persist its onboarding gate without publishing. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+Import an identity and persist its onboarding gate without publishing (`flags = 0`, delegating to `marmot_begin_onboarding_with_options`). Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 
 Snapshot findings include typed context, purpose, outcome, declared capability,
 owned actions and optional observation revision. The snapshot free releases
-those nested arrays. See [C diagnostic ownership](README.md#onboarding-relay-repair)
+those nested arrays and any `created_inbox_list`. See [C diagnostic ownership](README.md#onboarding-relay-repair)
 and the shared evidence limits before interpreting directory-query success.
 
 [Shared method and API guidance](../marmot-uniffi/API-GUIDE.md#marmotbegin_onboarding)
@@ -3735,8 +3741,9 @@ Frees a user emoji list, its sets and missing coordinates. NULL is safe.
 
 ### `marmot_account_relay_health`
 
-Write the account's relay health from its cached lists and the dial policy: `rows` (`roles`, `state`, `fault` read only when
-`has_fault`, `liveness`), `warnings` about invitations sent through the published inbox list, ordered from the most severe, `highest_severity` read only when
+Write the account's relay health from its cached lists, the dial policy and this process's inbox checks: `rows`
+(`roles`, `state`, `fault` read only when `has_fault`, `liveness`, `checked_at_unix` read only when
+`has_checked_at_unix`, `checking`), `warnings` about invitations sent through the published inbox list, ordered from the most severe, `highest_severity` read only when
 `has_highest_severity`, `inbox_list` and `falls_back_to_defaults`. A local read that never dials; the call blocks the
 calling thread. Re-read on `MARMOT_EVENT_RELAY_HEALTH_CHANGED`. Keep a default case over the warning kind, fault,
 action, role and state enums. Free the result with `marmot_account_relay_health_free`.
@@ -3746,6 +3753,17 @@ action, role and state enums. Free the result with `marmot_account_relay_health_
 ### `marmot_account_relay_health_free`
 
 Deep-free a record returned by `marmot_account_relay_health`, including its rows, warnings, URLs, role and action arrays. NULL is a no-op.
+
+### `marmot_check_account_relays`
+
+Ask the account's worker to check whether its inbox relays serve the account's inbox, then write the account's relay
+health as it reads after the check. Each row gains `checked_at_unix` (read only when `has_checked_at_unix`) and
+`checking`. The call blocks the calling thread for up to about 15 seconds, so keep it off the UI thread. While a check
+of the account runs it returns `MARMOT_STATUS_RELAY_CHECK_RUNNING` at once; without a running account worker it fails
+and dials nothing. A relay the policy refuses is never dialed; a check no relay answered changes nothing. Free the
+result with `marmot_account_relay_health_free`.
+
+[Shared method and API guidance](../marmot-uniffi/API-GUIDE.md#marmotcheck_account_relays)
 
 ## Relay liveness
 

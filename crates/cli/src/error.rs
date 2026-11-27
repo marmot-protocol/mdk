@@ -69,7 +69,7 @@ pub(crate) enum WnError {
     UnknownLocalAccount(String),
     #[error("invalid public key")]
     InvalidPublicKey,
-    #[error("public Nostr accounts do not have local signing keys")]
+    #[error("public Nostr accounts do not have signing keys")]
     PublicAccountCannotSign,
     #[error("invalid secret store: {0}")]
     InvalidSecretStore(String),
@@ -87,18 +87,40 @@ pub(crate) enum WnError {
     ChatsSubscribeRequiresDaemon,
     #[error("notifications subscribe requires the daemon; start it with `wn daemon start`")]
     NotificationsSubscribeRequiresDaemon,
-    #[error("login requires --nsec-stdin or an npub identity")]
+    #[error("login requires --nsec-stdin, --bunker-stdin, --nostrconnect, or an npub identity")]
     MissingLoginIdentity,
     #[error(
         "{command} does not accept private keys as command-line arguments; pipe the nsec to --nsec-stdin"
     )]
     SecretArgumentRejected { command: &'static str },
+    #[error(
+        "{command} does not accept NIP-46 URIs as command-line arguments; pipe the bunker:// URI to --bunker-stdin or use --nostrconnect"
+    )]
+    BunkerArgumentRejected { command: &'static str },
     #[error("{command} expects either a public identity argument or --nsec-stdin, not both")]
     ConflictingSecretInput { command: &'static str },
+    #[error("{command} cannot combine multiple login/pairing modes")]
+    ConflictingLoginInput { command: &'static str },
     #[error("{command} --nsec-stdin received empty input")]
     MissingStdinSecret { command: &'static str },
     #[error("{command} --nsec-stdin requires an nsec secret key")]
     InvalidStdinSecret { command: &'static str },
+    #[error("{command} --bunker-stdin received empty input")]
+    MissingBunkerStdin { command: &'static str },
+    #[error("{command} --bunker-stdin requires a bunker:// URI")]
+    InvalidBunkerStdin { command: &'static str },
+    #[error("{command} requires either --bunker-stdin or --nostrconnect")]
+    MissingNip46Mode { command: &'static str },
+    #[error(
+        "NIP-46 --nostrconnect pairing requires at least one signer relay (--signer-relays or default relay)"
+    )]
+    MissingNip46SignerRelays,
+    #[error(
+        "NIP-46 permissions (version {version}) require explicit approval; confirm interactively or pass --approve-permissions"
+    )]
+    Nip46PermissionApprovalRequired { version: u32, grants: Vec<String> },
+    #[error("account {0} is not an external-signing account")]
+    Nip46RequiresExternalAccount(String),
     #[error("no media attachment found for plaintext hash {0}")]
     MediaAttachmentNotFound(String),
     #[error("invalid media attachment: {0}")]
@@ -300,6 +322,8 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "repair": {
                 "login": "wn login <npub-or-hex>",
                 "import_nsec": "printf '%s\\n' \"$NSEC\" | wn login --nsec-stdin",
+                "nip46_bunker": "printf '%s\\n' \"$BUNKER_URI\" | wn login --bunker-stdin --approve-permissions",
+                "nip46_nostrconnect": "wn login --nostrconnect --signer-relays <relay-url>",
             },
         }),
         WnError::SecretArgumentRejected { command } => json!({
@@ -311,8 +335,22 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
                 "account_create": "printf '%s\\n' \"$NSEC\" | wn account create --nsec-stdin",
             },
         }),
+        WnError::BunkerArgumentRejected { command } => json!({
+            "code": "secret_argument_rejected",
+            "message": err.to_string(),
+            "command": command,
+            "repair": {
+                "login": "printf '%s\\n' \"$BUNKER_URI\" | wn login --bunker-stdin --approve-permissions",
+                "nostrconnect": "wn login --nostrconnect --signer-relays <relay-url>",
+            },
+        }),
         WnError::ConflictingSecretInput { command } => json!({
             "code": "conflicting_secret_input",
+            "message": err.to_string(),
+            "command": command,
+        }),
+        WnError::ConflictingLoginInput { command } => json!({
+            "code": "conflicting_login_input",
             "message": err.to_string(),
             "command": command,
         }),
@@ -325,6 +363,46 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "code": "invalid_stdin_secret",
             "message": err.to_string(),
             "command": command,
+        }),
+        WnError::MissingBunkerStdin { command } => json!({
+            "code": "missing_stdin_bunker_uri",
+            "message": err.to_string(),
+            "command": command,
+        }),
+        WnError::InvalidBunkerStdin { command } => json!({
+            "code": "invalid_stdin_bunker_uri",
+            "message": err.to_string(),
+            "command": command,
+        }),
+        WnError::MissingNip46Mode { command } => json!({
+            "code": "missing_nip46_mode",
+            "message": err.to_string(),
+            "command": command,
+            "repair": {
+                "bunker": "printf '%s\\n' \"$BUNKER_URI\" | wn accounts nip46 login --bunker-stdin --approve-permissions",
+                "nostrconnect": "wn accounts nip46 login --nostrconnect --signer-relays <relay-url>",
+            },
+        }),
+        WnError::MissingNip46SignerRelays => json!({
+            "code": "missing_nip46_signer_relays",
+            "message": err.to_string(),
+            "repair": {
+                "flag": "--signer-relays <ws-or-wss-url>",
+            },
+        }),
+        WnError::Nip46PermissionApprovalRequired { version, grants } => json!({
+            "code": "nip46_permission_approval_required",
+            "message": err.to_string(),
+            "version": version,
+            "grants": grants,
+            "repair": {
+                "flag": "--approve-permissions",
+            },
+        }),
+        WnError::Nip46RequiresExternalAccount(account_id) => json!({
+            "code": "nip46_requires_external_account",
+            "message": err.to_string(),
+            "account_id": account_id,
         }),
         WnError::MediaAttachmentNotFound(file_hash) => json!({
             "code": "media_attachment_not_found",
@@ -820,11 +898,49 @@ fn app_error_json(err: &AppError) -> Value {
                 "action": "edit only an available chat message this account sent; nothing was published",
             },
         }),
+        AppError::ExternalSignerUnavailable(account_id) => json!({
+            "code": "external_signer_unavailable",
+            "message": err.to_string(),
+            "account_id": account_id,
+            "repair": {
+                "register": "wn accounts nip46 register --bunker-stdin --approve-permissions",
+            },
+        }),
+        AppError::ExternalSignerMismatch => json!({
+            "code": "external_signer_mismatch",
+            "message": err.to_string(),
+        }),
+        AppError::Nip46(nip46_err) => nip46_error_json(nip46_err),
         other => json!({
             "code": "command_failed",
             "message": other.to_string(),
         }),
     }
+}
+
+fn nip46_error_json(err: &marmot_app::Nip46Error) -> Value {
+    use marmot_app::Nip46Error;
+    let code = match err {
+        Nip46Error::Invalid => "nip46_invalid",
+        Nip46Error::ProxyConfig => "nip46_proxy_config",
+        Nip46Error::Unavailable => "nip46_unavailable",
+        Nip46Error::RelayPublish => "nip46_relay_publish",
+        Nip46Error::Rejected => "nip46_rejected",
+        Nip46Error::Mismatch => "nip46_mismatch",
+        Nip46Error::Timeout => "nip46_timeout",
+        Nip46Error::Cancelled => "nip46_cancelled",
+        Nip46Error::LoggedOut => "nip46_logged_out",
+        Nip46Error::Unsupported => "nip46_unsupported",
+        Nip46Error::PermissionApprovalRequired => "nip46_permission_approval_required",
+        Nip46Error::Storage => "nip46_storage",
+        Nip46Error::Busy => "nip46_busy",
+        Nip46Error::Disconnected => "nip46_disconnected",
+        Nip46Error::RequestNotFound => "nip46_request_not_found",
+    };
+    json!({
+        "code": code,
+        "message": err.to_string(),
+    })
 }
 
 fn engine_error_json(err: &EngineError) -> Value {
@@ -1139,6 +1255,51 @@ mod tests {
 
         assert_eq!(rendered[0]["code"], "engine_error");
         assert!(rendered.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn nip46_errors_have_typed_codes_and_never_echo_bunker_secrets() {
+        let secret = "super-secret-bunker-token-9999";
+        let bunker_err = WnError::BunkerArgumentRejected { command: "login" };
+        assert!(!bunker_err.to_string().contains(secret));
+        let bunker_json = wn_error_json(&bunker_err);
+        assert_eq!(bunker_json["code"], "secret_argument_rejected");
+
+        let invalid_stdin = WnError::InvalidBunkerStdin { command: "login" };
+        assert_eq!(
+            wn_error_json(&invalid_stdin)["code"],
+            "invalid_stdin_bunker_uri"
+        );
+
+        let perms = marmot_app::Nip46Session::permissions();
+        let approval_err = WnError::Nip46PermissionApprovalRequired {
+            version: perms.version,
+            grants: perms.grants.clone(),
+        };
+        let approval_json = wn_error_json(&approval_err);
+        assert_eq!(approval_json["code"], "nip46_permission_approval_required");
+        assert_eq!(approval_json["version"], perms.version);
+        assert_eq!(approval_json["grants"], json!(perms.grants));
+        assert_eq!(approval_json["repair"]["flag"], "--approve-permissions");
+
+        assert_eq!(
+            wn_error_json(&WnError::App(AppError::Nip46(
+                marmot_app::Nip46Error::Rejected
+            )))["code"],
+            "nip46_rejected"
+        );
+        assert_eq!(
+            wn_error_json(&WnError::App(AppError::Nip46(
+                marmot_app::Nip46Error::Unavailable
+            )))["code"],
+            "nip46_unavailable"
+        );
+        assert_eq!(
+            wn_error_json(&WnError::App(AppError::ExternalSignerUnavailable(
+                "aa".repeat(32)
+            )))["code"],
+            "external_signer_unavailable"
+        );
     }
 
     /// The CLI column of `marmot-app`'s lower-stack error table: the code

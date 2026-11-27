@@ -23,12 +23,21 @@
 //! rows but no warning: when none is allowed, this device publishes its
 //! KeyPackages to its defaults and an MDK sender that allows none reads them
 //! from its own, so what MDK holds cannot say that invitations will not arrive.
+//!
+//! An inbox check ([`checks`]) adds what the lists cannot say: whether a
+//! relay serves this account's inbox when asked. Its results move a row's
+//! state and raise warnings of their own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nostr_directory::AccountRelayListStatus;
 use transport_nostr::{
     RelayEndpointClassification, RelayEndpointPolicy, RelayLivenessStatus, canonical_relay,
+};
+
+mod checks;
+pub(crate) use checks::{
+    CheckRecord, CheckSnapshot, RunInputs, RunOutcome, run as run_inbox_check,
 };
 
 /// The account's relay health: one row per relay it uses and the warnings
@@ -82,10 +91,17 @@ pub struct RelayHealthRow {
     /// The lists naming it, in the order Inbox, Write, Read.
     pub roles: Vec<RelayRole>,
     pub state: RelayHealthState,
-    /// Why the relay is not allowed; set exactly when `state` is `NotAllowed`.
+    /// Why the relay is not allowed (`NotAllowed`), what it refused
+    /// (`Failing`) or why the check could not verify it (`Suspected`). Set
+    /// for those three states, never for `Unchecked` or `Healthy`.
     pub fault: Option<RelayHealthFault>,
     /// The connection state `account_relay_liveness` reports, passed through.
     pub liveness: RelayLivenessStatus,
+    /// When the inbox check that decided `state` asked the relay, in Unix
+    /// seconds; `None` while no check has established anything about it.
+    pub checked_at_unix: Option<u64>,
+    /// An inbox check of this relay is running.
+    pub checking: bool,
 }
 
 impl std::fmt::Debug for RelayHealthRow {
@@ -96,6 +112,8 @@ impl std::fmt::Debug for RelayHealthRow {
             .field("state", &self.state)
             .field("fault", &self.fault)
             .field("liveness", &self.liveness)
+            .field("checked_at_unix", &self.checked_at_unix)
+            .field("checking", &self.checking)
             .finish()
     }
 }
@@ -111,32 +129,68 @@ pub enum RelayRole {
     Read,
 }
 
-/// What MDK knows of a relay. Only `Unchecked` and `NotAllowed` are produced
-/// yet; the others are reserved for checks of relays that come later.
+/// What MDK knows of a relay. A check's states (`Healthy`, `Suspected`,
+/// `Failing`) describe one read of the account's inbox at `checked_at_unix`
+/// and apply to inbox rows only; a relay the lists name only for NIP-65 is
+/// never checked. Results belong to the account worker's client and go with
+/// it: they last while the account runs and are never stored. Later
+/// versions may append states: keep a default branch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayHealthState {
-    /// Allowed, and not checked.
+    /// Allowed, and no check has established anything about it.
     Unchecked,
-    /// Not produced yet.
+    /// The relay answered the inbox check: it ended a query for this
+    /// account's gift wraps (kind 1059 addressed to it) with EOSE, retried
+    /// after authenticating when it asked for that. An EOSE that says the
+    /// relay may withhold events until authentication (NIP-67 `auth`) still
+    /// counts: the check proves the relay answered, not that it held back
+    /// nothing.
     Healthy,
-    /// Not produced yet.
+    /// The check could not verify the relay: it did not connect or answer
+    /// in time while another relay of the same check answered, or it
+    /// refused or ended the query while the account's signer is a remote
+    /// or host signer that may not have answered its authentication
+    /// challenge, or it refused authentication with a reply the check could
+    /// not read (so a refusal cannot be told from a rate limit), or it ended
+    /// the query without naming a refusal. `fault` says which. Render it as "could not verify", never as a failure.
     Suspected,
-    /// Not produced yet.
+    /// The relay refused to serve this account's inbox when checked, with
+    /// the account's own key answering any authentication challenge: it
+    /// required authentication and refused it, required payment, or
+    /// restricted or blocked the account. `fault` says which. A refusal
+    /// like that does not change by asking again.
     Failing,
     /// The relay policy refuses it: this device never dials it.
     NotAllowed,
 }
 
-/// Why a relay is not allowed, as the relay policy classifies it.
+/// Why a relay's row is not `Unchecked` or `Healthy`. Later versions may
+/// append faults: keep a default branch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayHealthFault {
-    /// On the retired-relay list.
+    /// `NotAllowed`: on the retired-relay list.
     Retired,
-    /// Not a relay URL.
+    /// `NotAllowed`: not a relay URL.
     Invalid,
-    /// A host this device refuses to dial: plaintext, a private address,
-    /// localhost or onion.
+    /// `NotAllowed`: a host this device refuses to dial: plaintext, a
+    /// private address, localhost or onion.
     Unsafe,
+    /// `Failing` or `Suspected`: the relay required authentication
+    /// (`auth-required:`) and did not accept the account's.
+    AuthenticationRequired,
+    /// `Failing` or `Suspected`: the relay required payment
+    /// (`payment-required:`).
+    PaymentRequired,
+    /// `Failing` or `Suspected`: the relay restricted or blocked the
+    /// account (`restricted:`, `blocked:`).
+    Restricted,
+    /// `Suspected`: no connection to the relay.
+    Unreachable,
+    /// `Suspected`: the relay did not answer within the check's time.
+    TimedOut,
+    /// `Suspected`: the relay ended the query without naming a refusal (an
+    /// error or invalid-request close), or sent more than it was asked for.
+    Unexplained,
 }
 
 /// A problem with the account's relay setup.
@@ -170,29 +224,37 @@ pub enum RelayWarningKind {
     /// the route through the same fallback to the defaults and may still get
     /// through. `relays` is empty.
     InboxListEmpty,
-    /// Critical: the published inbox list names relays but the policy allows
-    /// none. This device never listens on them, so an invitation sent through
-    /// the list cannot reach it. A sender on this same install (another local
-    /// account, or this account linking a new device) resolves the route
-    /// through the same fallback to the defaults and may still get through.
-    /// `relays` are the entries not allowed.
+    /// Critical: the published inbox list names relays and every one is
+    /// either refused by the policy or `Failing`. This device never listens
+    /// on a refused one, so an invitation sent through the list cannot reach
+    /// it there; and each failing one refused to serve this account's inbox
+    /// when checked (see its row's `checked_at_unix`). When the policy allows
+    /// none, a sender on this same install (another local account, or this
+    /// account linking a new device) resolves the route through the same
+    /// fallback to the defaults and may still get through. `relays` are every
+    /// entry. An `Unchecked` or `Suspected` entry never raises it.
     NoAllowedInboxRelay,
     /// Warning: the published inbox list names relays the policy refuses
-    /// beside at least one it allows. This device never listens on the refused
-    /// ones, so an invitation sent only to them does not reach it. `relays`
-    /// are the entries not allowed.
+    /// beside at least one it allows that is not `Failing`. This device never
+    /// listens on the refused ones, so an invitation sent only to them does
+    /// not reach it. `relays` are the entries not allowed.
     InboxRelaysNotAllowed,
-    /// Notice: exactly one entry of the published inbox list is allowed, so
-    /// this device's inbox route is that one relay and an invitation sent
-    /// through the list reaches it only there. `relays` is that relay.
+    /// Notice: exactly one entry of the published inbox list is allowed and
+    /// not `Failing`, so an invitation sent through the list reaches this
+    /// device at most there. `relays` is that relay.
     SingleInboxRelay,
+    /// Warning: an entry of the published inbox list is `Failing`, beside at
+    /// least one allowed entry that is not: the failing relay refused to serve
+    /// this account's inbox when checked (see its row's `checked_at_unix`).
+    /// `relays` are the failing entries.
+    InboxRelayFailing,
 }
 
 impl RelayWarningKind {
     pub fn severity(self) -> RelayWarningSeverity {
         match self {
             Self::InboxListEmpty | Self::NoAllowedInboxRelay => RelayWarningSeverity::Critical,
-            Self::InboxRelaysNotAllowed => RelayWarningSeverity::Warning,
+            Self::InboxRelaysNotAllowed | Self::InboxRelayFailing => RelayWarningSeverity::Warning,
             Self::SingleInboxRelay => RelayWarningSeverity::Notice,
         }
     }
@@ -204,7 +266,9 @@ impl RelayWarningKind {
                 RelayRepairAction::RemoveInboxRelay,
                 RelayRepairAction::AddInboxRelay,
             ],
-            Self::InboxRelaysNotAllowed => vec![RelayRepairAction::RemoveInboxRelay],
+            Self::InboxRelaysNotAllowed | Self::InboxRelayFailing => {
+                vec![RelayRepairAction::RemoveInboxRelay]
+            }
         }
     }
 }
@@ -230,12 +294,15 @@ pub enum RelayRepairAction {
 }
 
 /// The account's relay health from its held `lists`, with every relay judged
-/// by `classify` (the relay plane's dial policy) and liveness left `Unknown`
-/// for the caller to fill in. Only lists and policy decide the answer, so two
-/// answers from here differ exactly when a host should read it again.
+/// by `classify` (the relay plane's dial policy) and each allowed inbox
+/// relay's state by its last established inbox check in `checks`, and
+/// liveness left `Unknown` for the caller to fill in. Lists, policy and check
+/// states decide the answer; [`AccountRelayHealth::announced`] is the part
+/// whose change a host is told of.
 pub(crate) fn account_relay_health(
     lists: &AccountRelayListStatus,
     classify: impl FnOnce(Vec<String>) -> Vec<RelayEndpointClassification>,
+    checks: &CheckSnapshot,
 ) -> AccountRelayHealth {
     let mut roles: BTreeMap<String, Vec<RelayRole>> = BTreeMap::new();
     let named = [
@@ -259,20 +326,21 @@ pub(crate) fn account_relay_health(
         .into_iter()
         .zip(classified)
         .map(|((url, roles), classification)| {
-            let fault = match classification.policy {
-                RelayEndpointPolicy::Allowed => None,
-                RelayEndpointPolicy::Retired => Some(RelayHealthFault::Retired),
-                RelayEndpointPolicy::Invalid => Some(RelayHealthFault::Invalid),
-                RelayEndpointPolicy::Unsafe => Some(RelayHealthFault::Unsafe),
+            let inbox = roles.contains(&RelayRole::Inbox);
+            let check = checks.results.get(&url).filter(|_| inbox);
+            let (state, fault) = match (policy_fault(classification.policy), check) {
+                (Some(fault), _) => (RelayHealthState::NotAllowed, Some(fault)),
+                (None, Some(check)) => (check.state, check.fault),
+                (None, None) => (RelayHealthState::Unchecked, None),
             };
             RelayHealthRow {
+                checked_at_unix: check
+                    .filter(|_| state != RelayHealthState::NotAllowed)
+                    .map(|check| check.checked_at_unix),
+                checking: inbox && checks.checking.contains(&url),
                 url,
                 roles,
-                state: if fault.is_some() {
-                    RelayHealthState::NotAllowed
-                } else {
-                    RelayHealthState::Unchecked
-                },
+                state,
                 fault,
                 liveness: RelayLivenessStatus::Unknown,
             }
@@ -286,11 +354,27 @@ pub(crate) fn account_relay_health(
     } else {
         RelayListPresence::Unknown
     };
-    let (allowed, refused): (Vec<_>, Vec<_>) = rows
+    let inbox = rows
         .iter()
         .filter(|row| row.roles.contains(&RelayRole::Inbox))
-        .partition(|row| row.fault.is_none());
-    let urls = |rows: &[&RelayHealthRow]| rows.iter().map(|row| row.url.clone()).collect();
+        .collect::<Vec<_>>();
+    let urls = |state: fn(RelayHealthState) -> bool| {
+        inbox
+            .iter()
+            .filter(|row| state(row.state))
+            .map(|row| row.url.clone())
+            .collect::<Vec<_>>()
+    };
+    // Usable: allowed and not failing. Unchecked and suspected relays count,
+    // so only a refusal a check established can take an entry out.
+    let usable = urls(|state| {
+        !matches!(
+            state,
+            RelayHealthState::NotAllowed | RelayHealthState::Failing
+        )
+    });
+    let refused = urls(|state| state == RelayHealthState::NotAllowed);
+    let failing = urls(|state| state == RelayHealthState::Failing);
     let mut warnings = Vec::new();
     if inbox_list == RelayListPresence::Published {
         let mut warn = |kind: RelayWarningKind, relays: Vec<String>| {
@@ -301,47 +385,100 @@ pub(crate) fn account_relay_health(
                 actions: kind.actions(),
             });
         };
-        match (allowed.len(), refused.is_empty()) {
-            (0, true) => warn(RelayWarningKind::InboxListEmpty, Vec::new()),
-            (0, false) => warn(RelayWarningKind::NoAllowedInboxRelay, urls(&refused)),
-            (_, false) => warn(RelayWarningKind::InboxRelaysNotAllowed, urls(&refused)),
-            (_, true) => {}
-        }
-        if allowed.len() == 1 {
-            warn(RelayWarningKind::SingleInboxRelay, urls(&allowed));
+        if inbox.is_empty() {
+            warn(RelayWarningKind::InboxListEmpty, Vec::new());
+        } else if usable.is_empty() {
+            warn(
+                RelayWarningKind::NoAllowedInboxRelay,
+                inbox.iter().map(|row| row.url.clone()).collect(),
+            );
+        } else {
+            if !refused.is_empty() {
+                warn(RelayWarningKind::InboxRelaysNotAllowed, refused);
+            }
+            if !failing.is_empty() {
+                warn(RelayWarningKind::InboxRelayFailing, failing);
+            }
+            if usable.len() == 1 {
+                warn(RelayWarningKind::SingleInboxRelay, usable);
+            }
         }
     }
     warnings.sort_by_key(|warning| std::cmp::Reverse(warning.severity));
     AccountRelayHealth {
         inbox_list,
-        falls_back_to_defaults: allowed.is_empty(),
+        falls_back_to_defaults: inbox
+            .iter()
+            .all(|row| row.state == RelayHealthState::NotAllowed),
         highest_severity: warnings.first().map(|warning| warning.severity),
         rows,
         warnings,
     }
 }
 
+fn policy_fault(policy: RelayEndpointPolicy) -> Option<RelayHealthFault> {
+    match policy {
+        RelayEndpointPolicy::Allowed => None,
+        RelayEndpointPolicy::Retired => Some(RelayHealthFault::Retired),
+        RelayEndpointPolicy::Invalid => Some(RelayHealthFault::Invalid),
+        RelayEndpointPolicy::Unsafe => Some(RelayHealthFault::Unsafe),
+    }
+}
+
+impl AccountRelayHealth {
+    /// The answer a host is told changed: without liveness, when each relay
+    /// was last checked or whether a check runs, so a check that confirms
+    /// the answer announces nothing.
+    pub(crate) fn announced(mut self) -> Self {
+        for row in &mut self.rows {
+            row.liveness = RelayLivenessStatus::Unknown;
+            row.checked_at_unix = None;
+            row.checking = false;
+        }
+        self
+    }
+
+    /// The allowed inbox entries, the first [`checks::MAX_CHECKED_RELAYS`]
+    /// by URL: what an inbox check dials.
+    pub(crate) fn checkable_inbox_relays(&self) -> BTreeSet<String> {
+        self.rows
+            .iter()
+            .filter(|row| {
+                row.roles.contains(&RelayRole::Inbox) && row.state != RelayHealthState::NotAllowed
+            })
+            .take(checks::MAX_CHECKED_RELAYS)
+            .map(|row| row.url.clone())
+            .collect()
+    }
+}
+
 impl crate::MarmotApp {
     /// [`account_relay_health`] for a local account, from its cached lists
-    /// under the relay plane's own dial policy.
+    /// under the relay plane's own dial policy and the account worker's
+    /// inbox checks (`checks`, empty while no worker runs).
     pub(crate) fn account_relay_health(
         &self,
         label: &str,
+        checks: &CheckSnapshot,
     ) -> Result<AccountRelayHealth, crate::AppError> {
         let lists = self.account_relay_list_status(label)?;
-        Ok(account_relay_health(&lists, |urls| {
-            self.relay_plane.classify_relay_endpoints(urls)
-        }))
+        Ok(account_relay_health(
+            &lists,
+            |urls| self.relay_plane.classify_relay_endpoints(urls),
+            checks,
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::checks::CheckRecord;
     use super::*;
     use transport_nostr::RelaySafetyPolicy;
 
     use RelayWarningKind::{
-        InboxListEmpty, InboxRelaysNotAllowed, NoAllowedInboxRelay, SingleInboxRelay,
+        InboxListEmpty, InboxRelayFailing, InboxRelaysNotAllowed, NoAllowedInboxRelay,
+        SingleInboxRelay,
     };
     use RelayWarningSeverity::{Critical, Notice, Warning};
 
@@ -371,9 +508,18 @@ mod tests {
     }
 
     fn health(lists: &AccountRelayListStatus) -> AccountRelayHealth {
-        account_relay_health(lists, |urls| {
-            RelaySafetyPolicy::default().classify_endpoints(urls)
-        })
+        checked_health(lists, &CheckSnapshot::default())
+    }
+
+    fn checked_health(
+        lists: &AccountRelayListStatus,
+        checks: &CheckSnapshot,
+    ) -> AccountRelayHealth {
+        account_relay_health(
+            lists,
+            |urls| RelaySafetyPolicy::default().classify_endpoints(urls),
+            checks,
+        )
     }
 
     /// Each inbox setup raises exactly the warnings its condition names, and
@@ -516,5 +662,263 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// What one check run establishes per relay. An answer decides at once;
+    /// a refusal is `Failing` only under the account's own key, which always
+    /// answers authentication; a rate limit is never a fault; and silence
+    /// counts only beside a relay of the same run that answered, so a run
+    /// from an offline device changes nothing.
+    #[test]
+    fn a_check_run_establishes_only_what_an_answer_proves() {
+        use RelayHealthFault as F;
+        use RelayHealthState::{Failing, Healthy, Suspected};
+        use transport_nostr::DirectoryInspectionError::*;
+
+        let run = |results: &[(&str, Result<(), transport_nostr::DirectoryInspectionError>)],
+                   local_key: bool| {
+            checks::established(
+                results
+                    .iter()
+                    .map(|(relay, result)| ((*relay).to_owned(), result.clone()))
+                    .collect(),
+                local_key,
+                7,
+            )
+            .into_iter()
+            .map(|(relay, record)| {
+                let record = record.map(|record| {
+                    assert_eq!(record.checked_at_unix, 7);
+                    (record.state, record.fault)
+                });
+                (relay, record)
+            })
+            .collect::<Vec<_>>()
+        };
+        let results = [
+            ("a-served", Ok(())),
+            ("b-auth", Err(AuthenticationRequired)),
+            ("c-pay", Err(PaymentRequired)),
+            ("d-restricted", Err(Restricted)),
+            ("e-rate-limited", Err(RateLimited)),
+            ("e2-auth-rate-limited", Err(AuthenticationRateLimited)),
+            ("e3-auth-unread", Err(AuthenticationUnconfirmed)),
+            ("e4-auth-signing", Err(AuthenticationTimedOut)),
+            ("f-unexplained", Err(Unexplained)),
+            ("g-closed-port", Err(Unreachable)),
+            ("h-silent", Err(TimedOut)),
+        ];
+        let owned = |relay: &str| relay.to_owned();
+        for (local_key, refused) in [(true, Failing), (false, Suspected)] {
+            assert_eq!(
+                run(&results, local_key),
+                vec![
+                    (owned("a-served"), Some((Healthy, None))),
+                    (
+                        owned("b-auth"),
+                        Some((refused, Some(F::AuthenticationRequired)))
+                    ),
+                    (owned("c-pay"), Some((refused, Some(F::PaymentRequired)))),
+                    (owned("d-restricted"), Some((refused, Some(F::Restricted)))),
+                    (owned("e-rate-limited"), None),
+                    (owned("e2-auth-rate-limited"), None),
+                    (
+                        owned("e3-auth-unread"),
+                        Some((Suspected, Some(F::AuthenticationRequired)))
+                    ),
+                    (
+                        owned("e4-auth-signing"),
+                        Some((Suspected, Some(F::AuthenticationRequired)))
+                    ),
+                    (
+                        owned("f-unexplained"),
+                        Some((Suspected, Some(F::Unexplained)))
+                    ),
+                    (
+                        owned("g-closed-port"),
+                        Some((Suspected, Some(F::Unreachable)))
+                    ),
+                    (owned("h-silent"), Some((Suspected, Some(F::TimedOut)))),
+                ],
+                "local key: {local_key}"
+            );
+        }
+        // A rate limit is an answer: the relay is there.
+        assert_eq!(
+            run(&[("a", Err(RateLimited)), ("b", Err(Unreachable))], true),
+            vec![
+                (owned("a"), None),
+                (owned("b"), Some((Suspected, Some(F::Unreachable))))
+            ]
+        );
+        // Local queue backpressure says nothing of the relay AND does not count
+        // as an answer that would blame an unreachable peer on an offline device.
+        assert_eq!(
+            run(&[("a", Ok(())), ("b", Err(LocalBusy))], true),
+            vec![(owned("a"), Some((Healthy, None))), (owned("b"), None)]
+        );
+        assert_eq!(
+            run(&[("a", Err(LocalBusy)), ("b", Err(Unreachable))], true),
+            vec![(owned("a"), None), (owned("b"), None)]
+        );
+        // No relay answered: nothing is established.
+        assert_eq!(
+            run(&[("a", Err(Unreachable)), ("b", Err(TimedOut))], true),
+            vec![(owned("a"), None), (owned("b"), None)]
+        );
+        assert_eq!(
+            run(&[("a", Err(Unreachable))], true),
+            vec![(owned("a"), None)]
+        );
+    }
+
+    /// Check states raise their warnings: a failing relay beside a usable
+    /// one is a Warning, and the Critical fires once every entry is refused
+    /// or failing. An unchecked or suspected entry keeps the list usable, so
+    /// it never makes a Critical.
+    #[test]
+    fn failing_inbox_relays_raise_warnings_and_unverified_ones_none() {
+        use RelayHealthState::{Failing, Healthy, Suspected};
+        let a = "wss://a.example".to_owned();
+        let b = "wss://b.example".to_owned();
+        let checks = |states: &[(&str, RelayHealthState)]| CheckSnapshot {
+            results: states
+                .iter()
+                .map(|(url, state)| {
+                    let fault = match state {
+                        Failing => Some(RelayHealthFault::AuthenticationRequired),
+                        Suspected => Some(RelayHealthFault::Unreachable),
+                        _ => None,
+                    };
+                    (
+                        (*url).to_owned(),
+                        CheckRecord {
+                            state: *state,
+                            fault,
+                            checked_at_unix: 9,
+                        },
+                    )
+                })
+                .collect(),
+            checking: Default::default(),
+        };
+        type Case<'a> = (
+            &'a str,
+            Vec<String>,
+            CheckSnapshot,
+            Vec<(RelayWarningKind, RelayWarningSeverity, Vec<String>)>,
+        );
+        let cases: [Case; 6] = [
+            (
+                "one failing beside a healthy",
+                vec![a.clone(), b.clone()],
+                checks(&[(&a, Failing), (&b, Healthy)]),
+                vec![
+                    (InboxRelayFailing, Warning, vec![a.clone()]),
+                    (SingleInboxRelay, Notice, vec![b.clone()]),
+                ],
+            ),
+            (
+                "one failing beside an unchecked",
+                vec![a.clone(), b.clone()],
+                checks(&[(&a, Failing)]),
+                vec![
+                    (InboxRelayFailing, Warning, vec![a.clone()]),
+                    (SingleInboxRelay, Notice, vec![b.clone()]),
+                ],
+            ),
+            (
+                "every entry failing",
+                vec![a.clone(), b.clone()],
+                checks(&[(&a, Failing), (&b, Failing)]),
+                vec![(NoAllowedInboxRelay, Critical, vec![a.clone(), b.clone()])],
+            ),
+            (
+                "failing beside a retired relay",
+                vec![a.clone(), retired()],
+                checks(&[(&a, Failing)]),
+                vec![(NoAllowedInboxRelay, Critical, vec![a.clone(), retired()])],
+            ),
+            (
+                "every entry suspected",
+                vec![a.clone(), b.clone()],
+                checks(&[(&a, Suspected), (&b, Suspected)]),
+                vec![],
+            ),
+            (
+                "suspected beside a retired relay",
+                vec![a.clone(), retired()],
+                checks(&[(&a, Suspected)]),
+                vec![
+                    (InboxRelaysNotAllowed, Warning, vec![retired()]),
+                    (SingleInboxRelay, Notice, vec![a.clone()]),
+                ],
+            ),
+        ];
+        for (case, inbox, checks, expected) in cases {
+            let health = checked_health(&lists(case, Some(inbox)), &checks);
+            let warnings = health
+                .warnings
+                .iter()
+                .map(|warning| (warning.kind, warning.severity, warning.relays.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(warnings, expected, "{case}");
+            assert!(!health.falls_back_to_defaults, "{case}");
+        }
+    }
+
+    /// A check's state reaches only an allowed inbox row, which carries when
+    /// it was asked; the announced answer leaves out check times and checks
+    /// in progress, so a check that confirms every state announces nothing.
+    #[test]
+    fn check_results_reach_inbox_rows_and_confirmations_announce_nothing() {
+        let a = "wss://a.example".to_owned();
+        let mut lists = lists("rows", Some(vec![a.clone(), retired()]));
+        lists.nip65.read_relays = vec!["wss://read.example".into()];
+        let record = |checked_at_unix| CheckRecord {
+            state: RelayHealthState::Healthy,
+            fault: None,
+            checked_at_unix,
+        };
+        let snapshot = |checked_at_unix, checking: &[&str]| CheckSnapshot {
+            results: [&a, &retired(), &"wss://read.example".to_owned()]
+                .into_iter()
+                .map(|url| (url.clone(), record(checked_at_unix)))
+                .collect(),
+            checking: checking.iter().map(|url| (*url).to_owned()).collect(),
+        };
+        let first = checked_health(&lists, &snapshot(5, &[]));
+        let rows = first
+            .rows
+            .iter()
+            .map(|row| (row.url.clone(), row.state, row.checked_at_unix))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                (a.clone(), RelayHealthState::Healthy, Some(5)),
+                (
+                    "wss://read.example".into(),
+                    RelayHealthState::Unchecked,
+                    None
+                ),
+                (retired(), RelayHealthState::NotAllowed, None),
+                (
+                    "wss://write.example".into(),
+                    RelayHealthState::Unchecked,
+                    None
+                ),
+            ]
+        );
+        let again = checked_health(&lists, &snapshot(6, &[&a, "wss://read.example"]));
+        let checking = again
+            .rows
+            .iter()
+            .filter(|row| row.checking)
+            .map(|row| row.url.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(checking, vec![a.clone()]);
+        assert_ne!(first, again);
+        assert_eq!(first.announced(), again.announced());
     }
 }

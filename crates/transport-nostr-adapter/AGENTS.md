@@ -36,7 +36,6 @@ for reconnect/backoff and relay status mechanics.
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
 | `tests/acquisition_contract.rs` | Request validation and optional-boundary shape tests. |
 | `tests/publish_accounting.rs` | Direct-adapter publish admission, classification, and cancellation tests, with or without `sdk`. |
-| `tests/selective_history_acquisition_tests.rs` | `sdk`-gated bounded history acquisition and reconciliation-cursor tests. |
 | `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp including raw500/validated499 with1,200valid events (#2885), NIP-77 saturated second, an inconclusive second (a listed id withheld, a malformed NEG-MSG, or repeated id-fetch events that cut a one-id reply; retried and never saturated), resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing, `auth` leaves the slice owed, and a slice retried after authentication proves nothing (a scripted auth-gated relay with an unpublished cap); replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
 | `tests/relay_limit_subscriptions.rs` | `sdk`-gated subscription behavior against `tests/support/limit_relay.rs`, a proxy enforcing strfry 1.1.3's per-connection limits (REQ and NEG caps, filter shape, 500 limit clamp). |
 
@@ -126,9 +125,10 @@ for reconnect/backoff and relay status mechanics.
 - Stage each group's complete replay range before timestamp/id-ordered release. Keep
   live arrivals behind the draining batch. Every replacement REQ establishes its own current-peer boundary,
   including equivalent or narrower repacks; never inherit another REQ's ready floor. In-deadline peers fence
-  payload release until EOSE or their finite lease settles. Verified raw SDK group copies feed admission;
-  deduplicated `Event` copies must not bypass
-  it, and retired REQs must never admit late copies. SDK seen-state is not account admission.
+  payload release until EOSE or their finite lease settles. Verified raw SDK group (`RawGroup`) and kind-1059
+  inbox (`RawInbox`) copies feed admission on `RelayMessage::Event`; deduplicated `ClientNotification::Event`
+  copies are ignored, and retired or wrong-scope REQs must never admit late copies. SDK seen-state is not
+  account admission.
 - Admission belongs to each REQ/relay/transport-route, never a sticky group-wide failure flag. Share
   ciphertext bodies with separate source claims; retiring or failing one source must not discard a healthy
   source's older history. Waiting starts again at an unfinished source's first connection boundary. Each
@@ -259,9 +259,16 @@ for reconnect/backoff and relay status mechanics.
   blocks or delays another frame. It reads each frame's verb and id as the SDK's JSON parser reads them
   (`classify`, pinned against `RelayMessage::from_json`); a frame whose verb or EVENT id is not JSON (a raw control
   character included), or any binary frame, passes on and ends that connection's requests `InvalidMessage`, so no
-  EVENT the SDK would drop can shorten a page unseen. Each request's queue holds its byte budget plus one frame, which covers an ordinary
-  page's envelopes however slow the caller; only rejected events or more than a frame of padding can fill it, and
-  that ends the request as a cut. The collector applies the builder's relay limits (frame, event size, tags; a frame
+  EVENT the SDK would drop can shorten a page unseen. Each unshared request's queue holds its byte budget plus one frame, which covers an ordinary
+  page's envelopes however slow the caller; under `FiniteRequests::sharing`, each relay slot keeps one private 5 MiB frame and shares the group's byte budget across overflow backlogs. Only rejected events, shared-group backlog overflow, or more than a frame of padding can fill it, and
+  that ends the request as a cut. Active finite requests admit against a shared global queued-byte budget (192 MiB
+  default, FIFO reservation per unshared request, or one shared group budget plus one private 5 MiB frame per active
+  relay under `FiniteRequests::sharing` so peer relays in a directory fan-out never multiply the shared budget; an
+  individual oversized request clamps to global capacity so it runs exclusively without deadlocking). One total
+  deadline covers admission and wire execution: expiry during local admission ends `FiniteEnd::Busy` (never a relay
+  timeout), which callers map to local backpressure (`SweepEnd::LocalBusy` / `CompareEnd::LocalBusy` /
+  `DirectoryInspectionError::LocalBusy` / plain-lookup error) rather than blaming a healthy relay as `Unreachable` or
+  reading records as absent. The collector applies the builder's relay limits (frame, event size, tags; a frame
   never past the queue's 5 MiB ceiling; a relay's own `add_relay(..).limits(..)` override is not applied, since the
   SDK cannot read it back, so do not set one), expiry, the filter,
   the event id and signature of the supplied bytes, the client database's deletion check and the builder's admission
@@ -273,8 +280,12 @@ for reconnect/backoff and relay status mechanics.
   authenticates; the retry spends what the first attempt left of the budget, and the reply keeps both attempts' events and counts. Authentication still
   under way at the deadline ends the request `TimedOut` (undecided), never as the refusal. The relay plane's own
   one-shot clients get finite requests through `FiniteRequests::install`; keep that surface to `install`, `fetch`,
-  `fetch_watching` with `watch_auth` (an authentication watch started before the dial), `sharing` (one byte budget
-  for a read's relays, charged per kept event) and their types.
+  `fetch_watching` with `watch_auth` (an authentication watch started before the dial, with opt-in
+  `AuthWatch::with_challenge_wait(AUTH_CHALLENGE_WAIT)` for one-shot directory inspection only so history sweeps keep
+  their full timeout contract), `sharing` (one kept-event and shared queue-budget reservation
+  for a read's relays), `shutdown` (retiring active slots to suppress unsent REQs, sending `CLOSE` for already-sent
+  active requests on live clients, ending active/waiting requests as `Disconnected`, and joining tracked
+  `send_msg(req)` / `CLOSE` cleanup tasks) and their types.
 - The client's wire tap (`src/sweep/hint_tap.rs`) counts, per REQ, the EVENT frames its relay sends before that
   REQ's EOSE, valid or not, on the connection the REQ went out on (`ReplyCounts`). `dispatch_sdk_notification` asks
   `NostrRelayClient::reply_sent_nothing` once as it dispatches each EOSE, and each ask answers only the oldest EOSE

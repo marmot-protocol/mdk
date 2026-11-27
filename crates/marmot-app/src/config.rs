@@ -103,6 +103,7 @@ pub struct MarmotAppConfig {
     pub attachment_acquisition: Option<AttachmentAcquisitionPolicy>,
     /// Demand and permission ownership, fixed before runtime workers start.
     pub attachment_acquisition_mode: AttachmentAcquisitionMode,
+    pub acquire_public_avatars: bool,
     /// Disable exporters for short-lived command processes. Frozen cursors always disable them.
     pub usage_diagnostics_silent: bool,
     pub directory_max_future_skew: Duration,
@@ -258,6 +259,7 @@ impl Default for MarmotAppConfig {
             device_platform: None,
             attachment_acquisition: Some(AttachmentAcquisitionPolicy::default()),
             attachment_acquisition_mode: AttachmentAcquisitionMode::default(),
+            acquire_public_avatars: true,
             moderation_report_config: None,
             usage_diagnostics_silent: false,
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
@@ -299,6 +301,11 @@ impl MarmotAppConfig {
     /// Select native or host-managed demand before constructing a runtime.
     pub fn with_attachment_acquisition_mode(mut self, mode: AttachmentAcquisitionMode) -> Self {
         self.attachment_acquisition_mode = mode;
+        self
+    }
+
+    pub fn with_public_avatar_acquisition(mut self, enabled: bool) -> Self {
+        self.acquire_public_avatars = enabled;
         self
     }
 

@@ -812,3 +812,691 @@ async fn a_current_key_package_the_publisher_can_no_longer_send_is_replaced() {
         Some(first_event)
     );
 }
+
+#[tokio::test]
+async fn an_expired_pending_replacement_is_not_published_and_is_replaced_on_next_publish() {
+    #[derive(Clone)]
+    struct ClockSteppingPublisher {
+        inner: RecordingKeyPackages,
+        wall: Arc<TestWallClock>,
+        advance_on_prepare: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl KeyPackagePublisher for ClockSteppingPublisher {
+        fn legacy_slot_id(
+            &self,
+            account_id: &cgka_traits::MemberId,
+        ) -> Result<Option<String>, marmot_session::KeyPackagePublishError> {
+            self.inner.legacy_slot_id(account_id)
+        }
+
+        async fn prepare_key_package(
+            &self,
+            publication: marmot_session::KeyPackagePublication,
+        ) -> Result<cgka_traits::SignedPublicationArtifact, marmot_session::KeyPackagePublishError>
+        {
+            let artifact = self.inner.prepare_key_package(publication).await?;
+            let step = self
+                .advance_on_prepare
+                .swap(0, std::sync::atomic::Ordering::SeqCst);
+            if step > 0 {
+                self.wall.set(self.wall.now().0.saturating_add(step));
+            }
+            Ok(artifact)
+        }
+
+        async fn publish_prepared_key_package(
+            &self,
+            publication: &marmot_session::KeyPackagePublication,
+            artifact: &cgka_traits::SignedPublicationArtifact,
+        ) -> Result<marmot_session::KeyPackagePublishReceipt, marmot_session::KeyPackagePublishError>
+        {
+            self.inner
+                .publish_prepared_key_package(publication, artifact)
+                .await
+        }
+    }
+
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("kp slot expired pending").unwrap();
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let inner = RecordingKeyPackages::default();
+    let advance_on_prepare = Arc::new(std::sync::atomic::AtomicU64::new(31 * DAY));
+    let publisher = ClockSteppingPublisher {
+        inner: inner.clone(),
+        wall: wall.clone(),
+        advance_on_prepare: advance_on_prepare.clone(),
+    };
+    let mut runtime = slot_runtime(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        publisher,
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+
+    // The signer returned after the staged pending replacement already expired:
+    // publish_fresh_key_package must refuse without publishing it.
+    let error = runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("expired prepared replacement must not publish");
+    assert!(
+        matches!(
+            error,
+            marmot_session::AccountError::KeyPackage(ref err) if !err.externally_exposed
+        ),
+        "expected unexposed KeyPackage error, got {error:?}"
+    );
+    assert!(inner.publications().is_empty());
+
+    // Bring the test clock back to real time and mark the staged replacement as
+    // expired at `now` (simulating a replacement staged 30 days earlier) so a
+    // freshly generated OpenMLS replacement has a valid future `not_after`.
+    wall.set(now);
+    let mut lifecycle = slot_lifecycle(&runtime);
+    lifecycle.pending_replacement.as_mut().unwrap().not_after = Timestamp(now);
+    runtime
+        .session()
+        .put_key_package_lifecycle(&lifecycle)
+        .unwrap();
+    let expired_pending = lifecycle.pending_replacement.unwrap();
+
+    // While paused, maintenance does not schedule or retry an expired pending
+    // replacement (it is obsolete, not publishable prepared work).
+    runtime.pause_maintenance();
+    let due = runtime.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(expired_pending.not_after));
+    assert!(!due.retry_while_owed);
+
+    // Unpausing and publishing replaces the expired pending artifact with a fresh
+    // package and retires the expired retained private material during promotion.
+    runtime.resume_maintenance();
+    assert!(runtime.key_package_network_maintenance_due().unwrap());
+    let fresh = runtime.publish_fresh_key_package().await.unwrap();
+    assert_ne!(fresh, expired_pending.key_package);
+    assert_eq!(inner.publications().len(), 1);
+    assert_eq!(inner.publications()[0].key_package, fresh);
+    let promoted = slot_lifecycle(&runtime);
+    assert!(promoted.pending_replacement.is_none());
+    assert!(
+        promoted.retained_private_material.is_empty(),
+        "expired superseded pending material must be retired on promotion"
+    );
+    assert!(
+        !runtime
+            .durably_owned_key_packages()
+            .unwrap()
+            .contains(&expired_pending.key_package)
+    );
+}
+
+#[tokio::test]
+async fn an_expired_current_key_package_is_not_republished_or_fanned_out() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("kp slot expired current fanout").unwrap();
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let publisher = RefusingKeyPackages::default();
+    publisher
+        .partial
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut runtime = slot_runtime(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT, "wss://keys-2.example"],
+    );
+    let first = runtime.publish_fresh_key_package().await.unwrap();
+    let mut published = slot_lifecycle(&runtime);
+    let first_event = published.authored_event_id.clone().unwrap();
+    assert!(runtime.key_package_has_pending_fanout().unwrap());
+
+    // Once current_not_after elapses (at real time `now` so a fresh replacement
+    // is valid), the expired current event is no longer eligible for fanout
+    // retry or republication.
+    published.current_not_after = Some(Timestamp(now));
+    runtime
+        .session()
+        .put_key_package_lifecycle(&published)
+        .unwrap();
+    assert!(
+        !runtime.key_package_has_pending_fanout().unwrap(),
+        "expired current KeyPackage must not advertise pending fanout"
+    );
+
+    // Republishing an expired current KeyPackage falls back to a fresh one and
+    // retires the expired current bundle during promotion rather than retaining it.
+    publisher
+        .partial
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let replacement = runtime.republish_key_package().await.unwrap();
+    assert_ne!(replacement, first);
+    let after = slot_lifecycle(&runtime);
+    assert!(
+        after.retained_private_material.is_empty(),
+        "expired current KeyPackage must be retired on promotion, not retained"
+    );
+    assert!(
+        !runtime
+            .durably_owned_key_packages()
+            .unwrap()
+            .contains(&first)
+    );
+    assert_eq!(
+        publisher.attempts(),
+        vec![
+            (first_event, true),
+            (after.authored_event_id.unwrap(), true),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn empty_routing_does_not_strand_key_package_publication_once_a_writable_relay_is_added() {
+    let dir = relaxed_storage_dir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("kp slot empty routing recovery").unwrap();
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let publisher = RecordingKeyPackages::default();
+
+    // Staging or publishing with zero endpoints refuses without persisting a
+    // zero-target pending replacement, and maintenance does not spin retrying
+    // a KeyPackage publish until at least one writable endpoint is configured.
+    let mut empty_runtime = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[],
+    );
+    assert!(!empty_runtime.key_package_network_maintenance_due().unwrap());
+    assert!(!empty_runtime.maintenance_due(&[]).unwrap().retry_while_owed);
+    let err = empty_runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("empty routing must fail before staging");
+    assert!(matches!(
+        err,
+        marmot_session::AccountError::KeyPackage(ref err) if !err.externally_exposed
+    ));
+    assert!(
+        empty_runtime
+            .key_package_maintenance_status()
+            .unwrap()
+            .is_none_or(|lifecycle| lifecycle.pending_replacement.is_none()),
+        "empty routing must not persist a zero-target pending replacement"
+    );
+    drop(empty_runtime);
+
+    // Even if an existing persisted pending replacement has zero targets, adding
+    // a writable relay immediately makes maintenance due and publishes the exact
+    // signed artifact without waiting for expiry.
+    let mut seeded = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+    assert!(seeded.key_package_network_maintenance_due().unwrap());
+    assert!(seeded.maintenance_due(&[]).unwrap().retry_while_owed);
+    seeded
+        .prepare_fresh_key_package(vec![TransportEndpoint(KEY_ENDPOINT.into())])
+        .await
+        .unwrap();
+    let mut lifecycle = slot_lifecycle(&seeded);
+    let signed_before = lifecycle
+        .pending_replacement
+        .as_ref()
+        .unwrap()
+        .signed_event
+        .clone()
+        .unwrap();
+    lifecycle
+        .pending_replacement
+        .as_mut()
+        .unwrap()
+        .targets
+        .clear();
+    seeded
+        .session()
+        .put_key_package_lifecycle(&lifecycle)
+        .unwrap();
+    drop(seeded);
+
+    let writable = "wss://writable.example";
+    let mut recovered = slot_runtime(
+        current_session(database, &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[writable],
+    );
+    assert!(recovered.key_package_network_maintenance_due().unwrap());
+    assert!(recovered.maintenance_due(&[]).unwrap().retry_while_owed);
+    recovered.run_due_maintenance().await.unwrap();
+    let promoted = slot_lifecycle(&recovered);
+    assert!(promoted.pending_replacement.is_none());
+    assert_eq!(promoted.authored_signed_event, Some(signed_before));
+    let publications = publisher.publications();
+    assert_eq!(publications.len(), 1);
+    assert_eq!(
+        publications[0].endpoints,
+        vec![TransportEndpoint(writable.into())]
+    );
+}
+
+#[tokio::test]
+async fn persisted_pending_and_fanout_retries_respect_removed_or_read_only_relays() {
+    use cgka_traits::TransportFanoutAttemptState;
+
+    let dir = relaxed_storage_dir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("kp slot read-only retry policy").unwrap();
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let read_only = "wss://became-read-only.example";
+    let writable = "wss://writable.example";
+    let accepted = "wss://accepted.example";
+
+    // Part 1: A persisted pending replacement originally targeted a relay that
+    // later became read-only (removed from key_package_endpoints).
+    let failing = RefusingKeyPackages::default();
+    failing
+        .refuse_all
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut runtime = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        failing.clone(),
+        &wall,
+        0,
+        &[read_only],
+    );
+    runtime.publish_fresh_key_package().await.unwrap_err();
+    let pending = slot_lifecycle(&runtime).pending_replacement.unwrap();
+    let signed_event = pending.signed_event.clone().unwrap();
+    drop(runtime);
+
+    // When no writable relay remains, maintenance neither schedules nor sends to
+    // the removed/read-only relay.
+    let no_routes = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        RecordingKeyPackages::default(),
+        &wall,
+        0,
+        &[],
+    );
+    wall.set(now + 60);
+    assert!(!no_routes.key_package_network_maintenance_due().unwrap());
+    let due = no_routes.maintenance_due(&[]).unwrap();
+    assert_eq!(due.at, Some(pending.not_after));
+    assert!(!due.retry_while_owed);
+    drop(no_routes);
+
+    // When a writable relay replaces the read-only relay, maintenance preserves
+    // the exact signed bytes, marks the old relay PolicyProhibited, and sends
+    // only to the writable relay.
+    let publisher = RecordingKeyPackages::default();
+    let mut switched = slot_runtime(
+        current_session(database.clone(), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[writable],
+    );
+    assert!(switched.key_package_network_maintenance_due().unwrap());
+    switched.run_due_maintenance().await.unwrap();
+    let calls = publisher.publications();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].endpoints, vec![TransportEndpoint(writable.into())]);
+    let promoted = slot_lifecycle(&switched);
+    assert_eq!(promoted.authored_signed_event, Some(signed_event.clone()));
+    assert!(promoted.publication_targets.iter().any(|target| {
+        target.endpoint == TransportEndpoint(read_only.into())
+            && target.state == TransportFanoutAttemptState::PolicyProhibited
+    }));
+    drop(switched);
+
+    // Restoring that previously PolicyProhibited relay to writable routing
+    // makes fanout immediately owed and delivers the exact same signed artifact.
+    let mut restored_pending_target = slot_runtime(
+        current_session(database, &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[writable, read_only],
+    );
+    assert!(
+        restored_pending_target
+            .key_package_has_pending_fanout()
+            .unwrap()
+    );
+    assert!(
+        restored_pending_target
+            .maintenance_due(&[])
+            .unwrap()
+            .retry_while_owed
+    );
+    restored_pending_target.run_due_maintenance().await.unwrap();
+    let calls = publisher.publications();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[1].endpoints,
+        vec![TransportEndpoint(read_only.into())]
+    );
+    let restored_lifecycle = slot_lifecycle(&restored_pending_target);
+    assert_eq!(restored_lifecycle.authored_signed_event, Some(signed_event));
+    assert!(restored_lifecycle.publication_targets.iter().all(|target| {
+        target.state == TransportFanoutAttemptState::Accepted
+    }));
+    drop(restored_pending_target);
+
+    // Part 2: Current publication fanout with one accepted relay (A) and two
+    // failed relays (B = read_only, C = writable). Removing B while C remains
+    // writable retries only C; later restoring B delivers the exact same artifact
+    // to B without waiting for rotation.
+    let partial_db = dir.path().join("bob.sqlite");
+    let partial = PartialFanoutKeyPackages::default();
+    let mut fanout_runtime = slot_runtime(
+        current_session(partial_db.clone(), &key, b"bob"),
+        partial.clone(),
+        &wall,
+        0,
+        &[accepted, read_only, writable],
+    );
+    fanout_runtime.publish_fresh_key_package().await.unwrap();
+    let initial_artifact = slot_lifecycle(&fanout_runtime)
+        .authored_signed_event
+        .unwrap();
+    assert!(fanout_runtime.key_package_has_pending_fanout().unwrap());
+    drop(fanout_runtime);
+
+    // With B removed from routing and C still writable, fanout retries only C.
+    let mut c_only = slot_runtime(
+        current_session(partial_db.clone(), &key, b"bob"),
+        partial.clone(),
+        &wall,
+        0,
+        &[accepted, writable],
+    );
+    wall.set(now + 120);
+    assert!(c_only.key_package_has_pending_fanout().unwrap());
+    c_only.run_due_maintenance().await.unwrap();
+    assert!(!c_only.key_package_has_pending_fanout().unwrap());
+    let calls = partial.publications();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0.endpoints, vec![TransportEndpoint(writable.into())]);
+    assert_eq!(calls[1].1, initial_artifact);
+    drop(c_only);
+
+    // Restoring B to writable routing resumes fanout to B with the exact same
+    // signed artifact.
+    let mut b_restored = slot_runtime(
+        current_session(partial_db, &key, b"bob"),
+        partial.clone(),
+        &wall,
+        0,
+        &[accepted, writable, read_only],
+    );
+    wall.set(now + 240);
+    assert!(b_restored.key_package_has_pending_fanout().unwrap());
+    b_restored.run_due_maintenance().await.unwrap();
+    let calls = partial.publications();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[2].0.endpoints, vec![TransportEndpoint(read_only.into())]);
+    assert_eq!(calls[2].1, initial_artifact);
+    assert!(!b_restored.key_package_has_pending_fanout().unwrap());
+}
+
+#[derive(Clone, Default)]
+struct FailSigningKeyPackages {
+    fail_signing: Arc<std::sync::atomic::AtomicBool>,
+    inner: RecordingKeyPackages,
+}
+
+#[async_trait]
+impl KeyPackagePublisher for FailSigningKeyPackages {
+    fn legacy_slot_id(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<Option<String>, KeyPackagePublishError> {
+        self.inner.legacy_slot_id(account_id)
+    }
+
+    async fn prepare_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<cgka_traits::SignedPublicationArtifact, KeyPackagePublishError> {
+        if self.fail_signing.load(Ordering::Relaxed) {
+            return Err(KeyPackagePublishError::unexposed("signing unavailable"));
+        }
+        self.inner.prepare_key_package(publication).await
+    }
+
+    async fn publish_prepared_key_package(
+        &self,
+        publication: &KeyPackagePublication,
+        artifact: &cgka_traits::SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        self.inner
+            .publish_prepared_key_package(publication, artifact)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn empty_routes_do_not_announce_unsigned_or_stale_pending_replacement() {
+    use cgka_traits::app_components::{
+        DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterV1, DeviceSlotId,
+        NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_device_roster_v1,
+        encode_device_roster_v1, encode_nostr_routing_v1,
+    };
+
+    let dir = relaxed_storage_dir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key_phrase = "kp slot empty routes unsigned pending";
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let device_group_relay = "wss://device-group.example";
+    let device_group_route = [0x6b; 32];
+    let slot: DeviceSlotId = [0x42; 32];
+
+    let mut supported = default_group_components();
+    supported.extend([DEVICE_ROSTER_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID]);
+    let open_session = || {
+        AccountDeviceSession::open(
+            SessionConfig::new(
+                database.clone(),
+                SqlCipherKey::new(key_phrase).unwrap(),
+                pad32(b"alice"),
+                Box::new(nostr_peeler(b"alice")),
+            )
+            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+                keys: deterministic_nostr_keys(b"alice"),
+            }))
+            .protocol_profile(ProtocolProfile::Current)
+            .supported_app_components(supported.clone()),
+        )
+        .unwrap()
+    };
+
+    let mut session = open_session();
+    session
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            hex::encode(slot),
+        ))
+        .unwrap();
+    let mut roster = DeviceRosterV1 {
+        leaf_tag_key: [0x31; 32].into(),
+        ..DeviceRosterV1::default()
+    };
+    roster.devices.insert(
+        slot,
+        DeviceEntryV1 {
+            linked_at: now,
+            announced_key_package: None,
+            tag_signature_key: Some(session.own_signature_key()),
+            ..DeviceEntryV1::default()
+        },
+    );
+    let created = session
+        .create_group(CreateGroupRequest {
+            name: "device group".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: vec![
+                AppComponentData {
+                    component_id: DEVICE_ROSTER_COMPONENT_ID,
+                    data: encode_device_roster_v1(&roster).unwrap(),
+                },
+                AppComponentData {
+                    component_id: NOSTR_ROUTING_COMPONENT_ID,
+                    data: encode_nostr_routing_v1(
+                        &NostrRoutingV1::new(device_group_route, vec![device_group_relay.into()])
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                },
+            ],
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    match &created.effects.publish[..] {
+        [PublishWork::FoundingGroupCreated { .. }] => {}
+        [PublishWork::GroupCreated { pending, .. }] => {
+            session.confirm_published(*pending).await.unwrap();
+        }
+        _ => panic!("expected group creation publication"),
+    }
+    let device_group = created.group_id;
+    drop(session);
+
+    let announced_ref = |runtime: &mut AccountDeviceRuntime<
+        RecordingAdapter,
+        StaticTransportRouting,
+        FailSigningKeyPackages,
+    >| {
+        let roster_data = runtime
+            .session_mut()
+            .app_component(&device_group, DEVICE_ROSTER_COMPONENT_ID)
+            .unwrap()
+            .unwrap();
+        let merged = decode_device_roster_v1(&roster_data).unwrap();
+        merged.devices.get(&slot).unwrap().announced_key_package.clone()
+    };
+
+    let build_runtime = |publisher: FailSigningKeyPackages, kp_endpoints: &[&str]| {
+        let adapter = RecordingAdapter::default();
+        let routing = StaticTransportRouting::new(vec![])
+            .key_package_endpoints(
+                kp_endpoints
+                    .iter()
+                    .map(|endpoint| TransportEndpoint((*endpoint).into()))
+                    .collect(),
+            )
+            .with_group_route(
+                device_group.clone(),
+                device_group_route.to_vec(),
+                vec![TransportEndpoint(device_group_relay.into())],
+            );
+        let mut runtime =
+            AccountDeviceRuntime::new(open_session(), adapter.clone(), routing, publisher)
+                .with_maintenance_sources(
+                    wall.clone(),
+                    Arc::new(TestMonotonicClock::default()),
+                    Arc::new(TestRandom::new(0)),
+                );
+        runtime.set_key_package_announcement_group(Some(device_group.clone()));
+        runtime
+            .set_device_tag_group(Some(device_group.clone()))
+            .unwrap();
+        (runtime, adapter)
+    };
+
+    // 1. Stage a replacement whose signing fails, leaving a durable unsigned
+    // pending replacement in the lifecycle record.
+    let publisher = FailSigningKeyPackages::default();
+    publisher.fail_signing.store(true, Ordering::Relaxed);
+    let (mut staging, _) = build_runtime(publisher.clone(), &[KEY_ENDPOINT]);
+    staging
+        .prepare_fresh_key_package(vec![TransportEndpoint(KEY_ENDPOINT.into())])
+        .await
+        .expect_err("signing failure must fail preparation");
+    let unsigned_pending = slot_lifecycle(&staging)
+        .pending_replacement
+        .expect("staging leaves durable unsigned pending replacement");
+    assert!(unsigned_pending.signed_event.is_none());
+    drop(staging);
+
+    // 2. Remove all writable KeyPackage routes. Maintenance with a settled
+    // device group must not announce the unsigned pending replacement or emit
+    // any roster commit, and idle maintenance_due stays non-owed afterwards.
+    let (mut no_routes, adapter) = build_runtime(publisher.clone(), &[]);
+    assert!(!no_routes.key_package_network_maintenance_due().unwrap());
+    no_routes.run_due_maintenance().await.unwrap();
+    assert!(
+        adapter.publishes().is_empty(),
+        "maintenance must not commit an unsigned pending replacement when routes are empty"
+    );
+    assert_eq!(announced_ref(&mut no_routes), None);
+    let due = no_routes.maintenance_due(&[]).unwrap();
+    assert!(!due.retry_while_owed);
+    assert!(due.at.is_some());
+
+    // Direct announcement calls also refuse an unsigned pending replacement.
+    no_routes.announce_key_package_holding(&[]).await.unwrap();
+    assert!(adapter.publishes().is_empty());
+    assert_eq!(announced_ref(&mut no_routes), None);
+    drop(no_routes);
+
+    // 3. Restoring a writable route and working signer signs, announces, and
+    // publishes the pending replacement in the settled device group.
+    publisher.fail_signing.store(false, Ordering::Relaxed);
+    let (mut recovered, recovered_adapter) = build_runtime(publisher.clone(), &[KEY_ENDPOINT]);
+    assert!(recovered.key_package_network_maintenance_due().unwrap());
+    recovered.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        announced_ref(&mut recovered),
+        Some(unsigned_pending.key_package_ref.clone())
+    );
+    assert_eq!(recovered_adapter.publishes().len(), 1);
+    assert!(slot_lifecycle(&recovered).pending_replacement.is_none());
+    drop(recovered);
+
+    // 4. Stage and sign a second pending replacement (without announcing it
+    // yet), then expire it and remove writable routes: maintenance must not
+    // announce the obsolete pending replacement either.
+    let (mut pre_expire, _) = build_runtime(publisher.clone(), &[KEY_ENDPOINT]);
+    pre_expire.set_key_package_announcement_group(None);
+    pre_expire
+        .prepare_fresh_key_package(vec![TransportEndpoint(KEY_ENDPOINT.into())])
+        .await
+        .unwrap();
+    let expired_pending = slot_lifecycle(&pre_expire).pending_replacement.unwrap();
+    assert!(expired_pending.signed_event.is_some());
+    assert_ne!(
+        expired_pending.key_package_ref,
+        unsigned_pending.key_package_ref
+    );
+    drop(pre_expire);
+
+    wall.set(expired_pending.not_after.0);
+    let (mut expired_no_routes, expired_adapter) = build_runtime(publisher, &[]);
+    assert!(!expired_no_routes.key_package_network_maintenance_due().unwrap());
+    expired_no_routes.run_due_maintenance().await.unwrap();
+    assert!(
+        expired_adapter.publishes().is_empty(),
+        "maintenance must not announce an expired pending replacement when routes are empty"
+    );
+    assert_eq!(
+        announced_ref(&mut expired_no_routes),
+        Some(unsigned_pending.key_package_ref)
+    );
+}

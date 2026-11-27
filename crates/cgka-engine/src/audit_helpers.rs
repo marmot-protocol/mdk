@@ -603,8 +603,107 @@ pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
     err.privacy_safe_kind()
 }
 
+fn storage_error_detail(err: &cgka_traits::storage::StorageError) -> &'static str {
+    use cgka_traits::storage::StorageError;
+
+    match err {
+        StorageError::NotFound => "storage_not_found",
+        StorageError::AlreadyExists => "storage_already_exists",
+        StorageError::SnapshotMissing(_) => "storage_snapshot_missing",
+        StorageError::TimelineCursorExpired => "storage_timeline_cursor_expired",
+        StorageError::InvalidAttachmentBody(_) => "storage_invalid_attachment_body",
+        StorageError::Busy(_) => "storage_busy",
+        StorageError::Corruption(_) => "storage_corruption",
+        StorageError::Capacity(_) => "storage_capacity",
+        StorageError::Closed(_) => "storage_closed",
+        StorageError::UnsupportedSchemaVersion { .. } => "storage_unsupported_schema_version",
+        StorageError::Backend(_) => "storage_backend",
+        StorageError::Serialization(_) => "storage_serialization",
+    }
+}
+
+/// Closed, privacy-safe sub-classification for forensic audit rows.
+///
+/// Exhaustive over [`EngineError`] so free-form strings, decrypted plaintext,
+/// paths, and raw group/member/message ids can never flow into audit `detail`.
 pub(crate) fn engine_error_detail(err: &EngineError) -> Option<String> {
-    Some(err.to_string())
+    match err {
+        EngineError::Storage(storage_err) => Some(storage_error_detail(storage_err).to_string()),
+        EngineError::Peeler(peeler_err) => Some(peeler_error_kind(peeler_err).to_string()),
+        EngineError::AccountDevicesActivationRefused { reason, .. } => {
+            Some(reason.as_str().to_string())
+        }
+        EngineError::EventTooLarge {
+            artifact,
+            size_class,
+        } => Some(format!(
+            "artifact={} size_class={}",
+            artifact.as_str(),
+            size_class.as_str()
+        )),
+        EngineError::UnsupportedCiphersuite { got, required } => {
+            Some(format!("got={got:#06x} required={required:#06x}"))
+        }
+        EngineError::NoDataAppComponent { component_id } => {
+            Some(format!("component={component_id:#06x}"))
+        }
+        EngineError::AppMessageEpochMismatch { expected, current } => {
+            Some(format!("expected={} current={}", expected.0, current.0))
+        }
+        EngineError::AppMessageEpochUnsettled { expected } => {
+            Some(format!("expected={}", expected.0))
+        }
+        EngineError::ForkedEpoch {
+            last_stable,
+            conflicting_epoch,
+            ..
+        } => Some(format!(
+            "last_stable={} conflicting={}",
+            last_stable.0, conflicting_epoch.0
+        )),
+        EngineError::InvalidTransition(transition) => Some(format!(
+            "from={} to={} reason={}",
+            transition.from, transition.to, transition.reason
+        )),
+        EngineError::UnknownGroup(_)
+        | EngineError::GroupNotHydrated(_)
+        | EngineError::UnknownPending
+        | EngineError::NotAMember { .. }
+        | EngineError::NotGroupAdmin { .. }
+        | EngineError::UnknownMember { .. }
+        | EngineError::InvalidCredentialIdentity(_)
+        | EngineError::AdminCannotSelfRemove { .. }
+        | EngineError::LeaveAlreadyRequested { .. }
+        | EngineError::LeaveNotBlocked { .. }
+        | EngineError::AdminDepletion { .. }
+        | EngineError::MissingRequiredCapabilities { .. }
+        | EngineError::DisbandingUnsupportedMembers { .. }
+        | EngineError::DisbandingNotEnabled { .. }
+        | EngineError::InvalidAppMessagePayload(_)
+        | EngineError::InvalidAccountIdentityProof(_)
+        | EngineError::InvalidKeyPackageLifetime { .. }
+        | EngineError::InvalidKeyPackageCapabilities { .. }
+        | EngineError::AppMessageNewMembers
+        | EngineError::LinkDeviceUnsettled { .. }
+        | EngineError::SiblingAddUnsettled { .. }
+        | EngineError::DeviceEntryChanged { .. }
+        | EngineError::AccountEntryChanged { .. }
+        | EngineError::AccountEntryUnsettled { .. }
+        | EngineError::UnexpectedDeviceGroupWelcome
+        | EngineError::QueuedOutboundAtCapacity { .. }
+        | EngineError::GroupUnrecoverableRepairRequired { .. }
+        | EngineError::GroupRecoveryUnsettled { .. }
+        | EngineError::GroupRecoverySourceMismatch { .. }
+        | EngineError::Serialize(_)
+        | EngineError::InvalidWelcome
+        | EngineError::MissingWelcomeKeyPackage
+        | EngineError::WelcomeNotAddressedToThisDevice
+        | EngineError::WelcomeAlreadyProcessed
+        | EngineError::SiblingWelcomeHeld { .. }
+        | EngineError::SiblingWelcomePredatesForget
+        | EngineError::Backend(_)
+        | EngineError::Other(_) => None,
+    }
 }
 
 pub(crate) fn peeler_error_kind(err: &PeelerError) -> &'static str {
@@ -986,5 +1085,79 @@ mod tests {
         assert_eq!(membership[0].3.as_deref(), Some(source.as_str()));
         assert_eq!(membership[1].3.as_deref(), Some(source.as_str()));
         assert_ne!(membership[2].3.as_deref(), Some(source.as_str()));
+    }
+
+    #[test]
+    fn engine_error_detail_omits_plaintext_tokens_and_raw_ids() {
+        let sentinel_field = "sentinel_audit_plaintext_token_8193";
+        let sentinel_msg_id = "deadbeef".repeat(8);
+        let sender = MemberId::new(vec![0x11; 32]);
+        let valid = String::from_utf8(
+            cgka_traits::MarmotAppEvent::new(
+                hex::encode(sender.as_slice()),
+                1,
+                cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
+                vec![],
+                "hello",
+            )
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+        let malformed = valid.replacen('{', &format!("{{\"{sentinel_field}\":true,"), 1);
+        let app_err =
+            crate::app_payload::validate_app_payload_for_sender(malformed.as_bytes(), &sender)
+                .unwrap_err();
+        let backend_err = EngineError::Backend(format!("projection failed for {sentinel_msg_id}"));
+        let storage_err = EngineError::Storage(cgka_traits::storage::StorageError::Backend(
+            format!("sqlite error at /accounts/{sentinel_field}/db"),
+        ));
+        let peeler_err = EngineError::Peeler(PeelerError::Malformed(format!(
+            "raw token {sentinel_field} id {sentinel_msg_id}"
+        )));
+
+        assert_eq!(engine_error_detail(&app_err), None);
+        assert_eq!(engine_error_detail(&backend_err), None);
+        assert_eq!(
+            engine_error_detail(&storage_err).as_deref(),
+            Some("storage_backend")
+        );
+        assert_eq!(
+            engine_error_detail(&peeler_err).as_deref(),
+            Some("malformed")
+        );
+        assert_eq!(
+            engine_error_detail(&EngineError::AccountDevicesActivationRefused {
+                group_id: cgka_traits::GroupId::new(vec![0xaa; 16]),
+                reason: cgka_traits::error::AccountDevicesActivationRefusal::NotAdmin,
+            })
+            .as_deref(),
+            Some("not_admin")
+        );
+        assert_eq!(
+            engine_error_detail(&EngineError::EventTooLarge {
+                artifact: cgka_traits::OversizedArtifact::Welcome,
+                size_class: cgka_traits::EventSizeClass::Over4Mib,
+            })
+            .as_deref(),
+            Some("artifact=welcome size_class=over_4_mib")
+        );
+
+        for err in [&app_err, &backend_err, &storage_err, &peeler_err] {
+            if let Some(detail) = engine_error_detail(err) {
+                assert!(
+                    !detail.contains(sentinel_field),
+                    "engine_error_detail leaked plaintext token: {detail}"
+                );
+                assert!(
+                    !detail.contains(&sentinel_msg_id),
+                    "engine_error_detail leaked raw message id: {detail}"
+                );
+            }
+        }
+        assert!(
+            !app_err.to_string().contains(sentinel_field),
+            "EngineError::InvalidAppMessagePayload Display leaked plaintext token: {app_err}"
+        );
     }
 }

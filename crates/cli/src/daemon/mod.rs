@@ -35,11 +35,11 @@ mod runtime_host;
 mod subscriptions;
 
 pub use lifecycle::{default_log_path, default_pid_path, default_socket_path};
-pub(crate) use protocol::send_execute;
 pub use protocol::{
     DaemonClient, DaemonClientError, DaemonRuntimeActivityReport, DaemonStatus, DaemonStreamError,
     DaemonStreamResponse,
 };
+pub(crate) use protocol::{send_execute, send_nip46_pair};
 
 pub(crate) use lifecycle::*;
 pub(crate) use protocol::*;
@@ -468,10 +468,21 @@ async fn handle_daemon_connection(
             };
             let _ = handle_notifications_subscription(&mut stream, runtime, *cli).await;
         }
-        DaemonRequest::Execute { cli, import_nsec } => {
+        DaemonRequest::Nip46Pair { mut cli } => {
+            apply_defaults(&mut cli, &defaults);
+            let _ =
+                handle_nip46_pair_connection(cli, &mut stream, &defaults, state, events, &workers)
+                    .await;
+        }
+        DaemonRequest::Execute {
+            cli,
+            import_nsec,
+            import_bunker,
+        } => {
             let _ = handle_execute_connection(
                 cli,
                 import_nsec,
+                import_bunker,
                 &mut stream,
                 &defaults,
                 state,
@@ -545,9 +556,11 @@ async fn daemon_status_output(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_execute_connection(
     mut cli: Box<Cli>,
     mut import_nsec: Option<crate::ImportNsec>,
+    mut import_bunker: Option<crate::ImportBunkerUri>,
     stream: &mut UnixStream,
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
@@ -560,6 +573,19 @@ async fn handle_execute_connection(
         return Ok(());
     }
     let refresh = app_runtime_refresh_after_execute(&cli);
+    if let Some(output) = handle_app_runtime_nip46_request(
+        &cli,
+        &mut import_bunker,
+        defaults,
+        state.clone(),
+        events.clone(),
+        workers,
+    )
+    .await
+    {
+        write_daemon_output(stream, &output).await;
+        return Ok(());
+    }
     if let Some(output) = handle_app_runtime_account_setup_request(
         &cli,
         &mut import_nsec,
@@ -582,7 +608,7 @@ async fn handle_execute_connection(
     }
     // run_cli_local opens its own account/session and touches no shared daemon state, so it runs
     // entirely off the workers lock — the core head-of-line fix (#633).
-    let output = crate::run_cli_local(*cli, import_nsec).await;
+    let output = crate::run_cli_local(*cli, import_nsec, import_bunker).await;
     if output.code == 0 {
         refresh_app_runtime(defaults, state.clone(), events.clone(), workers, refresh).await;
     }

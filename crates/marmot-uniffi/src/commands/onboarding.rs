@@ -311,6 +311,8 @@ mod tests {
             default_relays: vec![relay_url.clone()],
             discovery_relays: vec![relay_url],
             inbox_relays: Vec::new(),
+            create_missing_inbox_list: false,
+            pass_device_notice_when_none_found: false,
         }
     }
 

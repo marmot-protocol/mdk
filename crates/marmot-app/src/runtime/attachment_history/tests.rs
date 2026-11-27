@@ -16,7 +16,7 @@ fn cached_diagnostic_runtime() -> (tempfile::TempDir, std::sync::Arc<MarmotAppRu
     let first = app
         .startup_diagnostics
         .observe(crate::NativeStartupStage::MigrationApply);
-    first.progress(crate::NativeStartupStage::MigrationApply, Some(105), true);
+    first.progress(crate::NativeStartupStage::MigrationApply, Some(105), 1);
     first.finish(true);
     (dir, std::sync::Arc::new(app.runtime()), account.label)
 }

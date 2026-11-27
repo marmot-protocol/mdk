@@ -39,6 +39,7 @@ mod push_token_reshare;
 mod quarantine_receive;
 mod read_state;
 mod relay_event_limits;
+mod relay_health_checks;
 mod relay_plane_runtime;
 mod replaceable_delivery;
 mod report_backfill;
@@ -7475,6 +7476,202 @@ async fn key_package_routing_sees_lists_a_setup_projected_after_the_routing_read
     );
 }
 
+#[test]
+fn key_package_fallback_routing_excludes_nip65_read_only_relays() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relays(
+        directory.path(),
+        vec![
+            "wss://read-only.example/".into(),
+            "wss://FALLBACK.example/".into(),
+        ],
+    );
+
+    // Empty write relays with a NIP-65 read-only relay matching one configured default;
+    // remaining fallback relays are canonicalized to match NIP-65 URL spelling.
+    let mut empty_writes = app.account_relay_list_status(&account.label).unwrap();
+    empty_writes.nip65.relays.clear();
+    empty_writes.nip65.write_relays.clear();
+    empty_writes.nip65.read_relays = vec!["wss://READ-ONLY.example".into()];
+    assert_eq!(
+        app.key_package_endpoints(&account.label, &empty_writes)
+            .unwrap(),
+        vec![TransportEndpoint("wss://fallback.example".into())]
+    );
+
+    // Unsafe write relays (cleartext ws:// on a public host, filtered out by
+    // host safety) also fall back without writing to relays explicitly declared
+    // read-only in NIP-65.
+    let mut unsafe_writes = empty_writes;
+    unsafe_writes.nip65.relays = vec!["ws://plain.example".into()];
+    unsafe_writes.nip65.write_relays = unsafe_writes.nip65.relays.clone();
+    assert_eq!(
+        app.key_package_endpoints(&account.label, &unsafe_writes)
+            .unwrap(),
+        vec![TransportEndpoint("wss://fallback.example".into())]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn live_worker_refreshes_key_package_routing_when_nip65_roles_change() {
+    use cgka_traits::{MaintenancePhase, Timestamp, TransportFanoutAttemptState};
+
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    let relay_a = "wss://relay-a.example";
+    let relay_b = "wss://relay-b.example";
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    // Configure relay B with non-canonical casing/trailing slash to prove a
+    // fallback-to-NIP-65 transition matches the persisted target cleanly.
+    let app = MarmotApp::with_relays(
+        directory.path(),
+        vec![relay_a.into(), "wss://RELAY-B.example/".into()],
+    )
+    .with_test_relay_client(relay.clone());
+
+    let make_status = |created_at: u64, write_relays: &[&str], read_relays: &[&str]| {
+        let mut status = app.account_relay_list_status(&account.label).unwrap();
+        status.nip65.created_at = created_at;
+        status.nip65.relays = write_relays.iter().map(|r| (*r).to_owned()).collect();
+        status.nip65.write_relays = status.nip65.relays.clone();
+        status.nip65.read_relays = read_relays.iter().map(|r| (*r).to_owned()).collect();
+        status.inbox.created_at = created_at;
+        status.inbox.relays = vec![relay_a.into()];
+        status.refresh();
+        status
+    };
+    // Start with a non-canonical spelling of relay B so initial publication
+    // canonicalizes it and later NIP-65 updates match the persisted target.
+    app.directory()
+        .remember_directory_relay_lists(
+            &account.account_id_hex,
+            &make_status(
+                100,
+                &[relay_a, "wss://RELAY-B.example/"],
+                &[relay_a, "wss://RELAY-B.example/"],
+            ),
+        )
+        .unwrap();
+
+    relay.accept_first_endpoint_only();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.publish_key_package(&account.label).await.unwrap();
+
+    let initial = runtime
+        .key_package_maintenance_status(&account.label)
+        .await
+        .unwrap()
+        .expect("published key package lifecycle");
+    let original_event_id = initial
+        .authored_signed_event
+        .as_ref()
+        .expect("signed key package event")
+        .id
+        .clone();
+    assert!(initial.publication_targets.iter().any(|target| {
+        target.endpoint.0 == relay_a && target.state == TransportFanoutAttemptState::Accepted
+    }));
+    assert!(initial.publication_targets.iter().any(|target| {
+        target.endpoint.0 == relay_b && target.state == TransportFanoutAttemptState::AttemptedFailed
+    }));
+    let kp_attempts_to_b = || {
+        relay
+            .attempted_routes()
+            .into_iter()
+            .filter(|(kind, endpoints)| {
+                *kind == KIND_MARMOT_KEY_PACKAGE
+                    && endpoints.iter().any(|endpoint| endpoint.0 == relay_b)
+            })
+            .count()
+    };
+    let attempts_before_demotion = kp_attempts_to_b();
+    assert!(
+        attempts_before_demotion >= 1,
+        "initial publication must have attempted relay B"
+    );
+
+    // Demote relay B to read-only while the worker stays running, then make B
+    // past its retry backoff. Maintenance refreshes routing and must not retry B.
+    app.directory()
+        .remember_directory_relay_lists(
+            &account.account_id_hex,
+            &make_status(200, &[relay_a], &[relay_a, relay_b]),
+        )
+        .unwrap();
+    runtime.run_due_maintenance(&account.label).await.unwrap();
+    {
+        let storage = app.account_storage(&account.label).unwrap();
+        let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+        let target_b = lifecycle
+            .publication_targets
+            .iter_mut()
+            .find(|target| target.endpoint.0 == relay_b)
+            .expect("relay B target");
+        target_b.last_attempt_at = Some(Timestamp(1));
+        storage.put_key_package_lifecycle(&lifecycle).unwrap();
+    }
+    runtime.run_due_maintenance(&account.label).await.unwrap();
+    assert_eq!(
+        kp_attempts_to_b(),
+        attempts_before_demotion,
+        "live worker must not retry KeyPackage fanout to a relay now declared read-only"
+    );
+
+    // Restore relay B to writable without restarting the worker or manually
+    // calling run_due_maintenance: relay-config reconciliation must refresh
+    // live KeyPackage routing, re-evaluate maintenance due, and wake the
+    // scheduled retry to deliver the exact same signed KeyPackage event to B.
+    let (retry_started, release_retry) = relay.hold_next_publish_of_kind(KIND_MARMOT_KEY_PACKAGE);
+    app.directory()
+        .remember_directory_relay_lists(
+            &account.account_id_hex,
+            &make_status(300, &[relay_a, relay_b], &[relay_a, relay_b]),
+        )
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), retry_started.notified())
+        .await
+        .expect("live worker should automatically wake and retry KeyPackage to restored relay B");
+    release_retry.notify_one();
+
+    // A serialized worker command (that does not itself run maintenance) waits
+    // behind the in-flight automatic retry until it finishes and persists.
+    runtime.pause_maintenance(&account.label).await.unwrap();
+    let restored = app
+        .account_storage(&account.label)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .expect("key package lifecycle");
+    assert!(restored.publication_targets.iter().any(|target| {
+        target.endpoint.0 == relay_b && target.state == TransportFanoutAttemptState::Accepted
+    }));
+    assert_eq!(restored.phase, MaintenancePhase::Complete);
+    assert_eq!(
+        restored
+            .authored_signed_event
+            .as_ref()
+            .expect("signed key package event")
+            .id,
+        original_event_id
+    );
+    assert_eq!(kp_attempts_to_b(), attempts_before_demotion + 1);
+    assert!(
+        relay
+            .accepted_routes()
+            .into_iter()
+            .any(|(kind, endpoints)| {
+                kind == KIND_MARMOT_KEY_PACKAGE
+                    && endpoints.iter().any(|endpoint| endpoint.0 == relay_b)
+            }),
+        "restored writable relay B must accept the retried KeyPackage"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_generation_upgrade_runs_once_per_account_on_activation() {
     use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
@@ -8369,6 +8566,7 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
             profile: None,
             follows: Vec::new(),
             follow_source_relays: Vec::new(),
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: Some(DirectoryKeyPackage {
                 key_package_id: "current-directory".into(),
@@ -10952,6 +11150,7 @@ fn directory_search_bounds_frontier_from_cached_follow_lists() {
             profile: None,
             follows: follows.clone(),
             follow_source_relays: Vec::new(),
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         })
@@ -10977,6 +11176,7 @@ fn directory_search_bounds_frontier_from_cached_follow_lists() {
                 }),
                 follows: Vec::new(),
                 follow_source_relays: Vec::new(),
+                follows_created_at: 0,
                 relay_lists: AccountRelayListStatus::empty(),
                 key_package: None,
             })
@@ -11014,6 +11214,7 @@ fn directory_search_uses_graph_cache_without_promoting_known_user() {
             profile: None,
             follows: vec![graph_user.clone()],
             follow_source_relays: Vec::new(),
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         })
@@ -11083,6 +11284,7 @@ fn test_directory_record(account_id_hex: &str, name: &str, created_at: u64) -> U
         }),
         follows: Vec::new(),
         follow_source_relays: Vec::new(),
+        follows_created_at: 0,
         relay_lists: AccountRelayListStatus::empty(),
         key_package: None,
     }
@@ -12387,6 +12589,7 @@ fn legacy_plaintext_directory_cache_keeps_file_when_migration_fails() {
             profile: None,
             follows: Vec::new(),
             follow_source_relays: Vec::new(),
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         })
@@ -12871,6 +13074,7 @@ fn local_account_directory_refresh_still_promotes_follows() {
     let follow_list = FetchedFollowList {
         follows: vec![follow.clone()],
         source_relays: vec!["wss://relay.example".to_owned()],
+        created_at: 0,
     };
     app.directory()
         .remember_directory_follow_list_for_test(&account.account_id_hex, &follow_list)
@@ -12910,6 +13114,7 @@ fn empty_follow_fetch_preserves_cached_edges() {
         profile: None,
         follows: vec![followed.clone()],
         follow_source_relays: vec!["wss://cached.example".to_owned()],
+        follows_created_at: 0,
         relay_lists: AccountRelayListStatus::empty(),
         key_package: None,
     };

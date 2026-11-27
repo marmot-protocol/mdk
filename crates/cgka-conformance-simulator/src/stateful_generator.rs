@@ -1307,7 +1307,7 @@ pub fn generate_public_app_stateful_recovery_case(
         sender: "alice".into(),
     });
     let mut case = model.finish_public(PUBLIC_APP_STATEFUL_RECOVERY_FAMILY, seed);
-    case.generator_version = "1".into();
+    case.generator_version = "2".into();
     case
 }
 
@@ -1343,7 +1343,6 @@ fn public_varied_recovery(model: &mut JourneyModel, rng: &mut StdRng) {
             model.steps.push(ScenarioStep::ReconnectClient {
                 client: client.clone(),
             });
-            model.online.insert(client.clone());
             if boundary == 1 {
                 model.steps.push(ScenarioStep::SyncRelayHistory {
                     clients: vec![client.clone()],
@@ -1353,10 +1352,14 @@ fn public_varied_recovery(model: &mut JourneyModel, rng: &mut StdRng) {
                     client: client.clone(),
                 });
             } else {
-                // Issue traffic before the explicit history-repair/checkpoint.
-                // This does not assert that background recovery is still partial.
+                // Issue traffic from caught-up peers before the returning
+                // client's explicit history-repair/checkpoint. Letting a stale
+                // returning client send before catching up emits messages at
+                // its pre-offline epoch, which recipients legally reject as
+                // PredatesLocalCopy or BeyondAppRetention.
                 public_recovery_burst(model, rng, 2..=8);
             }
+            model.online.insert(client.clone());
             model.steps.push(ScenarioStep::SyncRelayHistory {
                 clients: vec![client],
                 sync: ScenarioRelaySyncModeV2::FullHistory,
@@ -1666,14 +1669,17 @@ pub fn generate_public_app_activity_case(
             relay: "relay:default".into(),
             outage_ms: rng.gen_range(50..=250),
         });
-        // Reconnect without draining first; fresh sends enter while retained
-        // history is eligible. This is interleaved traffic, not continuous load.
+        // Reconnect without draining first; fresh sends from caught-up peers
+        // enter while retained history is eligible. Keep `returning` out of
+        // `model.online` until after the burst so it does not author from its
+        // stale pre-offline epoch before catch-up (which re-invited peers
+        // legally reject as PredatesLocalCopy).
         let returning = model.offline_client.clone();
         model.steps.push(ScenarioStep::ReconnectClient {
             client: returning.clone(),
         });
-        model.online.insert(returning.clone());
         public_recovery_burst(&mut model, &mut rng, 2..=4);
+        model.online.insert(returning.clone());
         model.steps.push(ScenarioStep::SyncRelayHistory {
             clients: vec![returning.clone()],
             sync: ScenarioRelaySyncModeV2::FullHistory,
@@ -1725,7 +1731,7 @@ pub fn generate_public_app_activity_case(
         });
     }
     let mut case = model.finish_public(family, seed);
-    case.generator_version = if pressure { "3" } else { "1" }.into();
+    case.generator_version = if pressure { "4" } else { "2" }.into();
     case
 }
 
@@ -1779,5 +1785,66 @@ mod checkpoint_tests {
             })
             .count();
         assert_eq!(checks, model.members.len() * payloads.len());
+    }
+
+    #[test]
+    fn returning_offline_peer_does_not_author_before_catchup() {
+        for (family, expected_version, cases) in [
+            (PUBLIC_APP_STATEFUL_RECOVERY_FAMILY, "2", 6u64),
+            ("public-app-longevity/v1", "2", 4u64),
+            ("public-app-retained-traffic/v1", "4", 4u64),
+            ("public-app-longevity-extended/v1", "2", 1u64),
+        ] {
+            let mut interleaved_caught_up_sends = 0usize;
+            for seed in [7u64, 42, 17001] {
+                for case_index in 0..cases {
+                    let case = crate::generate_family_case(family, seed, case_index).unwrap();
+                    let mut offline = BTreeSet::<String>::new();
+                    let mut stale = BTreeSet::<String>::new();
+                    for (step_index, step) in case.scenario.steps.iter().enumerate() {
+                        match step {
+                            ScenarioStep::SetClientOffline { client } => {
+                                offline.insert(client.clone());
+                            }
+                            ScenarioStep::ReconnectClient { client } => {
+                                offline.remove(client);
+                            }
+                            ScenarioStep::UpdateGroupProfile { .. }
+                            | ScenarioStep::UpdateAdminPolicy { .. }
+                            | ScenarioStep::RemoveMembers { .. }
+                            | ScenarioStep::InviteMembers { .. }
+                            | ScenarioStep::SelfUpdate { .. }
+                            | ScenarioStep::RaceGroupProfiles { .. }
+                            | ScenarioStep::RaceInviteProfile { .. } => {
+                                stale.extend(offline.iter().cloned());
+                            }
+                            ScenarioStep::SyncRelayHistory { clients, .. } => {
+                                for client in clients {
+                                    if !offline.contains(client) {
+                                        stale.remove(client);
+                                    }
+                                }
+                            }
+                            ScenarioStep::SendAppMessage { sender, payload } => {
+                                assert!(
+                                    !stale.contains(sender),
+                                    "{family} seed={seed} case={case_index} step={step_index}: \
+                                     stale returning peer {sender} sent {payload} before history catch-up"
+                                );
+                                if stale.iter().any(|client| !offline.contains(client)) {
+                                    interleaved_caught_up_sends += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert_eq!(case.generator_version, expected_version, "{family}");
+                }
+            }
+            assert!(
+                interleaved_caught_up_sends > 0,
+                "{family} must still interleave caught-up sends after ReconnectClient before SyncRelayHistory"
+            );
+        }
     }
 }

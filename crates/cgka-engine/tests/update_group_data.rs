@@ -4801,3 +4801,612 @@ async fn inbound_update_path_keeps_the_authenticated_account_and_profile() {
         }
     }
 }
+
+/// Legacy-profile groups must reject any commit or standalone proposal that
+/// drops `GROUP_ADMIN_POLICY_COMPONENT_ID` (0x8003) or un-requires it from
+/// `0x0001` on both send and inbound/replay (mdk#3795).
+#[tokio::test]
+async fn legacy_profile_rejects_dropping_admin_policy_on_send_and_replay() {
+    let (mut alice, alice_storage) = build_with_storage(b"legacy-admin-drop-alice");
+    let mut bob = build(b"legacy-admin-drop-bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "legacy-admin-guard".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcomes, pending) = match created {
+        SendResult::GroupCreated { welcomes, pending } => (welcomes, pending),
+        other => panic!("expected legacy GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    let mut without_admin = alice
+        .group_record(&gid)
+        .unwrap()
+        .required_capabilities
+        .app_components;
+    assert!(without_admin.ids.remove(&GROUP_ADMIN_POLICY_COMPONENT_ID));
+    let encoded_without_admin = encode_components_list(&without_admin.ids);
+
+    // Outbound send path: un-requiring 0x8003 must be refused.
+    let send_err = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: APP_COMPONENTS_COMPONENT_ID,
+                data: encoded_without_admin.clone(),
+            }],
+        })
+        .await
+        .expect_err("legacy send must refuse un-requiring admin policy");
+    assert!(
+        matches!(send_err, EngineError::Other(ref msg) if msg.contains("admin-policy component cannot be un-required")),
+        "unexpected send error: {send_err:?}"
+    );
+
+    // Standalone proposals on Legacy must also refuse un-requiring or dropping
+    // 0x8003 before entering the proposal store.
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, alice_storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(gid.as_slice());
+    let mut alice_mls = MlsGroup::load(provider.storage(), &mls_gid)
+        .unwrap()
+        .unwrap();
+    let binding = alice_storage
+        .account_device_signer(&alice.self_id())
+        .unwrap()
+        .unwrap();
+    let alice_signer = SignatureKeyPair::read(
+        alice_storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let (standalone_adu_msg, _) = alice_mls
+        .propose_app_data_update(
+            &provider,
+            &alice_signer,
+            APP_COMPONENTS_COMPONENT_ID,
+            AppDataUpdateOperation::Update(encoded_without_admin.clone().into()),
+        )
+        .unwrap();
+    let mut dropped_admin_ext = alice_mls.extensions().clone();
+    let mut dropped_admin_dict = dropped_admin_ext
+        .app_data_dictionary()
+        .unwrap()
+        .dictionary()
+        .clone();
+    dropped_admin_dict.remove(&GROUP_ADMIN_POLICY_COMPONENT_ID);
+    dropped_admin_ext
+        .add_or_replace(openmls::extensions::Extension::AppDataDictionary(
+            openmls::extensions::AppDataDictionaryExtension::new(dropped_admin_dict),
+        ))
+        .unwrap();
+    let (standalone_gce_drop_msg, _) = alice_mls
+        .propose_group_context_extensions(&provider, dropped_admin_ext, &alice_signer)
+        .unwrap();
+    let mut unreq_admin_ext = alice_mls.extensions().clone();
+    let mut unreq_admin_dict = unreq_admin_ext
+        .app_data_dictionary()
+        .unwrap()
+        .dictionary()
+        .clone();
+    unreq_admin_dict.insert(APP_COMPONENTS_COMPONENT_ID, encoded_without_admin.clone());
+    unreq_admin_ext
+        .add_or_replace(openmls::extensions::Extension::AppDataDictionary(
+            openmls::extensions::AppDataDictionaryExtension::new(unreq_admin_dict),
+        ))
+        .unwrap();
+    let (standalone_gce_unreq_msg, _) = alice_mls
+        .propose_group_context_extensions(&provider, unreq_admin_ext, &alice_signer)
+        .unwrap();
+    alice_mls
+        .clear_pending_proposals(provider.storage())
+        .unwrap();
+    for (idx, msg) in [
+        standalone_adu_msg,
+        standalone_gce_drop_msg,
+        standalone_gce_unreq_msg,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let wire = msg.tls_serialize_detached().unwrap();
+        let transport = TransportMessage {
+            id: MessageId::new(vec![0x71 + idx as u8; 8]),
+            payload: wire,
+            timestamp: Timestamp(10 + idx as u64),
+            causal_deps: vec![],
+            source: TransportSource("mock".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: gid.as_slice().to_vec(),
+            },
+        };
+        let outcome = bob.ingest(transport).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                IngestOutcome::Rejected {
+                    category: cgka_traits::ingest::ProposalRejectionCategory::InvalidEncoding,
+                }
+            ),
+            "standalone proposal {idx} must be rejected on legacy profile, got {outcome:?}"
+        );
+    }
+
+    // Inbound/replay path: raw commit dropping 0x8003 alongside un-requiring it
+    // from 0x0001 must be rejected without mutating Bob's epoch or admins.
+    let before_epoch = bob.epoch(&gid).unwrap();
+    let before_admins = bob.admin_pubkeys(&gid).unwrap();
+    let drop_commit = raw_app_data_commit(
+        &alice_storage,
+        &alice.self_id(),
+        &gid,
+        vec![
+            AppDataUpdateProposal::update(APP_COMPONENTS_COMPONENT_ID, encoded_without_admin),
+            AppDataUpdateProposal::remove(GROUP_ADMIN_POLICY_COMPONENT_ID),
+        ],
+    );
+    bob.ingest(drop_commit.clone()).await.unwrap();
+    let result = bob
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        result.accepted_commits.is_empty(),
+        "malicious legacy admin-drop commit must not be accepted: {result:?}"
+    );
+    assert!(
+        result
+            .dropped_messages
+            .iter()
+            .any(
+                |dropped| dropped.message_id == hex::encode(content_id(&drop_commit).as_slice())
+                    && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+            ),
+        "expected InvalidAgainstCandidateState drop: {result:?}"
+    );
+    assert_eq!(bob.epoch(&gid).unwrap(), before_epoch);
+    assert_eq!(bob.admin_pubkeys(&gid).unwrap(), before_admins);
+    assert!(
+        bob.app_component(&gid, GROUP_ADMIN_POLICY_COMPONENT_ID)
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Legacy-profile groups with `0x800c` enabled must enforce the same lifecycle
+/// transition and terminal disband Commit shape as Current-profile groups,
+/// rejecting incomplete disband commits, un-requiring `0x800c`, enabling while
+/// a leaf lacks `0x800c`, and transitions out of `Disbanded` (mdk#2455).
+#[tokio::test]
+async fn legacy_profile_enforces_lifecycle_transitions_and_disband_shape() {
+    use openmls::messages::proposals::RemoveProposal;
+    use tls_codec::Deserialize as _;
+
+    // Cases 0..=4 mirror `inbound_lifecycle_commits_require_the_complete_terminal_shape`
+    // on ProtocolProfile::Legacy, plus case 5 (un-requiring 0x800c).
+    for case in 0..6 {
+        let (mut alice, alice_storage) = build_with_storage(b"legacy-lifecycle-alice");
+        let mut bob = build(b"legacy-lifecycle-bob");
+        let bob_kp = bob.fresh_key_package().await.unwrap();
+        let (gid, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "legacy-active".into(),
+                description: "source description".into(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let (welcomes, pending) = match created {
+            SendResult::GroupCreated { welcomes, pending } => (welcomes, pending),
+            other => panic!("expected legacy GroupCreated, got {other:?}"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+        bob.join_welcome(welcomes.into_iter().next().unwrap())
+            .await
+            .unwrap();
+        let before = bob.group_record(&gid).unwrap();
+
+        let proposals = if case == 5 {
+            let mut without_lifecycle = before.required_capabilities.app_components.clone();
+            assert!(without_lifecycle.ids.remove(&GROUP_LIFECYCLE_COMPONENT_ID));
+            vec![Proposal::AppDataUpdate(Box::new(
+                AppDataUpdateProposal::update(
+                    APP_COMPONENTS_COMPONENT_ID,
+                    encode_components_list(&without_lifecycle.ids),
+                ),
+            ))]
+        } else {
+            let lifecycle = if case == 0 {
+                GroupLifecycleV1::Active
+            } else {
+                GroupLifecycleV1::Disbanded
+            };
+            let mut proposals = vec![Proposal::AppDataUpdate(Box::new(
+                AppDataUpdateProposal::update(
+                    GROUP_LIFECYCLE_COMPONENT_ID,
+                    cgka_traits::app_components::encode_group_lifecycle_v1(lifecycle),
+                ),
+            ))];
+            if case != 0 && case != 1 {
+                proposals.push(Proposal::AppDataUpdate(Box::new(
+                    AppDataUpdateProposal::update(
+                        GROUP_ADMIN_POLICY_COMPONENT_ID,
+                        encode_admin_policy_for_test(&[alice.self_id().as_slice().to_vec()]),
+                    ),
+                )));
+            }
+            if case != 0 && case != 2 {
+                let index = bob.own_leaf_index(&gid).unwrap();
+                proposals.push(Proposal::Remove(Box::new(
+                    RemoveProposal::tls_deserialize_exact(index.to_be_bytes()).unwrap(),
+                )));
+            }
+            if case == 3 {
+                proposals.push(Proposal::AppDataUpdate(Box::new(
+                    AppDataUpdateProposal::update(
+                        GROUP_PROFILE_COMPONENT_ID,
+                        encode_component_vectors(&[b"forbidden", b"terminal mutation"]),
+                    ),
+                )));
+            }
+            proposals
+        };
+
+        let commit = raw_commit(&alice_storage, &alice.self_id(), &gid, proposals);
+        bob.ingest(commit.clone()).await.unwrap();
+        let result = bob
+            .converge_stored_openmls_messages_at(&gid, 1_000_000)
+            .unwrap();
+        assert_eq!(
+            result.convergence_status,
+            ConvergenceStatus::Settled,
+            "case {case}: {result:?}"
+        );
+        if case == 4 {
+            assert_eq!(
+                result.accepted_commits.len(),
+                1,
+                "valid legacy terminal control: {result:?}"
+            );
+            assert!(matches!(
+                bob.epoch_state(&gid),
+                Some(cgka_traits::EpochState::Disbanded(_))
+            ));
+        } else {
+            assert!(
+                result.accepted_commits.is_empty(),
+                "case {case} must be rejected on legacy profile: {result:?}"
+            );
+            assert!(
+                result
+                    .dropped_messages
+                    .iter()
+                    .any(|dropped| dropped.message_id
+                        == hex::encode(content_id(&commit).as_slice())
+                        && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState),
+                "case {case}: {result:?}"
+            );
+            let after = bob.group_record(&gid).unwrap();
+            assert_eq!(after.epoch, before.epoch);
+            assert_eq!(after.members, before.members);
+            assert_eq!(
+                decode_group_lifecycle_v1(
+                    &bob.app_component(&gid, GROUP_LIFECYCLE_COMPONENT_ID)
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                GroupLifecycleV1::Active
+            );
+        }
+    }
+
+    // Legacy inbound enablement must be rejected if any member leaf lacks
+    // 0x800c support.
+    let old_supported = [GROUP_PROFILE_COMPONENT_ID, GROUP_ADMIN_POLICY_COMPONENT_ID];
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut old_bob = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"legacy-enable-bob"))
+        .account_identity_proof_signer(proof_signer(b"legacy-enable-bob"))
+        .supported_app_components(old_supported)
+        .feature_registry(registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    let mut carol = build(b"legacy-enable-carol");
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, alice_storage.mls_storage());
+    let mut alice_modern = EngineBuilder::new(alice_storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"legacy-enable-alice"))
+        .account_identity_proof_signer(proof_signer(b"legacy-enable-alice"))
+        .feature_registry(registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    let alice_kp = {
+        use tls_codec::Deserialize as _;
+        let wire = alice_modern.fresh_key_package().await.unwrap();
+        let msg = openmls::prelude::MlsMessageIn::tls_deserialize_exact(wire.bytes()).unwrap();
+        let openmls::prelude::MlsMessageBodyIn::KeyPackage(kp) = msg.extract() else {
+            panic!("expected KeyPackage");
+        };
+        kp.validate(provider.crypto(), openmls::prelude::ProtocolVersion::Mls10)
+            .unwrap()
+    };
+    let bob_kp = {
+        use tls_codec::Deserialize as _;
+        let wire = old_bob.fresh_key_package().await.unwrap();
+        let msg = openmls::prelude::MlsMessageIn::tls_deserialize_exact(wire.bytes()).unwrap();
+        let openmls::prelude::MlsMessageBodyIn::KeyPackage(kp) = msg.extract() else {
+            panic!("expected KeyPackage");
+        };
+        kp.validate(provider.crypto(), openmls::prelude::ProtocolVersion::Mls10)
+            .unwrap()
+    };
+    let carol_kp = {
+        use tls_codec::Deserialize as _;
+        let wire = carol.fresh_key_package().await.unwrap();
+        let msg = openmls::prelude::MlsMessageIn::tls_deserialize_exact(wire.bytes()).unwrap();
+        let openmls::prelude::MlsMessageBodyIn::KeyPackage(kp) = msg.extract() else {
+            panic!("expected KeyPackage");
+        };
+        kp.validate(provider.crypto(), openmls::prelude::ProtocolVersion::Mls10)
+            .unwrap()
+    };
+    let binding = alice_storage
+        .account_device_signer(&alice_modern.self_id())
+        .unwrap()
+        .unwrap();
+    let signer = SignatureKeyPair::read(
+        alice_storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let mut dict = openmls::extensions::AppDataDictionary::new();
+    dict.insert(
+        APP_COMPONENTS_COMPONENT_ID,
+        encode_components_list(&old_supported.into_iter().collect()),
+    );
+    dict.insert(
+        GROUP_PROFILE_COMPONENT_ID,
+        encode_component_vectors(&[b"pre-lifecycle", b""]),
+    );
+    dict.insert(
+        GROUP_ADMIN_POLICY_COMPONENT_ID,
+        encode_admin_policy_for_test(&[alice_modern.self_id().as_slice().to_vec()]),
+    );
+    let config = openmls::group::MlsGroupCreateConfig::builder()
+        .ciphersuite(DEFAULT_CIPHERSUITE)
+        .capabilities(alice_kp.leaf_node().capabilities().clone())
+        .with_leaf_node_extensions(alice_kp.leaf_node().extensions().clone())
+        .unwrap()
+        .wire_format_policy(cgka_engine::wire_format::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .with_group_context_extensions(
+            openmls::extensions::Extensions::from_vec(vec![
+                openmls::extensions::Extension::RequiredCapabilities(
+                    openmls::extensions::RequiredCapabilitiesExtension::new(
+                        &[
+                            openmls::prelude::ExtensionType::AppDataDictionary,
+                            openmls::prelude::ExtensionType::Unknown(
+                                cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
+                            ),
+                        ],
+                        &[openmls::prelude::ProposalType::AppDataUpdate],
+                        &[],
+                    ),
+                ),
+                openmls::extensions::Extension::AppDataDictionary(
+                    openmls::extensions::AppDataDictionaryExtension::new(dict),
+                ),
+            ])
+            .unwrap(),
+        )
+        .use_ratchet_tree_extension(true)
+        .build();
+    let mut raw_group = MlsGroup::new(
+        &provider,
+        &signer,
+        &config,
+        openmls::prelude::CredentialWithKey {
+            credential: alice_kp.leaf_node().credential().clone(),
+            signature_key: alice_kp.leaf_node().signature_key().clone(),
+        },
+    )
+    .unwrap();
+    let (_, welcome, _) = raw_group
+        .add_members(&provider, &signer, &[bob_kp, carol_kp])
+        .unwrap();
+    raw_group.merge_pending_commit(&provider).unwrap();
+    let gid = GroupId::new(raw_group.group_id().as_slice().to_vec());
+    let welcome_bytes = welcome.tls_serialize_detached().unwrap();
+    let wrapped_welcome = MockPeeler
+        .wrap_welcome(
+            &EncryptedPayload {
+                ciphertext: welcome_bytes,
+                aad: vec![],
+            },
+            &carol.self_id(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(carol.join_welcome(wrapped_welcome).await.unwrap(), gid);
+
+    let with_lifecycle = [
+        GROUP_PROFILE_COMPONENT_ID,
+        GROUP_ADMIN_POLICY_COMPONENT_ID,
+        GROUP_LIFECYCLE_COMPONENT_ID,
+    ]
+    .into_iter()
+    .collect();
+    let enable_commit = raw_app_data_commit(
+        &alice_storage,
+        &alice_modern.self_id(),
+        &gid,
+        vec![
+            AppDataUpdateProposal::update(
+                APP_COMPONENTS_COMPONENT_ID,
+                encode_components_list(&with_lifecycle),
+            ),
+            AppDataUpdateProposal::update(
+                GROUP_LIFECYCLE_COMPONENT_ID,
+                cgka_traits::app_components::encode_group_lifecycle_v1(GroupLifecycleV1::Active),
+            ),
+        ],
+    );
+    carol.ingest(enable_commit.clone()).await.unwrap();
+    let result = carol
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        result.accepted_commits.is_empty(),
+        "legacy lifecycle enablement with an unsupported leaf must be rejected: {result:?}"
+    );
+    assert!(
+        result
+            .dropped_messages
+            .iter()
+            .any(|dropped| dropped.message_id
+                == hex::encode(content_id(&enable_commit).as_slice())
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState),
+        "expected InvalidAgainstCandidateState drop: {result:?}"
+    );
+    assert_eq!(
+        carol
+            .app_component(&gid, GROUP_LIFECYCLE_COMPONENT_ID)
+            .unwrap(),
+        None
+    );
+}
+
+/// Caller `SendIntent::UpdateAppComponents` must not mutate
+/// `GROUP_LIFECYCLE_COMPONENT_ID` (0x800c), even in a solo group where the
+/// Commit would otherwise satisfy the disband Commit shape, because terminal
+/// disbanding must go through the disband request/candidate/tombstone path
+/// (mdk#3795).
+#[tokio::test]
+async fn caller_update_app_components_cannot_mutate_lifecycle_component() {
+    for legacy in [false, true] {
+        let mut alice = if legacy {
+            build(b"solo-lifecycle-legacy")
+        } else {
+            build_current(b"solo-lifecycle-current")
+        };
+        let (gid, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "solo".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        if let SendResult::GroupCreated { pending, .. } = created {
+            alice.confirm_published(pending).await.unwrap();
+        }
+        let before_epoch = alice.epoch(&gid).unwrap();
+
+        let disband_with_admin = vec![
+            AppComponentData {
+                component_id: GROUP_LIFECYCLE_COMPONENT_ID,
+                data: cgka_traits::app_components::encode_group_lifecycle_v1(
+                    GroupLifecycleV1::Disbanded,
+                ),
+            },
+            AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: encode_admin_policy_for_test(&[alice.self_id().as_slice().to_vec()]),
+            },
+        ];
+        let disband_only = vec![AppComponentData {
+            component_id: GROUP_LIFECYCLE_COMPONENT_ID,
+            data: cgka_traits::app_components::encode_group_lifecycle_v1(
+                GroupLifecycleV1::Disbanded,
+            ),
+        }];
+        let active_only = vec![AppComponentData {
+            component_id: GROUP_LIFECYCLE_COMPONENT_ID,
+            data: cgka_traits::app_components::encode_group_lifecycle_v1(GroupLifecycleV1::Active),
+        }];
+
+        for updates in [disband_with_admin, disband_only, active_only] {
+            let err = alice
+                .send(SendIntent::UpdateAppComponents {
+                    group_id: gid.clone(),
+                    updates,
+                })
+                .await
+                .expect_err("UpdateAppComponents must reject lifecycle mutations");
+            assert!(
+                matches!(err, EngineError::Other(ref msg) if msg.contains("group lifecycle component cannot be updated through UpdateAppComponents")),
+                "legacy={legacy}: unexpected error: {err:?}"
+            );
+            assert_eq!(alice.epoch(&gid).unwrap(), before_epoch);
+            assert!(matches!(
+                alice.epoch_state(&gid),
+                Some(cgka_traits::EpochState::Stable { .. })
+            ));
+            assert_eq!(
+                decode_group_lifecycle_v1(
+                    &alice
+                        .app_component(&gid, GROUP_LIFECYCLE_COMPONENT_ID)
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                GroupLifecycleV1::Active
+            );
+        }
+
+        // Even while a prior publish is unsettled (when an ordinary
+        // UpdateAppComponents would queue), targeting 0x800c must be refused
+        // immediately rather than queued.
+        let staged = alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: gid.clone(),
+                name: Some("in-flight".into()),
+                description: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(staged, SendResult::GroupEvolution { .. }));
+        let queued_err = alice
+            .send(SendIntent::UpdateAppComponents {
+                group_id: gid.clone(),
+                updates: vec![AppComponentData {
+                    component_id: GROUP_LIFECYCLE_COMPONENT_ID,
+                    data: cgka_traits::app_components::encode_group_lifecycle_v1(
+                        GroupLifecycleV1::Disbanded,
+                    ),
+                }],
+            })
+            .await
+            .expect_err("unsettled UpdateAppComponents targeting 0x800c must fail before queueing");
+        assert!(
+            matches!(queued_err, EngineError::Other(ref msg) if msg.contains("group lifecycle component cannot be updated through UpdateAppComponents")),
+            "legacy={legacy}: unexpected unsettled error: {queued_err:?}"
+        );
+    }
+}

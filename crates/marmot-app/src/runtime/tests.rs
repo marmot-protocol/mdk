@@ -4,6 +4,8 @@ use cgka_traits::transport_adapter::{
     TransportEndpointRejectionCategory, TransportPublishFailure,
 };
 
+use tokio::sync::mpsc;
+
 use super::account_worker::AccountStartupStage;
 use super::subscriptions::{chat_list_mute_expiries, message_kind_filter_allows};
 use super::*;
@@ -596,6 +598,8 @@ async fn worker_lookup_skips_reconcile() {
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
+            tasks: Default::default(),
         },
     );
     // A lifecycle transaction for another account must not hold up this worker.
@@ -1661,6 +1665,8 @@ async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout(
         shutdown,
         unit: Default::default(),
         read_state: Default::default(),
+        relay_checks: tokio::sync::watch::channel(Default::default()).1,
+        tasks: Default::default(),
     };
 
     let started = std::time::Instant::now();
@@ -3178,7 +3184,7 @@ fn lifecycle_refuses_account_open_after_shutdown_begins() {
     lifecycle.begin_shutdown();
 
     assert!(matches!(
-        lifecycle.begin_account_open(),
+        lifecycle.begin_account_open("alice"),
         Err(AppError::RuntimeStopping)
     ));
 }
@@ -3207,7 +3213,7 @@ async fn member_key_package_prewarm_refuses_work_after_shutdown_begins() {
 async fn lifecycle_waits_for_account_opens_to_drain() {
     let lifecycle = RuntimeLifecycle::new();
     let permit = lifecycle
-        .begin_account_open()
+        .begin_account_open("alice")
         .expect("account open should start before shutdown");
 
     let waiter = {
@@ -3259,6 +3265,8 @@ async fn account_manager_shutdown_drains_worker_inserted_by_in_flight_catch_up()
                 shutdown: shutdown_tx,
                 unit: Default::default(),
                 read_state: Default::default(),
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
+                tasks: Default::default(),
             },
         );
     });
@@ -3581,9 +3589,15 @@ async fn open_runtime_local_test_client(
     account_ref: &str,
 ) -> crate::AppClient {
     let shared = runtime.shared_services();
-    app.runtime_local_client(account_ref, shared.relay_plane(), shared.lifecycle(), None)
-        .await
-        .expect("open local test client")
+    app.runtime_local_client(
+        account_ref,
+        shared.relay_plane(),
+        shared.lifecycle(),
+        None,
+        None,
+    )
+    .await
+    .expect("open local test client")
 }
 
 /// Running sessions follow the stored audit-log switch, whatever order the
@@ -3688,6 +3702,8 @@ async fn finished_worker_is_replaced_on_first_requested_lookup() {
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
+            tasks: Default::default(),
         },
     );
 
@@ -3727,6 +3743,8 @@ async fn finished_worker_is_replaced_on_first_batch_reconcile() {
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
+            tasks: Default::default(),
         },
     );
 
@@ -4101,27 +4119,53 @@ async fn the_worker_samples_push_timing_only_while_owed() {
     runtime.shutdown().await;
 }
 
-/// An account whose KeyPackage cannot publish (no relays) owes session
-/// maintenance work with no stored time. It retries 15 s after its last
-/// run by the worker's clock, as the tick did, never back to back on each
-/// re-read of its due time (mdk#3265).
+/// An account with owed untimed session maintenance work (an overdue
+/// component recheck that cannot finish because the epoch-gap read fails)
+/// retries 15 s after its last run by the worker's clock, as the tick did,
+/// never back to back on each re-read of its due time (mdk#3265).
 #[tokio::test(flavor = "current_thread")]
 async fn owed_session_maintenance_retries_15_s_apart_not_back_to_back() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let app = relayless_app_without_device_groups(dir.path());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_open_ranking_provider(None, Vec::new())
+            .with_device_groups(false),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     app.account_home()
         .create_account("alice")
         .expect("create alice");
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.accounts().reconcile().await.expect("alice starts");
+    runtime
+        .create_group("alice", "owed-retry", &[], None)
+        .await
+        .expect("alice creates a group");
     let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    let before_overdue = count(RuntimeOp::WorkerMaintenanceDue);
+    runtime
+        .accounts()
+        .overdue_component_recheck_for_test("alice")
+        .await
+        .expect("the recheck is held overdue");
+    // Step past the read spacing and initial retry window so one maintenance
+    // run completes with the overdue recheck owed and anchors `last_run`.
+    for _ in 0..17 {
+        if count(RuntimeOp::WorkerMaintenanceDue) > before_overdue {
+            break;
+        }
+        advance_held_clock(Duration::from_secs(1)).await;
+    }
     timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-        while count(RuntimeOp::WorkerMaintenanceDue) == 0 {
+        while count(RuntimeOp::WorkerMaintenanceDue) == before_overdue {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the first session maintenance run completes");
+    .expect("the first owed session maintenance run completes");
     let runs = count(RuntimeOp::WorkerMaintenanceDue);
     // The run's retry is due 15 s after it started, so no later than 15 s
     // from here on the worker's clock.
@@ -5170,6 +5214,8 @@ async fn stuck_worker_reap_does_not_block_a_healthy_account() {
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
+            tasks: Default::default(),
         },
     );
 
@@ -5247,6 +5293,8 @@ async fn deactivation_waits_for_worker_abort_before_committing_sign_out() {
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
+            tasks: Default::default(),
         },
     );
 
@@ -5503,6 +5551,8 @@ async fn catch_up_error_from_ready_account_takes_precedence_over_sibling_backoff
             shutdown,
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
+            tasks: Default::default(),
         },
     );
 
@@ -6256,5 +6306,549 @@ async fn abandoned_invite_decline_does_not_leave_the_group() {
         .expect("an abandoned decline must not consume the pending invite");
     assert!(!accepted.pending_confirmation);
     assert_eq!(accepted.self_membership, crate::SelfMembership::Member);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Dropping any of the six runtime subscription handles must terminate its
+/// background forwarding task promptly without waiting for another event or
+/// runtime shutdown (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_each_subscription_terminates_its_background_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("alice", "sub leak check", &[], None)
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    async fn wait_for_receiver_count(runtime: &MarmotAppRuntime, expected: usize, label: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.events.receiver_count() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{label} leaked its broadcast receiver: expected {expected}, still {}",
+                runtime.events.receiver_count()
+            )
+        });
+    }
+
+    let baseline = runtime.events.receiver_count();
+
+    let sub = runtime
+        .subscribe_messages("alice", AppMessageQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_messages").await;
+
+    let sub = runtime
+        .subscribe_timeline_messages("alice", TimelineMessageQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_timeline_messages").await;
+
+    let sub = runtime.subscribe_chats("alice", false).await.unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_chats").await;
+
+    let sub = runtime.subscribe_chat_list("alice", false).await.unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_chat_list").await;
+
+    let sub = runtime
+        .subscribe_group_state("alice", &group_id_hex)
+        .await
+        .unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_group_state").await;
+
+    let sub = runtime.subscribe_notifications().unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_notifications").await;
+
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// `spawn_create_catch_up` must be tracked alongside invite catch-ups so
+/// shutdown drains it and refuses new spawns once shutting down, and
+/// `create_group_with_prepared_initial_image` must schedule post-create
+/// catch-up just like `create_group` (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_catch_up_is_tracked_and_wired_for_prepared_initial_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .unwrap();
+
+    // Stage and mark a prepared initial group image uploaded.
+    let mut png = Vec::new();
+    image::ImageEncoder::write_image(
+        image::codecs::png::PngEncoder::new(&mut png),
+        &[0, 0, 0, 255],
+        1,
+        1,
+        image::ExtendedColorType::Rgba8,
+    )
+    .unwrap();
+    let staged = runtime
+        .stage_prepared_group_image("alice", png, "image/png".into())
+        .await
+        .unwrap();
+    {
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .app_storage()
+            .mark_prepared_group_image_upload_uploaded(&staged.upload_id, crate::unix_now_seconds())
+            .unwrap();
+    }
+
+    let telemetry = runtime.shared_services().observer.performance().clone();
+    let before = telemetry
+        .snapshot()
+        .group_create_post_mutation_catch_up
+        .attempts;
+    let created = runtime
+        .create_group_with_prepared_initial_image(
+            "alice",
+            "prepared image group",
+            &[],
+            None,
+            staged.upload_id,
+        )
+        .await
+        .unwrap();
+    assert!(created.operation.is_some());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while telemetry
+            .snapshot()
+            .group_create_post_mutation_catch_up
+            .attempts
+            <= before
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("create_group_with_prepared_initial_image must trigger post-create catch-up");
+
+    // Once shutdown stops accepting catch-up tasks, `spawn_create_catch_up` must not spawn one.
+    let manager = runtime.accounts.clone();
+    manager
+        .invite_catch_up_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .accepting = false;
+    let (command, mut receiver) = crate::runtime::test_worker_channel(1);
+    manager.spawn_create_catch_up(command);
+    tokio::task::yield_now().await;
+    assert!(
+        receiver.try_recv().is_err(),
+        "spawn_create_catch_up must not spawn after shutdown stops accepting tasks"
+    );
+
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// `reset_incomplete_account_setup` must acquire the same canonical teardown
+/// fences (generated setup + onboarding transaction + moderation reports +
+/// generated removal) as `remove_account` before taking `worker_transactions`
+/// (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_incomplete_account_setup_acquires_teardown_fences() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(directory.path());
+    let keys = nostr::prelude::Keys::generate();
+    let secret = keys.secret_key().to_secret_hex();
+    let account = home.import_nostr_account(&secret).unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+
+    crate::tests::account_database_from_an_older_build(&app, &account.label);
+    app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let transaction = app.onboarding_transaction(&account.account_id_hex);
+    let gate = transaction.lock().await;
+    let reset = runtime.reset_incomplete_account_setup(&secret, true);
+    tokio::pin!(reset);
+    assert!(
+        futures::poll!(reset.as_mut()).is_pending(),
+        "reset_incomplete_account_setup must wait on the onboarding transaction fence"
+    );
+    assert!(
+        runtime
+            .setup
+            .generated_setup_fenced_for_test(&account.account_id_hex),
+        "reset_incomplete_account_setup must raise the generated-setup fence"
+    );
+    drop(gate);
+    tokio::time::timeout(Duration::from_secs(5), reset)
+        .await
+        .expect("reset completes once onboarding transaction releases")
+        .unwrap();
+    assert!(matches!(
+        home.account(&account.label),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// `reset_incomplete_account_setup` must not call `account_storage` before
+/// acquiring the worker transaction, so a concurrent removal that has already
+/// evicted caches cannot have its stale database handle repopulated before the
+/// account directory is renamed (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_incomplete_account_setup_does_not_repopulate_evicted_cache_during_removal() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(directory.path());
+    let keys = nostr::prelude::Keys::generate();
+    let secret = keys.secret_key().to_secret_hex();
+    let account = home.import_nostr_account(&secret).unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+
+    crate::tests::account_database_from_an_older_build(&app, &account.label);
+    app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    // Simulate `remove_account` holding `worker_transactions` right after
+    // `drop_account_caches` and before `account_home().remove_account`.
+    let tx_guard = runtime.accounts.worker_transactions.lock().await;
+    app.drop_account_caches(&account.label);
+    assert!(
+        !app.account_storages
+            .lock()
+            .unwrap()
+            .contains_key(&account.label)
+    );
+
+    let reset = tokio::spawn({
+        let runtime = runtime.clone();
+        let secret = secret.clone();
+        async move { runtime.reset_incomplete_account_setup(&secret, true).await }
+    });
+    // Wait until `reset` has completed its preflight, acquired the lifecycle
+    // fences, and is parked on `worker_transactions`.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime
+            .setup
+            .generated_setup_fenced_for_test(&account.account_id_hex)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reset reaches lifecycle fences and waits on worker_transactions");
+    assert!(
+        !app.account_storages
+            .lock()
+            .unwrap()
+            .contains_key(&account.label),
+        "reset preflight must not reopen account_storage before acquiring worker_transactions"
+    );
+
+    // Finish the simulated removal and release the transaction.
+    home.remove_account(&account.label).unwrap();
+    drop(tx_guard);
+    let err = tokio::time::timeout(Duration::from_secs(5), reset)
+        .await
+        .expect("reset finishes after removal releases worker_transactions")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AppError::AccountHome(AccountHomeError::UnknownAccount(_))
+        ),
+        "expected UnknownAccount after concurrent removal, got {err:?}"
+    );
+    assert!(
+        !app.account_storages
+            .lock()
+            .unwrap()
+            .contains_key(&account.label),
+        "account storage cache must remain empty after removal"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Continuous broadcast traffic must not starve block-list refreshes on
+/// `subscribe_timeline_messages` or chat mute expiry on
+/// `subscribe_chat_list` (mdk#3801).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn broadcast_traffic_does_not_starve_block_list_refresh_or_mute_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    // Anchor virtual chat-list time to the current wall clock so SQLite reads
+    // and the virtual clock agree while keeping a 60-second mute deadline
+    // immune to runner load.
+    let base_ms = crate::notifications::unix_now_ms();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay)
+        .with_virtual_chat_list_clock(base_ms);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("alice", "unbiased select", &[], None)
+        .await
+        .unwrap()
+        .operation
+        .expect("group created");
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let mute_until = base_ms + 60_000;
+    app.set_chat_muted("alice", &group_id_hex, Some(mute_until))
+        .unwrap();
+
+    let mut timeline = runtime
+        .subscribe_timeline_messages("alice", TimelineMessageQuery::default())
+        .await
+        .unwrap();
+    let mut chat_list = runtime.subscribe_chat_list("alice", false).await.unwrap();
+    assert!(
+        chat_list
+            .snapshot
+            .iter()
+            .any(|row| row.group_id_hex == group_id_hex && row.muted),
+        "chat list snapshot must start muted"
+    );
+
+    let base_row = chat_list
+        .snapshot
+        .iter()
+        .find(|row| row.group_id_hex == group_id_hex)
+        .unwrap()
+        .clone();
+    const BURST: usize = 64;
+
+    // 1. Mark the mute expired in storage and deliver an initial projection
+    // setting `mute_expiries` to `base_ms` (already due at virtual t=0),
+    // followed synchronously by `BURST` ready broadcast events. Under a biased
+    // select prioritizing `events.recv()`, all 64 projections drain ahead of
+    // `MuteChanged`; under an unbiased work select, `MuteChanged` fires well
+    // before all 64 drain (failure probability <= (1/2)^64).
+    app.set_chat_muted("alice", &group_id_hex, Some(base_ms - 1))
+        .unwrap();
+    for i in 0..=BURST {
+        let mut row = base_row.clone();
+        row.pinned_position = Some(i as u32);
+        row.muted = true;
+        row.muted_until_ms = Some(base_ms);
+        let _ = runtime.events.send(MarmotAppEvent::ProjectionUpdated(
+            crate::RuntimeProjectionUpdate {
+                account_id_hex: alice.account_id_hex.clone(),
+                account_label: "alice".into(),
+                update: crate::AppProjectionUpdate {
+                    group_id_hex: group_id_hex.clone(),
+                    chat_list_trigger: ChatListUpdateTrigger::NewLastMessage,
+                    chat_list_row: Some(row),
+                    timeline_messages: Vec::new(),
+                    timeline_changes: Vec::new(),
+                },
+            },
+        ));
+    }
+
+    let mut chat_list_saw_mute_expiry_before_burst_end = false;
+    // Allow 1 extra slot for the initial projection that arms `mute_expiries = base_ms`.
+    for _ in 0..=BURST {
+        let update = tokio::time::timeout(Duration::from_secs(5), chat_list.recv())
+            .await
+            .expect("chat list subscription delivers update")
+            .expect("chat list subscription stays open");
+        if matches!(
+            update,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::MuteChanged,
+                ..
+            }
+        ) {
+            chat_list_saw_mute_expiry_before_burst_end = true;
+            break;
+        }
+    }
+    assert!(
+        chat_list_saw_mute_expiry_before_burst_end,
+        "biased broadcast select starved chat list MuteChanged behind all {BURST} ready broadcast events"
+    );
+
+    // 2. Trigger a block-list change SYNCHRONOUSLY alongside `BURST` matching
+    // timeline projections so `block_changes.changed()` and all 64 broadcast
+    // events are simultaneously ready on `subscribe_timeline_messages`.
+    let blocked_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
+    let adopted = app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .adopt_block_list(
+            &storage_sqlite::StoredBlockList {
+                event_id: "aa".repeat(32),
+                event_created_at: crate::unix_now_seconds().max(1),
+                public_tags: Vec::new(),
+                private_tags: vec![vec!["p".into(), blocked_pubkey.clone()]],
+            },
+            &[(blocked_pubkey, true)],
+            crate::notifications::unix_now_ms(),
+            &alice.account_id_hex,
+            &MarmotApp::chat_list_mention_classifier(&alice.account_id_hex),
+        )
+        .unwrap();
+    assert!(adopted, "block list update must be adopted");
+    app.block_list_updates.send_modify(|revision| {
+        *revision = revision.wrapping_add(1);
+    });
+    for i in 0..BURST {
+        let _ = runtime.events.send(MarmotAppEvent::ProjectionUpdated(
+            crate::RuntimeProjectionUpdate {
+                account_id_hex: alice.account_id_hex.clone(),
+                account_label: "alice".into(),
+                update: crate::AppProjectionUpdate {
+                    group_id_hex: group_id_hex.clone(),
+                    chat_list_trigger: ChatListUpdateTrigger::NewLastMessage,
+                    chat_list_row: None,
+                    timeline_messages: Vec::new(),
+                    timeline_changes: vec![storage_sqlite::TimelineMessageChange::Remove {
+                        message_id_hex: format!("{i:064x}"),
+                        reason: storage_sqlite::TimelineRemoveReason::Invalidated,
+                    }],
+                },
+            },
+        ));
+    }
+
+    let mut timeline_saw_policy_before_burst_end = false;
+    for _ in 0..BURST {
+        let signal = tokio::time::timeout(Duration::from_secs(5), timeline.updates.recv())
+            .await
+            .expect("timeline subscription delivers signal")
+            .expect("timeline subscription stays open");
+        if matches!(
+            signal,
+            crate::runtime::subscriptions::TimelineSubscriptionSignal::PolicyRefresh
+        ) {
+            timeline_saw_policy_before_burst_end = true;
+            break;
+        }
+    }
+    assert!(
+        timeline_saw_policy_before_burst_end,
+        "biased broadcast select starved timeline block-list PolicyRefresh behind all {BURST} ready broadcast events"
+    );
+
+    drop(timeline);
+    drop(chat_list);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Teardown (`deactivate_account`) must wait for an in-flight worker reconnect
+/// blocking open to drain (and drop any rejected `OpenedAccount`) before
+/// evicting caches, so the abandoned reconnect open cannot repopulate
+/// `account_storages` after teardown returns (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_waits_for_in_flight_reconnect_open_before_evicting_caches() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+
+    // Hold the reconnect's blocking `open_account` at `SessionOpen`.
+    let (reached, proceed) = install_local_open_gate(&app, "alice");
+    let mut events = runtime.subscribe();
+    let commands = runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .get(&alice.account_id_hex)
+        .expect("alice worker running")
+        .commands
+        .clone();
+
+    runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_consumer_exit_for_test();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::AccountError(error))
+                    if error.message.starts_with("runtime receive failed") =>
+                {
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime events closed before receive failure");
+                }
+            }
+        }
+    })
+    .await
+    .expect("consumer exit triggers reconnect loop");
+
+    // Interrupt the reconnect backoff sleep immediately so the worker enters
+    // its blocking reconnect open without waiting for wall-clock backoff.
+    let (respond, _rx) = oneshot::channel();
+    let _ = commands.try_send(AccountWorkerCommand::ConnectivityRestored { respond });
+    wait_for_test_signal(reached, "reconnect SessionOpen gate").await;
+
+    let deactivate = tokio::spawn({
+        let accounts = runtime.accounts();
+        async move { accounts.deactivate_account("alice").await }
+    });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    let finished_while_reconnect_held = deactivate.is_finished();
+    proceed.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), deactivate)
+        .await
+        .expect("deactivate finishes once reconnect open drains")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !finished_while_reconnect_held,
+        "teardown returned while a blocking reconnect open was still in flight"
+    );
+    // Fence behind the blocking pool to verify no late reopen repopulates caches.
+    tokio::task::spawn_blocking(|| ()).await.unwrap();
+    assert!(
+        !app.account_storages.lock().unwrap().contains_key("alice"),
+        "abandoned reconnect open must not repopulate evicted account storage cache"
+    );
     runtime.shutdown_and_close().await.unwrap();
 }

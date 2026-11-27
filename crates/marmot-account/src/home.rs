@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::io::{
     read_json, read_private_json, read_private_json_bounded, validate_account_label,
-    write_private_bytes, write_private_json,
+    validate_existing_account_label, write_private_bytes, write_private_json,
 };
 use crate::secret_store::{
     AccountSecretStore, KeychainSecretStore, LocalFileSecretStore,
@@ -331,8 +331,23 @@ impl AccountHome {
         &self.root
     }
 
+    /// Return the directory for `label` after validating it as a safe single
+    /// path component (rejecting traversal, separators, colons, and control
+    /// characters on all platforms, plus Windows-reserved names on Windows).
+    pub fn try_account_dir(&self, label: &str) -> AccountHomeResult<PathBuf> {
+        validate_existing_account_label(label)?;
+        Ok(self.accounts_dir().join(label))
+    }
+
+    /// Return the directory for a validated account `label`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `label` fails path-safety validation. Callers with untrusted
+    /// labels should use [`Self::try_account_dir`].
     pub fn account_dir(&self, label: &str) -> PathBuf {
-        self.accounts_dir().join(label)
+        self.try_account_dir(label)
+            .expect("AccountHome::account_dir requires a safe account label")
     }
 
     pub fn create_account(&self, label: &str) -> AccountHomeResult<AccountSummary> {
@@ -401,6 +416,9 @@ impl AccountHome {
             let Some(label) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
+            if validate_existing_account_label(&label).is_err() {
+                continue;
+            }
             let Some(state) = self.raw_account_setup_state(&label)? else {
                 continue;
             };
@@ -470,7 +488,7 @@ impl AccountHome {
             .mutation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        validate_account_label(label)?;
+        validate_existing_account_label(label)?;
 
         let account_id_hex = keys.public_key().to_hex();
         if self.account_record_path(label).exists() {
@@ -488,6 +506,8 @@ impl AccountHome {
         {
             return self.reuse_or_repair_signing_account(account, &keys);
         }
+
+        validate_account_label(label)?;
 
         let account = AccountSummary {
             label: label.to_owned(),
@@ -631,11 +651,9 @@ impl AccountHome {
             if stored_keys.public_key() != keys.public_key() {
                 return Err(AccountHomeError::AccountIdMismatch);
             }
-        } else {
-            if let Err(err) = self.secret_store.write_secret(&account, &keys) {
-                let _ = fs::remove_dir_all(self.account_dir(&account.label));
-                return Err(err);
-            }
+        } else if let Err(err) = self.secret_store.write_secret(&account, &keys) {
+            let _ = fs::remove_dir_all(self.account_dir(&account.label));
+            return Err(err);
         }
         if let Err(err) = self.write_account_record(&account) {
             if !reused_account_id_credential {
@@ -721,7 +739,7 @@ impl AccountHome {
         label: &str,
         state: &AccountSetupState,
     ) -> AccountHomeResult<()> {
-        validate_account_label(label)?;
+        validate_existing_account_label(label)?;
         write_private_json(self.account_setup_state_path(label), state)
     }
 
@@ -1009,10 +1027,10 @@ impl AccountHome {
     }
 
     pub fn account(&self, account_ref: &str) -> AccountHomeResult<AccountSummary> {
-        if validate_account_label(account_ref).is_ok() {
+        if validate_existing_account_label(account_ref).is_ok() {
             let path = self.account_record_path(account_ref);
             if path.exists() {
-                return read_private_json(path);
+                return Self::read_account_record(path);
             }
         }
 
@@ -1022,7 +1040,13 @@ impl AccountHome {
         if !path.exists() {
             return Err(AccountHomeError::UnknownAccount(account_ref.to_owned()));
         }
-        read_private_json(path)
+        Self::read_account_record(path)
+    }
+
+    fn read_account_record(path: impl AsRef<Path>) -> AccountHomeResult<AccountSummary> {
+        let account: AccountSummary = read_private_json(path)?;
+        validate_existing_account_label(&account.label)?;
+        Ok(account)
     }
 
     pub fn accounts(&self) -> AccountHomeResult<Vec<AccountSummary>> {
@@ -1339,7 +1363,7 @@ impl AccountHome {
                 path.exists()
             };
             if exists {
-                match read_private_json(path) {
+                match Self::read_account_record(path) {
                     Ok(account) => accounts.push(account),
                     Err(error) if strict => return Err(error),
                     Err(_) => skipped_unreadable_records += 1,
@@ -1426,11 +1450,11 @@ impl AccountHome {
     /// invariant is that once the MLS-DB wipe starts it must complete, because a
     /// half-wiped MLS database is worse than either extreme. The rename is that
     /// commit point. If the rename itself fails, the account directory remains
-    /// intact, but its NIP-46 session may already be removed. If deleting the
-    /// secret or the tombstone fails *after* the rename, the live account is
-    /// already gone; the residual tombstone bytes are orphaned junk outside any
-    /// live account, so the call still reports success rather than a forbidden
-    /// partial-live state.
+    /// intact, but its NIP-46 session may already be removed. After the rename
+    /// commits, tombstoned local secret files are always scrubbed and tombstone
+    /// deletion is attempted best-effort (orphan bytes outside `accounts/` do
+    /// not fail removal), while any independent secret-store deletion error is
+    /// propagated after local cleanup finishes.
     pub fn remove_account(&self, account_ref: &str) -> AccountHomeResult<()> {
         self.remove_account_inner(account_ref, None, false)
     }
@@ -1486,6 +1510,18 @@ impl AccountHome {
             }
         }
 
+        // Resolve fallible shared-credential policy before the rename commit
+        // point while holding `mutation_lock`, so a lookup failure leaves the
+        // account live and untouched rather than stranding a tombstone. Check
+        // even for non-signing records so removing a public record after a
+        // reinstall still deletes a surviving same-ID vault credential unless
+        // another signing record depends on it.
+        let remove_signing_secret = if preserve_account_id_credential {
+            false
+        } else {
+            !self.secret_shared_with_other_record(&account)?
+        };
+
         // The session credential lives outside the account directory. Delete it
         // before the wipe commits so a vault failure remains actionable.
         self.remove_nip46_session_inner(&account, Nip46Removal::Recorded)?;
@@ -1497,19 +1533,25 @@ impl AccountHome {
         let live_dir = self.account_dir(&account.label);
         let tombstone = self.move_account_dir_to_tombstone(&account.label, &live_dir)?;
 
-        // The wipe already committed. An early return would report a completed
-        // removal as failed and skip the secret scrub below, so warn and continue.
+        // The wipe already committed. Never return early from post-commit
+        // cleanup failures: always attempt independent secret-store deletion,
+        // both tombstoned local secret-file scrubs, and recursive tombstone
+        // deletion before propagating any credential-removal failure so local
+        // plaintext key material is always scrubbed and callers are never told
+        // an independent credential was removed when its deletion failed.
+        let mut post_commit_secret_err: Option<AccountHomeError> = None;
         if account.external_signing
-            && self
+            && let Err(err) = self
                 .secret_store
                 .remove_secret(&external_database_credential(&account))
-                .is_err()
         {
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "remove_account",
-                "failed to remove external database credential after wipe commit"
+                kind = "external_database",
+                "failed to remove independent credential after wipe commit"
             );
+            post_commit_secret_err = Some(err);
         }
 
         // Drop the signing secret unless a twin record still depends on a
@@ -1518,8 +1560,16 @@ impl AccountHome {
         // a no-op (NotFound -> Ok); the tombstoned secret file is scrubbed below
         // before recursive directory deletion. For the keychain store the entry
         // is independent of the directory and is removed here.
-        if !preserve_account_id_credential && !self.secret_shared_with_other_record(&account)? {
-            self.secret_store.remove_secret(&account)?;
+        if remove_signing_secret && let Err(err) = self.secret_store.remove_secret(&account) {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "remove_account",
+                kind = "signing",
+                "failed to remove independent credential after wipe commit"
+            );
+            if post_commit_secret_err.is_none() {
+                post_commit_secret_err = Some(err);
+            }
         }
 
         // For the local-file secret store, the signing secret moved into the
@@ -1559,6 +1609,9 @@ impl AccountHome {
                 "failed to delete wiped account tombstone; bytes are orphaned but no live account remains"
             );
         }
+        if let Some(err) = post_commit_secret_err {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -1576,7 +1629,7 @@ impl AccountHome {
             return Ok(None);
         }
         let tombstone_root = self.root.join(WIPE_TOMBSTONE_DIR);
-        fs::create_dir_all(&tombstone_root)?;
+        fs_private::create_dir_all_private(&tombstone_root)?;
         for _ in 0..32 {
             let attempt = TOMBSTONE_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tombstone =
@@ -1793,7 +1846,7 @@ impl AccountHome {
     }
 
     fn write_account_record(&self, account: &AccountSummary) -> AccountHomeResult<()> {
-        validate_account_label(&account.label)?;
+        validate_existing_account_label(&account.label)?;
         write_private_json(self.account_record_path(&account.label), account)
     }
 

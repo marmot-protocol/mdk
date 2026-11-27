@@ -65,8 +65,7 @@ evidence exploratory; a path-only status record is insufficient.
 
 Retain the exact command and runner output beside the artifacts. The default
 development profile is a development check; follow `crates/cgka-conformance-simulator/APP_PATH_COVERAGE.md`'s
-release/production-policy recipes when that is the acceptance claim. Never use
-the half-second `precheck` profile as runtime acceptance evidence. Do not
+release/production-policy recipes when that is the acceptance claim. Do not
 enable `test-policy-overrides` for this default production-settlement recipe.
 Keep CLI override builds separate so Cargo feature unification does not alter
 the app journey's timing policy.

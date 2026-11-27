@@ -1,23 +1,38 @@
 name: Simulator Nightly
 
+# Invoked daily by `.github/workflows/rc-releases.yml` via `workflow_call` on the
+# verified `origin/canary` tip, and on demand via `workflow_dispatch`.
 on:
-  schedule:
-    # GitHub has started scheduled runs 4.5-7.5 hours late since late August
-    # 2026, so this fires at 21:17 UTC for a start around 02:00-05:00 UTC.
-    - cron: "17 21 * * *"
   workflow_dispatch:
     inputs:
       recovery_only:
         description: Run only the production-policy recovery journeys and scorecard
         type: boolean
         default: false
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Optional exact 40-character commit SHA to check out (used by rc-releases.yml)
+        required: false
+        default: ""
+        type: string
+      recovery_only:
+        description: Run only the production-policy recovery journeys and scorecard
+        required: false
+        default: false
+        type: boolean
+      report_failure:
+        description: Open a failure issue when a job fails (set by scheduled callers)
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
   issues: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: simulator-nightly-${{ inputs.source_sha || github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -40,6 +55,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install pinned Odin
         uses: ./.github/actions/setup-odin
@@ -56,7 +72,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
         with:
-          tool: cargo-nextest@0.9.104
+          tool: cargo-nextest@0.9.132
 
       - name: Install just
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
@@ -194,7 +210,7 @@ jobs:
           retention-days: 30
 
       - name: Report nightly failure
-        if: failure()
+        if: ${{ failure() && inputs.report_failure == true }}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -206,7 +222,7 @@ jobs:
             --body "The simulator nightly failed. Run: ${RUN_URL}"
 
   relay-runtime-offline-replay:
-    # The merge queue's relay-runtime lane ignores this 1,600-message case
+    # The CI relay-runtime lane ignores this 1,600-message case
     # because catch-up outruns its 60-second window on slow runners
     # (mdk#2538). Run it here with that lane's features and flags, unchanged.
     name: Relay runtime 1,600-message offline replay
@@ -221,6 +237,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install pinned Odin
         uses: ./.github/actions/setup-odin
@@ -260,7 +277,7 @@ jobs:
           -E 'test(=offline_replay::offline_replay_crosses_queue)'
 
       - name: Report scheduled relay runtime failure
-        if: ${{ failure() && github.event_name == 'schedule' }}
+        if: ${{ failure() && inputs.report_failure == true }}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -286,6 +303,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install pinned Odin
         uses: ./.github/actions/setup-odin
@@ -351,7 +369,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: public-app-catchup-${{ github.sha }}
+          name: public-app-catchup-${{ inputs.source_sha || github.sha }}
           path: |
             target/public-app-catchup-evidence/*.txt
             target/public-app-catchup-evidence/app-journey-*/*.json
@@ -360,7 +378,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Report scheduled recovery failure
-        if: ${{ failure() && github.event_name == 'schedule' }}
+        if: ${{ failure() && inputs.report_failure == true }}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

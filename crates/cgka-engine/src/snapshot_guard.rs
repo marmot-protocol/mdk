@@ -103,10 +103,14 @@ pub(crate) enum RewindSite {
     /// The deferred-peel sweep rewinds onto the retained anchor to enumerate
     /// candidate branches.
     CandidateBranchSweep,
+    /// Missing-anchor local-history verification inspects an intermediate
+    /// retained anchor to confirm that the installed copy's confirmation-tag
+    /// lineage reaches the claimed epoch.
+    HistoryLineageProof,
 }
 
 impl RewindSite {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::PastPeelContext,
         Self::RetentionSource,
         Self::EncryptedMediaSource,
@@ -116,6 +120,7 @@ impl RewindSite {
         Self::Replay,
         Self::RetainedAnchorPass,
         Self::CandidateBranchSweep,
+        Self::HistoryLineageProof,
     ];
 
     /// Durable snapshot-name prefix. No prefix is a prefix of another, so
@@ -131,12 +136,13 @@ impl RewindSite {
             Self::Replay => "openmls-probe-",
             Self::RetainedAnchorPass => "openmls-retained-probe-",
             Self::CandidateBranchSweep => "openmls-branch-probe-",
+            Self::HistoryLineageProof => "history-lineage-proof-",
         }
     }
 
     /// Every site's durable prefix, for finding interrupted windows in all
     /// groups at once.
-    pub(crate) fn prefixes() -> [&'static str; 9] {
+    pub(crate) fn prefixes() -> [&'static str; 10] {
         Self::ALL.map(Self::prefix)
     }
 
@@ -726,6 +732,10 @@ mod tests {
             (
                 "openmls-branch-probe-a1b2c3d4e5f60718",
                 RewindSite::CandidateBranchSweep,
+            ),
+            (
+                "history-lineage-proof-a1b2c3d4e5f60718",
+                RewindSite::HistoryLineageProof,
             ),
         ] {
             assert_eq!(RewindSite::classify(name), Some(site), "name: {name}");

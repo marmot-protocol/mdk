@@ -478,6 +478,8 @@ pub struct MarmotClientOptions {
     /// "iOS", for this device's entry on the account's Devices screen; NULL,
     /// blank or over 64 bytes leaves it out.
     pub device_platform: *const c_char,
+    /// Disable background acquisition of public avatar URLs. Zero (default) keeps it enabled.
+    pub disable_public_avatar_acquisition: u8,
 }
 
 /// Create a client with combined relay, cursor, label and secret-storage
@@ -570,6 +572,7 @@ unsafe fn open_client_with_configuration(
         Err(status) => return status,
     };
     let defaults = MarmotClientOptions {
+        disable_public_avatar_acquisition: 0,
         attachment_acquisition_mode: 0,
         relay_policy: 0,
         cursor_persistence: 0,
@@ -622,6 +625,9 @@ unsafe fn open_client_with_configuration(
             move |root, relays| {
                 let options = marmot_uniffi::MarmotOptions {
                     attachment_acquisition_mode: Some(attachment_mode),
+                    disable_public_avatar_acquisition: memory::c_bool(
+                        options.disable_public_avatar_acquisition,
+                    ),
                     relay_policy: Some(policy),
                     cursor_persistence: Some(cursor.into()),
                     client_name: name,

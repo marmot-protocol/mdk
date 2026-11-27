@@ -198,6 +198,7 @@ mod tests {
                 event_kind: None,
                 event_created_at: None,
                 follows: vec![],
+                follows_created_at: 0,
             })
             .unwrap();
         let checkpoint = storage

@@ -82,7 +82,7 @@ fn scheduled_workflows_collect_and_enforce_lane_observations() {
         assert!(workflow.contains("observed-usage.v1.json"));
         assert!(workflow.contains("budget-evaluation.v1.json"));
         assert!(workflow.contains(evidence_dir));
-        assert!(workflow.contains("tool: cargo-nextest@0.9.104"));
+        assert!(workflow.contains("tool: cargo-nextest@0.9.132"));
         assert!(workflow.contains("CARGO_PROFILE_DEV_DEBUG: \"0\""));
         assert!(workflow.contains("CARGO_PROFILE_TEST_DEBUG: \"0\""));
     }

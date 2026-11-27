@@ -8,11 +8,12 @@ use marmot_app::{
 };
 use serde_json::{Value, json};
 
+use crate::commands::nip46::{nip46_session_summary_json, signing_mode_str};
 use crate::{
-    AccountCommand, CliRuntimeInfo, CommandOutput, ImportNsec, SecretStoreKind, WnError,
-    account_selector_or_default, npub_for_account_id, parse_public_key, profile_display_name,
-    relay_endpoints, relay_lists_json, resolve_account, terminal_safe_json_display,
-    terminal_safe_text, validate_materialized_secret_identity,
+    AccountCommand, CliRuntimeInfo, CommandOutput, ImportBunkerUri, ImportNsec, SecretStoreKind,
+    WnError, account_selector_or_default, npub_for_account_id, parse_public_key,
+    profile_display_name, relay_endpoints, relay_lists_json, resolve_account,
+    terminal_safe_json_display, terminal_safe_text, validate_materialized_secret_identity,
 };
 
 pub(crate) async fn identity_create_command(
@@ -75,8 +76,13 @@ pub(crate) fn whoami_command(
 ) -> Result<CommandOutput, WnError> {
     if account_flag.is_some() {
         let account = resolve_account(account_home, account_flag)?;
-        let status = if account.local_signing {
-            wn_status_json(app.status(&account.label)?, &runtime_info)?
+        let status = if account.can_sign() {
+            wn_status_json(
+                account_home,
+                &account,
+                app.status(&account.label)?,
+                &runtime_info,
+            )?
         } else {
             public_account_status_json(
                 &account,
@@ -93,6 +99,13 @@ pub(crate) fn whoami_command(
         });
     }
 
+    accounts_list_output(account_home, app)
+}
+
+fn accounts_list_output(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+) -> Result<CommandOutput, WnError> {
     let accounts = account_home.accounts()?;
     let accounts_json = accounts
         .into_iter()
@@ -105,7 +118,7 @@ pub(crate) fn whoami_command(
             .iter()
             .map(|account| {
                 format!(
-                    "{} {} local-signing={}",
+                    "{} {} local-signing={} external-signing={}",
                     account_display_name_or_npub(account),
                     account
                         .get("account_id")
@@ -114,7 +127,11 @@ pub(crate) fn whoami_command(
                     account
                         .get("local_signing")
                         .and_then(Value::as_bool)
-                        .unwrap_or(false)
+                        .unwrap_or(false),
+                    account
+                        .get("external_signing")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 )
             })
             .collect::<Vec<_>>()
@@ -220,6 +237,8 @@ pub(crate) fn account_setup_command_output(
             "account_id": setup.account.account_id_hex,
             "npub": npub_for_account_id(&setup.account.account_id_hex)?,
             "local_signing": setup.account.local_signing,
+            "external_signing": setup.account.external_signing,
+            "signing_mode": signing_mode_str(&setup.account),
             "relay_lists": relay_lists_json(setup.relay_lists),
             "key_package": setup.key_package_bytes.map(|bytes| json!({
                 "published": true,
@@ -261,6 +280,7 @@ fn missing_relay_list_status(missing: Vec<MissingRelayListKind>) -> AccountRelay
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn account_command(
     account_home: &AccountHome,
     app: &MarmotApp,
@@ -268,7 +288,10 @@ pub(crate) async fn account_command(
     runtime_info: CliRuntimeInfo,
     account_flag: Option<String>,
     relay: Option<String>,
+    daemon_default_account_relays: Vec<String>,
+    daemon_discovery_relays: Vec<String>,
     import_nsec: Option<ImportNsec>,
+    import_bunker: Option<ImportBunkerUri>,
 ) -> Result<CommandOutput, WnError> {
     match command {
         AccountCommand::Create {
@@ -292,42 +315,10 @@ pub(crate) async fn account_command(
             )
             .await
         }
-        AccountCommand::List => {
-            let accounts = account_home.accounts()?;
-            let accounts_json = accounts
-                .into_iter()
-                .map(|account| account_summary_json(app, account))
-                .collect::<Result<Vec<_>, _>>()?;
-            let plain = if accounts_json.is_empty() {
-                "no accounts".to_owned()
-            } else {
-                accounts_json
-                    .iter()
-                    .map(|account| {
-                        format!(
-                            "{} {} local-signing={}",
-                            account_display_name_or_npub(account),
-                            account
-                                .get("account_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
-                            account
-                                .get("local_signing")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            Ok(CommandOutput {
-                plain,
-                json: json!({ "accounts": accounts_json }),
-            })
-        }
+        AccountCommand::List => accounts_list_output(account_home, app),
         AccountCommand::Status { account } => {
             let account = resolve_account(account_home, account.or(account_flag))?;
-            if !account.local_signing {
+            if !account.can_sign() {
                 let relay_lists = app
                     .directory()
                     .account_relay_list_status_for_account_id(&account.account_id_hex)?;
@@ -341,7 +332,7 @@ pub(crate) async fn account_command(
                 });
             }
             let status = app.status(&account.label)?;
-            let json = wn_status_json(status, &runtime_info)?;
+            let json = wn_status_json(account_home, &account, status, &runtime_info)?;
             Ok(CommandOutput {
                 plain: terminal_safe_json_display(
                     &serde_json::to_string_pretty(&json)
@@ -369,6 +360,19 @@ pub(crate) async fn account_command(
                     "relay_lists": relay_lists_json(relay_lists),
                 }),
             })
+        }
+        AccountCommand::Nip46 { command } => {
+            crate::commands::nip46::nip46_command(
+                account_home,
+                app,
+                command,
+                account_flag,
+                relay,
+                daemon_default_account_relays,
+                daemon_discovery_relays,
+                import_bunker,
+            )
+            .await
         }
     }
 }
@@ -417,12 +421,15 @@ fn account_summary_json(
         .flatten()
         .and_then(|entry| entry.profile);
     let display_name = profile_display_name(profile.as_ref());
+    let signing_mode = signing_mode_str(&account);
     Ok(json!({
         "account_id": account.account_id_hex,
         "npub": npub_for_account_id(&account.account_id_hex)?,
         "display_name": display_name,
         "profile": profile,
         "local_signing": account.local_signing,
+        "external_signing": account.external_signing,
+        "signing_mode": signing_mode,
     }))
 }
 
@@ -441,11 +448,18 @@ fn account_display_name_or_npub(account: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn wn_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Result<Value, WnError> {
-    Ok(json!({
+fn wn_status_json(
+    account_home: &AccountHome,
+    account: &marmot_account::AccountSummary,
+    status: AppStatus,
+    runtime_info: &CliRuntimeInfo,
+) -> Result<Value, WnError> {
+    let mut value = json!({
         "account_id": status.account_id_hex,
         "npub": npub_for_account_id(&status.account_id_hex)?,
-        "local_signing": true,
+        "local_signing": account.local_signing,
+        "external_signing": account.external_signing,
+        "signing_mode": signing_mode_str(account),
         "transport": status.transport,
         "groups": status.groups,
         "seen_events": status.seen_events,
@@ -457,7 +471,16 @@ fn wn_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Result<Va
         "secret_store": secret_store_json(runtime_info),
         "projections": status.projections,
         "relay_lists": relay_lists_json(status.relay_lists),
-    }))
+    });
+    if account.external_signing
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "nip46".to_owned(),
+            nip46_session_summary_json(account_home, account, None),
+        );
+    }
+    Ok(value)
 }
 
 fn secret_store_json(runtime_info: &CliRuntimeInfo) -> Value {
@@ -480,6 +503,8 @@ fn public_account_status_json(
         "account_id": account.account_id_hex,
         "npub": npub_for_account_id(&account.account_id_hex)?,
         "local_signing": false,
+        "external_signing": false,
+        "signing_mode": "public",
         "relay_lists": relay_lists_json(relay_lists),
     }))
 }

@@ -260,6 +260,7 @@ async fn member_recovery_journals_malformed_replacement() {
             &nostr_directory::FetchedFollowList {
                 follows: vec![accounts[0].account_id_hex.clone()],
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();

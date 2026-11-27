@@ -1,6 +1,6 @@
 //! Derived attachment discovery. Protocol validation and acquisition policy live
 //! above storage; a slot is not a promise that an attachment can be downloaded.
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::StorageError;
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
@@ -144,6 +144,8 @@ fn version_tx(
     conn: &Connection,
     group: &str,
 ) -> Result<AttachmentHistoryVersion, AttachmentHistoryError> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     let store_epoch = conn
         .query_row_cached(
             "SELECT store_epoch FROM chat_presentation_meta WHERE id=1",
@@ -180,6 +182,7 @@ impl SqliteAppStorage {
         reaction: &str,
         now: u64,
     ) -> Result<Vec<AttachmentHistoryEntry>, StorageError> {
+        let group = canonical_group_id_hex(group);
         self.connection.with_deferred_read(|conn| {
             let mut stmt = conn.prepare_cached("SELECT 1 AS reaction_artwork,h.message_id_hex,h.attachment_index,h.source_message_id_hex,
                 h.source_epoch,h.sender,h.timeline_at,h.received_at,h.slot_json,
@@ -196,7 +199,7 @@ impl SqliteAppStorage {
                   AND h.attachment_index<100 AND length(CAST(h.slot_json AS BLOB))<=16384
                   AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?3)
                 ORDER BY h.attachment_index LIMIT 100").storage()?;
-            stmt.query_map(rusqlite::params![group,reaction,crate::u64_to_i64(now)?],entry_from_row)
+            stmt.query_map(rusqlite::params![group.as_ref(),reaction,crate::u64_to_i64(now)?],entry_from_row)
                 .storage()?.collect::<Result<Vec<_>,_>>().storage()
         })
     }
@@ -236,6 +239,8 @@ impl SqliteAppStorage {
         if !(1..=MAX_ATTACHMENT_HISTORY_PAGE).contains(&limit) {
             return Err(AttachmentHistoryError::InvalidLimit);
         }
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
+        let group_id_hex = group_id_hex.as_ref();
         self.connection.with_deferred_read(|conn| {
             let version = version_tx(conn, group_id_hex)?;
             if let Some(cursor) = cursor {
@@ -310,6 +315,8 @@ pub(crate) fn refresh_reaction_attachment_sources_tx(
     group: &str,
     target: Option<&str>,
 ) -> Result<(), StorageError> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     // Earlier migration bodies also rebuild timelines. Their schema has no
     // reaction source view yet; migration 0167 performs the initial backfill.
     if !conn

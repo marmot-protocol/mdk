@@ -3949,6 +3949,7 @@ async fn availability_expired() {
             &nostr_directory::FetchedFollowList {
                 follows: vec![accounts[0].account_id_hex.clone()],
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();
@@ -4003,6 +4004,7 @@ async fn availability_obsolete_only() {
             &nostr_directory::FetchedFollowList {
                 follows: vec![account.account_id_hex.clone()],
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();
@@ -4068,6 +4070,7 @@ async fn availability_multi_slot() {
             &nostr_directory::FetchedFollowList {
                 follows: vec![accounts[0].account_id_hex.clone()],
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();
@@ -4127,6 +4130,7 @@ async fn availability_fenced_first_slot_uses_alternative() {
             &nostr_directory::FetchedFollowList {
                 follows: vec![accounts[0].account_id_hex.clone()],
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();
@@ -4209,6 +4213,7 @@ async fn availability_recovery_stays_bounded() {
             &nostr_directory::FetchedFollowList {
                 follows: vec![accounts[0].account_id_hex.clone()],
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();
@@ -4302,6 +4307,7 @@ async fn availability_discovery_is_bounded() {
             &nostr_directory::FetchedFollowList {
                 follows: vec![accounts[0].account_id_hex.clone()],
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();
@@ -4369,6 +4375,7 @@ async fn availability_unusable_cached_route_rediscovers() {
             &nostr_directory::FetchedFollowList {
                 follows: vec![account.account_id_hex.clone()],
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();
@@ -4396,6 +4403,7 @@ async fn availability_live_deletions_are_fenced() {
                     .map(|account| account.account_id_hex.clone())
                     .collect(),
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();
@@ -4469,6 +4477,7 @@ async fn availability_deleted_stays_not_found() {
             &nostr_directory::FetchedFollowList {
                 follows: vec![accounts[0].account_id_hex.clone()],
                 source_relays: Vec::new(),
+                created_at: 0,
             },
         )
         .unwrap();

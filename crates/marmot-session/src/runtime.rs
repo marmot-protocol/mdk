@@ -1353,7 +1353,11 @@ where
 
     /// `sealed` opened with this device's history key for `context`;
     /// `None` when it does not open or this device has no history key yet.
-    pub fn open_history(&self, context: &[u8], sealed: &[u8]) -> SessionResult<Option<Vec<u8>>> {
+    pub fn open_history(
+        &self,
+        context: &[u8],
+        sealed: &[u8],
+    ) -> SessionResult<Option<cgka_traits::SecretBytes>> {
         self.session.open_history(context, sealed)
     }
 
@@ -1386,7 +1390,7 @@ where
         entropy: &[u8; crate::RECOVERY_ENTROPY_LEN],
         context: &[u8],
         sealed: &[u8],
-    ) -> SessionResult<Option<Vec<u8>>> {
+    ) -> SessionResult<Option<cgka_traits::SecretBytes>> {
         self.session
             .open_with_recovery_key(entropy, context, sealed)
     }
@@ -1869,8 +1873,14 @@ where
             || lifecycle
                 .pending_replacement
                 .as_ref()
-                .is_none_or(|pending| self.pending_replacement_obsolete(&lifecycle, pending))
+                .is_none_or(|pending| self.pending_replacement_obsolete(&lifecycle, pending, now))
         {
+            if endpoints.is_empty() {
+                return Err(crate::key_package::KeyPackagePublishError::unexposed(
+                    "no KeyPackage publication endpoints are configured",
+                )
+                .into());
+            }
             // Newer than every publication in the slot, a foreign one
             // included, and than its withdrawal: relays drop anything up to
             // that.
@@ -1920,6 +1930,12 @@ where
                     })
                     .collect(),
             )?;
+        } else if let Some(pending) = lifecycle.pending_replacement.as_mut()
+            && merge_republish_publication_targets(&mut pending.targets, &endpoints)
+        {
+            // Keep the exact durable signed KeyPackage and private material
+            // when the account's write relays change before promotion (mdk#3747).
+            self.session.put_key_package_lifecycle(&lifecycle)?;
         }
 
         if lifecycle
@@ -1931,16 +1947,13 @@ where
                 .pending_replacement
                 .as_ref()
                 .expect("unsigned pending replacement exists");
+            let active_endpoints = active_pending_endpoints(&pending.targets)?;
             let publication = KeyPackagePublication {
                 account_id: self.session.self_id().clone(),
                 key_package: pending.key_package.clone(),
                 slot_id: lifecycle.stable_slot_id.clone(),
                 created_at: pending.authored_created_at,
-                endpoints: pending
-                    .targets
-                    .iter()
-                    .map(|target| target.endpoint.clone())
-                    .collect(),
+                endpoints: active_endpoints,
             };
             let artifact = self.key_packages.prepare_key_package(publication).await?;
             lifecycle
@@ -1983,6 +1996,14 @@ where
                 .pending_replacement
                 .as_ref()
                 .expect("pending replacement exists");
+            // An asynchronous signer may have returned after the package expired.
+            // The next preparation replaces it and runs the announcement gate again.
+            if pending.not_after <= self.wall_clock.now() {
+                return Err(crate::key_package::KeyPackagePublishError::unexposed(
+                    "the prepared KeyPackage expired before publication",
+                )
+                .into());
+            }
             // A device group's roster names it before it reaches the slot;
             // maintenance announces it.
             self.ensure_key_package_announced(&pending.key_package_ref)?;
@@ -1991,16 +2012,13 @@ where
                 .as_ref()
                 .expect("prepared replacement has an exact signed event")
                 .clone();
+            let attempt_endpoints = active_pending_endpoints(&pending.targets)?;
             let publication = KeyPackagePublication {
                 account_id: self.session.self_id().clone(),
                 key_package: pending.key_package.clone(),
                 slot_id: lifecycle.stable_slot_id.clone(),
                 created_at: artifact.created_at,
-                endpoints: pending
-                    .targets
-                    .iter()
-                    .map(|target| target.endpoint.clone())
-                    .collect(),
+                endpoints: attempt_endpoints,
             };
             let error = match self
                 .key_packages
@@ -2093,20 +2111,26 @@ where
         // replacements superseded before any was confirmed; a consumed one
         // keeps the grace period it started when it was superseded.
         let confirmed_at = self.wall_clock.now();
-        for material in &mut lifecycle.retained_private_material {
+        let mut retired = Vec::new();
+        lifecycle.retained_private_material.retain_mut(|material| {
             if material.awaiting_confirmed_replacement {
                 material.awaiting_confirmed_replacement = false;
                 if !material.consumed {
                     material.replaced_at = confirmed_at;
                 }
             }
-        }
-        let mut retired = Vec::new();
+            if material.delete_at() <= confirmed_at {
+                retired.push(material.key_package.clone());
+                return false;
+            }
+            true
+        });
         if let Some(key_package) = lifecycle.current_key_package.clone() {
             match (
                 lifecycle.current_key_package_ref.clone(),
                 lifecycle.current_not_after,
             ) {
+                (_, Some(not_after)) if not_after <= confirmed_at => retired.push(key_package),
                 (Some(key_package_ref), Some(not_after)) => lifecycle
                     .retained_private_material
                     .push(RetainedKeyPackagePrivateMaterial {
@@ -2198,36 +2222,62 @@ where
             }))
     }
 
+    fn lifecycle_needs_key_package_preparation(
+        &self,
+        lifecycle: Option<&KeyPackageLifecycleState>,
+        now: Timestamp,
+    ) -> bool {
+        match lifecycle {
+            None => true,
+            Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
+                Some(pending) => {
+                    self.pending_replacement_obsolete(lifecycle, pending, now)
+                        || pending.signed_event.is_none()
+                }
+                None => {
+                    lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref
+                        || self.current_key_package_replacement_due(lifecycle, now)
+                }
+            },
+        }
+    }
+
+    /// Whether the KeyPackage slot needs a fresh replacement staged or an
+    /// unsigned pending replacement signed before it can be announced or
+    /// published, regardless of whether writable routes are currently
+    /// configured.
+    pub(super) fn key_package_preparation_due(&self) -> AccountResult<bool> {
+        let now = self.wall_clock.now();
+        let lifecycle = self.session.key_package_lifecycle()?;
+        Ok(self.lifecycle_needs_key_package_preparation(lifecycle.as_ref(), now))
+    }
+
     pub fn key_package_network_maintenance_due(&self) -> AccountResult<bool> {
         if self.key_package_slot_withdrawn {
             return Ok(false);
         }
+        let current_endpoints = self.routing.key_package_endpoints();
+        if current_endpoints.is_empty() {
+            return Ok(false);
+        }
         let now = self.wall_clock.now();
-        Ok(match self.session.key_package_lifecycle()? {
-            None => true,
-            Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
-                Some(pending) => {
-                    self.pending_replacement_obsolete(&lifecycle, pending)
-                        || pending.signed_event.is_none()
-                        || pending
-                            .targets
-                            .iter()
-                            .any(|target| key_package_target_retry_due(target, now))
-                }
-                None => {
-                    lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref
-                        || self.current_key_package_replacement_due(&lifecycle, now)
-                }
-            },
-        })
+        let lifecycle = self.session.key_package_lifecycle()?;
+        Ok(
+            self.lifecycle_needs_key_package_preparation(lifecycle.as_ref(), now)
+                || lifecycle
+                    .and_then(|lifecycle| lifecycle.pending_replacement)
+                    .is_some_and(|pending| {
+                        pending_targets_need_publish(&pending.targets, &current_endpoints, now)
+                    }),
+        )
     }
 
     /// Whether the current KeyPackage is due for replacement for any reason
-    /// other than a Welcome consuming it: there is none, its weekly refresh
-    /// is due, the generator policy changed, the capabilities this client
-    /// supports changed (`foundation/key-packages.md`, "Refreshing a slot"),
-    /// or the slot was withdrawn at sign-out or served a foreign publication
-    /// at least as new.
+    /// other than a Welcome consuming it: there is none, it has expired, its
+    /// weekly refresh is due, the generator policy changed, the capabilities
+    /// this client supports changed (`foundation/key-packages.md`, "Refreshing
+    /// a slot"), or the slot was withdrawn at sign-out or served a foreign
+    /// publication at least as new.
     fn current_key_package_replacement_due(
         &self,
         lifecycle: &KeyPackageLifecycleState,
@@ -2236,24 +2286,29 @@ where
         let Some(current) = lifecycle.current_key_package.as_ref() else {
             return true;
         };
-        key_package_refresh_due(lifecycle, now)
+        lifecycle
+            .current_not_after
+            .is_some_and(|deadline| deadline <= now)
+            || key_package_refresh_due(lifecycle, now)
             || self.current_publication_superseded(lifecycle)
             || !lifecycle.upgrade_rotation_recorded
             || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
             || !self.advertises_current_capabilities(current)
     }
 
-    /// Whether `pending` must be replaced before it is published: built by an
-    /// older generator revision, superseded in the slot (staged before its
-    /// withdrawal, or no newer than a foreign publication found there), or
-    /// built without the capabilities this device now advertises, such as a
-    /// device tag once this device tags (mdk#2628 3.1d).
+    /// Whether `pending` must be replaced before it is published: expired,
+    /// built by an older generator revision, superseded in the slot (staged
+    /// before its withdrawal, or no newer than a foreign publication found
+    /// there), or built without the capabilities this device now advertises,
+    /// such as a device tag once this device tags (mdk#2628 3.1d).
     fn pending_replacement_obsolete(
         &self,
         lifecycle: &KeyPackageLifecycleState,
         pending: &PendingKeyPackageReplacement,
+        now: Timestamp,
     ) -> bool {
-        pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+        pending.not_after <= now
+            || pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
             || self.slot_publication_superseded(lifecycle, pending.authored_created_at)
             || !self.advertises_current_capabilities(&pending.key_package)
     }
@@ -2271,20 +2326,22 @@ where
         if self.key_package_slot_withdrawn {
             return Ok(false);
         }
-        // A withdrawn or superseded publication is replaced, not resent.
+        let now = self.wall_clock.now();
+        let current_endpoints = self.routing.key_package_endpoints();
+        // A withdrawn, superseded, or expired publication is replaced, not resent.
         Ok(self
             .session
             .key_package_lifecycle()?
             .is_some_and(|lifecycle| {
                 !self.current_publication_superseded(&lifecycle)
+                    && !lifecycle
+                        .current_not_after
+                        .is_some_and(|deadline| deadline <= now)
                     && lifecycle.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
                     && lifecycle.authored_signed_event.is_some()
                     && lifecycle.publication_targets.iter().any(|target| {
-                        matches!(
-                            target.state,
-                            TransportFanoutAttemptState::Unattempted
-                                | TransportFanoutAttemptState::AttemptedFailed
-                        )
+                        current_endpoints.contains(&target.endpoint)
+                            && target.state != TransportFanoutAttemptState::Accepted
                     })
             }))
     }
@@ -2399,10 +2456,26 @@ where
         let Some(artifact) = lifecycle.authored_signed_event.clone() else {
             return Ok(());
         };
+        let now = self.wall_clock.now();
+        if lifecycle
+            .current_not_after
+            .is_some_and(|deadline| deadline <= now)
+        {
+            return Ok(());
+        }
+        let current_endpoints = self.routing.key_package_endpoints();
+        for target in &mut lifecycle.publication_targets {
+            if current_endpoints.contains(&target.endpoint) {
+                reauthorize_fanout_target(target);
+            }
+        }
         let endpoints = lifecycle
             .publication_targets
             .iter()
-            .filter(|target| key_package_target_retry_due(target, self.wall_clock.now()))
+            .filter(|target| {
+                current_endpoints.contains(&target.endpoint)
+                    && key_package_target_retry_due(target, now)
+            })
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
         if endpoints.is_empty() {
@@ -2443,11 +2516,8 @@ where
                     self.wall_clock.now(),
                 );
                 lifecycle.phase = if lifecycle.publication_targets.iter().all(|target| {
-                    matches!(
-                        target.state,
-                        TransportFanoutAttemptState::Accepted
-                            | TransportFanoutAttemptState::PolicyProhibited
-                    )
+                    !current_endpoints.contains(&target.endpoint)
+                        || target.state == TransportFanoutAttemptState::Accepted
                 }) {
                     cgka_traits::MaintenancePhase::Complete
                 } else {
@@ -2976,6 +3046,7 @@ where
         // Paused maintenance may finish existing publication intent, but an
         // obsolete pending replacement requires fresh private material and
         // therefore waits for resume like every other new preparation.
+        let key_package_now = self.wall_clock.now();
         let key_package_prepared = self
             .session
             .key_package_lifecycle()?
@@ -2983,7 +3054,9 @@ where
                 lifecycle
                     .pending_replacement
                     .as_ref()
-                    .is_some_and(|pending| !self.pending_replacement_obsolete(&lifecycle, pending))
+                    .is_some_and(|pending| {
+                        !self.pending_replacement_obsolete(&lifecycle, pending, key_package_now)
+                    })
             });
         if key_package_due && (!self.maintenance_paused || key_package_prepared) {
             let started = self.monotonic_clock.elapsed();
@@ -8487,21 +8560,28 @@ fn current_key_package_republish_blocker(
     }
 }
 
+fn reauthorize_fanout_target(target: &mut TransportFanoutTarget) -> bool {
+    if target.state != TransportFanoutAttemptState::PolicyProhibited {
+        return false;
+    }
+    target.state = TransportFanoutAttemptState::Unattempted;
+    target.attempt_count = 0;
+    target.last_attempt_at = None;
+    target.failure_code = None;
+    true
+}
+
 fn merge_republish_publication_targets(
     targets: &mut Vec<TransportFanoutTarget>,
     current_endpoints: &[TransportEndpoint],
-) {
+) -> bool {
+    let mut changed = false;
     for endpoint in current_endpoints {
         if let Some(target) = targets
             .iter_mut()
             .find(|target| target.endpoint == *endpoint)
         {
-            if target.state == TransportFanoutAttemptState::PolicyProhibited {
-                target.state = TransportFanoutAttemptState::Unattempted;
-                target.attempt_count = 0;
-                target.last_attempt_at = None;
-                target.failure_code = None;
-            }
+            changed |= reauthorize_fanout_target(target);
             continue;
         }
         targets.push(TransportFanoutTarget {
@@ -8511,6 +8591,7 @@ fn merge_republish_publication_targets(
             last_attempt_at: None,
             failure_code: None,
         });
+        changed = true;
     }
     for target in targets.iter_mut() {
         if current_endpoints.contains(&target.endpoint) {
@@ -8521,7 +8602,50 @@ fn merge_republish_publication_targets(
         }
         target.state = TransportFanoutAttemptState::PolicyProhibited;
         target.failure_code = Some("endpoint_removed_from_policy".into());
+        changed = true;
     }
+    changed
+}
+
+fn active_pending_endpoints(
+    targets: &[TransportFanoutTarget],
+) -> AccountResult<Vec<TransportEndpoint>> {
+    let endpoints: Vec<_> = targets
+        .iter()
+        .filter(|target| target.state != TransportFanoutAttemptState::PolicyProhibited)
+        .map(|target| target.endpoint.clone())
+        .collect();
+    if endpoints.is_empty() {
+        return Err(crate::key_package::KeyPackagePublishError::unexposed(
+            "no KeyPackage publication endpoints are configured",
+        )
+        .into());
+    }
+    Ok(endpoints)
+}
+
+fn has_newly_authorized_pending_target(
+    targets: &[TransportFanoutTarget],
+    current_endpoints: &[TransportEndpoint],
+) -> bool {
+    current_endpoints.iter().any(|endpoint| {
+        targets
+            .iter()
+            .find(|target| target.endpoint == *endpoint)
+            .is_none_or(|target| target.state == TransportFanoutAttemptState::PolicyProhibited)
+    })
+}
+
+fn pending_targets_need_publish(
+    targets: &[TransportFanoutTarget],
+    current_endpoints: &[TransportEndpoint],
+    now: Timestamp,
+) -> bool {
+    has_newly_authorized_pending_target(targets, current_endpoints)
+        || targets.iter().any(|target| {
+            current_endpoints.contains(&target.endpoint)
+                && key_package_target_retry_due(target, now)
+        })
 }
 
 fn note_key_package_attempt(

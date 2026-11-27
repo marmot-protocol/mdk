@@ -4,8 +4,9 @@ on:
   push:
     tags:
       - marmotkit-v*
-      # Nightly tags are created by nightly-releases.yml, which calls this workflow itself.
+      # RC and legacy nightly tags are created by rc-releases.yml, which calls this workflow itself.
       - "!marmotkit-v*-nightly.*"
+      - "!marmotkit-v*-rc.*"
   workflow_dispatch:
     inputs:
       source_sha:
@@ -20,7 +21,7 @@ on:
   workflow_call:
     inputs:
       source_sha:
-        description: Full 40-character source SHA on master
+        description: Full 40-character source SHA on master (or verified metadata-only release commit)
         required: true
         type: string
       build_only:
@@ -28,8 +29,8 @@ on:
         required: false
         default: false
         type: boolean
-      nightly_version:
-        description: Nightly version X.Y.Z-nightly.YYYYMMDD[.N]; stages a draft for nightly-releases.yml to publish
+      release_version:
+        description: SemVer RC (X.Y.Z-rc.N) or promoted Stable (X.Y.Z); stages a draft for rc-releases.yml or promote-release.yml to publish
         required: true
         type: string
 
@@ -37,9 +38,9 @@ permissions:
   contents: read
 
 concurrency:
-  # Nightlies get their own group: sharing a snapshot's group for the same SHA
-  # would deadlock against that snapshot's wait for the building nightly.
-  group: marmotkit-bindings-${{ inputs.nightly_version || inputs.source_sha || github.ref }}-${{ inputs.build_only && github.sha || 'publish' }}
+  # RCs and promotions get their own group: sharing a snapshot's group for the
+  # same SHA would deadlock against that snapshot's wait for the building RC.
+  group: marmotkit-bindings-${{ inputs.release_version || inputs.source_sha || github.ref }}-${{ inputs.build_only && github.sha || 'publish' }}
   cancel-in-progress: false
 
 env:
@@ -53,11 +54,11 @@ env:
 
 jobs:
   release-lane:
-    name: Wait for a building nightly
-    # A nightly yields to releases and snapshots before it builds; once it is
+    name: Wait for a building RC
+    # An RC yields to releases and snapshots before it builds; once it is
     # building, releases and snapshots wait for it to leave the macOS runners.
     # The job always runs, because a skipped ancestor would skip every build
-    # job below; nightly and build-only runs skip only its steps.
+    # job below; RC, promotion, and build-only runs skip only its steps.
     runs-on: ubuntu-latest
     timeout-minutes: 200
     permissions:
@@ -66,17 +67,17 @@ jobs:
 
     steps:
       - name: Check out workflow scripts
-        if: ${{ !inputs.nightly_version && !inputs.build_only }}
+        if: ${{ !inputs.release_version && !inputs.build_only }}
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
 
-      - name: Wait for a building nightly to finish
-        if: ${{ !inputs.nightly_version && !inputs.build_only }}
+      - name: Wait for a building RC to finish
+        if: ${{ !inputs.release_version && !inputs.build_only }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 scripts/nightly_release.py wait-lane --nightly --timeout-minutes 180 --fail-on-timeout
+        run: python3 scripts/rc_release.py wait-lane --rc --timeout-minutes 180 --fail-on-timeout
 
   metadata:
     name: Resolve immutable release identity
@@ -92,7 +93,8 @@ jobs:
       macos_binary_name: ${{ steps.identity.outputs.macos_binary_name }}
       swift_name: ${{ steps.identity.outputs.swift_name }}
       is_snapshot: ${{ steps.identity.outputs.is_snapshot }}
-      is_nightly: ${{ steps.identity.outputs.is_nightly }}
+      is_rc: ${{ steps.identity.outputs.is_rc }}
+      is_staged: ${{ steps.identity.outputs.is_staged }}
 
     steps:
       - name: Check out requested source
@@ -102,6 +104,14 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.source_sha || github.sha }}
 
+      - name: Check out workflow verification scripts
+        if: ${{ !!inputs.release_version }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: builder
+
       - name: Resolve release identity
         id: identity
         shell: bash
@@ -109,42 +119,52 @@ jobs:
           REQUESTED_SHA: ${{ inputs.source_sha }}
           BUILDER_SHA: ${{ github.sha }}
           BUILD_ONLY: ${{ inputs.build_only }}
-          NIGHTLY_VERSION: ${{ inputs.nightly_version }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse 'HEAD^{commit}')"
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          is_nightly=false
-          NIGHTLY_VERSION="${NIGHTLY_VERSION:-}"
+          is_rc=false
+          is_staged=false
+          RELEASE_VERSION="${RELEASE_VERSION:-}"
 
-          # Called by nightly-releases.yml: the caller's event is schedule or
-          # workflow_dispatch, so check the nightly input before the event.
-          if [[ -n "$NIGHTLY_VERSION" ]]; then
+          # Called by rc-releases.yml or promote-release.yml: the caller's event
+          # is schedule or workflow_dispatch, so check release_version first.
+          if [[ -n "$RELEASE_VERSION" ]]; then
             if [[ "$BUILD_ONLY" != true && "$GITHUB_REF" != "refs/heads/master" ]]; then
-              echo "error: nightly publishing must run with the workflow from refs/heads/master" >&2
-              exit 1
-            fi
-            if [[ ! "$NIGHTLY_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-nightly\.[0-9]{8}(\.[1-9][0-9]{0,2})?$ ]]; then
-              echo "error: nightly version must look like 0.14.0-nightly.20261020" >&2
-              exit 1
-            fi
-            if [[ "${BASH_REMATCH[1]}-dev" != "$workspace_version" ]]; then
-              echo "error: nightly $NIGHTLY_VERSION does not match source workspace version $workspace_version" >&2
+              echo "error: RC/promoted publishing must run with the workflow from refs/heads/master" >&2
               exit 1
             fi
             if [[ ! "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ || "$source_sha" != "$REQUESTED_SHA" ]]; then
-              echo "error: nightly source must be the requested full SHA, got $source_sha" >&2
+              echo "error: release source must be the requested full SHA, got $source_sha" >&2
               exit 1
             fi
             git fetch --no-tags origin master
-            if ! git merge-base --is-ancestor "$source_sha" origin/master; then
-              echo "error: nightly SHA must be a commit reachable from origin/master" >&2
-              exit 1
+            version_kind="$(python3 "${BUILDER_DIR:-builder}/scripts/rc_release.py" check-version \
+              --release-version "$RELEASE_VERSION" \
+              --workspace-version "$workspace_version")"
+            if [[ "$version_kind" == "rc" ]]; then
+              if ! git merge-base --is-ancestor "$source_sha" origin/master; then
+                echo "error: RC SHA must be a commit reachable from origin/master" >&2
+                exit 1
+              fi
+              is_rc=true
+            else
+              if ! git merge-base --is-ancestor "$source_sha" origin/master; then
+                parent_sha="$(git rev-parse "${source_sha}^1")"
+                if ! git merge-base --is-ancestor "$parent_sha" origin/master; then
+                  echo "error: promoted release commit parent $parent_sha is not reachable from origin/master" >&2
+                  exit 1
+                fi
+                python3 "${BUILDER_DIR:-builder}/scripts/promote_release.py" verify-metadata-diff \
+                  --root . --base "$parent_sha" --head "$source_sha"
+              fi
+              is_rc=false
             fi
-            release_id="$NIGHTLY_VERSION"
-            release_tag="marmotkit-v$NIGHTLY_VERSION"
+            release_id="$RELEASE_VERSION"
+            release_tag="marmotkit-v$RELEASE_VERSION"
             is_snapshot=false
-            is_nightly=true
+            is_staged=true
           elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             if [[ "$BUILD_ONLY" != true && "$GITHUB_REF" != "refs/heads/master" ]]; then
               echo "error: snapshot publishing must run with the workflow from refs/heads/master" >&2
@@ -191,7 +211,8 @@ jobs:
             echo "macos_binary_name=MarmotKitFFI-macos-$release_id.xcframework.zip"
             echo "swift_name=MarmotKit-$release_id.swift"
             echo "is_snapshot=$is_snapshot"
-            echo "is_nightly=$is_nightly"
+            echo "is_rc=$is_rc"
+            echo "is_staged=$is_staged"
           } >> "$GITHUB_OUTPUT"
 
       - name: Stage UniFFI API reference
@@ -997,7 +1018,8 @@ jobs:
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
           BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
           IS_SNAPSHOT: ${{ needs.metadata.outputs.is_snapshot }}
-          IS_NIGHTLY: ${{ needs.metadata.outputs.is_nightly }}
+          IS_RC: ${{ needs.metadata.outputs.is_rc }}
+          IS_STAGED: ${{ needs.metadata.outputs.is_staged }}
           BINARY_NAME: ${{ needs.metadata.outputs.binary_name }}
           MACOS_BINARY_NAME: ${{ needs.metadata.outputs.macos_binary_name }}
           SWIFT_NAME: ${{ needs.metadata.outputs.swift_name }}
@@ -1042,14 +1064,14 @@ jobs:
           These checks validate local archives, not App Store export or upload. The Rust debug policy is unchanged.
           Assets on this release are immutable.
           EOF
-          if [[ "$IS_NIGHTLY" == "true" ]]; then
+          if [[ "$IS_RC" == "true" ]]; then
             {
-              echo "Nightly build for testing only. Pin a formal \`marmotkit-v<version>\` release for anything you ship."
-              echo "Nightlies are deleted after 30 days, and going back to an older nightly is not supported."
+              echo "SemVer Release Candidate for staging and integration testing. Pin a formal \`marmotkit-v<version>\` release for production."
+              echo "Verified from \`origin/canary\` after Canary, simulator-nightly, and convergence-hardening passed."
               echo
               cat "$notes"
-            } > "$notes.nightly"
-            mv "$notes.nightly" "$notes"
+            } > "$notes.rc"
+            mv "$notes.rc" "$notes"
           fi
 
           if release_state="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
@@ -1062,16 +1084,19 @@ jobs:
             fi
           fi
 
-          if [[ "$IS_SNAPSHOT" == "true" || "$IS_NIGHTLY" == "true" ]] && \
+          if [[ "$IS_SNAPSHOT" == "true" || "$IS_STAGED" == "true" ]] && \
              git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$tag" >/dev/null 2>&1; then
-            echo "error: immutable snapshot or nightly tag $tag already exists; refusing to move it" >&2
+            echo "error: immutable snapshot, RC, or promoted tag $tag already exists; refusing to move it" >&2
             exit 1
           fi
 
           assets=(dist/ios/* dist/macos/* dist/android/* dist/docs/API-REFERENCE.md)
-          if [[ "$IS_NIGHTLY" == "true" ]]; then
+          if [[ "$IS_RC" == "true" ]]; then
             title="v$version - MarmotKit"
             release_flags=(--prerelease --latest=false --target "$SOURCE_SHA")
+          elif [[ "$IS_STAGED" == "true" ]]; then
+            title="v$version - MarmotKit"
+            release_flags=(--latest=false --target "$SOURCE_SHA")
           elif [[ "$IS_SNAPSHOT" == "false" ]]; then
             title="v$version - MarmotKit"
             release_flags=(--latest=false)
@@ -1110,9 +1135,9 @@ jobs:
             }
           done
 
-          if [[ "$IS_NIGHTLY" == "true" ]]; then
-            # nightly-releases.yml publishes all three tracks together once each draft is verified.
-            echo "Staged verified draft $tag for the nightly publish job"
+          if [[ "$IS_STAGED" == "true" ]]; then
+            # rc-releases.yml / promote-release.yml publishes all tracks together once every draft is verified.
+            echo "Staged verified draft $tag for atomic publish"
             exit 0
           fi
 
@@ -1133,8 +1158,8 @@ jobs:
 
   validate-published-ios:
     name: Validate published iOS SwiftPM consumer
-    # Nightlies are still drafts here; their bytes passed the local consumer checks above.
-    if: success() && needs.metadata.outputs.is_nightly != 'true'
+    # Staged RC and promoted drafts are published by their caller; bytes already passed local checks.
+    if: success() && needs.metadata.outputs.is_staged != 'true'
     runs-on: macos-latest
     needs:
       - metadata
@@ -1180,7 +1205,7 @@ jobs:
 
   validate-published-macos:
     name: Validate published macOS SwiftPM consumer
-    if: success() && needs.metadata.outputs.is_nightly != 'true'
+    if: success() && needs.metadata.outputs.is_staged != 'true'
     runs-on: macos-latest
     needs:
       - metadata

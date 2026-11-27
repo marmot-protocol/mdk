@@ -20,9 +20,7 @@ use marmot_account::{
     Nip46Removal, NostrAccountImport,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{
-    Mutex, Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch,
-};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, broadcast, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
@@ -163,6 +161,7 @@ pub(crate) use account_worker::{TestWorkerReceiver, test_worker_channel};
 pub(crate) use audit_tracker::{
     AuditLogTrackerUploader, post_audit_log_tracker_update_for_runtime,
 };
+pub(crate) use onboarding::onboarding_defers_key_package_maintenance;
 
 // Surface the split-out `pub(crate)` items the test modules reach for: the
 // crate-root `src/tests.rs` via `crate::runtime::Item`, and `runtime/tests.rs`
@@ -305,6 +304,121 @@ impl Drop for AccountTeardownGuard<'_> {
     fn drop(&mut self) {
         self.manager
             .set_account_tearing_down(&self.account_id, false);
+    }
+}
+
+/// Canonical per-account teardown fence acquisition helper shared by
+/// `remove_account`, `remove_account_fenced`, `reset_incomplete_account_setup`,
+/// and `deactivate_account_marking` (mdk#3801).
+///
+/// Every teardown acquires fences in the same order before taking
+/// `AccountManager::worker_transactions`:
+/// 1. Generated-setup fence (`fence_generated_teardown` for removals/resets, or
+///    the re-entrant `fence_generated_setup` for deactivations whose caller may
+///    already hold `onboarding_transaction`).
+/// 2. Moderation-report fence (`fence_moderation_reports`, or
+///    `close_moderation_report_admission` for `reset_incomplete_account_setup`).
+/// 3. Generated-removal preparation fence (`fence_generated_removal`, for
+///    destructive removals/resets).
+struct AccountLifecycleFences<'a> {
+    _generated_teardown: Option<onboarding::GeneratedTeardownFence>,
+    _generated_setup: Option<onboarding::GeneratedSetupFence>,
+    _moderation_reports: Option<crate::moderation_reports::ModerationReportFence>,
+    _generated_removal: Option<tokio::sync::MutexGuard<'a, ()>>,
+}
+
+impl<'a> AccountLifecycleFences<'a> {
+    async fn acquire_for_deactivation(
+        manager: &'a AccountManager,
+        account_ref: &str,
+    ) -> Result<(Self, Result<(), AppError>), AppError> {
+        let generated_setup = manager.fence_generated_setup(account_ref).await?;
+        let (moderation_reports, report_purge) =
+            manager.fence_moderation_reports(account_ref).await;
+        Ok((
+            Self {
+                _generated_teardown: None,
+                _generated_setup: generated_setup,
+                _moderation_reports: moderation_reports,
+                _generated_removal: None,
+            },
+            report_purge,
+        ))
+    }
+
+    async fn acquire_for_removal(
+        manager: &'a AccountManager,
+        expected: &AccountSummary,
+    ) -> Result<Self, AppError> {
+        let generated_teardown = manager
+            .setup
+            .fence_generated_teardown(manager, &expected.account_id_hex)
+            .await;
+        // A label may have been reused while foreground setup finished.
+        // Check before purging reports and again after taking worker_transactions.
+        manager.resolve_original(expected)?;
+        let (moderation_reports, _) = manager.fence_moderation_reports(&expected.label).await;
+        let generated_removal = manager
+            .setup
+            .fence_generated_removal(&generated_teardown)
+            .await;
+        Ok(Self {
+            _generated_teardown: Some(generated_teardown),
+            _generated_setup: None,
+            _moderation_reports: moderation_reports,
+            _generated_removal: Some(generated_removal),
+        })
+    }
+
+    async fn acquire_for_reset(
+        manager: &'a AccountManager,
+        expected: &AccountSummary,
+    ) -> Result<Self, AppError> {
+        let generated_teardown = manager
+            .setup
+            .fence_generated_teardown(manager, &expected.account_id_hex)
+            .await;
+        // A label may have been reused while foreground setup finished.
+        // Check before fencing reports and again after taking worker_transactions.
+        manager.resolve_original(expected)?;
+        // Close report admission and drain in-flight work without purging rows
+        // yet, so a reset rejected by precondition re-checks leaves reports
+        // untouched; a committed reset deletes the account directory anyway.
+        let moderation_reports = manager
+            .close_moderation_report_admission(&expected.label)
+            .await;
+        let generated_removal = manager
+            .setup
+            .fence_generated_removal(&generated_teardown)
+            .await;
+        Ok(Self {
+            _generated_teardown: Some(generated_teardown),
+            _generated_setup: None,
+            _moderation_reports: moderation_reports,
+            _generated_removal: Some(generated_removal),
+        })
+    }
+
+    async fn acquire_for_removal_with_teardown(
+        manager: &'a AccountManager,
+        expected: &AccountSummary,
+        teardown: &onboarding::GeneratedTeardownFence,
+    ) -> Result<Self, AppError> {
+        // A label may have been reused while foreground setup finished.
+        // Check before purging reports and again after taking worker_transactions.
+        manager.resolve_original(expected)?;
+        // Stop and delete the account's moderation reports, and admit none
+        // until the removal below has committed (every removal entry point).
+        // Fenced before the global lock: the purge may open account storage.
+        // Removing the directory deletes the rows even if this purge fails.
+        let (moderation_reports, _) = manager.fence_moderation_reports(&expected.label).await;
+        let generated_removal = manager.setup.fence_generated_removal(teardown).await;
+        Ok(Self {
+            _generated_teardown: None,
+            _generated_setup: None,
+            _moderation_reports: moderation_reports,
+            _generated_removal: Some(generated_removal),
+        })
     }
 }
 
@@ -840,11 +954,13 @@ struct RuntimeLifecycleInner {
     /// from here (mdk#3466 L3).
     shutdown_began: std::sync::OnceLock<tokio::time::Instant>,
     active_account_opens: AtomicUsize,
+    active_account_opens_by_id: StdMutex<HashMap<String, usize>>,
     account_opens_drained: Notify,
 }
 
 pub(crate) struct RuntimeAccountOpenPermit {
     lifecycle: RuntimeLifecycle,
+    account_id_hex: String,
     started_at: Instant,
 }
 
@@ -858,6 +974,7 @@ impl RuntimeLifecycle {
                 stop_tx,
                 shutdown_began: std::sync::OnceLock::new(),
                 active_account_opens: AtomicUsize::new(0),
+                active_account_opens_by_id: StdMutex::new(HashMap::new()),
                 account_opens_drained: Notify::new(),
             }),
         }
@@ -912,19 +1029,57 @@ impl RuntimeLifecycle {
         self.inner.stop_tx.subscribe()
     }
 
-    pub(crate) fn begin_account_open(&self) -> Result<RuntimeAccountOpenPermit, AppError> {
+    pub(crate) fn begin_account_open(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<RuntimeAccountOpenPermit, AppError> {
         self.ensure_running()?;
+        {
+            let mut by_id = self
+                .inner
+                .active_account_opens_by_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *by_id.entry(account_id_hex.to_owned()).or_insert(0) += 1;
+        }
         self.inner
             .active_account_opens
             .fetch_add(1, Ordering::AcqRel);
         if self.is_stopping() {
-            self.finish_account_open(Instant::now());
+            self.finish_account_open(account_id_hex, Instant::now());
             return Err(AppError::RuntimeStopping);
         }
         Ok(RuntimeAccountOpenPermit {
             lifecycle: self.clone(),
+            account_id_hex: account_id_hex.to_owned(),
             started_at: Instant::now(),
         })
+    }
+
+    pub(crate) async fn wait_for_account_opens_for_account_to_drain(
+        &self,
+        account_id_hex: &str,
+        wait: Duration,
+    ) -> bool {
+        if self.active_account_opens_for_account(account_id_hex) == 0 {
+            return true;
+        }
+        if wait.is_zero() {
+            return false;
+        }
+        timeout(wait, async {
+            loop {
+                let notified = self.inner.account_opens_drained.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.active_account_opens_for_account(account_id_hex) == 0 {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
     }
 
     pub(crate) async fn wait_for_account_opens_to_drain(&self, wait: Duration) -> bool {
@@ -982,13 +1137,41 @@ impl RuntimeLifecycle {
         self.inner.active_account_opens.load(Ordering::Acquire)
     }
 
-    fn finish_account_open(&self, started_at: Instant) {
+    fn active_account_opens_for_account(&self, account_id_hex: &str) -> usize {
+        self.inner
+            .active_account_opens_by_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(account_id_hex)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn finish_account_open(&self, account_id_hex: &str, started_at: Instant) {
+        let account_remaining = {
+            let mut by_id = self
+                .inner
+                .active_account_opens_by_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let remaining = by_id
+                .get_mut(account_id_hex)
+                .map(|count| {
+                    *count = count.saturating_sub(1);
+                    *count
+                })
+                .unwrap_or(0);
+            if remaining == 0 {
+                by_id.remove(account_id_hex);
+            }
+            remaining
+        };
         let previous = self
             .inner
             .active_account_opens
             .fetch_sub(1, Ordering::AcqRel);
         let remaining = previous.saturating_sub(1);
-        if remaining == 0 {
+        if remaining == 0 || account_remaining == 0 {
             self.inner.account_opens_drained.notify_waiters();
         }
         tracing::debug!(
@@ -1003,7 +1186,8 @@ impl RuntimeLifecycle {
 
 impl Drop for RuntimeAccountOpenPermit {
     fn drop(&mut self) {
-        self.lifecycle.finish_account_open(self.started_at);
+        self.lifecycle
+            .finish_account_open(&self.account_id_hex, self.started_at);
     }
 }
 
@@ -1626,10 +1810,13 @@ pub enum MarmotAppEvent {
     },
     /// The account's relay health changed: re-read
     /// [`MarmotAppRuntime::account_relay_health`]. Fires when its answer,
-    /// apart from each row's liveness, differs from the one last announced,
-    /// which only a change to the account's held relay lists causes, and once
-    /// each time the account's worker starts. A relay connecting or
-    /// disconnecting never fires it; `subscribe_relay_liveness` reports those.
+    /// apart from each row's liveness, `checked_at_unix` and `checking`,
+    /// differs from the one last announced, which a change to the account's
+    /// held relay lists or a state an inbox check established causes, and
+    /// once each time the account's worker starts. It follows the relay lists
+    /// and check results, not connects and disconnects: connection changes
+    /// come from `subscribe_relay_liveness`. A check that confirms every
+    /// state, or starts, fires nothing; the check commands return the answer.
     /// Only a running account worker sends it: a list that changes while
     /// none runs (an external-signer account whose signer is not registered,
     /// say) announces nothing, so read the query when the account starts and
@@ -7026,6 +7213,11 @@ impl MarmotAppRuntime {
     pub fn storage_is_closed(&self) -> bool {
         self.accounts.app.storage_is_closed()
     }
+
+    #[cfg(test)]
+    pub(crate) fn generated_setup_fenced_for_test(&self, account_id: &str) -> bool {
+        self.setup.generated_setup_fenced_for_test(account_id)
+    }
 }
 
 /// Aggregate result of one [`MarmotAppRuntime::catch_up_accounts_reporting`]
@@ -7371,6 +7563,27 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Wait until every blocking `runtime_local_client` open for `account_id`
+    /// has finished and dropped any uncollected `OpenedAccount` before
+    /// teardown evicts caches or removes on-disk state (mdk#3801).
+    async fn ensure_account_opens_drained(&self, account_id: &str) -> Result<(), AppError> {
+        if self
+            .shared
+            .lifecycle()
+            .wait_for_account_opens_for_account_to_drain(
+                account_id,
+                APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
+            )
+            .await
+        {
+            Ok(())
+        } else {
+            Err(AppError::BlockingTask(
+                "account open still in progress".into(),
+            ))
+        }
+    }
+
     async fn finish_worker_reapers_unbounded(&self) {
         loop {
             let reaper = self
@@ -7470,11 +7683,8 @@ impl AccountManager {
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
         let account = self.app.account_home().account(account_ref)?;
         self.finish_nip46_account(&account).await;
-        let fence = self
-            .setup
-            .fence_generated_teardown(self, &account.account_id_hex)
-            .await;
-        self.remove_account_fenced(&account, &fence).await
+        let fences = AccountLifecycleFences::acquire_for_removal(self, &account).await?;
+        self.remove_account_with_fences(&account, fences).await
     }
 
     // Wipe already owns the account's foreground fence before its network
@@ -7484,15 +7694,17 @@ impl AccountManager {
         expected: &AccountSummary,
         fence: &onboarding::GeneratedTeardownFence,
     ) -> Result<(), AppError> {
-        // A label may have been reused while foreground setup finished.
-        // Check before purging reports and after taking the worker transaction.
-        self.resolve_original(expected)?;
-        // Stop and delete the account's moderation reports, and admit none
-        // until the removal below has committed (every removal entry point).
-        // Fenced before the global lock: the purge may open account storage.
-        // Removing the directory deletes the rows even if this purge fails.
-        let (_report_fence, _) = self.fence_moderation_reports(&expected.label).await;
-        let _preparation = self.setup.fence_generated_removal(fence).await;
+        let fences =
+            AccountLifecycleFences::acquire_for_removal_with_teardown(self, expected, fence)
+                .await?;
+        self.remove_account_with_fences(expected, fences).await
+    }
+
+    async fn remove_account_with_fences(
+        &self,
+        expected: &AccountSummary,
+        _fences: AccountLifecycleFences<'_>,
+    ) -> Result<(), AppError> {
         let lock_wait = self
             .shared
             .observer
@@ -7524,6 +7736,8 @@ impl AccountManager {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
+            self.ensure_account_opens_drained(&account.account_id_hex)
+                .await?;
             // Evict every in-memory handle and warm flag for this label BEFORE
             // the account directory is deleted. Otherwise the cached account
             // storage connection (and directory cache) keeps pointing at the
@@ -7580,32 +7794,15 @@ impl AccountManager {
         .await
     }
 
-    /// Explicit recovery for an account created before durable setup journals.
-    ///
-    /// This is intentionally not automatic: without a lifecycle/legacy slot,
-    /// local files cannot prove that an old KeyPackage was never exposed. The
-    /// caller must present the matching nsec and explicitly acknowledge that
-    /// resetting can orphan such an unknown publication. The credential is
-    /// retained so the next `create_or_import_account` reuses it rather than
-    /// creating a duplicate keychain entry.
-    pub async fn reset_incomplete_account_setup(
+    /// Pure metadata/keychain preflight that never opens `account_storage`, so
+    /// a concurrent `remove_account` that already evicted caches cannot have
+    /// its stale database connection repopulated before the directory rename
+    /// (mdk#3801).
+    fn validate_incomplete_account_setup_reset_preflight(
         &self,
-        nsec: &str,
-        acknowledge_possible_key_package_orphan: bool,
+        account_id: &str,
+        account: &AccountSummary,
     ) -> Result<(), AppError> {
-        let lock_wait = self
-            .shared
-            .observer
-            .performance()
-            .observe(RuntimeOp::LifecycleLockWait);
-        let _worker_transaction = self.worker_transactions.lock().await;
-        lock_wait.finish(TelemetryOutcome::Success);
-        self.shared.lifecycle().ensure_running()?;
-        if !acknowledge_possible_key_package_orphan {
-            return Err(AppError::AccountSetupRecoveryRequired);
-        }
-        let account_id = AccountHome::account_id_for_secret(nsec)?;
-        let account = self.app.account_home().account(&account_id)?;
         if !account.local_signing
             || self
                 .app
@@ -7631,13 +7828,63 @@ impl AccountManager {
         {
             return Err(AppError::AccountSetupResetNotApplicable);
         }
+        if self.app.key_package_record_path(&account.label).exists() {
+            return Err(AppError::AccountSetupKeyPackageRecoveryAvailable);
+        }
+        Ok(())
+    }
+
+    /// Storage-backed reset validation, called strictly under
+    /// `AccountLifecycleFences` and `worker_transactions` (mdk#3801).
+    fn validate_incomplete_account_setup_reset_storage(
+        &self,
+        account: &AccountSummary,
+    ) -> Result<(), AppError> {
         let storage = self.app.account_storage(&account.label)?;
         if storage.key_package_lifecycle()?.is_some()
             || !storage.stored_key_package_bundles()?.is_empty()
-            || self.app.key_package_record_path(&account.label).exists()
         {
             return Err(AppError::AccountSetupKeyPackageRecoveryAvailable);
         }
+        Ok(())
+    }
+
+    /// Explicit recovery for an account created before durable setup journals.
+    ///
+    /// This is intentionally not automatic: without a lifecycle/legacy slot,
+    /// local files cannot prove that an old KeyPackage was never exposed. The
+    /// caller must present the matching nsec and explicitly acknowledge that
+    /// resetting can orphan such an unknown publication. The credential is
+    /// retained so the next `create_or_import_account` reuses it rather than
+    /// creating a duplicate keychain entry.
+    pub async fn reset_incomplete_account_setup(
+        &self,
+        nsec: &str,
+        acknowledge_possible_key_package_orphan: bool,
+    ) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        if !acknowledge_possible_key_package_orphan {
+            return Err(AppError::AccountSetupRecoveryRequired);
+        }
+        let account_id = AccountHome::account_id_for_secret(nsec)?;
+        let expected = self.app.account_home().account(&account_id)?;
+        // Validate read-only non-DB preconditions before fencing generated
+        // setup or report admission so rejected calls never disturb a live
+        // account and never repopulate evicted storage caches.
+        self.validate_incomplete_account_setup_reset_preflight(&account_id, &expected)?;
+        self.finish_nip46_account(&expected).await;
+        let _fences = AccountLifecycleFences::acquire_for_reset(self, &expected).await?;
+        let lock_wait = self
+            .shared
+            .observer
+            .performance()
+            .observe(RuntimeOp::LifecycleLockWait);
+        let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve_original(&expected)?;
+        self.validate_incomplete_account_setup_reset_preflight(&account_id, &account)?;
+        self.validate_incomplete_account_setup_reset_storage(&account)?;
 
         self.ensure_worker_reaped(&account.account_id_hex).await?;
 
@@ -7647,6 +7894,8 @@ impl AccountManager {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
+            self.ensure_account_opens_drained(&account.account_id_hex)
+                .await?;
             {
                 let gate = self.shared.local_submission_gate(&account.account_id_hex);
                 let _admission = gate.lock().await;
@@ -7709,6 +7958,20 @@ impl AccountManager {
         (Some(fence), purged.map(|_| ()))
     }
 
+    async fn close_moderation_report_admission(
+        &self,
+        account_ref: &str,
+    ) -> Option<crate::moderation_reports::ModerationReportFence> {
+        let Ok(account) = self.app.account_home().account(account_ref) else {
+            return None;
+        };
+        Some(
+            self.app
+                .close_moderation_report_admission(&account.label)
+                .await,
+        )
+    }
+
     /// Stop `account_ref`'s generated setup for a teardown, before the
     /// worker transaction: no background attempt is in flight once this
     /// returns, and none starts while the fence is held. Only an account
@@ -7744,13 +8007,13 @@ impl AccountManager {
     ) -> Result<(), AppError> {
         let account = self.resolve(account_ref)?;
         self.finish_nip46_account(&account).await;
-        // Queued moderation reports never outlive a sign-out: stop and delete
-        // them, and admit none until the sign-out below has committed. Fenced
-        // before the global lock: the purge may open account storage. A failed
-        // purge does not stop the sign-out, but it is reported: reports left on
-        // disk would be retried at the next sign-in.
-        let (_report_fence, report_purge) = self.fence_moderation_reports(account_ref).await;
-        let _generated_setup_fence = self.fence_generated_setup(account_ref).await?;
+        // Acquire teardown fences in the same canonical order as removal
+        // (generated setup before moderation reports, both before
+        // `worker_transactions`). A failed report purge does not stop the
+        // sign-out, but it is reported: reports left on disk would be retried
+        // at the next sign-in.
+        let (_fences, report_purge) =
+            AccountLifecycleFences::acquire_for_deactivation(self, account_ref).await?;
         let lock_wait = self
             .shared
             .observer
@@ -7768,8 +8031,12 @@ impl AccountManager {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
+            self.ensure_account_opens_drained(&account.account_id_hex)
+                .await?;
             let home = self.app.account_home();
             if unlinked {
+                self.app
+                    .stop_unlinked_account_publishing(&account.account_id_hex);
                 home.mark_account_unlinked(&account.label)?;
             } else {
                 home.set_account_signed_out(&account.label, true)?;
@@ -8155,11 +8422,13 @@ impl AccountManager {
                         self.app.account_open_progress(&account.label),
                     );
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-                    let (command_tx, command_rx) = mpsc::channel(8);
                     let unit = Arc::new(WorkerUnitGauge::recording(
                         self.shared.observer.performance().clone(),
                     ));
+                    let (commands, command_rx) = WorkerCommands::host_channel(8, unit.clone());
+                    let tasks = account_worker::WorkerTaskScope::new();
                     let (read_state_tx, read_state) = read_state_channel();
+                    let (relay_checks_tx, relay_checks) = watch::channel(Default::default());
                     let (unlinked_tx, unlinked_rx) = oneshot::channel();
                     self.deactivate_when_unlinked(
                         account.account_id_hex.clone(),
@@ -8178,6 +8447,8 @@ impl AccountManager {
                             unlinked: unlinked_tx,
                             unit: unit.clone(),
                             read_state: read_state_tx,
+                            relay_checks: relay_checks_tx,
+                            tasks: tasks.clone(),
                         },
                         command_rx,
                         ready_tx,
@@ -8189,11 +8460,13 @@ impl AccountManager {
                         ManagedAccountWorker {
                             ready: false,
                             handle,
-                            commands: WorkerCommands::observed(command_tx, unit.clone()),
+                            commands,
                             media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
                             shutdown: shutdown_tx,
                             unit,
                             read_state,
+                            relay_checks,
+                            tasks,
                         },
                     );
                     ready_receivers.push((account_id, Instant::now(), ready_rx, startup_progress));

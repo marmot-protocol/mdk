@@ -125,6 +125,8 @@ impl Fixture {
                 shutdown,
                 unit: Default::default(),
                 read_state: Default::default(),
+                relay_checks: tokio::sync::watch::channel(Default::default()).1,
+                tasks: Default::default(),
             },
         );
         let f = Self {
@@ -1804,6 +1806,8 @@ async fn closing_window_cannot_abandon_reconcile_worker_teardown() {
             media_admission: Arc::new(Semaphore::new(1)),
             unit: Default::default(),
             read_state: Default::default(),
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
+            tasks: Default::default(),
         },
     );
     let mut sub = f

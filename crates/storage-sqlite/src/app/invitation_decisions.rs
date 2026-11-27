@@ -1,6 +1,6 @@
 //! Per-admission invitation decisions and work, independent of chat presentation.
 
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -47,7 +47,8 @@ impl SqliteAppStorage {
         chat: &str,
         generation: &[u8; 32],
     ) -> StorageResult<Option<InvitationDecision>> {
-        held(&*self.lock()?, chat, generation)
+        let chat = canonical_group_id_hex(chat);
+        held(&*self.lock()?, chat.as_ref(), generation)
     }
 
     /// A user's explicit change: value, broadcast and required Leave work commit together.
@@ -57,6 +58,8 @@ impl SqliteAppStorage {
         generation: [u8; 32],
         declined: bool,
     ) -> StorageResult<InvitationDecision> {
+        let chat = canonical_group_id_hex(chat);
+        let chat = chat.as_ref();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let prior = held(&conn, chat, &generation)?;
@@ -92,6 +95,8 @@ impl SqliteAppStorage {
         chat: &str,
         generation: [u8; 32],
     ) -> StorageResult<()> {
+        let chat = canonical_group_id_hex(chat);
+        let chat = chat.as_ref();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if held(&conn, chat, &generation)?.is_none() {
@@ -139,10 +144,11 @@ impl SqliteAppStorage {
         chat: &str,
         generation: &[u8; 32],
     ) -> StorageResult<Option<bool>> {
+        let chat = canonical_group_id_hex(chat);
         self.lock()?
             .query_row_cached(
                 "SELECT unsent FROM invitation_decisions WHERE group_id_hex = ?1 AND generation = ?2",
-                params![chat, generation.as_slice()],
+                params![chat.as_ref(), generation.as_slice()],
                 |row| row.get(0),
             )
             .optional()
@@ -166,7 +172,8 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for decision in decisions {
-                conn.execute_cached("UPDATE invitation_decisions SET unsent = 0 WHERE group_id_hex = ?1 AND generation = ?2 AND version = ?3 AND declined = ?4", params![decision.group_id_hex, decision.generation.as_slice(), decision.version as i64, decision.declined]).storage()?;
+                let group_id_hex = canonical_group_id_hex(&decision.group_id_hex);
+                conn.execute_cached("UPDATE invitation_decisions SET unsent = 0 WHERE group_id_hex = ?1 AND generation = ?2 AND version = ?3 AND declined = ?4", params![group_id_hex.as_ref(), decision.generation.as_slice(), decision.version as i64, decision.declined]).storage()?;
             }
             Ok(())
         })
@@ -192,7 +199,8 @@ impl SqliteAppStorage {
         &self,
         decision: &InvitationDecision,
     ) -> StorageResult<()> {
-        self.lock()?.execute_cached("UPDATE invitation_decisions SET apply_owed = 0 WHERE group_id_hex = ?1 AND generation = ?2 AND version = ?3 AND declined = ?4", params![decision.group_id_hex, decision.generation.as_slice(), decision.version as i64, decision.declined]).storage()?;
+        let group_id_hex = canonical_group_id_hex(&decision.group_id_hex);
+        self.lock()?.execute_cached("UPDATE invitation_decisions SET apply_owed = 0 WHERE group_id_hex = ?1 AND generation = ?2 AND version = ?3 AND declined = ?4", params![group_id_hex.as_ref(), decision.generation.as_slice(), decision.version as i64, decision.declined]).storage()?;
         Ok(())
     }
 
@@ -202,7 +210,8 @@ impl SqliteAppStorage {
         chat: &str,
         generation: &[u8; 32],
     ) -> StorageResult<()> {
-        self.lock()?.execute_cached("UPDATE invitation_decisions SET apply_owed = 1, decline_owed = declined WHERE group_id_hex = ?1 AND generation = ?2", params![chat, generation.as_slice()]).storage()?;
+        let chat = canonical_group_id_hex(chat);
+        self.lock()?.execute_cached("UPDATE invitation_decisions SET apply_owed = 1, decline_owed = declined WHERE group_id_hex = ?1 AND generation = ?2", params![chat.as_ref(), generation.as_slice()]).storage()?;
         Ok(())
     }
 
@@ -212,7 +221,8 @@ impl SqliteAppStorage {
         &self,
         decision: &InvitationDecision,
     ) -> StorageResult<()> {
-        self.lock()?.execute_cached("UPDATE invitation_decisions SET apply_owed = 0, decline_owed = 0 WHERE group_id_hex = ?1 AND generation = ?2 AND version = ?3 AND declined = ?4", params![decision.group_id_hex, decision.generation.as_slice(), decision.version as i64, decision.declined]).storage()?;
+        let group_id_hex = canonical_group_id_hex(&decision.group_id_hex);
+        self.lock()?.execute_cached("UPDATE invitation_decisions SET apply_owed = 0, decline_owed = 0 WHERE group_id_hex = ?1 AND generation = ?2 AND version = ?3 AND declined = ?4", params![group_id_hex.as_ref(), decision.generation.as_slice(), decision.version as i64, decision.declined]).storage()?;
         Ok(())
     }
 
@@ -222,7 +232,8 @@ impl SqliteAppStorage {
         chat: &str,
         generation: &[u8; 32],
     ) -> StorageResult<()> {
-        self.lock()?.execute_cached("UPDATE invitation_decisions SET decline_owed = 0 WHERE group_id_hex = ?1 AND generation = ?2", params![chat, generation.as_slice()]).storage()?;
+        let chat = canonical_group_id_hex(chat);
+        self.lock()?.execute_cached("UPDATE invitation_decisions SET decline_owed = 0 WHERE group_id_hex = ?1 AND generation = ?2", params![chat.as_ref(), generation.as_slice()]).storage()?;
         Ok(())
     }
 }

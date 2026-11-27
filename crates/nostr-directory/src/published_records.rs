@@ -1483,6 +1483,54 @@ pub(crate) fn watermark_allows(
     barrier_allows(event_id, created_at, barrier)
 }
 
+/// Whether the shared KeyPackage replacement/deletion journal allows a
+/// KeyPackage publication `(slot_id, event_id, created_at)` to remain current.
+///
+/// Unlike [`KeyPackageJournalFence::allows`] (which operates over a single
+/// network lookup's candidate set and treats watermarks as plain barriers),
+/// cached projections also enforce `ExactDeletion` watermarks and
+/// `global_eviction` against wall-clock freshness.
+pub(crate) fn evidence_allows_key_package(
+    evidence: &PublicKeyPackageEvidenceSnapshot,
+    slot_id: Option<&str>,
+    event_id: &str,
+    created_at: u64,
+    freshness: DirectoryFreshness,
+) -> bool {
+    let slot_id = slot_id.filter(|slot| !slot.is_empty());
+    let future_skew_secs = freshness.max_created_at.saturating_sub(freshness.now);
+    let replacement_ok = evidence
+        .replacements
+        .iter()
+        .filter(|replacement| slot_id == Some(replacement.key_package_id.as_str()))
+        .all(|replacement| replacement_allows(event_id, created_at, replacement));
+    let barriers_ok = evidence
+        .barriers
+        .iter()
+        .filter(|barrier| {
+            barrier.deleted_event_id.is_some() || slot_id == Some(barrier.key_package_id.as_str())
+        })
+        .all(|barrier| barrier_allows(event_id, created_at, barrier));
+    let watermark_ok = evidence.watermark.as_ref().is_none_or(|barrier| {
+        watermark_allows(
+            event_id,
+            created_at,
+            freshness.now,
+            future_skew_secs,
+            barrier,
+        )
+    }) && evidence.global_eviction.as_ref().is_none_or(|barrier| {
+        watermark_allows(
+            event_id,
+            created_at,
+            freshness.now,
+            future_skew_secs,
+            barrier,
+        )
+    });
+    replacement_ok && barriers_ok && watermark_ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

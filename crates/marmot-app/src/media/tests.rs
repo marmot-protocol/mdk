@@ -1133,6 +1133,151 @@ async fn blossom_upload_rejects_oversized_descriptor_before_buffering() {
     );
 }
 
+#[derive(Debug)]
+struct CountingNostrSigner {
+    calls: Arc<AtomicUsize>,
+}
+
+impl transport_nostr_peeler::MarmotNostrSigner for CountingNostrSigner {
+    fn get_public_key(
+        &self,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::PublicKey, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err("signer must not be invoked for unsafe URLs".into()) })
+    }
+
+    fn sign_event(
+        &self,
+        _unsigned: nostr::prelude::UnsignedEvent,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::Event, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err("signer must not be invoked for unsafe URLs".into()) })
+    }
+
+    fn nip04_encrypt<'a>(
+        &'a self,
+        _public_key: &'a nostr::prelude::PublicKey,
+        _content: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err("unused".into()) })
+    }
+
+    fn nip04_decrypt<'a>(
+        &'a self,
+        _public_key: &'a nostr::prelude::PublicKey,
+        _payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err("unused".into()) })
+    }
+
+    fn nip44_encrypt<'a>(
+        &'a self,
+        _public_key: &'a nostr::prelude::PublicKey,
+        _content: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err("unused".into()) })
+    }
+
+    fn nip44_decrypt<'a>(
+        &'a self,
+        _public_key: &'a nostr::prelude::PublicKey,
+        _payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err("unused".into()) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blossom_upload_and_delete_reject_unsafe_urls_without_invoking_signer() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let signer = CountingNostrSigner {
+        calls: calls.clone(),
+    };
+    let body = bytes::Bytes::from_static(b"encrypted bytes");
+    let hash = hex::encode(Sha256::digest(&body));
+
+    let literal_transport = BlossomHttpTransport::new(false);
+    for server in [
+        "http://127.0.0.1:8080",
+        "https://10.0.0.1",
+        "https://user:pass@blossom.example",
+    ] {
+        let upload_err =
+            upload_blossom_blob(server, body.clone(), &hash, &signer, &literal_transport)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(upload_err, AppError::UnsafeMediaFetch(_)),
+            "upload to {server} must fail with UnsafeMediaFetch, got {upload_err:?}"
+        );
+        let delete_err = delete_blossom_blob(server, &hash, &signer, &literal_transport)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(delete_err, AppError::UnsafeMediaFetch(_)),
+            "delete on {server} must fail with UnsafeMediaFetch, got {delete_err:?}"
+        );
+    }
+
+    let private_resolver: DnsResolver = Arc::new(|_host, port| {
+        Box::pin(async move { Ok(vec![std::net::SocketAddr::from(([10, 0, 0, 1], port))]) })
+    });
+    let dns_transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(5),
+        private_resolver,
+    );
+    let upload_err = upload_blossom_blob(
+        "https://private.example",
+        body,
+        &hash,
+        &signer,
+        &dns_transport,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(upload_err, AppError::UnsafeMediaFetch(_)),
+        "DNS-resolved private IP upload must fail with UnsafeMediaFetch, got {upload_err:?}"
+    );
+    let delete_err = delete_blossom_blob("https://private.example", &hash, &signer, &dns_transport)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(delete_err, AppError::UnsafeMediaFetch(_)),
+        "DNS-resolved private IP delete must fail with UnsafeMediaFetch, got {delete_err:?}"
+    );
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "unsafe Blossom endpoints must never invoke the signer"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_image_upload_rejects_non_raster_and_oversized_inputs_before_network() {
     let signer = signing_keys();

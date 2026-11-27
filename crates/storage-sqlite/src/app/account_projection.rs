@@ -1,4 +1,6 @@
-use crate::base::connection::{CachedSql, ConnectionGuard};
+use crate::base::connection::{
+    CachedSql, ConnectionGuard, canonical_group_id_hex, canonical_group_id_hex_opt,
+};
 use crate::{
     SQLITE_BIND_PARAMETER_CHUNK, SqliteAppStorage, SqliteResultExt,
     base::connection::retry_on_busy, bool_i64, i64_to_u64, i64_to_usize, u64_to_i64, unix_now_ms,
@@ -43,6 +45,32 @@ impl DeleteLocalGroupDataResult {
 struct SecureDeleteIntent {
     nonce: Vec<u8>,
     result_json: String,
+}
+
+pub(crate) trait MergeCheckpointResult: Sized {
+    fn merge_from(&mut self, other: Self);
+}
+
+impl MergeCheckpointResult for DeleteLocalGroupDataResult {
+    fn merge_from(&mut self, other: Self) {
+        self.deleted_rows = self.deleted_rows.saturating_add(other.deleted_rows);
+    }
+}
+
+impl MergeCheckpointResult for crate::app::timeline::SecurePruneAppEventsResult {
+    fn merge_from(&mut self, other: Self) {
+        self.pruned_messages = self.pruned_messages.saturating_add(other.pruned_messages);
+        self.pruned_media_epoch_secrets = self
+            .pruned_media_epoch_secrets
+            .saturating_add(other.pruned_media_epoch_secrets);
+        let mut hashes = self
+            .media_ciphertext_sha256
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        hashes.extend(other.media_ciphertext_sha256);
+        self.media_ciphertext_sha256 = hashes.into_iter().collect();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1090,11 +1118,12 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for (group_id_hex, expected_frontier) in frontiers_to_clear {
+                let group_id_hex = canonical_group_id_hex(group_id_hex);
                 conn.execute_cached(
                     "DELETE FROM local_group_deletion_frontiers
                      WHERE group_id_hex = ?1 AND message_insert_order = ?2",
                     params![
-                        group_id_hex,
+                        group_id_hex.as_ref(),
                         i64::try_from(*expected_frontier).unwrap_or(i64::MAX)
                     ],
                 )
@@ -1177,21 +1206,26 @@ impl SqliteAppStorage {
                     .collect::<Result<std::collections::HashSet<_>, _>>()
                     .storage()?
             };
+            let canonical_groups = state
+                .groups
+                .iter()
+                .map(|group| (canonical_group_id_hex(&group.group_id_hex), group))
+                .collect::<Vec<_>>();
             // Probe only groups in this write, not the lifetime collection of
             // forgotten ids. Ordinary delta checkpoints usually contain one.
-            if !state.groups.is_empty() {
-                for group in &state.groups {
-                    if let Ok(id) = hex::decode(&group.group_id_hex)
-                        && crate::cross::projection::group_awaits_welcome(&conn, &id)? {
-                        locally_deleted_group_ids.insert(group.group_id_hex.clone());
+            if !canonical_groups.is_empty() {
+                for (group_id_hex, _group) in &canonical_groups {
+                    if let Ok(id) = hex::decode(group_id_hex.as_ref())
+                        && crate::cross::projection::group_awaits_welcome(&conn, &id)?
+                    {
+                        locally_deleted_group_ids.insert(group_id_hex.as_ref().to_owned());
                     }
                 }
             }
-            let retained_group_ids = state
-                .groups
+            let retained_group_ids = canonical_groups
                 .iter()
-                .filter(|group| !locally_deleted_group_ids.contains(&group.group_id_hex))
-                .map(|group| group.group_id_hex.as_str())
+                .filter(|(group_id_hex, _)| !locally_deleted_group_ids.contains(group_id_hex.as_ref()))
+                .map(|(group_id_hex, _)| group_id_hex.as_ref())
                 .collect::<std::collections::HashSet<_>>();
             // Draft text and attachment plaintext are user-authored durable data,
             // unlike this re-derivable projection. Exclude their owning groups
@@ -1216,17 +1250,17 @@ impl SqliteAppStorage {
                 )?;
             }
 
-            for group in state
-                .groups
+            for (group_id_hex, group) in canonical_groups
                 .iter()
-                .filter(|group| !locally_deleted_group_ids.contains(&group.group_id_hex))
+                .filter(|(group_id_hex, _)| !locally_deleted_group_ids.contains(group_id_hex.as_ref()))
             {
+                let group_id_hex = group_id_hex.as_ref();
                 // The stored row's Welcome, or `None` when the group has no row.
                 let stored_welcome = conn
                     .query_row_cached(
                         "SELECT via_welcome_message_id_hex FROM account_groups
                          WHERE group_id_hex = ?1",
-                        params![&group.group_id_hex],
+                        params![group_id_hex],
                         |row| row.get::<_, Option<String>>(0),
                     )
                     .optional()
@@ -1281,7 +1315,7 @@ impl SqliteAppStorage {
                         OR account_groups.prior_nostr_routes_json IS NOT excluded.prior_nostr_routes_json
                         OR account_groups.member_count IS NOT excluded.member_count",
                     params![
-                        &group.group_id_hex,
+                        group_id_hex,
                         &group.endpoint,
                         &group.profile_name,
                         &group.profile_description,
@@ -1320,7 +1354,7 @@ impl SqliteAppStorage {
                                 registration_updated_at_ms = excluded.registration_updated_at_ms,
                                 queued_at_ms = excluded.queued_at_ms,
                                 last_attempted_at_ms = NULL",
-                            params![&group.group_id_hex, unix_now_ms()],
+                            params![group_id_hex, unix_now_ms()],
                         )
                         .storage()?;
                     if queued > 0 {
@@ -1343,23 +1377,26 @@ impl SqliteAppStorage {
                             joined_at_ms = NULL,
                             join_window_counted_ms = 0,
                             announce_owed_at_ms = NULL",
-                        params![&group.group_id_hex, unix_now_ms()],
+                        params![group_id_hex, unix_now_ms()],
                     )
                     .storage()?;
                 }
 
-                delete_stale_group_components(&conn, &group.group_id_hex, &group.components)?;
+                delete_stale_group_components(&conn, group_id_hex, &group.components)?;
                 for component in &group.components {
-                    upsert_group_component(&conn, &group.group_id_hex, component, now_i64)?;
+                    upsert_group_component(&conn, group_id_hex, component, now_i64)?;
                 }
                 replace_direct_conversation_members_tx(
                     &conn,
-                    &group.group_id_hex,
+                    group_id_hex,
                     group.direct_member_ids_hex.as_deref(),
                     persist_direct_conversation_members(group),
                 )?;
-                crate::app::chat_presentation::replace_members_tx(&conn, &group.group_id_hex,
-                    group.presentation_member_ids_hex.as_deref().unwrap_or(&[]))?;
+                crate::app::chat_presentation::replace_members_tx(
+                    &conn,
+                    group_id_hex,
+                    group.presentation_member_ids_hex.as_deref().unwrap_or(&[]),
+                )?;
             }
             for message_id in application_event_ids_to_ack {
                 crate::cross::projection::acknowledge_outbox(&conn, message_id)?;
@@ -1399,6 +1436,7 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         member_ids_hex: &[String],
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let already_indexed = conn
@@ -1406,7 +1444,7 @@ impl SqliteAppStorage {
                     "SELECT EXISTS(
                         SELECT 1 FROM direct_conversation_members WHERE group_id_hex = ?1
                      )",
-                    params![group_id_hex],
+                    params![group_id_hex.as_ref()],
                     |row| row.get::<_, bool>(0),
                 )
                 .storage()?;
@@ -1415,7 +1453,7 @@ impl SqliteAppStorage {
             }
             replace_direct_conversation_members_tx(
                 &conn,
-                group_id_hex,
+                &group_id_hex,
                 Some(member_ids_hex),
                 member_ids_hex.len() == 2,
             )?;
@@ -1450,12 +1488,13 @@ impl SqliteAppStorage {
     /// app projection from a torn projection write while the MLS group remains
     /// live, without trusting a remote sender's timestamp.
     pub fn local_group_deletion_frontier(&self, group_id_hex: &str) -> StorageResult<Option<u64>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .query_row_cached(
                 "SELECT message_insert_order
                  FROM local_group_deletion_frontiers
                  WHERE group_id_hex = ?1",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
@@ -1476,13 +1515,14 @@ impl SqliteAppStorage {
         &self,
         group_id_hex: &str,
     ) -> StorageResult<Vec<StoredNostrRoute>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let routes_json = self
             .lock()?
             .query_row_cached(
                 "SELECT prior_nostr_routes_json
                  FROM local_group_deletion_frontiers
                  WHERE group_id_hex = ?1",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -1503,13 +1543,14 @@ impl SqliteAppStorage {
         &self,
         group_id_hex: &str,
     ) -> StorageResult<Option<LocalGroupDeletionInvitation>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         Ok(self
             .lock()?
             .query_row_cached(
                 "SELECT pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex
                  FROM local_group_deletion_frontiers
                  WHERE group_id_hex = ?1",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
                 |row| {
                     let pending_confirmation = row.get::<_, Option<bool>>(0)?;
                     let welcomer_account_id_hex = row.get(1)?;
@@ -1540,6 +1581,7 @@ impl SqliteAppStorage {
         if routes.is_empty() {
             return Ok(());
         }
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let Some(routes_json) = conn
@@ -1547,7 +1589,7 @@ impl SqliteAppStorage {
                     "SELECT prior_nostr_routes_json
                      FROM local_group_deletion_frontiers
                      WHERE group_id_hex = ?1",
-                    params![group_id_hex],
+                    params![group_id_hex.as_ref()],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()
@@ -1572,7 +1614,7 @@ impl SqliteAppStorage {
                     retained.push(route.clone());
                 }
             }
-            let group_id = hex::decode(group_id_hex).map_err(|error| {
+            let group_id = hex::decode(group_id_hex.as_ref()).map_err(|error| {
                 StorageError::Serialization(format!("invalid local group id: {error}"))
             })?;
             let active_route_ids = {
@@ -1610,7 +1652,7 @@ impl SqliteAppStorage {
                 "UPDATE local_group_deletion_frontiers
                  SET prior_nostr_routes_json = ?2
                  WHERE group_id_hex = ?1",
-                params![group_id_hex, retained_json],
+                params![group_id_hex.as_ref(), retained_json],
             )
             .storage()?;
             Ok(())
@@ -1717,11 +1759,12 @@ impl SqliteAppStorage {
     /// state. Terminal engine state is the anti-resurrection authority, so the
     /// app-only marker no longer serves a purpose.
     pub fn clear_local_group_deletion_frontier(&self, group_id_hex: &str) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         Ok(self
             .lock()?
             .execute_cached(
                 "DELETE FROM local_group_deletion_frontiers WHERE group_id_hex = ?1",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
             )
             .storage()?
             > 0)
@@ -1731,20 +1774,21 @@ impl SqliteAppStorage {
     /// even if it was archived before leaving. Ordinary member activity preserves archive.
     /// Returns whether this transitioned an existing departed projection back to Member.
     pub fn restore_group_self_membership(&self, group_id_hex: &str) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.connection.with_transaction(|| {
             let departed = self
-                .group_self_membership(group_id_hex)?
+                .group_self_membership(&group_id_hex)?
                 .is_some_and(SelfMembership::departed);
             if departed {
                 self.lock()?
                     .execute_cached(
                         "UPDATE account_groups SET archived=0 WHERE group_id_hex=?1",
-                        [group_id_hex],
+                        [group_id_hex.as_ref()],
                     )
                     .storage()?;
             }
             // Preserve push-share admission and every existing membership side effect.
-            self.set_group_self_membership(group_id_hex, SelfMembership::Member)?;
+            self.set_group_self_membership(&group_id_hex, SelfMembership::Member)?;
             Ok(departed)
         })
     }
@@ -1761,6 +1805,7 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         membership: SelfMembership,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let updated = conn
@@ -1768,7 +1813,7 @@ impl SqliteAppStorage {
                     "UPDATE account_groups
                      SET self_membership = ?2
                      WHERE group_id_hex = ?1",
-                    params![group_id_hex, membership.as_str()],
+                    params![group_id_hex.as_ref(), membership.as_str()],
                 )
                 .storage()?;
             if updated == 0 {
@@ -1792,7 +1837,7 @@ impl SqliteAppStorage {
                                 registration_updated_at_ms = excluded.registration_updated_at_ms,
                                 queued_at_ms = excluded.queued_at_ms,
                                 last_attempted_at_ms = NULL",
-                            params![group_id_hex, queued_at_ms],
+                            params![group_id_hex.as_ref(), queued_at_ms],
                         )
                         .storage()?;
                     if queued > 0 {
@@ -1807,13 +1852,13 @@ impl SqliteAppStorage {
                     conn.execute_cached(
                         "DELETE FROM pending_push_registration_shares
                          WHERE group_id_hex = ?1",
-                        params![group_id_hex],
+                        params![group_id_hex.as_ref()],
                     )
                     .storage()?;
                     // Gossip state covers one membership; a later join starts afresh.
                     conn.execute_cached(
                         "DELETE FROM group_push_gossip_state WHERE group_id_hex = ?1",
-                        params![group_id_hex],
+                        params![group_id_hex.as_ref()],
                     )
                     .storage()?;
                 }
@@ -1853,11 +1898,12 @@ impl SqliteAppStorage {
         &self,
         group_id_hex: &str,
     ) -> StorageResult<Option<SelfMembership>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let conn = self.lock()?;
         let value = conn
             .query_row_cached(
                 "SELECT self_membership FROM account_groups WHERE group_id_hex = ?1",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -1868,11 +1914,12 @@ impl SqliteAppStorage {
     /// The group's [`StoredGroupStanding`], or `None` when it has no
     /// `account_groups` row.
     pub fn group_standing(&self, group_id_hex: &str) -> StorageResult<Option<StoredGroupStanding>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let conn = self.lock()?;
         conn.query_row_cached(
             "SELECT self_membership, pending_confirmation FROM account_groups
              WHERE group_id_hex = ?1",
-            params![group_id_hex],
+            params![group_id_hex.as_ref()],
             |row| {
                 Ok(StoredGroupStanding {
                     self_membership: SelfMembership::from_storage(&row.get::<_, String>(0)?),
@@ -1909,8 +1956,9 @@ impl SqliteAppStorage {
         &self,
         group_id_hex: Option<&str>,
     ) -> StorageResult<i64> {
+        let group_id_hex = canonical_group_id_hex_opt(group_id_hex);
         let conn = self.lock()?;
-        match group_id_hex {
+        match group_id_hex.as_deref() {
             Some(group_id_hex) => conn.query_row_cached(
                 "SELECT COALESCE(MAX(insert_order), 0) FROM app_events WHERE group_id_hex = ?1",
                 params![group_id_hex],
@@ -1962,7 +2010,9 @@ impl SqliteAppStorage {
         }
         if let Some(group_id_hex) = &query.group_id_hex {
             conditions.push("group_id_hex = ?".to_owned());
-            values.push(Value::Text(group_id_hex.clone()));
+            values.push(Value::Text(
+                canonical_group_id_hex(group_id_hex).into_owned(),
+            ));
         }
         if let Some(kinds) = query.kinds.as_deref().filter(|kinds| !kinds.is_empty()) {
             let placeholders = std::iter::repeat_n("?", kinds.len())
@@ -2010,6 +2060,7 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         message_id_hex: &str,
     ) -> StorageResult<Option<StoredAppMessageRecord>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let cols = APP_EVENT_REPLAY_COLUMNS;
         self.lock()?
             .query_row_cached(
@@ -2018,7 +2069,7 @@ impl SqliteAppStorage {
                      WHERE group_id_hex = ?1 AND message_id_hex = ?2
                      LIMIT 1"
                 ),
-                params![group_id_hex, message_id_hex],
+                params![group_id_hex.as_ref(), message_id_hex],
                 app_message_from_row,
             )
             .optional()
@@ -2165,6 +2216,7 @@ impl SqliteAppStorage {
             &rusqlite::Connection,
         ) -> StorageResult<(crate::app::timeline::SecurePruneAppEventsResult, T)>,
     ) -> StorageResult<(crate::app::timeline::SecurePruneAppEventsResult, T)> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         // `secure_delete` must be ON *before* the prune transaction begins:
         // SQLite does not guarantee zero-on-free for pages freed in the same
         // transaction that toggles the pragma, so setting it inside the
@@ -2184,7 +2236,7 @@ impl SqliteAppStorage {
                     .storage()?;
                 let (outcome, value) = prune(&tx)?;
                 if outcome.pruned_messages > 0 || outcome.pruned_media_epoch_secrets > 0 {
-                    merge_secure_prune_intent_tx(&tx, group_id_hex, &outcome)?;
+                    merge_secure_prune_intent_tx(&tx, &group_id_hex, &outcome)?;
                 }
                 tx.commit().storage()?;
                 Ok((outcome, value))
@@ -2194,7 +2246,7 @@ impl SqliteAppStorage {
         })?;
         let finish = finish_secure_delete_checkpoint_intent::<
             crate::app::timeline::SecurePruneAppEventsResult,
-        >(self, SECURE_DELETE_RETENTION_OPERATION, group_id_hex)?;
+        >(self, SECURE_DELETE_RETENTION_OPERATION, &group_id_hex)?;
         let mut outcome = finish.result.unwrap_or(outcome);
         outcome.erasure_pending = finish.erasure_pending;
         if outcome.pruned_media_epoch_secrets > 0 {
@@ -2387,13 +2439,14 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         now_ms: i64,
     ) -> StorageResult<AccountChatNotificationSettings> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let row = self
             .lock()?
             .query_row_cached(
                 "SELECT muted_until_ms, updated_at_ms
                  FROM chat_notification_settings
                  WHERE group_id_hex = ?1",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
                 |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()
@@ -2403,7 +2456,7 @@ impl SqliteAppStorage {
         let row_exists = row.is_some();
         let (muted_until_ms, updated_at_ms) = row.unwrap_or((Some(0), 0));
         Ok(AccountChatNotificationSettings {
-            group_id_hex: group_id_hex.to_owned(),
+            group_id_hex: group_id_hex.into_owned(),
             muted: chat_mute_is_effective(row_exists, muted_until_ms, now_ms),
             muted_until_ms,
             updated_at_ms,
@@ -2415,6 +2468,7 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         muted_until_ms: Option<i64>,
     ) -> StorageResult<AccountChatNotificationSettings> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .execute_cached(
                 "INSERT INTO chat_notification_settings (
@@ -2424,23 +2478,24 @@ impl SqliteAppStorage {
                  ON CONFLICT(group_id_hex) DO UPDATE SET
                     muted_until_ms = excluded.muted_until_ms,
                     updated_at_ms = excluded.updated_at_ms",
-                params![group_id_hex, muted_until_ms, unix_now_ms()],
+                params![group_id_hex.as_ref(), muted_until_ms, unix_now_ms()],
             )
             .storage()?;
-        self.chat_notification_settings(group_id_hex)
+        self.chat_notification_settings(&group_id_hex)
     }
 
     pub fn clear_chat_muted(
         &self,
         group_id_hex: &str,
     ) -> StorageResult<AccountChatNotificationSettings> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .execute_cached(
                 "DELETE FROM chat_notification_settings WHERE group_id_hex = ?1",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
             )
             .storage()?;
-        self.chat_notification_settings(group_id_hex)
+        self.chat_notification_settings(&group_id_hex)
     }
 
     pub fn push_registration(
@@ -2637,6 +2692,7 @@ impl SqliteAppStorage {
         registration_updated_at_ms: i64,
         attempted_at_ms: i64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .execute_cached(
                 "UPDATE pending_push_registration_shares
@@ -2644,7 +2700,7 @@ impl SqliteAppStorage {
                  WHERE group_id_hex = ?1 AND token_fingerprint = ?2
                    AND registration_updated_at_ms = ?3",
                 params![
-                    group_id_hex,
+                    group_id_hex.as_ref(),
                     token_fingerprint,
                     registration_updated_at_ms,
                     attempted_at_ms
@@ -2660,13 +2716,18 @@ impl SqliteAppStorage {
         token_fingerprint: &str,
         registration_updated_at_ms: i64,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         Ok(self
             .lock()?
             .execute_cached(
                 "DELETE FROM pending_push_registration_shares
                  WHERE group_id_hex = ?1 AND token_fingerprint = ?2
                    AND registration_updated_at_ms = ?3",
-                params![group_id_hex, token_fingerprint, registration_updated_at_ms],
+                params![
+                    group_id_hex.as_ref(),
+                    token_fingerprint,
+                    registration_updated_at_ms
+                ],
             )
             .storage()?
             > 0)
@@ -2745,17 +2806,18 @@ impl SqliteAppStorage {
         registration: &AccountPushRegistration,
         queued_at_ms: i64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             conn.execute_cached(
                 "DELETE FROM pending_push_registration_shares
                  WHERE group_id_hex = ?1",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
             )
             .storage()?;
             insert_push_registration_removal_with_conn(
                 &conn,
-                group_id_hex,
+                &group_id_hex,
                 registration,
                 queued_at_ms,
             )?;
@@ -2772,6 +2834,7 @@ impl SqliteAppStorage {
         registration_updated_at_ms: i64,
         queued_at_ms: i64,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let inserted = conn
@@ -2789,7 +2852,7 @@ impl SqliteAppStorage {
                     queued_at_ms = excluded.queued_at_ms,
                     last_attempted_at_ms = NULL",
                     params![
-                        group_id_hex,
+                        group_id_hex.as_ref(),
                         token_fingerprint,
                         registration_updated_at_ms,
                         queued_at_ms,
@@ -2820,6 +2883,7 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         queued_at_ms: i64,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let queued = conn
@@ -2844,7 +2908,7 @@ impl SqliteAppStorage {
                         registration_updated_at_ms = excluded.registration_updated_at_ms,
                         queued_at_ms = excluded.queued_at_ms,
                         last_attempted_at_ms = NULL",
-                    params![account_label, group_id_hex, queued_at_ms],
+                    params![account_label, group_id_hex.as_ref(), queued_at_ms],
                 )
                 .storage()?
                 > 0;
@@ -2927,6 +2991,7 @@ impl SqliteAppStorage {
         removal: &AccountPendingPushRegistrationRemoval,
         attempted_at_ms: i64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(&removal.group_id_hex);
         self.lock()?
             .execute_cached(
                 "UPDATE pending_push_registration_removals
@@ -2935,7 +3000,7 @@ impl SqliteAppStorage {
                    AND server_pubkey_hex = ?3 AND token_fingerprint = ?4
                    AND registration_updated_at_ms = ?5",
                 params![
-                    &removal.group_id_hex,
+                    group_id_hex.as_ref(),
                     i64::from(removal.registration.platform),
                     &removal.registration.server_pubkey_hex,
                     &removal.registration.token_fingerprint,
@@ -2951,6 +3016,7 @@ impl SqliteAppStorage {
         &self,
         removal: &AccountPendingPushRegistrationRemoval,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(&removal.group_id_hex);
         Ok(self
             .lock()?
             .execute_cached(
@@ -2959,7 +3025,7 @@ impl SqliteAppStorage {
                    AND server_pubkey_hex = ?3 AND token_fingerprint = ?4
                    AND registration_updated_at_ms = ?5",
                 params![
-                    &removal.group_id_hex,
+                    group_id_hex.as_ref(),
                     i64::from(removal.registration.platform),
                     &removal.registration.server_pubkey_hex,
                     &removal.registration.token_fingerprint,
@@ -2976,6 +3042,7 @@ impl SqliteAppStorage {
     /// [`Self::apply_group_push_token`], which enforces the ordering primitive and
     /// tombstones.
     pub fn upsert_group_push_token(&self, token: &AccountGroupPushToken) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(&token.group_id_hex);
         let conn = self.lock()?;
         conn.execute_cached(
             "INSERT INTO group_push_tokens (
@@ -2994,7 +3061,7 @@ impl SqliteAppStorage {
                     record_digest = excluded.record_digest,
                     updated_at_ms = excluded.updated_at_ms",
             params![
-                &token.group_id_hex,
+                group_id_hex.as_ref(),
                 &token.member_id_hex,
                 u32_to_i64(token.leaf_index),
                 i64::from(token.platform),
@@ -3019,12 +3086,15 @@ impl SqliteAppStorage {
     /// the record was applied. Callers verify `owner_sig` and group membership
     /// before calling.
     pub fn apply_group_push_token(&self, token: &AccountGroupPushToken) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(&token.group_id_hex);
         retry_on_busy(|| {
             let mut conn = self.lock()?;
-            let tx = conn.transaction().storage()?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .storage()?;
             let incoming = (token.owner_ts, token.record_digest.as_str());
             let key = PushTokenKey {
-                group_id_hex: &token.group_id_hex,
+                group_id_hex: group_id_hex.as_ref(),
                 member_id_hex: &token.member_id_hex,
                 leaf_index: token.leaf_index,
                 platform: token.platform,
@@ -3055,7 +3125,7 @@ impl SqliteAppStorage {
                     record_digest = excluded.record_digest,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
-                    &token.group_id_hex,
+                    group_id_hex.as_ref(),
                     &token.member_id_hex,
                     u32_to_i64(token.leaf_index),
                     i64::from(token.platform),
@@ -3085,12 +3155,15 @@ impl SqliteAppStorage {
         &self,
         tombstone: &AccountGroupPushTokenTombstone,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(&tombstone.group_id_hex);
         retry_on_busy(|| {
             let mut conn = self.lock()?;
-            let tx = conn.transaction().storage()?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .storage()?;
             let incoming = (tombstone.owner_ts, tombstone.record_digest.as_str());
             let key = PushTokenKey {
-                group_id_hex: &tombstone.group_id_hex,
+                group_id_hex: group_id_hex.as_ref(),
                 member_id_hex: &tombstone.member_id_hex,
                 leaf_index: tombstone.leaf_index,
                 platform: tombstone.platform,
@@ -3145,7 +3218,7 @@ impl SqliteAppStorage {
                     token_fingerprint = excluded.token_fingerprint,
                     owner_sig = excluded.owner_sig",
                 params![
-                    &tombstone.group_id_hex,
+                    group_id_hex.as_ref(),
                     &tombstone.member_id_hex,
                     u32_to_i64(tombstone.leaf_index),
                     i64::from(tombstone.platform),
@@ -3169,6 +3242,7 @@ impl SqliteAppStorage {
         &self,
         group_id_hex: &str,
     ) -> StorageResult<Vec<AccountGroupPushTokenTombstone>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let conn = self.lock()?;
         let mut statement = conn
             .prepare_cached(
@@ -3180,7 +3254,10 @@ impl SqliteAppStorage {
             )
             .storage()?;
         statement
-            .query_map(params![group_id_hex], group_push_token_tombstone_from_row)
+            .query_map(
+                params![group_id_hex.as_ref()],
+                group_push_token_tombstone_from_row,
+            )
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()
@@ -3191,13 +3268,14 @@ impl SqliteAppStorage {
         &self,
         group_id_hex: &str,
     ) -> StorageResult<Option<AccountGroupPushGossipState>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .query_row_cached(
                 "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
                         joining_since_ms, join_window_counted_ms, announce_owed_at_ms
                  FROM group_push_gossip_state
                  WHERE group_id_hex = ?1",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
                 group_push_gossip_state_from_row,
             )
             .optional()
@@ -3277,21 +3355,25 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         owed_at_ms: i64,
     ) -> StorageResult<Option<i64>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .query_row_cached(
                 "INSERT INTO group_push_gossip_state (group_id_hex, announce_owed_at_ms)
                  SELECT group_id_hex, ?2 FROM account_groups
                  WHERE group_id_hex = ?1 AND self_membership = 'member'
                  ON CONFLICT(group_id_hex) DO UPDATE SET
-                    announce_owed_at_ms = MAX(
-                        COALESCE(
+                    announce_owed_at_ms = CASE
+                        WHEN group_push_gossip_state.announce_owed_at_ms IS NULL
+                            THEN excluded.announce_owed_at_ms
+                        WHEN group_push_gossip_state.announce_owed_at_ms >= ?3
+                            THEN ?3
+                        ELSE MAX(
                             group_push_gossip_state.announce_owed_at_ms + 1,
                             excluded.announce_owed_at_ms
-                        ),
-                        excluded.announce_owed_at_ms
-                    )
+                        )
+                    END
                  RETURNING announce_owed_at_ms",
-                params![group_id_hex, owed_at_ms],
+                params![group_id_hex.as_ref(), owed_at_ms, i64::MAX],
                 |row| row.get(0),
             )
             .optional()
@@ -3332,13 +3414,14 @@ impl SqliteAppStorage {
         expected: u64,
         replacement: Option<u64>,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let replacement = replacement.map(u64_to_i64).transpose()?;
         Ok(self
             .lock()?
             .execute_cached(
                 "UPDATE group_push_gossip_state SET snapshot_owed_after_epoch = ?3
                  WHERE group_id_hex = ?1 AND snapshot_owed_after_epoch = ?2",
-                params![group_id_hex, u64_to_i64(expected)?, replacement],
+                params![group_id_hex.as_ref(), u64_to_i64(expected)?, replacement],
             )
             .storage()?
             > 0)
@@ -3384,9 +3467,13 @@ impl SqliteAppStorage {
         }
         conn.execute_cached(
             "UPDATE group_push_gossip_state
-                 SET join_window_counted_ms = join_window_counted_ms + ?1
+                 SET join_window_counted_ms = CASE
+                     WHEN ?1 > 0 AND join_window_counted_ms > ?2 - ?1 THEN ?2
+                     WHEN ?1 < 0 AND join_window_counted_ms < ?3 - ?1 THEN ?3
+                     ELSE join_window_counted_ms + ?1
+                 END
                  WHERE joining_since_ms IS NOT NULL AND joined_at_ms IS NOT NULL",
-            params![counted_ms],
+            params![counted_ms, i64::MAX, i64::MIN],
         )
         .storage()
     }
@@ -3404,6 +3491,7 @@ impl SqliteAppStorage {
         announced_at_ms: i64,
         settles_owed: Option<i64>,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         Ok(self
             .lock()?
             .execute_cached(
@@ -3420,7 +3508,7 @@ impl SqliteAppStorage {
                         WHEN group_push_gossip_state.announce_owed_at_ms IS ?3 THEN NULL
                         ELSE group_push_gossip_state.announce_owed_at_ms
                     END",
-                params![group_id_hex, announced_at_ms, settles_owed],
+                params![group_id_hex.as_ref(), announced_at_ms, settles_owed],
             )
             .storage()?
             > 0)
@@ -3432,9 +3520,10 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         value: i64,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         Ok(self
             .lock()?
-            .execute_cached(sql, params![group_id_hex, value])
+            .execute_cached(sql, params![group_id_hex.as_ref(), value])
             .storage()?
             > 0)
     }
@@ -3443,6 +3532,7 @@ impl SqliteAppStorage {
         &self,
         group_id_hex: &str,
     ) -> StorageResult<Vec<AccountGroupPushToken>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let conn = self.lock()?;
         let mut statement = conn
             .prepare_cached(
@@ -3455,7 +3545,7 @@ impl SqliteAppStorage {
             )
             .storage()?;
         statement
-            .query_map(params![group_id_hex], group_push_token_from_row)
+            .query_map(params![group_id_hex.as_ref()], group_push_token_from_row)
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()
@@ -3469,14 +3559,15 @@ impl SqliteAppStorage {
         leaves: &[(String, u32)],
         departed_members: &[String],
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.connection.with_transaction(|| -> StorageResult<()> {
             let conn = self.lock()?;
             for (member, index) in leaves {
-                conn.execute_cached("DELETE FROM group_push_tokens WHERE group_id_hex = ?1 AND member_id_hex = ?2 AND leaf_index = ?3", params![group_id_hex, member, i64::from(*index)]).storage()?;
+                conn.execute_cached("DELETE FROM group_push_tokens WHERE group_id_hex = ?1 AND member_id_hex = ?2 AND leaf_index = ?3", params![group_id_hex.as_ref(), member, i64::from(*index)]).storage()?;
             }
             for member in departed_members {
-                conn.execute_cached("DELETE FROM group_push_tokens WHERE group_id_hex = ?1 AND member_id_hex = ?2", params![group_id_hex, member]).storage()?;
-                conn.execute_cached("DELETE FROM group_push_token_tombstones WHERE group_id_hex = ?1 AND member_id_hex = ?2", params![group_id_hex, member]).storage()?;
+                conn.execute_cached("DELETE FROM group_push_tokens WHERE group_id_hex = ?1 AND member_id_hex = ?2", params![group_id_hex.as_ref(), member]).storage()?;
+                conn.execute_cached("DELETE FROM group_push_token_tombstones WHERE group_id_hex = ?1 AND member_id_hex = ?2", params![group_id_hex.as_ref(), member]).storage()?;
             }
             Ok(())
         })
@@ -3489,6 +3580,7 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         active_leaves: &[(String, u32)],
     ) -> StorageResult<usize> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         // Materialize one scalar lookup set per statement. Correlated JSON
         // scans (and row-value NOT IN null checks) grow quadratically. Member
         // plus ':' plus a non-null u32 leaf is an unambiguous identity key.
@@ -3504,7 +3596,7 @@ impl SqliteAppStorage {
                      SELECT json_extract(leaf.value, '$[0]') || ':' || json_extract(leaf.value, '$[1]')
                      FROM json_each(?2) AS leaf
                  )",
-                        params![group_id_hex, roster],
+                        params![group_id_hex.as_ref(), roster],
                     )
                     .storage()?;
                 conn.execute_cached(
@@ -3512,7 +3604,7 @@ impl SqliteAppStorage {
                  WHERE group_id_hex = ?1 AND member_id_hex NOT IN (
                      SELECT json_extract(leaf.value, '$[0]') FROM json_each(?2) AS leaf
                  )",
-                    params![group_id_hex, roster],
+                    params![group_id_hex.as_ref(), roster],
                 )
                 .storage()?;
                 Ok(removed)
@@ -3524,6 +3616,7 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         active_members: &[String],
     ) -> StorageResult<usize> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.connection
             .with_transaction(|| -> StorageResult<usize> {
                 let conn = self.lock()?;
@@ -3531,7 +3624,7 @@ impl SqliteAppStorage {
                     .iter()
                     .map(String::as_str)
                     .collect::<std::collections::HashSet<_>>();
-                let scope = [Value::Text(group_id_hex.to_owned())];
+                let scope = [Value::Text(group_id_hex.as_ref().to_owned())];
                 // Clear tombstones for departed members too: once a member is gone, no
                 // relayed record for them can verify against current membership, so their
                 // tombstones are no longer load-bearing.
@@ -3672,6 +3765,7 @@ fn insert_push_registration_removal_with_conn(
     registration: &AccountPushRegistration,
     queued_at_ms: i64,
 ) -> StorageResult<()> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
     conn.execute_cached(
         "INSERT INTO pending_push_registration_removals (
             group_id_hex, account_label, account_id_hex, platform,
@@ -3690,7 +3784,7 @@ fn insert_push_registration_removal_with_conn(
             queued_at_ms = excluded.queued_at_ms,
             last_attempted_at_ms = NULL",
         params![
-            group_id_hex,
+            group_id_hex.as_ref(),
             &registration.account_label,
             &registration.account_id_hex,
             i64::from(registration.platform),
@@ -3801,11 +3895,12 @@ fn secure_delete_intent(
     operation_kind: &str,
     scope: &str,
 ) -> StorageResult<Option<SecureDeleteIntent>> {
+    let scope = canonical_group_id_hex(scope);
     conn.query_row_cached(
         "SELECT intent_nonce, result_json
          FROM secure_delete_checkpoint_intents
          WHERE operation_kind = ?1 AND scope = ?2",
-        params![operation_kind, scope],
+        params![operation_kind, scope.as_ref()],
         |row| {
             Ok(SecureDeleteIntent {
                 nonce: row.get(0)?,
@@ -3823,6 +3918,7 @@ fn upsert_secure_delete_intent_tx(
     scope: &str,
     result_json: &str,
 ) -> StorageResult<()> {
+    let scope = canonical_group_id_hex(scope);
     tx.execute_cached(
         "INSERT INTO secure_delete_checkpoint_intents (
             operation_kind, scope, intent_nonce, result_json
@@ -3830,7 +3926,7 @@ fn upsert_secure_delete_intent_tx(
          ON CONFLICT(operation_kind, scope) DO UPDATE SET
             intent_nonce = randomblob(16),
             result_json = excluded.result_json",
-        params![operation_kind, scope, result_json],
+        params![operation_kind, scope.as_ref(), result_json],
     )
     .storage()?;
     Ok(())
@@ -3841,34 +3937,25 @@ fn merge_secure_prune_intent_tx(
     group_id_hex: &str,
     new_result: &crate::app::timeline::SecurePruneAppEventsResult,
 ) -> StorageResult<()> {
-    let mut merged = secure_delete_intent(tx, SECURE_DELETE_RETENTION_OPERATION, group_id_hex)?
-        .map(|intent| {
-            serde_json::from_str::<crate::app::timeline::SecurePruneAppEventsResult>(
-                &intent.result_json,
-            )
-            .map_err(|error| StorageError::Serialization(error.to_string()))
-        })
-        .transpose()?
-        .unwrap_or_default();
-    merged.pruned_messages = merged
-        .pruned_messages
-        .saturating_add(new_result.pruned_messages);
-    merged.pruned_media_epoch_secrets = merged
-        .pruned_media_epoch_secrets
-        .saturating_add(new_result.pruned_media_epoch_secrets);
-    let mut hashes = merged
-        .media_ciphertext_sha256
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    hashes.extend(new_result.media_ciphertext_sha256.iter().cloned());
-    merged.media_ciphertext_sha256 = hashes.into_iter().collect();
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
+    let mut merged = crate::app::timeline::SecurePruneAppEventsResult::default();
+    if let Some(intent) =
+        secure_delete_intent(tx, SECURE_DELETE_RETENTION_OPERATION, &group_id_hex)?
+    {
+        let existing = serde_json::from_str::<crate::app::timeline::SecurePruneAppEventsResult>(
+            &intent.result_json,
+        )
+        .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        merged.merge_from(existing);
+    }
+    merged.merge_from(new_result.clone());
     merged.erasure_pending = false;
     let result_json = serde_json::to_string(&merged)
         .map_err(|error| StorageError::Serialization(error.to_string()))?;
     upsert_secure_delete_intent_tx(
         tx,
         SECURE_DELETE_RETENTION_OPERATION,
-        group_id_hex,
+        &group_id_hex,
         &result_json,
     )
 }
@@ -3878,13 +3965,15 @@ pub(crate) fn merge_local_group_delete_intent_tx(
     group_id_hex: &str,
     deleted_rows: usize,
 ) -> StorageResult<()> {
-    let mut merged = secure_delete_intent(tx, SECURE_DELETE_LOCAL_GROUP_OPERATION, group_id_hex)?
-        .map(|intent| {
-            serde_json::from_str::<DeleteLocalGroupDataResult>(&intent.result_json)
-                .map_err(|error| StorageError::Serialization(error.to_string()))
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
+    let mut merged = DeleteLocalGroupDataResult::default();
+    if let Some(intent) =
+        secure_delete_intent(tx, SECURE_DELETE_LOCAL_GROUP_OPERATION, &group_id_hex)?
+    {
+        let existing = serde_json::from_str::<DeleteLocalGroupDataResult>(&intent.result_json)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        merged.merge_from(existing);
+    }
     merged.deleted_rows = merged.deleted_rows.saturating_add(deleted_rows);
     merged.completed_pending_checkpoint = false;
     merged.erasure_pending = false;
@@ -3893,7 +3982,7 @@ pub(crate) fn merge_local_group_delete_intent_tx(
     upsert_secure_delete_intent_tx(
         tx,
         SECURE_DELETE_LOCAL_GROUP_OPERATION,
-        group_id_hex,
+        &group_id_hex,
         &result_json,
     )
 }
@@ -3906,16 +3995,17 @@ pub(crate) fn finish_secure_delete_checkpoint_intent<T>(
 where
     T: serde::de::DeserializeOwned,
 {
+    let scope = canonical_group_id_hex(scope);
     let mut last_result = None;
     for _ in 0..8 {
-        let conn = storage.lock()?;
-        let Some(intent) = secure_delete_intent(&conn, operation_kind, scope)? else {
+        let mut conn = storage.lock()?;
+        let Some(intent) = secure_delete_intent(&conn, operation_kind, &scope)? else {
             return Ok(SecureDeleteCheckpointFinish {
                 result: None,
                 erasure_pending: false,
             });
         };
-        let result = serde_json::from_str(&intent.result_json)
+        let result = serde_json::from_str::<T>(&intent.result_json)
             .map_err(|error| StorageError::Serialization(error.to_string()))?;
         match checkpoint_wal_truncate_after_secure_delete(&conn) {
             Ok(()) => {}
@@ -3927,18 +4017,22 @@ where
             }
             Err(error) => return Err(error),
         }
-        let deleted = conn
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .storage()?;
+        let deleted = tx
             .execute_cached(
                 "DELETE FROM secure_delete_checkpoint_intents
                  WHERE operation_kind = ?1 AND scope = ?2
                    AND intent_nonce = ?3",
-                params![operation_kind, scope, &intent.nonce],
+                params![operation_kind, scope.as_ref(), &intent.nonce],
             )
             .storage()?;
         if deleted == 0 {
             last_result = Some(result);
             continue;
         }
+        tx.commit().storage()?;
         return Ok(SecureDeleteCheckpointFinish {
             result: Some(result),
             erasure_pending: false,
@@ -4060,29 +4154,52 @@ fn delete_stale_group_components(
     group_id_hex: &str,
     components: &[StoredAccountGroupComponent],
 ) -> StorageResult<()> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
     if components.is_empty() {
         tx.execute_cached(
             "DELETE FROM account_group_app_components WHERE group_id_hex = ?1",
-            params![group_id_hex],
+            params![group_id_hex.as_ref()],
         )
         .storage()?;
         return Ok(());
     }
-    let placeholders = std::iter::repeat_n("?", components.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "DELETE FROM account_group_app_components
-         WHERE group_id_hex = ?
-           AND component_id NOT IN ({placeholders})"
-    );
-    let mut values = Vec::with_capacity(components.len() + 1);
-    values.push(Value::Text(group_id_hex.to_owned()));
-    for component in components {
-        values.push(Value::Integer(i64::from(component.component_id)));
+    let existing_ids = {
+        let mut statement = tx
+            .prepare_cached(
+                "SELECT component_id FROM account_group_app_components WHERE group_id_hex = ?1",
+            )
+            .storage()?;
+        statement
+            .query_map(params![group_id_hex.as_ref()], |row| row.get::<_, i64>(0))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?
+    };
+    let retained_ids = components
+        .iter()
+        .map(|component| i64::from(component.component_id))
+        .collect::<std::collections::HashSet<_>>();
+    let stale_ids = existing_ids
+        .into_iter()
+        .filter(|id| !retained_ids.contains(id))
+        .collect::<Vec<_>>();
+    for chunk in stale_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK - 1) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM account_group_app_components
+             WHERE group_id_hex = ?
+               AND component_id IN ({placeholders})"
+        );
+        let mut values = Vec::with_capacity(chunk.len() + 1);
+        values.push(Value::Text(group_id_hex.as_ref().to_owned()));
+        for id in chunk {
+            values.push(Value::Integer(*id));
+        }
+        tx.execute_cached(&sql, params_from_iter(values.iter()))
+            .storage()?;
     }
-    tx.execute_cached(&sql, params_from_iter(values.iter()))
-        .storage()?;
     Ok(())
 }
 
@@ -4092,6 +4209,7 @@ fn upsert_group_component(
     component: &StoredAccountGroupComponent,
     now: i64,
 ) -> StorageResult<()> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
     tx.execute_cached(
         "INSERT INTO account_group_app_components (
             group_id_hex, component_id, component_name, component_data_hex, updated_at
@@ -4104,7 +4222,7 @@ fn upsert_group_component(
          WHERE account_group_app_components.component_name IS NOT excluded.component_name
             OR account_group_app_components.component_data_hex IS NOT excluded.component_data_hex",
         params![
-            group_id_hex,
+            group_id_hex.as_ref(),
             i64::from(component.component_id),
             &component.component_name,
             &component.component_data_hex,
@@ -4443,9 +4561,10 @@ pub(crate) fn replace_direct_conversation_members_tx(
     member_ids_hex: Option<&[String]>,
     persist_direct: bool,
 ) -> StorageResult<()> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
     conn.execute_cached(
         "DELETE FROM direct_conversation_members WHERE group_id_hex = ?1",
-        params![group_id_hex],
+        params![group_id_hex.as_ref()],
     )
     .storage()?;
     if !persist_direct {
@@ -4466,7 +4585,7 @@ pub(crate) fn replace_direct_conversation_members_tx(
         conn.execute_cached(
             "INSERT OR IGNORE INTO direct_conversation_members (group_id_hex, member_id_hex)
              VALUES (?1, ?2)",
-            params![group_id_hex, member_id_hex],
+            params![group_id_hex.as_ref(), member_id_hex],
         )
         .storage()?;
     }
@@ -4485,6 +4604,8 @@ fn load_account_groups(
     conn: &Connection,
     group_id_hex: Option<&str>,
 ) -> StorageResult<Vec<StoredAccountGroup>> {
+    let group_id_hex = canonical_group_id_hex_opt(group_id_hex);
+    let group_id_hex = group_id_hex.as_deref();
     let mut group_statement = conn
         .prepare_cached(&format!(
             "SELECT group_id_hex, endpoint, profile_name, profile_description,

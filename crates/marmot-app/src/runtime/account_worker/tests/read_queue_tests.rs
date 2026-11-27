@@ -380,6 +380,7 @@ async fn profile_failures_answer_from_published_state(
                 event_kind: None,
                 event_created_at: None,
                 follows: Vec::new(),
+                follows_created_at: 0,
             })
             .unwrap();
     };

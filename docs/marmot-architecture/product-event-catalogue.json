@@ -1813,7 +1813,8 @@
           "too_many_relays",
           "multi_device_unsupported",
           "other_installation_possible",
-          "discovery_incomplete"
+          "discovery_incomplete",
+          "rate_limited"
         ],
         "source_issue": [
           "none",
@@ -1837,7 +1838,8 @@
           "too_many_relays",
           "multi_device_unsupported",
           "other_installation_possible",
-          "discovery_incomplete"
+          "discovery_incomplete",
+          "rate_limited"
         ],
         "context": [
           "unknown",

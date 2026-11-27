@@ -2403,10 +2403,81 @@ async fn recovery_runner_cools_a_relay_after_three_unreachable_answers() {
     let (_, until) = health.cooldown.expect("the third answer cools the relay");
     assert_eq!(idle(runner.step().await), Some(until));
 
-    // A reconnect ends the cooldown at once.
+    // A reconnect ends the cooldown and clears every unit's unreachable wait at
+    // once, so both units advance immediately without advancing the clock.
     relay.set_reachable(true);
     handle.relay_reconnected(RELAY);
+    let resumed = [ran(runner.step().await), ran(runner.step().await)];
+    assert!(
+        resumed
+            .iter()
+            .all(|summary| !summary.recheck && summary.outcome == Outcome::Advanced)
+    );
+    assert_eq!(
+        resumed
+            .iter()
+            .map(|summary| summary.key.route.clone())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([first, second])
+    );
+    let health = account.app.recovery_relay_health(RELAY).unwrap().unwrap();
+    assert_eq!((health.unreachable_streak, health.cooldown), (0, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_reconnect_unblocks_fenced_unit_before_unreachable_retry_wait() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .unreachable()
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, handle) = runner(&host, test_policy());
+
+    // A brief outage settles one Unreachable attempt: per-unit 30s retry wait,
+    // no relay cooldown yet.
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Unreachable);
+    let retry_at = account.unit(&route, RELAY).next_attempt_at_seconds;
+    assert!(retry_at >= t0 + RUNNER_UNREACHABLE_RETRY_SECS);
+    let health = account.app.recovery_relay_health(RELAY).unwrap().unwrap();
+    assert_eq!((health.unreachable_streak, health.cooldown), (1, None));
+    assert_eq!(idle(runner.step().await), Some(retry_at));
+
+    // The relay reconnects 5s later (well before the 30s retry wait) and its
+    // live REQ arms a live capture fence on the route.
+    clock.advance(5);
+    let reconnected_at = clock.now();
+    assert!(reconnected_at < retry_at);
+    relay.set_reachable(true);
+    let since = t0 - 30;
+    host.tails.stand(&route, RELAY, reconnected_at);
+    host.set_counts(vec![LiveCount {
+        routes: vec![route.clone()],
+        relay: RELAY.to_owned(),
+        since,
+        oldest_seen: Some(t0),
+    }]);
+    assert_eq!(host.fences().await, vec![(vec![route.clone()], since)]);
+
+    // Reconnect clears the per-unit wait immediately so the runner drains the
+    // fenced unit and releases the live fence without waiting for `retry_at`.
+    handle.relay_reconnected(RELAY);
     assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+    assert!(clock.now() < retry_at);
+    assert!(
+        host.fences().await.is_empty(),
+        "draining the reconnected unit must release the live fence immediately"
+    );
     let health = account.app.recovery_relay_health(RELAY).unwrap().unwrap();
     assert_eq!((health.unreachable_streak, health.cooldown), (0, None));
 }

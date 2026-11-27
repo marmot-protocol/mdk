@@ -291,7 +291,7 @@ impl AppClient {
     /// owns authentication, retry pacing, membership checks and publication.
     async fn advance_auto_recovery(&mut self) -> Result<(), AppError> {
         if self.runtime.maintenance_is_paused()
-            || self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+            || self.maintenance_passes()? != super::MaintenancePasses::Run
         {
             return Ok(());
         }
@@ -350,7 +350,7 @@ impl AppClient {
             self.refresh_member_inbox_routes(std::iter::once(member.as_str()))?;
         }
         if self.runtime.maintenance_is_paused()
-            || self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+            || self.maintenance_passes()? != super::MaintenancePasses::Run
         {
             return Ok(());
         }
@@ -395,7 +395,7 @@ impl AppClient {
 
     pub(crate) async fn recover_superseded_invites(&mut self) -> Result<(), AppError> {
         if self.runtime.maintenance_is_paused()
-            || self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+            || self.maintenance_passes()? != super::MaintenancePasses::Run
         {
             return Ok(());
         }
@@ -815,5 +815,101 @@ mod tests {
             ]),
             vec!["bob laptop", "carol phone", "dave phone"]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unfinished_interactive_onboarding_defers_recipient_challenge_key_package_publication()
+    {
+        use crate::tests::ScriptedPushRelayClient;
+        use crate::{AccountHome, MarmotApp};
+        use cgka_traits::group_recovery::{GroupRecoveryBody, GroupRecoverySource};
+        use cgka_traits::storage::GroupStorage;
+        use std::sync::Arc;
+        use storage_sqlite::{GroupRecoveryPhase, GroupRecoveryRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        let group = client
+            .create_group("recovery-deferral", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        drop(client);
+
+        let storage = app.account_storage("alice").unwrap();
+        let mut halted = storage.get_group(&group).unwrap();
+        halted.unrecoverable = true;
+        storage.put_group(&halted).unwrap();
+
+        let mut client = app.client("alice").await.unwrap();
+        client.runtime.retry_group_rejoin(&group).unwrap();
+        let mut record = storage.list_group_recoveries().unwrap().pop().unwrap();
+        assert_eq!(record.role, GroupRecoveryRole::Recipient);
+        let GroupRecoveryBody::Request { device_key_hash } = record.message.body else {
+            panic!("expected initial recipient Request body");
+        };
+        record.phase = GroupRecoveryPhase::Challenge;
+        record.retry_at = 0;
+        record.expires_at = u64::MAX / 2;
+        record.message.expires_at = u64::MAX / 2;
+        record.message.body = GroupRecoveryBody::Challenge {
+            source: GroupRecoverySource {
+                epoch: halted.epoch,
+                epoch_authenticator_hash: [7u8; 32],
+                leaf_index: 0,
+                leaf_hash: [8u8; 32],
+                device_key_hash,
+                coordinator_key_hash: [10u8; 32],
+            },
+        };
+        storage.put_group_recovery(&record).unwrap();
+
+        // Mark interactive onboarding unfinished: neither advance_auto_recovery nor
+        // run_due_maintenance may publish a KeyPackage for the Challenge.
+        home.begin_account_setup_with(
+            &account,
+            false,
+            marmot_account::AccountSetupKind::InteractiveIdentity,
+            marmot_account::AccountSetupPhase::KeyPackagePublicationStarted,
+        )
+        .unwrap();
+        let before_events = relay.published_event_ids().len();
+        let before_kp = client
+            .runtime
+            .key_package_maintenance_status()
+            .unwrap()
+            .and_then(|s| s.authored_event_id);
+
+        client.advance_auto_recovery().await.unwrap();
+        let after_auto_recovery = storage.list_group_recoveries().unwrap();
+        assert_eq!(after_auto_recovery[0].phase, GroupRecoveryPhase::Challenge);
+        assert_eq!(relay.published_event_ids().len(), before_events);
+        assert_eq!(
+            client
+                .runtime
+                .key_package_maintenance_status()
+                .unwrap()
+                .and_then(|s| s.authored_event_id),
+            before_kp
+        );
+
+        // Once interactive onboarding completes, recovery proceeds and publishes.
+        home.complete_account_setup("alice").unwrap();
+        client.advance_auto_recovery().await.unwrap();
+        assert_ne!(
+            client
+                .runtime
+                .key_package_maintenance_status()
+                .unwrap()
+                .and_then(|s| s.authored_event_id),
+            before_kp
+        );
+        assert!(relay.published_event_ids().len() > before_events);
     }
 }

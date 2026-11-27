@@ -513,7 +513,7 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
     let original_ref = hex::encode(key_package_ref(&original_package));
     expect_link_welcome(&mut moving, &original, &original_creator, &original_package);
     let mut original_roster = roster(&[(1, "Original"), (2, "Moving")]);
-    original_roster.leaf_tag_key = [0x31; 32];
+    original_roster.leaf_tag_key = [0x31; 32].into();
     original_roster.devices.get_mut(&slot(2)).unwrap().rename_id = Some([0x72; 16]);
     let (_, created) = create_under(
         &mut original_creator,

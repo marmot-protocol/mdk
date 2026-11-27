@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::params;
@@ -260,13 +260,14 @@ fn record_gather(
         changed |= insert_item(tx, item, now, roster_seen_at)?;
     }
     if let Some(group) = baseline {
+        let group = canonical_group_id_hex(group);
         tx.execute_cached(
             "INSERT INTO account_compromise_warning_baseline (id, device_group_id_hex, taken_at)
              VALUES (1, ?1, ?2)
              ON CONFLICT(id) DO UPDATE SET
                  device_group_id_hex = excluded.device_group_id_hex,
                  taken_at = excluded.taken_at",
-            params![group, now],
+            params![group.as_ref(), now],
         )
         .storage()?;
     }

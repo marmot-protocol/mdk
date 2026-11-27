@@ -243,24 +243,28 @@ without adding that report to `contents`. Exact-head candidate packages from the
 the same report beside `manifest.txt` and the build provenance. Publishing a new formal or snapshot artifact, and
 adopting it in an Android app, remains a separate release step.
 
-## Nightlies
+## Daily release candidates (RCs)
 
-Each day's nightly publishes the iOS, macOS and Android assets above under a dated pre-release, for example
-`marmotkit-v0.14.0-nightly.20261020` with `MarmotKitFFI-0.14.0-nightly.20261020.xcframework.zip` and
-`marmotkit-android-0.14.0-nightly.20261020.zip`. The identifier works exactly like a formal version: keep the binary,
-Swift, privacy and Android inputs on one identifier and verify the same checksums. The manifests record the nightly as
-`release_identifier`, master's `X.Y.Z-dev` as the workspace version, and the exact source SHA.
+Each day's release candidate builds the iOS, macOS, and Android assets above strictly from the verified `origin/canary`
+tip after Canary, `simulator-nightly`, and `convergence-hardening` pass. Assets publish under a SemVer pre-release tag,
+for example `marmotkit-v0.20.0-rc.1` with `MarmotKitFFI-0.20.0-rc.1.xcframework.zip` and
+`marmotkit-android-0.20.0-rc.1.zip`. The identifier works like a formal version: keep the binary, Swift, privacy, and
+Android inputs on one identifier and verify the same checksums. The manifests record the RC as `release_identifier`,
+master's `X.Y.0-dev` as the workspace version, and the exact verified `origin/canary` source SHA.
 
-Use nightlies only for testing. Pin a formal `marmotkit-v<version>` release for anything you ship. Nightlies are deleted
-after 30 days, so a nightly pin stops resolving, and going back to an older nightly is not supported. To find the newest
-nightly, read `latest.json` on the `nightly-meta` branch:
+Use RCs for staging and client integration testing. Pin a formal `marmotkit-v<version>` release for anything you ship.
+RCs are deleted after 30 days, so an expired RC pin stops resolving and going back to an older RC is not supported. To
+find the newest RC and its machine-readable API diff, read `rc/latest.json` (schema 2) and `rc/signature_delta.json` on
+the `rc-meta` branch (replacing the retired `nightly-meta/latest.json` channel):
 
 ```text
-https://raw.githubusercontent.com/marmot-protocol/mdk/nightly-meta/latest.json
+https://raw.githubusercontent.com/marmot-protocol/mdk/rc-meta/rc/latest.json
+https://raw.githubusercontent.com/marmot-protocol/mdk/rc-meta/rc/signature_delta.json
 ```
 
-It lists every asset's URL and SHA-256 for MarmotKit, Marmot C and WN Agent. See
-[nightly builds](../../release.md#nightly-builds) for naming, publication and retention.
+`rc/latest.json` lists every asset's URL and SHA-256 for MarmotKit, Marmot C, and WN Agent along with the classified
+Patch/Minor SemVer impact. See [daily release candidates](../../release.md#daily-release-candidates) for naming,
+classification, publication, promotion, and retention.
 
 ## Publishing
 

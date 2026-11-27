@@ -177,6 +177,7 @@ cargo test -p marmot-app
 Feature builds (release artifacts enable these exporters):
 
 ```sh
+just android-check                                   # fast arm64-v8a cross-check (same check as CI's rust-android-check)
 cargo check -p marmot-uniffi --features otlp-export
 cargo check -p marmot-uniffi --features product-analytics-export
 ```

@@ -189,7 +189,7 @@ the tests do.
 ## Flakes
 
 Fix flakes in the order `just flake-report` ranks them. It counts failed
-attempts per test across the last week of merge-queue runs, including the
+attempts per test across recent CI runs, including the
 ones CI's retry hid. Find the root cause; a fix awaits the state the test
 needs and never raises a timeout, adds a retry or loosens an assertion.
 

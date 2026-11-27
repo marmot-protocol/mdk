@@ -103,6 +103,7 @@ mod push;
 pub(crate) mod read_state;
 mod receipts;
 pub(crate) mod recovery;
+pub(crate) mod relay_checks;
 mod retention;
 pub(crate) mod sibling_chat_gaps;
 pub(crate) mod sign_ins;
@@ -260,12 +261,23 @@ pub(crate) struct EncryptedMediaUploadHttp {
     allowed_locator_kinds: Vec<String>,
     allow_loopback_http: bool,
     transport: BlossomHttpTransport,
-    retention_app: MarmotApp,
-    retention_account: String,
+    storage: storage_sqlite::SqliteAccountStorage,
+    media: crate::AccountMediaStore,
+    account_dir: std::path::PathBuf,
+    fallback_policy: storage_sqlite::AttachmentDownloadPolicy,
+    tasks: crate::runtime::account_worker::WorkerTaskScope,
     retention_group: GroupId,
 }
 
 impl EncryptedMediaUploadHttp {
+    pub(crate) fn with_tasks(
+        mut self,
+        tasks: crate::runtime::account_worker::WorkerTaskScope,
+    ) -> Self {
+        self.tasks = tasks;
+        self
+    }
+
     /// Stages every body in the media store, uploads, then binds the uploads
     /// to their descriptors. A body the disk cannot hold refuses the send
     /// with the storage-full error; any failure releases what was staged.
@@ -274,12 +286,17 @@ impl EncryptedMediaUploadHttp {
     pub(crate) async fn run(
         self,
     ) -> Result<(MediaUploadResult, crate::media::outgoing::OutgoingUploads), AppError> {
-        let mut uploads = crate::media::outgoing::OutgoingUploads::new(
-            self.retention_app.clone(),
-            self.retention_account.clone(),
+        let tasks = self.tasks.clone();
+        let cancel = tasks.token();
+        let mut uploads = crate::media::outgoing::OutgoingUploads::with_handles(
+            self.storage.clone(),
+            self.media.clone(),
+            tasks.clone(),
         );
-        let app = self.retention_app.clone();
-        let account = self.retention_account.clone();
+        let storage = self.storage.clone();
+        let media = self.media.clone();
+        let account_dir = self.account_dir.clone();
+        let fallback_policy = self.fallback_policy.clone();
         let group = self.retention_group.clone();
         let source_epoch = self.source_epoch;
         let control = match &self.request {
@@ -288,11 +305,32 @@ impl EncryptedMediaUploadHttp {
             }
             crate::media::file_transfer::MediaUploadPayload::Bytes(_) => None,
         };
-        let staging = tokio::task::spawn_blocking(move || {
-            crate::media::outgoing::SendStaging::open(&app, &account, &group, source_epoch)
-        })
-        .await
-        .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
+        struct CancelOnDrop(Option<Arc<crate::MediaFileTransferControl>>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                if let Some(control) = self.0.take() {
+                    control.cancel();
+                }
+            }
+        }
+        let mut cancel_on_drop = CancelOnDrop(control.clone());
+        let staging_cancel = cancel.clone();
+        let staging = tasks
+            .spawn_blocking(move || {
+                if staging_cancel.is_cancelled() {
+                    return Err(AppError::TransportClosed);
+                }
+                crate::media::outgoing::SendStaging::open_with_handles(
+                    storage,
+                    media,
+                    account_dir,
+                    &fallback_policy,
+                    &group,
+                    source_epoch,
+                )
+            })
+            .await
+            .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
         let result = match staging {
             Ok(staging) => self.upload(Arc::new(staging), &mut uploads).await,
             Err(error) => Err(error),
@@ -307,6 +345,7 @@ impl EncryptedMediaUploadHttp {
                 return Err(error);
             }
         };
+        cancel_on_drop.0 = None;
         Ok((result, uploads))
     }
 
@@ -315,6 +354,8 @@ impl EncryptedMediaUploadHttp {
         staging: Arc<crate::media::outgoing::SendStaging>,
         uploads: &mut crate::media::outgoing::OutgoingUploads,
     ) -> Result<MediaUploadResult, AppError> {
+        let tasks = self.tasks.clone();
+        let cancel = tasks.token();
         let policy = MediaOperationPolicy {
             version: self.version,
             default_endpoints: &self.default_endpoints,
@@ -324,13 +365,24 @@ impl EncryptedMediaUploadHttp {
         let mut result = match self.request {
             crate::media::file_transfer::MediaUploadPayload::Files(sources, control) => {
                 let servers = crate::media::upload_servers(sources.server().clone(), policy)?;
-                let (stage, stage_control, version) =
-                    (staging.clone(), control.clone(), self.version);
-                // The blocking task owns the reservations it makes until this
-                // await hands them back; if this future is dropped first, the
-                // task's result drops and releases them.
+                let (stage, stage_control, version, stage_cancel) = (
+                    staging.clone(),
+                    control.clone(),
+                    self.version,
+                    cancel.clone(),
+                );
+                // The blocking task owns the reservations it makes until the
+                // oneshot hands them back; if this future is dropped first, the
+                // failed send releases them synchronously inside the tracked
+                // closure BEFORE TaskTracker drops its token (mdk#3801).
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
                 let mut staged = uploads.handoff();
-                let (staged, sources) = tokio::task::spawn_blocking(move || {
+                tasks.spawn_blocking(move || {
+                    if stage_cancel.is_cancelled() {
+                        staged.release_blocking();
+                        let _ = result_tx.send((staged, Err(AppError::TransportClosed)));
+                        return;
+                    }
                     let sources = match sources {
                         crate::media::file_transfer::FileUploadSources::Host(request) => {
                             stage_file_sources(
@@ -351,10 +403,13 @@ impl EncryptedMediaUploadHttp {
                             )
                         }
                     };
-                    (staged, sources)
-                })
-                .await
-                .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
+                    if let Err((mut rejected, _)) = result_tx.send((staged, sources)) {
+                        rejected.release_blocking();
+                    }
+                });
+                let (staged, sources) = result_rx
+                    .await
+                    .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
                 uploads.absorb(staged);
                 crate::media::outgoing::upload_staged(
                     staging.media(),
@@ -366,14 +421,21 @@ impl EncryptedMediaUploadHttp {
                     policy,
                     &self.transport,
                     control,
+                    &tasks,
                 )
                 .await?
             }
             crate::media::file_transfer::MediaUploadPayload::Bytes(request) => {
                 crate::media::validate_media_upload_batch(&request.attachments)?;
-                let stage = staging.clone();
+                let (stage, stage_cancel) = (staging.clone(), cancel.clone());
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
                 let mut reserved = uploads.handoff();
-                let (request, reserved, staged) = tokio::task::spawn_blocking(move || {
+                tasks.spawn_blocking(move || {
+                    if stage_cancel.is_cancelled() {
+                        reserved.release_blocking();
+                        let _ = result_tx.send((request, reserved, Err(AppError::TransportClosed)));
+                        return;
+                    }
                     let staged = request.attachments.iter().try_for_each(|attachment| {
                         let len = attachment.plaintext.len() as u64;
                         stage
@@ -383,15 +445,18 @@ impl EncryptedMediaUploadHttp {
                                     target,
                                     &mut std::io::Cursor::new(&attachment.plaintext),
                                     len,
-                                    &|| false,
+                                    &|| stage_cancel.is_cancelled(),
                                 )
                             })
                             .map(|_| ())
                     });
-                    (request, reserved, staged)
-                })
-                .await
-                .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
+                    if let Err((_, mut rejected, _)) = result_tx.send((request, reserved, staged)) {
+                        rejected.release_blocking();
+                    }
+                });
+                let (request, reserved, staged) = result_rx
+                    .await
+                    .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
                 uploads.absorb(reserved);
                 staged?;
                 upload_encrypted_media(
@@ -414,7 +479,13 @@ impl EncryptedMediaUploadHttp {
         // expired. The message itself has not been sent yet.
         let tokens = uploads.tokens().to_vec();
         let descriptors = result.clone();
-        tokio::task::spawn_blocking(move || staging.bind(&tokens, &descriptors))
+        tasks
+            .spawn_blocking(move || {
+                if cancel.is_cancelled() {
+                    return Err(AppError::TransportClosed);
+                }
+                staging.bind(&tokens, &descriptors)
+            })
             .await
             .map_err(|_| AppError::BlockingTask("media staging failed".into()))??;
         Ok(result)
@@ -629,12 +700,26 @@ impl EncryptedMediaDownloadHttp {
 
 pub(crate) struct GroupImageDownloadHttp {
     image_hash_hex: String,
-    image_key_hex: String,
+    image_key_hex: Zeroizing<String>,
     image_nonce_hex: String,
     media_type: String,
     server: String,
     transport: BlossomHttpTransport,
 }
+
+impl std::fmt::Debug for GroupImageDownloadHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupImageDownloadHttp")
+            .field("image_hash_hex", &self.image_hash_hex)
+            .field("image_key_hex", &"<redacted>")
+            .field("image_nonce_hex", &self.image_nonce_hex)
+            .field("media_type", &self.media_type)
+            .field("server", &self.server)
+            .finish_non_exhaustive()
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for GroupImageDownloadHttp {}
 
 pub(crate) struct PreparedGroupImageUploadHttp {
     encrypted_blob: Vec<u8>,
@@ -644,6 +729,8 @@ pub(crate) struct PreparedGroupImageUploadHttp {
     allow_loopback_http: bool,
     transport: BlossomHttpTransport,
 }
+
+impl zeroize::ZeroizeOnDrop for PreparedGroupImageUploadHttp {}
 
 impl PreparedGroupImageUploadHttp {
     pub(crate) async fn run(self) -> Result<(), AppError> {
@@ -673,6 +760,29 @@ pub(crate) enum InitialGroupImageSource {
 }
 
 impl GroupImageDownloadHttp {
+    fn try_from_input(
+        input: &mut AppGroupImageInput,
+        resolve_server: impl FnOnce() -> Result<String, AppError>,
+        transport: BlossomHttpTransport,
+    ) -> Result<Self, AppError> {
+        if !input.is_present() {
+            return Err(AppError::InvalidEncryptedMedia(
+                "group has no image set".into(),
+            ));
+        }
+        // Resolve the server before taking fields out of `input` so a lookup
+        // failure leaves the key material inside the zeroizing input holder.
+        let server = resolve_server()?;
+        Ok(Self {
+            image_hash_hex: std::mem::take(&mut input.image_hash_hex),
+            image_key_hex: Zeroizing::new(std::mem::take(&mut input.image_key_hex)),
+            image_nonce_hex: std::mem::take(&mut input.image_nonce_hex),
+            media_type: input.media_type.take().unwrap_or_default(),
+            server,
+            transport,
+        })
+    }
+
     pub(crate) async fn run(self) -> Result<Vec<u8>, AppError> {
         fetch_group_image_with_transport(
             &self.image_hash_hex,
@@ -865,6 +975,10 @@ pub struct AppClient {
     /// persisted. Before this index existed, every inbound delivery and every
     /// publish-report batch rebuilt a `HashSet` from the full 16k-entry ring.
     pub(crate) seen_events_index: receipts::SeenEventIndex,
+    /// What this client's inbox relay checks established, by relay URL.
+    /// They go with the client (`relay_checks`).
+    pub(crate) inbox_relay_checks:
+        std::collections::BTreeMap<String, crate::relay_health::CheckRecord>,
     /// Number of ids at the tail of `state.seen_events` observed since the last
     /// successful account-projection checkpoint. The count saturates at the
     /// bounded ring length, so even a catch-up batch larger than the window
@@ -1374,6 +1488,9 @@ pub(crate) enum MaintenancePasses {
     /// A wake-collection runtime (`CursorPersistence::Frozen`) leaves the
     /// passes to an advancing one.
     Frozen,
+    /// Interactive onboarding has not completed yet: setup owns the first
+    /// KeyPackage publication and background maintenance waits for it.
+    Onboarding,
 }
 
 impl AppClient {
@@ -1597,6 +1714,11 @@ impl AppClient {
             MaintenancePasses::SignOutHeld
         } else if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
             MaintenancePasses::Frozen
+        } else if crate::runtime::onboarding_defers_key_package_maintenance(
+            &self.app,
+            &self.state.label,
+        ) {
+            MaintenancePasses::Onboarding
         } else {
             MaintenancePasses::Run
         })
@@ -1619,7 +1741,7 @@ impl AppClient {
                     .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
                 return Ok(maintenance_run_summary_from_account(summary));
             }
-            MaintenancePasses::Frozen => {
+            MaintenancePasses::Frozen | MaintenancePasses::Onboarding => {
                 self.runtime.sweep_expired_key_package_private_material()?;
                 self.discard_expired_sibling_key_packages();
                 let summary = self
@@ -1680,6 +1802,9 @@ impl AppClient {
         boxed(|| self.device_rename_upkeep()).await;
         boxed(|| self.drive_history_deliveries()).await;
         let prepared = self.epoch_gap_held_groups().and_then(|held| {
+            // Safety net for direct AppClient callers and any missed worker
+            // relay-config signals; no-op when endpoints are unchanged.
+            self.refresh_key_package_routing()?;
             self.sync_key_package_announcement_group()?;
             self.sync_device_tag_group()?;
             Ok(held)
@@ -1898,7 +2023,7 @@ impl AppClient {
     }
 
     pub(crate) fn key_package_maintenance_requires_catch_up(&self) -> bool {
-        self.app.cursor_persistence() == crate::CursorPersistence::Advance
+        matches!(self.maintenance_passes(), Ok(MaintenancePasses::Run))
             && self
                 .runtime
                 .key_package_maintenance_requires_catch_up()
@@ -1973,7 +2098,8 @@ impl AppClient {
         media_type: &str,
     ) -> Result<AppPreparedGroupImageUpload, AppError> {
         let prepared = prepare_group_image_upload(plaintext, media_type)?;
-        let component_data = hex::decode(AppGroupImageComponent::new(prepared.input).data_hex)?;
+        let component = AppGroupImageComponent::new(prepared.input);
+        let component_data = hex::decode(&component.data_hex)?;
         let mut id_bytes = [0_u8; 16];
         OsRng.fill_bytes(&mut id_bytes);
         let upload_id = hex::encode(id_bytes);
@@ -2072,25 +2198,26 @@ impl AppClient {
                 prepared_group_image_status(&record.status()),
             ));
         }
-        let input =
-            AppGroupImageInput::from_component_bytes(&record.component_data).ok_or_else(|| {
+        let mut input = AppGroupImageInput::from_component_bytes(&record.component_data)
+            .ok_or_else(|| {
                 AppError::InvalidEncryptedMedia("prepared group image component is invalid".into())
             })?;
         let encrypted_blob = record.encrypted_blob.ok_or_else(|| {
             AppError::InvalidEncryptedMedia("prepared group image ciphertext is missing".into())
         })?;
-        let upload_secret = record.upload_secret.ok_or_else(|| {
+        let upload_secret = Zeroizing::new(record.upload_secret.ok_or_else(|| {
             AppError::InvalidEncryptedMedia("prepared group image upload key is missing".into())
-        })?;
+        })?);
+        let server = self
+            .app
+            .deployment()
+            .group_image_endpoint_for(server.as_deref())?;
         Ok(PreparedGroupImageUploadStart::Http(
             PreparedGroupImageUploadHttp {
                 encrypted_blob,
-                image_hash_hex: input.image_hash_hex,
-                upload_secret: Zeroizing::new(upload_secret),
-                server: self
-                    .app
-                    .deployment()
-                    .group_image_endpoint_for(server.as_deref())?,
+                image_hash_hex: std::mem::take(&mut input.image_hash_hex),
+                upload_secret,
+                server,
                 allow_loopback_http,
                 transport: self.blossom_http_transport.clone(),
             },
@@ -2628,7 +2755,8 @@ impl AppClient {
                                 step.finish(&upload);
                                 let upload = upload?;
                                 let input = AppGroupImageInput::from(upload);
-                                hex::decode(AppGroupImageComponent::new(input).data_hex)?
+                                let component = AppGroupImageComponent::new(input);
+                                hex::decode(&component.data_hex)?
                             }
                             InitialGroupImageSource::Prepared { component_data, .. } => {
                                 component_data
@@ -6115,6 +6243,10 @@ impl AppClient {
             }
             crate::media::file_transfer::MediaUploadPayload::Bytes(_) => None,
         };
+        let storage = self.app.account_storage(&self.state.label)?;
+        let media = self.app.account_media_store(&self.state.label, &storage)?;
+        let account_dir = self.app.account_dir(&self.state.label);
+        let fallback_policy = crate::runtime::attachment_controls::default_policy(&self.app.config);
         Ok((
             EncryptedMediaUploadHttp {
                 request,
@@ -6127,8 +6259,11 @@ impl AppClient {
                 allowed_locator_kinds: policy.allowed_locator_kinds,
                 allow_loopback_http: allow_loopback,
                 transport: self.blossom_http_transport.clone(),
-                retention_app: self.app.clone(),
-                retention_account: self.state.label.clone(),
+                storage,
+                media,
+                account_dir,
+                fallback_policy,
+                tasks: crate::runtime::account_worker::WorkerTaskScope::new(),
                 retention_group: group_id.clone(),
             },
             EncryptedMediaUploadFinish {
@@ -6441,7 +6576,8 @@ impl AppClient {
                 step.finish(&upload);
                 AppGroupImageInput::from(upload?)
             };
-            let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
+            let component = AppGroupImageComponent::new(input);
+            let data = hex::decode(&component.data_hex)?;
             let effects = self
                 .runtime
                 .send_host_change_with_audit_context(
@@ -6476,20 +6612,12 @@ impl AppClient {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups_for_send("prepare_group_image_download")
             .await?;
-        let input = self.image_for_group(group_id);
-        if !input.is_present() {
-            return Err(AppError::InvalidEncryptedMedia(
-                "group has no image set".into(),
-            ));
-        }
-        Ok(GroupImageDownloadHttp {
-            image_hash_hex: input.image_hash_hex,
-            image_key_hex: input.image_key_hex,
-            image_nonce_hex: input.image_nonce_hex,
-            media_type: input.media_type.unwrap_or_default(),
-            server: self.app.deployment().group_image_endpoint_for(None)?,
-            transport: self.blossom_http_transport.clone(),
-        })
+        let mut input = self.image_for_group(group_id);
+        GroupImageDownloadHttp::try_from_input(
+            &mut input,
+            || self.app.deployment().group_image_endpoint_for(None),
+            self.blossom_http_transport.clone(),
+        )
     }
 
     /// Send an app-defined event with an arbitrary non-reserved kind. `tags`
@@ -7545,6 +7673,17 @@ impl AppClient {
         Ok(())
     }
 
+    /// Refresh only the account's KeyPackage publication endpoints from the
+    /// latest directory relay lists so a live worker or maintenance pass picks
+    /// up NIP-65 read/write changes without rebuilding group subscriptions.
+    pub(crate) fn refresh_key_package_routing(&self) -> Result<bool, AppError> {
+        let relay_lists = self.app.account_relay_list_status(&self.state.label)?;
+        let endpoints = self
+            .app
+            .key_package_endpoints(&self.state.label, &relay_lists)?;
+        Ok(self.routing.replace_key_package_endpoints(endpoints))
+    }
+
     /// Install the inbox routes of the given members, which a Welcome publish
     /// needs. Key-package resolution has just stored their relay lists, and
     /// nothing else in the table can have changed, so this replaces a
@@ -7940,8 +8079,20 @@ impl AppClient {
     /// Re-publish a welcome that a confirmed create/invite failed to deliver,
     /// from the copy the engine stored at wrap time — no re-commit (mdk#352).
     /// Clears the pending record only once the welcome is accepted; a repeated
-    /// failure leaves it queued for a later retry.
+    /// failure leaves it queued for a later retry. Rejects Welcomes belonging
+    /// to groups the host may not see (such as the internal device group).
     pub async fn redeliver_welcome(
+        &mut self,
+        message_id_hex: &str,
+    ) -> Result<SendSummary, AppError> {
+        let message_id = cgka_traits::MessageId::new(hex::decode(message_id_hex)?);
+        self.require_host_visible_welcome(&message_id)?;
+        self.redeliver_welcome_internal(message_id_hex).await
+    }
+
+    /// Internal redelivery seam for device-pairing link maintenance, which owns
+    /// the device group's own founding/linking Welcome retries.
+    pub(super) async fn redeliver_welcome_internal(
         &mut self,
         message_id_hex: &str,
     ) -> Result<SendSummary, AppError> {
@@ -7980,6 +8131,34 @@ impl AppClient {
         observed
             .run_async(Box::pin(work), marmot_observability::confirmed_or_failure)
             .await
+    }
+
+    fn require_host_visible_welcome(
+        &self,
+        message_id: &cgka_traits::MessageId,
+    ) -> Result<(), AppError> {
+        use cgka_traits::EngineError;
+        use cgka_traits::storage::{MessageStorage as _, StorageError};
+        use marmot_session::{AccountError, SessionError};
+
+        // Match `AccountDeviceRuntime::redeliver_welcome`'s engine-wrapped
+        // storage error so missing and hidden device-group Welcomes remain
+        // indistinguishable and preserve the host/CLI `as_engine_error()`
+        // contract.
+        let engine_storage_error = |error: StorageError| {
+            AppError::Account(AccountError::Session(SessionError::Engine(
+                EngineError::Storage(error),
+            )))
+        };
+        let record = self
+            .app
+            .account_storage(&self.state.label)?
+            .get_message(message_id)
+            .map_err(engine_storage_error)?;
+        if !self.host_may_see_group(&record.group_id) {
+            return Err(engine_storage_error(StorageError::NotFound));
+        }
+        Ok(())
     }
 }
 
@@ -8526,6 +8705,63 @@ mod poll_send_validation_tests {
             AppError::InvalidAppMessagePayload(message)
                 if message == "poll is closed at the response event timestamp"
         ));
+    }
+}
+
+#[cfg(test)]
+mod group_image_download_http_tests {
+    use super::{
+        AppGroupImageInput, BlossomHttpTransport, GroupImageDownloadHttp,
+        PreparedGroupImageUploadHttp,
+    };
+    use crate::AppError;
+
+    #[test]
+    fn group_image_download_http_preserves_zeroizing_on_error_and_redacts_debug() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<GroupImageDownloadHttp>();
+        assert_zeroize_on_drop::<PreparedGroupImageUploadHttp>();
+
+        let hash_hex = "11".repeat(32);
+        let key_hex = "de".repeat(32);
+        let nonce_hex = "22".repeat(12);
+        let upload_key_hex = "ad".repeat(32);
+        let mut input = AppGroupImageInput {
+            image_hash_hex: hash_hex.clone(),
+            image_key_hex: key_hex.clone(),
+            image_nonce_hex: nonce_hex.clone(),
+            image_upload_key_hex: upload_key_hex,
+            media_type: Some("image/png".to_owned()),
+        };
+
+        let err = GroupImageDownloadHttp::try_from_input(
+            &mut input,
+            || Err(AppError::BlobStore("no group-image server".into())),
+            BlossomHttpTransport::new(false),
+        )
+        .expect_err("endpoint resolution failure must fail preparation");
+        assert!(matches!(err, AppError::BlobStore(_)));
+        assert_eq!(
+            input.image_key_hex, key_hex,
+            "endpoint failure must leave key material inside the zeroizing AppGroupImageInput"
+        );
+
+        let download = GroupImageDownloadHttp::try_from_input(
+            &mut input,
+            || Ok("https://blossom.example".to_owned()),
+            BlossomHttpTransport::new(false),
+        )
+        .expect("configured endpoint must produce download request");
+        assert!(input.image_key_hex.is_empty());
+        assert_eq!(download.image_key_hex.as_str(), key_hex);
+
+        let rendered = format!("{download:?}");
+        assert!(rendered.contains(&hash_hex));
+        assert!(rendered.contains("<redacted>"));
+        assert!(
+            !rendered.contains(&key_hex),
+            "GroupImageDownloadHttp Debug must not expose image_key_hex: {rendered}"
+        );
     }
 }
 

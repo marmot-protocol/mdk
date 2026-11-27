@@ -1,0 +1,11 @@
+[Unit]
+Description=Run MDK Revert-Only Bisect Agent every 2 minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=2m
+RandomizedDelaySec=15s
+Unit=mdk-bisect-agent.service
+
+[Install]
+WantedBy=timers.target

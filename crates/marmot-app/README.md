@@ -202,7 +202,12 @@ requires acknowledgements from its operational relays.
 Interactive sign-in keeps a notice before initial KeyPackage publication: signing
 in alone does not restore existing chats or messages. The historical `SingleDevice`
 step and acknowledgment APIs retain their names and consent rules, but current
-findings no longer declare all multi-device use unsupported. See the shared
+findings no longer declare all multi-device use unsupported. Hosts may opt in via
+`OnboardingOptions::pass_device_notice_when_none_found` to pass `SingleDevice`
+automatically after complete empty discovery (while keeping `single_device_notice`
+populated) and `OnboardingOptions::create_missing_inbox_list` to publish the
+recommended kind `10050` inbox list automatically after complete discovery confirms
+none exists (reported in `OnboardingSnapshot::created_inbox_list`). See the shared
 [notice copy and advisory discovery limits](../marmot-uniffi/README.md#single-device-notice).
 Hosts adopt that presentation through localization; MDK owns the pause, discovery
 and publication gate.
@@ -583,10 +588,10 @@ tags. MDK renames one tag of that design: a turn names the chat message that sta
   ordered by the first event's `seq`. `TimelineMessageRecord::agent_item` is the parsed latest version, with its
   `settles`; it is `None` for an item MDK cannot read, such as the old shape. A kind 1202 has no row.
 - **Late joiners.** A member added after an item began never gets its first event, only its later edits, and each
-  edit carries the whole item. Until the first event arrives (it may come in a sibling's history), the earliest edit
-  stands in for it: the row has the first event's id, sits at that edit's place, shows the highest version, and has
+  edit carries the whole item. Until the first event arrives (it may come in a sibling's history), the first edit
+  this device received stands in for it (not the one with the earliest `created_at`, which its sender chooses): the row has the first event's id, sits at that edit's place, shows the highest version, and has
   `agent_item_first_event_missing` set, so the app can say the item started earlier. An item in a thread stays in
-  it when its edits repeat `E`/`K`/`P`; without them it shows in the main timeline. Only the sender of that earliest
+  it when its edits repeat `E`/`K`/`P`; without them it shows in the main timeline. Only the sender of that
   edit can change or delete the row, and its retention and import source are that edit's. Once retention removes
   an item, an edit of it that arrives later does not show it again.
 - **Subagent threads.** A subagent is a thread hanging from its `task` item (marmot-agents D-121). Every item in it

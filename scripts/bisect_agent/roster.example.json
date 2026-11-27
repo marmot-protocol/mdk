@@ -1,0 +1,8 @@
+{
+  "wn_bin": "wn",
+  "engineering_group_id": "",
+  "alert_log_path": "/srv/mdk/state/bisect-alerts.jsonl",
+  "github_to_group": {
+    "example-maintainer": ""
+  }
+}

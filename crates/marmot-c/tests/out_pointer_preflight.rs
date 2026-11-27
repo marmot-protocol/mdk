@@ -8,13 +8,17 @@ use std::ffi::CString;
 use std::time::Instant;
 
 use marmot_c::commands::{
-    marmot_group_app_component, marmot_pending_welcome_deliveries,
-    marmot_send_prepared_media_with_client_token, marmot_set_group_archived,
-    marmot_update_app_component,
+    marmot_begin_onboarding, marmot_begin_onboarding_with_options, marmot_group_app_component,
+    marmot_pending_welcome_deliveries, marmot_send_prepared_media_with_client_token,
+    marmot_set_group_archived, marmot_update_app_component,
 };
 use marmot_c::subscriptions::{
     MarmotEventsSubscription, marmot_events_subscription_free, marmot_events_subscription_next,
     marmot_subscribe_events,
+};
+use marmot_c::types::onboarding::{
+    MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST,
+    MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND, marmot_onboarding_snapshot_free,
 };
 use marmot_c::{MarmotClient, MarmotStatus, marmot_client_free, marmot_client_shutdown};
 
@@ -623,5 +627,119 @@ fn prepared_media_snapshot_output_is_preflighted_before_any_input_is_used() {
             MarmotStatus::NullPointer
         );
         assert!(out.is_null());
+    }
+}
+
+#[test]
+fn begin_onboarding_with_options_validates_flags_and_persists_opt_in_options() {
+    use nostr::prelude::ToBech32;
+
+    let fixture = ClientFixture::new();
+    let relays = [fixture.relay_url.as_ptr()];
+
+    // Unknown flag bits are rejected before touching inputs and clear out-pointer.
+    for bad_flags in [
+        4u32,
+        MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST | 4,
+        u32::MAX,
+    ] {
+        let mut out = std::ptr::dangling_mut();
+        let status = unsafe {
+            marmot_begin_onboarding_with_options(
+                fixture.client,
+                std::ptr::null(),
+                relays.as_ptr(),
+                1,
+                relays.as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                bad_flags,
+                &raw mut out,
+            )
+        };
+        assert_eq!(status, MarmotStatus::InvalidArgument);
+        assert!(out.is_null());
+    }
+
+    let read_checkpoint_options = |account_id: &str| -> (bool, bool) {
+        let path = fixture
+            ._home
+            .path()
+            .join("accounts")
+            .join(account_id)
+            .join("onboarding.json");
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("checkpoint")).expect("json");
+        (
+            value["options"]["create_missing_inbox_list"]
+                .as_bool()
+                .expect("create_missing_inbox_list bool"),
+            value["options"]["pass_device_notice_when_none_found"]
+                .as_bool()
+                .expect("pass_device_notice_when_none_found bool"),
+        )
+    };
+
+    // marmot_begin_onboarding delegates with flags = 0 (both opt-in flags false).
+    let default_keys = nostr::prelude::Keys::generate();
+    let default_id = default_keys.public_key().to_hex();
+    let default_nsec = CString::new(default_keys.secret_key().to_bech32().unwrap()).unwrap();
+    let mut snapshot = std::ptr::null_mut();
+    let status = unsafe {
+        marmot_begin_onboarding(
+            fixture.client,
+            default_nsec.as_ptr(),
+            relays.as_ptr(),
+            1,
+            relays.as_ptr(),
+            1,
+            std::ptr::null(),
+            0,
+            &raw mut snapshot,
+        )
+    };
+    assert_eq!(status, MarmotStatus::Ok);
+    assert!(!snapshot.is_null());
+    assert!(unsafe { (*snapshot).created_inbox_list.is_null() });
+    unsafe { marmot_onboarding_snapshot_free(snapshot) };
+    assert_eq!(read_checkpoint_options(&default_id), (false, false));
+
+    // marmot_begin_onboarding_with_options forwards each bitmask combination accurately.
+    for (flags, expected) in [
+        (MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST, (true, false)),
+        (
+            MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND,
+            (false, true),
+        ),
+        (
+            MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST
+                | MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND,
+            (true, true),
+        ),
+    ] {
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        let nsec = CString::new(keys.secret_key().to_bech32().unwrap()).unwrap();
+        let mut out = std::ptr::null_mut();
+        let status = unsafe {
+            marmot_begin_onboarding_with_options(
+                fixture.client,
+                nsec.as_ptr(),
+                relays.as_ptr(),
+                1,
+                relays.as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                flags,
+                &raw mut out,
+            )
+        };
+        assert_eq!(status, MarmotStatus::Ok);
+        assert!(!out.is_null());
+        assert!(unsafe { (*out).created_inbox_list.is_null() });
+        unsafe { marmot_onboarding_snapshot_free(out) };
+        assert_eq!(read_checkpoint_options(&id), expected);
     }
 }

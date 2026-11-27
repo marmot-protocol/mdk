@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import nightly_release  # noqa: E402
+import rc_release  # noqa: E402
 import ci_runner  # noqa: E402
 import ci_archive_layout as archive_layout  # noqa: E402
 import check_pr_signatures as signatures  # noqa: E402
@@ -202,7 +202,7 @@ class SignaturePolicyTests(unittest.TestCase):
                     return bool(needs) and any(gated(parent, visited | {job}) for parent in
                         re.findall(r"[a-z0-9][a-z0-9-]*", needs[1]))
                 for job, body in jobs.items():
-                    if job not in {"required-ci", "merge-group-fail-fast"}:
+                    if job != "required-ci":
                         self.assertTrue(gated(job), f"{path.name}:{job} can run before signatures")
                         self.assertNotRegex(body, r"(?m)^    if:.*(?:always|failure|cancelled)\(")
 
@@ -225,6 +225,7 @@ class PackagingPolicyTests(unittest.TestCase):
         bindings_profile = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
         bp_trigger = bindings_profile.split("\npermissions:\n", 1)[0]
         self.assertIn("  workflow_dispatch:", bp_trigger)
+        self.assertIn("  workflow_call:", bp_trigger)
         self.assertNotIn("  pull_request:", bp_trigger)
         self.assertNotIn("  push:", bp_trigger)
         self.assertNotIn("issues: write", bindings_profile)
@@ -236,7 +237,7 @@ class PackagingPolicyTests(unittest.TestCase):
         push_block = wn_trigger.split("\n  push:\n", 1)[1].split("\n  workflow_dispatch:\n", 1)[0]
         push_lines = [line.strip() for line in push_block.splitlines()
                       if line.strip() and not line.strip().startswith("#")]
-        self.assertEqual(push_lines, ["tags:", "- wn-agent-v*", '- "!wn-agent-v*-nightly.*"'])
+        self.assertEqual(push_lines, ["tags:", "- wn-agent-v*", '- "!wn-agent-v*-nightly.*"', '- "!wn-agent-v*-rc.*"'])
         pr_block = wn_trigger.split("\n  pull_request:\n", 1)[1].split("\n  push:\n", 1)[0]
         for expected_path in (
             "crates/agent-control/**",
@@ -276,48 +277,330 @@ class PackagingPolicyTests(unittest.TestCase):
 
 
 class MergeGatePolicyTests(unittest.TestCase):
-    def test_only_the_merge_queue_and_opt_ins_select_the_full_matrix(self):
-        script = workflow_step("ci.yml", "Select CI mode")
-        for event, full_label, expected in [
-            ("pull_request", "false", "precheck"),
-            ("pull_request", "true", "full"),
-            ("merge_group", "false", "full"),
-            ("workflow_dispatch", "false", "full"),
-            ("push", "false", "warm"),
-        ]:
-            with self.subTest(event=event, full_label=full_label), tempfile.TemporaryDirectory() as tmp:
+    def test_pr_trust_only_marks_same_repo_collaborator_prs_as_team(self):
+        script = workflow_step("ci.yml", "Classify PR trust")
+        fake_gh = textwrap.dedent("""\
+            gh() {
+              if [[ "$FAKE_PERM" == "error" ]]; then return 1; fi
+              printf '%s\\n' "$FAKE_PERM"
+            }
+        """)
+        cases = [
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "admin", "true"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "maintain", "true"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "write", "true"),
+            # Organization member without write access must fail closed into full CI.
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "org-reader", "read", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "outsider", "none", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "error", "false"),
+            ("pull_request", "marmot-protocol/mdk", "external/mdk", "true", "alice", "admin", "false"),
+            ("pull_request", "marmot-protocol/mdk", "marmot-protocol/mdk", "true", "alice", "admin", "false"),
+            ("pull_request", "marmot-protocol/mdk", "", "false", "alice", "admin", "false"),
+            ("push", "marmot-protocol/mdk", "marmot-protocol/mdk", "false", "alice", "admin", "false"),
+        ]
+        for event, repo, head_repo, head_fork, author, perm, expected in cases:
+            with self.subTest(event=event, head_repo=head_repo, head_fork=head_fork, perm=perm), tempfile.TemporaryDirectory() as tmp:
                 output = Path(tmp) / "output"
-                subprocess.run(["bash", "-c", script], check=True, capture_output=True, timeout=10,
-                               env={**os.environ, "EVENT_NAME": event, "FULL_CI": full_label,
-                                    "GITHUB_OUTPUT": str(output)})
-                self.assertEqual(output.read_text(), f"ci_mode={expected}\n")
+                subprocess.run(
+                    ["bash", "-c", fake_gh + script],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": event,
+                        "REPO": repo,
+                        "HEAD_REPO": head_repo,
+                        "HEAD_FORK": head_fork,
+                        "PR_AUTHOR": author,
+                        "FAKE_PERM": perm,
+                        "GITHUB_OUTPUT": str(output),
+                    },
+                )
+                self.assertEqual(output.read_text(), f"is_team_pr={expected}\n")
 
-    def test_required_ci_rejects_skipped_jobs_in_full_runs(self):
+    def test_team_prs_select_fast_mode_while_external_prs_and_opt_ins_select_full(self):
+        script = workflow_step("ci.yml", "Select CI mode")
+        for event, full_label, is_team, requested_shards, expected_mode, expected_shards in [
+            ("pull_request", "false", "true", "", "fast", "14"),
+            ("pull_request", "true", "true", "6", "full", "14"),
+            ("pull_request", "false", "false", "6", "full", "14"),
+            ("pull_request", "false", "", "", "full", "14"),
+            ("workflow_dispatch", "false", "false", "", "full", "14"),
+            ("workflow_dispatch", "false", "false", "6", "full", "6"),
+            ("schedule", "false", "false", "6", "full", "6"),
+            ("push", "false", "false", "", "warm", "14"),
+        ]:
+            with self.subTest(
+                event=event,
+                full_label=full_label,
+                is_team=is_team,
+                shards=requested_shards,
+            ), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "output"
+                subprocess.run(
+                    ["bash", "-c", script],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": event,
+                        "FULL_CI": full_label,
+                        "IS_TEAM_PR": is_team,
+                        "REQUESTED_SHARDS": requested_shards,
+                        "SOURCE_SHA": "",
+                        "GITHUB_OUTPUT": str(output),
+                    },
+                )
+                parsed = dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line)
+                self.assertEqual(parsed["ci_mode"], expected_mode)
+                self.assertEqual(parsed["rust_test_shards"], expected_shards)
+                self.assertEqual(
+                    json.loads(parsed["rust_test_partitions"]),
+                    list(range(1, int(expected_shards) + 1)),
+                )
+
+        # Invalid shard counts and malformed source_sha inputs must fail closed.
+        for bad_env in (
+            {"EVENT_NAME": "schedule", "REQUESTED_SHARDS": "9", "SOURCE_SHA": ""},
+            {"EVENT_NAME": "schedule", "REQUESTED_SHARDS": "6", "SOURCE_SHA": "not-a-sha"},
+        ):
+            with self.subTest(bad_env=bad_env), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "output"
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "FULL_CI": "false",
+                        "IS_TEAM_PR": "false",
+                        "GITHUB_OUTPUT": str(output),
+                        **bad_env,
+                    },
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_required_ci_enforces_fast_team_gate_and_full_external_gate(self):
         script = workflow_step("ci.yml", "Require every selected core CI job to succeed")
-        passed = {"signatures": {"result": "success"}, "changes": {"result": "success"},
-                  "rust-test": {"result": "success"}}
-        skipped = {**passed, "rust-test": {"result": "skipped"}}
+        passed = {
+            "signatures": {"result": "success"},
+            "changes": {"result": "success"},
+            "rust-format": {"result": "success"},
+            "rust-audit": {"result": "success"},
+            "ios-account-clippy": {"result": "success"},
+            "marmotkit-native-host": {"result": "success"},
+            "rust-test": {"result": "success"},
+        }
+        skipped = {
+            **passed,
+            "ios-account-clippy": {"result": "skipped"},
+            "marmotkit-native-host": {"result": "skipped"},
+            "rust-test": {"result": "skipped"},
+        }
+        apple_passed = {
+            **skipped,
+            "ios-account-clippy": {"result": "success"},
+            "marmotkit-native-host": {"result": "success"},
+        }
         failed = {**passed, "rust-test": {"result": "failure"}}
         cancelled = {**passed, "rust-test": {"result": "cancelled"}}
-        for event, mode, needs, expected in [
-            ("pull_request", "precheck", skipped, True),
-            ("pull_request", "precheck", failed, False),
-            ("pull_request", "precheck", {**passed, "signatures": {"result": "skipped"}}, False),
-            ("pull_request", "precheck", {**passed, "signatures": {"result": "failure"}}, False),
-            ("pull_request", "precheck", cancelled, False),
-            ("pull_request", "full", skipped, False),
-            ("merge_group", "full", passed, True),
-            ("merge_group", "full", skipped, False),
-            ("merge_group", "full", cancelled, False),
-            ("merge_group", "precheck", skipped, False),
-            ("merge_group", "", skipped, False),
-            ("push", "warm", skipped, True),
+        for event, mode, is_team, apple_opt_in, needs, expected in [
+            ("pull_request", "fast", "true", "false", skipped, True),
+            ("pull_request", "fast", "true", "true", apple_passed, True),
+            ("pull_request", "fast", "true", "true", skipped, False),
+            ("pull_request", "fast", "true", "true", {**apple_passed, "ios-account-clippy": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "true", {**apple_passed, "marmotkit-native-host": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", failed, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "signatures": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "changes": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-format": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-audit": {"result": "skipped"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-audit": {"result": "failure"}}, False),
+            ("pull_request", "fast", "true", "false", {**skipped, "rust-format": {"result": "failure"}}, False),
+            ("pull_request", "fast", "true", "false", cancelled, False),
+            ("pull_request", "fast", "false", "false", skipped, False),
+            ("pull_request", "full", "false", "false", passed, True),
+            ("pull_request", "full", "false", "false", skipped, False),
+            ("pull_request", "full", "true", "true", skipped, False),
+            ("pull_request", "", "true", "false", skipped, False),
+            ("push", "warm", "false", "false", skipped, True),
         ]:
-            with self.subTest(event=event, mode=mode, needs=needs):
-                result = subprocess.run(["bash", "-c", script], capture_output=True, timeout=10,
-                                        env={**os.environ, "EVENT_NAME": event, "CI_MODE": mode,
-                                             "NEEDS": json.dumps(needs)})
+            with self.subTest(event=event, mode=mode, is_team=is_team, apple=apple_opt_in, needs=needs):
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": event,
+                        "CI_MODE": mode,
+                        "IS_TEAM_PR": is_team,
+                        "APPLE_OPT_IN": apple_opt_in,
+                        "TREE_STATE": "green",
+                        "TREE_STATE_REASON": "",
+                        "TREE_FIX_OPT_IN": "false",
+                        "NEEDS": json.dumps(needs),
+                    },
+                )
                 self.assertEqual(result.returncode == 0, expected)
+
+        # Meltdown freeze (tree_state=red) blocks PRs unless labelled `tree-fix` or `revert`.
+        for tree_state, tree_fix, expected in [
+            ("red", "false", False),
+            ("red", "", False),
+            ("red", "true", True),
+            ("green", "false", True),
+        ]:
+            with self.subTest(tree_state=tree_state, tree_fix=tree_fix):
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "EVENT_NAME": "pull_request",
+                        "CI_MODE": "fast",
+                        "IS_TEAM_PR": "true",
+                        "APPLE_OPT_IN": "false",
+                        "TREE_STATE": tree_state,
+                        "TREE_STATE_REASON": "canary red",
+                        "TREE_FIX_OPT_IN": tree_fix,
+                        "NEEDS": json.dumps(skipped),
+                    },
+                )
+                self.assertEqual(result.returncode == 0, expected)
+
+    def test_read_tree_state_blocks_red_or_malformed_and_defaults_green_when_absent(self):
+        script = workflow_step("ci.yml", "Read tree state")
+        labels_script = workflow_step("ci.yml", "Check CI opt-in labels")
+        self.assertIn('index("tree-fix") != null or index("revert") != null', labels_script)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            origin = Path(tmp) / "origin.git"
+            work = Path(tmp) / "work"
+            subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+            subprocess.run(["git", "init", "-b", "master", str(work)], check=True, capture_output=True)
+            for args in (
+                ("config", "user.name", "Test"),
+                ("config", "user.email", "test@example.com"),
+                ("config", "commit.gpgsign", "false"),
+                ("remote", "add", "origin", str(origin)),
+            ):
+                subprocess.run(["git", "-C", str(work), *args], check=True, capture_output=True)
+            (work / "README.md").write_text("hi\n")
+            subprocess.run(["git", "-C", str(work), "add", "."], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "commit", "-m", "init"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "push", "origin", "master"], check=True, capture_output=True)
+
+            def run_read(event="pull_request", repo="marmot-protocol/mdk"):
+                out = Path(tmp) / "out"
+                out.unlink(missing_ok=True)
+                subprocess.run(
+                    ["bash", "-c", script],
+                    cwd=work,
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={**os.environ, "EVENT_NAME": event, "REPO": repo, "GITHUB_OUTPUT": str(out)},
+                )
+                return dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+
+            # Missing tree-state branch defaults to green ONLY on standalone forks;
+            # the canonical repository fails closed to red.
+            self.assertEqual(run_read("pull_request", repo="someone/mdk")["tree_state"], "green")
+            canonical_missing = run_read("pull_request", repo="marmot-protocol/mdk")
+            self.assertEqual(canonical_missing["tree_state"], "red")
+            self.assertIn("canonical origin/tree-state branch is missing", canonical_missing["tree_state_reason"])
+
+            # Push orphan tree-state branch with green, red, and malformed JSON.
+            ts = Path(tmp) / "ts"
+            subprocess.run(["git", "init", "-b", "tree-state", str(ts)], check=True, capture_output=True)
+            for args in (
+                ("config", "user.name", "Test"),
+                ("config", "user.email", "test@example.com"),
+                ("config", "commit.gpgsign", "false"),
+                ("remote", "add", "origin", str(origin)),
+            ):
+                subprocess.run(["git", "-C", str(ts), *args], check=True, capture_output=True)
+
+            for payload, expected_state in [
+                ('{"schema_version":1,"state":"green","reason":"ok"}\n', "green"),
+                ('{"schema_version":1,"state":"red","reason":"broken canary"}\n', "red"),
+                ('not-json\n', "red"),
+            ]:
+                (ts / "state.json").write_text(payload)
+                subprocess.run(["git", "-C", str(ts), "add", "state.json"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(ts), "commit", "-m", "update"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(ts), "push", "-f", "origin", "tree-state"], check=True, capture_output=True)
+                with self.subTest(payload=payload.strip()):
+                    self.assertEqual(run_read("pull_request")["tree_state"], expected_state)
+            # A colliding tag `refs/tags/tree-state` pointing to green must NOT shadow a red
+            # `refs/heads/tree-state` branch (fetch must name `refs/heads/tree-state` explicitly).
+            (ts / "state.json").write_text('{"schema_version":1,"state":"green","reason":"tag decoy"}\n')
+            subprocess.run(["git", "-C", str(ts), "add", "state.json"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "commit", "-m", "tag green decoy"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "tag", "tree-state"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "push", "origin", "refs/tags/tree-state"], check=True, capture_output=True)
+            (ts / "state.json").write_text('{"schema_version":1,"state":"red","reason":"real branch red"}\n')
+            subprocess.run(["git", "-C", str(ts), "add", "state.json"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "commit", "-m", "branch red"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ts), "push", "-f", "origin", "refs/heads/tree-state"], check=True, capture_output=True)
+            colliding = run_read("pull_request")
+            self.assertEqual(colliding["tree_state"], "red")
+            self.assertEqual(colliding["tree_state_reason"].strip(), "real branch red")
+            # Non-PR events skip freeze check.
+            self.assertEqual(run_read("schedule")["tree_state"], "green")
+
+            # Broken/unreachable remote must fail closed to red (never silently default green).
+            subprocess.run(
+                ["git", "-C", str(work), "remote", "set-url", "origin", str(Path(tmp) / "missing.git")],
+                check=True,
+                capture_output=True,
+            )
+            broken = run_read("pull_request")
+            self.assertEqual(broken["tree_state"], "red")
+            self.assertIn("unable to verify origin/tree-state", broken["tree_state_reason"])
+
+    def test_fast_team_gate_skips_heavy_compile_jobs_and_honors_ci_apple(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        blocks = {
+            block.split(":\n", 1)[0]: block
+            for block in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs)
+            if ":\n" in block
+        }
+        for job_name in ("rust-wasm-check", "rust-android-check", "rust-clippy", "rust-test-build"):
+            with self.subTest(job=job_name):
+                self.assertIn("needs.changes.outputs.ci_mode != 'fast'", blocks[job_name])
+        # `ci:apple` must trigger both macOS jobs even when changed paths leave run_ios=false.
+        for job_name in ("ios-account-clippy", "marmotkit-native-host"):
+            with self.subTest(job=job_name):
+                self.assertIn(
+                    "needs.changes.outputs.apple_opt_in == 'true'\n"
+                    "      || (needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_ios == 'true')",
+                    blocks[job_name],
+                )
+
+    def test_android_check_and_workflow_call_contracts(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        justfile = (ROOT / "Justfile").read_text()
+        self.assertIn("  workflow_call:\n", workflow)
+        self.assertIn("ANDROID_NDK_VERSION: 27.2.12479018", workflow)
+        android_job = workflow.split("\n  rust-android-check:\n", 1)[1].split("\n  rust-clippy:\n", 1)[0]
+        # `ci_runner.py prepare` deletes /usr/local/lib/android, so android-check must skip it.
+        self.assertNotIn("ci_runner.py prepare", android_job)
+        self.assertNotIn("Upload runner diagnostics", android_job)
+        # CI and local development share the single `just android-check` recipe.
+        self.assertIn("run: just android-check", android_job)
+        self.assertIn("cargo check --locked --target aarch64-linux-android -p marmot-uniffi", justfile)
+        self.assertIn("aarch64-linux-android26-clang", justfile)
+        # Every checkout in ci.yml must honor optional inputs.source_sha for Canary pinning.
+        checkouts = workflow.count("uses: actions/checkout@")
+        pinned = workflow.count("ref: ${{ inputs.source_sha }}")
+        self.assertEqual(checkouts, pinned)
+        self.assertGreaterEqual(checkouts, 24)
 
     def test_required_ci_needs_every_gating_job(self):
         # Required CI is the only required check, so a job missing from its
@@ -326,17 +609,15 @@ class MergeGatePolicyTests(unittest.TestCase):
         jobs = set(re.findall(r"(?m)^  ([a-z0-9-]+):\n", workflow.split("\njobs:\n", 1)[1]))
         required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    runs-on:", 1)[0]
         needs = re.findall(r"(?m)^      - ([a-z0-9-]+)$", required)
-        # The layout experiment runs only on request; the watcher must never fail a run.
+        # The layout experiment runs only on request.
         self.assertEqual(sorted(needs),
-                         sorted(jobs - {"archive-layout-experiment", "merge-group-fail-fast", "required-ci"}))
+                         sorted(jobs - {"archive-layout-experiment", "required-ci"}))
 
     def test_full_runs_use_nextest_profiles_without_a_default_filter(self):
-        # The merge queue is the only gate that runs every test to the end, so a
-        # profile filter would silently drop coverage from master.
         profiles = tomllib.loads((ROOT / ".config/nextest.toml").read_text())["profile"]
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         used = set(re.findall(r"--profile (\S+)", workflow)) - {"minimal"}
-        self.assertEqual(used, {"ci", "default", "precheck"})
+        self.assertEqual(used, {"ci", "default"})
         for profile in used:
             with self.subTest(profile=profile):
                 config = profiles.get(profile, {})
@@ -345,154 +626,29 @@ class MergeGatePolicyTests(unittest.TestCase):
                 for override in config.get("overrides", []):
                     self.assertNotIn("default-filter", override)
 
-    def test_only_the_pre_check_counts_a_stopped_test_as_passed(self):
-        # A test that passes on timeout never finishes, so only the pull-request
-        # pre-check may select a profile that allows it.
+    def test_no_nextest_profile_counts_a_stopped_test_as_passed(self):
         profiles = tomllib.loads((ROOT / ".config/nextest.toml").read_text())["profile"]
         for name, config in profiles.items():
             timeouts = [config.get("slow-timeout")]
             timeouts += [override.get("slow-timeout") for override in config.get("overrides", [])]
             passes = any(isinstance(t, dict) and t.get("on-timeout") == "pass" for t in timeouts)
             with self.subTest(profile=name):
-                self.assertEqual(passes, name == "precheck")
+                self.assertFalse(passes)
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        steps = [step for step in workflow.split("\n      - name: ")[1:] if "--profile precheck" in step]
-        self.assertEqual(len(steps), 1)
-        self.assertIn("\n        if: needs.changes.outputs.ci_mode == 'precheck'\n", steps[0])
-        # The job holding that step must still start for a pre-check, or the
-        # pre-check silently loses its tests: it accepts skipped jobs.
-        jobs = workflow.split("\njobs:\n", 1)[1]
-        job = next(block for block in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs) if "--profile precheck" in block)
-        self.assertRegex(job, r"(?m)^    if: needs\.changes\.outputs\.run_full == 'true'$")
+        self.assertNotIn("--profile precheck", workflow)
 
-    def test_only_the_merge_group_watcher_can_cancel_and_it_cannot_fail_the_run(self):
+    def test_ci_has_no_dead_merge_group_triggers_or_write_permissions(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        watcher = workflow.split("\n  merge-group-fail-fast:\n", 1)[1].split("\n  required-ci:\n", 1)[0]
-        self.assertIn("    if: github.event_name == 'merge_group'\n", watcher)
-        self.assertIn("    continue-on-error: true\n    permissions:\n      actions: write\n      checks: read\n      contents: read\n\n",
-                      watcher)
-        # The branch lookup must name this run's own group and commit.
-        self.assertIn("          HEAD_REF: ${{ github.ref }}\n          HEAD_SHA: ${{ github.sha }}\n", watcher)
-        # Build and test jobs run third-party code; none of them may cancel or dispatch runs.
-        self.assertEqual(len(re.findall(r"(?m)^ +actions: write$", workflow)), 1)
-        # A job-level continue-on-error reads as success in `needs` but as a failed job to the watcher.
-        self.assertEqual(len(re.findall(r"(?m)^    continue-on-error:", workflow)), 1)
-        timeout = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", watcher).group(1))
-        watch = int(re.search(r"deadline=\$\(\(SECONDS \+ (\d+) \* 60\)\)", watcher).group(1))
-        self.assertLess(watch, timeout)
-        # Required CI must still run, and fail, once the watcher cancels the run.
+        self.assertNotIn("merge_group", workflow)
+        self.assertNotIn("merge-group-fail-fast", workflow)
+        # Build and test jobs run third-party code; none of them may hold write permissions
+        # or job-level continue-on-error.
+        self.assertEqual(len(re.findall(r"(?m)^ +[a-z-]+: write$", workflow)), 0)
+        self.assertEqual(len(re.findall(r"(?m)^    continue-on-error:", workflow)), 0)
+        # Required CI must still run and fail on cancelled runs.
         self.assertIn("\n  required-ci:\n    name: Required CI\n", workflow)
         required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    needs:\n", 1)[0]
         self.assertRegex(required, r"(?m)^    if: always\(\)$")
-
-    def test_merge_group_watcher_cancels_a_failed_or_dropped_group(self):
-        script = workflow_step("ci.yml", "Cancel the run when a job fails")
-        # gh applies the trailing --jq filter itself; the fake runs it with jq.
-        # Request n to an endpoint reads its response n, and later requests
-        # repeat its last response.
-        fakes = textwrap.dedent("""\
-            gh() {
-              if [[ "$1" == api ]]; then
-                echo "gh ${*:1:$#-1}" >> "$STATE/calls"
-                if [[ "$2" == */annotations ]]; then
-                  printf '%s' '[{"annotation_level":"failure","message":"No space left on device"}]' | jq -r "${@: -1}"
-                  return
-                fi
-                local kind=jobs
-                [[ "$*" != *matching-refs* ]] || kind=refs
-                local count=$(( $(cat "$STATE/$kind") + 1 ))
-                echo "$count" > "$STATE/$kind"
-                local last=$(ls "$STATE/$kind".*.json | wc -l)
-                local response="$STATE/$kind.$(( count < last ? count : last )).json"
-                [[ "$(cat "$response")" != error ]] || return 1
-                jq -r "${@: -1}" "$response"
-              else
-                echo "gh $*" >> "$STATE/calls"
-                local cancels=$(( $(cat "$STATE/cancels") + 1 ))
-                echo "$cancels" > "$STATE/cancels"
-                (( cancels > REFUSED_CANCELS ))
-              fi
-            }
-            sleep() { echo "sleep $1" >> "$STATE/calls"; SECONDS=$((SECONDS + $1)); }
-        """)
-
-        def job(name, status, conclusion=None):
-            return {"name": name, "status": status, "conclusion": conclusion}
-
-        group = "refs/heads/gh-readonly-queue/master/pr-7-" + "b" * 40
-        commit = "c" * 40
-
-        def branch(sha, ref=group):
-            return [{"ref": ref, "object": {"type": "commit", "sha": sha}}]
-
-        live, gone, reused = branch(commit), [], branch("d" * 40)
-        running = [job("Classify CI changes", "completed", "success"),
-                   job("Rust tests (1/7)", "in_progress"), job("Rust WASM check", "completed", "skipped")]
-        failed = running + [job("Relay runtime tests (2/2)", "completed", "failure")]
-        finished = [job("Rust tests (1/7)", "completed", "success"), job("Required CI", "queued")]
-        poll = "gh api --paginate repos/o/r/actions/runs/42/jobs?per_page=100 --jq"
-        look = f"gh api repos/o/r/git/matching-refs/{group.removeprefix('refs/')} --jq"
-        wait, cancel = "sleep 60", "gh run cancel 42"
-        for name, jobs, refs, refused, expected, env in [
-            ("failure cancels at once", [failed], [live], 0, [poll, cancel], {}),
-            ("dead runner annotations survive cancellation",
-             [running + [{**job("Rust tests (1/14)", "completed", "failure"),
-                          "check_run_url": "https://api.github.com/repos/o/r/check-runs/7"}]],
-             [live], 0, [poll, "gh api https://api.github.com/repos/o/r/check-runs/7/annotations --jq", cancel], {}),
-            ("timeout or cancellation counts as a failure",
-             [running + [job("Windows filesystem contracts", "completed", "cancelled")]], [live], 0,
-             [poll, cancel], {}),
-            ("success, skips and running jobs on a live branch keep watching", [running, finished], [live], 0,
-             [poll, look, wait, poll], {}),
-            ("Required CI means nothing is left to stop",
-             [finished + [job("Rust tests (2/7)", "completed", "failure")]], [gone], 0, [poll], {}),
-            ("failed request is retried", ["error", failed], [live], 0, [poll, wait, poll, cancel], {}),
-            ("refused cancel is retried", [failed], [live], 1, [poll, cancel, wait, poll, cancel], {}),
-            ("watching stops at the deadline", [running], [live], 0, [poll, look, wait] * 150, {}),
-            # The queue deleted the group's branch, or gave its name to a later group on the same base.
-            ("a branch gone for two lookups cancels", [running], [gone], 0,
-             [poll, look, wait, poll, look, cancel], {}),
-            ("a branch reused by another group cancels", [running], [reused], 0,
-             [poll, look, wait, poll, look, cancel], {}),
-            ("another branch sharing the prefix is not this group", [running],
-             [branch(commit, group + "-other")], 0, [poll, look, wait, poll, look, cancel], {}),
-            ("refused cancel of a dropped group is retried", [running], [gone], 1,
-             [poll, look, wait, poll, look, cancel, wait, poll, look, cancel], {}),
-            # A passed group's branch is deleted after Required CI appears, which wins.
-            ("a passed group's deleted branch never cancels", [running, finished], [gone], 0,
-             [poll, look, wait, poll], {}),
-            ("one missing lookup is not enough", [running, running, running, finished], [gone, live, gone], 0,
-             [poll, look, wait, poll, look, wait, poll, look, wait, poll], {}),
-            ("a failed lookup proves nothing", [running, running, running, finished], [gone, "error", gone], 0,
-             [poll, look, wait, poll, look, wait, poll, look, wait, poll], {}),
-            ("a failed jobs request skips the lookup", [running, "error", finished], [gone], 0,
-             [poll, look, wait, poll, wait, poll], {}),
-            ("no group branch, no lookups", [running, finished], [gone], 0, [poll, wait, poll],
-             {"HEAD_REF": ""}),
-            ("a tag is not a group branch", [running, finished], [gone], 0, [poll, wait, poll],
-             {"HEAD_REF": "refs/tags/v1"}),
-            ("a malformed commit disables lookups", [running, finished], [gone], 0, [poll, wait, poll],
-             {"HEAD_SHA": "HEAD"}),
-        ]:
-            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
-                state = Path(tmp)
-                (state / "calls").write_text("")
-                for counter in ("jobs", "refs", "cancels"):
-                    (state / counter).write_text("0")
-                for kind, responses in (("jobs", [{"jobs": r} if r != "error" else r for r in jobs]),
-                                        ("refs", refs)):
-                    for index, response in enumerate(responses, 1):
-                        body = response if response == "error" else json.dumps(response)
-                        (state / f"{kind}.{index}.json").write_text(body)
-                # GitHub runs `run:` steps with `bash -e`.
-                result = subprocess.run(["bash", "-e", "-c", fakes + script], capture_output=True, text=True,
-                                        timeout=60, env={**os.environ, "STATE": tmp, "GH_REPO": "o/r",
-                                                         "RUN_ID": "42", "HEAD_REF": group, "HEAD_SHA": commit,
-                                                         "REFUSED_CANCELS": str(refused), **env})
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual((state / "calls").read_text().splitlines(), expected)
-                if name == "dead runner annotations survive cancellation":
-                    self.assertIn("No space left on device", result.stdout)
 
 
 class CacheBudgetPolicyTests(unittest.TestCase):
@@ -509,10 +665,10 @@ class CacheBudgetPolicyTests(unittest.TestCase):
                 save_if = save_if.group(1) if save_if else "true"
                 with self.subTest(workflow=workflow.name, step=step.splitlines()[0]):
                     if workflow.name == "wn-agent-binaries.yml":
-                        # Release tags and nightlies publish these binaries, so
-                        # they never restore a cache (binding packages below).
+                        # Release tags, RCs, and promoted releases publish these binaries,
+                        # so they never restore a cache (binding packages below).
                         self.assertRegex(step, r"(?m)^        if: runner\.os == 'macOS' && "
-                                               r"!startsWith\(github\.ref, 'refs/tags/'\) && !inputs\.nightly_version$")
+                                               r"!startsWith\(github\.ref, 'refs/tags/'\) && !inputs\.release_version$")
                     if save_if == "false":
                         continue
                     saving.add(workflow.name)
@@ -620,67 +776,20 @@ class OdinArchiveCacheTests(unittest.TestCase):
             self.assertFalse((tmp / "odin-install").exists())
 
 
-class NightlyReleasePolicyTests(unittest.TestCase):
-    DAY = dt.date(2026, 10, 20)
+class RcReleasePolicyTests(unittest.TestCase):
+    DAY = dt.date(2026, 11, 26)
 
-    def test_nightly_base_comes_only_from_a_dev_workspace_version(self):
-        self.assertEqual(nightly_release.nightly_base_version("0.14.0-dev"), "0.14.0")
-        for version in ("0.14.0", "0.14.0-rc.1", "0.14.0-dev.1", "v0.14.0-dev"):
-            with self.subTest(version=version):
-                self.assertIsNone(nightly_release.nightly_base_version(version))
-
-    def test_names_are_dated_and_take_a_counter_when_any_track_used_the_day(self):
-        choose = nightly_release.choose_nightly_version
-        self.assertEqual(choose("0.14.0", self.DAY, []), "0.14.0-nightly.20261020")
-        self.assertEqual(nightly_release.nightly_tags("0.14.0-nightly.20261020"), {
-            "marmotkit": "marmotkit-v0.14.0-nightly.20261020",
-            "marmotc": "marmotc-v0.14.0-nightly.20261020",
-            "wn-agent": "wn-agent-v0.14.0-nightly.20261020",
-        })
-        taken = ["marmotc-v0.14.0-nightly.20261020"]
-        self.assertEqual(choose("0.14.0", self.DAY, taken), "0.14.0-nightly.20261020.1")
-        taken += ["wn-agent-v0.14.0-nightly.20261020.1"]
-        self.assertEqual(choose("0.14.0", self.DAY, taken), "0.14.0-nightly.20261020.2")
-
-    def test_source_is_the_newest_green_commit_and_never_older_than_the_last_nightly(self):
-        shas = ["d", "c", "b", "a"]
-        select = nightly_release.select_source
-        self.assertEqual(select(shas, None, lambda sha: sha in {"c", "a"}), "c")
-        # Unchanged master: the previous nightly's source is the answer, so the run skips.
-        self.assertEqual(select(shas, "b", lambda sha: False), "b")
-        # A green commit older than the previous nightly is never chosen.
-        self.assertEqual(select(shas, "c", lambda sha: sha == "a"), "c")
-        self.assertIsNone(select(shas, None, lambda sha: False))
-
-    def test_retention_deletes_only_expired_unprotected_nightly_tags(self):
-        tags = [
-            "marmotkit-v0.14.0-nightly.20260919", "marmotc-v0.14.0-nightly.20260919.1",
-            "wn-agent-v0.13.0-nightly.20260901", "marmotkit-v0.14.0-nightly.20260920",
-            "marmotkit-v0.14.0-nightly.20261019", "marmotkit-v0.14.0-nightly.20260801",
-            # Formal, snapshot, other pre-releases and malformed names are never touched.
-            "v0.13.0", "marmotkit-v0.13.0", "marmotc-v0.12.0", "wn-agent-v0.13.0",
-            "marmotkit-v0.14.0-rc.1", "marmotkit-snapshot-" + "a" * 40,
-            "v0.14.0-nightly.20200101", "marmotkit-v0.14.0-nightly.20261399",
-            "marmotkit-v0.14.0-nightly.2020010", "marmotkit-v0.14.0-nightly.20200101-x",
-        ]
-        expired = nightly_release.expired_nightly_tags(
-            tags, self.DAY, protected=["marmotkit-v0.14.0-nightly.20260801"]
-        )
-        self.assertEqual(expired, [
-            "marmotc-v0.14.0-nightly.20260919.1",
-            "marmotkit-v0.14.0-nightly.20260919",
-            "wn-agent-v0.13.0-nightly.20260901",
-        ])
-
-    def test_latest_json_names_each_track_asset_with_its_url_and_checksum(self):
-        version = "0.14.0-nightly.20261020"
+    def test_rc_latest_json_names_each_track_asset_with_its_url_and_checksum(self):
+        version = "0.20.0-rc.1"
         releases = {
             prefix: {"assets": [{"name": f"{prefix}.zip", "size": 3, "digest": "sha256:" + "b" * 64}]}
-            for prefix in nightly_release.TRACK_PREFIXES
+            for prefix in rc_release.TRACK_PREFIXES
         }
-        document = nightly_release.latest_document(version, "a" * 40, releases, "o/r", "https://run")
+        document = rc_release.latest_rc_document(
+            version, "a" * 40, releases, "o/r", "https://run", today=self.DAY
+        )
         self.assertEqual((document["version"], document["source_sha"], document["date"]),
-                         (version, "a" * 40, "2026-10-20"))
+                         (version, "a" * 40, "2026-11-26"))
         self.assertEqual(document["tracks"]["marmotc"], {
             "tag": "marmotc-v" + version,
             "release_url": "https://github.com/o/r/releases/tag/marmotc-v" + version,
@@ -688,62 +797,139 @@ class NightlyReleasePolicyTests(unittest.TestCase):
                         "url": f"https://github.com/o/r/releases/download/marmotc-v{version}/marmotc.zip"}],
         })
         releases["wn-agent"]["assets"][0]["digest"] = None
-        with self.assertRaises(nightly_release.NightlyError):
-            nightly_release.latest_document(version, "a" * 40, releases, "o/r", "https://run")
+        with self.assertRaises(rc_release.ReleaseError):
+            rc_release.latest_rc_document(version, "a" * 40, releases, "o/r", "https://run", today=self.DAY)
 
-    def test_only_release_and_snapshot_runs_hold_the_lane(self):
-        busy = nightly_release.busy_release_runs({
+    def test_only_release_promotion_and_snapshot_runs_hold_the_lane(self):
+        busy = rc_release.busy_release_runs({
             "bindings.yaml": [{"id": 1, "status": "in_progress", "event": "workflow_dispatch"},
                               {"id": 2, "status": "completed", "event": "push"}],
             "c-bindings.yml": [{"id": 3, "status": "queued", "event": "push"}],
+            "promote-release.yml": [{"id": 7, "status": "in_progress", "event": "workflow_dispatch"}],
             "wn-agent-binaries.yml": [
                 {"id": 4, "status": "in_progress", "event": "push", "head_branch": "master"},
-                {"id": 5, "status": "waiting", "event": "push", "head_branch": "wn-agent-v0.14.0"},
+                {"id": 5, "status": "waiting", "event": "push", "head_branch": "wn-agent-v0.19.0"},
                 {"id": 6, "status": "in_progress", "event": "pull_request", "head_branch": "wn-agent-v-ish"},
             ],
         })
-        self.assertEqual([run["id"] for run in busy], [1, 3, 5])
+        self.assertEqual([run["id"] for run in busy], [1, 3, 7, 5])
 
-    def test_required_ci_is_read_from_the_merge_queue_run_for_the_master_commit(self):
-        # Shape of run 39288024598: the merge-queue run that produced master commit 3cafb038
-        # reports that same commit as head_sha, on its gh-readonly-queue branch.
-        master = "3cafb03883832fb27f4fee178e9568be53acb1b8"
-        gh = nightly_release.GitHub("o/r", "token")
-        runs = {"workflow_runs": [{"id": 39288024598, "head_sha": master, "conclusion": "success",
-                                   "event": "merge_group",
-                                   "head_branch": "gh-readonly-queue/master/pr-2469-3188510989374e7b588717fc3d077c257f6a55ce"}]}
-        jobs = [{"name": "Rust tests", "conclusion": "success"}, {"name": "Required CI", "conclusion": "success"}]
-        with unittest.mock.patch.object(gh, "get", return_value=runs) as get, \
-                unittest.mock.patch.object(gh, "paginate", return_value=jobs):
-            self.assertTrue(gh.required_ci_passed(master))
-        self.assertIn(f"event=merge_group&head_sha={master}&status=success", get.call_args.args[0])
-        for wrong_jobs in ([{"name": "Required CI", "conclusion": "failure"}], [{"name": "Rust tests", "conclusion": "success"}]):
-            with self.subTest(jobs=wrong_jobs), unittest.mock.patch.object(gh, "get", return_value=runs), \
-                    unittest.mock.patch.object(gh, "paginate", return_value=wrong_jobs):
-                self.assertFalse(gh.required_ci_passed(master))
-
-    def test_nightly_jobs_require_their_dependencies_and_own_concurrency(self):
-        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
-        self.assertIn("    if: success() && !inputs.build_only && !inputs.dry_run\n", workflow)
+    def test_rc_workflow_gates_publish_on_all_five_parallel_lanes_and_owns_concurrency(self):
+        workflow = (ROOT / ".github/workflows/rc-releases.yml").read_text()
+        self.assertIn(
+            "    needs: [plan, lane, simulator-nightly, convergence-hardening, marmotkit, marmotc, wn-agent]\n",
+            workflow,
+        )
+        self.assertIn("needs.lane.outputs.lane_free == 'true'", workflow)
+        self.assertIn("needs.simulator-nightly.result == 'success'", workflow)
+        self.assertIn("needs.convergence-hardening.result == 'success'", workflow)
+        # Hardening/simulator gates run before acquiring the shared macOS release lane.
+        self.assertIn("    needs: [plan, simulator-nightly, convergence-hardening]\n", workflow)
         self.assertEqual(workflow.count("    if: success() && needs.lane.outputs.lane_free == 'true'\n"), 3)
+        self.assertEqual(
+            workflow.count("    if: success() && needs.plan.outputs.skip != 'true' && !inputs.dry_run && !inputs.build_only\n"),
+            2,
+        )
+        # cleanup-drafts runs only when publish was skipped, never deleting drafts after publish starts.
+        cleanup_block = workflow.split("\n  cleanup-drafts:\n", 1)[1].split("\n  retention:\n", 1)[0]
+        self.assertIn("needs.publish.result == 'skipped'", cleanup_block)
+        # Never gate runner.temp uploads with hashFiles() (which only matches GITHUB_WORKSPACE).
+        self.assertNotIn("hashFiles(", workflow)
+        self.assertIn("uses: ./.github/workflows/simulator-nightly.yml", workflow)
+        self.assertIn("uses: ./.github/workflows/convergence-hardening.yml", workflow)
+        self.assertIn("  group: rc-releases\n", workflow)
+        self.assertNotIn("git push", workflow)
         bindings = (ROOT / ".github/workflows/bindings.yaml").read_text()
-        # A nightly must not share a same-SHA snapshot's group, which waits for the nightly.
-        self.assertIn("  group: marmotkit-bindings-${{ inputs.nightly_version || inputs.source_sha || github.ref }}-",
+        # RCs and promotions must not share a same-SHA snapshot's concurrency group.
+        self.assertIn("  group: marmotkit-bindings-${{ inputs.release_version || inputs.source_sha || github.ref }}-",
                       bindings)
+        # Simulator nightly and convergence hardening must pin inputs.source_sha on workflow_call.
+        for wf in ("simulator-nightly.yml", "convergence-hardening.yml"):
+            text = (ROOT / ".github/workflows" / wf).read_text()
+            self.assertIn("  workflow_call:\n", text)
+            self.assertIn("      source_sha:\n", text)
+            self.assertIn("ref: ${{ inputs.source_sha }}", text)
+        sim_text = (ROOT / ".github/workflows/simulator-nightly.yml").read_text()
+        self.assertNotIn("\n  schedule:\n", sim_text)
 
-    def test_a_failed_scheduled_nightly_reports_to_one_open_issue(self):
-        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+    def test_simulator_nightly_alerts_via_explicit_workflow_call_input_from_scheduled_rc(self):
+        sim = (ROOT / ".github/workflows/simulator-nightly.yml").read_text()
+        rc = (ROOT / ".github/workflows/rc-releases.yml").read_text()
+
+        # `simulator-nightly.yml` has no `schedule` trigger; gating on `github.event_name == 'schedule'`
+        # or `github.workflow == 'Simulator Nightly'` made all three failure alerts dead code.
+        self.assertNotIn("github.workflow == 'Simulator Nightly'", sim)
+        self.assertNotIn("github.event_name == 'schedule'", sim)
+        call_block = sim.split("\n  workflow_call:\n", 1)[1].split("\npermissions:\n", 1)[0]
+        self.assertRegex(
+            call_block,
+            r"(?s)      report_failure:\n(?:        [^\n]+\n)*?        default: false\n        type: boolean\n",
+        )
+        for step_name in (
+            "Report nightly failure",
+            "Report scheduled relay runtime failure",
+            "Report scheduled recovery failure",
+        ):
+            with self.subTest(step=step_name):
+                step = sim.split(f"      - name: {step_name}\n", 1)[1].split("\n      - name:", 1)[0]
+                self.assertIn("        if: ${{ failure() && inputs.report_failure == true }}\n", step)
+
+        rc_sim_job = rc.split("\n  simulator-nightly:\n", 1)[1].split("\n  convergence-hardening:\n", 1)[0]
+        self.assertIn("      issues: write\n", rc_sim_job)
+        self.assertIn("      report_failure: ${{ github.event_name == 'schedule' }}\n", rc_sim_job)
+
+    def test_all_workflows_and_bisect_classifier_align_on_one_cargo_nextest_version(self):
+        expected_version = "0.9.132"
+        found: list[tuple[str, str]] = []
+        for path in sorted((ROOT / ".github/workflows").glob("*.y*ml")):
+            text = path.read_text()
+            for match in re.finditer(r"cargo-nextest@([0-9]+\.[0-9]+\.[0-9]+)", text):
+                found.append((path.name, match.group(1)))
+            for match in re.finditer(
+                r"Install pinned cargo-nextest.*?version=([0-9]+\.[0-9]+\.[0-9]+)", text, re.S
+            ):
+                found.append((path.name, match.group(1)))
+        self.assertTrue(
+            {"ci.yml", "simulator-nightly.yml", "convergence-hardening.yml"} <= {wf for wf, _ in found},
+            f"expected nextest pins in core/scheduled workflows, got {found}",
+        )
+        drifted = [(wf, ver) for wf, ver in found if ver != expected_version]
+        self.assertEqual(drifted, [], f"drifted cargo-nextest pins: {drifted}")
+        classifier = (ROOT / "scripts/bisect_agent/classifier.py").read_text()
+        self.assertIn(expected_version, classifier)
+        self.assertNotIn("0.9.148", classifier)
+
+    def test_promote_workflow_skips_test_lanes_and_requires_metadata_diff_guard(self):
+        workflow = (ROOT / ".github/workflows/promote-release.yml").read_text()
+        self.assertIn("  workflow_dispatch:\n", workflow)
+        self.assertIn("      rc_version:\n", workflow)
+        self.assertIn("      override_version:\n", workflow)
+        self.assertNotIn("publish_crates_io", workflow)
+        self.assertIn("Preflight release credentials", workflow)
+        self.assertIn("META_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}", workflow)
+        self.assertIn("PR_GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}", workflow)
+        self.assertIn("validate-published-ios:", workflow)
+        self.assertIn("validate-published-macos:", workflow)
+        self.assertIn("\n  open-sync-pr:\n", workflow)
+        self.assertIn("python3 scripts/promote_release.py verify-metadata-diff", workflow)
+        self.assertIn("uses: ./.github/workflows/bindings.yaml", workflow)
+        self.assertIn("uses: ./.github/workflows/c-bindings.yml", workflow)
+        self.assertIn("uses: ./.github/workflows/wn-agent-binaries.yml", workflow)
+        self.assertNotIn("simulator-nightly.yml", workflow)
+        self.assertNotIn("convergence-hardening.yml", workflow)
+        self.assertNotIn("cargo test", workflow)
+        self.assertNotIn("cargo nextest", workflow)
+
+    def test_a_failed_scheduled_rc_reports_to_one_open_issue(self):
+        workflow = (ROOT / ".github/workflows/rc-releases.yml").read_text()
         jobs = re.findall(r"^  ([a-z][a-z-]*):\n", workflow.split("\njobs:\n", 1)[1], re.MULTILINE)
         report = workflow.split("\n  report:\n", 1)[1].split("\n    steps:\n", 1)[0]
-        # Skipped nights exit 0, so only real failures in any other job report. A job timeout
-        # leaves that job cancelled rather than failed; a cancelled run reports nothing.
         self.assertIn(f"    needs: [{', '.join(job for job in jobs if job != 'report')}]\n", report)
         self.assertIn("    if: github.event_name == 'schedule' && !cancelled() && "
                       "(failure() || contains(needs.*.result, 'cancelled'))\n", report)
         self.assertIn("    permissions:\n      issues: write\n", report)
-        self.assertEqual(workflow.count("issues: write"), 1)
 
-        script = workflow_step("nightly-releases.yml", "Open or update the nightly failure issue")
+        script = workflow_step("rc-releases.yml", "Open or update the RC failure issue")
         fake_gh = textwrap.dedent("""\
             gh() {
               if [[ "$1 $2" == "issue list" ]]; then
@@ -757,12 +943,12 @@ class NightlyReleasePolicyTests(unittest.TestCase):
         needs = json.dumps({"plan": {"result": "success"}, "marmotc": {"result": "failure"},
                             "wn-agent": {"result": "cancelled"}, "publish": {"result": "skipped"},
                             "retention": {"result": "failure"}})
-        body = ("--body The scheduled nightly failed for abc123 "
+        body = ("--body The scheduled RC (0.20.0-rc.1) failed for abc123 "
                 "(failed jobs: marmotc, wn-agent (cancelled), retention). Run: https://run")
         for issues, expected in [
-            ([{"number": 9, "title": "Nightly release failed twice"}],
-             f"issue create --repo o/r --title Nightly release failed {body}"),
-            ([{"number": 9, "title": "Nightly release failed twice"}, {"number": 12, "title": "Nightly release failed"}],
+            ([{"number": 9, "title": "RC release failed twice"}],
+             f"issue create --repo o/r --title RC release failed {body}"),
+            ([{"number": 9, "title": "RC release failed twice"}, {"number": 12, "title": "RC release failed"}],
              f"issue comment 12 --repo o/r {body}"),
         ]:
             with self.subTest(issues=issues), tempfile.TemporaryDirectory() as tmp:
@@ -770,63 +956,64 @@ class NightlyReleasePolicyTests(unittest.TestCase):
                 subprocess.run(
                     ["bash", "-c", fake_gh + script], check=True, timeout=10,
                     env={**os.environ, "ISSUES": json.dumps(issues), "LOG": str(log), "NEEDS": needs,
-                         "REPO": "o/r", "RUN_URL": "https://run", "SOURCE_SHA": "abc123"},
+                         "REPO": "o/r", "RUN_URL": "https://run", "SOURCE_SHA": "abc123",
+                         "RC_VERSION": "0.20.0-rc.1"},
                 )
                 self.assertEqual(log.read_text(), expected + "\n")
 
-    def test_tag_pushed_release_workflows_ignore_nightly_tags(self):
+    def test_tag_pushed_release_workflows_ignore_rc_and_nightly_tags(self):
         for workflow, prefix in [("bindings.yaml", "marmotkit"), ("c-bindings.yml", "marmotc"),
                                  ("wn-agent-binaries.yml", "wn-agent")]:
             with self.subTest(workflow=workflow):
                 text = (ROOT / ".github/workflows" / workflow).read_text()
                 self.assertIn(f'      - "!{prefix}-v*-nightly.*"\n', text)
+                self.assertIn(f'      - "!{prefix}-v*-rc.*"\n', text)
                 self.assertIn("  workflow_call:\n", text)
-                self.assertIn("      nightly_version:\n", text)
-                # Tag pushes and dispatches have no nightly_version input at all (null), so
+                self.assertIn("      release_version:\n", text)
+                # Tag pushes and dispatches have no release_version input at all (null), so
                 # conditions must test truthiness rather than compare with ''.
-                self.assertIsNone(re.search(r"inputs\.nightly_version\s*[!=]=", text))
-                self.assertIn("inputs.nightly_version }}", text)
+                self.assertIsNone(re.search(r"inputs\.release_version\s*[!=]=", text))
+                self.assertIn("inputs.release_version }}", text)
 
-    def test_nightlies_are_scheduled_pre_releases_that_never_become_latest(self):
-        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+    def test_rcs_are_scheduled_pre_releases_that_never_become_latest(self):
+        workflow = (ROOT / ".github/workflows/rc-releases.yml").read_text()
         self.assertIn('    - cron: "17 0 * * *"\n', workflow)
-        self.assertIn("  group: nightly-releases\n", workflow)
-        self.assertNotIn("git push", workflow)
-        script = (ROOT / "scripts/nightly_release.py").read_text()
-        self.assertEqual(script.count('"make_latest": "false"'), 2)
+        script = (ROOT / "scripts/rc_release.py").read_text()
+        self.assertIn('"make_latest": "false"', script)
         self.assertNotIn('"make_latest": "true"', script)
-        self.assertEqual(nightly_release.RETENTION_DAYS, 30)
+        self.assertEqual(rc_release.RETENTION_DAYS, 30)
         bindings = (ROOT / ".github/workflows/bindings.yaml").read_text()
         self.assertIn(
-            '          if [[ "$IS_NIGHTLY" == "true" ]]; then\n'
+            '          if [[ "$IS_RC" == "true" ]]; then\n'
             '            title="v$version - MarmotKit"\n'
             '            release_flags=(--prerelease --latest=false --target "$SOURCE_SHA")\n',
             bindings,
         )
 
-    def test_install_guidance_never_resolves_to_a_nightly(self):
+    def test_install_guidance_never_resolves_to_an_rc_or_nightly(self):
         with tempfile.TemporaryDirectory() as tmp:
             notes = Path(tmp) / "docs/release"
             notes.mkdir(parents=True)
-            for name in ("0.13.0.md", "0.14.0-nightly.20261020.md", "wn-homebrew.md"):
+            for name in ("0.19.0.md", "0.20.0-rc.1.md", "0.20.0-nightly.20261126.md", "wn-homebrew.md"):
                 (notes / name).write_text("notes\n")
-            self.assertEqual(documented_release_version(Path(tmp), "0.14.0-dev"), "0.13.0")
+            self.assertEqual(documented_release_version(Path(tmp), "0.20.0-dev"), "0.19.0")
         quickstart = (ROOT / "integrations/README.md").read_text()
         installer_pattern = re.search(r"grep -Eq '(\^https://github\[\.\]com/marmot-protocol/mdk/[^']+)'",
                                       quickstart).group(1)
         resolver = re.search(r'match = re\.fullmatch\(r"([^"]+)", tag\)', quickstart).group(1)
-        nightly = "wn-agent-v0.14.0-nightly.20261020"
-        url = f"https://github.com/marmot-protocol/mdk/releases/download/{nightly}/install-hermes-marmot.sh"
-        self.assertIsNone(re.search(installer_pattern, url))
-        self.assertIsNotNone(re.search(installer_pattern, url.replace(nightly, "wn-agent-v0.13.0")))
-        self.assertIsNone(re.fullmatch(resolver, nightly))
-        self.assertIsNotNone(re.fullmatch(resolver, "wn-agent-v0.13.0"))
+        for prerelease in ("wn-agent-v0.20.0-rc.1", "wn-agent-v0.20.0-nightly.20261126"):
+            url = f"https://github.com/marmot-protocol/mdk/releases/download/{prerelease}/install-hermes-marmot.sh"
+            self.assertIsNone(re.search(installer_pattern, url))
+            self.assertIsNone(re.fullmatch(resolver, prerelease))
+        stable_url = "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.19.0/install-hermes-marmot.sh"
+        self.assertIsNotNone(re.search(installer_pattern, stable_url))
+        self.assertIsNotNone(re.fullmatch(resolver, "wn-agent-v0.19.0"))
 
-    def test_binary_bundles_take_the_nightly_version_and_source_commit(self):
+    def test_binary_bundles_accept_minor_rc_patch_rc_and_stable_versions(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "src"
             root.mkdir()
-            (root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.14.0-dev"\n')
+            (root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.20.0-dev"\n')
             (root / "Cargo.lock").write_text("# lock\n")
             git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@example.com",
                    "-c", "commit.gpgsign=false"]
@@ -838,23 +1025,27 @@ class NightlyReleasePolicyTests(unittest.TestCase):
             binary = root / "target/x86_64-unknown-linux-gnu/release/wn-agent"
             binary.parent.mkdir(parents=True)
             binary.write_text("#!/bin/sh\n")
-            env = {**os.environ, "RUNNER_TEMP": tmp, "GITHUB_SHA": "f" * 40, "GITHUB_REF_TYPE": "branch",
-                   "RELEASE_SOURCE_SHA": source_sha, "NIGHTLY_VERSION": "0.14.0-nightly.20261020"}
             command = ["bash", str(ROOT / "scripts/package-binary-bundle.sh"), "wn-agent", "linux-x86_64",
                        "x86_64-unknown-linux-gnu"]
-            subprocess.run(command, cwd=root, env=env, check=True, capture_output=True)
-            asset = root / "dist/wn-agent-linux-x86_64/wn-agent-linux-x86_64-0.14.0-nightly.20261020.tar.gz"
-            manifest = json.loads(subprocess.run(
-                ["tar", "-xzOf", str(asset), "wn-agent-linux-x86_64/manifest.json"],
-                check=True, capture_output=True).stdout)
-            self.assertEqual(
-                (manifest["artifact_version"], manifest["release_tag"], manifest["source_sha"]),
-                ("0.14.0-nightly.20261020", "wn-agent-v0.14.0-nightly.20261020", source_sha))
-            for overrides in ({"NIGHTLY_VERSION": "0.15.0-nightly.20261020"},
-                              {"NIGHTLY_VERSION": "0.14.0-nightly.2026102"},
-                              {"RELEASE_SOURCE_SHA": "e" * 40}):
+            for rc_ver in ("0.20.0-rc.1", "0.19.1-rc.2"):
+                env = {**os.environ, "RUNNER_TEMP": tmp, "GITHUB_SHA": "f" * 40, "GITHUB_REF_TYPE": "branch",
+                       "RELEASE_SOURCE_SHA": source_sha, "RELEASE_VERSION": rc_ver}
+                subprocess.run(command, cwd=root, env=env, check=True, capture_output=True)
+                asset = root / f"dist/wn-agent-linux-x86_64/wn-agent-linux-x86_64-{rc_ver}.tar.gz"
+                manifest = json.loads(subprocess.run(
+                    ["tar", "-xzOf", str(asset), "wn-agent-linux-x86_64/manifest.json"],
+                    check=True, capture_output=True).stdout)
+                self.assertEqual(
+                    (manifest["artifact_version"], manifest["release_tag"], manifest["source_sha"]),
+                    (rc_ver, f"wn-agent-v{rc_ver}", source_sha))
+            base_env = {**os.environ, "RUNNER_TEMP": tmp, "GITHUB_SHA": "f" * 40, "GITHUB_REF_TYPE": "branch",
+                        "RELEASE_SOURCE_SHA": source_sha}
+            for overrides in ({"RELEASE_VERSION": "0.21.0-rc.1"},
+                              {"RELEASE_VERSION": "0.20.0-rc.0"},
+                              {"RELEASE_VERSION": "0.20.0"},
+                              {"RELEASE_VERSION": "0.20.0-rc.1", "RELEASE_SOURCE_SHA": "e" * 40}):
                 with self.subTest(overrides=overrides):
-                    result = subprocess.run(command, cwd=root, env={**env, **overrides}, capture_output=True)
+                    result = subprocess.run(command, cwd=root, env={**base_env, **overrides}, capture_output=True)
                     self.assertNotEqual(result.returncode, 0)
 
 
@@ -894,8 +1085,8 @@ class FlakeReportPolicyTests(unittest.TestCase):
                 self.assertEqual(log.read_text(), expected + "\n")
 
 
-class FakeNightlyGitHub:
-    """In-memory stand-in for the GitHub calls that publish_nightly makes."""
+class FakeRcGitHub:
+    """In-memory stand-in for the GitHub calls that publish_rc makes."""
 
     SHA = "a" * 40
 
@@ -905,11 +1096,12 @@ class FakeNightlyGitHub:
         self.fail_patch: set[str] = set()
         self.tags: dict[str, str] = {}
         self.meta_head: str | None = None
-        self.meta: dict | None = None
+        self.meta_files: dict[str, str] = {}
         self.commits: dict[str, dict] = {}
+        self.trees: dict[str, dict[str, str]] = {}
         self.blobs: dict[str, str] = {}
         self.releases = {}
-        for index, (prefix, title) in enumerate(nightly_release.TRACKS):
+        for index, (prefix, title) in enumerate(rc_release.TRACKS):
             tag = f"{prefix}-v{version}"
             self.releases[tag] = {
                 "id": index, "tag_name": tag, "name": f"v{version} - {title}", "draft": True,
@@ -927,25 +1119,38 @@ class FakeNightlyGitHub:
     def tag_commit(self, tag):
         return self.tags.get(tag)
 
-    def read_latest(self):
-        return self.meta
+    def read_latest_rc(self):
+        raw = self.meta_files.get(rc_release.RC_LATEST_FILE)
+        return json.loads(raw) if raw else None
+
+    def read_rc_counters(self):
+        raw = self.meta_files.get(rc_release.RC_COUNTERS_FILE)
+        return json.loads(raw).get("highest_rc", {}) if raw else {}
 
     def get(self, path, *, allow_404=False):
         suffix = path.removeprefix("repos/o/r/")
         if suffix.startswith("releases/"):
             release = next(r for r in self.releases.values() if r["id"] == int(suffix.split("/")[1]))
             return dict(release)
-        if suffix == f"git/ref/heads/{nightly_release.META_BRANCH}":
+        if suffix == f"git/ref/heads/{rc_release.META_BRANCH}":
             return {"object": {"sha": self.meta_head}} if self.meta_head else None
+        if suffix.startswith("git/commits/"):
+            sha = suffix.removeprefix("git/commits/")
+            return {"sha": sha, "tree": {"sha": self.commits[sha]["tree"]}}
         raise AssertionError(path)
 
     def request(self, method, path, body=None, **_):
         suffix = path.removeprefix("repos/o/r/")
+        if method == "DELETE" and suffix.startswith("releases/"):
+            rid = int(suffix.split("/")[1])
+            tag = next(t for t, r in self.releases.items() if r["id"] == rid)
+            del self.releases[tag]
+            return None, ""
         if method == "PATCH" and suffix.startswith("releases/"):
             release = next(r for r in self.releases.values() if r["id"] == int(suffix.split("/")[1]))
             if release["tag_name"] in self.fail_patch:
                 self.fail_patch.discard(release["tag_name"])
-                raise nightly_release.NightlyError(f"PATCH {path} failed with HTTP 502")
+                raise rc_release.ReleaseError(f"PATCH {path} failed with HTTP 502")
             assert body == {"draft": False, "prerelease": True, "make_latest": "false"}
             release.update(draft=False, immutable=True)
             self.tags[release["tag_name"]] = release["target_commitish"]
@@ -955,94 +1160,137 @@ class FakeNightlyGitHub:
             self.blobs[sha] = body["content"]
             return {"sha": sha}, ""
         if suffix == "git/trees":
-            assert [entry["path"] for entry in body["tree"]] == [nightly_release.META_FILE]
-            return {"sha": "tree-" + body["tree"][0]["sha"]}, ""
+            base = dict(self.trees.get(body.get("base_tree", ""), {}))
+            for entry in body["tree"]:
+                base[entry["path"]] = self.blobs[entry["sha"]]
+            tree_sha = f"tree{len(self.trees)}"
+            self.trees[tree_sha] = base
+            return {"sha": tree_sha}, ""
         if suffix == "git/commits":
             assert "author" not in body and "committer" not in body
             sha = f"commit{len(self.commits)}"
             self.commits[sha] = body
             return {"sha": sha, "verification": {"verified": self.verified, "reason": "valid"}}, ""
-        if (method, suffix) in (("PATCH", f"git/refs/heads/{nightly_release.META_BRANCH}"), ("POST", "git/refs")):
+        if (method, suffix) in (("PATCH", f"git/refs/heads/{rc_release.META_BRANCH}"), ("POST", "git/refs")):
             assert body.get("force") in (None, False)
             self.meta_head = body["sha"]
             tree = self.commits[body["sha"]]["tree"]
-            self.meta = json.loads(self.blobs[tree.removeprefix("tree-")])
+            self.meta_files = dict(self.trees[tree])
             return None, ""
         raise AssertionError((method, path))
 
 
-class NightlyPublishTests(unittest.TestCase):
-    VERSION = "0.14.0-nightly.20261020"
+class RcPublishTests(unittest.TestCase):
+    VERSION = "0.20.0-rc.1"
+    DAY = dt.date(2026, 11, 26)
 
-    def publish(self, gh):
-        with unittest.mock.patch.object(nightly_release.time, "sleep"):
-            return nightly_release.publish_nightly(gh, self.VERSION, FakeNightlyGitHub.SHA, "https://run")
+    def publish(self, gh, *, impact=None, delta=None, notes=None):
+        with unittest.mock.patch.object(rc_release.time, "sleep"):
+            return rc_release.publish_rc(
+                gh, self.VERSION, FakeRcGitHub.SHA, "https://run",
+                impact_report=impact, signature_delta=delta, integration_notes=notes, today=self.DAY,
+            )
 
-    def test_publishes_all_three_tracks_then_latest_json_on_an_orphan_branch(self):
-        gh = FakeNightlyGitHub(self.VERSION)
-        self.publish(gh)
+    def test_publishes_all_three_tracks_then_rc_meta_files_on_orphan_branch(self):
+        gh = FakeRcGitHub(self.VERSION)
+        self.publish(
+            gh,
+            impact={"impact": "minor", "baseline_tag": "v0.19.0", "baseline_sha": "b" * 40, "triggers": ["mig"]},
+            delta={"schema": 1, "uniffi": {"breaking": []}},
+            notes="# Notes\n",
+        )
         self.assertTrue(all(not r["draft"] and r["immutable"] for r in gh.releases.values()))
-        self.assertEqual(gh.meta["version"], self.VERSION)
-        self.assertEqual(sorted(gh.meta["tracks"]), ["marmotc", "marmotkit", "wn-agent"])
+        latest = gh.read_latest_rc()
+        self.assertEqual(latest["version"], self.VERSION)
+        self.assertEqual(sorted(latest["tracks"]), ["marmotc", "marmotkit", "wn-agent"])
+        self.assertIn(rc_release.RC_DELTA_FILE, gh.meta_files)
+        self.assertIn(rc_release.RC_IMPACT_FILE, gh.meta_files)
+        self.assertIn(rc_release.RC_NOTES_FILE, gh.meta_files)
+        self.assertIn(f"{rc_release.RC_RELEASES_DIR}/{self.VERSION}.json", gh.meta_files)
         self.assertEqual(gh.commits[gh.meta_head]["parents"], [])
 
     def test_a_missing_or_wrong_track_publishes_nothing(self):
         for breakage in ("missing", "target", "title"):
             with self.subTest(breakage=breakage):
-                gh = FakeNightlyGitHub(self.VERSION)
+                gh = FakeRcGitHub(self.VERSION)
                 tag = "wn-agent-v" + self.VERSION
                 if breakage == "missing":
                     del gh.releases[tag]
                 elif breakage == "target":
                     gh.releases[tag]["target_commitish"] = "b" * 40
                 else:
-                    gh.releases[tag]["name"] = "v0.14.0 - wn-agent"
-                with self.assertRaises(nightly_release.NightlyError):
+                    gh.releases[tag]["name"] = "v0.20.0 - wn-agent"
+                with self.assertRaises(rc_release.ReleaseError):
                     self.publish(gh)
                 self.assertTrue(all(r["draft"] for r in gh.releases.values() if r["tag_name"] != tag))
-                self.assertIsNone(gh.meta)
+                self.assertIsNone(gh.read_latest_rc())
 
-    def test_a_failed_publication_resumes_on_rerun_without_moving_latest_early(self):
-        gh = FakeNightlyGitHub(self.VERSION)
-        gh.meta = {"version": "0.14.0-nightly.20261019"}
+    def test_a_failed_publication_resumes_after_cleanup_without_moving_latest_early(self):
+        gh = FakeRcGitHub(self.VERSION)
+        gh.meta_files[rc_release.RC_LATEST_FILE] = json.dumps({"version": "0.19.1-rc.1"})
         gh.fail_patch.add("marmotc-v" + self.VERSION)
-        with self.assertRaisesRegex(nightly_release.NightlyError, "Published so far: marmotkit-v"):
+        with self.assertRaisesRegex(rc_release.ReleaseError, "Published so far: marmotkit-v"):
             self.publish(gh)
-        self.assertEqual(gh.meta, {"version": "0.14.0-nightly.20261019"})
+        self.assertEqual(gh.read_latest_rc(), {"version": "0.19.1-rc.1"})
+        # Workflow cleanup-drafts runs after publish fails: since marmotkit is already
+        # published, cleanup MUST preserve marmotc and wn-agent drafts so re-run resumes.
+        self.assertEqual(rc_release.cleanup_unpublished_drafts(gh, self.VERSION), [])
         self.publish(gh)
         self.assertTrue(all(not r["draft"] for r in gh.releases.values()))
-        self.assertEqual(gh.meta["version"], self.VERSION)
-        # A further re-run finds everything done and writes nothing.
+        self.assertEqual(gh.read_latest_rc()["version"], self.VERSION)
+        self.assertEqual(gh.read_rc_counters(), {"0.20.0": 1})
         commits = len(gh.commits)
         self.assertIsNone(self.publish(gh))
         self.assertEqual(len(gh.commits), commits)
 
+    def test_cleanup_drops_all_drafts_when_zero_tracks_were_published(self):
+        gh = FakeRcGitHub(self.VERSION)
+        deleted = rc_release.cleanup_unpublished_drafts(gh, self.VERSION)
+        self.assertEqual(len(deleted), 3)
+        self.assertEqual(gh.releases, {})
+
     def test_an_unverified_metadata_commit_never_moves_the_branch(self):
-        gh = FakeNightlyGitHub(self.VERSION, verified=False)
-        with self.assertRaisesRegex(nightly_release.NightlyError, "not verified"):
+        gh = FakeRcGitHub(self.VERSION, verified=False)
+        with self.assertRaisesRegex(rc_release.ReleaseError, "not verified"):
             self.publish(gh)
         self.assertIsNone(gh.meta_head)
         gh.verified = True
         self.publish(gh)
-        self.assertEqual(gh.meta["source_sha"], FakeNightlyGitHub.SHA)
+        self.assertEqual(gh.read_latest_rc()["source_sha"], FakeRcGitHub.SHA)
 
-    def test_releases_and_snapshots_wait_only_for_a_nightly_past_its_lane_wait(self):
-        lane = nightly_release.LANE_JOB
-        step = nightly_release.LANE_STEP
-        building = nightly_release.nightly_is_building
-        self.assertFalse(building([{"name": "Plan nightly", "conclusion": "success"}]))
+    def test_releases_and_snapshots_wait_only_for_an_rc_past_its_lane_wait(self):
+        lane = rc_release.LANE_JOB
+        step = rc_release.LANE_STEP
+        building = rc_release.rc_is_building
+        self.assertFalse(building([{"name": "Plan SemVer RC", "conclusion": "success"}]))
+        # Pre-lane simulator/convergence gates must NOT hold the macOS release lane.
+        self.assertFalse(building([
+            {"name": "Plan SemVer RC", "status": "completed", "conclusion": "success"},
+            {"name": "Simulator Nightly gate / Full simulator, campaigns, and vectors", "status": "in_progress", "conclusion": None},
+            {"name": "Convergence Hardening gate / Weekly or release convergence hardening", "status": "in_progress", "conclusion": None},
+        ]))
         self.assertFalse(building([{"name": lane, "conclusion": None,
                                     "steps": [{"name": step, "status": "in_progress", "conclusion": None}]}]))
         self.assertTrue(building([{"name": lane, "conclusion": None,
                                    "steps": [{"name": step, "status": "completed", "conclusion": "success"}]}]))
         self.assertTrue(building([{"name": lane, "conclusion": "success"}]))
-        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+        self.assertTrue(building([
+            {"name": lane, "status": "completed", "conclusion": "success"},
+            {"name": "MarmotKit / Build Apple libraries", "status": "in_progress", "conclusion": None},
+        ]))
+        # Once all packaging tracks finish, publish/retention on Ubuntu do not hold the macOS lane.
+        self.assertFalse(building([
+            {"name": lane, "status": "completed", "conclusion": "success"},
+            {"name": "MarmotKit / Create GitHub release", "status": "completed", "conclusion": "success"},
+            {"name": "Marmot C / Publish Marmot C", "status": "completed", "conclusion": "success"},
+            {"name": "wn-agent / Stage wn-agent RC or promoted release", "status": "completed", "conclusion": "success"},
+            {"name": "Publish SemVer RC and rc-meta", "status": "in_progress", "conclusion": None},
+        ]))
+        workflow = (ROOT / ".github/workflows/rc-releases.yml").read_text()
         self.assertIn(f"    name: {lane}\n", workflow)
         self.assertIn(f"      - name: {step}\n", workflow)
 
     def test_binding_jobs_never_inherit_a_skipped_ancestor(self):
-        # A skipped job skips every job below it that uses the implicit success(), so the
-        # lane job that nightly and build-only runs do not need must still run.
         bindings = (ROOT / ".github/workflows/bindings.yaml").read_text()
         lane = bindings.split("\n  release-lane:\n", 1)[1].split("\n    steps:\n", 1)[0]
         self.assertNotIn("\n    if:", lane)
@@ -1343,6 +1591,510 @@ sha256sum() { shasum -a 256 "$@"; }
             self.assertIn(b"checksum", result.stderr)
             self.assertFalse((Path(tmp) / "cargo-nextest-0.9.132").exists())
             self.assertFalse((Path(tmp) / "path").exists())
+
+    def test_pr_trailer_contract_and_advisory_step_resolve_pr_refs(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        changes = workflow.split("\n  changes:\n", 1)[1].split("\n  rust-format:\n", 1)[0]
+        rust_format = workflow.split("\n  rust-format:\n", 1)[1].split("\n  rust-audit:\n", 1)[0]
+        self.assertIn("fetch-depth: 0", changes)
+        self.assertIn("run: python3 scripts/test_check_pr_trailers.py", rust_format)
+
+        script = workflow_step("ci.yml", "PR commit trailers")
+        self.assertIn('python3 scripts/check_pr_trailers.py "${args[@]}"', script)
+        # Team PRs (fast mode) must fail when a crate change skips `just dependents-nextest`,
+        # so the step may not swallow the script's exit status.
+        self.assertIn('if [[ "$CI_MODE" == fast ]]; then\n    args+=(--enforce-dependents)', script)
+        self.assertNotIn("|| echo", script)
+        self.assertNotIn("${{", script)
+
+        # Execute the exact workflow step in a synthetic PR merge-ref checkout
+        # (matching `actions/checkout` with `fetch-depth: 0` on pull_request).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "-b", "master")
+            git("config", "user.name", "Test")
+            git("config", "user.email", "test@example.com")
+            git("config", "commit.gpgsign", "false")
+            scripts_dir = repo / "scripts"
+            scripts_dir.mkdir()
+            for name in ("check_pr_trailers.py", "changelog.py", "dependents_nextest.py", "classify_ci_changes.py"):
+                (scripts_dir / name).write_text((ROOT / "scripts" / name).read_text())
+            (repo / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/app"]\n')
+            (repo / "crates/app").mkdir(parents=True)
+            (repo / "crates/app/Cargo.toml").write_text('[package]\nname = "app"\n')
+            git("add", "scripts", "Cargo.toml", "crates")
+            git("commit", "-m", "Base commit")
+            git("checkout", "-b", "pr-branch")
+            (repo / "feature.txt").write_text("ok\n")
+            git("add", "feature.txt")
+            git(
+                "commit", "-m",
+                "Add feature\n\n"
+                "Local-Checks: cargo fmt\n"
+                "Local-Review: claude + codex merge @ 1234567\n"
+                "Release-Impact: patch\n",
+            )
+            head_sha = git("rev-parse", "HEAD")
+
+            git("checkout", "master")
+            (repo / "master.txt").write_text("advanced\n")
+            git("add", "master.txt")
+            git("commit", "-m", "Advance master")
+            base_sha = git("rev-parse", "HEAD")
+            git("merge", "--no-ff", "pr-branch", "-m", "Synthetic refs/pull/1/merge")
+
+            result = subprocess.run(
+                ["bash", "-c", script],
+                cwd=repo,
+                env={
+                    **os.environ,
+                    "EVENT_NAME": "pull_request",
+                    "BASE_SHA": base_sha,
+                    "HEAD_SHA": head_sha,
+                    "CI_MODE": "fast",
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("pr-trailers: OK (Release-Impact: patch)", result.stdout)
+            self.assertNotIn("::warning", result.stdout)
+
+            # A crate change without `just dependents-nextest` fails a team PR and only
+            # warns when the full CI matrix runs the tests itself.
+            git("checkout", "-b", "crate-branch", base_sha)
+            (repo / "crates/app/lib.rs").write_text("changed\n")
+            git("add", "crates/app/lib.rs")
+            git(
+                "commit", "-m",
+                "Change crate\n\n"
+                "Local-Checks: cargo fmt; cargo clippy -p app\n"
+                "Local-Review: claude + codex merge @ 1234567\n"
+                "Release-Impact: none\n",
+            )
+            crate_head = git("rev-parse", "HEAD")
+            for mode, expected in (("fast", 1), ("full", 0)):
+                with self.subTest(mode=mode):
+                    run = subprocess.run(
+                        ["bash", "-c", script],
+                        cwd=repo,
+                        env={**os.environ, "EVENT_NAME": "pull_request", "BASE_SHA": base_sha,
+                             "HEAD_SHA": crate_head, "CI_MODE": mode},
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(run.returncode, expected, run.stdout + run.stderr)
+                    self.assertIn("just dependents-nextest", run.stdout)
+
+
+class CanaryWorkflowPolicyTests(unittest.TestCase):
+    @staticmethod
+    def _permissions_union(text: str) -> dict[str, str]:
+        rank = {"none": 0, "read": 1, "write": 2}
+        merged: dict[str, str] = {}
+        for match in re.finditer(r"(?m)^([ ]*)permissions:\n((?:\1  [a-z-]+: [a-z]+\n)+)", text):
+            for scope, level in re.findall(r"([a-z-]+): ([a-z]+)", match.group(2)):
+                if rank.get(level, -1) > rank.get(merged.get(scope, "none"), -1):
+                    merged[scope] = level
+        return merged
+
+    def test_canary_workflow_structure_permissions_and_concurrency(self):
+        workflow = (ROOT / ".github/workflows/canary.yml").read_text()
+        ci_workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        bp_workflow = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
+
+        self.assertIn('    - cron: "7 * * * *"\n', workflow)
+        self.assertIn("  workflow_dispatch:\n", workflow)
+        self.assertNotIn("  pull_request:", workflow)
+        self.assertIn("permissions:\n  actions: read\n  contents: read\n", workflow)
+        self.assertIn("concurrency:\n  group: canary\n  cancel-in-progress: false\n", workflow)
+        self.assertIn("uses: ./.github/workflows/ci.yml", workflow)
+        self.assertIn("rust_test_shards: 6", workflow)
+        self.assertIn("uses: ./.github/workflows/bindings-profile.yml", workflow)
+
+        # `verify-ci` must cover the full permission union requested by `ci.yml`
+        # (GitHub validates nested permissions before evaluating job `if:`s),
+        # while no other Canary job may hold write permissions.
+        verify_ci = workflow.split("\n  verify-ci:\n", 1)[1].split("\n  # Serialization", 1)[0]
+        verify_bp = workflow.split("\n  verify-bindings-profile:\n", 1)[1].split("\n  summary:\n", 1)[0]
+        plan_block = workflow.split("\n  plan:\n", 1)[1].split("\n  # GitHub validates", 1)[0]
+        summary_block = workflow.split("\n  summary:\n", 1)[1]
+
+        rank = {"none": 0, "read": 1, "write": 2}
+        ci_required = self._permissions_union(ci_workflow)
+        verify_ci_granted = self._permissions_union(verify_ci)
+        for scope, level in ci_required.items():
+            with self.subTest(scope=scope, required=level):
+                self.assertGreaterEqual(rank[verify_ci_granted.get(scope, "none")], rank[level])
+
+        bp_required = self._permissions_union(bp_workflow)
+        verify_bp_granted = self._permissions_union(verify_bp)
+        for scope, level in bp_required.items():
+            with self.subTest(bp_scope=scope, required=level):
+                self.assertGreaterEqual(rank[verify_bp_granted.get(scope, "none")], rank[level])
+
+        for readonly_name, block in (
+            ("plan", plan_block),
+            ("verify-ci", verify_ci),
+            ("verify-bindings-profile", verify_bp),
+            ("summary", summary_block),
+        ):
+            with self.subTest(job=readonly_name):
+                self.assertNotIn(": write", block)
+
+        # Avoid nested concurrency deadlock: `bindings-profile.yml` owns `macos-packaging`.
+        self.assertNotIn("concurrency:", verify_bp)
+        self.assertIn("group: macos-packaging", bp_workflow)
+
+    def test_canary_plan_skips_unchanged_master_and_triggers_packaging_only_on_binding_diffs(self):
+        script = workflow_step("canary.yml", "Resolve Canary target and packaging trigger")
+        fake_gh = textwrap.dedent("""\
+            gh() {
+              local endpoint=""
+              for arg in "$@"; do
+                case "$arg" in
+                  repos/*) endpoint="$arg" ;;
+                esac
+              done
+              if [[ -n "${FAKE_GH_LOG:-}" ]]; then
+                printf '%s\\n' "$*" >> "$FAKE_GH_LOG"
+              fi
+              if [[ "$endpoint" == *"/jobs"* ]]; then
+                if [[ "$FAKE_JOBS_JSON" == "error" ]]; then return 1; fi
+                if [[ "$FAKE_JOBS_JSON" == "error_body" ]]; then
+                  printf '{"message":"Internal Server Error"}\\n'
+                  return 1
+                fi
+                printf '%s\\n' "$FAKE_JOBS_JSON"
+                return 0
+              fi
+              if [[ "$FAKE_RUNS_JSON" == "error" ]]; then return 1; fi
+              if [[ "$FAKE_RUNS_JSON" == "error_body" ]]; then
+                printf '{"message":"Internal Server Error"}\\n'
+                return 1
+              fi
+              printf '%s\\n' "$FAKE_RUNS_JSON"
+            }
+        """)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "-b", "master")
+            git("config", "user.name", "Test")
+            git("config", "user.email", "test@example.com")
+            git("config", "commit.gpgsign", "false")
+            (repo / "crates/cgka-engine/src").mkdir(parents=True)
+            (repo / "crates/cgka-engine/src/lib.rs").write_text("// base\n")
+            git("add", ".")
+            git("commit", "-m", "c0")
+            c0 = git("rev-parse", "HEAD")
+
+            (repo / "crates/cgka-engine/src/lib.rs").write_text("// core change\n")
+            git("add", ".")
+            git("commit", "-m", "c1")
+            c1 = git("rev-parse", "HEAD")
+
+            (repo / "crates/marmot-uniffi/src").mkdir(parents=True)
+            (repo / "crates/marmot-uniffi/src/lib.rs").write_text("// binding change\n")
+            git("add", ".")
+            git("commit", "-m", "c2")
+            c2 = git("rev-parse", "HEAD")
+
+            (repo / ".github/actions/setup-odin").mkdir(parents=True)
+            (repo / ".github/actions/setup-odin/action.yml").write_text("name: setup-odin\n")
+            git("add", ".")
+            git("commit", "-m", "c3")
+            c3 = git("rev-parse", "HEAD")
+
+            (repo / ".cargo").mkdir(parents=True)
+            (repo / ".cargo/config.toml").write_text("[build]\n")
+            git("add", ".")
+            git("commit", "-m", "c4")
+            c4 = git("rev-parse", "HEAD")
+
+            (repo / "crates/marmot-uniffi-macros/src").mkdir(parents=True)
+            (repo / "crates/marmot-uniffi-macros/src/lib.rs").write_text("// macro change\n")
+            git("add", ".")
+            git("commit", "-m", "c5")
+            c5 = git("rev-parse", "HEAD")
+
+            # Simulate bare-metal Canary already sitting at c2.
+            git("update-ref", "refs/remotes/origin/canary", c2)
+
+            def job(name, conclusion="success", status="completed"):
+                return {"name": name, "status": status, "conclusion": conclusion}
+
+            def run_plan(checkout_sha, runs, force="false", force_bp="false", jobs="error"):
+                git("checkout", "-q", checkout_sha)
+                out = repo / "gh_out"
+                gh_log = repo / "gh_calls.log"
+                out.unlink(missing_ok=True)
+                gh_log.unlink(missing_ok=True)
+                if isinstance(runs, str):
+                    runs_json = runs
+                elif isinstance(runs, dict):
+                    runs_json = json.dumps(runs)
+                else:
+                    runs_json = json.dumps({"workflow_runs": runs})
+                if isinstance(jobs, str):
+                    jobs_json = jobs
+                elif isinstance(jobs, list) and jobs and all(isinstance(p, dict) and "jobs" in p for p in jobs):
+                    jobs_json = json.dumps(jobs)
+                elif isinstance(jobs, dict):
+                    jobs_json = json.dumps(jobs)
+                else:
+                    jobs_json = json.dumps([{"jobs": jobs}])
+                subprocess.run(
+                    ["bash", "-c", fake_gh + script],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "REPO": "marmot-protocol/mdk",
+                        "RUN_ID": "999",
+                        "FAKE_RUNS_JSON": runs_json,
+                        "FAKE_JOBS_JSON": jobs_json,
+                        "FAKE_GH_LOG": str(gh_log),
+                        "FORCE": force,
+                        "FORCE_BINDINGS_PROFILE": force_bp,
+                        "GITHUB_OUTPUT": str(out),
+                    },
+                )
+                result = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+                result["_gh_calls"] = gh_log.read_text().splitlines() if gh_log.exists() else []
+                return result
+
+            def green(sha, run_id=100, updated_at="2026-11-26T15:00:00Z", run_attempt=1):
+                return {
+                    "id": run_id,
+                    "run_attempt": run_attempt,
+                    "head_sha": sha,
+                    "conclusion": "success",
+                    "updated_at": updated_at,
+                }
+
+            def failed(sha, run_id=101, updated_at="2026-11-26T15:30:00Z", run_attempt=1):
+                return {
+                    "id": run_id,
+                    "run_attempt": run_attempt,
+                    "head_sha": sha,
+                    "conclusion": "failure",
+                    "updated_at": updated_at,
+                }
+
+            ci_only_failed_jobs = [
+                job("Plan Canary batch", "success"),
+                job("Full cross-platform CI (6 shards) / Relay runtime tests (1/2)", "failure"),
+                job("Full cross-platform CI (6 shards) / Required CI", "failure"),
+                job("Record Canary summary", "failure"),
+            ]
+            packaging_failed_jobs = [
+                job("Plan Canary batch", "success"),
+                job("Full cross-platform CI (6 shards) / Required CI", "success"),
+                job("MarmotKit Release Profile / Resolve exact candidate identity", "success"),
+                job("MarmotKit Release Profile / Build Apple candidate input (ios-device)", "failure"),
+                job("Record Canary summary", "failure"),
+            ]
+            packaging_passed_ci_failed_jobs = [
+                job("Plan Canary batch", "success"),
+                job("Full cross-platform CI (6 shards) / Relay runtime tests (1/2)", "failure"),
+                job("MarmotKit Release Profile / Resolve exact candidate identity", "success"),
+                job("MarmotKit Release Profile / Build Apple candidate input (ios-device)", "success"),
+                job("Record Canary summary", "failure"),
+            ]
+
+            # Unchanged master whose latest completed run succeeded skips quickly.
+            self.assertEqual(run_plan(c1, [green(c1)])["should_run"], "false")
+            # Force overrides skip.
+            forced = run_plan(c1, [green(c1)], force="true")
+            self.assertEqual((forced["should_run"], forced["run_bindings_profile"]), ("true", "false"))
+            # Manual run_bindings_profile=true also bypasses early skip on an already-green SHA.
+            forced_bp = run_plan(c1, [green(c1)], force="false", force_bp="true")
+            self.assertEqual((forced_bp["should_run"], forced_bp["run_bindings_profile"]), ("true", "true"))
+            # Core-only diff whose previous attempt failed in CI only does NOT force packaging on retry.
+            core_ci_retry = run_plan(
+                c1,
+                [failed(c1, 102, run_attempt=2), green(c0, 100)],
+                jobs=ci_only_failed_jobs,
+            )
+            self.assertEqual((core_ci_retry["should_run"], core_ci_retry["run_bindings_profile"]), ("true", "false"))
+            self.assertTrue(
+                any("repos/marmot-protocol/mdk/actions/runs/102/attempts/2/jobs?per_page=100" in c for c in core_ci_retry["_gh_calls"]),
+                core_ci_retry["_gh_calls"],
+            )
+            # An older green run followed by a newer failed packaging run on the same SHA must NOT skip
+            # and must retry packaging rather than letting the older green run bury the failure.
+            failed_bp_after_green = run_plan(
+                c1,
+                [failed(c1, 102), green(c1, 100)],
+                jobs=packaging_failed_jobs,
+            )
+            self.assertEqual(
+                (failed_bp_after_green["should_run"], failed_bp_after_green["run_bindings_profile"]),
+                ("true", "true"),
+            )
+            # If a newer failed run on an already-green SHA passed packaging and only failed CI,
+            # the retry reruns CI without repeating 60-minute packaging.
+            failed_ci_bp_passed = run_plan(
+                c1,
+                [failed(c1, 102), green(c1, 100)],
+                jobs=packaging_passed_ci_failed_jobs,
+            )
+            self.assertEqual(
+                (failed_ci_bp_passed["should_run"], failed_ci_bp_passed["run_bindings_profile"]),
+                ("true", "false"),
+            )
+            # A rerun of an older run ID sits behind a newer ID in GitHub's creation-ordered list,
+            # but has a newer updated_at; ordering by completion recency must inspect its exact attempt.
+            rerun_failed_bp = run_plan(
+                c1,
+                [
+                    green(c1, 105, updated_at="2026-11-26T15:10:00Z"),
+                    failed(c1, 100, updated_at="2026-11-26T15:45:00Z", run_attempt=2),
+                ],
+                jobs=packaging_failed_jobs,
+            )
+            self.assertEqual(
+                (rerun_failed_bp["should_run"], rerun_failed_bp["run_bindings_profile"]),
+                ("true", "true"),
+            )
+            self.assertTrue(
+                any("repos/marmot-protocol/mdk/actions/runs/100/attempts/2/jobs?per_page=100" in c for c in rerun_failed_bp["_gh_calls"]),
+                rerun_failed_bp["_gh_calls"],
+            )
+            rerun_failed_ci_only = run_plan(
+                c1,
+                [
+                    green(c1, 105, updated_at="2026-11-26T15:10:00Z"),
+                    failed(c1, 100, updated_at="2026-11-26T15:45:00Z", run_attempt=2),
+                ],
+                jobs=ci_only_failed_jobs,
+            )
+            self.assertEqual(
+                (rerun_failed_ci_only["should_run"], rerun_failed_ci_only["run_bindings_profile"]),
+                ("true", "false"),
+            )
+            # Multi-page jobs response still catches a packaging failure on page 2.
+            paginated_bp_fail = run_plan(
+                c1,
+                [failed(c1, 102), green(c0, 100)],
+                jobs=[
+                    {"jobs": [job("Plan Canary batch", "success"), job("Full cross-platform CI (6 shards) / Required CI", "failure")]},
+                    {"jobs": [job("MarmotKit Release Profile / Build Apple candidate input (ios-device)", "failure"), job("Record Canary summary", "failure")]},
+                ],
+            )
+            self.assertEqual((paginated_bp_fail["should_run"], paginated_bp_fail["run_bindings_profile"]), ("true", "true"))
+            # Uninspectable, cancelled, plan-failed, or zero-job packaging failures fail safe to retrying packaging.
+            for unsafe_jobs in (
+                "error",
+                "error_body",
+                {"message": "bad payload"},
+                [],
+                [job("Plan Canary batch", "failure")],
+                [
+                    job("Plan Canary batch", "success"),
+                    job("Full cross-platform CI (6 shards) / Required CI", "failure"),
+                    job("Record Canary summary", "cancelled"),
+                ],
+                [
+                    job("Plan Canary batch", "success"),
+                    job("Full cross-platform CI (6 shards) / Required CI", "success"),
+                    job("Record Canary summary", "failure"),
+                ],
+            ):
+                with self.subTest(unsafe_jobs=unsafe_jobs):
+                    res = run_plan(c1, [failed(c1, 102), green(c0, 100)], jobs=unsafe_jobs)
+                    self.assertEqual((res["should_run"], res["run_bindings_profile"]), ("true", "true"))
+            # Binding diff whose latest attempt failed in CI only STILL requires packaging because c1..c2 touched bindings.
+            binding_ci_retry = run_plan(
+                c2,
+                [failed(c2, 102), green(c1, 100)],
+                jobs=ci_only_failed_jobs,
+            )
+            self.assertEqual((binding_ci_retry["should_run"], binding_ci_retry["run_bindings_profile"]), ("true", "true"))
+            # Core-only diff runs CI without heavy macOS bindings-profile packaging.
+            core = run_plan(c1, [green(c0)])
+            self.assertEqual((core["should_run"], core["run_bindings_profile"]), ("true", "false"))
+            # Binding diff triggers bindings-profile packaging.
+            binding = run_plan(c2, [green(c1)])
+            self.assertEqual((binding["should_run"], binding["run_bindings_profile"]), ("true", "true"))
+            # Tooling-only diff (setup-odin) also triggers bindings-profile packaging.
+            odin_tooling = run_plan(c3, [green(c2)])
+            self.assertEqual((odin_tooling["should_run"], odin_tooling["run_bindings_profile"]), ("true", "true"))
+            # Cargo config diff (.cargo/config.toml) also triggers bindings-profile packaging.
+            cargo_cfg = run_plan(c4, [green(c3)])
+            self.assertEqual((cargo_cfg["should_run"], cargo_cfg["run_bindings_profile"]), ("true", "true"))
+            # Binding proc-macro diff (crates/marmot-uniffi-macros/) also triggers packaging.
+            macro_diff = run_plan(c5, [green(c4)])
+            self.assertEqual((macro_diff["should_run"], macro_diff["run_bindings_profile"]), ("true", "true"))
+            # API failure (empty, error JSON on stdout with nonzero exit, or malformed payload)
+            # and missing hosted baseline all fail safe to running CI + packaging even if
+            # bare-metal `origin/canary` already sits at `source_sha`.
+            for bad_runs in ("error", "error_body", {"message": "bad payload"}, []):
+                with self.subTest(bad_runs=bad_runs):
+                    res = run_plan(c2, bad_runs)
+                    self.assertEqual((res["should_run"], res["run_bindings_profile"]), ("true", "true"))
+
+    def test_canary_summary_records_json_and_enforces_gate(self):
+        write_script = workflow_step("canary.yml", "Write Canary summary artifact")
+        gate_script = workflow_step("canary.yml", "Enforce Canary gate")
+        cases = [
+            ("success", "false", "false", "skipped", "skipped", "skipped", True),
+            ("success", "true", "false", "success", "skipped", "success", True),
+            ("success", "true", "true", "success", "success", "success", True),
+            ("success", "true", "false", "failure", "skipped", "failure", False),
+            ("success", "true", "true", "success", "failure", "failure", False),
+            ("failure", "true", "false", "skipped", "skipped", "failure", False),
+        ]
+        for plan_res, should_run, run_bp, ci_res, bp_res, expected_overall, gate_ok in cases:
+            with self.subTest(plan=plan_res, should_run=should_run, run_bp=run_bp, ci=ci_res, bp=bp_res), \
+                    tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                out = tmp_path / "out"
+                summary_md = tmp_path / "summary.md"
+                subprocess.run(
+                    ["bash", "-c", write_script],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "RUNNER_TEMP": tmp,
+                        "GITHUB_OUTPUT": str(out),
+                        "GITHUB_STEP_SUMMARY": str(summary_md),
+                        "PLAN_RESULT": plan_res,
+                        "SHOULD_RUN": should_run,
+                        "SOURCE_SHA": "a" * 40,
+                        "PREVIOUS_SHA": "b" * 40,
+                        "RUN_BINDINGS_PROFILE": run_bp,
+                        "CI_RESULT": ci_res,
+                        "BINDINGS_PROFILE_RESULT": bp_res,
+                        "RUN_ID": "42",
+                        "RUN_URL": "https://github.com/marmot-protocol/mdk/actions/runs/42",
+                    },
+                )
+                doc = json.loads((tmp_path / "canary-summary.json").read_text())
+                self.assertEqual(doc["overall"], expected_overall)
+                gate = subprocess.run(
+                    ["bash", "-c", gate_script],
+                    capture_output=True,
+                    timeout=10,
+                    env={**os.environ, "OVERALL": doc["overall"]},
+                )
+                self.assertEqual(gate.returncode == 0, gate_ok)
 
 
 if __name__ == "__main__":
