@@ -531,3 +531,130 @@ fn delete_local_group_data_wipes_persisted_mixed_case_rows_and_pre_upgrade_inten
         0
     );
 }
+
+/// Regression for #3798 / PR #3818 review: wiping an uppercase or mixed-case
+/// group must leave a retirement barrier that still fences subsequent
+/// `remember_encrypted_media_epoch_secret`, `encrypted_media_epoch_secret`, and
+/// `encrypted_media_epoch_secret_may_be_served` calls made with uppercase or
+/// mixed-case `group_id_hex`.
+#[test]
+fn uppercase_wipe_retirement_watermark_fences_uppercase_secret_restoration() {
+    let store = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let app = store.app_storage();
+
+    app.remember_encrypted_media_epoch_secret("AABB", 1, 5, b"original-secret")
+        .unwrap();
+    assert_eq!(
+        app.encrypted_media_epoch_secret("AABB", 1, 5)
+            .unwrap()
+            .as_deref(),
+        Some(b"original-secret".as_slice())
+    );
+    assert!(
+        app.encrypted_media_epoch_secret_may_be_served("AABB", 5)
+            .unwrap()
+    );
+
+    let wiped = store.delete_local_group_data("AABB").unwrap();
+    assert!(wiped.did_delete());
+
+    // Attempting to re-insert the wiped epoch secret with uppercase or
+    // mixed-case group id must be fenced by the retirement watermark.
+    app.remember_encrypted_media_epoch_secret("AABB", 1, 5, b"resurrected")
+        .unwrap();
+    app.remember_encrypted_media_epoch_secret("AaBb", 1, 5, b"resurrected")
+        .unwrap();
+    for casing in ["AABB", "AaBb", "aabb"] {
+        assert_eq!(
+            app.encrypted_media_epoch_secret(casing, 1, 5).unwrap(),
+            None,
+            "wiped secret must not be restorable under casing {casing}"
+        );
+        assert!(
+            !app.encrypted_media_epoch_secret_may_be_served(casing, 5)
+                .unwrap(),
+            "may_be_served must remain false under casing {casing}"
+        );
+    }
+
+    // A pre-existing uppercase watermark (written before canonicalization)
+    // must also fence lowercase callers.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO encrypted_media_epoch_secret_retirement_watermarks(
+                 group_id_hex, retired_through_epoch, retired_at_unix_seconds
+             ) VALUES('EE01', 10, 1)",
+            [],
+        )
+        .unwrap();
+    app.remember_encrypted_media_epoch_secret("ee01", 1, 5, b"blocked")
+        .unwrap();
+    assert_eq!(
+        app.encrypted_media_epoch_secret("ee01", 1, 5).unwrap(),
+        None
+    );
+    assert!(
+        !app.encrypted_media_epoch_secret_may_be_served("ee01", 5)
+            .unwrap()
+    );
+}
+
+/// Regression for #3798 / PR #3818 review: `delete_local_group_data` must keep
+/// indexed `group_id_hex` lookups on large message tables (`app_events`,
+/// `message_timeline`) rather than forcing full-table scans via `LOWER(...)`.
+#[test]
+fn delete_local_group_data_uses_group_id_indexes_on_large_tables() {
+    thread_local! {
+        static DELETE_SQLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn record_deletes(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+            && (sql.contains("DELETE FROM app_events ")
+                || sql.contains("DELETE FROM message_timeline "))
+        {
+            DELETE_SQLS.with_borrow_mut(|sqls| sqls.push(sql.to_owned()));
+        }
+    }
+
+    let store = SqliteAccountStorage::in_memory_for_test().unwrap();
+    DELETE_SQLS.with_borrow_mut(Vec::clear);
+    store.lock().unwrap().trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(record_deletes),
+    );
+    store.delete_local_group_data("aabb").unwrap();
+    store
+        .lock()
+        .unwrap()
+        .trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
+
+    let sqls = DELETE_SQLS.take();
+    assert_eq!(
+        sqls.len(),
+        2,
+        "expected app_events and message_timeline deletes: {sqls:?}"
+    );
+    let conn = store.lock().unwrap();
+    for sql in sqls {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let params_vec = vec!["aabb"; stmt.parameter_count()];
+        let details: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let target_plan = details.first().map(String::as_str).unwrap_or("");
+        assert!(
+            target_plan.starts_with("SEARCH ") && target_plan.contains("USING "),
+            "expected indexed SEARCH plan for `{sql}`, got {details:?}"
+        );
+        assert!(
+            !target_plan.starts_with("SCAN "),
+            "must not full-table SCAN target table for `{sql}`, got {details:?}"
+        );
+    }
+}

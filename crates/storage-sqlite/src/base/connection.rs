@@ -1580,9 +1580,6 @@ pub(crate) fn finish_account_open(
         observer,
         crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::OperationalPragmas),
     );
-    connection
-        .busy_timeout(Duration::from_millis(options.busy_timeout_ms))
-        .storage()?;
     // A database with no schema yet starts in incremental auto-vacuum mode,
     // so freed pages can go back to the filesystem without the one-time
     // compaction older databases need (mdk#2314 step 6). The mode can only
@@ -1788,7 +1785,6 @@ fn apply_sqlcipher_key(
     key: &SqlCipherKey,
     cipher_compatibility: u8,
 ) -> StorageResult<()> {
-    validate_cipher_compatibility(cipher_compatibility)?;
     connection
         .pragma_update(None, "key", key.as_secret_str())
         .storage()?;

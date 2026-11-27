@@ -4001,37 +4001,25 @@ where
             }
             Err(error) => return Err(error),
         }
-        let consumed_all = if intents.len() == 1 {
-            let intent = &intents[0];
-            conn.execute_cached(
-                "DELETE FROM secure_delete_checkpoint_intents
-                 WHERE operation_kind = ?1 AND scope = ?2
-                   AND intent_nonce = ?3",
-                params![operation_kind, &intent.scope, &intent.nonce],
-            )
-            .storage()?
-                == 1
-        } else {
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .storage()?;
+        let mut deleted = 0usize;
+        for intent in &intents {
+            deleted += tx
+                .execute_cached(
+                    "DELETE FROM secure_delete_checkpoint_intents
+                     WHERE operation_kind = ?1 AND scope = ?2
+                       AND intent_nonce = ?3",
+                    params![operation_kind, &intent.scope, &intent.nonce],
+                )
                 .storage()?;
-            let mut deleted = 0usize;
-            for intent in &intents {
-                deleted += tx
-                    .execute_cached(
-                        "DELETE FROM secure_delete_checkpoint_intents
-                         WHERE operation_kind = ?1 AND scope = ?2
-                           AND intent_nonce = ?3",
-                        params![operation_kind, &intent.scope, &intent.nonce],
-                    )
-                    .storage()?;
-            }
-            if deleted == intents.len() {
-                tx.commit().storage()?;
-                true
-            } else {
-                false
-            }
+        }
+        let consumed_all = if deleted == intents.len() {
+            tx.commit().storage()?;
+            true
+        } else {
+            false
         };
         if !consumed_all {
             last_result = Some(result);

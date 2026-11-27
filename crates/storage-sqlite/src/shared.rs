@@ -677,18 +677,9 @@ impl SqliteSharedStorage {
                  FROM (
                      SELECT account_id_hex,
                             npub,
-                            CASE WHEN created_at_token IS NOT NULL
-                                   AND marmot_is_valid_u64(created_at_token)
-                                 THEN profile_json
-                                 ELSE NULL
-                            END AS profile_json,
-                            CASE WHEN created_at_token IS NOT NULL
-                                   AND marmot_is_valid_u64(created_at_token)
-                                 THEN created_at_token
-                                 ELSE NULL
-                            END AS created_at_token,
-                            CASE WHEN created_at_token IS NOT NULL
-                                   AND marmot_is_valid_u64(created_at_token)
+                            CASE WHEN profile_valid THEN profile_json ELSE NULL END AS profile_json,
+                            CASE WHEN profile_valid THEN created_at_token ELSE NULL END AS created_at_token,
+                            CASE WHEN profile_valid
                                  THEN min(
                                      marmot_search_rank(json_extract(profile_json, '$.name'), ?1) * 6,
                                      marmot_search_rank(json_extract(profile_json, '$.nip05'), ?1) * 6 + 1,
@@ -698,25 +689,32 @@ impl SqliteSharedStorage {
                                  )
                                  ELSE identity_rank
                             END AS search_rank,
-                            (profile_json IS NOT NULL
-                             AND (created_at_token IS NULL
-                                  OR NOT marmot_is_valid_u64(created_at_token))) AS malformed_profile
+                            (profile_json IS NOT NULL AND NOT profile_valid) AS malformed_profile
                      FROM (
                          SELECT account_id_hex,
                                 npub,
                                 profile_json,
-                                CASE
-                                    WHEN profile_json IS NULL THEN NULL
-                                    WHEN NOT json_valid(profile_json) THEN 'invalid'
-                                    WHEN json_type(profile_json) != 'object' THEN 'invalid'
-                                    ELSE COALESCE(profile_json -> '$.created_at', '0')
-                                END AS created_at_token,
-                                min(
-                                    marmot_search_rank(npub, ?1) * 6 + 4,
-                                    marmot_search_rank(account_id_hex, ?1) * 6 + 5
-                                ) AS identity_rank
-                         FROM directory_users
-                         {inner_where}
+                                created_at_token,
+                                (created_at_token IS NOT NULL
+                                 AND marmot_is_valid_u64(created_at_token)) AS profile_valid,
+                                identity_rank
+                         FROM (
+                             SELECT account_id_hex,
+                                    npub,
+                                    profile_json,
+                                    CASE
+                                        WHEN profile_json IS NULL THEN NULL
+                                        WHEN NOT json_valid(profile_json) THEN 'invalid'
+                                        WHEN json_type(profile_json) != 'object' THEN 'invalid'
+                                        ELSE COALESCE(profile_json -> '$.created_at', '0')
+                                    END AS created_at_token,
+                                    min(
+                                        marmot_search_rank(npub, ?1) * 6 + 4,
+                                        marmot_search_rank(account_id_hex, ?1) * 6 + 5
+                                    ) AS identity_rank
+                             FROM directory_users
+                             {inner_where}
+                         )
                      )
                  )
                  {outer_suffix}"
