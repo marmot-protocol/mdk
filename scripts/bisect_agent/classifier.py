@@ -723,12 +723,13 @@ def classify_failure(
       - on the locally-unreproducible fallback (non-Linux / Relay-E2E) so human-tracked
         non-Linux flakes do not escalate into false Meltdowns;
       - when `tip` passes single retry (intermittent), skipping stress runs;
-      - immediately on a second consecutive `tip` replay (before the missing-baseline
-        check or `baseline` replay) so alternating or missing-baseline tracked flakes
-        stay `KNOWN_FLAKE` instead of triggering false Meltdowns or bogus reverts;
+      - on a second `tip` replay before returning `UNREPRODUCIBLE` when no distinct
+        green baseline is available, so intermittent tracked flakes without a baseline
+        stay `KNOWN_FLAKE` instead of triggering false Meltdowns;
       - when both `tip` and `baseline` fail; and
-      - on a second consecutive `baseline` replay when `baseline` passed (`tip -> tip
-        -> baseline -> baseline`), confirming repeatability before returning
+      - in palindrome confirmation order (`tip -> baseline -> baseline -> tip`, or
+        `tip -> baseline(TEST_ABSENT) -> tip` for newly added tests), defeating both
+        alternating and early-fail/later-pass burst streams before returning
         `DETERMINISTIC_REGRESSION`.
     """
     # Bucket 1: Runner/network/disk infrastructure error.
@@ -771,10 +772,7 @@ def classify_failure(
         )
 
     if tip_verdict == RunVerdict.FAIL:
-        if matched_issue is not None:
-            # Confirm repeatability on `tip` consecutively (`tip -> tip`) BEFORE checking
-            # for a missing baseline or replaying `baseline`, so an alternating flake or
-            # a tracked flake without a distinct green baseline stays `KNOWN_FLAKE`.
+        def _confirm_tracked_tip() -> ClassificationResult | None:
             tip_confirm, tip_confirm_detail = run_on_sha(signal.tip_sha, signal.command)
             if tip_confirm in {RunVerdict.INCONCLUSIVE, RunVerdict.TEST_ABSENT}:
                 return ClassificationResult(
@@ -790,11 +788,21 @@ def classify_failure(
                     ),
                     matched_issue=matched_issue,
                 )
+            return None
+
         if not signal.baseline_sha or signal.baseline_sha == signal.tip_sha:
+            if matched_issue is not None:
+                # Confirm repeatability on `tip` before returning UNREPRODUCIBLE so a
+                # tracked flake without a distinct green baseline stays KNOWN_FLAKE.
+                tip_check = _confirm_tracked_tip()
+                if tip_check is not None:
+                    return tip_check
             return ClassificationResult(
                 bucket=Bucket.UNREPRODUCIBLE,
                 reason=f"reproduced on {signal.tip_sha[:9]} but no distinct green baseline is available to bisect",
+                matched_issue=matched_issue,
             )
+
         base_verdict, base_detail = run_on_sha(signal.baseline_sha, signal.command)
         if base_verdict == RunVerdict.FAIL:
             if matched_issue is not None:
@@ -820,31 +828,37 @@ def classify_failure(
                 bucket=Bucket.INFRA_ERROR,
                 reason=f"inconclusive baseline check on {signal.baseline_sha[:9]} ({base_detail})",
             )
-        if matched_issue is not None and base_verdict == RunVerdict.PASS:
-            # Confirm `baseline` consecutively (`baseline -> baseline`) so the overall
-            # tracked-flake replay order is `tip -> tip -> baseline -> baseline`.
-            base_confirm, base_confirm_detail = run_on_sha(signal.baseline_sha, signal.command)
-            if base_confirm in {RunVerdict.INCONCLUSIVE, RunVerdict.TEST_ABSENT}:
-                return ClassificationResult(
-                    bucket=Bucket.INFRA_ERROR,
-                    reason=f"inconclusive baseline confirmation on {signal.baseline_sha[:9]} ({base_confirm_detail})",
-                )
-            if base_confirm == RunVerdict.FAIL:
-                return ClassificationResult(
-                    bucket=Bucket.KNOWN_FLAKE,
-                    reason=(
-                        f"reproduced on tip {signal.tip_sha[:9]} and failed baseline confirmation "
-                        f"on {signal.baseline_sha[:9]}; matches open flake issue #{matched_issue} "
-                        f"for {signal.failed_test}"
-                    ),
-                    matched_issue=matched_issue,
-                )
+        if matched_issue is not None:
+            # Confirm in palindrome order (`tip -> baseline -> baseline -> tip`) so
+            # neither alternating (`[F, P, F, P]`) nor early-fail/later-pass burst
+            # streams (`[F, F, P, P]`, `[F, P, P, P]`) align with tip/baseline.
+            if base_verdict == RunVerdict.PASS:
+                base_confirm, base_confirm_detail = run_on_sha(signal.baseline_sha, signal.command)
+                if base_confirm in {RunVerdict.INCONCLUSIVE, RunVerdict.TEST_ABSENT}:
+                    return ClassificationResult(
+                        bucket=Bucket.INFRA_ERROR,
+                        reason=f"inconclusive baseline confirmation on {signal.baseline_sha[:9]} ({base_confirm_detail})",
+                    )
+                if base_confirm == RunVerdict.FAIL:
+                    return ClassificationResult(
+                        bucket=Bucket.KNOWN_FLAKE,
+                        reason=(
+                            f"reproduced on tip {signal.tip_sha[:9]} and failed baseline confirmation "
+                            f"on {signal.baseline_sha[:9]}; matches open flake issue #{matched_issue} "
+                            f"for {signal.failed_test}"
+                        ),
+                        matched_issue=matched_issue,
+                    )
+            tip_check = _confirm_tracked_tip()
+            if tip_check is not None:
+                return tip_check
         return ClassificationResult(
             bucket=Bucket.DETERMINISTIC_REGRESSION,
             reason=(
                 f"reproduced on {signal.tip_sha[:9]} and did not fail on "
                 f"baseline {signal.baseline_sha[:9]} ({base_verdict.value})"
             ),
+            matched_issue=matched_issue,
         )
 
     # Passed single retry (intermittent). Check open individual `Flaky:` issues before

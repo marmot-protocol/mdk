@@ -397,11 +397,11 @@ class ClassifierTests(unittest.TestCase):
 
         # 1. Deterministic regression (always fails tip, always passes baseline) MUST NOT be
         # suppressed by the leaderboard OR by an open individual `Flaky:` issue.
-        # Confirmation replays each revision consecutively (`tip -> tip -> baseline -> baseline`)
-        # so an alternating, revision-independent failure cannot align with `tip` every time.
-        for label, issues, expected_shas in (
-            ("leaderboard", leaderboard, [sig.tip_sha, sig.baseline_sha]),
-            ("individual", individual, [sig.tip_sha, sig.tip_sha, sig.baseline_sha, sig.baseline_sha]),
+        # Confirmation uses palindrome order (`tip -> baseline -> baseline -> tip`) so
+        # neither alternating streams nor early-fail/later-pass bursts align with tip/baseline.
+        for label, issues, expected_shas, expected_issue in (
+            ("leaderboard", leaderboard, [sig.tip_sha, sig.baseline_sha], None),
+            ("individual", individual, [sig.tip_sha, sig.baseline_sha, sig.baseline_sha, sig.tip_sha], 4001),
         ):
             with self.subTest(issues=label):
                 seen_shas: list[str] = []
@@ -416,16 +416,19 @@ class ClassifierTests(unittest.TestCase):
 
                 cls = classify_failure(sig, run_on_sha=det_runner, open_flake_issues=issues)
                 self.assertEqual(cls.bucket, Bucket.DETERMINISTIC_REGRESSION)
+                self.assertEqual(cls.matched_issue, expected_issue)
                 self.assertEqual(seen_shas, expected_shas)
 
-        # 1b. Revision-independent alternating stream `[FAIL, PASS, FAIL, PASS, ...]` (and
-        # baseline confirmation failure `[FAIL, FAIL, PASS, FAIL]`) on a tracked flake MUST
-        # classify as KNOWN_FLAKE and never enter bisect.
+        # 1b. Revision-independent alternating streams AND burst streams on a tracked flake
+        # MUST classify as KNOWN_FLAKE and never enter bisect.
         for label, outcomes in (
             ("alternating_stream", [RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.FAIL, RunVerdict.PASS]),
-            ("baseline_fails_confirm", [RunVerdict.FAIL, RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.FAIL]),
+            ("early_fail_burst_2", [RunVerdict.FAIL, RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.PASS]),
+            ("early_fail_burst_3", [RunVerdict.FAIL, RunVerdict.FAIL, RunVerdict.FAIL, RunVerdict.PASS]),
+            ("single_fail_burst", [RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.PASS, RunVerdict.PASS]),
+            ("baseline_fails_confirm", [RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.FAIL, RunVerdict.FAIL]),
         ):
-            with self.subTest(alternating=label):
+            with self.subTest(stream=label):
                 seq = iter(outcomes)
                 alt_cls = classify_failure(
                     sig,
@@ -434,6 +437,32 @@ class ClassifierTests(unittest.TestCase):
                 )
                 self.assertEqual(alt_cls.bucket, Bucket.KNOWN_FLAKE)
                 self.assertEqual(alt_cls.matched_issue, 4001)
+
+        # 1b-ii. Newly added test (`TEST_ABSENT` on baseline) on a tracked flake still confirms
+        # `tip` a second time (`tip -> baseline(TEST_ABSENT) -> tip`).
+        absent_det_shas: list[str] = []
+
+        def absent_det_runner(sha: str, _cmd: tuple[str, ...]) -> tuple[RunVerdict, str]:
+            absent_det_shas.append(sha)
+            return (
+                (RunVerdict.FAIL, "target test failed")
+                if sha == sig.tip_sha
+                else (RunVerdict.TEST_ABSENT, "test absent on baseline")
+            )
+
+        absent_det = classify_failure(sig, run_on_sha=absent_det_runner, open_flake_issues=individual)
+        self.assertEqual(absent_det.bucket, Bucket.DETERMINISTIC_REGRESSION)
+        self.assertEqual(absent_det.matched_issue, 4001)
+        self.assertEqual(absent_det_shas, [sig.tip_sha, sig.baseline_sha, sig.tip_sha])
+
+        absent_flaky_seq = iter([RunVerdict.FAIL, RunVerdict.TEST_ABSENT, RunVerdict.PASS])
+        absent_flaky = classify_failure(
+            sig,
+            run_on_sha=lambda _s, _c: (next(absent_flaky_seq), "observed"),
+            open_flake_issues=individual,
+        )
+        self.assertEqual(absent_flaky.bucket, Bucket.KNOWN_FLAKE)
+        self.assertEqual(absent_flaky.matched_issue, 4001)
 
         # 1c. Missing or equal baseline still runs tracked-flake confirmation on `tip` before
         # returning UNREPRODUCIBLE so an intermittent tracked flake does not trigger Meltdown.
@@ -2392,6 +2421,200 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
             )
             self.assertEqual(stress_cls.bucket, Bucket.INFRA_ERROR)
             self.assertIn("bisect wall-clock budget exceeded", stress_cls.reason)
+
+    def test_contradictory_replay_outcomes_never_freeze_or_revert_unrelated_commit(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo, origin = _init_repo(tmp, with_bare_origin=True)
+            assert origin is not None
+            c0 = _commit_file(repo, "app.txt", "good\n", "c0: green baseline")
+            c1_docs = _commit_file(repo, "README.md", "docs tweak\n", "c1: unrelated docs edit")
+            c2 = _commit_file(repo, "app.txt", "broken\n", "c2: tip commit")
+            _git(repo, "push", "origin", "master")
+            _seed_tree_state(tmp, origin, state="green")
+
+            flaky_test = "marmot-session::runtime::flaky_burst_target"
+            flaky_cmd = nextest_command_for_test("marmot-session", "runtime", "flaky_burst_target", profile="ci")
+            tracked_issues = [{"number": 4001, "title": f"Flaky: {flaky_test}", "body": ""}]
+
+            def make_signal(run_id: str) -> FailureSignal:
+                return FailureSignal(
+                    source="hosted_canary",
+                    run_id=run_id,
+                    run_url=f"https://example.com/{run_id}",
+                    tip_sha=c2,
+                    baseline_sha=c0,
+                    failed_job="Full cross-platform CI (6 shards) / Rust tests (1/6)",
+                    failed_test=flaky_test,
+                    command=flaky_cmd,
+                )
+
+            # 1. Early-fail/later-pass burst `[F, F, P, P, F, F]` on tracked flake MUST be caught
+            # during palindrome classification (`tip -> base` sees `F, F`) without entering bisect.
+            burst_stream = iter(
+                [
+                    RunVerdict.FAIL,
+                    RunVerdict.FAIL,
+                    RunVerdict.PASS,
+                    RunVerdict.PASS,
+                    RunVerdict.FAIL,
+                    RunVerdict.FAIL,
+                ]
+            )
+            gh1 = StubGitHub(author="dev", open_issues=tracked_issues)
+            tree1 = TreeStateController(repo, dry_run=False, sign_commits=False)
+            ctrl1 = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=gh1,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree1,
+                dry_run=False,
+                sign_commits=False,
+                worktree_root=tmp / "wts-burst",
+                run_in_wt=lambda _wt, _cmd: (next(burst_stream), "burst"),
+            )
+            cls1, out1 = ctrl1.handle_failure(make_signal("901:1"), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual(cls1.bucket, Bucket.KNOWN_FLAKE)
+            self.assertEqual(cls1.matched_issue, 4001)
+            self.assertIsNone(out1)
+            self.assertEqual(tree1.read_remote_status(), "green")
+            self.assertEqual(gh1.prs, [])
+            self.assertEqual(gh1.reruns, ["901:1"])
+
+            # 2. Revision-independent stream passing palindrome classification (`[F, P, P, F]`)
+            # and then contradicting `baseline` (`c0`) during bisect (`c1=F, c0=F`) MUST NOT
+            # freeze the tree or open a revert PR; downgrades to KNOWN_FLAKE.
+            bisect_contradict_stream = iter(
+                [
+                    RunVerdict.FAIL,  # classify c2
+                    RunVerdict.PASS,  # classify c0
+                    RunVerdict.PASS,  # classify c0 confirm
+                    RunVerdict.FAIL,  # classify c2 confirm
+                    RunVerdict.FAIL,  # bisect mid c1
+                    RunVerdict.FAIL,  # bisect parent c0 -> contradicts c0=PASS!
+                ]
+            )
+            gh2 = StubGitHub(author="dev", open_issues=tracked_issues)
+            tree2 = TreeStateController(repo, dry_run=False, sign_commits=False)
+            ctrl2 = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=gh2,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree2,
+                dry_run=False,
+                sign_commits=False,
+                worktree_root=tmp / "wts-bisect-contradict",
+                run_in_wt=lambda _wt, _cmd: (next(bisect_contradict_stream), "burst"),
+            )
+            cls2, out2 = ctrl2.handle_failure(make_signal("902:1"), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual(cls2.bucket, Bucket.KNOWN_FLAKE)
+            self.assertEqual(cls2.matched_issue, 4001)
+            self.assertIn(c0[:9], cls2.reason)
+            self.assertIsNone(out2)
+            self.assertEqual(tree2.read_remote_status(), "green")
+            self.assertEqual(gh2.prs, [])
+            self.assertEqual(gh2.reruns, ["902:1"])
+            self.assertTrue(any(issue.get("issue_number") == 4001 for issue in gh2.issues))
+
+            # 3. Stream isolating unrelated docs commit `c1_docs` in bisect (`c1=F, c0=P`) and
+            # then contradicting `c2` during live-master revert check (`c2=PASS` vs earlier `FAIL`)
+            # MUST NOT record/open a revert PR for `c1_docs` or freeze the tree.
+            revert_contradict_stream = iter(
+                [
+                    RunVerdict.FAIL,  # classify c2
+                    RunVerdict.PASS,  # classify c0
+                    RunVerdict.PASS,  # classify c0 confirm
+                    RunVerdict.FAIL,  # classify c2 confirm
+                    RunVerdict.FAIL,  # bisect mid c1_docs
+                    RunVerdict.PASS,  # bisect parent c0
+                    RunVerdict.PASS,  # attempt_clean_revert live-master c2 -> contradicts c2=FAIL!
+                ]
+            )
+            gh3 = StubGitHub(author="dev", open_issues=tracked_issues)
+            tree3 = TreeStateController(repo, dry_run=False, sign_commits=False)
+            ctrl3 = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=gh3,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree3,
+                dry_run=False,
+                sign_commits=False,
+                worktree_root=tmp / "wts-revert-contradict",
+                run_in_wt=lambda _wt, _cmd: (next(revert_contradict_stream), "burst"),
+            )
+            cls3, out3 = ctrl3.handle_failure(make_signal("903:1"), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual(cls3.bucket, Bucket.KNOWN_FLAKE)
+            self.assertEqual(cls3.matched_issue, 4001)
+            self.assertIn(c2[:9], cls3.reason)
+            self.assertIsNone(out3)
+            self.assertEqual(tree3.read_remote_status(), "green")
+            self.assertEqual(gh3.prs, [])
+            self.assertEqual(gh3.reruns, ["903:1"])
+
+            # 4. Untracked test (no open `Flaky:` issue) hitting contradictory `baseline` outcomes
+            # between classification (`c0=PASS`) and bisect (`c0=FAIL`) MUST NOT freeze master;
+            # downgrades to NEW_INTERMITTENT.
+            untracked_contradict_stream = iter(
+                [
+                    RunVerdict.FAIL,  # classify c2
+                    RunVerdict.PASS,  # classify c0
+                    RunVerdict.FAIL,  # bisect mid c1_docs
+                    RunVerdict.FAIL,  # bisect parent c0 -> contradicts c0=PASS!
+                ]
+            )
+            gh4 = StubGitHub(author="dev", open_issues=[])
+            tree4 = TreeStateController(repo, dry_run=False, sign_commits=False)
+            ctrl4 = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=gh4,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree4,
+                dry_run=False,
+                sign_commits=False,
+                worktree_root=tmp / "wts-untracked-contradict",
+                run_in_wt=lambda _wt, _cmd: (next(untracked_contradict_stream), "flaky"),
+            )
+            cls4, out4 = ctrl4.handle_failure(make_signal("904:1"), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual(cls4.bucket, Bucket.NEW_INTERMITTENT)
+            self.assertIsNone(cls4.matched_issue)
+            self.assertIn(c0[:9], cls4.reason)
+            self.assertIsNone(out4)
+            self.assertEqual(tree4.read_remote_status(), "green")
+            self.assertEqual(gh4.prs, [])
+            self.assertTrue(any(str(issue.get("title", "")).startswith("New-Intermittent:") for issue in gh4.issues))
+
+            # 5. True deterministic regression on a tracked flake STILL bisects to `c2` (not
+            # `c1_docs`) and opens a verified revert PR cleanly.
+            gh5 = StubGitHub(author="dev", open_issues=tracked_issues)
+            tree5 = TreeStateController(repo, dry_run=False, sign_commits=False)
+            ctrl5 = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=gh5,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree5,
+                dry_run=False,
+                sign_commits=False,
+                worktree_root=tmp / "wts-real-det-tracked",
+                run_in_wt=lambda wt, _cmd: (
+                    RunVerdict.PASS if (wt / "app.txt").read_text(encoding="utf-8").strip() == "good" else RunVerdict.FAIL,
+                    "",
+                ),
+            )
+            cls5, out5 = ctrl5.handle_failure(make_signal("905:1"), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual(cls5.bucket, Bucket.DETERMINISTIC_REGRESSION)
+            self.assertEqual(cls5.matched_issue, 4001)
+            assert out5 is not None
+            self.assertEqual(out5.culprit_sha, c2)
+            self.assertNotEqual(out5.culprit_sha, c1_docs)
+            self.assertTrue(out5.clean_revert and out5.revert_verified)
+            self.assertFalse(out5.meltdown_triggered)
+            self.assertEqual(tree5.read_remote_status(), "green")
+            self.assertEqual(len(gh5.prs), 1)
 
 
 if __name__ == "__main__":
