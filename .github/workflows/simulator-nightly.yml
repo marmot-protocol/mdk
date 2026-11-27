@@ -21,6 +21,11 @@ on:
         required: false
         default: false
         type: boolean
+      report_failure:
+        description: Open a failure issue when a job fails (set by scheduled callers)
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -67,7 +72,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
         with:
-          tool: cargo-nextest@0.9.104
+          tool: cargo-nextest@0.9.132
 
       - name: Install just
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
@@ -205,7 +210,7 @@ jobs:
           retention-days: 30
 
       - name: Report nightly failure
-        if: failure() && github.event_name == 'schedule' && github.workflow == 'Simulator Nightly'
+        if: ${{ failure() && inputs.report_failure == true }}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -217,7 +222,7 @@ jobs:
             --body "The simulator nightly failed. Run: ${RUN_URL}"
 
   relay-runtime-offline-replay:
-    # The merge queue's relay-runtime lane ignores this 1,600-message case
+    # The CI relay-runtime lane ignores this 1,600-message case
     # because catch-up outruns its 60-second window on slow runners
     # (mdk#2538). Run it here with that lane's features and flags, unchanged.
     name: Relay runtime 1,600-message offline replay
@@ -272,7 +277,7 @@ jobs:
           -E 'test(=offline_replay::offline_replay_crosses_queue)'
 
       - name: Report scheduled relay runtime failure
-        if: ${{ failure() && github.event_name == 'schedule' && github.workflow == 'Simulator Nightly' }}
+        if: ${{ failure() && inputs.report_failure == true }}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -373,7 +378,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Report scheduled recovery failure
-        if: ${{ failure() && github.event_name == 'schedule' && github.workflow == 'Simulator Nightly' }}
+        if: ${{ failure() && inputs.report_failure == true }}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

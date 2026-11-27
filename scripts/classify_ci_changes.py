@@ -47,6 +47,7 @@ C_WORKSPACE_CRATES = {
     "marmot-markdown",
     "marmot-observability",
     "marmot-markdown-ast",
+    "marmot-pairing",
     "marmot-session",
     "nostr-directory",
     "marmot-uniffi",
@@ -69,6 +70,7 @@ CONFORMANCE_WORKSPACE_CRATES = {
     "marmot-markdown",
     "marmot-observability",
     "marmot-markdown-ast",
+    "marmot-pairing",
     "marmot-session",
     "nostr-directory",
     "storage-sqlite",
@@ -169,6 +171,7 @@ def _is_recognized_specialist_path(path: str) -> bool:
         or path in ROOT_BUILD_PATHS
         or path in SPECIALIST_EXACT_PATHS
         or path.startswith("formal/tamarin/")
+        or path.startswith("formal/pairing/")
         or path.startswith("formal/liveness/")
     )
 
@@ -225,7 +228,8 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
         for path in normalized
     )
     run_formal = unclassified_path or workflow_changed or any(
-        path.startswith("formal/tamarin/")
+        path.startswith(("formal/tamarin/", "formal/pairing/"))
+        or _crate_name(path) == "marmot-pairing"
         or path
         in {
             "Justfile",

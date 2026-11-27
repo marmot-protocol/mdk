@@ -118,6 +118,7 @@ jobs:
     uses: ./.github/workflows/simulator-nightly.yml
     with:
       source_sha: ${{ needs.plan.outputs.source_sha }}
+      report_failure: ${{ github.event_name == 'schedule' }}
 
   convergence-hardening:
     name: Convergence Hardening gate

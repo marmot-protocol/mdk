@@ -184,7 +184,7 @@ Non-Unix observations lack required CPU/RSS fields and therefore cannot satisfy 
 The retained raw observation and budget decision live under `target/cgka-nightly-lane-evidence` or
 `target/cgka-hardening-lane-evidence` beside the per-step records.
 
-The scheduled workflows pin Nextest `0.9.104` because case and retry accounting depends on its structured suite and
+The scheduled workflows pin Nextest `0.9.132` because case and retry accounting depends on its structured suite and
 retry-status formats. Missing artifact roots contribute zero bytes so an early lane failure can still retain its
 aggregate; the disk root remains mandatory. A release manifest's `output_dir` must not equal or nest under the retained
 weekly, adversarial, or distributed-container roots, because overlapping roots would double-count bytes and are
