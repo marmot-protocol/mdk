@@ -2127,10 +2127,10 @@ fn secure_prune_selected_app_events_tx(
     )?;
     let roots = pruned_message_ids.clone();
     for root in &roots {
-        for dependent in
-            app_events_targeting_message_tx(tx, group_id_hex, MARMOT_APP_EVENT_KIND_EDIT, root)?
-        {
-            pruned_message_ids.insert(dependent.message_id_hex);
+        // Include invalidated local edits too so pruning a root never leaves
+        // failed or rejected edit plaintexts behind in `app_events`.
+        for dependent_id in edit_message_ids_targeting_message_tx(tx, group_id_hex, root)? {
+            pruned_message_ids.insert(dependent_id);
         }
     }
     // Retain deletion evidence so delayed targets and edits remain hidden.
@@ -2861,6 +2861,29 @@ fn deleted_reaction_ids_for_target_tx(
     Ok(deleted)
 }
 
+fn edit_message_ids_targeting_message_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    target_message_id_hex: &str,
+) -> StorageResult<Vec<String>> {
+    let mut stmt = tx
+        .prepare_cached(&format!(
+            "SELECT edges.modifier_message_id_hex
+             FROM message_modifier_edges AS edges
+             WHERE edges.group_id_hex = ?1
+               AND edges.kind = {}
+               AND edges.target_message_id_hex = ?2",
+            u64_to_i64(MARMOT_APP_EVENT_KIND_EDIT)?
+        ))
+        .storage()?;
+    stmt.query_map(params![group_id_hex, target_message_id_hex], |row| {
+        row.get::<_, String>(0)
+    })
+    .storage()?
+    .collect::<Result<Vec<_>, _>>()
+    .storage()
+}
+
 fn app_events_targeting_message_tx(
     tx: &Connection,
     group_id_hex: &str,
@@ -3193,8 +3216,8 @@ fn scrub_app_event_rows_by_ids_tx(
                      source_epoch = NULL,
                      direction = '',
                      sender = '',
-                     plaintext = zeroblob(length(plaintext)),
-                     tags_json = zeroblob(length(tags_json)),
+                     plaintext = zeroblob(octet_length(plaintext)),
+                     tags_json = zeroblob(octet_length(tags_json)),
                      invalidation_reason = NULL,
                      origin_commit_id = NULL,
                      retention_seconds = NULL,
@@ -3253,7 +3276,7 @@ fn scrub_retained_edit_bodies_tx(
         tx.execute_cached(
             &format!(
                 "UPDATE message_timeline
-                SET plaintext = zeroblob(length(plaintext)), edit_json = NULL
+                SET plaintext = zeroblob(octet_length(plaintext)), edit_json = NULL
                 WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})
                   AND edit_json IS NOT NULL"
             ),
@@ -3263,7 +3286,10 @@ fn scrub_retained_edit_bodies_tx(
         tx.execute_cached(
             &format!(
                 "UPDATE chat_list_rows
-                SET last_message_preview = zeroblob(length(last_message_preview))
+                SET last_message_preview = CASE
+                    WHEN last_message_preview IS NULL THEN NULL
+                    ELSE zeroblob(octet_length(last_message_preview))
+                END
                 WHERE group_id_hex = ? AND last_message_id_hex IN ({placeholders})"
             ),
             params_from_iter(values.iter()),
@@ -3294,14 +3320,14 @@ fn scrub_timeline_projection_rows_by_ids_tx(
                      source_epoch = NULL,
                      direction = '',
                      sender = '',
-                     plaintext = zeroblob(length(plaintext)),
-                     tags_json = zeroblob(length(tags_json)),
+                     plaintext = zeroblob(octet_length(plaintext)),
+                     tags_json = zeroblob(octet_length(tags_json)),
                      reply_to_message_id_hex = NULL,
                      media_json = CASE
                          WHEN media_json IS NULL THEN NULL
-                         ELSE zeroblob(length(media_json))
+                         ELSE zeroblob(octet_length(media_json))
                      END,
-                     reactions_json = zeroblob(length(reactions_json)),
+                     reactions_json = zeroblob(octet_length(reactions_json)),
                      edit_json = NULL,
                      deleted_by_message_id_hex = NULL,
                      deletion_source = 'unknown',

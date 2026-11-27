@@ -1113,6 +1113,145 @@ fn account_projection_group_prune_chunks_stale_keys_under_sqlite_variable_limit(
     );
 }
 
+/// Regression for #3798: pruning stale group components must not bind an
+/// unbounded `NOT IN (...)` list past SQLite's variable limit.
+#[test]
+fn account_projection_group_components_prune_chunks_stale_ids_under_sqlite_variable_limit() {
+    const COMPONENT_COUNT: usize = SQLITE_BIND_PARAMETER_CHUNK + 105;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    {
+        let conn = store.lock().unwrap();
+        // SAFETY: Lower this test connection's bind-parameter limit before any
+        // concurrent use; rusqlite retains ownership of the handle.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                1_000,
+            );
+        }
+    }
+    let components = (0..COMPONENT_COUNT as u16)
+        .map(|id| StoredAccountGroupComponent {
+            component_id: id,
+            component_name: format!("comp-{id}"),
+            component_data_hex: "00".to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let mut stored = group("aa", "many-components");
+    stored.components = components.clone();
+
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![stored.clone()],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .expect("initial save with >1000 components must not exceed SQLite variable limit");
+
+    stored.components = components[1..].to_vec();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![stored.clone()],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .expect("pruning one stale component from >1000 retained must succeed");
+    let loaded = app.load_account_projection_state("alice", 16).unwrap();
+    assert_eq!(loaded.groups[0].components.len(), COMPONENT_COUNT - 1);
+    assert!(
+        loaded.groups[0]
+            .components
+            .iter()
+            .all(|component| component.component_id != 0)
+    );
+
+    stored.components = vec![components[COMPONENT_COUNT - 1].clone()];
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![stored],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .expect("pruning >1000 stale components in chunks must succeed");
+    let loaded = app.load_account_projection_state("alice", 16).unwrap();
+    assert_eq!(loaded.groups[0].components.len(), 1);
+    assert_eq!(
+        loaded.groups[0].components[0].component_id,
+        (COMPONENT_COUNT - 1) as u16
+    );
+}
+
+/// Regression for #3798: push-gossip integer arithmetic must saturate at
+/// `i64::MAX`/`i64::MIN` instead of overflowing to SQLite `REAL`.
+#[test]
+fn push_gossip_arithmetic_saturates_without_sqlite_real_promotion() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![group("aa", "alpha")],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    app.set_group_self_membership("aa", SelfMembership::Member)
+        .unwrap();
+
+    assert_eq!(
+        app.record_group_push_announce_owed("aa", i64::MAX).unwrap(),
+        Some(i64::MAX)
+    );
+    assert_eq!(
+        app.record_group_push_announce_owed("aa", i64::MAX).unwrap(),
+        Some(i64::MAX)
+    );
+
+    app.record_group_push_gossip_join("aa", 10).unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE group_push_gossip_state SET joining_since_ms = 5 WHERE group_id_hex = 'aa'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(app.count_push_join_window_time(i64::MAX).unwrap(), 1);
+    assert_eq!(app.count_push_join_window_time(1).unwrap(), 1);
+    let state = app.group_push_gossip_state("aa").unwrap().unwrap();
+    assert_eq!(state.join_window_counted_ms, i64::MAX);
+
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE group_push_gossip_state SET join_window_counted_ms = ?1 WHERE group_id_hex = 'aa'",
+            params![i64::MIN],
+        )
+        .unwrap();
+    assert_eq!(app.count_push_join_window_time(-5).unwrap(), 1);
+    let state = app.group_push_gossip_state("aa").unwrap().unwrap();
+    assert_eq!(state.join_window_counted_ms, i64::MIN);
+}
+
 #[test]
 fn account_projection_state_does_not_rewrite_unchanged_group_rows() {
     let store = SqliteAccountStorage::in_memory().unwrap();

@@ -93,8 +93,10 @@ fn encode_legacy_json<T: Serialize + ?Sized>(
     label: OpenMlsValueLabel,
     value: &T,
 ) -> Result<SerializedBuffer, SqliteOpenMlsStorageError> {
-    let bytes = serde_json::to_vec(value)?;
-    Ok(SerializedBuffer::from_database(label, bytes))
+    match label.sensitivity() {
+        ValueSensitivity::Public => Ok(SerializedBuffer::Public(serde_json::to_vec(value)?)),
+        ValueSensitivity::Secret => Ok(SerializedBuffer::Secret(serialize_sensitive_json(value)?)),
+    }
 }
 
 enum SerializedBuffer {
@@ -706,6 +708,35 @@ mod tests {
         }
 
         assert!(SerializedList::deserialize(label, b"[[55],").is_err());
+    }
+
+    /// Regression for #3798: `encode_legacy_json` must route secret labels
+    /// through the two-pass exact-allocation `serialize_sensitive_json` path
+    /// instead of an unzeroized `serde_json::to_vec` buffer.
+    #[test]
+    fn encode_legacy_json_routes_secret_labels_through_sensitive_serializer() {
+        use std::cell::Cell;
+
+        struct ExpandsOnSecondPass(Cell<bool>);
+
+        impl Serialize for ExpandsOnSecondPass {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                if self.0.replace(false) {
+                    serializer.serialize_str("short")
+                } else {
+                    serializer.serialize_str("expanded-on-second-pass-past-measured-size")
+                }
+            }
+        }
+
+        let secret_label = OpenMlsValueLabel::test_secret(b"SecretLegacy");
+        let err = encode_legacy_json(secret_label, &ExpandsOnSecondPass(Cell::new(true)))
+            .err()
+            .expect("secret encode_legacy_json must use two-pass serialize_sensitive_json");
+        assert!(
+            err.to_string().contains("sensitive JSON changed size"),
+            "{err:?}"
+        );
     }
 
     #[test]

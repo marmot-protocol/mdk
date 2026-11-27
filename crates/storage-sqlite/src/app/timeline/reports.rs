@@ -426,7 +426,7 @@ pub(super) fn rescrub_control(conn: &Connection, group: &str, id: &str) -> Stora
         .storage()?;
     }
     conn.execute_cached(
-        "UPDATE app_events SET plaintext = zeroblob(length(plaintext))
+        "UPDATE app_events SET plaintext = zeroblob(octet_length(plaintext))
          WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND (kind != 4891 OR NOT EXISTS (
            SELECT 1 FROM content_removal_validation v WHERE v.group_id_hex=?1 AND v.message_id_hex=?2 AND v.state=2
          ))",

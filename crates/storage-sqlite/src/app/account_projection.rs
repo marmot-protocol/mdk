@@ -3287,15 +3287,18 @@ impl SqliteAppStorage {
                  SELECT group_id_hex, ?2 FROM account_groups
                  WHERE group_id_hex = ?1 AND self_membership = 'member'
                  ON CONFLICT(group_id_hex) DO UPDATE SET
-                    announce_owed_at_ms = MAX(
-                        COALESCE(
+                    announce_owed_at_ms = CASE
+                        WHEN group_push_gossip_state.announce_owed_at_ms IS NULL
+                            THEN excluded.announce_owed_at_ms
+                        WHEN group_push_gossip_state.announce_owed_at_ms >= ?3
+                            THEN ?3
+                        ELSE MAX(
                             group_push_gossip_state.announce_owed_at_ms + 1,
                             excluded.announce_owed_at_ms
-                        ),
-                        excluded.announce_owed_at_ms
-                    )
+                        )
+                    END
                  RETURNING announce_owed_at_ms",
-                params![group_id_hex, owed_at_ms],
+                params![group_id_hex, owed_at_ms, i64::MAX],
                 |row| row.get(0),
             )
             .optional()
@@ -3388,9 +3391,13 @@ impl SqliteAppStorage {
         }
         conn.execute_cached(
             "UPDATE group_push_gossip_state
-                 SET join_window_counted_ms = join_window_counted_ms + ?1
+                 SET join_window_counted_ms = CASE
+                     WHEN ?1 > 0 AND join_window_counted_ms > ?2 - ?1 THEN ?2
+                     WHEN ?1 < 0 AND join_window_counted_ms < ?3 - ?1 THEN ?3
+                     ELSE join_window_counted_ms + ?1
+                 END
                  WHERE joining_since_ms IS NOT NULL AND joined_at_ms IS NOT NULL",
-            params![counted_ms],
+            params![counted_ms, i64::MAX, i64::MIN],
         )
         .storage()
     }
@@ -4072,21 +4079,43 @@ fn delete_stale_group_components(
         .storage()?;
         return Ok(());
     }
-    let placeholders = std::iter::repeat_n("?", components.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "DELETE FROM account_group_app_components
-         WHERE group_id_hex = ?
-           AND component_id NOT IN ({placeholders})"
-    );
-    let mut values = Vec::with_capacity(components.len() + 1);
-    values.push(Value::Text(group_id_hex.to_owned()));
-    for component in components {
-        values.push(Value::Integer(i64::from(component.component_id)));
+    let existing_ids = {
+        let mut statement = tx
+            .prepare_cached(
+                "SELECT component_id FROM account_group_app_components WHERE group_id_hex = ?1",
+            )
+            .storage()?;
+        statement
+            .query_map(params![group_id_hex], |row| row.get::<_, i64>(0))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?
+    };
+    let retained_ids = components
+        .iter()
+        .map(|component| i64::from(component.component_id))
+        .collect::<std::collections::HashSet<_>>();
+    let stale_ids = existing_ids
+        .into_iter()
+        .filter(|id| !retained_ids.contains(id))
+        .collect::<Vec<_>>();
+    for chunk in stale_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK - 1) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM account_group_app_components
+             WHERE group_id_hex = ?
+               AND component_id IN ({placeholders})"
+        );
+        let mut values = Vec::with_capacity(chunk.len() + 1);
+        values.push(Value::Text(group_id_hex.to_owned()));
+        for id in chunk {
+            values.push(Value::Integer(*id));
+        }
+        tx.execute_cached(&sql, params_from_iter(values.iter()))
+            .storage()?;
     }
-    tx.execute_cached(&sql, params_from_iter(values.iter()))
-        .storage()?;
     Ok(())
 }
 
